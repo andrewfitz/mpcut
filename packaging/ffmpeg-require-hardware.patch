@@ -1,0 +1,18 @@
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -845,13 +845,8 @@
+                                                                    &kCFTypeDictionaryValueCallBacks);
+ 
+     CFDictionarySetValue(config_info,
+-                        avctx->codec_id == AV_CODEC_ID_HEVC
+-                        || avctx->codec_id == AV_CODEC_ID_PRORES
+-                        || avctx->codec_id == AV_CODEC_ID_PRORES_RAW
+-                            ?
+-                            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder :
+-                            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
+-                         kCFBooleanTrue);
++                         kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
++                         kCFBooleanTrue);
+ 
+     avc_info = CFDictionaryCreateMutable(kCFAllocatorDefault,
+                                          1,
