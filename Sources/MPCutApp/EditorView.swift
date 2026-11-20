@@ -11,7 +11,7 @@ struct EditorView: View {
         VStack(spacing: 0) {
             viewer
                 .frame(minHeight: 180, maxHeight: .infinity)
-            if !editor.isEmpty || editor.canUndo || editor.canRedo {
+            if !editor.isEmpty || editor.hasHistory {
                 transport
                 Divider()
                 timeline
@@ -25,24 +25,28 @@ struct EditorView: View {
         .navigationSubtitle(editor.formatSummary ?? "")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                if !editor.isEmpty || !editor.queuedRanges.isEmpty {
+                    Button(action: editor.showBulkQueue) {
+                        Label("Export Queue (\(editor.queuedRanges.count))", systemImage: "list.number")
+                    }
+                    .help("Review and export queued ranges")
+                    .disabled(!editor.canShowBulkQueue)
+                }
                 if !editor.isEmpty {
+                    PreviewSoundControls(preview: editor.preview)
                     Button(action: editor.chooseFiles) {
                         Label("Add Clips", systemImage: "plus").labelStyle(.titleAndIcon)
                     }
                     .disabled(editor.isBusy)
-                    Toggle("Smart Trim", isOn: Binding(get: { editor.smartTrim }, set: editor.setSmartTrim))
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
-                        .disabled(!editor.canEdit || (!editor.canUseSmartTrim && !editor.smartTrim))
-                        .help(editor.canUseSmartTrim
-                            ? "Allow cuts between keyframes by encoding just the video at the cut edges."
-                            : "Smart Trim supports compatible H.264, HEVC, and AV1 footage.")
                     Button(action: editor.chooseExport) {
                         Label("Export", systemImage: "square.and.arrow.up").labelStyle(.titleAndIcon)
                     }
                     .disabled(!editor.canEdit)
                 }
             }
+        }
+        .sheet(isPresented: $editor.isBulkQueuePresented, onDismiss: editor.bulkQueueDismissed) {
+            BulkQueueView(editor: editor)
         }
         .toolbarRole(.editor)
         .onAppear(perform: installKeyboardMonitor)
@@ -75,34 +79,47 @@ struct EditorView: View {
     private var transport: some View {
         HStack(spacing: 16) {
             HStack(spacing: 10) {
+                ClipTool(icon: "backward.end.alt", label: "Previous Scene", shortcut: "⇧←") { editor.stepScene(-1) }
+                    .disabled(!editor.canStepScenes)
                 ClipTool(icon: "backward.end.fill", label: "Previous Keyframe", shortcut: "⌥←") {
                     editor.step(-1, keyframes: true)
                 }
+                .disabled(!editor.canEdit)
                 ClipTool(icon: "backward.frame", label: "Previous Frame", shortcut: "←") { editor.step(-1) }
+                    .disabled(!editor.canEdit)
                 PreviewPlayButton(preview: editor.preview)
                 ClipTool(icon: "forward.frame", label: "Next Frame", shortcut: "→") { editor.step(1) }
+                    .disabled(!editor.canEdit)
                 ClipTool(icon: "forward.end.fill", label: "Next Keyframe", shortcut: "⌥→") {
                     editor.step(1, keyframes: true)
                 }
+                .disabled(!editor.canEdit)
+                ClipTool(icon: "forward.end.alt", label: "Next Scene", shortcut: "⇧→") { editor.stepScene(1) }
+                    .disabled(!editor.canStepScenes)
             }
-            .disabled(!editor.canEdit)
+            .disabled(!editor.canNavigate)
 
             Divider().frame(height: 18)
 
             HStack(spacing: 9) {
                 ClipTool(icon: nil, label: "Mark In", shortcut: "I", active: editor.markIn != nil, action: editor.setIn)
                 ClipTool(icon: nil, label: "Mark Out", shortcut: "O", active: editor.markOut != nil, action: editor.setOut)
+                ClipTool(icon: "text.badge.plus", label: "Add Marked Range to Export Queue", shortcut: "⇧⌘A", action: editor.addMarkedRange)
+                    .disabled(!editor.canAddMarkedRange)
                 ClipTool(icon: "scissors", label: "Split at Playhead", visibleTitle: "Split", shortcut: "⌘B", action: editor.split)
-                ClipTool(icon: "trash", label: "Delete", shortcut: "⌫", action: editor.deleteSelection)
+                ClipTool(icon: "trash", label: editor.deleteTitle, shortcut: "⌫", action: editor.deleteSelection)
                     .disabled(!editor.canDelete)
+                if editor.markIn != nil || editor.markOut != nil {
+                    ClipTool(icon: "xmark.circle", label: "Clear Marks", shortcut: "Esc", action: editor.clearMarks)
+                }
             }
             .disabled(!editor.canEdit)
 
             Spacer()
 
-            ClipTool(icon: "arrow.uturn.backward", label: "Undo", shortcut: "⌘Z", action: editor.undo)
+            ClipTool(icon: "arrow.uturn.backward", label: editor.undoTitle, shortcut: "⌘Z", action: editor.undo)
                 .disabled(!editor.canUndo)
-            ClipTool(icon: "arrow.uturn.forward", label: "Redo", shortcut: "⇧⌘Z", action: editor.redo)
+            ClipTool(icon: "arrow.uturn.forward", label: editor.redoTitle, shortcut: "⇧⌘Z", action: editor.redo)
                 .disabled(!editor.canRedo)
         }
         .padding(.horizontal, 17)
@@ -117,15 +134,25 @@ struct EditorView: View {
             selection: editor.selectedID,
             markIn: editor.markIn,
             markOut: editor.markOut,
+            thumbnailHeight: editor.timelineThumbnailHeight,
+            sequenceDuration: editor.duration,
+            scenesBySource: editor.scenesBySource, viewNamesBySource: editor.viewNamesBySource,
+            sceneRevision: editor.sceneRevision,
+            snapToKeyframes: $editor.snapToKeyframes,
+            largeThumbnails: $editor.largeThumbnails,
+            zoom: $editor.timelineZoom,
+            timeEntryRequest: editor.timeEntryRequest,
+            allowsClipEdits: !editor.isBusy,
             onSelect: editor.select,
             onSeek: editor.seek,
             onTrim: editor.trim,
             onMove: editor.move,
             onDrop: { editor.importFiles($0, at: $1) },
+            onScrub: editor.scrub, onEndScrub: editor.preview.endScrub,
             onCancelTrim: editor.cancelTrim,
             thumbnail: editor.thumbnail
         )
-        .disabled(editor.isBusy)
+        .disabled(editor.isBusy && !editor.canNavigate)
     }
 
     private var status: some View {
@@ -144,17 +171,43 @@ struct EditorView: View {
                 ProgressView()
                     .controlSize(.small)
                     .accessibilityHidden(true)
-                Text(editor.isImporting ? "Checking clips…" : "Checking edit…")
+                Text(editor.isImporting
+                     ? (editor.isCancelling ? "Cancelling…" : (editor.isEmpty ? "Opening clips…" : "Indexing frames and audio…"))
+                     : "Checking edit…")
                 Spacer()
+                if editor.isImporting {
+                    Button("Cancel", action: editor.cancelImport)
+                        .disabled(editor.isCancelling)
+                }
             } else {
+                if let progress = editor.sceneProgress {
+                    ProgressView(value: progress).frame(width: 62)
+                    Text("Finding scenes… \(Int(progress * 100))%")
+                    Button("Cancel", action: editor.cancelSceneAnalysis)
+                } else {
+                    if editor.canScanScenes {
+                        Button(action: editor.scanForScenes) {
+                            Label("Scan for Scenes", systemImage: "viewfinder")
+                        }
+                        .help("Find scene cuts in the background and enable scene navigation.")
+                        Divider().frame(height: 12)
+                    }
+                    if let label = editor.currentSceneLabel {
+                        Button(label, action: editor.renameCurrentView)
+                            .buttonStyle(.borderless)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .disabled(!editor.canRenameCurrentView)
+                            .help("Rename this view across all matching scenes")
+                        Divider().frame(height: 12)
+                    }
+                }
                 Text(editor.statusMessage)
                     .lineLimit(1)
                     .help(editor.statusMessage)
                 Spacer()
-                if let exportURL = editor.lastExportedURL {
-                    Button("Show in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([exportURL])
-                    }
+                if editor.lastExportedURL != nil {
+                    Button("Show in Finder", action: editor.showExportInFinder)
                 }
             }
         }
@@ -170,22 +223,39 @@ struct EditorView: View {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard let window = event.window, window === editorWindow, window.attachedSheet == nil,
-                  !(window.firstResponder is NSTextView) else { return event }
+                  !(window.firstResponder is NSTextView),
+                  !(window.firstResponder is NSControl) else { return event }
             let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
-            if modifiers == [] && event.keyCode == 49 && editor.canEdit {
-                editor.preview.togglePlayback()
-                return nil
-            }
-            if (modifiers == [] || modifiers == [.option]), editor.canEdit {
-                switch event.keyCode {
-                case 123: editor.step(-1, keyframes: modifiers.contains(.option))
-                case 124: editor.step(1, keyframes: modifiers.contains(.option))
-                default: return event
+            if modifiers.isEmpty, editor.canNavigate {
+                if event.keyCode == 49 {
+                    if !event.isARepeat { editor.preview.togglePlayback() }
+                    return nil
+                }
+                switch event.charactersIgnoringModifiers?.lowercased() {
+                case "j": if !event.isARepeat { editor.preview.shuttle(-1) }
+                case "k": if !event.isARepeat { editor.preview.pause() }
+                case "l": if !event.isARepeat { editor.preview.shuttle(1) }
+                default: return handleFrameStep(event, modifiers: modifiers)
                 }
                 return nil
             }
-            return event
+            return handleFrameStep(event, modifiers: modifiers)
         }
+    }
+
+    private func handleFrameStep(_ event: NSEvent, modifiers: NSEvent.ModifierFlags) -> NSEvent? {
+        guard editor.canEdit, modifiers.isEmpty || modifiers == [.option] || modifiers == [.shift] else { return event }
+        if modifiers == [.shift], event.keyCode == 123 || event.keyCode == 124 {
+            guard editor.canStepScenes else { return event }
+            editor.stepScene(event.keyCode == 123 ? -1 : 1)
+            return nil
+        }
+        switch event.keyCode {
+        case 123: editor.step(-1, keyframes: modifiers.contains(.option))
+        case 124: editor.step(1, keyframes: modifiers.contains(.option))
+        default: return event
+        }
+        return nil
     }
 
     private func removeKeyboardMonitor() {
@@ -240,6 +310,16 @@ private struct ViewerPanel: View {
             } else {
                 PreviewView(preview: preview)
                     .accessibilityLabel("Movie preview")
+                if preview.issue == nil, let warning = preview.audioWarning {
+                    Label(warning, systemImage: "speaker.slash.fill")
+                        .font(.callout)
+                        .padding(8)
+                        .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 6))
+                        .environment(\.colorScheme, .dark)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                        .allowsHitTesting(false)
+                }
                 if let issue = preview.issue {
                     Label(issue, systemImage: "video.slash")
                         .font(.callout)
@@ -254,12 +334,50 @@ private struct ViewerPanel: View {
     }
 }
 
+private struct PreviewSoundControls: View {
+    @ObservedObject var preview: SequencePreview
+    @State private var showVolume = false
+
+    var body: some View {
+        Button {
+            showVolume.toggle()
+        } label: {
+            Label("Preview Audio", systemImage: preview.isMuted || preview.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
+        }
+        .help("Preview volume, mute, and audio scrubbing")
+        .popover(isPresented: $showVolume) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Button { preview.isMuted.toggle() } label: {
+                        Image(systemName: preview.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                            .frame(width: 22)
+                    }
+                    .accessibilityLabel(preview.isMuted ? "Unmute preview" : "Mute preview")
+                    .help(preview.isMuted ? "Unmute preview" : "Mute preview")
+                    Slider(value: Binding(get: { preview.volume }, set: {
+                        preview.volume = $0
+                        preview.isMuted = false
+                    }), in: 0...1)
+                    .accessibilityLabel("Preview volume")
+                }
+                Toggle("Play audio while scrubbing", isOn: $preview.scrubSoundEnabled)
+            }
+            .padding(14)
+            .frame(width: 228)
+        }
+    }
+}
+
 private struct PreviewPlayButton: View {
     @ObservedObject var preview: SequencePreview
 
     var body: some View {
-        ClipTool(icon: preview.isPlaying ? "pause.fill" : "play.fill",
-                 label: preview.isPlaying ? "Pause" : "Play", shortcut: "Space", action: preview.togglePlayback)
+        let rate = preview.playbackRate
+        let speed = "\(rate < 0 ? "−" : "")\(Int(abs(rate)))×"
+        let label = rate == 0 ? "Play" : (rate == 1 ? "Pause" : "Pause \(speed) Playback")
+        ClipTool(icon: rate == 0 ? "play.fill" : "pause.fill", label: label,
+                 visibleTitle: rate == 0 || rate == 1 ? nil : speed,
+                 shortcut: "Space · J / K / L", action: preview.togglePlayback)
             .disabled(preview.issue != nil)
     }
 }

@@ -14,7 +14,7 @@ func matroskaAudioCodec(_ audio: AudioIndex, media: MediaInfo) -> String? {
     }
 }
 
-struct OpusTrimWindow {
+struct OpusTrimWindow: Sendable {
     let start: Int64
     let firstPacketEnd: Int64
     let end: Int64
@@ -42,7 +42,7 @@ struct OpusTrimWindow {
 /* Opus is clocked at 48 kHz. Matroska's default block timestamps are rounded to
  * milliseconds. Track the exact decoded sample count and check it against every
  * block timestamp before qualifying an endpoint. */
-func opusTrimWindow(_ audio: AudioIndex, origin: RationalTime) -> OpusTrimWindow? {
+func opusTrimWindow(_ audio: AudioIndex, origin: RationalTime, checkCancellation: () throws -> Void = {}) rethrows -> OpusTrimWindow? {
     let stream = audio.stream
     let padding = stream.initialPadding
     guard stream.sampleRate == 48_000, stream.timeBase == RationalTime(numerator: 1, denominator: 1_000),
@@ -59,6 +59,7 @@ func opusTrimWindow(_ audio: AudioIndex, origin: RationalTime) -> OpusTrimWindow
     var firstPacketEnd: Int64?
     var packetStarts: [Int64] = []
     for (index, packet) in audio.packets.enumerated() {
+        if index.isMultiple(of: 1_024) { try checkCancellation() }
         guard let pts = try? origin.adding(packet.time).roundedToSamples(48_000) else { break }
         let (delta, deltaOverflow) = pts.subtractingReportingOverflow(expected)
         let (next, packetOverflow) = expected.addingReportingOverflow(Int64(packet.decodedSamples))

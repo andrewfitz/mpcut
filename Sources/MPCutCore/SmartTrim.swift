@@ -8,7 +8,8 @@ extension CutEngine {
     /// the choices when we can reproduce the source's picture format at the edges.
     public func smartTrimEligible(in media: MediaInfo, container: String) -> Bool {
         let video = media.video
-        guard media.sourceStartSafe, !video.multipleDescriptions, video.bitDepth == 8, !video.hasAlpha, !video.complexPicture,
+        guard media.sourceStartSafe, !video.multipleDescriptions, !video.hasAdditionalVideoLayers,
+              video.bitDepth == 8, !video.hasAlpha, !video.complexPicture,
               ["yuv420p", "yuvj420p"].contains(video.pixelFormat),
               ["unknown", "bt709", "bt470m", "bt470bg", "smpte170m", "smpte240m", "iec61966-2-1"].contains(video.colorTransfer),
               video.width > 0, video.height > 0, video.width.isMultiple(of: 2), video.height.isMultiple(of: 2) else {

@@ -7,6 +7,7 @@
 #include <libavutil/display.h>
 #include <libswresample/swresample.h>
 #include <math.h>
+#include <float.h>
 
 typedef struct {
     AVCodecContext *codec;
@@ -20,6 +21,7 @@ struct MPPreviewDecoder {
     PreviewStream audio;
     PreviewStream *receiving;
     AVVideotoolboxContext hardware;
+    VTDecompressionSessionRef verified_session;
     AVPacket *packet;
     AVFrame *frame;
     SwrContext *resampler;
@@ -27,6 +29,8 @@ struct MPPreviewDecoder {
     int audio_rate;
     enum AVSampleFormat audio_format;
     bool audio_unavailable;
+    bool audio_enabled;
+    bool audio_only;
     bool eof;
     bool awaiting_keyframe;
     bool encoding_edge;
@@ -152,6 +156,7 @@ MPPreviewDecoder *mp_preview_open(const char *path, bool video_only, MPPreviewCa
     if (!open_stream(preview, &preview->video, AVMEDIA_TYPE_VIDEO))
         goto failure;
     preview->audio.index = -1;
+    preview->audio_enabled = !video_only;
     if (video_only) {
         for (unsigned i = 0; i < preview->format->nb_streams; i++) {
             if ((int)i != preview->video.index)
@@ -204,6 +209,8 @@ void mp_preview_close(MPPreviewDecoder *preview)
     if (!preview)
         return;
     preview->cancelled = NULL;
+    if (preview->verified_session)
+        CFRelease(preview->verified_session);
     clear_hardware(&preview->hardware);
     avcodec_free_context(&preview->video.codec);
     avcodec_free_context(&preview->audio.codec);
@@ -218,9 +225,23 @@ void mp_preview_close(MPPreviewDecoder *preview)
     free(preview);
 }
 
+void mp_preview_enable_audio(MPPreviewDecoder *preview, bool enabled)
+{
+    if (preview->audio.index >= 0) {
+        preview->format->streams[preview->audio.index]->discard = enabled ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+        preview->audio_enabled = enabled;
+    }
+}
+
+void mp_preview_select_audio_only(MPPreviewDecoder *preview)
+{
+    preview->audio_only = true;
+    preview->format->streams[preview->video.index]->discard = AVDISCARD_ALL;
+}
+
 bool mp_preview_has_audio(const MPPreviewDecoder *preview)
 {
-    return preview->audio.codec && !preview->audio_unavailable;
+    return preview->audio_enabled && preview->audio.codec && !preview->audio_unavailable;
 }
 
 bool mp_preview_has_unavailable_audio(const MPPreviewDecoder *preview)
@@ -290,13 +311,27 @@ bool mp_preview_seek(MPPreviewDecoder *preview, double seconds)
     if (preview->origin > 0 && target > INT64_MAX - preview->origin)
         return false;
     int result;
-    if (strcmp(preview->format->iformat->name, "mpegts") == 0) {
+    if (preview->audio_only && mp_preview_has_audio(preview)) {
+        // Decode a little audio preroll for transform codecs, independently of the video GOP.
+        int64_t absolute = preview->origin + FFMAX(0, target - AV_TIME_BASE / 4);
+        int64_t ticks = av_rescale_q(absolute, AV_TIME_BASE_Q, preview->format->streams[preview->audio.index]->time_base);
+        result = av_seek_frame(preview->format, preview->audio.index, ticks, AVSEEK_FLAG_BACKWARD);
+    } else if (strcmp(preview->format->iformat->name, "mpegts") == 0) {
         result = seek_transport_stream(preview, target);
     } else {
-        int64_t preroll = mp_preview_has_audio(preview) ? AV_TIME_BASE / 4 : 0;
-        int64_t timestamp = av_rescale_q(FFMAX(0, target - preroll) + preview->origin, AV_TIME_BASE_Q,
-            preview->video.codec->pkt_timebase);
-        result = av_seek_frame(preview->format, preview->video.index, timestamp, AVSEEK_FLAG_BACKWARD);
+        const AVStream *video = preview->format->streams[preview->video.index];
+        double relative = mp_preview_has_audio(preview) ? fmax(0, seconds - 0.25) : seconds;
+        long double ticks = (long double)relative * video->time_base.den / video->time_base.num;
+        // Keep exact rational frame times that passed through Double. A real
+        // fractional tick must round down or a backward seek can return a future keyframe.
+        long double nearest = roundl(ticks);
+        if (fabsl(ticks - nearest) <= fminl(0.000001L, 2 * DBL_EPSILON * fmaxl(1, ticks)))
+            ticks = nearest;
+        int64_t start = video->start_time != AV_NOPTS_VALUE ? video->start_time :
+            av_rescale_q(preview->origin, AV_TIME_BASE_Q, video->time_base);
+        if (ticks >= 0x1p63L || (start > 0 && (int64_t)ticks > INT64_MAX - start))
+            return false;
+        result = av_seek_frame(preview->format, preview->video.index, start + (int64_t)ticks, AVSEEK_FLAG_BACKWARD);
     }
     if (result < 0)
         return false;
@@ -322,16 +357,25 @@ static CMTime sample_time(const MPPreviewDecoder *preview, const PreviewStream *
     return CMTimeSubtract(timestamp_time(pts, stream->codec->pkt_timebase), preview->timeline_origin);
 }
 
-static bool using_hardware(const MPPreviewDecoder *preview)
+static bool using_hardware(MPPreviewDecoder *preview)
 {
     if (!preview->hardware.session)
         return false;
+    // Retain the verified session so a replacement cannot reuse its address.
+    if (preview->verified_session == preview->hardware.session)
+        return true;
+    if (preview->verified_session) {
+        CFRelease(preview->verified_session);
+        preview->verified_session = NULL;
+    }
     CFTypeRef property = NULL;
     OSStatus status = VTSessionCopyProperty(preview->hardware.session,
         kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder, NULL, &property);
     bool hardware = status == noErr && property == kCFBooleanTrue;
     if (property)
         CFRelease(property);
+    if (hardware)
+        preview->verified_session = (VTDecompressionSessionRef)CFRetain(preview->hardware.session);
     return hardware;
 }
 
@@ -503,9 +547,9 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
         }
         if (preview->eof) {
             PreviewStream *stream = &preview->video;
-            if (stream->drained)
+            if (preview->audio_only || stream->drained)
                 stream = &preview->audio;
-            if (stream->drained || !stream->codec || (stream == &preview->audio && preview->audio_unavailable))
+            if (stream->drained || !stream->codec || (stream == &preview->audio && !mp_preview_has_audio(preview)))
                 return MPPreviewEnd;
             int result = avcodec_send_packet(stream->codec, NULL);
             if (result == AVERROR_EOF) {
@@ -531,12 +575,12 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
             return MPPreviewError;
         }
         PreviewStream *stream = NULL;
-        if (preview->packet->stream_index == preview->video.index) {
+        if (!preview->audio_only && preview->packet->stream_index == preview->video.index) {
             if (!preview->awaiting_keyframe || (preview->packet->flags & AV_PKT_FLAG_KEY)) {
                 preview->awaiting_keyframe = false;
                 stream = &preview->video;
             }
-        } else if (preview->packet->stream_index == preview->audio.index && !preview->audio_unavailable)
+        } else if (preview->packet->stream_index == preview->audio.index && mp_preview_has_audio(preview))
             stream = &preview->audio;
         if (stream && stream->codec)
             result = avcodec_send_packet(stream->codec, preview->packet);

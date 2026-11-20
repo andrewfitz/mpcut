@@ -10,6 +10,7 @@
 #include <libavutil/avstring.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/opt.h>
+#include <libavutil/parseutils.h>
 #include <libavutil/pixdesc.h>
 
 #include <math.h>
@@ -115,8 +116,16 @@ static int copy_metadata(const AVCodecParameters *params, MPProbeStream *stream)
     const AVPacketSideData *matrix = items[0];
     if (matrix && matrix->size == 9 * sizeof(int32_t)) {
         double rotation = av_display_rotation_get((const int32_t *)matrix->data);
-        if (isfinite(rotation))
+        if (isfinite(rotation)) {
             stream->rotation = (int)lround(rotation);
+            int32_t canonical[9];
+            av_display_rotation_set(canonical, -stream->rotation);
+            // Camera matrices can translate a rotated picture back into view.
+            // Reject flips, scaling, perspective and approximate rotations.
+            const int32_t *m = (const int32_t *)matrix->data;
+            stream->rotation_only = stream->rotation % 90 == 0 &&
+                !memcmp(m, canonical, 6 * sizeof(*m)) && m[8] == canonical[8];
+        }
     }
     return 0;
 }
@@ -124,6 +133,8 @@ static int copy_metadata(const AVCodecParameters *params, MPProbeStream *stream)
 static int describe_stream(AVFormatContext *file, AVStream *input, MPProbeStream *stream)
 {
     const AVCodecParameters *params = input->codecpar;
+    stream->field_order = params->field_order;
+    stream->chroma_location = av_chroma_location_name(params->chroma_location);
     stream->complex_picture = params->field_order != AV_FIELD_UNKNOWN && params->field_order != AV_FIELD_PROGRESSIVE;
     stream->track_id = input->id;
     stream->disposition = input->disposition;
@@ -199,7 +210,7 @@ static int describe_stream(AVFormatContext *file, AVStream *input, MPProbeStream
 }
 
 /* MOV H.26x samples are length-prefixed. Transport streams use Annex B. */
-static bool h26x_start(const AVPacket *packet, const AVCodecParameters *params, bool source_start)
+static bool h26x_start(const AVPacket *packet, const AVCodecParameters *params, bool source_start, int *multilayer)
 {
     bool hevc = params->codec_id == AV_CODEC_ID_HEVC;
     int length_size = 0;
@@ -237,6 +248,8 @@ static bool h26x_start(const AVPacket *packet, const AVCodecParameters *params, 
         if (unit_end - i < (hevc ? 2 : 1))
             return false;
         int type = hevc ? (bytes[i] >> 1) & 63 : bytes[i] & 31;
+        if (hevc && mp_hevc_multilayer_unit(bytes + i, unit_end - i))
+            *multilayer = 1;
         if (hevc && type <= 31) {
             if (type < 16 || type > (source_start ? 21 : 20))
                 return false;
@@ -308,7 +321,7 @@ static bool av1_units(const uint8_t *bytes, size_t size, int *reduced_header)
     return false;
 }
 
-static bool independent(const AVPacket *packet, const AVCodecParameters *params, bool source_start)
+static bool independent(const AVPacket *packet, const AVCodecParameters *params, bool source_start, int *multilayer)
 {
     if (params->codec_id == AV_CODEC_ID_PRORES)
         return packet->size >= 26 && AV_RB32(packet->data + 4) == MKBETAG('i', 'c', 'p', 'f');
@@ -316,7 +329,7 @@ static bool independent(const AVPacket *packet, const AVCodecParameters *params,
         return false;
     switch (params->codec_id) {
     case AV_CODEC_ID_H264: case AV_CODEC_ID_HEVC:
-        return h26x_start(packet, params, source_start);
+        return h26x_start(packet, params, source_start, multilayer);
     case AV_CODEC_ID_VP8:
         return vp8_start(packet->data, packet->size);
     case AV_CODEC_ID_VP9:
@@ -383,6 +396,19 @@ done:
     return success;
 }
 
+static bool matching_shape(enum AVCodecID codec, const MPDescriptionShape *a, const MPDescriptionShape *b)
+{
+    if (a->width != b->width || a->height != b->height || a->coded_width != b->coded_width ||
+        a->format != b->format || a->field_order != b->field_order)
+        return false;
+    if (a->coded_height == b->coded_height)
+        return true;
+    // HEVC encoders can pad the same visible rows to an 8- or 16-line boundary.
+    int64_t height = a->height;
+    return codec == AV_CODEC_ID_HEVC && FFMIN(a->coded_height, b->coded_height) == ((height + 7) & ~INT64_C(7)) &&
+           FFMAX(a->coded_height, b->coded_height) == ((height + 15) & ~INT64_C(15));
+}
+
 static int record_packet(MPProbeResult *result, const AVCodecParameters *params, const AVPacket *packet,
                          MPDescriptionShape *first_description)
 {
@@ -401,9 +427,9 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
         description_shape(params, params->extradata, params->extradata_size, packet, first_description);
     if (config) {
         MPDescriptionShape shape;
-        if (can_compare && first_description->width && independent(packet, params, false) &&
+        if (can_compare && first_description->width && independent(packet, params, false, &stream->multilayer) &&
             description_shape(params, config, side_size, packet, &shape) &&
-            !memcmp(first_description, &shape, sizeof(shape))) {
+            matching_shape(params->codec_id, first_description, &shape)) {
             stream->multiple_descriptions = 1;
         } else {
             issue(result, "The stream changes codec configuration during the file.");
@@ -431,15 +457,16 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
     if (video) {
         bool first = !stream->count;
         sample->key = !!(packet->flags & AV_PKT_FLAG_KEY) || params->codec_id == AV_CODEC_ID_PRORES;
-        if (independent(packet, params, false))
+        if (independent(packet, params, false, &stream->multilayer))
             sample->start = 1;
-        else if (first && independent(packet, params, true))
+        else if (first && independent(packet, params, true, &stream->multilayer))
             sample->start = 2;
         if (params->codec_id == AV_CODEC_ID_VP8 || params->codec_id == AV_CODEC_ID_VP9) {
             const uint8_t *alpha = av_packet_get_side_data(packet, AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, &side_size);
             const bool has_alpha = alpha && side_size > 8 && AV_RB64(alpha) == 1;
             if (has_alpha && !stream->alpha_bits) {
                 issue(result, "The video contains alpha samples without a declared alpha track mode.");
+                stream->alpha_bits = stream->bit_depth ? stream->bit_depth : 8;
             } else if (stream->alpha_bits && sample->start) {
                 if (!has_alpha || !(params->codec_id == AV_CODEC_ID_VP8 ? vp8_start(alpha + 8, side_size - 8) :
                                                                         vp9_start(alpha + 8, side_size - 8)))
@@ -453,11 +480,24 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
             if (!sample->start) {
                 issue(result, "A ProRes sample has an invalid frame header.");
             } else {
+                const uint8_t flags = packet->data[20];
+                const unsigned frame_type = (flags >> 2) & 3;
+                const uint32_t layout = (uint32_t)(flags & 0xcc) << 24 | AV_RB24(packet->data + 22);
+                if (AV_RB16(packet->data + 16) != params->width || AV_RB16(packet->data + 18) != params->height ||
+                    (flags >> 6) < 2 || frame_type == 3 || (!first && stream->prores_layout != layout))
+                    issue(result, "A ProRes sample changes dimensions, chroma, field order or color description.");
+                if (first) {
+                    stream->prores_layout = layout;
+                    if (stream->field_order == AV_FIELD_UNKNOWN)
+                        stream->field_order = frame_type == 0 ? AV_FIELD_PROGRESSIVE :
+                                              frame_type == 1 ? AV_FIELD_TT : AV_FIELD_BB;
+                }
                 const int alpha_code = packet->data[25] & 15;
                 const int alpha_bits = alpha_code == 1 ? 8 : alpha_code == 2 ? 16 : 0;
                 if (alpha_code > 2 || (!first && alpha_bits != stream->alpha_bits))
                     issue(result, "The ProRes alpha configuration is unsupported or changes during the file.");
-                stream->alpha_bits = alpha_bits;
+                // Conversion must preserve transparency seen anywhere in the clip.
+                stream->alpha_bits = first ? alpha_bits : FFMAX(stream->alpha_bits, alpha_bits);
             }
         }
     } else {
@@ -498,7 +538,7 @@ typedef struct {
     unsigned char start, end;
 } CutPoint;
 
-static int reorder_video(MPProbeStream *video, bool *source_start)
+static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska_avc_or_hevc)
 {
     MPProbePacket *packets = video->packets;
     CutPoint *cuts = av_calloc(video->count, sizeof(*cuts));
@@ -507,6 +547,8 @@ static int reorder_video(MPProbeStream *video, bool *source_start)
 
     int64_t suffix_min = INT64_MAX;
     for (size_t i = video->count; i-- > 0;) {
+        if (matroska_avc_or_hevc && (packets[i].dts == AV_NOPTS_VALUE || (i && packets[i].dts <= packets[i - 1].dts)))
+            video->reconstructed_dts = 1;
         suffix_min = FFMIN(suffix_min, packets[i].pts);
         cuts[i].first_presentation = suffix_min;
     }
@@ -524,9 +566,29 @@ static int reorder_video(MPProbeStream *video, bool *source_start)
         }
         prefix_max = FFMAX(prefix_max, packet->pts);
         packet->start = packet->end = 0;
+        if (video->reconstructed_dts)
+            packet->dts = (int64_t)i; // Keep the coded packet ordinal through the presentation sort.
     }
     *source_start = cuts[0].start;
     qsort(packets, video->count, sizeof(*packets), compare_pts);
+    if (video->reconstructed_dts) {
+        // Matroska AVC/HEVC blocks store PTS in coded order. A packet-only demux
+        // may report these same values as DTS. Assign presentation-clock slots
+        // in coded order, shifted just far enough that no DTS exceeds its PTS.
+        __int128 delay = 0;
+        for (size_t i = 0; i < video->count; i++) {
+            __int128 lead = (__int128)packets[packets[i].dts].pts - packets[i].pts;
+            if (lead > delay) delay = lead;
+        }
+        for (size_t i = 0; i < video->count; i++) {
+            __int128 dts = (__int128)packets[packets[i].dts].pts - delay;
+            if (dts <= INT64_MIN) {
+                av_free(cuts);
+                return AVERROR_INVALIDDATA;
+            }
+            packets[i].dts = (int64_t)dts;
+        }
+    }
     size_t frame = 0;
     for (size_t i = 0; i < video->count; i++) {
         const CutPoint *cut = &cuts[i];
@@ -543,7 +605,7 @@ static int reorder_video(MPProbeStream *video, bool *source_start)
     return 0;
 }
 
-static int build_video_index(MPProbeResult *result)
+static int build_video_index(MPProbeResult *result, const AVStream *input_video)
 {
     MPProbeStream *video = &result->streams[result->video_index];
     MPProbePacket *packets = video->packets;
@@ -559,7 +621,10 @@ static int build_video_index(MPProbeResult *result)
     }
     bool source_start = packets[0].start != 0;
     if (!sorted) {
-        int status = reorder_video(video, &source_start);
+        enum AVCodecID codec = input_video->codecpar->codec_id;
+        bool matroska_avc_or_hevc = av_match_name("matroska", result->format) &&
+                                    (codec == AV_CODEC_ID_H264 || codec == AV_CODEC_ID_HEVC);
+        int status = reorder_video(video, &source_start, matroska_avc_or_hevc);
         if (status < 0)
             return status;
     }
@@ -596,6 +661,19 @@ static int build_video_index(MPProbeResult *result)
         if (track_end > packets[video->count - 1].pts)
             result->end = track_end;
     }
+    if (av_match_name("matroska", result->format) && av_cmp_q(time_base, AV_TIME_BASE_Q) >= 0) {
+        // Matroska demux rounds a track's default block duration down to whole
+        // ticks. FFmpeg's per-track DURATION tag records its absolute end on
+        // the segment clock. Use it only to resolve a one-tick rounding error.
+        const AVDictionaryEntry *tag = av_dict_get(input_video->metadata, "DURATION", NULL, 0);
+        int64_t us;
+        if (tag && av_parse_time(&us, tag->value, 1) == 0 && us >= 0) {
+            int64_t tagged_end = av_rescale_q(us, AV_TIME_BASE_Q, time_base);
+            int64_t delta = av_sat_sub64(tagged_end, packet_end);
+            if (tagged_end > packets[video->count - 1].pts && delta >= -1 && delta <= 1)
+                result->end = tagged_end;
+        }
+    }
     for (size_t i = 0; i < video->count; i++) {
         int64_t next = i + 1 < video->count ? packets[i + 1].pts : result->end;
         if (next > packets[i].pts)
@@ -616,7 +694,9 @@ static bool needs_stream_analysis(const AVFormatContext *file)
               !mp_has_header_probe(params->codec_id))))
             return true;
         if (params->codec_type == AVMEDIA_TYPE_AUDIO &&
-            (!params->sample_rate || !params->ch_layout.nb_channels))
+            (!params->sample_rate || !params->ch_layout.nb_channels ||
+             (params->codec_id == AV_CODEC_ID_AAC && params->ch_layout.nb_channels > 2 &&
+              params->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)))
             return true;
     }
     return false;
@@ -624,6 +704,9 @@ static bool needs_stream_analysis(const AVFormatContext *file)
 
 static void update_header_description(MPProbeStream *stream, const AVCodecParameters *params)
 {
+    stream->field_order = params->field_order;
+    stream->complex_picture |= params->field_order != AV_FIELD_UNKNOWN && params->field_order != AV_FIELD_PROGRESSIVE;
+    stream->chroma_location = av_chroma_location_name(params->chroma_location);
     stream->profile = params->profile;
     stream->pixel_format = av_get_pix_fmt_name(params->format);
     const AVPixFmtDescriptor *pixel = av_pix_fmt_desc_get(params->format);
@@ -712,6 +795,8 @@ static int indexed_prores(const MPMOVIndex *index, AVFormatContext *file, MPProb
             status = record_packet(result, params, &packet, NULL);
             if (status < 0)
                 goto done;
+            MPProbeStream *indexed = &result->streams[i];
+            indexed->packets[indexed->count - 1].byte_count = entry->size;
         }
         if (expected != stream->duration)
             goto fallback;
@@ -819,7 +904,8 @@ static void describe_pcm_bit_depths(AVFormatContext *file)
     }
 }
 
-MPProbeResult *mp_probe_read(const char *path, MPProbeCancelled cancelled, void *context,
+MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
+                            MPProbeCancelled cancelled, void *context,
                             char *error, size_t error_capacity)
 {
     AVFormatContext *file = avformat_alloc_context();
@@ -834,17 +920,22 @@ MPProbeResult *mp_probe_read(const char *path, MPProbeCancelled cancelled, void 
     if (status < 0)
         goto fail;
     AVStream *prores = NULL;
-    if (prores_index_candidate(file, &prores)) {
+    if (!preview_only && prores_index_candidate(file, &prores)) {
         describe_pcm_bit_depths(file);
         if (mp_mov_open_index(path, file, &mov_index) && !describe_prores_header(&mov_index, prores)) {
             close(mov_index.fd);
             mov_index.fd = -1;
         }
     }
-    if (needs_stream_analysis(file)) {
-        status = av_opt_set(file, "codec_whitelist", MPCUT_PROBE_DECODERS, 0);
-        if (status < 0)
-            goto fail;
+    if (!preview_only && needs_stream_analysis(file)) {
+        // Copy inspection uses packet headers. Conversion also needs the decoded
+        // pixel format for codecs such as Animation, PNG and FFV1, whose
+        // container parameters may give no indication that alpha is present.
+        if (!conversion) {
+            status = av_opt_set(file, "codec_whitelist", MPCUT_PROBE_DECODERS, 0);
+            if (status < 0)
+                goto fail;
+        }
         status = avformat_find_stream_info(file, NULL);
         if (status < 0)
             goto fail;
@@ -873,10 +964,15 @@ MPProbeResult *mp_probe_read(const char *path, MPProbeCancelled cancelled, void 
         if (type == AVMEDIA_TYPE_VIDEO && !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
             if (result->video_index == -1)
                 result->video_index = i;
-            else
+            else {
                 issue(result, "Multiple video tracks are unsupported.");
-            if (raw_video(stream->codecpar, result->format))
+                if (!result->timeline_issue[0])
+                    snprintf(result->timeline_issue, sizeof(result->timeline_issue), "Multiple video tracks are unsupported.");
+            }
+            if (raw_video(stream->codecpar, result->format)) {
                 issue(result, "RAW video is unsupported.");
+                snprintf(result->timeline_issue, sizeof(result->timeline_issue), "RAW video is unsupported.");
+            }
         } else if (type == AVMEDIA_TYPE_DATA && stream->codecpar->codec_tag == MKTAG('t', 'm', 'c', 'd') &&
                    av_match_name("mov", file->iformat->name) && !timecode) {
             timecode = true;
@@ -888,10 +984,36 @@ MPProbeResult *mp_probe_read(const char *path, MPProbeCancelled cancelled, void 
         status = AVERROR_STREAM_NOT_FOUND;
         goto fail;
     }
+    if (preview_only) {
+        // Use declared timing for an early preview. The full scan determines
+        // the edit duration and verified boundaries independently.
+        const AVStream *video = file->streams[result->video_index];
+        int64_t duration = video->duration;
+        if (duration <= 0 && av_match_name("matroska", result->format)) {
+            const AVDictionaryEntry *tag = av_dict_get(video->metadata, "DURATION", NULL, 0);
+            int64_t end;
+            if (tag && av_parse_time(&end, tag->value, 1) == 0 && end > 0) {
+                int64_t start = video->start_time == AV_NOPTS_VALUE ? 0 : video->start_time;
+                duration = av_sat_sub64(av_rescale_q(end, AV_TIME_BASE_Q, video->time_base), start);
+            }
+        }
+        if (duration <= 0 && file->duration > 0)
+            duration = av_rescale_q(file->duration, AV_TIME_BASE_Q, video->time_base);
+        result->origin = video->start_time == AV_NOPTS_VALUE ? 0 : video->start_time;
+        result->end = av_sat_add64(result->origin, duration);
+        if (result->end <= result->origin || video->codecpar->width <= 0 || video->codecpar->height <= 0) {
+            status = AVERROR_INVALIDDATA;
+            goto fail;
+        }
+        av_packet_free(&packet);
+        avformat_close_input(&file);
+        return result;
+    }
     AVCodecParameters *video_params = file->streams[result->video_index]->codecpar;
     bool prores_video = video_params->codec_id == AV_CODEC_ID_PRORES;
     bool needs_video_header = video_params->format < 0 &&
                               (prores_video || mp_has_header_probe(video_params->codec_id));
+    bool inspect_scan = video_params->codec_id == AV_CODEC_ID_H264 || video_params->codec_id == AV_CODEC_ID_HEVC;
     status = indexed_prores(&mov_index, file, result, cancelled, context);
     if (status < 0)
         goto fail;
@@ -904,11 +1026,19 @@ MPProbeResult *mp_probe_read(const char *path, MPProbeCancelled cancelled, void 
         status = av_read_frame(file, packet);
         if (status < 0)
             break;
-        if (needs_video_header && packet->stream_index == result->video_index &&
-            (prores_video ? read_prores_header(video_params, packet->data, packet->size) :
-             (packet->flags & AV_PKT_FLAG_KEY) && mp_read_video_header(video_params, packet))) {
-            update_header_description(&result->streams[result->video_index], video_params);
-            needs_video_header = false;
+        if ((needs_video_header || inspect_scan) && packet->stream_index == result->video_index &&
+            (prores_video || (packet->flags & AV_PKT_FLAG_KEY))) {
+            bool may_interlace = false;
+            bool read = prores_video ? read_prores_header(video_params, packet->data, packet->size) :
+                                       mp_read_video_header(video_params, packet, &may_interlace,
+                                                            &result->streams[result->video_index].multilayer);
+            if (read) {
+                MPProbeStream *stream = &result->streams[result->video_index];
+                update_header_description(stream, video_params);
+                stream->complex_picture |= may_interlace;
+                needs_video_header = false;
+            }
+            inspect_scan = false;
         }
         if (packet->stream_index < result->stream_count)
             status = record_packet(result, file->streams[packet->stream_index]->codecpar, packet, &first_description);
@@ -922,7 +1052,7 @@ MPProbeResult *mp_probe_read(const char *path, MPProbeCancelled cancelled, void 
         goto fail;
     if (needs_video_header)
         issue(result, "The video codec headers do not identify the pixel format.");
-    status = build_video_index(result);
+    status = build_video_index(result, file->streams[result->video_index]);
     if (status < 0)
         goto fail;
     av_packet_free(&packet);

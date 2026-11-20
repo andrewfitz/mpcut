@@ -29,6 +29,22 @@ class WriterRegression(unittest.TestCase):
         self.assertIs(report["ok"], ok, report)
         return report
 
+    def test_mp4_export_respects_cropped_webm_opus_padding(self):
+        source = Path(__file__).resolve().parents[1] / "MPCutAppTests/Fixtures/WebM-Opus-GOP.webm"
+        cropped = self.root / "cropped.webm"
+        self.export(source, cropped, "--from", "1", "--to", "3")
+        out = self.root / "assembly.mp4"
+        for flags in [("--mode", "copy"), ("--mode", "smart"), ("--mode", "encode", "--audio", "copy")]:
+            with self.subTest(flags=flags):
+                report = self.export(cropped, out, *flags, dry_run=True, ok=False)
+                self.assertIn("audible range", report["error"]["message"])
+                self.assertFalse(out.exists())
+        report = self.export(cropped, out, "--mode", "encode", "--audio", "auto")
+        self.assertEqual(report["audioActions"][0]["action"], "aac")
+        audio_stream = probe(out, "-select_streams", "a:0", "-show_streams")["streams"][0]
+        self.assertEqual(audio_stream["codec_name"], "aac")
+        self.assertEqual(int(audio_stream["duration_ts"]) * Fraction(audio_stream["time_base"]), 2)
+
     def test_audible_lead_and_tail_survive_whole_mov_copy(self):
         for codec in ["pcm_s16le", "aac"]:
             with self.subTest(codec=codec):
@@ -73,6 +89,111 @@ class WriterRegression(unittest.TestCase):
         self.assertEqual(frames(output), frames(source)[:20])
         timecode = probe(output, "-select_streams", "d:0", "-show_streams")["streams"][0]
         self.assertEqual(timecode["tags"]["timecode"], "01:23:45:05")
+
+    def test_prefix_opus_trim_reports_exact_presentation_duration(self):
+        source = self.root / "source.webm"
+        output = self.root / "prefix.webm"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=25:d=3", "-f", "lavfi", "-i",
+               "sine=r=48000:d=3", "-c:v", "libvpx-vp9", "-deadline", "realtime", "-g", "25",
+               "-c:a", "libopus", source)
+        self.export(source, output, "--to", "1")
+        self.assertEqual(audio(output), audio(source)[:2 * 48_000])
+        info = probe(output, "-show_format", "-show_streams")
+        self.assertEqual(Fraction(info["format"]["duration"]), 1)
+        self.assertEqual([s["tags"]["DURATION"] for s in info["streams"]],
+                         ["00:00:01.000000000"] * 2)
+        reopened = self.root / "reopened.webm"
+        plan = self.export(output, reopened, dry_run=True)
+        self.assertEqual(ratio(plan["duration"]), 1)
+        self.export(output, reopened)
+        self.assertEqual(Fraction(probe(reopened, "-show_format")["format"]["duration"]), 1)
+        self.assertEqual(audio(reopened), audio(output))
+
+    def test_matroska_statistics_tags_do_not_survive_a_cut(self):
+        source = self.root / "statistics.mkv"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=25:d=6", "-f", "lavfi", "-i", "sine=r=48000:d=6",
+               "-c:v", "libvpx-vp9", "-deadline", "realtime", "-g", "25", "-c:a", "libopus",
+               "-metadata:s:v:0", "DURATION-eng=00:10:00.000000000", "-metadata:s:v:0", "BPS-eng=1000",
+               "-metadata:s:a:0", "DURATION-eng=00:10:00.000000000", "-metadata:s:a:0", "language=eng", source)
+        for name, args, seconds in [("middle", ("--from", "2", "--to", "4"), 2), ("tail", ("--from", "2"), 4)]:
+            with self.subTest(edit=name):
+                output = self.root / f"{name}.mkv"
+                self.export(source, output, *args)
+                streams = probe(output, "-show_streams")["streams"]
+                for stream in streams:
+                    tags = stream["tags"]
+                    self.assertFalse([key for key in tags if key.upper().startswith(("DURATION-", "BPS"))], tags)
+                    self.assertEqual(tags["DURATION"], f"00:00:0{seconds}.000000000")
+                self.assertEqual(streams[1]["tags"].get("language"), "eng")
+
+    def test_preserves_dolby_vision_configuration_record(self):
+        source = self.root / "dolby.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x180:r=25:d=1", "-vf", "setsar=1",
+               "-c:v", "libx265", "-x265-params", "log-level=error:pools=1", "-pix_fmt", "yuv420p10le",
+               "-tag:v", "hvc1", source, allow_diagnostics=True)
+        # Replace our fixture's square-pixel box with an equally sized profile-8
+        # display configuration. Its coded frames and sample offsets stay intact.
+        data = source.read_bytes()
+        square_pixels = bytes.fromhex("00000010") + b"pasp" + bytes.fromhex("0000000100000001")
+        dovi = bytes.fromhex("00000010") + b"dvvC" + bytes.fromhex("0100103540000000")
+        self.assertEqual(data.count(square_pixels), 1)
+        source.write_bytes(data.replace(square_pixels, dovi))
+        def configurations(path):
+            return probe(path, "-select_streams", "v:0", "-show_entries",
+                         "stream_side_data")["streams"][0]["side_data_list"]
+        expected = configurations(source)
+        self.assertTrue(expected)
+        for ext in ["mp4", "mkv"]:
+            with self.subTest(container=ext):
+                output = self.root / ("dolby-copy." + ext)
+                self.export(source, output)
+                self.assertEqual(configurations(output), expected)
+                self.assertEqual(sample_hashes(output), sample_hashes(source))
+        rejected = self.export(source, self.root / "dolby.mov", dry_run=True, ok=False)
+        self.assertIn("Dolby Vision", rejected["error"]["message"])
+
+    def test_reordered_matroska_keeps_coded_order_and_display_timing(self):
+        for codec, options in [
+            ("libx264", ["-x264-params", "keyint=25:min-keyint=25:scenecut=0:bframes=3:b-adapt=0"]),
+            ("libx265", ["-x265-params", "keyint=25:min-keyint=25:scenecut=0:bframes=3:b-adapt=0:open-gop=0:pools=1:log-level=error"]),
+        ]:
+            source = self.root / (codec + ".mkv")
+            ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x192:r=25:d=3", "-c:v", codec,
+                   *options, source, allow_diagnostics=True)
+            original = frames(source)
+            for ext in ["mp4", "mkv"]:
+                with self.subTest(codec=codec, ext=ext):
+                    output = self.root / (codec + "." + ext + "." + ext)
+                    self.export(source, output, "--from", "1", "--to", "2", "--clip", source, "--to", "1")
+                    self.assertEqual(frames(output), original[25:50] + original[:25])
+                    self.assertEqual(sample_hashes(output), sample_hashes(source)[25:50] + sample_hashes(source)[:25])
+                    pts = probe(output, "-show_packets", "-show_entries", "packet=pts_time")["packets"]
+                    self.assertEqual(sorted(Fraction(p["pts_time"]) for p in pts), [Fraction(i, 25) for i in range(50)])
+
+    def test_preserves_packed_stereo_layout(self):
+        source = self.root / "stereo.mkv"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x192:r=25:d=1", "-c:v", "libx264",
+               "-metadata:s:v", "stereo_mode=left_right", source)
+        for ext in ["mov", "mp4"]:
+            rejected = self.export(source, self.root / ("stereo." + ext), dry_run=True, ok=False)
+            self.assertIn("stereo layout", rejected["error"]["message"])
+        output = self.root / "stereo-copy.mkv"
+        self.export(source, output)
+        track = probe(output, "-show_streams")["streams"][0]
+        self.assertTrue(any(side.get("type") == "side by side" for side in track["side_data_list"]))
+
+    def test_fractional_pixel_aspect_ratio_survives_copy_and_smart_trim(self):
+        source = self.root / "anamorphic.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=3", "-vf", "setsar=16/15",
+               "-c:v", "libx264", "-x264-params", "keyint=25:min-keyint=25:scenecut=0:open-gop=0",
+               "-pix_fmt", "yuv420p", source)
+        for label, options in [("copy", []), ("smart", ["--smart-trim", "--from", "0.4", "--to", "2.6"])]:
+            with self.subTest(label=label):
+                output = self.root / (label + ".mp4")
+                self.export(source, output, *options)
+                track = probe(output, "-show_streams")["streams"][0]
+                self.assertEqual(track["sample_aspect_ratio"], "16:15")
+                self.assertEqual(track["display_aspect_ratio"], "256:135")
 
     def test_vp9_alpha_requires_a_muxer_that_carries_it(self):
         source = self.root / "alpha.webm"

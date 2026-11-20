@@ -88,7 +88,8 @@ static int configure_encoder(EdgeEncoder *work, const AVStream *video, int64_t t
     codec->height = source->height;
     codec->time_base = video->time_base;
     codec->framerate = video->avg_frame_rate.num > 0 ? video->avg_frame_rate : video->r_frame_rate;
-    codec->sample_aspect_ratio = source->sample_aspect_ratio;
+    codec->sample_aspect_ratio = video->sample_aspect_ratio.num > 0 && video->sample_aspect_ratio.den > 0
+                                 ? video->sample_aspect_ratio : source->sample_aspect_ratio;
     codec->color_primaries = source->color_primaries;
     codec->color_trc = source->color_trc;
     codec->colorspace = source->color_space;
@@ -109,6 +110,9 @@ static int configure_encoder(EdgeEncoder *work, const AVStream *video, int64_t t
         codec->qmax = max_qp;
         av_dict_set(&options, "svtav1-params", "pred-struct=1:lookahead=0:lp=4", 0);
     } else {
+        // FFmpeg's default inserts an extra hardware keyframe every 12 pictures.
+        // Each edge already starts independently and ends at the next copy seam.
+        codec->gop_size = (int)FFMIN(work->edge->count, INT_MAX);
         codec->pix_fmt = AV_PIX_FMT_VIDEOTOOLBOX;
         codec->sw_pix_fmt = AV_PIX_FMT_NV12;
         av_dict_set(&options, "allow_sw", "0", 0);
@@ -215,9 +219,17 @@ static int check_coded_size(const EdgeEncoder *work, const AVPacket *packet)
         result = av_parser_parse2(parser, codec, &data, &size, packet->data, packet->size,
                                   packet->pts, packet->dts, 0);
         if (result >= 0) {
-            result = parser->coded_width == work->coded_width && parser->coded_height == work->coded_height
-                     && parser->width == work->codec->width && parser->height == work->codec->height
-                     ? 0 : AVERROR_INPUT_CHANGED;
+            // HEVC encoders can pad a visible picture to 8 or 16 lines. These
+            // two standard bottom paddings can share the same decoded surface.
+            int64_t height = work->codec->height;
+            int64_t aligned8 = (height + 7) & ~INT64_C(7);
+            int64_t aligned16 = (height + 15) & ~INT64_C(15);
+            bool height_matches = parser->coded_height == work->coded_height ||
+                (id == AV_CODEC_ID_HEVC &&
+                 ((work->coded_height == aligned8 && parser->coded_height == aligned16) ||
+                  (work->coded_height == aligned16 && parser->coded_height == aligned8)));
+            result = parser->coded_width == work->coded_width && height_matches &&
+                     parser->width == work->codec->width && parser->height == height ? 0 : AVERROR_INPUT_CHANGED;
         }
     }
     av_parser_close(parser);
@@ -405,7 +417,17 @@ MPCutEdge *mpcut_edge_open(const char *path, const AVStream *video, MPCutTime de
         return edge;
     MPCutEdge *retry = encode_edge(path, video, decode_from, from, to, expected_frames,
                                    target_bit_rate, 63, progress, context, fraction, error, capacity);
-    if (retry && edge->payload_bytes <= retry->payload_bytes) {
+    if (!retry) {
+        // The first encode is still valid. Only a cancellation discards it.
+        if (progress && progress(context, fraction)) {
+            mpcut_edge_free(edge);
+            return NULL;
+        }
+        if (capacity)
+            error[0] = '\0';
+        return edge;
+    }
+    if (edge->payload_bytes <= retry->payload_bytes) {
         mpcut_edge_free(retry);
         return edge;
     }

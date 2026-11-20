@@ -18,7 +18,7 @@ SAMPLE_RATE = 48_000
 CLI = None
 
 
-def movie(path, codec, width=320, transfer="bt709"):
+def movie(path, codec, width=320, transfer="bt709", height=96):
     # Eight luma blocks encode the picture number, surviving both lossy encoders.
     marker = "geq=lum='if(lt(Y,16)*lt(X,128),if(bitand(N,pow(2,floor(X/16))),210,32),lum(X,Y))'"
     marker += f",setparams=range=limited:color_primaries=bt709:color_trc={transfer}:colorspace=bt709"
@@ -29,7 +29,7 @@ def movie(path, codec, width=320, transfer="bt709"):
         "av1": ["-c:v", "libsvtav1", "-preset", "10", "-g", "25", "-svtav1-params", "lp=2"],
     }
     sound = ["-c:a", "libopus"] if codec == "av1" else ["-c:a", "aac", "-aac_pns", "0"]
-    ffmpeg("-f", "lavfi", "-i", f"testsrc2=s={width}x96:r={FPS}:d=5",
+    ffmpeg("-f", "lavfi", "-i", f"testsrc2=s={width}x{height}:r={FPS}:d=5",
            "-f", "lavfi", "-i", f"sine=r={SAMPLE_RATE}:d=5:f=930",
            "-vf", marker, *settings[codec], "-pix_fmt", "yuv420p", "-color_range", "tv",
            "-color_trc", transfer, "-color_primaries", "bt709", "-colorspace", "bt709",
@@ -116,6 +116,47 @@ class SmartTrimTests(unittest.TestCase):
         if dry or not ok:
             self.assertFalse(output.exists())
         return report
+
+    def test_json_order_joins_the_selected_ranges_and_preserves_copied_gops(self):
+        source = self.sources["h264"]
+        output = self.root / "reordered.mp4"
+        ranges = [(7, 32), (39, 51), (54, 112)]
+        order = [3, 1, 3]
+        request = {
+            "file": str(source),
+            "output": str(output),
+            "clips": [{"from": {"numerator": start, "denominator": FPS}, "to": str(Fraction(end, FPS))}
+                      for start, end in ranges],
+            "order": order,
+        }
+        command = [CLI, "export", "--json", "--stdin"]
+        dry = subprocess.run([*command, "--dry-run"], input=json.dumps(request), capture_output=True,
+                             text=True, check=True, timeout=90)
+        plan = json.loads(dry.stdout)
+        self.assertFalse(output.exists())
+        self.assertEqual(plan["mode"], "smart")
+        self.assertEqual(plan["order"], order)
+        self.assertGreater(ratio(plan["copiedDuration"]), 0)
+        self.assertGreater(ratio(plan["encodedDuration"]), 0)
+        result = subprocess.run(command, input=json.dumps(request), capture_output=True, text=True,
+                                check=True, timeout=90)
+        self.assertEqual(json.loads(result.stdout)["segments"], plan["segments"])
+        expected = bytes(frame for index in order for frame in range(*ranges[index - 1]))
+        self.assertEqual(picture_ids(output), expected)
+        self.assertEqual(run([self.fixtures / "DecodeFrameIDs", output]), expected)
+        source_hashes, output_hashes = vcl_hashes(source, "h264"), vcl_hashes(output, "h264")
+        copied_frames = 0
+        for segment, index in zip(plan["segments"], order):
+            start, end = ranges[index - 1]
+            edges = [(ratio(edge["from"]), ratio(edge["to"])) for edge in segment.get("encodedEdges", [])]
+            for frame in range(start, end):
+                source_time = Fraction(frame, FPS)
+                if any(left <= source_time < right for left, right in edges):
+                    continue
+                output_time = ratio(segment["outputStart"]) + Fraction(frame - start, FPS)
+                self.assertEqual(output_hashes[output_time], source_hashes[source_time])
+                copied_frames += 1
+        self.assertEqual(copied_frames, ratio(plan["copiedDuration"]) * FPS)
 
     def check_trim(self, codec, ranges, edges):
         source = self.sources[codec]
@@ -258,6 +299,30 @@ class SmartTrimTests(unittest.TestCase):
                     expected = {t - Fraction(offset, FPS): data for t, data in timestamped_hashes(mixed)
                                 if t >= Fraction(offset, FPS)}
                     self.assertEqual(dict(timestamped_hashes(reopened)), expected, "re-open changed picture packets")
+
+    def test_hevc_bottom_padding_change_decodes_seeks_and_reopens(self):
+        source = movie(self.root / "unpadded-hevc.mov", "hevc", width=640, height=360)
+        output = self.root / "cut.mov"
+        self.export(output, [(source, 7, 88)])
+        sequence = bytes(range(7, 88))
+        for offset in (0, 18, 68):
+            self.assertEqual(run([self.fixtures / "DecodeFrameIDs", output, str(offset)]), sequence[offset:])
+        # Independently decoded copied pictures retain all visible luma and chroma.
+        self.assertEqual(frames(output)[18:68], frames(source)[25:75])
+        reopened = self.root / "reopened.mov"
+        self.export(reopened, [(output, 18, 81)], smart=False)
+        self.assertEqual(run([self.fixtures / "DecodeFrameIDs", reopened]), sequence[18:])
+
+    def test_hardware_edges_avoid_periodic_keyframes_inside_short_gops(self):
+        for codec in ("h264", "hevc"):
+            with self.subTest(codec=codec):
+                source = self.sources[codec]
+                output = self.root / (codec + source.suffix)
+                self.export(output, [(source, 7, 88)])
+                packets = probe(output, "-select_streams", "v:0", "-show_packets",
+                                "-show_entries", "packet=pts_time,flags")["packets"]
+                keys = sorted(Fraction(p["pts_time"]) * FPS for p in packets if "K" in p["flags"])
+                self.assertEqual(keys, [0, 18, 43, 68])
 
     def test_avc_coded_width_change_is_native_playable_or_rejected(self):
         # Some VideoToolbox encoders pad 160px AVC to a 192px coded picture.

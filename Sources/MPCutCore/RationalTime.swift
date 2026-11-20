@@ -36,19 +36,24 @@ public struct RationalTime: Hashable, Comparable, Codable, Sendable, CustomStrin
         }
         guard ratio.count == 1 else { throw invalid }
         let clock = unsigned.split(separator: ":", omittingEmptySubsequences: false)
-        guard clock.count == 1 || clock.count == 3, let last = clock.last, !last.isEmpty else { throw invalid }
+        guard clock.count <= 3, let last = clock.last, !last.isEmpty else { throw invalid }
         let decimal = last.split(separator: ".", omittingEmptySubsequences: false)
         guard decimal.count <= 2 else { throw invalid }
         let wholePart = decimal[0].isEmpty && decimal.count == 2 && clock.count == 1 ? 0 : digits(decimal[0])
         guard var whole = wholePart else { throw invalid }
-        if clock.count == 3 {
-            guard let hours = digits(clock[0]), let minutes = digits(clock[1]), minutes < 60, whole < 60 else {
-                throw invalid
+        if clock.count >= 2 {
+            guard let minutes = digits(clock[clock.count - 2]), whole < 60 else { throw invalid }
+            let (minuteSeconds, minutesOverflow) = minutes.multipliedReportingOverflow(by: 60)
+            let (total, sumOverflow) = minuteSeconds.addingReportingOverflow(whole)
+            guard !minutesOverflow, !sumOverflow else { throw invalid }
+            whole = total
+            if clock.count == 3 {
+                guard let hours = digits(clock[0]), minutes < 60 else { throw invalid }
+                let (hourSeconds, hoursOverflow) = hours.multipliedReportingOverflow(by: 3_600)
+                let (total, sumOverflow) = hourSeconds.addingReportingOverflow(whole)
+                guard !hoursOverflow, !sumOverflow else { throw invalid }
+                whole = total
             }
-            let (hourSeconds, hoursOverflow) = hours.multipliedReportingOverflow(by: 3_600)
-            let (allSeconds, sumOverflow) = hourSeconds.addingReportingOverflow(minutes * 60 + whole)
-            guard !hoursOverflow, !sumOverflow else { throw invalid }
-            whole = allSeconds
         }
         var scale: UInt64 = 1
         var fraction: UInt64 = 0

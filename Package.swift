@@ -19,7 +19,7 @@ let package = Package(
             providers: bundledFFmpeg ? nil : [.brew(["ffmpeg"])]
         ),
         .target(name: "PacketWriter", dependencies: ["CFFmpeg", "FFPreview"], linkerSettings: [.linkedLibrary("avcodec"), .linkedLibrary("avutil")]),
-        .target(name: "MediaProbe", dependencies: ["CFFmpeg"]),
+        .target(name: "MediaProbe", dependencies: ["CFFmpeg"], linkerSettings: [.linkedLibrary("swscale"), .linkedFramework("CoreVideo")]),
         .target(
             name: "FFPreview",
             dependencies: ["CFFmpeg"],

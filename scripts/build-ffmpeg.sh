@@ -3,7 +3,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 if [[ $(uname -m) != arm64 ]]; then
-    echo "Build the MPCut FFmpeg libraries using a native arm64 shell." >&2
+    echo "Build the MPCut FFmpeg helper and libraries using a native arm64 shell." >&2
     exit 1
 fi
 build_dir="$root/.build/mpcut-ffmpeg"
@@ -68,6 +68,9 @@ if [[ -f "$build_dir/.recipe" && $(cat "$build_dir/.recipe") == "$recipe" &&
       -f "$prefix/include/libavcodec/avcodec.h" &&
       -f "$prefix/include/libavutil/avutil.h" &&
       -f "$prefix/include/libswresample/swresample.h" &&
+      -x "$prefix/bin/ffmpeg" &&
+      -f "$prefix/lib/libavdevice.dylib" && -f "$prefix/lib/libavfilter.dylib" &&
+      -f "$prefix/lib/libswscale.dylib" &&
       -f "$prefix/lib/libavformat.dylib" && -f "$prefix/lib/libavcodec.dylib" &&
       -f "$prefix/lib/libavutil.dylib" && -f "$prefix/lib/libswresample.dylib" ]]; then
     exit 0
@@ -108,13 +111,14 @@ src/configure \
     --arch=aarch64 --cc="$compiler" \
     --sysroot="$SDKROOT" \
     --extra-cflags=-mmacosx-version-min=14.0 --extra-ldflags=-mmacosx-version-min=14.0 \
+    --extra-ldexeflags="-Wl,-rpath,@loader_path/../lib -Wl,-rpath,@loader_path/../Frameworks" \
     --install-name-dir=@rpath \
     --enable-shared --disable-static \
-    --disable-autodetect --disable-programs --disable-doc --disable-debug \
-    --disable-avdevice --disable-avfilter --disable-swscale \
+    --disable-autodetect --disable-ffplay --disable-ffprobe --disable-doc --disable-debug \
+    --disable-indevs --disable-outdevs --enable-indev=lavfi \
     --disable-network --disable-encoders --enable-zlib --enable-bzlib \
     --enable-videotoolbox --enable-libsvtav1 --pkg-config-flags=--static \
-    --enable-encoder=h264_videotoolbox,hevc_videotoolbox,libsvtav1
+    --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox,libsvtav1,aac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,wrapped_avframe,rawvideo
 make -j "$jobs" DESTDIR="$stage" install
 cd "$build_dir"
 install -m 644 "$stage/$source_name"/{COPYING.LGPLv2.1,LICENSE.md} "$stage$prefix/"

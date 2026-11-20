@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import CoreImage
 import CoreFoundation
+import Metal
 import MPCutCore
 import SwiftUI
 import VideoToolbox
@@ -232,12 +233,48 @@ private func nativeVideoMapping(_ segments: [AVAssetTrackSegment], url: URL) thr
     return mapping
 }
 
+// Accessed only on the owning decode queue. The end is part of the key:
+// the same timestamp at an exclusive trim boundary can show a different frame.
+struct ScrubFrameCache {
+    private struct Entry {
+        let time: Double
+        let end: Double?
+        let frame: PreviewFrame
+        let bytes: Int
+    }
+
+    private var entries: [Entry] = []
+    private var bytes = 0
+    private var source: URL?
+
+    mutating func frame(url: URL, at time: Double, before end: Double?,
+                        decode: () throws -> PreviewFrame?) rethrows -> PreviewFrame? {
+        if source != url {
+            entries.removeAll(keepingCapacity: true)
+            bytes = 0
+            source = url
+        }
+        if let hit = entries.last(where: { $0.time == time && $0.end == end }) { return hit.frame }
+        guard let frame = try decode() else { return nil }
+        let size = CVPixelBufferGetDataSize(frame.buffer)
+        let budget = 48 * 1024 * 1024
+        guard size > 0, size <= budget else { return frame }
+        while entries.count >= 8 || bytes + size > budget {
+            bytes -= entries.removeFirst().bytes
+        }
+        entries.append(Entry(time: time, end: end, frame: frame, bytes: size))
+        bytes += size
+        return frame
+    }
+}
+
 private final class DecodeRequests: @unchecked Sendable {
     let queue: DispatchQueue
     private let lock = NSLock()
     private var generation = 0
     private var decoder: HardwareFrames?
     private var decoderURL: URL?
+    private var recent = ScrubFrameCache()
 
     init(label: String, qos: DispatchQoS) {
         queue = DispatchQueue(label: label, qos: qos)
@@ -254,13 +291,24 @@ private final class DecodeRequests: @unchecked Sendable {
         lock.withLock { generation == value }
     }
 
-    func frame(url: URL, time: Double, before end: Double? = nil, cancelled: () -> Bool) throws -> PreviewFrame? {
+    func releaseDecoder() {
+        queue.async {
+            self.decoder = nil
+            self.decoderURL = nil
+            self.recent = ScrubFrameCache()
+        }
+    }
+
+    func frame(url: URL, time: Double, before end: Double?, scrubbing: Bool, cancelled: () -> Bool) throws -> PreviewFrame? {
         guard !cancelled() else { return nil }
         if decoderURL != url || decoder == nil {
             decoder = try HardwareFrames(url: url)
             decoderURL = url
         }
-        return try decoder?.frame(at: time, before: end, cancelled: cancelled)
+        if !scrubbing { return try decoder?.frame(at: time, before: end, cancelled: cancelled) }
+        return try recent.frame(url: url, at: time, before: end) {
+            try decoder?.frame(at: time, before: end, cancelled: cancelled)
+        }
     }
 }
 
@@ -279,7 +327,11 @@ private final class ThumbnailRequest: @unchecked Sendable {
 // thumbnails of a source, including segments created by splitting the same clip.
 private final class ThumbnailDecoder: @unchecked Sendable {
     let queue = DispatchQueue(label: "mpcut.preview.thumbnails", qos: .utility, autoreleaseFrequency: .workItem)
-    private lazy var context = CIContext()
+    private static let context: CIContext = {
+        let options: [CIContextOption: Any] = [.cacheIntermediates: false, .name: "MPCut Filmstrip"]
+        guard let device = MTLCreateSystemDefaultDevice() else { return CIContext(options: options) }
+        return CIContext(mtlDevice: device, options: options)
+    }()
     private var sourceID: UUID?
     private var native: HardwareFrames?
     private var fallback = FFPreviewReader(videoOnly: true)
@@ -303,15 +355,32 @@ private final class ThumbnailDecoder: @unchecked Sendable {
         let pixels = CIImage(cvPixelBuffer: frame.buffer).transformed(by: frame.displayTransform)
         let scale = min(size.width / pixels.extent.width, size.height / pixels.extent.height, 1)
         let scaled = pixels.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        return context.createCGImage(scaled, from: scaled.extent)
+        return Self.context.createCGImage(scaled, from: scaled.extent)
     }
 }
 
 @MainActor
 final class SequencePreview: ObservableObject {
     @Published private(set) var time: Double = 0
-    @Published private(set) var isPlaying = false
+    @Published private(set) var playbackRate: Float = 0
+    var isPlaying: Bool { playbackRate != 0 }
     @Published private(set) var issue: String?
+    @Published private(set) var audioWarning: String?
+
+    @Published var volume: Float = 1 { didSet { updateGain() } }
+    @Published var isMuted = false { didSet { updateGain() } }
+    @Published var scrubSoundEnabled = true { didSet { if !scrubSoundEnabled { scrubAudio.stop() } } }
+    private let scrubAudio = ScrubAudioPlayer()
+    private var scrubPicture: (source: URL, pts: Double, end: Double)?
+    private var isScrubbing = false
+
+    private func updateGain() {
+        let gain = isMuted ? 0 : min(max(volume, 0), 1)
+        audioPlayer.volume = gain
+        fallback?.setGain(gain)
+        scrubAudio.gain = gain
+        if gain == 0 { scrubAudio.stop() }
+    }
 
     private let requests = DecodeRequests(label: "mpcut.preview.video", qos: .userInteractive)
     private let audioPlayer = AVPlayer()
@@ -361,11 +430,13 @@ final class SequencePreview: ObservableObject {
         self.time = min(max(time, 0), duration)
         playable = false
         issue = nil
+        audioWarning = nil
         displayedURL = nil
         frame = nil
         surface?.clear()
         removeAudioItem()
         guard !ranges.isEmpty else {
+            requests.releaseDecoder()
             thumbnails = ThumbnailDecoder()
             return
         }
@@ -388,7 +459,7 @@ final class SequencePreview: ObservableObject {
                             self.startFallback(nativeIssue: message)
                         }
                     }
-                    self.seekAudio()
+                    if !self.isScrubbing && self.playbackRate >= 0 { self.seekAudio() }
                 }
                 self.playable = true
             } catch {
@@ -469,8 +540,8 @@ final class SequencePreview: ObservableObject {
                 self.audioSeeking = false
                 if !finished {
                     self.startFallback(nativeIssue: "The source audio could not seek to this position.")
-                } else if self.isPlaying {
-                    self.audioPlayer.play()
+                } else if self.playbackRate > 0 {
+                    self.audioPlayer.rate = self.playbackRate
                 }
             }
         }
@@ -478,10 +549,11 @@ final class SequencePreview: ObservableObject {
 
     private func startFallback(nativeIssue: String) {
         guard fallback == nil else { return }
-        let wasPlaying = isPlaying
+        let priorRate = playbackRate
         pause()
         loading?.cancel()
         _ = requests.next()
+        requests.releaseDecoder()
         rendering = false
         removeAudioItem()
         let generation = sequenceGeneration
@@ -494,32 +566,36 @@ final class SequencePreview: ObservableObject {
             guard let self, self.sequenceGeneration == generation else { return }
             let time = min(max(0, position), self.duration)
             if self.time != time { self.time = time }
-            if self.isPlaying && self.time >= self.duration {
+            if self.playbackRate > 0 && self.time >= self.duration {
                 self.pause()
             }
         }, onIssue: { [weak self] error in
             guard let self, self.sequenceGeneration == generation else { return }
             self.issue = "\(error) \(nativeIssue)"
             self.pause()
+        }, onAudioWarning: { [weak self] message in
+            guard let self, self.sequenceGeneration == generation else { return }
+            self.audioWarning = message
         })
+        alternative.setGain(isMuted ? 0 : volume)
         fallback = alternative
         if let auditionPosition {
             alternative.audition(url: auditionPosition.url, at: auditionPosition.time)
         } else {
             alternative.seek(to: time)
         }
-        if wasPlaying {
-            isPlaying = true
-            alternative.play()
+        if priorRate != 0 {
+            startPlayback(at: priorRate)
         }
     }
 
     func pause() {
+        endScrub()
         fallback?.pause()
         audioPlayer.pause()
         ticker?.cancel()
         ticker = nil
-        isPlaying = false
+        playbackRate = 0
     }
 
     func audition(_ range: PreviewRange, at sourceTime: Double) {
@@ -530,6 +606,46 @@ final class SequencePreview: ObservableObject {
         } else {
             render(url: range.url, time: sourceTime)
         }
+    }
+
+    func scrub(to position: Double, rangeIndex: Int, sourceFrame: Double) {
+        guard ranges.indices.contains(rangeIndex) else { return }
+        let range = ranges[rangeIndex]
+        let start = offsets[rangeIndex]
+        let end = rangeIndex + 1 < offsets.count ? offsets[rangeIndex + 1] : duration
+        let target = min(max(position, start), end)
+        let reverse = target < time
+        if !isScrubbing {
+            pause()
+            audioSeekGeneration += 1
+            audioPlayer.currentItem?.cancelPendingSeeks()
+            isScrubbing = true
+        }
+        auditionPosition = nil
+        time = target
+        if scrubPicture?.source != range.url || scrubPicture?.pts != sourceFrame || scrubPicture?.end != range.end {
+            scrubPicture = (range.url, sourceFrame, range.end)
+            if let fallback { fallback.audition(url: range.url, at: sourceFrame) }
+            else { render(url: range.url, time: sourceFrame, before: range.end) }
+        }
+        guard scrubSoundEnabled, !isMuted, volume > 0 else { return }
+        let composition = audioPlayer.currentItem?.asset
+        guard composition != nil || fallback != nil else { return }
+        let point = composition == nil ? min(range.end, range.start + (target - start)) : target
+        let bounds = composition == nil ? range.start..<range.end : start..<end
+        if let request = ScrubAudioRequest(source: range.url, composition: composition,
+                                           position: point, bounds: bounds, reverse: reverse) {
+            scrubAudio.submit(request)
+        }
+    }
+
+    func endScrub() {
+        guard isScrubbing else { return }
+        isScrubbing = false
+        scrubPicture = nil
+        scrubAudio.stop()
+        fallback?.park(at: time)
+        if audioEnd > 0 { seekAudio() }
     }
 
     func seek(to time: Double) {
@@ -551,20 +667,48 @@ final class SequencePreview: ObservableObject {
     func togglePlayback() {
         if isPlaying {
             pause()
+        } else if frame != nil && issue == nil {
+            if time >= duration { seek(to: 0) }
+            startPlayback(at: 1)
+        }
+    }
+
+    func shuttle(_ direction: Int) {
+        let sign: Float = direction < 0 ? -1 : 1
+        let speed = playbackRate * sign
+        startPlayback(at: sign * (speed > 0 ? min(8, speed * 2) : 1))
+    }
+
+    private func startPlayback(at rate: Float) {
+        guard frame != nil, issue == nil, rate != playbackRate, duration > 0 else { return }
+        if (rate > 0 && time >= duration) || (rate < 0 && time <= 0) {
+            pause()
             return
         }
-        guard frame != nil, issue == nil, duration > 0 else { return }
-        if time >= duration || auditionPosition != nil { seek(to: time >= duration ? 0 : time) }
-        if let fallback {
-            isPlaying = true
-            fallback.play()
+        guard rate < 0 || fallback != nil || playable else { return }
+        endScrub()
+        if auditionPosition != nil { seek(to: time) }
+
+        // Adjust an active forward stream in place, retaining its decoded audio.
+        if rate > 0, playbackRate > 0 {
+            playbackRate = rate
+            startTime = time
+            clockStart = .now
+            if let fallback { fallback.play(rate: rate) }
+            else if usingAudioClock && !audioSeeking { audioPlayer.rate = rate }
             return
         }
-        guard playable else { return }
+
+        pause()
+        playbackRate = rate
         startTime = time
         clockStart = .now
-        isPlaying = true
-        if usingAudioClock && !audioSeeking { audioPlayer.play() }
+        if let fallback, rate > 0 {
+            fallback.park(at: time)
+            fallback.play(rate: rate)
+            return
+        }
+        if rate > 0, audioEnd > 0 { seekAudio() }
         ticker = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(16))
@@ -575,9 +719,22 @@ final class SequencePreview: ObservableObject {
     }
 
     private func tick() {
-        guard !audioSeeking else { return }
         let elapsed = clockStart.duration(to: .now).components
-        let clock = startTime + Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+        let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+        let clock = startTime + seconds * Double(playbackRate)
+        if playbackRate < 0 {
+            time = max(0, clock)
+            if time == 0 {
+                pause()
+                seek(to: 0)
+            } else if let fallback {
+                fallback.displayStill(at: time)
+            } else {
+                renderTimeline(immediate: false)
+            }
+            return
+        }
+        guard !audioSeeking else { return }
         let next = usingAudioClock ? audioPlayer.currentTime().seconds : clock
         guard next.isFinite else { return }
         let position = min(max(time, next), duration)
@@ -603,22 +760,22 @@ final class SequencePreview: ObservableObject {
     }
 
     private func renderTimeline(immediate: Bool) {
-        guard immediate || !rendering,
-              let index = offsets.lastIndex(where: { $0 <= time }), ranges.indices.contains(index) else { return }
+        guard immediate || !rendering, !offsets.isEmpty else { return }
+        let index = max(0, offsets.lowerBound { $0 > time } - 1)
         let range = ranges[index]
         let sourceTime = time == duration ? range.end
             : min(range.end, range.start + (time - offsets[index]))
-        render(url: range.url, time: sourceTime, before: range.end)
+        render(url: range.url, time: sourceTime, before: range.end, scrubbing: immediate)
     }
 
-    private func render(url: URL, time: Double, before end: Double? = nil) {
+    private func render(url: URL, time: Double, before end: Double? = nil, scrubbing: Bool = true) {
         let serial = requests.next()
         rendering = true
         let requests = requests
         requests.queue.async { [weak self] in
             guard requests.current(serial) else { return }
             let result = Result {
-                try requests.frame(url: url, time: time, before: end) { !requests.current(serial) }
+                try requests.frame(url: url, time: time, before: end, scrubbing: scrubbing) { !requests.current(serial) }
             }
             Task { @MainActor in
                 guard let self, requests.current(serial) else { return }
@@ -663,6 +820,7 @@ final class SequencePreview: ObservableObject {
 
 final class PreviewSurface: NSView {
     private let displayLayer = AVSampleBufferDisplayLayer()
+    private var cachedFormat: CMVideoFormatDescription?
     private var pictureTransform = CGAffineTransform.identity
 
     override init(frame: NSRect) {
@@ -693,6 +851,7 @@ final class PreviewSurface: NSView {
     }
 
     fileprivate func clear() {
+        cachedFormat = nil
         displayLayer.flushAndRemoveImage()
     }
 
@@ -701,10 +860,13 @@ final class PreviewSurface: NSView {
             pictureTransform = frame.displayTransform
             layoutPicture()
         }
-        var format: CMVideoFormatDescription?
-        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: frame.buffer,
-                                                           formatDescriptionOut: &format) == noErr,
-              let format else { return }
+        if cachedFormat.map({ CMVideoFormatDescriptionMatchesImageBuffer($0, imageBuffer: frame.buffer) }) != true {
+            var format: CMVideoFormatDescription?
+            guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: frame.buffer,
+                                                               formatDescriptionOut: &format) == noErr else { return }
+            cachedFormat = format
+        }
+        guard let format = cachedFormat else { return }
         var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: frame.time, decodeTimeStamp: .invalid)
         var sample: CMSampleBuffer?
         guard CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: frame.buffer,

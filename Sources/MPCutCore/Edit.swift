@@ -21,9 +21,13 @@ public struct CutError: Error, LocalizedError, Codable, Sendable {
     public var errorDescription: String? { message }
 }
 
-public enum SnapMode: String, Codable, Sendable {
+public enum SnapMode: String, Codable, CaseIterable, Sendable {
     case exact
     case nearest
+}
+
+public enum ExportMode: String, Codable, CaseIterable, Sendable {
+    case copy, smart, encode
 }
 
 public struct ClipRequest: Sendable {
@@ -68,6 +72,7 @@ public struct ResolvedSegment: Codable, Sendable {
     public let to: RationalTime
     public let outputStart: RationalTime
     public let tracks: [ResolvedTrack]
+    var sourceOrigin: RationalTime?
     var lastVideoFrame: RationalTime?
     let reachesEnd: Bool
     var multipleDescriptions = false
@@ -88,4 +93,23 @@ public struct ResolvedEdit: Encodable, Sendable {
     let identities: [URL: SourceIdentity]
 
     enum CodingKeys: String, CodingKey { case segments, duration, container }
+
+    public func encodedVideoDuration(for mode: ExportMode) throws -> RationalTime {
+        switch mode {
+        case .copy: return .zero
+        case .encode: return duration
+        case .smart:
+            var total = RationalTime.zero
+            for segment in segments {
+                for edge in segment.encodedEdges ?? [] {
+                    total = try total.adding(edge.to.subtracting(edge.from))
+                }
+            }
+            return total
+        }
+    }
+
+    public func copiedVideoDuration(for mode: ExportMode) throws -> RationalTime {
+        try duration.subtracting(encodedVideoDuration(for: mode))
+    }
 }

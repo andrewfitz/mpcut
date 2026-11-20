@@ -30,6 +30,7 @@ typedef struct {
     int multiple_descriptions; /* Source MOV contains multiple video sample descriptions. */
     const MPCutTime *video_dts; /* Optional output decode slots for Smart Trim MOV splices. */
     size_t video_dts_count;
+    MPCutTime source_origin; /* Indexed video presentation origin, when available. */
 } MPCutSegment;
 
 /* AAC presentation edits in their track's native sample clock. */
@@ -49,7 +50,7 @@ const MPCutAACSourceEdit *mpcut_aac_source_track(const MPCutAACSource *source, i
 typedef int (*MPCutProgress)(void *context, double fraction);
 
 /* Checks the input tracks against the output container without creating a file. */
-int mpcut_check_mux(const char *input_path, const char *output_path,
+int mpcut_check_mux(const char *input_path, const char *output_path, int padded_opus_track,
                     char *error, size_t error_capacity);
 
 /* Write presentation end times (nanoseconds) into a staged WebM or MKV. */
@@ -65,7 +66,7 @@ int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime d
  * output_path is a temporary file with the destination's real extension.
  * Returns 0 on success, 1 on failure, or 2 on cancellation.
  */
-int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_path,
+int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_path, int audio_only,
                 MPCutProgress progress, void *context, char *error, size_t error_capacity);
 
 #endif

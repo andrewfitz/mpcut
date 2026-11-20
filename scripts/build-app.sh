@@ -45,6 +45,7 @@ trap cleanup EXIT
 mkdir -p "$contents"/{Frameworks,Helpers,MacOS,Resources/FFmpeg}
 install -m 755 "$bin_dir/MPCutDesktop" "$contents/MacOS/MPCut"
 install -m 755 "$bin_dir/mpcut" "$contents/Helpers/mpcut"
+install -m 755 "$ffmpeg/install/bin/ffmpeg" "$contents/Helpers/ffmpeg"
 install -m 644 "$root/packaging/Info.plist" "$contents/Info.plist"
 install -m 644 "$root/packaging/Credits.html" "$contents/Resources/Credits.html"
 install -m 644 "$root/Resources/MPCut.icns" "$contents/Resources/MPCut.icns"
@@ -74,7 +75,7 @@ mkdir "$notices/SVT-AV1"
 install -m 644 "$ffmpeg/install/SVT-AV1"/{LICENSE.md,LICENSE-BSD2.md,PATENTS.md,fastfeat-LICENSE,safestringlib-LICENSE} \
     "$ffmpeg/$svt_name.tar.bz2" "$notices/SVT-AV1/"
 
-for binary in "$contents"/Frameworks/*.dylib "$contents/Helpers/mpcut" "$contents/MacOS/MPCut"; do
+for binary in "$contents"/Frameworks/*.dylib "$contents"/Helpers/* "$contents/MacOS/MPCut"; do
     if [[ $(xcrun lipo -archs "$binary") != arm64 ]]; then
         echo "Expected an arm64 binary at $binary." >&2
         exit 1
@@ -118,10 +119,12 @@ if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     exit 1
 fi
 plutil -insert CFBundleShortVersionString -string "$version" "$contents/Info.plist"
+plutil -insert CFBundleVersion -string "$version" "$contents/Info.plist"
 codesign --force --sign - --timestamp=none "$app"
 codesign --verify --deep --strict "$app"
 plutil -lint "$contents/Info.plist"
 env -i PATH=/usr/bin:/bin "$contents/Helpers/mpcut" --help >/dev/null
+env -i PATH=/usr/bin:/bin "$contents/Helpers/ffmpeg" -version >/dev/null
 
 if [[ -e "$final" || -L "$final" ]]; then
     mv "$final" "$previous"

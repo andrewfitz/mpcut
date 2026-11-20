@@ -17,9 +17,11 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avstring.h>
+#include <libavutil/dovi_meta.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
+#include <libavutil/stereo3d.h>
 
 typedef __int128 Wide;
 
@@ -59,6 +61,8 @@ typedef struct {
     char *error;
     size_t error_capacity;
     double fraction;
+    int audio_only;
+    unsigned video_index;
     int has_timecode;
     AVRational timecode_rate;
     int smart_trim;
@@ -82,6 +86,7 @@ typedef struct {
     int keep_audio_end;
     int whole_file;
     int opus_trim;
+    int matroska_input;
 } Range;
 
 static int fail(Writer *writer, const char *format, ...) {
@@ -262,7 +267,24 @@ static int validate_streams(Writer *writer, const AVFormatContext *input, int *t
         }
         for (int side_index = 0; side_index < codec->nb_coded_side_data; side_index++) {
             enum AVPacketSideDataType type = codec->coded_side_data[side_index].type;
-            if ((type == AV_PKT_DATA_DISPLAYMATRIX || type == AV_PKT_DATA_DOVI_CONF) && !is_mov(format)) {
+            if (type == AV_PKT_DATA_STEREO3D && !is_matroska(format)) {
+                const AVStereo3D *stereo = (const AVStereo3D *)codec->coded_side_data[side_index].data;
+                // The MOV/MP4 muxer can reduce a packed eye layout to "unspecified"
+                // when its eyes atom is read back, even if an st3d box is present.
+                if (stereo->view == AV_STEREO3D_VIEW_PACKED && stereo->type != AV_STEREO3D_UNSPEC &&
+                    stereo->type != AV_STEREO3D_2D)
+                    return fail(writer, "Choose a compatible Matroska container to preserve the packed stereo layout on track %u in %s",
+                                index, input->url);
+            }
+            if (type == AV_PKT_DATA_DOVI_CONF && strcmp(format->name, "mp4") != 0) {
+                const AVDOVIDecoderConfigurationRecord *record =
+                    (const AVDOVIDecoderConfigurationRecord *)codec->coded_side_data[side_index].data;
+                // The Matroska muxer writes a Dolby Vision block mapping through profile 10.
+                if (strcmp(format->name, "matroska") != 0 || record->dv_profile > 10)
+                    return fail(writer, "Choose MP4 to preserve the Dolby Vision configuration on track %u in %s",
+                                index, input->url);
+            }
+            if (type == AV_PKT_DATA_DISPLAYMATRIX && !is_mov(format)) {
                 return fail(writer, "%s cannot preserve %s on track %u in %s", format->name,
                             av_packet_side_data_name(type), index, input->url);
             }
@@ -301,11 +323,17 @@ static int prepare_output(Writer *writer) {
     return 0;
 }
 
-int mpcut_check_mux(const char *input_path, const char *output_path, char *error, size_t error_capacity) {
+int mpcut_check_mux(const char *input_path, const char *output_path, int padded_opus_track,
+                    char *error, size_t error_capacity) {
     Writer writer = {.output_path = output_path, .error = error, .error_capacity = error_capacity};
     AVFormatContext *input = NULL;
 
     int result = prepare_output(&writer);
+    if (!result && padded_opus_track >= 0 && is_mov(writer.output->oformat)) {
+        result = fail(&writer, "Copying Opus track %d to %s would change its audible range. "
+                      "Use MKV for lossless audio or choose Re-encode with AAC.", padded_opus_track,
+                      writer.output->oformat->name);
+    }
     if (!result) {
         result = input_open(&writer, &input, input_path);
     }
@@ -319,11 +347,35 @@ int mpcut_check_mux(const char *input_path, const char *output_path, char *error
     return result;
 }
 
-static unsigned output_index(unsigned input_index, int timecode_index) {
-    return input_index - (timecode_index >= 0 && input_index > (unsigned)timecode_index);
+static unsigned output_index(const Writer *writer, unsigned input_index, int timecode_index) {
+    return input_index - (writer->audio_only && input_index > writer->video_index) - (timecode_index >= 0 && input_index > (unsigned)timecode_index);
 }
 
-static int configure_output(Writer *writer, const AVFormatContext *input, int whole_file,
+/* Matroska statistics tags (for example mkvmerge's DURATION-eng) describe the whole source track.
+ * The muxer filters only an exact DURATION key, so a copied stale value would describe the wrong length. */
+static int drop_statistics_tags(AVDictionary **metadata)
+{
+    static const char *const names[] = { "DURATION", "BPS", "NUMBER_OF_FRAMES", "NUMBER_OF_BYTES" };
+    AVDictionary *kept = NULL;
+    const AVDictionaryEntry *entry = NULL;
+    while ((entry = av_dict_iterate(*metadata, entry))) {
+        int stale = !av_strncasecmp(entry->key, "_STATISTICS_", 12);
+        for (size_t i = 0; !stale && i < sizeof(names) / sizeof(names[0]); i++) {
+            size_t length = strlen(names[i]);
+            stale = !av_strncasecmp(entry->key, names[i], length)
+                && (entry->key[length] == '\0' || entry->key[length] == '-');
+        }
+        if (!stale && av_dict_set(&kept, entry->key, entry->value, 0) < 0) {
+            av_dict_free(&kept);
+            return AVERROR(ENOMEM);
+        }
+    }
+    av_dict_free(metadata);
+    *metadata = kept;
+    return 0;
+}
+
+static int configure_output(Writer *writer, AVFormatContext *input, int whole_file,
                             int timecode_index, const MPCutTimecode *timecode, const char *initial_timecode,
                             const MPCutSegment *segment) {
     AVFormatContext *output = writer->output;
@@ -331,7 +383,7 @@ static int configure_output(Writer *writer, const AVFormatContext *input, int wh
     if (writer->has_timecode) {
         writer->timecode_rate = timecode->rate;
     }
-    unsigned output_count = input->nb_streams - writer->has_timecode;
+    unsigned output_count = input->nb_streams - writer->has_timecode - writer->audio_only;
     writer->last_dts = av_calloc(output_count, sizeof(*writer->last_dts));
     if (!writer->last_dts) {
         return fail(writer, "Cannot allocate output track state");
@@ -345,10 +397,10 @@ static int configure_output(Writer *writer, const AVFormatContext *input, int wh
         av_dict_set(&output->metadata, "timecode", NULL, 0);
     }
     for (unsigned index = 0; index < input->nb_streams; index++) {
-        if ((int)index == timecode_index) {
+        if ((int)index == timecode_index || (writer->audio_only && index == writer->video_index)) {
             continue;
         }
-        const AVStream *source = input->streams[index];
+        AVStream *source = input->streams[index];
         AVStream *destination = avformat_new_stream(output, NULL);
         if (!destination) {
             return fail(writer, "Cannot allocate output track %u", index);
@@ -357,6 +409,13 @@ static int configure_output(Writer *writer, const AVFormatContext *input, int wh
         if (result < 0) {
             return ff_error(writer, result, "Cannot copy stream configuration from", input->url);
         }
+        // The MP4 muxer writes the Dolby Vision configuration box only at this
+        // compliance level. Without it, the base-layer pictures survive but the
+        // muxer quietly drops the display configuration.
+        if (strcmp(output->oformat->name, "mp4") == 0 &&
+            av_packet_side_data_get(source->codecpar->coded_side_data, source->codecpar->nb_coded_side_data,
+                                    AV_PKT_DATA_DOVI_CONF))
+            output->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
         if (index < segment->opus_track_count && segment->opus_pre_skip[index] >= 0) {
             AVCodecParameters *codec = destination->codecpar;
             int skip = segment->opus_pre_skip[index];
@@ -382,10 +441,17 @@ static int configure_output(Writer *writer, const AVFormatContext *input, int wh
         destination->time_base = source->time_base;
         destination->avg_frame_rate = source->avg_frame_rate;
         destination->r_frame_rate = source->r_frame_rate;
-        destination->sample_aspect_ratio = source->sample_aspect_ratio;
+        if (source->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            // MOV can provide the pixel aspect ratio on the stream at open. The
+            // muxer writes the exact pasp box from the codec parameters.
+            AVRational sar = av_guess_sample_aspect_ratio(input, source, NULL);
+            destination->sample_aspect_ratio = destination->codecpar->sample_aspect_ratio = sar;
+        }
         destination->disposition = source->disposition;
 
         result = av_dict_copy(&destination->metadata, source->metadata, 0);
+        if (result >= 0)
+            result = drop_statistics_tags(&destination->metadata);
         if (result < 0) {
             return ff_error(writer, result, "Cannot copy track metadata from", input->url);
         }
@@ -424,7 +490,7 @@ static int configure_output(Writer *writer, const AVFormatContext *input, int wh
                 break;
             }
         }
-        result = av_opt_set_int(output->priv_data, "write_tmcd", writer->has_timecode, 0);
+        result = av_opt_set_int(output->priv_data, "write_tmcd", writer->has_timecode && !writer->audio_only, 0);
         if (writer->has_timecode) {
             if (result >= 0) {
                 result = av_opt_set_int(output->priv_data, "video_track_timescale", timecode->output_timescale, 0);
@@ -461,13 +527,18 @@ static int configure_output(Writer *writer, const AVFormatContext *input, int wh
     return 0;
 }
 
-static int video_origin(Writer *writer, AVFormatContext **input, unsigned *video_index, MPCutTime *origin) {
+static int video_origin(Writer *writer, AVFormatContext **input, unsigned *video_index,
+                        MPCutTime indexed_origin, MPCutTime *origin) {
     AVFormatContext *source = *input;
     unsigned index = 0;
     while (source->streams[index]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
         index++;
     }
     *video_index = index;
+    if (indexed_origin.denominator > 0) {
+        *origin = indexed_origin;
+        return 0;
+    }
 
     const AVStream *video = source->streams[index];
     AVRational base = video->time_base;
@@ -597,7 +668,7 @@ int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime d
         if (index == 0) {
             unsigned video_index;
             MPCutTime origin;
-            result = video_origin(&writer, &input, &video_index, &origin);
+            result = video_origin(&writer, &input, &video_index, segment->source_origin, &origin);
             if (result) {
                 break;
             }
@@ -667,6 +738,12 @@ static int remux_packet(Writer *writer, const AVStream *input_track, const Range
         && (last_picture || time_compare(packet_end, range->source_end) > 0)) {
         packet_end = range->source_end;
     }
+    if (video && range->matroska_input && last_picture && packet_end.denominator) {
+        int64_t end_tick = time_round(range->source_end, input_track->time_base);
+        Wide difference = (Wide)end_tick - packet->pts - packet->duration;
+        if (end_tick != AV_NOPTS_VALUE && difference >= -1 && difference <= 1)
+            packet_end = range->source_end; // Matroska's default frame duration can round off one tick.
+    }
     if (!range->whole_file) {
         if (packet->duration <= 0 || !packet_end.denominator) {
             return fail(writer, "Missing duration on %s track %d", track_type, packet->stream_index);
@@ -701,7 +778,7 @@ static int remux_packet(Writer *writer, const AVStream *input_track, const Range
         return fail(writer, "Output clock cannot represent a %s packet on track %d", track_type, packet->stream_index);
     }
     enum AVCodecID codec = input_track->codecpar->codec_id;
-    if (video && packet->dts == AV_NOPTS_VALUE && strcmp(writer->output->oformat->name, "matroska") == 0
+    if (video && !writer->video_dts && packet->dts == AV_NOPTS_VALUE && strcmp(writer->output->oformat->name, "matroska") == 0
         && (codec == AV_CODEC_ID_H264 || codec == AV_CODEC_ID_HEVC)) {
         /* Matroska stores presentation timestamps. Supply ordering for the leading
            reordered packets whose decode timestamps its demuxer cannot recover. */
@@ -1049,7 +1126,7 @@ static int write_aac_source_track(Writer *writer, AVFormatContext *raw, const AV
     int64_t first = time_round(range->source_start, samples);
     int64_t output_first = time_round(range->output_start, samples);
     int64_t output_end = time_round(range->output_end, samples);
-    unsigned destination = output_index(input_track->index, timecode_index);
+    unsigned destination = output_index(writer, input_track->index, timecode_index);
     if (range->whole_file) {
         int64_t shift = time_round(range->shift, samples);
         int64_t track_end = edits[count - 1].presentation_end;
@@ -1291,7 +1368,7 @@ static int write_range(Writer *writer, AVFormatContext *input, unsigned video_in
     AVPacket *packet = writer->packet;
     int written_video = 0;
     int result;
-    unsigned remaining = input->nb_streams - (timecode_index >= 0);
+    unsigned remaining = input->nb_streams - (timecode_index >= 0) - writer->audio_only;
     int mov_video_timing = av_match_name("mov", input->iformat->name)
         && (is_mov(writer->output->oformat) || is_matroska(writer->output->oformat));
     MPCutTime progress_shift = time_add(range->output_start, range->source_start, -1);
@@ -1313,7 +1390,7 @@ static int write_range(Writer *writer, AVFormatContext *input, unsigned video_in
     for (unsigned index = 0; writer->aac_edits && index < input->nb_streams; index++) {
         const AVCodecParameters *codec = input->streams[index]->codecpar;
         if (codec->codec_id == AV_CODEC_ID_AAC && !range->whole_file && writer->range_tracks[index] != 2) {
-            result = mpcut_aac_begin(writer->aac_edits, output_index(index, timecode_index), codec->sample_rate, range->source_start,
+            result = mpcut_aac_begin(writer->aac_edits, output_index(writer, index, timecode_index), codec->sample_rate, range->source_start,
                                     range->output_start, range->output_end, writer->error, writer->error_capacity);
             if (result) {
                 return result;
@@ -1326,7 +1403,7 @@ static int write_range(Writer *writer, AVFormatContext *input, unsigned video_in
             || (unsigned)packet->stream_index >= writer->range_track_count) {
             return fail(writer, "Track layout changed while reading %s", input->url);
         }
-        if (packet->stream_index == timecode_index || writer->range_tracks[packet->stream_index] == 2) {
+        if ((writer->audio_only && (unsigned)packet->stream_index == video_index) || packet->stream_index == timecode_index || writer->range_tracks[packet->stream_index] == 2) {
             result = progress_at(writer, writer->fraction);
             if (result) {
                 return result;
@@ -1337,10 +1414,10 @@ static int write_range(Writer *writer, AVFormatContext *input, unsigned video_in
         unsigned input_index = packet->stream_index;
         const AVStream *input_track = input->streams[input_index];
         int video = input_index == video_index;
-        packet->stream_index = output_index(input_index, timecode_index);
+        packet->stream_index = output_index(writer, input_index, timecode_index);
         int64_t source_pts = packet->pts;
         double fraction = writer->fraction;
-        if (video && source_pts != AV_NOPTS_VALUE) {
+        if ((video || writer->audio_only) && source_pts != AV_NOPTS_VALUE) {
             MPCutTime pts = time_ticks(source_pts, input_track->time_base);
             MPCutTime mapped = time_add(pts, progress_shift, 1);
             if (mapped.denominator) {
@@ -1408,7 +1485,7 @@ static int write_range(Writer *writer, AVFormatContext *input, unsigned video_in
     }
     if (pending_patches(writer))
         return fail(writer, "The source ended before every Smart Trim edge picture was written");
-    if (!written_video) {
+    if (!writer->audio_only && !written_video) {
         return fail(writer, "No video samples in the selected range of %s", input->url);
     }
     for (unsigned index = 0; writer->opus_trim && index < input->nb_streams; index++) {
@@ -1420,7 +1497,7 @@ static int write_range(Writer *writer, AVFormatContext *input, unsigned video_in
     for (unsigned index = 0; writer->aac_edits && index < input->nb_streams; index++) {
         if (input->streams[index]->codecpar->codec_id == AV_CODEC_ID_AAC && !range->whole_file
             && writer->range_tracks[index] != 2) {
-            result = mpcut_aac_end(writer->aac_edits, output_index(index, timecode_index),
+            result = mpcut_aac_end(writer->aac_edits, output_index(writer, index, timecode_index),
                                   writer->error, writer->error_capacity);
             if (result) {
                 return result;
@@ -1435,15 +1512,15 @@ static int validate_layout(Writer *writer, const AVFormatContext *input, int tim
     if (has_timecode != writer->has_timecode) {
         return fail(writer, "Timecode track presence changed in %s", input->url);
     }
-    if (input->nb_streams - has_timecode != writer->output->nb_streams) {
+    if (input->nb_streams - has_timecode - writer->audio_only != writer->output->nb_streams) {
         return fail(writer, "Track count changed in %s", input->url);
     }
 
     for (unsigned index = 0; index < input->nb_streams; index++) {
-        if ((int)index == timecode_index) {
+        if ((int)index == timecode_index || (writer->audio_only && index == writer->video_index)) {
             continue;
         }
-        const AVCodecParameters *destination = writer->output->streams[output_index(index, timecode_index)]->codecpar;
+        const AVCodecParameters *destination = writer->output->streams[output_index(writer, index, timecode_index)]->codecpar;
         const AVCodecParameters *source = input->streams[index]->codecpar;
         if (source->codec_type != destination->codec_type || source->codec_id != destination->codec_id) {
             return fail(writer, "Track %u has a different codec in %s", index, input->url);
@@ -1452,7 +1529,7 @@ static int validate_layout(Writer *writer, const AVFormatContext *input, int tim
     return 0;
 }
 
-int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_path,
+int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_path, int audio_only,
                 MPCutProgress progress, void *context, char *error, size_t error_capacity) {
     Writer writer = {
         .output_path = output_path,
@@ -1461,6 +1538,7 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
         .error = error,
         .error_capacity = error_capacity
     };
+    writer.audio_only = audio_only != 0;
     AVFormatContext *input = NULL;
     int result;
 
@@ -1527,12 +1605,13 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
         }
         unsigned video_index = 0;
         MPCutTime origin = {0, 0};
-        result = video_origin(&writer, &input, &video_index, &origin);
+        result = video_origin(&writer, &input, &video_index, segment->source_origin, &origin);
         if (result) {
             goto cleanup;
         }
 
         Range range = {
+            .matroska_input = av_match_name("matroska", input->iformat->name),
             .source_start = time_add(origin, segment->start, 1),
             .source_end = time_add(origin, segment->end, 1),
             .last_video_frame = time_add(origin, segment->last_video_frame, 1),
@@ -1594,6 +1673,9 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
         if (result) {
             goto cleanup;
         }
+        writer.video_index = video_index;
+        if (writer.audio_only)
+            input->streams[video_index]->discard = AVDISCARD_ALL;
         result = index ? validate_layout(&writer, input, timecode_index)
                        : configure_output(&writer, input, range.whole_file, timecode_index, &timecode, initial_timecode, segment);
         if (result) {
@@ -1610,7 +1692,7 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             goto cleanup;
         }
 
-        if (writer.video_dts_used != writer.video_dts_count) {
+        if (!writer.audio_only && writer.video_dts_used != writer.video_dts_count) {
             result = fail(&writer, "Fewer video samples than indexed in the Smart Trim edit");
             goto cleanup;
         }

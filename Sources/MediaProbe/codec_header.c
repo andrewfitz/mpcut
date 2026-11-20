@@ -89,27 +89,42 @@ static void avc_scaling_lists(BitReader *bits, unsigned count)
 
 static void read_vui_color(BitReader *bits, AVCodecParameters *params)
 {
+    // read_bits returns 0 past the end, and 0 is a valid color enum. Commit only a complete prefix.
+    int range = AVCOL_RANGE_UNSPECIFIED;
+    unsigned primaries = AVCOL_PRI_UNSPECIFIED, transfer = AVCOL_TRC_UNSPECIFIED, matrix = AVCOL_SPC_UNSPECIFIED;
     if (read_bits(bits, 1) && read_bits(bits, 8) == 255)
         read_bits(bits, 32);
     if (read_bits(bits, 1))
         read_bits(bits, 1);
-    if (!read_bits(bits, 1))
+    if (read_bits(bits, 1)) {
+        read_bits(bits, 3);
+        range = read_bits(bits, 1) ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+        if (read_bits(bits, 1)) {
+            primaries = read_bits(bits, 8);
+            transfer = read_bits(bits, 8);
+            matrix = read_bits(bits, 8);
+        }
+    }
+    unsigned top = 0; // Inferred as 0 when chroma_loc_info_present_flag is 0.
+    if (read_bits(bits, 1)) {
+        top = ue(bits);
+        ue(bits); // chroma_sample_loc_type_bottom_field
+    }
+    if (bits->invalid)
         return;
-    read_bits(bits, 3);
-    unsigned range = read_bits(bits, 1) ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
-    if (params->color_range == AVCOL_RANGE_UNSPECIFIED)
+    if (range != AVCOL_RANGE_UNSPECIFIED && params->color_range == AVCOL_RANGE_UNSPECIFIED)
         params->color_range = range;
-    if (!read_bits(bits, 1))
-        return;
-    unsigned primaries = read_bits(bits, 8);
-    unsigned transfer = read_bits(bits, 8);
-    unsigned matrix = read_bits(bits, 8);
-    if (params->color_primaries == AVCOL_PRI_UNSPECIFIED && av_color_primaries_name(primaries))
+    if (params->color_primaries == AVCOL_PRI_UNSPECIFIED && primaries != AVCOL_PRI_UNSPECIFIED &&
+        av_color_primaries_name(primaries))
         params->color_primaries = primaries;
-    if (params->color_trc == AVCOL_TRC_UNSPECIFIED && av_color_transfer_name(transfer))
+    if (params->color_trc == AVCOL_TRC_UNSPECIFIED && transfer != AVCOL_TRC_UNSPECIFIED &&
+        av_color_transfer_name(transfer))
         params->color_trc = transfer;
-    if (params->color_space == AVCOL_SPC_UNSPECIFIED && av_color_space_name(matrix))
+    if (params->color_space == AVCOL_SPC_UNSPECIFIED && matrix != AVCOL_SPC_UNSPECIFIED &&
+        av_color_space_name(matrix))
         params->color_space = matrix;
+    if (top <= 5 && params->chroma_location == AVCHROMA_LOC_UNSPECIFIED)
+        params->chroma_location = (enum AVChromaLocation)(top + 1);
 }
 
 static size_t unescape_rbsp(uint8_t *rbsp, const uint8_t *data, size_t length)
@@ -127,7 +142,7 @@ static size_t unescape_rbsp(uint8_t *rbsp, const uint8_t *data, size_t length)
     return size;
 }
 
-static bool read_avc_sps(AVCodecParameters *params)
+static bool read_avc_sps(AVCodecParameters *params, bool *may_interlace)
 {
     if (params->extradata_size < 9 || params->extradata[0] != 1)
         return false;
@@ -178,7 +193,8 @@ static bool read_avc_sps(AVCodecParameters *params)
     read_bits(&bits, 1); // gaps_in_frame_num_value_allowed_flag
     ue(&bits); // pic_width_in_mbs_minus1
     ue(&bits); // pic_height_in_map_units_minus1
-    if (!read_bits(&bits, 1)) // frame_mbs_only_flag
+    bool frame_only = read_bits(&bits, 1);
+    if (!frame_only)
         read_bits(&bits, 1);
     read_bits(&bits, 1); // direct_8x8_inference_flag
     if (read_bits(&bits, 1)) {
@@ -191,6 +207,9 @@ static bool read_avc_sps(AVCodecParameters *params)
         return false;
     if (params->color_range == AVCOL_RANGE_UNSPECIFIED)
         params->color_range = AVCOL_RANGE_MPEG;
+    *may_interlace = !frame_only;
+    if (frame_only && params->field_order == AV_FIELD_UNKNOWN)
+        params->field_order = AV_FIELD_PROGRESSIVE;
     params->profile = profile;
     if (profile == 66 && (constraints & 0x40))
         params->profile |= AV_PROFILE_H264_CONSTRAINED;
@@ -279,7 +298,7 @@ static bool hevc_reference_sets(BitReader *bits, unsigned poc_bits)
     return !bits->invalid;
 }
 
-static bool hevc_vui(const uint8_t *sps, unsigned length, AVCodecParameters *params)
+static bool hevc_vui(const uint8_t *sps, unsigned length, AVCodecParameters *params, bool *may_interlace)
 {
     uint8_t rbsp[4096];
     if (length < 3 || length > sizeof(rbsp) || (sps[0] & 1) || (sps[1] & 0xf8))
@@ -322,12 +341,16 @@ static bool hevc_vui(const uint8_t *sps, unsigned length, AVCodecParameters *par
     if (!hevc_reference_sets(&bits, poc_bits))
         return false;
     read_bits(&bits, 2); // temporal_mvp_enabled_flag and strong_intra_smoothing_enabled_flag
-    if (read_bits(&bits, 1))
+    if (read_bits(&bits, 1)) {
         read_vui_color(&bits, params);
+        read_bits(&bits, 1); // neutral_chroma_indication_flag
+        if (read_bits(&bits, 1)) // field_seq_flag
+            *may_interlace = true;
+    }
     return !bits.invalid;
 }
 
-static void read_hevc_sps_color(AVCodecParameters *params)
+static void read_hevc_sps_color(AVCodecParameters *params, bool *may_interlace, int *multilayer)
 {
     const uint8_t *bytes = params->extradata;
     const uint8_t *sps = NULL;
@@ -335,6 +358,7 @@ static void read_hevc_sps_color(AVCodecParameters *params)
     size_t size = params->extradata_size;
     if (size < 23 || bytes[0] != 1)
         return;
+    *may_interlace = !!(bytes[6] & 0x40); // general_interlaced_source_flag in hvcC
     size_t cursor = 23;
     for (unsigned array = 0; array < bytes[22]; array++) {
         if (size - cursor < 3)
@@ -349,6 +373,8 @@ static void read_hevc_sps_color(AVCodecParameters *params)
             cursor += 2;
             if (length > size - cursor)
                 return;
+            if (mp_hevc_multilayer_unit(bytes + cursor, length))
+                *multilayer = 1;
             if (type == 33) {
                 if (sps)
                     return;
@@ -358,7 +384,7 @@ static void read_hevc_sps_color(AVCodecParameters *params)
             cursor += length;
         }
     }
-    if (sps && hevc_vui(sps, sps_length, params) && params->color_range == AVCOL_RANGE_UNSPECIFIED)
+    if (sps && hevc_vui(sps, sps_length, params, may_interlace) && params->color_range == AVCOL_RANGE_UNSPECIFIED)
         params->color_range = AVCOL_RANGE_MPEG;
 }
 
@@ -423,6 +449,10 @@ static bool read_with_parser(AVCodecParameters *params, const AVPacket *packet)
                                       packet->pts, packet->dts, packet->pos);
         if (status >= 0 && parser->format != AV_PIX_FMT_NONE) {
             params->format = parser->format;
+            if (params->field_order == AV_FIELD_UNKNOWN)
+                params->field_order = parser->field_order;
+            if (params->chroma_location == AVCHROMA_LOC_UNSPECIFIED)
+                params->chroma_location = context->chroma_sample_location;
             if (!params->width)
                 params->width = parser->width;
             if (!params->height)
@@ -451,15 +481,19 @@ bool mp_has_header_probe(enum AVCodecID codec)
            codec == AV_CODEC_ID_VP9 || codec == AV_CODEC_ID_AV1;
 }
 
-bool mp_read_video_header(AVCodecParameters *params, const AVPacket *packet)
+bool mp_read_video_header(AVCodecParameters *params, const AVPacket *packet, bool *may_interlace,
+                          int *multilayer)
 {
     switch (params->codec_id) {
     case AV_CODEC_ID_H264:
-        if (read_avc_sps(params))
+        if (read_avc_sps(params, may_interlace)) {
+            if (*may_interlace && params->field_order == AV_FIELD_UNKNOWN)
+                read_with_parser(params, packet);
             return true;
+        }
         return read_with_parser(params, packet);
     case AV_CODEC_ID_HEVC:
-        read_hevc_sps_color(params);
+        read_hevc_sps_color(params, may_interlace, multilayer);
         return read_with_parser(params, packet);
     case AV_CODEC_ID_AV1:
         return read_with_parser(params, packet);

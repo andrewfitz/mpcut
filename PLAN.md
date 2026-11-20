@@ -2,6 +2,8 @@
 
 A single-session, Apple Silicon–only utility for joining and trimming matching video clips. Drop files, arrange them on one timeline, check the cuts, and export one movie. The window holds the edit in memory. Closing it ends the session.
 
+The follow-up proposal covers frame-level handles, optional keyframe snapping, and three export modes. [Frame editing and export modes](docs/EXPORT-MODES.md)
+
 ## Release scope
 
 Ship two native arm64 entry points, a Mac app and a headless CLI. Each produces one movie from an ordered sequence of compatible source ranges. Editing is nondestructive. The app keeps the timeline in memory and writes only the exported movie.

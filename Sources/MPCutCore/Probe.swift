@@ -5,6 +5,7 @@ import PacketWriter
 
 public struct StreamInfo: Encodable, Sendable {
     public let index: Int
+    let trackID: Int32
     public let kind: String
     public let codec: String
     public let codecTag: String
@@ -14,9 +15,11 @@ public struct StreamInfo: Encodable, Sendable {
     public let displayWidth: Int
     public let displayHeight: Int
     public let rotation: Int
+    let rotationOnly: Bool
     public let bitDepth: Int
     public let pixelFormat: String
     public let alphaBits: Int
+    public let hasAdditionalVideoLayers: Bool
     public var hasAlpha: Bool { alphaBits > 0 }
     public let frameRate: RationalTime
     public let sampleAspectRatio: RationalTime
@@ -36,17 +39,20 @@ public struct StreamInfo: Encodable, Sendable {
     public let colorPrimaries: String
     public let colorTransfer: String
     public let colorMatrix: String
+    public let fieldOrder: String
+    public let chromaLocation: String
     public let colorRange: String
     public let configuration: Data
     public let codecMetadata: Data
     public let multipleDescriptions: Bool
     let complexPicture: Bool
+    let reconstructedDTS: Bool
 
     enum CodingKeys: String, CodingKey {
         case index, kind, codec, codecTag, profile, width, height, displayWidth, displayHeight
-        case rotation, bitDepth, pixelFormat, alphaBits, frameRate, sampleAspectRatio, timeBase
+        case rotation, bitDepth, pixelFormat, alphaBits, hasAdditionalVideoLayers, frameRate, sampleAspectRatio, timeBase
         case start, duration, sampleRate, channels, channelLayout, isPCM, initialPadding, trailingPadding
-        case seekPreroll, language, disposition, colorPrimaries, colorTransfer, colorMatrix, colorRange
+        case seekPreroll, language, disposition, colorPrimaries, colorTransfer, colorMatrix, colorRange, fieldOrder, chromaLocation
     }
 }
 
@@ -84,6 +90,7 @@ public struct AudioIndex: Encodable, Sendable {
     public let hasPriming: Bool
     public let pcmContinuity: Bool
     let presentationEdits: [AACPresentationEdit]
+    var opusWindow: OpusTrimWindow? = nil
 
     enum CodingKeys: String, CodingKey {
         case start, end, hasPriming
@@ -106,6 +113,7 @@ public struct MediaInfo: Encodable, Sendable {
     public let frames: [FrameInfo]
     public let audio: [AudioIndex]
     public let copyIssue: String?
+    public let timelineIssue: String?
     public let sourceStartSafe: Bool
     let identity: SourceIdentity
     private let videoIndex: Int
@@ -114,7 +122,7 @@ public struct MediaInfo: Encodable, Sendable {
 
     init(url: URL, format: String, duration: RationalTime, origin: RationalTime, streams: [StreamInfo],
          frames: [FrameInfo], audio: [AudioIndex], copyIssue: String?, sourceStartSafe: Bool,
-         identity: SourceIdentity, videoIndex: Int) {
+         identity: SourceIdentity, videoIndex: Int, timelineIssue: String? = nil) {
         self.url = url
         self.format = format
         self.duration = duration
@@ -123,13 +131,14 @@ public struct MediaInfo: Encodable, Sendable {
         self.frames = frames
         self.audio = audio
         self.copyIssue = copyIssue
+        self.timelineIssue = timelineIssue
         self.sourceStartSafe = sourceStartSafe
         self.identity = identity
         self.videoIndex = videoIndex
     }
 
     enum CodingKeys: String, CodingKey {
-        case url, format, duration, origin, streams, frames, audio, copyIssue, sourceStartSafe
+        case url, format, duration, origin, streams, frames, audio, copyIssue, sourceStartSafe, timelineIssue
     }
 }
 
@@ -139,8 +148,6 @@ struct SourceIdentity: Equatable, Sendable {
     let size: Int64
     let modifiedSeconds: Int
     let modifiedNanoseconds: Int
-    let changedSeconds: Int
-    let changedNanoseconds: Int
 
     init(_ url: URL) throws {
         var info = stat()
@@ -156,14 +163,19 @@ struct SourceIdentity: Equatable, Sendable {
         size = info.st_size
         modifiedSeconds = info.st_mtimespec.tv_sec
         modifiedNanoseconds = info.st_mtimespec.tv_nsec
-        changedSeconds = info.st_ctimespec.tv_sec
-        changedNanoseconds = info.st_ctimespec.tv_nsec
+        // ctime also changes for metadata such as tags, permissions and
+        // file-provider state. Those updates leave the media bytes intact.
     }
 }
 
 enum Probe {
-    static func read(_ url: URL, keyframes: Bool = true, cancelled: (() -> Bool)? = nil) throws -> MediaInfo {
+    static func read(_ url: URL, keyframes: Bool = true, conversion: Bool = false, previewOnly: Bool = false,
+                     expectedIdentity: SourceIdentity? = nil,
+                     cancelled: (() -> Bool)? = nil) throws -> MediaInfo {
         let before = try SourceIdentity(url)
+        if let expectedIdentity, expectedIdentity != before {
+            throw CutError(code: "source_changed", message: "The source changed while opening the clip.")
+        }
         var error = [CChar](repeating: 0, count: 256)
         let callback: MPProbeCancelled? = cancelled == nil ? nil : { context in
             guard let context else { return 0 }
@@ -173,7 +185,8 @@ enum Probe {
         let control = cancelled.map(ProbeCancellation.init)
         let pointer = withExtendedLifetime(control) {
             url.withUnsafeFileSystemRepresentation { path in
-                mp_probe_read(path, callback, control.map { Unmanaged.passUnretained($0).toOpaque() },
+                mp_probe_read(path, conversion ? 1 : 0, previewOnly ? 1 : 0, callback,
+                              control.map { Unmanaged.passUnretained($0).toOpaque() },
                               &error, error.count)
             }
         }
@@ -183,7 +196,7 @@ enum Probe {
         }
         defer { mp_probe_free(pointer) }
         let media = try makeMedia(pointer.pointee, url: url, identity: before,
-                                  keyframes: keyframes, cancelled: cancelled)
+                                  keyframes: keyframes, previewOnly: previewOnly, cancelled: cancelled)
         guard try SourceIdentity(url) == before else {
             throw CutError(code: "source_changed", message: "The source changed during inspection.")
         }
@@ -203,7 +216,7 @@ private final class ProbeCancellation {
 }
 
 private extension Probe {
-    static func makeMedia(_ native: MPProbeResult, url: URL, identity: SourceIdentity, keyframes: Bool,
+    static func makeMedia(_ native: MPProbeResult, url: URL, identity: SourceIdentity, keyframes: Bool, previewOnly: Bool,
                           cancelled: (() -> Bool)?) throws -> MediaInfo {
         let storage = UnsafeBufferPointer(start: native.streams, count: Int(native.stream_count))
         let videoIndex = Int(native.video_index)
@@ -213,12 +226,13 @@ private extension Probe {
         var frames: [FrameInfo] = []
         var streams: [StreamInfo] = []
         var audio: [AudioIndex] = []
+        let timelineIssue = fixedString(native.timeline_issue)
         var copyIssue: String? = fixedString(native.issue)
         if copyIssue?.isEmpty == true { copyIssue = nil }
         let format = fixedString(native.format)
         var aacSource: OpaquePointer?
         defer { mpcut_aac_source_free(aacSource) }
-        if format.split(separator: ",").contains("mov"),
+        if !previewOnly, format.split(separator: ",").contains("mov"),
            storage.contains(where: { string($0.codec) == "aac" }) {
             var error = [CChar](repeating: 0, count: 256)
             let capacity = error.count
@@ -250,7 +264,7 @@ private extension Probe {
             }
             let stream = describe(value, index: index, base: base, start: start, duration: streamDuration)
             streams.append(stream)
-            if stream.multipleDescriptions, copyIssue == nil,
+            if !previewOnly, stream.multipleDescriptions, copyIssue == nil,
                !matchingMovieDescriptions(url: url, trackID: value.track_id) {
                 copyIssue = "The video sample descriptions have different picture formats."
             }
@@ -258,14 +272,14 @@ private extension Probe {
                 frames.reserveCapacity(packets.count)
                 for (position, packet) in packets.enumerated() {
                     if position.isMultiple(of: 1_024) { try checkCancellation(cancelled) }
+                    let time = try relativeTime(packet.pts, base: base, origin: origin)
                     frames.append(FrameInfo(
-                        dts: try relativeDTS(packet, base: base, origin: origin),
-                        time: try timestamp(packet.pts, base: base).subtracting(origin),
-                        duration: try timestamp(packet.duration, base: base),
+                        dts: packet.dts == packet.pts ? time : try relativeDTS(packet, base: base, origin: origin),
+                        time: time, duration: try timestamp(packet.duration, base: base),
                         keyframe: packet.key != 0, canStart: packet.start != 0, canEnd: packet.end != 0,
                         byteCount: packet.byte_count))
                 }
-            } else if stream.kind == "audio" {
+            } else if !previewOnly, stream.kind == "audio" {
                 if packets.isEmpty || stream.sampleRate <= 0 {
                     copyIssue = copyIssue ?? "Audio track \(index) has no usable presentation clock."
                 }
@@ -283,13 +297,17 @@ private extension Probe {
                     } else if value.deferred_aac_issue == 2 {
                         copyIssue = copyIssue ?? "AAC track \(index) has a packet with missing duration."
                     }
-                    audio.append(try buildAudio(stream, packets: packets, origin: origin, cancelled: cancelled))
+                    var index = try buildAudio(stream, packets: packets, origin: origin, cancelled: cancelled)
+                    if keyframes, stream.codec == "opus", format.split(separator: ",").contains("matroska") {
+                        index.opusWindow = try opusTrimWindow(index, origin: origin) { try checkCancellation(cancelled) }
+                    }
+                    audio.append(index)
                 }
             }
         }
         return MediaInfo(url: url, format: format, duration: duration,
                          origin: origin, streams: streams, frames: frames, audio: audio, copyIssue: copyIssue,
-                         sourceStartSafe: native.source_start_safe != 0, identity: identity, videoIndex: videoIndex)
+                         sourceStartSafe: native.source_start_safe != 0, identity: identity, videoIndex: videoIndex, timelineIssue: timelineIssue.isEmpty ? nil : timelineIssue)
     }
 
     static func makeAACEdits(_ source: OpaquePointer?, trackID: Int32, stream: StreamInfo) throws -> [AACPresentationEdit]? {
@@ -327,7 +345,7 @@ private extension Probe {
         if !stream.isPCM { indexed.reserveCapacity(packets.count) }
         for (index, packet) in packets.enumerated() {
             if index.isMultiple(of: 1_024) { try checkCancellation(cancelled) }
-            let rawStart = try timestamp(packet.pts, base: stream.timeBase).subtracting(origin)
+            let rawStart = try relativeTime(packet.pts, base: stream.timeBase, origin: origin)
             let duration = try timestamp(packet.duration, base: stream.timeBase)
             let rawEnd = try rawStart.adding(duration)
             if stream.isPCM {
@@ -354,20 +372,22 @@ private extension Probe {
                 }
             }
             hasPriming = hasPriming || skip > 0 || discard > 0
-            let audibleStart = try rawStart.adding(RationalTime(numerator: Int64(skip), denominator: sampleRate))
+            let audibleStart = skip == 0 ? rawStart : try rawStart.adding(RationalTime(numerator: Int64(skip), denominator: sampleRate))
             let decodedEnd = decodedSamples > 0
                 ? try rawStart.adding(RationalTime(numerator: Int64(decodedSamples), denominator: sampleRate))
                 : rawEnd
             // A demuxer can report an already shortened final packet together
             // with the padding that must be discarded from its coded samples.
-            let audibleEnd = min(rawEnd, try decodedEnd.subtracting(
-                RationalTime(numerator: Int64(discard), denominator: sampleRate)))
+            let trimmedEnd = discard == 0 ? decodedEnd : try decodedEnd.subtracting(
+                RationalTime(numerator: Int64(discard), denominator: sampleRate))
+            let audibleEnd = min(rawEnd, trimmedEnd)
             if audibleStart < audibleEnd {
                 start = min(start ?? audibleStart, audibleStart)
                 end = max(end ?? audibleEnd, audibleEnd)
             }
             if !stream.isPCM {
-                indexed.append(AudioPacket(time: rawStart, dts: try relativeDTS(packet, base: stream.timeBase, origin: origin),
+                let dts = packet.dts == packet.pts ? rawStart : try relativeDTS(packet, base: stream.timeBase, origin: origin)
+                indexed.append(AudioPacket(time: rawStart, dts: dts,
                                            duration: duration, skipSamples: skip, discardSamples: discard,
                                            decodedSamples: decodedSamples))
             }
@@ -380,10 +400,13 @@ private extension Probe {
     static func describe(_ value: MPProbeStream, index: Int, base: RationalTime,
                          start: RationalTime, duration: RationalTime) -> StreamInfo {
         StreamInfo(
-            index: index, kind: string(value.kind), codec: string(value.codec), codecTag: fixedString(value.codec_tag),
+            index: index, trackID: value.track_id, kind: string(value.kind), codec: string(value.codec),
+            codecTag: fixedString(value.codec_tag),
             profile: Int(value.profile), width: Int(value.width), height: Int(value.height),
             displayWidth: Int(value.display_width), displayHeight: Int(value.display_height), rotation: Int(value.rotation),
+            rotationOnly: value.rotation_only != 0,
             bitDepth: Int(value.bit_depth), pixelFormat: string(value.pixel_format), alphaBits: Int(value.alpha_bits),
+            hasAdditionalVideoLayers: value.multilayer != 0,
             frameRate: ratio(value.rate_num, value.rate_den), sampleAspectRatio: ratio(value.sar_num, value.sar_den),
             timeBase: base, start: start, hasDeclaredStart: value.start != .min,
             duration: duration, sampleRate: Int(value.sample_rate),
@@ -392,13 +415,31 @@ private extension Probe {
             disposition: Int(value.disposition), isPCM: value.pcm != 0,
             initialPadding: Int(value.initial_padding), trailingPadding: Int(value.trailing_padding),
             seekPreroll: Int(value.seek_preroll), colorPrimaries: string(value.primaries),
-            colorTransfer: string(value.transfer), colorMatrix: string(value.matrix), colorRange: string(value.range),
+            colorTransfer: string(value.transfer), colorMatrix: string(value.matrix),
+            fieldOrder: fieldOrder(value.field_order), chromaLocation: string(value.chroma_location),
+            colorRange: string(value.range),
             configuration: data(value.config, size: value.config_size), codecMetadata: data(value.metadata, size: value.metadata_size),
-            multipleDescriptions: value.multiple_descriptions != 0, complexPicture: value.complex_picture != 0)
+            multipleDescriptions: value.multiple_descriptions != 0, complexPicture: value.complex_picture != 0, reconstructedDTS: value.reconstructed_dts != 0)
+    }
+
+    static func fieldOrder(_ value: Int32) -> String {
+        switch value {
+        case 1: return "progressive"
+        case 2: return "tt"
+        case 3: return "bb"
+        case 4: return "tb"
+        case 5: return "bt"
+        default: return "unknown"
+        }
+    }
+
+    static func relativeTime(_ ticks: Int64, base: RationalTime, origin: RationalTime) throws -> RationalTime {
+        let time = try timestamp(ticks, base: base)
+        return origin == .zero ? time : try time.subtracting(origin)
     }
 
     static func relativeDTS(_ packet: MPProbePacket, base: RationalTime, origin: RationalTime) throws -> RationalTime? {
-        packet.dts == .min ? nil : try timestamp(packet.dts, base: base).subtracting(origin)
+        packet.dts == .min ? nil : try relativeTime(packet.dts, base: base, origin: origin)
     }
 
     static func ratio(_ numerator: Int32, _ denominator: Int32) -> RationalTime {
@@ -410,6 +451,7 @@ private extension Probe {
 
     static func timestamp(_ ticks: Int64, base: RationalTime) throws -> RationalTime {
         guard ticks != .min else { return .zero }
+        if base.numerator == 1 { return RationalTime(numerator: ticks, denominator: base.denominator) }
         return try RationalTime(numerator: ticks).multiplied(by: base)
     }
 

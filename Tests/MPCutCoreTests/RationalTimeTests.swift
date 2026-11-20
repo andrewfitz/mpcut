@@ -3,11 +3,18 @@ import XCTest
 
 final class RationalTimeTests: XCTestCase {
     func testMalformedTimestampsReturnStructuredErrors() {
-        for input in ["", "+", "-", ".", "1.", "00:00:", "00:60:00", "1/0", "9223372036854775808"] {
+        for input in ["", "+", "-", ".", "1.", "00:00:", "00:60:00", "1:60", "1/0", "9223372036854775808"] {
             XCTAssertThrowsError(try RationalTime(parsing: input), input) { error in
                 XCTAssertEqual((error as? CutError)?.code, "invalid_time")
             }
         }
+    }
+
+    func testMinuteClockAcceptsElapsedMinutesAndFractionalSeconds() throws {
+        XCTAssertEqual(try RationalTime(parsing: "23:01"), RationalTime(numerator: 1381))
+        XCTAssertEqual(try RationalTime(parsing: "4:03"), RationalTime(numerator: 243))
+        XCTAssertEqual(try RationalTime(parsing: "62:03.25"), RationalTime(numerator: 14893, denominator: 4))
+        XCTAssertEqual(try RationalTime(parsing: "62:03.25"), try RationalTime(parsing: "01:02:03.25"))
     }
 
     func testParserReducesBeforeCheckingNumeratorRange() throws {

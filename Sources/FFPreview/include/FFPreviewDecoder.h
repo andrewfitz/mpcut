@@ -24,6 +24,9 @@ struct AVStream;
 const struct AVStream *mp_preview_prepare_edge(MPPreviewDecoder *preview);
 void mp_preview_coded_size(const MPPreviewDecoder *preview, int *width, int *height);
 void mp_preview_close(MPPreviewDecoder *preview);
+/* Select picture-only scrubbing or A/V playback before the next seek. */
+void mp_preview_enable_audio(MPPreviewDecoder *preview, bool enabled);
+void mp_preview_select_audio_only(MPPreviewDecoder *preview);
 bool mp_preview_has_audio(const MPPreviewDecoder *preview);
 bool mp_preview_has_unavailable_audio(const MPPreviewDecoder *preview);
 bool mp_preview_seek(MPPreviewDecoder *preview, double seconds);
