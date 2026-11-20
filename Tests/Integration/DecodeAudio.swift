@@ -8,11 +8,15 @@ struct DecodeAudio {
             throw CocoaError(.fileReadInvalidFileName)
         }
         let url = URL(fileURLWithPath: CommandLine.arguments[1])
-        let asset = AVURLAsset(url: url)
+        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
             throw CocoaError(.fileReadCorruptFile)
         }
         let reader = try AVAssetReader(asset: asset)
+        // Explicit track extent includes leading empty edits and drains the final
+        // AAC buffer even when the picture ends earlier than the audio.
+        let span = try await track.load(.timeRange)
+        reader.timeRange = CMTimeRange(start: .zero, end: span.end)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVLinearPCMBitDepthKey: 16,

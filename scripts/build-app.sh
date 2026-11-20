@@ -67,8 +67,12 @@ install -m 644 "$root/packaging/FFmpeg-Notice.txt" "$notices/NOTICE.txt"
 install -m 644 "$root/packaging/ffmpeg-require-hardware.patch" "$notices/changes.diff"
 install -m 644 "$root/scripts/build-ffmpeg.sh" "$notices/build-ffmpeg.sh"
 source_name=$(cat "$ffmpeg/install/ffmpeg-source-name")
+svt_name=$(cat "$ffmpeg/install/svt-source-name")
 install -m 644 "$ffmpeg/$source_name.tar.xz" "$notices/"
 install -m 644 "$ffmpeg/install"/{COPYING.LGPLv2.1,LICENSE.md} "$notices/"
+mkdir "$notices/SVT-AV1"
+install -m 644 "$ffmpeg/install/SVT-AV1"/{LICENSE.md,LICENSE-BSD2.md,PATENTS.md,fastfeat-LICENSE,safestringlib-LICENSE} \
+    "$ffmpeg/$svt_name.tar.bz2" "$notices/SVT-AV1/"
 
 for binary in "$contents"/Frameworks/*.dylib "$contents/Helpers/mpcut" "$contents/MacOS/MPCut"; do
     if [[ $(xcrun lipo -archs "$binary") != arm64 ]]; then

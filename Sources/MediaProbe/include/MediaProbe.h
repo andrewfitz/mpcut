@@ -5,7 +5,7 @@
 
 typedef struct {
     int64_t pts, dts, duration;
-    uint32_t skip, discard, decoded_samples;
+    uint32_t skip, discard, decoded_samples, byte_count;
     unsigned char key, start, end;
 } MPProbePacket;
 
@@ -19,7 +19,7 @@ typedef struct {
     int sample_rate, channels, pcm, initial_padding, trailing_padding, seek_preroll;
     char *language;
     int disposition;
-    int track_id, deferred_aac_issue;
+    int track_id, deferred_aac_issue, complex_picture, multiple_descriptions;
     uint8_t *config, *metadata;
     size_t config_size, metadata_size;
     MPProbePacket *packets;

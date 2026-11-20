@@ -45,6 +45,21 @@ public struct ResolvedTrack: Codable, Sendable {
     public let sourceEnd: RationalTime
     public let outputStart: RationalTime
     public let outputEnd: RationalTime
+    var opusPreSkip: Int32? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case index, kind, sourceStart, sourceEnd, outputStart, outputEnd
+    }
+}
+
+public struct EncodedEdge: Codable, Sendable {
+    public let from: RationalTime
+    public let to: RationalTime
+    public let frameCount: Int
+    public internal(set) var targetBitRate: Int64?
+    var decodeFrom: RationalTime = .zero
+
+    enum CodingKeys: String, CodingKey { case from, to, frameCount, targetBitRate }
 }
 
 public struct ResolvedSegment: Codable, Sendable {
@@ -55,9 +70,12 @@ public struct ResolvedSegment: Codable, Sendable {
     public let tracks: [ResolvedTrack]
     var lastVideoFrame: RationalTime?
     let reachesEnd: Bool
+    var multipleDescriptions = false
+    var videoDecodeTimes: [RationalTime] = []
+    public internal(set) var encodedEdges: [EncodedEdge]? = nil
 
     enum CodingKeys: String, CodingKey {
-        case file, from, to, outputStart, tracks, reachesEnd
+        case file, from, to, outputStart, tracks, reachesEnd, encodedEdges
     }
 
     public var duration: RationalTime { to - from }

@@ -10,11 +10,26 @@ typedef struct {
 } MPCutTime;
 
 typedef struct {
+    MPCutTime from;
+    MPCutTime to;
+    size_t frame_count;
+    MPCutTime decode_from;
+    int64_t target_bit_rate;
+} MPCutEdgeRange;
+
+typedef struct {
     const char *path;
     MPCutTime start;
     MPCutTime end;
     MPCutTime last_video_frame; /* Presentation time relative to source video origin. */
     int reaches_end;
+    const int32_t *opus_pre_skip; /* Per-track decoder preroll for a standalone Opus trim. */
+    size_t opus_track_count;
+    MPCutEdgeRange head_edge;
+    MPCutEdgeRange tail_edge;
+    int multiple_descriptions; /* Source MOV contains multiple video sample descriptions. */
+    const MPCutTime *video_dts; /* Optional output decode slots for Smart Trim MOV splices. */
+    size_t video_dts_count;
 } MPCutSegment;
 
 /* AAC presentation edits in their track's native sample clock. */
@@ -36,6 +51,9 @@ typedef int (*MPCutProgress)(void *context, double fraction);
 /* Checks the input tracks against the output container without creating a file. */
 int mpcut_check_mux(const char *input_path, const char *output_path,
                     char *error, size_t error_capacity);
+
+/* Write presentation end times (nanoseconds) into a staged WebM or MKV. */
+int mpcut_set_matroska_durations(const char *path, const int64_t *ends, size_t count);
 
 /* Validates an edit's timecode continuity and the first retained timecode sample. */
 int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime duration,

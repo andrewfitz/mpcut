@@ -16,8 +16,13 @@ enum MPPreviewResult {
 
 typedef bool (*MPPreviewCancelled)(void *context);
 
-MPPreviewDecoder *mp_preview_open(const char *path, MPPreviewCancelled cancelled,
+MPPreviewDecoder *mp_preview_open(const char *path, bool video_only, MPPreviewCancelled cancelled,
                                  void *context, const char **error);
+/* Before the first read, request native YUV surfaces for a Smart Trim encode.
+ * The returned stream belongs to this decoder and includes its probed configuration. */
+struct AVStream;
+const struct AVStream *mp_preview_prepare_edge(MPPreviewDecoder *preview);
+void mp_preview_coded_size(const MPPreviewDecoder *preview, int *width, int *height);
 void mp_preview_close(MPPreviewDecoder *preview);
 bool mp_preview_has_audio(const MPPreviewDecoder *preview);
 bool mp_preview_has_unavailable_audio(const MPPreviewDecoder *preview);

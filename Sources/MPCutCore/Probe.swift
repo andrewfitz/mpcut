@@ -39,6 +39,8 @@ public struct StreamInfo: Encodable, Sendable {
     public let colorRange: String
     public let configuration: Data
     public let codecMetadata: Data
+    public let multipleDescriptions: Bool
+    let complexPicture: Bool
 
     enum CodingKeys: String, CodingKey {
         case index, kind, codec, codecTag, profile, width, height, displayWidth, displayHeight
@@ -55,6 +57,9 @@ public struct FrameInfo: Encodable, Sendable {
     public let keyframe: Bool
     public let canStart: Bool
     public let canEnd: Bool
+    let byteCount: UInt32
+
+    enum CodingKeys: String, CodingKey { case dts, time, duration, keyframe, canStart, canEnd }
 }
 
 public struct AudioPacket: Sendable {
@@ -245,6 +250,10 @@ private extension Probe {
             }
             let stream = describe(value, index: index, base: base, start: start, duration: streamDuration)
             streams.append(stream)
+            if stream.multipleDescriptions, copyIssue == nil,
+               !matchingMovieDescriptions(url: url, trackID: value.track_id) {
+                copyIssue = "The video sample descriptions have different picture formats."
+            }
             if index == videoIndex, keyframes {
                 frames.reserveCapacity(packets.count)
                 for (position, packet) in packets.enumerated() {
@@ -253,7 +262,8 @@ private extension Probe {
                         dts: try relativeDTS(packet, base: base, origin: origin),
                         time: try timestamp(packet.pts, base: base).subtracting(origin),
                         duration: try timestamp(packet.duration, base: base),
-                        keyframe: packet.key != 0, canStart: packet.start != 0, canEnd: packet.end != 0))
+                        keyframe: packet.key != 0, canStart: packet.start != 0, canEnd: packet.end != 0,
+                        byteCount: packet.byte_count))
                 }
             } else if stream.kind == "audio" {
                 if packets.isEmpty || stream.sampleRate <= 0 {
@@ -383,7 +393,8 @@ private extension Probe {
             initialPadding: Int(value.initial_padding), trailingPadding: Int(value.trailing_padding),
             seekPreroll: Int(value.seek_preroll), colorPrimaries: string(value.primaries),
             colorTransfer: string(value.transfer), colorMatrix: string(value.matrix), colorRange: string(value.range),
-            configuration: data(value.config, size: value.config_size), codecMetadata: data(value.metadata, size: value.metadata_size))
+            configuration: data(value.config, size: value.config_size), codecMetadata: data(value.metadata, size: value.metadata_size),
+            multipleDescriptions: value.multiple_descriptions != 0, complexPicture: value.complex_picture != 0)
     }
 
     static func relativeDTS(_ packet: MPProbePacket, base: RationalTime, origin: RationalTime) throws -> RationalTime? {

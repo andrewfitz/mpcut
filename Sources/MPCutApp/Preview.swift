@@ -56,7 +56,8 @@ private final class HardwareFrames: @unchecked Sendable {
     private let track: AVAssetTrack
     private let origin: CMTime
     private let transform: CGAffineTransform
-    private let format: CMFormatDescription
+    private let hasMultipleDescriptions: Bool
+    private var sessionFormat: CMFormatDescription?
     private let mapping: CMTimeMapping
     private let generator: AVSampleBufferGenerator
     private var session: VTDecompressionSession?
@@ -73,8 +74,8 @@ private final class HardwareFrames: @unchecked Sendable {
             throw PreviewFailure("macOS could not open a single preview video track in \(url.lastPathComponent).")
         }
         let descriptions = track.formatDescriptions
-        guard descriptions.count == 1, let description = descriptions.first else {
-            throw PreviewFailure("macOS preview requires a single video format in \(url.lastPathComponent).")
+        guard !descriptions.isEmpty else {
+            throw PreviewFailure("The video track has no format description in \(url.lastPathComponent).")
         }
         let mapping = try nativeVideoMapping(track.segments, url: url)
         // An edit may start between pictures. AVFoundation then exposes preroll at a
@@ -83,7 +84,7 @@ private final class HardwareFrames: @unchecked Sendable {
             throw PreviewFailure("The video edit in \(url.lastPathComponent) is not aligned to an indexed picture.")
         }
         self.track = track
-        self.format = description as! CMFormatDescription
+        hasMultipleDescriptions = descriptions.count > 1
         self.mapping = mapping
         generator = AVSampleBufferGenerator(asset: asset, timebase: nil)
         origin = mapping.target.start
@@ -122,6 +123,8 @@ private final class HardwareFrames: @unchecked Sendable {
             },
             decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque()
         )
+        let format = start.copyCurrentSampleFormatDescription()
+        sessionFormat = format
         let status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault, formatDescription: format,
             decoderSpecification: specification, imageBufferAttributes: attributes,
@@ -174,7 +177,6 @@ private final class HardwareFrames: @unchecked Sendable {
             }
         }
         request = desiredTime
-        guard let session else { return nil }
         while !cancelled() {
             frameLock.lock()
             frames.removeAll { $0.time < desiredTime }
@@ -186,6 +188,17 @@ private final class HardwareFrames: @unchecked Sendable {
             }
             if let matching { return matching }
             guard let cursor else { return nil }
+            if hasMultipleDescriptions, let format = sessionFormat,
+               !CFEqual(cursor.copyCurrentSampleFormatDescription(), format) {
+                guard cursor.currentSampleSyncInfo.sampleIsFullSync.boolValue, let previous = session,
+                      VTDecompressionSessionFinishDelayedFrames(previous) == noErr,
+                      VTDecompressionSessionWaitForAsynchronousFrames(previous) == noErr else {
+                    throw PreviewFailure("The video changes format between random-access pictures.")
+                }
+                if let delayed = frameLock.withLock({ frames.first { $0.time == desiredTime } }) { return delayed }
+                try reset(at: cursor)
+            }
+            guard let session else { return nil }
             let sample = try generator.makeSampleBuffer(for: AVSampleBufferRequest(start: cursor))
             // The serial decode queue owns this session. Synchronous output avoids
             // draining the whole session after each packet.
@@ -262,6 +275,38 @@ private final class ThumbnailRequest: @unchecked Sendable {
     }
 }
 
+// The serial queue owns the decoders. Retain the successful route for successive
+// thumbnails of a source, including segments created by splitting the same clip.
+private final class ThumbnailDecoder: @unchecked Sendable {
+    let queue = DispatchQueue(label: "mpcut.preview.thumbnails", qos: .utility, autoreleaseFrequency: .workItem)
+    private lazy var context = CIContext()
+    private var sourceID: UUID?
+    private var native: HardwareFrames?
+    private var fallback = FFPreviewReader(videoOnly: true)
+
+    func image(source: UUID, url: URL, time: Double, size: CGSize, request: ThumbnailRequest) -> CGImage? {
+        guard !request.isCancelled else { return nil }
+        if sourceID != source {
+            native = try? HardwareFrames(url: url)
+            fallback = FFPreviewReader(videoOnly: true)
+            sourceID = source
+        }
+        var frame = try? native?.frame(at: time) { request.isCancelled }
+        if frame == nil && !request.isCancelled {
+            frame = try? fallback.perform(cancelled: { request.isCancelled }) {
+                try fallback.seek(url: url, to: time)
+                return try fallback.still(at: time) { request.isCancelled }
+            }
+            if frame != nil { native = nil }
+        }
+        guard let frame, !request.isCancelled else { return nil }
+        let pixels = CIImage(cvPixelBuffer: frame.buffer).transformed(by: frame.displayTransform)
+        let scale = min(size.width / pixels.extent.width, size.height / pixels.extent.height, 1)
+        let scaled = pixels.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        return context.createCGImage(scaled, from: scaled.extent)
+    }
+}
+
 @MainActor
 final class SequencePreview: ObservableObject {
     @Published private(set) var time: Double = 0
@@ -289,8 +334,7 @@ final class SequencePreview: ObservableObject {
     private var audioSeeking = false
     private var auditionPosition: (url: URL, time: Double)?
     private var frame: PreviewFrame?
-    private let thumbnails = DecodeRequests(label: "mpcut.preview.thumbnails", qos: .utility)
-    private let thumbnailContext = CIContext()
+    private var thumbnails = ThumbnailDecoder()
     private weak var surface: PreviewSurface?
 
     deinit {
@@ -321,7 +365,10 @@ final class SequencePreview: ObservableObject {
         frame = nil
         surface?.clear()
         removeAudioItem()
-        guard !ranges.isEmpty else { return }
+        guard !ranges.isEmpty else {
+            thumbnails = ThumbnailDecoder()
+            return
+        }
 
         renderTimeline(immediate: true)
         loading = Task { [weak self] in
@@ -592,31 +639,20 @@ final class SequencePreview: ObservableObject {
         }
     }
 
-    func thumbnail(url: URL, at sourceTime: Double, size: CGSize) async -> CGImage? {
+    func thumbnail(source: UUID, url: URL, at time: Double, size: CGSize) async -> CGImage? {
         guard !Task.isCancelled, size.width > 0, size.height > 0 else { return nil }
-        let context = thumbnailContext
         let request = ThumbnailRequest()
         let thumbnails = thumbnails
-        let native: CGImage? = await withTaskCancellationHandler {
+        return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 thumbnails.queue.async {
-                    let image = try? thumbnails.frame(url: url, time: sourceTime) { request.isCancelled }
-                    guard !request.isCancelled, let image else {
-                        continuation.resume(returning: nil)
-                        return
-                    }
-                    let pixels = CIImage(cvPixelBuffer: image.buffer).transformed(by: image.displayTransform)
-                    let scale = min(size.width / pixels.extent.width, size.height / pixels.extent.height, 1)
-                    let scaled = pixels.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-                    continuation.resume(returning: context.createCGImage(scaled, from: scaled.extent))
+                    let image = thumbnails.image(source: source, url: url, time: time, size: size, request: request)
+                    continuation.resume(returning: request.isCancelled ? nil : image)
                 }
             }
         } onCancel: {
             request.cancel()
         }
-        guard !Task.isCancelled else { return nil }
-        if let native { return native }
-        return await WebSequencePlayback.thumbnail(url: url, at: sourceTime, size: size)
     }
 
     fileprivate func attach(_ surface: PreviewSurface) {

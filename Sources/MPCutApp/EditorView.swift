@@ -30,6 +30,13 @@ struct EditorView: View {
                         Label("Add Clips", systemImage: "plus").labelStyle(.titleAndIcon)
                     }
                     .disabled(editor.isBusy)
+                    Toggle("Smart Trim", isOn: Binding(get: { editor.smartTrim }, set: editor.setSmartTrim))
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .disabled(!editor.canEdit || (!editor.canUseSmartTrim && !editor.smartTrim))
+                        .help(editor.canUseSmartTrim
+                            ? "Allow cuts between keyframes by encoding just the video at the cut edges."
+                            : "Smart Trim supports compatible H.264, HEVC, and AV1 footage.")
                     Button(action: editor.chooseExport) {
                         Label("Export", systemImage: "square.and.arrow.up").labelStyle(.titleAndIcon)
                     }
@@ -68,9 +75,15 @@ struct EditorView: View {
     private var transport: some View {
         HStack(spacing: 16) {
             HStack(spacing: 10) {
+                ClipTool(icon: "backward.end.fill", label: "Previous Keyframe", shortcut: "⌥←") {
+                    editor.step(-1, keyframes: true)
+                }
                 ClipTool(icon: "backward.frame", label: "Previous Frame", shortcut: "←") { editor.step(-1) }
                 PreviewPlayButton(preview: editor.preview)
                 ClipTool(icon: "forward.frame", label: "Next Frame", shortcut: "→") { editor.step(1) }
+                ClipTool(icon: "forward.end.fill", label: "Next Keyframe", shortcut: "⌥→") {
+                    editor.step(1, keyframes: true)
+                }
             }
             .disabled(!editor.canEdit)
 
@@ -102,7 +115,8 @@ struct EditorView: View {
             clips: editor.timelineClips,
             playhead: editor.playhead,
             selection: editor.selectedID,
-            markedRange: editor.markedRange,
+            markIn: editor.markIn,
+            markOut: editor.markOut,
             onSelect: editor.select,
             onSeek: editor.seek,
             onTrim: editor.trim,

@@ -90,6 +90,8 @@ static int copy_metadata(const AVCodecParameters *params, MPProbeStream *stream)
     for (size_t i = 0; i < FF_ARRAY_ELEMS(retained); i++) {
         items[i] = av_packet_side_data_get(params->coded_side_data, params->nb_coded_side_data, retained[i]);
         if (items[i]) {
+            if (retained[i] != AV_PKT_DATA_DISPLAYMATRIX)
+                stream->complex_picture = 1;
             if (items[i]->size > UINT32_MAX || SIZE_MAX - size < items[i]->size + 8)
                 return AVERROR_INVALIDDATA;
             size += items[i]->size + 8;
@@ -122,6 +124,7 @@ static int copy_metadata(const AVCodecParameters *params, MPProbeStream *stream)
 static int describe_stream(AVFormatContext *file, AVStream *input, MPProbeStream *stream)
 {
     const AVCodecParameters *params = input->codecpar;
+    stream->complex_picture = params->field_order != AV_FIELD_UNKNOWN && params->field_order != AV_FIELD_PROGRESSIVE;
     stream->track_id = input->id;
     stream->disposition = input->disposition;
     const AVDictionaryEntry *language = av_dict_get(input->metadata, "language", NULL, 0);
@@ -336,7 +339,52 @@ static bool interior_cut_codec(enum AVCodecID codec)
            codec == AV_CODEC_ID_VP8 || codec == AV_CODEC_ID_VP9 || codec == AV_CODEC_ID_AV1;
 }
 
-static int record_packet(MPProbeResult *result, const AVCodecParameters *params, const AVPacket *packet)
+/* MOV may switch avc1/hvc1 sample descriptions at an IDR. Verify the
+ * dimensions and pixel layout described by the actual bitstream, as well
+ * as the container-level presentation properties checked by the caller. */
+typedef struct {
+    int width, height, coded_width, coded_height, format, field_order;
+} MPDescriptionShape;
+
+static bool description_shape(const AVCodecParameters *params, const uint8_t *config, size_t size,
+                              const AVPacket *packet, MPDescriptionShape *shape)
+{
+    const size_t length_field = params->codec_id == AV_CODEC_ID_HEVC ? 21 : 4;
+    if (!config || size <= length_field || size > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE ||
+        config[0] != 1 || (config[length_field] & 3) != 3)
+        return false;
+    AVCodecParserContext *parser = av_parser_init(params->codec_id);
+    AVCodecContext *context = avcodec_alloc_context3(NULL);
+    bool success = false;
+    if (!parser || !context)
+        goto done;
+    context->extradata = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!context->extradata)
+        goto done;
+    memcpy(context->extradata, config, size);
+    context->extradata_size = (int)size;
+    context->codec_id = params->codec_id;
+    parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+    uint8_t *parsed = NULL;
+    int parsed_size = 0;
+    if (av_parser_parse2(parser, context, &parsed, &parsed_size, packet->data, packet->size,
+                         packet->pts, packet->dts, packet->pos) == packet->size &&
+        parsed_size == packet->size && parser->format == AV_PIX_FMT_YUV420P &&
+        parser->width == params->width && parser->height == params->height &&
+        parser->coded_width > 0 && parser->coded_height > 0 &&
+        (parser->field_order == AV_FIELD_UNKNOWN || parser->field_order == AV_FIELD_PROGRESSIVE)) {
+        *shape = (MPDescriptionShape){parser->width, parser->height, parser->coded_width, parser->coded_height,
+                                      parser->format, parser->field_order};
+        success = true;
+    }
+done:
+    av_parser_close(parser);
+    avcodec_free_context(&context);
+    return success;
+}
+
+static int record_packet(MPProbeResult *result, const AVCodecParameters *params, const AVPacket *packet,
+                         MPDescriptionShape *first_description)
 {
     MPProbeStream *stream = &result->streams[packet->stream_index];
     bool video = packet->stream_index == result->video_index;
@@ -345,8 +393,23 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
     if (packet->flags & AV_PKT_FLAG_CORRUPT)
         issue(result, "An audio or video packet is marked corrupt.");
     size_t side_size;
-    if (av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &side_size) ||
-        av_packet_get_side_data(packet, AV_PKT_DATA_PARAM_CHANGE, &side_size))
+    const uint8_t *config = av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &side_size);
+    bool can_compare = first_description && video && av_match_name("mov", result->format) &&
+        ((params->codec_id == AV_CODEC_ID_H264 && params->codec_tag == MKTAG('a', 'v', 'c', '1')) ||
+         (params->codec_id == AV_CODEC_ID_HEVC && params->codec_tag == MKTAG('h', 'v', 'c', '1')));
+    if (can_compare && !stream->count)
+        description_shape(params, params->extradata, params->extradata_size, packet, first_description);
+    if (config) {
+        MPDescriptionShape shape;
+        if (can_compare && first_description->width && independent(packet, params, false) &&
+            description_shape(params, config, side_size, packet, &shape) &&
+            !memcmp(first_description, &shape, sizeof(shape))) {
+            stream->multiple_descriptions = 1;
+        } else {
+            issue(result, "The stream changes codec configuration during the file.");
+        }
+    }
+    if (av_packet_get_side_data(packet, AV_PKT_DATA_PARAM_CHANGE, &side_size))
         issue(result, "The stream changes codec configuration during the file.");
     if (packet->pts == AV_NOPTS_VALUE) {
         issue(result, "An audio or video packet is missing its presentation timestamp.");
@@ -363,7 +426,8 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
         stream->capacity = capacity;
     }
     MPProbePacket *sample = &stream->packets[stream->count];
-    *sample = (MPProbePacket){.pts = packet->pts, .dts = packet->dts, .duration = packet->duration};
+    *sample = (MPProbePacket){.pts = packet->pts, .dts = packet->dts, .duration = packet->duration,
+                              .byte_count = packet->size};
     if (video) {
         bool first = !stream->count;
         sample->key = !!(packet->flags & AV_PKT_FLAG_KEY) || params->codec_id == AV_CODEC_ID_PRORES;
@@ -645,7 +709,7 @@ static int indexed_prores(const MPMOVIndex *index, AVFormatContext *file, MPProb
                 .duration = duration, .flags = AV_PKT_FLAG_KEY,
                 .data = video ? header : NULL, .size = video ? sizeof(header) : 0,
             };
-            status = record_packet(result, params, &packet);
+            status = record_packet(result, params, &packet, NULL);
             if (status < 0)
                 goto done;
         }
@@ -831,6 +895,7 @@ MPProbeResult *mp_probe_read(const char *path, MPProbeCancelled cancelled, void 
     status = indexed_prores(&mov_index, file, result, cancelled, context);
     if (status < 0)
         goto fail;
+    MPDescriptionShape first_description = {0};
     while (status == 0) {
         if (cancelled && cancelled(context)) {
             status = AVERROR_EXIT;
@@ -846,7 +911,7 @@ MPProbeResult *mp_probe_read(const char *path, MPProbeCancelled cancelled, void 
             needs_video_header = false;
         }
         if (packet->stream_index < result->stream_count)
-            status = record_packet(result, file->streams[packet->stream_index]->codecpar, packet);
+            status = record_packet(result, file->streams[packet->stream_index]->codecpar, packet, &first_description);
         else
             issue(result, "The source introduces a track after its stream headers.");
         av_packet_unref(packet);

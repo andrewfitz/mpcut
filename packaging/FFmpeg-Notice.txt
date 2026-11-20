@@ -1,17 +1,21 @@
-MPCut uses libraries from the FFmpeg project.
+MPCut uses libraries from the FFmpeg and SVT-AV1 projects.
 
 The bundled FFmpeg 9.0.2 libraries are distributed under the GNU Lesser
 General Public License, version 2.1 or later. See COPYING.LGPLv2.1 and
 LICENSE.md in this directory. The project site is https://ffmpeg.org/.
 
-This directory includes the exact upstream source archive, the patch that
-requires hardware-accelerated VideoToolbox sessions, and the build recipe.
-The shared libraries are installed in Contents/Frameworks. The build enables
-no GPL, nonfree, or third-party codec libraries.
+The FFmpeg codec library incorporates the SVT-AV1 4.3.0 encoder from the
+Alliance for Open Media. Its upstream license, patent terms and additional
+notices are in SVT-AV1/. The project site is https://gitlab.com/AOMediaCodec/SVT-AV1.
 
-To rebuild these libraries on Apple Silicon with Xcode, create a build
+This directory includes both upstream source archives, the patch to require
+hardware decoding in VideoToolbox, and the build recipe. FFmpeg's shared
+libraries are installed in Contents/Frameworks. The three video encoders
+enabled for Smart Trim are h264_videotoolbox, hevc_videotoolbox and libsvtav1.
+
+To rebuild these libraries on Apple Silicon with Xcode, CMake and pkg-config, create a build
 directory with scripts/, packaging/, and .build/mpcut-ffmpeg/ subdirectories.
 Copy build-ffmpeg.sh into scripts/, changes.diff into packaging/ as
-ffmpeg-require-hardware.patch, and the source archive into .build/mpcut-ffmpeg/.
+ffmpeg-require-hardware.patch, and both source archives into .build/mpcut-ffmpeg/.
 Run `bash scripts/build-ffmpeg.sh` from the build directory. The resulting
 libraries are in .build/mpcut-ffmpeg/install/lib/.

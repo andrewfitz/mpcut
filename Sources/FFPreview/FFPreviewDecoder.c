@@ -29,6 +29,7 @@ struct MPPreviewDecoder {
     bool audio_unavailable;
     bool eof;
     bool awaiting_keyframe;
+    bool encoding_edge;
     int64_t origin;
     CMTime timeline_origin;
     MPPreviewCancelled cancelled;
@@ -125,7 +126,7 @@ failure:
     return false;
 }
 
-MPPreviewDecoder *mp_preview_open(const char *path, MPPreviewCancelled cancelled,
+MPPreviewDecoder *mp_preview_open(const char *path, bool video_only, MPPreviewCancelled cancelled,
                                  void *context, const char **error)
 {
     *error = "Could not allocate the preview decoder.";
@@ -150,8 +151,15 @@ MPPreviewDecoder *mp_preview_open(const char *path, MPPreviewCancelled cancelled
     *error = "This video stream has no compatible VideoToolbox decoder.";
     if (!open_stream(preview, &preview->video, AVMEDIA_TYPE_VIDEO))
         goto failure;
-    if (!open_stream(preview, &preview->audio, AVMEDIA_TYPE_AUDIO))
+    preview->audio.index = -1;
+    if (video_only) {
+        for (unsigned i = 0; i < preview->format->nb_streams; i++) {
+            if ((int)i != preview->video.index)
+                preview->format->streams[i]->discard = AVDISCARD_ALL;
+        }
+    } else if (!open_stream(preview, &preview->audio, AVMEDIA_TYPE_AUDIO)) {
         preview->audio_unavailable = preview->audio.index >= 0;
+    }
     AVStream *video = preview->format->streams[preview->video.index];
     preview->origin = video->start_time == AV_NOPTS_VALUE ? preview->format->start_time
         : av_rescale_q(video->start_time, video->time_base, AV_TIME_BASE_Q);
@@ -167,6 +175,28 @@ MPPreviewDecoder *mp_preview_open(const char *path, MPPreviewCancelled cancelled
 failure:
     mp_preview_close(preview);
     return NULL;
+}
+
+const AVStream *mp_preview_prepare_edge(MPPreviewDecoder *preview)
+{
+    if (!preview || preview->hardware.session)
+        return NULL;
+    const AVStream *stream = preview->format->streams[preview->video.index];
+    const AVCodecParameters *codec = stream->codecpar;
+    bool full_range = codec->color_range == AVCOL_RANGE_JPEG || codec->format == AV_PIX_FMT_YUVJ420P;
+    if (codec->format != AV_PIX_FMT_YUV420P && codec->format != AV_PIX_FMT_YUVJ420P)
+        return NULL;
+    preview->encoding_edge = true;
+    preview->video.codec->err_recognition |= AV_EF_EXPLODE;
+    preview->hardware.cv_pix_fmt_type = full_range ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                                                  : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    return stream;
+}
+
+void mp_preview_coded_size(const MPPreviewDecoder *preview, int *width, int *height)
+{
+    *width = preview->video.codec->coded_width;
+    *height = preview->video.codec->coded_height;
 }
 
 void mp_preview_close(MPPreviewDecoder *preview)
@@ -393,6 +423,29 @@ finish:
     return sample;
 }
 
+/* Replacing a coded picture would discard these payloads. They can occur
+ * inside individual access units even when the container has no track flag. */
+static bool edge_metadata_supported(const AVFrame *frame)
+{
+    for (int i = 0; i < frame->nb_side_data; i++) {
+        switch (frame->side_data[i]->type) {
+        case AV_FRAME_DATA_A53_CC:
+        case AV_FRAME_DATA_MASTERING_DISPLAY_METADATA:
+        case AV_FRAME_DATA_CONTENT_LIGHT_LEVEL:
+        case AV_FRAME_DATA_DYNAMIC_HDR_PLUS:
+        case AV_FRAME_DATA_DYNAMIC_HDR_VIVID:
+        case AV_FRAME_DATA_DOVI_RPU_BUFFER:
+        case AV_FRAME_DATA_DOVI_METADATA:
+        case AV_FRAME_DATA_ICC_PROFILE:
+        case AV_FRAME_DATA_FILM_GRAIN_PARAMS:
+            return false;
+        default:
+            break;
+        }
+    }
+    return true;
+}
+
 int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const char **error)
 {
     *sample = NULL;
@@ -407,6 +460,17 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
             if (result == 0) {
                 int kind = stream == &preview->video ? MPPreviewVideo : MPPreviewAudio;
                 if (kind == MPPreviewVideo) {
+                    if (preview->encoding_edge && (preview->frame->decode_error_flags ||
+                        (preview->frame->flags & (AV_FRAME_FLAG_CORRUPT | AV_FRAME_FLAG_INTERLACED)))) {
+                        av_frame_unref(preview->frame);
+                        *error = "Smart Trim requires intact, progressive source pictures.";
+                        return MPPreviewError;
+                    }
+                    if (preview->encoding_edge && !edge_metadata_supported(preview->frame)) {
+                        av_frame_unref(preview->frame);
+                        *error = "This picture carries embedded captions, colour, or grain metadata that requires copying.";
+                        return MPPreviewError;
+                    }
                     if (preview->frame->format != AV_PIX_FMT_VIDEOTOOLBOX || !using_hardware(preview)) {
                         av_frame_unref(preview->frame);
                         *error = "VideoToolbox could not decode this stream in hardware.";

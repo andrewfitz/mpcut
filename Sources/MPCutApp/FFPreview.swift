@@ -1,5 +1,4 @@
 import AVFoundation
-import CoreImage
 import FFPreview
 
 private func ffTime(_ seconds: Double) -> CMTime {
@@ -23,7 +22,8 @@ private struct FFPreviewBatch {
     var noAudio = false
 }
 
-private final class FFPreviewReader: @unchecked Sendable {
+final class FFPreviewReader: @unchecked Sendable {
+    private let videoOnly: Bool
     private var decoder: OpaquePointer?
     private var url: URL?
     private var transform = CGAffineTransform.identity
@@ -31,6 +31,10 @@ private final class FFPreviewReader: @unchecked Sendable {
     private var videoFinished = false
     private var audioFinished = false
     private var cancelled: (() -> Bool)?
+
+    init(videoOnly: Bool = false) {
+        self.videoOnly = videoOnly
+    }
 
     deinit { mp_preview_close(decoder) }
 
@@ -56,7 +60,7 @@ private final class FFPreviewReader: @unchecked Sendable {
             var error: UnsafePointer<CChar>?
             let context = Unmanaged.passUnretained(self).toOpaque()
             decoder = url.path.withCString {
-                mp_preview_open($0, { context in
+                mp_preview_open($0, videoOnly, { context in
                     guard let context else { return false }
                     let reader = Unmanaged<FFPreviewReader>.fromOpaque(context).takeUnretainedValue()
                     return reader.cancelled?() ?? false
@@ -94,14 +98,15 @@ private final class FFPreviewReader: @unchecked Sendable {
                   let buffer = sample.imageBuffer else { continue }
             let frame = PreviewFrame(buffer: buffer, time: sample.presentationTimeStamp, transform: transform)
             if frame.time.seconds >= end { return preceding }
+            if frame.time.seconds == target { return frame }
             if frame.time.seconds > target + 0.000_001 { return preceding ?? frame }
             preceding = frame
         }
         return nil
     }
 
-    func batch(from target: Double, end: Double, timelineOffset: Double, first: Bool,
-               cancelled: () -> Bool) throws -> FFPreviewBatch {
+    fileprivate func batch(from target: Double, end: Double, timelineOffset: Double, first: Bool,
+                           cancelled: () -> Bool) throws -> FFPreviewBatch {
         var output = FFPreviewBatch()
         var preceding = first ? pendingFrame : nil
         var needsFirst = first
@@ -424,47 +429,5 @@ final class WebSequencePlayback {
             }
         }
         fill()
-    }
-
-    private static let thumbnailQueue = DispatchQueue(label: "mpcut.web-thumbnails", qos: .utility,
-                                                       autoreleaseFrequency: .workItem)
-    private static let thumbnailReader = FFPreviewReader()
-    private static let thumbnailContext = CIContext()
-
-    static func thumbnail(url: URL, at time: Double, size: CGSize) async -> CGImage? {
-        guard !Task.isCancelled, size.width > 0, size.height > 0 else { return nil }
-        let request = FFPreviewRequests()
-        let generation = request.next()
-        let reader = thumbnailReader
-        let context = thumbnailContext
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                thumbnailQueue.async {
-                    guard request.current(generation) else {
-                        continuation.resume(returning: nil)
-                        return
-                    }
-                    do {
-                        let frame = try reader.perform(cancelled: { !request.current(generation) }) {
-                            try reader.seek(url: url, to: time)
-                            return try reader.still(at: time, cancelled: { !request.current(generation) })
-                        }
-                        guard let frame, request.current(generation) else {
-                            continuation.resume(returning: nil)
-                            return
-                        }
-                        let pixels = CIImage(cvPixelBuffer: frame.buffer).transformed(by: frame.displayTransform)
-                        let scale = min(size.width / pixels.extent.width, size.height / pixels.extent.height, 1)
-                        let scaled = pixels.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-                        let image = context.createCGImage(scaled, from: scaled.extent)
-                        continuation.resume(returning: request.current(generation) ? image : nil)
-                    } catch {
-                        continuation.resume(returning: nil)
-                    }
-                }
-            }
-        } onCancel: {
-            _ = request.next()
-        }
     }
 }

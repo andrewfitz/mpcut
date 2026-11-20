@@ -5,7 +5,10 @@ import PacketWriter
 public struct CutEngine: Sendable {
     private let cancelled: (@Sendable () -> Bool)?
 
-    public init(cancelled: (@Sendable () -> Bool)? = nil) {
+    private let smartTrim: Bool
+
+    public init(cancelled: (@Sendable () -> Bool)? = nil, smartTrim: Bool = false) {
+        self.smartTrim = smartTrim
         self.cancelled = cancelled
     }
 
@@ -105,6 +108,7 @@ public struct CutEngine: Sendable {
         var considered: Set<String> = []
         return probeOrder.filter { container in
             !container.isEmpty && considered.insert(container).inserted &&
+                (!media.video.multipleDescriptions || ["mov", "mp4", "m4v"].contains(container)) &&
                 media.audio.allSatisfy { $0.presentationEdits.isEmpty || supportsAACEdits($0.stream, container: container) } &&
                 muxIssue(media.url, container: container) == nil
         }
@@ -172,6 +176,11 @@ public struct CutEngine: Sendable {
             }
             for info in uniqueMedia {
                 try checkCancellation()
+                if info.video.multipleDescriptions && !["mov", "mp4", "m4v"].contains(explicit) {
+                    throw CutError(code: "unsupported_container",
+                                   message: "This source uses multiple video sample descriptions and requires MOV or MP4 output.",
+                                   segment: firstOccurrence[info.url])
+                }
                 if let issue = muxIssue(info.url, container: explicit) {
                     throw CutError(code: "unsupported_container", message: issue,
                                    segment: firstOccurrence[info.url])
@@ -184,7 +193,10 @@ public struct CutEngine: Sendable {
         var defaultFailure: CutError?
         for candidate in suggestedContainers(for: sequence[0]) {
             try checkCancellation()
-            if !uniqueMedia.dropFirst().allSatisfy({ muxIssue($0.url, container: candidate) == nil }) {
+            if !uniqueMedia.dropFirst().allSatisfy({
+                (!$0.video.multipleDescriptions || ["mov", "mp4", "m4v"].contains(candidate))
+                    && muxIssue($0.url, container: candidate) == nil
+            }) {
                 continue
             }
             do {
@@ -245,7 +257,7 @@ public struct CutEngine: Sendable {
         let requests = zip(clips, sequence).enumerated().map { ($0.offset + 1, $0.element.0, $0.element.1) }
         var effective: [(startIndex: Int, endIndex: Int, clip: ClipRequest, info: MediaInfo)] = []
         for (index, request, info) in requests {
-            let mayCoalesce = container == "webm" || (container == "mkv" &&
+            let mayCoalesce = smartTrim || container == "webm" || (container == "mkv" &&
                 info.audio.contains(where: { matroskaAudioCodec($0, media: info) != nil }))
             if mayCoalesce,
                let previous = effective.last, previous.info.url == info.url,
@@ -262,6 +274,9 @@ public struct CutEngine: Sendable {
         var silentAACSegments: [Int: Int] = [:]
         var audibleAACTracks: Set<Int> = []
         var lastVideoDTS: RationalTime?
+        let canScheduleVideo = smartTrim && ["mov", "mp4", "m4v"].contains(container)
+            && ["h264", "hevc"].contains(sequence[0].video.codec)
+        var decodeOverlap = false
         var duration = RationalTime.zero
         for (offset, request) in effective.enumerated() {
             try checkCancellation()
@@ -329,11 +344,14 @@ public struct CutEngine: Sendable {
                 }
                 if let minimum = minimumDTS, let previous = lastVideoDTS,
                    try minimum.adding(shift) <= previous {
-                    throw CutError(code: "unsafe_boundary", message: "The video decode timestamps overlap at this join.",
-                                   segment: index, boundary: "from",
-                                   nearest: includeSuggestions
-                                       ? neighboringBoundaries(around: from, in: startCandidates.times, eligible: { $0 < to })
-                                       : nil)
+                    if canScheduleVideo {
+                        decodeOverlap = true
+                    } else {
+                        throw CutError(code: "unsafe_boundary", message: "The video decode timestamps overlap at this join.",
+                                       segment: index, boundary: "from", nearest: includeSuggestions
+                                           ? neighboringBoundaries(around: from, in: startCandidates.times, eligible: { $0 < to })
+                                           : nil)
+                    }
                 }
                 lastVideoDTS = try maximumDTS.map { try $0.adding(shift) } ?? lastVideoDTS
             }
@@ -365,9 +383,42 @@ public struct CutEngine: Sendable {
                 }
                 throw error
             }
+            let edges = smartTrim && smartTrimEligible(in: info, container: container)
+                ? try smartTrimEdges(frames: info.frames, kept: lower..<upper, from: from, to: to,
+                                     sourceEnd: info.duration, codec: info.video.codec, segment: index)
+                : []
             segments.append(ResolvedSegment(file: info.url, from: from, to: to, outputStart: trackStart,
-                                            tracks: tracks, lastVideoFrame: lastFrame.time, reachesEnd: to == info.duration))
+                                            tracks: tracks, lastVideoFrame: lastFrame.time, reachesEnd: to == info.duration,
+                                            multipleDescriptions: info.video.multipleDescriptions,
+                                            encodedEdges: edges.isEmpty ? nil : edges))
             duration = end
+        }
+
+        if canScheduleVideo && (decodeOverlap || segments.contains(where: { $0.encodedEdges != nil })) {
+            var delay = RationalTime.zero
+            for (index, request) in effective.enumerated() {
+                let frames = request.info.frames
+                let segment = segments[index]
+                let lower = frames.lowerBound { $0.time >= segment.from }
+                let upper = frames.lowerBound { $0.time >= segment.to }
+                let kept = frames[lower..<upper]
+                let decodeTimes = kept.compactMap(\.dts).sorted()
+                guard decodeTimes.count == kept.count else {
+                    throw CutError(code: "unsupported_container", message: "Missing MOV decode timestamps.", segment: index + 1)
+                }
+                // Leave at least the source decoder's lead at every retained packet slot,
+                // including reordered B pictures. Replacing an edge sorts its PTS within
+                // those slots. Sorted PTS remain at or after the corresponding sorted DTS.
+                for (picture, dts) in zip(kept, decodeTimes) {
+                    delay = max(delay, try picture.time.subtracting(dts))
+                }
+                segments[index].videoDecodeTimes = try kept.map { try segment.outputStart.adding($0.time.subtracting(segment.from)) }
+                try checkCancellation()
+            }
+            for index in segments.indices {
+                segments[index].videoDecodeTimes = try segments[index].videoDecodeTimes.map { try $0.subtracting(delay) }
+                try checkCancellation()
+            }
         }
 
         for track in silentAACSegments.keys.sorted() where !audibleAACTracks.contains(track) {
@@ -423,10 +474,18 @@ public struct CutEngine: Sendable {
         if result != 0 {
             throw CutError(code: "write_failed", message: String(cString: diagnostic))
         }
+        if edit.segments.count == 1, let tracks = edit.segments.first?.tracks,
+           tracks.contains(where: { $0.opusPreSkip != nil }) {
+            let ends = try tracks.sorted { $0.index < $1.index }.map { try $0.outputEnd.roundedToSamples(1_000_000_000) }
+            guard mpcut_set_matroska_durations(partial.path, ends, ends.count) == 0 else {
+                throw CutError(code: "write_failed", message: "Could not finalize the Opus trim’s presentation duration.")
+            }
+        }
         try checkCancellation()
         for (source, identity) in edit.identities {
             try verifyIdentity(source, identity: identity)
         }
+        try checkCancellation()
         guard renamex_np(partial.path, destination.path, UInt32(RENAME_EXCL)) == 0 else {
             if errno == EEXIST { throw destinationExists }
             throw CutError(code: "write_failed", message: String(cString: strerror(errno)))
@@ -463,15 +522,46 @@ public struct CutEngine: Sendable {
         guard paths.allSatisfy({ $0 != nil }) else {
             throw CutError(code: "write_failed", message: "Could not allocate the source file paths.")
         }
-        let native = zip(segments, paths).map { segment, path in
-            MPCutSegment(path: UnsafePointer(path),
-                         start: MPCutTime(numerator: segment.from.numerator, denominator: segment.from.denominator),
-                         end: MPCutTime(numerator: segment.to.numerator, denominator: segment.to.denominator),
-                         last_video_frame: MPCutTime(numerator: segment.lastVideoFrame?.numerator ?? 0,
-                                                      denominator: segment.lastVideoFrame?.denominator ?? 0),
-                         reaches_end: segment.reachesEnd ? 1 : 0)
+        // Only a single continuous range can use a track-wide OpusHead pre-skip.
+        let tracks = segments.count == 1 ? segments[0].tracks : []
+        var preSkips: [Int32] = []
+        for track in tracks {
+            guard let skip = track.opusPreSkip else { continue }
+            if preSkips.count <= track.index {
+                preSkips.append(contentsOf: repeatElement(-1, count: track.index + 1 - preSkips.count))
+            }
+            preSkips[track.index] = skip
         }
-        return native.withUnsafeBufferPointer(body)
+        func nativeTime(_ time: RationalTime) -> MPCutTime {
+            MPCutTime(numerator: time.numerator, denominator: time.denominator)
+        }
+        func nativeEdge(_ edge: EncodedEdge?) -> MPCutEdgeRange {
+            guard let edge else { return MPCutEdgeRange() }
+            return MPCutEdgeRange(from: nativeTime(edge.from), to: nativeTime(edge.to),
+                                  frame_count: edge.frameCount, decode_from: nativeTime(edge.decodeFrom),
+                                  target_bit_rate: edge.targetBitRate ?? 0)
+        }
+
+        let schedule = segments.flatMap { $0.videoDecodeTimes.map(nativeTime) }
+        return schedule.withUnsafeBufferPointer { ticks in
+            preSkips.withUnsafeBufferPointer { skips in
+                var cursor = 0
+                let native = zip(segments, paths).map { segment, path in
+                    let count = segment.videoDecodeTimes.count
+                    let start = count == 0 ? nil : ticks.baseAddress?.advanced(by: cursor)
+                    cursor += count
+                    return MPCutSegment(path: UnsafePointer(path), start: nativeTime(segment.from), end: nativeTime(segment.to),
+                                        last_video_frame: segment.lastVideoFrame.map(nativeTime) ?? MPCutTime(),
+                                        reaches_end: segment.reachesEnd ? 1 : 0,
+                                        opus_pre_skip: skips.baseAddress, opus_track_count: skips.count,
+                                        head_edge: nativeEdge(segment.encodedEdges?.first(where: { $0.from == segment.from })),
+                                        tail_edge: nativeEdge(segment.encodedEdges?.last(where: { $0.from != segment.from })),
+                                        multiple_descriptions: segment.multipleDescriptions ? 1 : 0,
+                                        video_dts: start, video_dts_count: count)
+                }
+                return native.withUnsafeBufferPointer(body)
+            }
+        }
     }
 
     private func verifyIdentity(_ source: URL, identity: SourceIdentity) throws {
@@ -529,7 +619,7 @@ private final class ExportProgress {
     }
 }
 
-private extension Array {
+extension Array {
     func lowerBound(where isAtOrAboveBoundary: (Element) -> Bool) -> Int {
         var lower = startIndex
         var upper = endIndex
@@ -569,7 +659,8 @@ private extension CutEngine {
 
     func boundarySet(in media: MediaInfo, start: Bool, first: Bool, last: Bool,
                      container: String) -> Boundaries {
-        var candidates = Set(media.frames.filter { start ? $0.canStart : $0.canEnd }.map(\.time))
+        let frameAccurate = smartTrim && smartTrimEligible(in: media, container: container)
+        var candidates = Set(media.frames.lazy.filter { frameAccurate || (start ? $0.canStart : $0.canEnd) }.map(\.time))
         candidates = candidates.filter { .zero < $0 && $0 < media.duration }
         if start && media.sourceStartSafe { candidates.insert(.zero) }
         if !start && media.duration > .zero { candidates.insert(media.duration) }
@@ -596,11 +687,12 @@ private extension CutEngine {
                     let sample = RationalTime(numerator: 1, denominator: Int64(track.sampleRate))
                     return (try? audio.end.adding(sample)).map { candidate <= $0 } ?? false
                 }
-            } else if !start && first && last && supportsOpusPrefix(audio, media: media, container: container) {
-                let window = opusPrefixWindow(audio, origin: media.origin)
+            } else if first && last && supportsOpusTrim(audio, media: media, container: container) {
+                let window = opusTrimWindow(audio, origin: media.origin)
                 candidates = candidates.filter { candidate in
-                    if candidate == media.duration { return true }
+                    if start && candidate == .zero || !start && candidate == media.duration { return true }
                     guard let sample = try? media.origin.adding(candidate).roundedToSamples(48_000) else { return false }
+                    if start { return window?.preSkip(at: sample) != nil }
                     return window?.containsEnd(sample) == true
                 }
             } else if start {
@@ -674,6 +766,13 @@ private extension CutEngine {
         ]
         for audio in media.audio {
             let track = audio.stream
+            var opusPreSkip: Int32?
+            // Reopened crops can contain multiple full packets of hidden decoder history.
+            if supportsOpusTrim(audio, media: media, container: container), let packet = audio.packets.first,
+               track.initialPadding >= packet.decodedSamples, packet.decodedSamples > 0,
+               track.initialPadding <= 65_535, first, last {
+                opusPreSkip = Int32(track.initialPadding)
+            }
             let sourceStart: RationalTime
             let sourceEnd: RationalTime
             let trackOutputStart: RationalTime
@@ -683,8 +782,8 @@ private extension CutEngine {
                     throw CutError(code: "unsafe_boundary", message: "AAC track \(track.index) has no audible samples.",
                                    segment: segment, track: track.index)
                 }
-                if supportsOpusPrefix(audio, media: media, container: container),
-                   let window = opusPrefixWindow(audio, origin: media.origin), window.complete {
+                if supportsOpusTrim(audio, media: media, container: container),
+                   let window = opusTrimWindow(audio, origin: media.origin), window.complete {
                     sourceStart = try RationalTime(numerator: window.start, denominator: 48_000).subtracting(media.origin)
                     sourceEnd = try RationalTime(numerator: window.end, denominator: 48_000).subtracting(media.origin)
                 } else {
@@ -694,16 +793,29 @@ private extension CutEngine {
                 trackOutputStart = try outputStart.adding(sourceStart)
                 trackOutputEnd = try outputStart.adding(sourceEnd)
                 if track.codec == "aac" { audibleAACTracks.insert(track.index) }
-            } else if first && last && from == .zero && supportsOpusPrefix(audio, media: media, container: container) {
-                let endSample = try media.origin.adding(to).roundedToSamples(48_000)
-                guard let window = opusPrefixWindow(audio, origin: media.origin), window.containsEnd(endSample) else {
-                    throw CutError(code: "unsafe_boundary", message: "Opus track \(track.index) cannot preserve the requested prefix.",
+            } else if first && last && supportsOpusTrim(audio, media: media, container: container) {
+                let reachesEnd = to == media.duration
+                guard let window = opusTrimWindow(audio, origin: media.origin), !reachesEnd || window.complete else {
+                    throw CutError(code: "unsafe_boundary", message: "Opus track \(track.index) has discontinuous packet timing.",
                                    segment: segment, boundary: "to", track: track.index)
                 }
-                sourceStart = try RationalTime(numerator: window.start, denominator: 48_000).subtracting(media.origin)
+                let endSample = reachesEnd ? window.end : try media.origin.adding(to).roundedToSamples(48_000)
+                guard window.containsEnd(endSample) else {
+                    throw CutError(code: "unsafe_boundary", message: "Opus track \(track.index) cannot preserve the requested end.",
+                                   segment: segment, boundary: "to", track: track.index)
+                }
+                let startSample = from == .zero ? window.start : try media.origin.adding(from).roundedToSamples(48_000)
+                if from != .zero {
+                    guard let skip = window.preSkip(at: startSample), startSample < endSample else {
+                        throw CutError(code: "unsafe_boundary", message: "Opus track \(track.index) cannot preserve the requested start.",
+                                       segment: segment, boundary: "from", track: track.index)
+                    }
+                    opusPreSkip = skip
+                }
+                sourceStart = try RationalTime(numerator: startSample, denominator: 48_000).subtracting(media.origin)
                 sourceEnd = try RationalTime(numerator: endSample, denominator: 48_000).subtracting(media.origin)
-                trackOutputStart = try outputStart.adding(sourceStart)
-                trackOutputEnd = try outputStart.adding(sourceEnd)
+                trackOutputStart = try outputStart.adding(sourceStart.subtracting(from))
+                trackOutputEnd = try outputStart.adding(sourceEnd.subtracting(from))
             } else if track.isPCM || supportsAACEdits(track, container: container) {
                 let sampleRate = track.sampleRate
                 guard sampleRate > 0 else {
@@ -811,7 +923,7 @@ private extension CutEngine {
             }
             tracks.append(ResolvedTrack(index: track.index, kind: "audio", sourceStart: sourceStart,
                                         sourceEnd: sourceEnd, outputStart: trackOutputStart,
-                                        outputEnd: trackOutputEnd))
+                                        outputEnd: trackOutputEnd, opusPreSkip: opusPreSkip))
         }
         return tracks
     }

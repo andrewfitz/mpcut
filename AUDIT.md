@@ -10,13 +10,13 @@ Reviewed the native editor, both hardware-preview paths, media inspection, cut p
 | Export | Reordered VFR pictures respect the presentation duration. MOV copies retain audio that leads or extends beyond the picture. AAC edit lists retain supported silent intervals across export and reimport. | Compared packet hashes, decoded frames, audio samples, and timestamps. Checked an original Canon EOS 6D recording and an iPhone camera recording. |
 | Compatibility | The app checks WebM alpha at cut points, distinguishes RGB AVC, and detects reordered language tracks. Dry run checks timecode and destination clock limits. | Fixtures include transparent VP9, RGB AVC, swapped audio tracks, RAW exclusion, and ranges the target container cannot express. |
 | Automation | Unknown JSON fields identify the offending key and clip before export. | Tested direct arguments, JSON stdin, nonzero source timestamps, and interrupted input and export. |
-| Packaging | The release build works from a checkout with spaces using a system-only PATH. The relocated arm64 app loads its bundled media libraries. | Verified the signature, library paths, and a relocated CLI export. A simulated signing failure preserved the previous bundle. |
+| Packaging | The relocated arm64 app loads its bundled media libraries with a system-only PATH. | Verified the signature, library paths, and a relocated CLI export. A simulated signing failure preserved the previous bundle. |
 
 ## Reproduce the release checks
 
-The audited build passed six Swift tests and 32 integration tests. The integration suites ran against the helper inside the signed app bundle.
+The Smart Trim build passed 10 Swift tests and 44 integration tests. The Smart Trim suite checks frame order at splices, copied video and audio payloads, source-derived edge bitrates, and output size on low-bitrate AV1 footage. The integration suites ran against the helper inside the signed app bundle.
 
-Run on Apple Silicon with the Xcode tools, Python 3, and FFmpeg CLI tools. Development builds also use the FFmpeg development libraries described in the README.
+Run on Apple Silicon with the Xcode tools, CMake, pkg-config, Python 3, and FFmpeg CLI tools. Development builds also use the FFmpeg development libraries described in the README.
 
 ```sh
 swift test
@@ -24,6 +24,7 @@ swift test
 codesign --verify --deep --strict dist/MPCut.app
 python3 Tests/Integration/media_regression.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/audit_writer.py dist/MPCut.app/Contents/Helpers/mpcut
+python3 Tests/Integration/smart_trim.py dist/MPCut.app/Contents/Helpers/mpcut
 ```
 
 ## Qualification limits

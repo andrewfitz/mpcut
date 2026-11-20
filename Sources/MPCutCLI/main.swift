@@ -81,6 +81,7 @@ private struct ExportResult: Encodable {
         let outputStart: RationalTime
         let duration: RationalTime
         let tracks: [ResolvedTrack]
+        let encodedEdges: [EncodedEdge]?
 
         init(_ segment: ResolvedSegment) {
             file = segment.file.path
@@ -89,6 +90,7 @@ private struct ExportResult: Encodable {
             outputStart = segment.outputStart
             duration = segment.duration
             tracks = segment.tracks
+            encodedEdges = segment.encodedEdges
         }
     }
 
@@ -223,7 +225,6 @@ private func timestamp(_ value: String?, segment: Int, boundary: String) throws 
 }
 
 private func run(_ arguments: Arguments, interruption: Interruption) throws {
-    let engine = CutEngine(cancelled: { !interruption.isActive })
     switch arguments.command {
     case .version:
         if arguments.json {
@@ -238,6 +239,7 @@ private func run(_ arguments: Arguments, interruption: Interruption) throws {
             print(Arguments.usage)
         }
     case let .inspect(file, keyframes):
+        let engine = CutEngine(cancelled: { !interruption.isActive })
         try interruption.check()
         let media = try engine.inspect(fileURL(file, label: "Input"), keyframes: keyframes)
         let issue = media.copyIssue ?? (media.sourceStartSafe ? nil : "The source does not begin at a verified video access point.")
@@ -245,7 +247,8 @@ private func run(_ arguments: Arguments, interruption: Interruption) throws {
         try interruption.check()
         try writeJSON(Inspection(media: media, copy: CopyEligibility(reason: issue, containers: containers)),
                       pretty: !arguments.json)
-    case let .export(supplied, dryRun, snapNearest):
+    case let .export(supplied, dryRun, snapNearest, smartTrim):
+        let engine = CutEngine(cancelled: { !interruption.isActive }, smartTrim: smartTrim)
         let input = try supplied ?? readInput(interruption)
         guard !input.clips.isEmpty else {
             throw CLIError("invalid_arguments", "Export requires at least one clip.")

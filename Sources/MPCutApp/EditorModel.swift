@@ -4,16 +4,22 @@ import Foundation
 import MPCutCore
 
 private struct IndexedSource: Sendable {
+    let id = UUID()
     let media: MediaInfo
     let frames: [RationalTime]
     let keyframes: [RationalTime]
     let keyframeSeconds: [Double]
+    let thumbnailSyncTimes: [Double]
 
     init(media: MediaInfo) {
         self.media = media
         frames = media.frames.map(\.time)
         keyframes = media.frames.lazy.filter(\.keyframe).map(\.time)
         keyframeSeconds = keyframes.map(\.seconds)
+        thumbnailSyncTimes = media.frames.compactMap { frame in
+            if frame.canStart || (frame.time == .zero && media.sourceStartSafe) { return frame.time.seconds }
+            return nil
+        }
     }
 
     var url: URL { media.url }
@@ -38,8 +44,9 @@ private struct EditorSegment: Sendable {
     var preview: PreviewRange { PreviewRange(url: source.url, exactStart: start, exactEnd: end) }
     var request: ClipRequest { ClipRequest(file: source.url, from: start, to: end) }
     var timeline: TimelineClip {
-        TimelineClip(id: id, name: source.name, sourceStart: start.seconds, sourceEnd: end.seconds,
-                     sourceDuration: source.duration.seconds, keyframes: source.keyframeSeconds)
+        TimelineClip(id: id, sourceID: source.id, name: source.name, sourceStart: start.seconds, sourceEnd: end.seconds,
+                     sourceDuration: source.duration.seconds, keyframes: source.keyframeSeconds,
+                     thumbnailSyncTimes: source.thumbnailSyncTimes, frames: source.frames)
     }
 }
 
@@ -75,21 +82,40 @@ private struct BoundaryIndex: Sendable {
 }
 
 private struct PreparedEdit: Sendable {
-    var container: String?
-    var bySource: [URL: BoundaryIndex] = [:]
+    private struct CacheKey: Hashable {
+        let source: UUID
+        let container: String
+        let smartTrim: Bool
+    }
 
-    init() {}
+    let container: String?
+    let smartTrim: Bool
+    let canUseSmartTrim: Bool
+    private var cachedBoundaries: [CacheKey: BoundaryIndex] = [:]
 
-    init(segments: [EditorSegment], container: String, previous: Self, engine: CutEngine) {
+    init(smartTrim: Bool = false) {
+        self.smartTrim = smartTrim
+        container = nil
+        canUseSmartTrim = false
+    }
+
+    init(segments: [EditorSegment], container: String, smartTrim: Bool, previous: Self, engine: CutEngine) {
         self.container = container
-        for segment in segments where bySource[segment.source.url] == nil {
-            let source = segment.source
-            if previous.container == container, let cached = previous.bySource[source.url] {
-                bySource[source.url] = cached
-            } else {
-                bySource[source.url] = BoundaryIndex(media: source.media, container: container, engine: engine)
+        self.smartTrim = smartTrim
+        canUseSmartTrim = segments.first.map { engine.smartTrimEligible(in: $0.source.media, container: container) } ?? false
+        let sources = Set(segments.map { $0.source.id })
+        cachedBoundaries = previous.cachedBoundaries.filter { sources.contains($0.key.source) }
+        for segment in segments {
+            let key = CacheKey(source: segment.source.id, container: container, smartTrim: smartTrim)
+            if cachedBoundaries[key] == nil {
+                cachedBoundaries[key] = BoundaryIndex(media: segment.source.media, container: container, engine: engine)
             }
         }
+    }
+
+    func boundaries(for source: IndexedSource) -> BoundaryIndex? {
+        guard let container else { return nil }
+        return cachedBoundaries[CacheKey(source: source.id, container: container, smartTrim: smartTrim)]
     }
 }
 
@@ -149,7 +175,8 @@ final class EditorModel: ObservableObject {
     private var trimOrigin: Double?
     private var trimAudition: (UUID, TimelineEdge, RationalTime)?
     private var cancellation: EditCancellation?
-    private var exportTask: Task<Void, Never>?
+    private var exportTasks: [UUID: Task<Void, Never>] = [:]
+    private var waitingForExportCleanup = false
     private var pendingOpenFiles: [URL] = []
     private var session = UUID()
 
@@ -165,10 +192,12 @@ final class EditorModel: ObservableObject {
     var timelineClips: [TimelineClip] { segments.map(\.timeline) }
     var isEmpty: Bool { segments.isEmpty }
     var selectedID: UUID? { edit.selectedID }
+    var smartTrim: Bool { edit.preparation.smartTrim }
+    var canUseSmartTrim: Bool { edit.preparation.canUseSmartTrim }
     var markIn: Double? { edit.markIn }
     var markOut: Double? { edit.markOut }
     var duration: Double { edit.duration.seconds }
-    var isBusy: Bool { isImporting || isExporting || isCheckingEdit || isPresentingPanel }
+    var isBusy: Bool { isImporting || isExporting || isCheckingEdit || isPresentingPanel || waitingForExportCleanup }
     var canEdit: Bool { !isEmpty && !isBusy }
     var canUndo: Bool { !isBusy && !undoStack.isEmpty }
     var canRedo: Bool { !isBusy && !redoStack.isEmpty }
@@ -225,7 +254,8 @@ final class EditorModel: ObservableObject {
         preview.pause()
         let token = EditCancellation()
         cancellation = token
-        let engine = CutEngine(cancelled: { token.isCancelled })
+        let useSmartTrim = smartTrim
+        let engine = CutEngine(cancelled: { token.isCancelled }, smartTrim: useSmartTrim)
         let existing = segments
         let priorPreparation = edit.preparation
         let insertion = min(max(0, index ?? existing.count), existing.count)
@@ -266,7 +296,7 @@ final class EditorModel: ObservableObject {
                     }
                 }
                 let prepared = resolvedContainer.map {
-                    PreparedEdit(segments: candidate, container: $0, previous: priorPreparation, engine: engine)
+                    PreparedEdit(segments: candidate, container: $0, smartTrim: useSmartTrim, previous: priorPreparation, engine: engine)
                 } ?? priorPreparation
                 return (candidate, accepted, rejected, prepared)
             }.value
@@ -353,7 +383,7 @@ final class EditorModel: ObservableObject {
         guard let (index, segment, offset) = locatedSegment(at: playhead) else { return }
         let target = playhead - offset.seconds + segment.start.seconds
         guard playhead - offset.seconds > max(playhead.ulp * 4, 0.000000001) else { return }
-        guard let boundaries = edit.preparation.bySource[segment.source.url],
+        guard let boundaries = edit.preparation.boundaries(for: segment.source),
               let cut = nearest(in: boundaries.splitPoints, to: target, after: segment.start, before: segment.end) else {
             alert = EditorNotice(title: "Can’t Split Clip", message: "There’s no verified split point inside this range.")
             return
@@ -373,7 +403,7 @@ final class EditorModel: ObservableObject {
         guard canEdit, sourceTime.isFinite,
               let index = segments.firstIndex(where: { $0.id == id }) else { return nil }
         let segment = segments[index]
-        guard let boundaries = edit.preparation.bySource[segment.source.url] else { return nil }
+        guard let boundaries = edit.preparation.boundaries(for: segment.source) else { return nil }
         let offset = positionedSegments()[index].1
         let first = index == 0
         let last = index == segments.count - 1
@@ -444,6 +474,9 @@ final class EditorModel: ObservableObject {
             deleteMarkedRange(markedRange, reversed: markIn == markedRange.upperBound)
         } else if markIn != nil, markOut != nil {
             alert = EditorNotice(title: "Can’t Delete Marked Range", message: "Move one mark to create a range to delete.")
+        } else if markIn != nil || markOut != nil {
+            let missing = markIn == nil ? "Mark In" : "Mark Out"
+            alert = EditorNotice(title: "Finish the Marked Range", message: "Set \(missing) to finish the range, or press Esc to clear the mark and delete a whole clip.")
         } else if let selectedID, let index = segments.firstIndex(where: { $0.id == selectedID }) {
             var proposed = segments
             proposed.remove(at: index)
@@ -470,6 +503,12 @@ final class EditorModel: ObservableObject {
         updateStatus()
     }
 
+    func setSmartTrim(_ enabled: Bool) {
+        guard canEdit, enabled != smartTrim, !enabled || canUseSmartTrim else { return }
+        validate(segments, selecting: selectedID, at: playhead, action: enabled ? "Enable Smart Trim" : "Disable Smart Trim",
+                 smartTrim: enabled)
+    }
+
     func chooseExport() {
         guard canEdit, let first = segments.first, let defaultContainer = edit.preparation.container else { return }
         cancelTrim()
@@ -478,23 +517,35 @@ final class EditorModel: ObservableObject {
         cancellation = token
         isCheckingEdit = true
         let candidate = segments
+        let useSmartTrim = smartTrim
         let currentSession = session
         Task {
-            let containerExtensions = await Task.detached(priority: .userInitiated) {
-                let engine = CutEngine(cancelled: { token.isCancelled })
-                let alternatives = engine.suggestedContainers(for: first.source.media)
-                    .filter { $0 != defaultContainer }
-                    .filter { !token.isCancelled && (try? Self.resolve(candidate, engine: engine, container: $0)) != nil }
-                return [defaultContainer] + alternatives
+            let result = await Task.detached(priority: .userInitiated) { () -> Result<[ExportFormat], Error> in
+                Result {
+                    let engine = CutEngine(cancelled: { token.isCancelled }, smartTrim: useSmartTrim)
+                    let preferred = try Self.resolve(candidate, engine: engine, container: defaultContainer)
+                    let alternatives = engine.suggestedContainers(for: first.source.media)
+                        .filter { $0 != defaultContainer }
+                        .compactMap { container -> ResolvedEdit? in
+                            guard !token.isCancelled else { return nil }
+                            return try? Self.resolve(candidate, engine: engine, container: container)
+                        }
+                    return ([preferred] + alternatives).map { ExportFormat(edit: $0, smartTrim: useSmartTrim) }
+                }
             }.value
             guard session == currentSession else { return }
             cancellation = nil
             isCheckingEdit = false
-            presentExport(formats: containerExtensions, stem: first.source.url.deletingPathExtension().lastPathComponent)
+            switch result {
+            case .success(let formats):
+                presentExport(formats: formats, stem: first.source.url.deletingPathExtension().lastPathComponent)
+            case .failure(let error):
+                alert = EditorNotice(title: "Can’t Export", message: error.localizedDescription)
+            }
         }
     }
 
-    private func presentExport(formats: [String], stem: String) {
+    private func presentExport(formats: [ExportFormat], stem: String) {
         guard !formats.isEmpty else { return }
         let panel = NSSavePanel()
         panel.title = "Export Movie"
@@ -502,7 +553,7 @@ final class EditorModel: ObservableObject {
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
         panel.nameFieldStringValue = "\(stem) Edit"
-        let formatControl = ExportFormatControl(panel: panel, containers: formats)
+        let formatControl = ExportFormatControl(panel: panel, formats: formats)
         isPresentingPanel = true
         let currentSession = session
         present(panel) { [weak self, formatControl] accepted in
@@ -525,10 +576,15 @@ final class EditorModel: ObservableObject {
     }
 
     func cancelAndWaitForExport(_ completion: @escaping () -> Void) -> Bool {
-        guard let exportTask else { return false }
-        cancellation?.cancel()
+        guard !exportTasks.isEmpty else { return false }
+        waitingForExportCleanup = true
+        cancelExport()
+        // A closed session may still be removing its staged file. Each closed
+        // session already cancelled its own export when the window closed.
+        let pending = Array(exportTasks.values)
         Task {
-            await exportTask.value
+            for task in pending { await task.value }
+            waitingForExportCleanup = false
             completion()
         }
         return true
@@ -554,9 +610,9 @@ final class EditorModel: ObservableObject {
         updateStatus()
     }
 
-    func thumbnail(for id: UUID, at sourceTime: Double, size: CGSize) async -> CGImage? {
-        guard let source = segments.first(where: { $0.id == id })?.source else { return nil }
-        return await preview.thumbnail(url: source.url, at: sourceTime, size: size)
+    func thumbnail(for sourceID: UUID, at sourceTime: Double, size: CGSize) async -> CGImage? {
+        guard let source = segments.first(where: { $0.source.id == sourceID })?.source else { return nil }
+        return await preview.thumbnail(source: sourceID, url: source.url, at: sourceTime, size: size)
     }
 
     private func deleteMarkedRange(_ marked: ClosedRange<Double>, reversed: Bool) {
@@ -574,7 +630,7 @@ final class EditorModel: ObservableObject {
                 before.append(segment)
             } else if offset < marked.lowerBound - tolerance {
                 let wanted = marked.lowerBound - offset + segment.start.seconds
-                guard let boundaries = edit.preparation.bySource[segment.source.url] else { return }
+                guard let boundaries = edit.preparation.boundaries(for: segment.source) else { return }
                 let choices = boundaries.ends(first: before.isEmpty, last: !keepsTrailing)
                 guard let cut = nearest(in: choices, to: wanted, after: segment.start, before: segment.end) else {
                     showMarkBoundaryError(segment, mark: reversed ? "Out" : "In")
@@ -588,7 +644,7 @@ final class EditorModel: ObservableObject {
                 after.append(segment)
             } else if end > marked.upperBound + tolerance {
                 let wanted = marked.upperBound - offset + segment.start.seconds
-                guard let boundaries = edit.preparation.bySource[segment.source.url] else { return }
+                guard let boundaries = edit.preparation.boundaries(for: segment.source) else { return }
                 let choices = boundaries.starts(first: !keepsLeading, last: segment.id == segments.last?.id)
                 guard let cut = nearest(in: choices, to: wanted, after: segment.start, before: segment.end) else {
                     showMarkBoundaryError(segment, mark: reversed ? "In" : "Out")
@@ -622,6 +678,7 @@ final class EditorModel: ObservableObject {
         isCancelling = false
         exportProgress = 0
         let candidate = segments
+        let useSmartTrim = smartTrim
         let currentSession = session
         let token = EditCancellation()
         cancellation = token
@@ -635,10 +692,10 @@ final class EditorModel: ObservableObject {
             }
             return true
         }
-        exportTask = Task {
+        exportTasks[currentSession] = Task {
             let failure = await Task.detached(priority: .userInitiated) { () -> String? in
                 do {
-                    let engine = CutEngine(cancelled: { token.isCancelled })
+                    let engine = CutEngine(cancelled: { token.isCancelled }, smartTrim: useSmartTrim)
                     let resolved = try Self.resolve(candidate, engine: engine, output: output)
                     try engine.export(resolved, to: output, progress: reportProgress)
                     return nil
@@ -647,7 +704,7 @@ final class EditorModel: ObservableObject {
                 }
             }.value
 
-            exportTask = nil
+            exportTasks.removeValue(forKey: currentSession)
             guard session == currentSession else { return }
             isExporting = false
             isCancelling = false
@@ -668,12 +725,13 @@ final class EditorModel: ObservableObject {
     }
 
     private func validate(_ proposed: [EditorSegment], selecting id: UUID?, at destination: Double,
-                          action: String, originalPlayhead: Double? = nil) {
+                          action: String, originalPlayhead: Double? = nil, smartTrim requestedMode: Bool? = nil) {
         cancelTrim()
         preview.pause()
         let original = originalPlayhead ?? playhead
+        let useSmartTrim = requestedMode ?? smartTrim
         guard !proposed.isEmpty else {
-            apply(proposed, prepared: PreparedEdit(), selecting: id, at: destination, originalPlayhead: original)
+            apply(proposed, prepared: PreparedEdit(smartTrim: useSmartTrim), selecting: id, at: destination, originalPlayhead: original)
             return
         }
         let currentSession = session
@@ -684,9 +742,10 @@ final class EditorModel: ObservableObject {
         Task {
             let result = await Task.detached(priority: .userInitiated) { () -> Result<PreparedEdit, Error> in
                 Result {
-                    let engine = CutEngine(cancelled: { token.isCancelled })
+                    let engine = CutEngine(cancelled: { token.isCancelled }, smartTrim: useSmartTrim)
                     let resolved = try Self.resolve(proposed, engine: engine)
-                    return PreparedEdit(segments: proposed, container: resolved.container, previous: priorPreparation, engine: engine)
+                    return PreparedEdit(segments: proposed, container: resolved.container, smartTrim: useSmartTrim,
+                                        previous: priorPreparation, engine: engine)
                 }
             }.value
 
@@ -697,9 +756,21 @@ final class EditorModel: ObservableObject {
             switch result {
             case .failure(let failure):
                 restorePreview(at: original)
-                alert = EditorNotice(title: "Couldn’t \(action)", message: failure.localizedDescription)
+                if requestedMode == false, let issue = failure as? CutError, issue.code == "unsafe_boundary" {
+                    alert = EditorNotice(title: "This Edit Needs Smart Trim",
+                                         message: "Move the cut to a copy-safe boundary to turn Smart Trim off. " + issue.message)
+                } else {
+                    alert = EditorNotice(title: "Couldn’t \(action)", message: failure.localizedDescription)
+                }
             case .success(let prepared):
-                apply(proposed, prepared: prepared, selecting: id, at: destination, originalPlayhead: original)
+                if requestedMode != nil {
+                    undoStack.append(snapshot())
+                    redoStack.removeAll()
+                    edit.preparation = prepared
+                    updateStatus()
+                } else {
+                    apply(proposed, prepared: prepared, selecting: id, at: destination, originalPlayhead: original)
+                }
             }
         }
     }
@@ -795,26 +866,50 @@ final class EditorModel: ObservableObject {
     }
 }
 
+private struct ExportFormat: Sendable {
+    let container: String
+    let message: String
+
+    init(edit: ResolvedEdit, smartTrim: Bool) {
+        container = edit.container
+        guard smartTrim else {
+            message = ""
+            return
+        }
+        let edges = edit.segments.flatMap { $0.encodedEdges ?? [] }
+        let frames = edges.reduce(0) { $0 + $1.frameCount }
+        guard frames > 0 else {
+            message = "All selected frames can be copied."
+            return
+        }
+        let seconds = edges.reduce(0.0) { $0 + ($1.to - $1.from).seconds }
+        let duration = seconds.formatted(.number.precision(.fractionLength(0...3)))
+        let unit = frames == 1 ? "frame" : "frames"
+        message = "Smart Trim will encode \(frames) video \(unit) (\(duration) s) at the cut edges."
+    }
+}
+
 private final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private weak var panel: NSSavePanel?
-    private let containers: [String]
+    private let formats: [ExportFormat]
     private var selectedContainer: String
 
-    init(panel: NSSavePanel, containers: [String]) {
+    init(panel: NSSavePanel, formats: [ExportFormat]) {
         self.panel = panel
-        self.containers = containers
-        selectedContainer = containers[0]
+        self.formats = formats
+        selectedContainer = formats[0].container
         super.init()
         panel.delegate = self
+        panel.message = formats[0].message
 
         let selector = NSPopUpButton()
-        for container in containers {
-            selector.addItem(withTitle: container.uppercased())
+        for format in formats {
+            selector.addItem(withTitle: format.container.uppercased())
         }
         selector.target = self
         selector.action = #selector(selectContainer)
         selector.setAccessibilityLabel("File format")
-        selector.isEnabled = containers.count > 1
+        selector.isEnabled = formats.count > 1
         let label = NSTextField(labelWithString: "File format")
         let row = NSStackView(views: [label, selector])
         row.orientation = .horizontal
@@ -849,9 +944,10 @@ private final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     }
 
     private func updateType(at index: Int) {
-        guard let panel, containers.indices.contains(index) else { return }
+        guard let panel, formats.indices.contains(index) else { return }
         let previousContainer = selectedContainer
-        selectedContainer = containers[index]
+        selectedContainer = formats[index].container
+        panel.message = formats[index].message
         let currentName = panel.nameFieldStringValue as NSString
         if currentName.pathExtension.lowercased() == previousContainer {
             panel.nameFieldStringValue = currentName.deletingPathExtension
@@ -859,8 +955,8 @@ private final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     }
 }
 
-private extension Array where Element == RationalTime {
-    func lowerBound(where predicate: (RationalTime) -> Bool) -> Int {
+extension Array {
+    func lowerBound(where predicate: (Element) -> Bool) -> Int {
         var lower = 0
         var upper = count
         while lower < upper {

@@ -76,7 +76,7 @@ enum CLICommand {
     case help
     case version
     case inspect(file: String, keyframes: Bool)
-    case export(input: InputEdit?, dryRun: Bool, snapNearest: Bool)
+    case export(input: InputEdit?, dryRun: Bool, snapNearest: Bool, smartTrim: Bool)
 }
 
 struct Arguments {
@@ -88,11 +88,14 @@ struct Arguments {
     Usage:
       mpcut --version [--json]
       mpcut inspect [--json] [--keyframes] [--] FILE
-      mpcut export [--json] [--dry-run] [--snap nearest] --output FILE
+      mpcut export [--json] [--dry-run] [--smart-trim] [--snap nearest] --output FILE
                    --clip FILE [--from TIME] [--to TIME] [--clip FILE ...]
-      mpcut export --json --stdin [--dry-run] [--snap nearest]
+      mpcut export --json --stdin [--dry-run] [--smart-trim] [--snap nearest]
 
     --keyframes includes keyframe markers and verified video start points.
+
+    --smart-trim encodes only the video edges required for a frame cut.
+    Use --dry-run --json to see the planned encodedEdges for each clip.
 
     TIME accepts decimal seconds, HH:MM:SS with optional fractional seconds,
     or exact rational seconds such as 1001/30000. Starts are inclusive and
@@ -167,6 +170,7 @@ struct Arguments {
         var stdin = false
         var dryRun = false
         var snapNearest = false
+        var smartTrim = false
 
         func value(for option: String) throws -> String {
             guard let value = arguments.next(), !value.hasPrefix("--") else {
@@ -183,6 +187,11 @@ struct Arguments {
                 stdin = true
             case "--dry-run":
                 dryRun = true
+            case "--smart-trim":
+                guard !smartTrim else {
+                    throw CLIError("invalid_arguments", "--smart-trim may be specified only once.")
+                }
+                smartTrim = true
             case "--snap":
                 guard try value(for: argument) == "nearest" else {
                     throw CLIError("invalid_arguments", "--snap accepts 'nearest'. Omit --snap for exact cuts.")
@@ -216,12 +225,12 @@ struct Arguments {
             guard json, output == nil, clips.isEmpty else {
                 throw CLIError("invalid_arguments", "--stdin requires --json and supplies the output and clips.")
             }
-            return .export(input: nil, dryRun: dryRun, snapNearest: snapNearest)
+            return .export(input: nil, dryRun: dryRun, snapNearest: snapNearest, smartTrim: smartTrim)
         }
 
         guard let output, !clips.isEmpty else {
             throw CLIError("invalid_arguments", "Export requires --output and at least one --clip.")
         }
-        return .export(input: InputEdit(output: output, clips: clips), dryRun: dryRun, snapNearest: snapNearest)
+        return .export(input: InputEdit(output: output, clips: clips), dryRun: dryRun, snapNearest: snapNearest, smartTrim: smartTrim)
     }
 }

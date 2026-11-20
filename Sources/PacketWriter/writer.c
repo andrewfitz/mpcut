@@ -1,6 +1,8 @@
 #include "PacketWriter.h"
 #include "timecode.h"
 #include "aac_edits.h"
+#include "smart_edge.h"
+#include "splice_headers.h"
 #include "../CFFmpeg/copy_probe.h"
 #include "../CFFmpeg/opus_packet.h"
 
@@ -8,6 +10,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,18 +28,31 @@ static const int movie_timescale = 705600000;
 typedef struct {
     int started;
     int finished;
+    int copied;
     int64_t next_sample;
-} OpusPrefix;
+} OpusTrim;
+
+typedef struct {
+    MPCutEdgeRange plan;
+    int64_t start_pts;
+    int64_t end_pts;
+    size_t consumed;
+    MPCutEdge *encoded;
+    int64_t *source_times;
+    int64_t *encoded_times;
+} EdgePatch;
 
 typedef struct {
     AVFormatContext *output;
     AVPacket *packet;
     MPCutAAC *aac_edits;
     MPCutAACSource *aac_source;
-    OpusPrefix *opus_prefix;
+    OpusTrim *opus_trim;
     int64_t *last_dts;
     uint8_t *range_tracks;
     unsigned range_track_count;
+    const MPCutTime *video_dts;
+    size_t video_dts_count, video_dts_used;
     const char *output_path;
     MPCutProgress progress;
     void *progress_context;
@@ -45,6 +61,14 @@ typedef struct {
     double fraction;
     int has_timecode;
     AVRational timecode_rate;
+    int smart_trim;
+    int restore_video_config;
+    int edge_cancelled;
+    int track_video_config;
+    uint8_t *active_config;
+    size_t active_config_size;
+    int64_t video_origin_pts;
+    EdgePatch patches[2];
 } Writer;
 
 typedef struct {
@@ -57,7 +81,7 @@ typedef struct {
     int keep_audio_start;
     int keep_audio_end;
     int whole_file;
-    int opus_prefix;
+    int opus_trim;
 } Range;
 
 static int fail(Writer *writer, const char *format, ...) {
@@ -300,7 +324,8 @@ static unsigned output_index(unsigned input_index, int timecode_index) {
 }
 
 static int configure_output(Writer *writer, const AVFormatContext *input, int whole_file,
-                            int timecode_index, const MPCutTimecode *timecode, const char *initial_timecode) {
+                            int timecode_index, const MPCutTimecode *timecode, const char *initial_timecode,
+                            const MPCutSegment *segment) {
     AVFormatContext *output = writer->output;
     writer->has_timecode = timecode_index >= 0;
     if (writer->has_timecode) {
@@ -332,10 +357,26 @@ static int configure_output(Writer *writer, const AVFormatContext *input, int wh
         if (result < 0) {
             return ff_error(writer, result, "Cannot copy stream configuration from", input->url);
         }
+        if (index < segment->opus_track_count && segment->opus_pre_skip[index] >= 0) {
+            AVCodecParameters *codec = destination->codecpar;
+            int skip = segment->opus_pre_skip[index];
+            if (!is_matroska(output->oformat) || codec->codec_id != AV_CODEC_ID_OPUS || skip > UINT16_MAX
+                || codec->extradata_size < 19 || memcmp(codec->extradata, "OpusHead", 8) != 0) {
+                return fail(writer, "Invalid Opus trim header on track %u", index);
+            }
+            codec->initial_padding = skip;
+            AV_WL16(codec->extradata + 10, skip);
+        }
         /* MOV sample entries carry semantics such as ProRes profile and HEVC parameter-set placement. */
         if (!is_mov(output->oformat) || !output->oformat->codec_tag
             || av_codec_get_id(output->oformat->codec_tag, source->codecpar->codec_tag) != source->codecpar->codec_id) {
             destination->codecpar->codec_tag = 0;
+        }
+        if (writer->smart_trim && is_mov(output->oformat)) {
+            if (source->codecpar->codec_id == AV_CODEC_ID_H264)
+                destination->codecpar->codec_tag = MKTAG('a', 'v', 'c', '1');
+            else if (source->codecpar->codec_id == AV_CODEC_ID_HEVC)
+                destination->codecpar->codec_tag = MKTAG('h', 'v', 'c', '1');
         }
         destination->id = destination->index + 1;
         destination->time_base = source->time_base;
@@ -646,6 +687,13 @@ static int remux_packet(Writer *writer, const AVStream *input_track, const Range
     MPCutTime dts = time_ticks(packet->dts, input_track->time_base);
     int64_t mapped_pts = time_round(time_add(pts, range->shift, 1), track->time_base);
     int64_t mapped_dts = time_round(time_add(dts, range->shift, 1), track->time_base);
+    if (video && writer->video_dts) {
+        if (writer->video_dts_used >= writer->video_dts_count)
+            return fail(writer, "More video samples than indexed in the Smart Trim edit");
+        mapped_dts = time_round(writer->video_dts[writer->video_dts_used++], track->time_base);
+        if (mapped_dts == AV_NOPTS_VALUE || mapped_dts > mapped_pts)
+            return fail(writer, "Cannot represent a Smart Trim decode slot on the output clock");
+    }
     int64_t mapped_end = time_round(time_add(packet_end, range->shift, 1), track->time_base);
     if (mapped_pts == AV_NOPTS_VALUE || (packet->dts != AV_NOPTS_VALUE && mapped_dts == AV_NOPTS_VALUE)
         || (packet->duration > 0 && (mapped_end == AV_NOPTS_VALUE || mapped_end <= mapped_pts
@@ -672,9 +720,9 @@ static int remux_packet(Writer *writer, const AVStream *input_track, const Range
     return 0;
 }
 
-/* Keep every Opus packet from the original decoder start to the cut.
- * DiscardPadding on the last block removes only the unwanted tail samples. */
-static int trim_opus_prefix(Writer *writer, const AVStream *stream, const Range *range, OpusPrefix *state) {
+/* Count samples on the original decoder clock. OpusHead hides the retained
+ * decoder preroll and DiscardPadding trims the final block. */
+static int trim_opus_packet(Writer *writer, const AVStream *stream, const Range *range, OpusTrim *state) {
     AVPacket *packet = writer->packet;
     if (state->finished) {
         packet->size = 0;
@@ -692,7 +740,7 @@ static int trim_opus_prefix(Writer *writer, const AVStream *stream, const Range 
     unsigned discard = side && side_size >= 10 ? AV_RL32(side + 4) : 0;
     if (pts == AV_NOPTS_VALUE || end == AV_NOPTS_VALUE || packet->dts != packet->pts
         || stream->time_base.num != 1 || stream->time_base.den != 1000 || codec->sample_rate != 48000
-        || codec->initial_padding < 0 || (uint64_t)skip + discard >= (unsigned)duration
+        || codec->initial_padding < 0 || duration <= 0 || discard >= (unsigned)duration
         || skip != (state->started ? 0 : (unsigned)codec->initial_padding)
         || (!state->started && discard)) {
         return fail(writer, "Opus track %d has invalid packet timing at the trim", packet->stream_index);
@@ -701,11 +749,32 @@ static int trim_opus_prefix(Writer *writer, const AVStream *stream, const Range 
     Wide first = state->started ? state->next_sample : (Wide)pts + ((skip + 24) / 48) * 48 - skip;
     Wide last = first + duration;
     if ((Wide)pts - first < -24 || (Wide)pts - first > 24 || last > INT64_MAX
-        || end <= first + skip || (discard && end > last - discard)) {
+        || (!range->keep_audio_end && (end <= first + skip || (discard && end > last - discard)))) {
         return fail(writer, "Opus track %d has discontinuous audio at the trim", packet->stream_index);
     }
 
-    if (end <= last - discard) {
+    state->started = 1;
+    state->next_sample = (int64_t)last;
+    AVStream *output = writer->output->streams[packet->stream_index];
+    if (!range->keep_audio_start) {
+        int64_t cut = time_round(range->source_start, sample_base);
+        int padding = output->codecpar->initial_padding;
+        Wide first_retained = (Wide)cut - padding;
+        if (first < first_retained) {
+            packet->size = 0;
+            return 0;
+        }
+        if (!state->copied && first != first_retained) {
+            return fail(writer, "Opus track %d could not locate its decoder preroll", packet->stream_index);
+        }
+        // Matroska adds CodecDelay (rounded to its millisecond clock) to packet PTS.
+        // Timestamp retained packets from the first block, avoiding double rounding.
+        int64_t relative = (int64_t)(first - first_retained);
+        int64_t ticks = av_rescale_q(relative, sample_base, output->time_base)
+                      - av_rescale_q(padding, sample_base, output->time_base);
+        packet->pts = packet->dts = ticks;
+    }
+    if (!range->keep_audio_end && end <= last - discard) {
         discard = (unsigned)(last - end);
         if (skip && discard) {
             return fail(writer, "Opus track %d needs trim padding at both ends of one packet", packet->stream_index);
@@ -722,8 +791,10 @@ static int trim_opus_prefix(Writer *writer, const AVStream *stream, const Range 
         }
         state->finished = 1;
     }
-    state->started = 1;
-    state->next_sample = (int64_t)last;
+    state->copied = 1;
+    if (!range->keep_audio_start) {
+        return 0;
+    }
     Range packet_range = *range;
     packet_range.whole_file = 1;
     return remux_packet(writer, stream, &packet_range, 0, 0);
@@ -1072,6 +1143,146 @@ static int write_aac_source(Writer *writer, const AVFormatContext *input, int ti
     return result;
 }
 
+static int prepare_patches(Writer *writer, const AVStream *video, const MPCutSegment *segment, MPCutTime origin) {
+    const MPCutEdgeRange plan[] = {segment->head_edge, segment->tail_edge};
+    writer->video_origin_pts = time_round(origin, video->time_base);
+    for (unsigned i = 0; i < 2; i++) {
+        EdgePatch *patch = &writer->patches[i];
+        *patch = (EdgePatch){ .plan = plan[i] };
+        if (!plan[i].frame_count)
+            continue;
+        if (plan[i].decode_from.denominator <= 0 || plan[i].from.denominator <= 0 || plan[i].to.denominator <= 0 ||
+            plan[i].decode_from.numerator < 0 || time_compare(plan[i].decode_from, plan[i].from) > 0 ||
+            time_compare(plan[i].from, segment->start) < 0 || time_compare(plan[i].to, segment->end) > 0 ||
+            time_compare(plan[i].from, plan[i].to) >= 0 ||
+            (i == 1 && plan[0].frame_count && time_compare(plan[0].to, plan[i].from) > 0))
+            return fail(writer, "Invalid Smart Trim edge range in %s", segment->path);
+        enum AVCodecID codec = video->codecpar->codec_id;
+        if (!(((codec == AV_CODEC_ID_H264 || codec == AV_CODEC_ID_HEVC) && is_mov(writer->output->oformat)) ||
+              (codec == AV_CODEC_ID_AV1 && is_matroska(writer->output->oformat))))
+            return fail(writer, "This video codec and container cannot carry a Smart Trim edge");
+        patch->start_pts = time_round(time_add(origin, plan[i].from, 1), video->time_base);
+        patch->end_pts = time_round(time_add(origin, plan[i].to, 1), video->time_base);
+        if (writer->video_origin_pts == AV_NOPTS_VALUE || patch->start_pts == AV_NOPTS_VALUE ||
+            patch->end_pts == AV_NOPTS_VALUE || patch->end_pts <= patch->start_pts)
+            return fail(writer, "The video clock cannot represent a Smart Trim edge in %s", segment->path);
+    }
+    return 0;
+}
+
+static int compare_pts(const void *lhs, const void *rhs) {
+    int64_t a = *(const int64_t *)lhs;
+    int64_t b = *(const int64_t *)rhs;
+    return (a > b) - (a < b);
+}
+
+static int edge_progress(void *context, double fraction) {
+    Writer *writer = context;
+    if (!writer->edge_cancelled)
+        writer->edge_cancelled = progress_at(writer, fraction) != 0;
+    return writer->edge_cancelled;
+}
+
+static int pending_patches(const Writer *writer) {
+    for (unsigned i = 0; i < 2; i++) {
+        if (writer->patches[i].consumed < writer->patches[i].plan.frame_count)
+            return 1;
+    }
+    return 0;
+}
+
+/* Map display-ordered replacement pictures onto the retained source decode slots.
+ * The source index proves that copied runs start and end outside the patched GOPs.
+ * Keeping the original DTS slots preserves decode order on either side of a patch. */
+static int splice_video(Writer *writer, const AVFormatContext *input, const AVStream *video, const Range *range) {
+    AVPacket *packet = writer->packet;
+    const int64_t pts = packet->pts;
+    if (pts == AV_NOPTS_VALUE)
+        return fail(writer, "A Smart Trim video packet has no presentation timestamp");
+    if (writer->track_video_config) {
+        size_t size = 0;
+        const uint8_t *extra = av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &size);
+        if (extra) {
+            if (size == 0 || size > INT_MAX)
+                return fail(writer, "Invalid source sample description in %s", input->url);
+            uint8_t *copy = av_memdup(extra, size);
+            if (!copy)
+                return fail(writer, "Cannot retain the active source sample description");
+            av_free(writer->active_config);
+            writer->active_config = copy;
+            writer->active_config_size = size;
+            writer->restore_video_config = 1;
+        }
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        EdgePatch *patch = &writer->patches[i];
+        if (!patch->plan.frame_count || pts < patch->start_pts || pts >= patch->end_pts)
+            continue;
+        if (patch->consumed >= patch->plan.frame_count)
+            return fail(writer, "More source pictures than indexed in a Smart Trim edge");
+        if (!patch->encoded) {
+            patch->source_times = av_malloc_array(patch->plan.frame_count, sizeof(int64_t));
+            patch->encoded_times = av_malloc_array(patch->plan.frame_count, sizeof(int64_t));
+            if (!patch->source_times || !patch->encoded_times)
+                return fail(writer, "Cannot verify the presentation times of the Smart Trim edge");
+            patch->encoded = mpcut_edge_open(input->url, video, patch->plan.decode_from,
+                patch->plan.from, patch->plan.to, patch->plan.frame_count, patch->plan.target_bit_rate, edge_progress,
+                writer, writer->fraction, writer->error, writer->error_capacity);
+            if (!patch->encoded)
+                return writer->edge_cancelled ? 2 : 1;
+        }
+        int index = packet->stream_index;
+        int64_t dts = packet->dts;
+        av_packet_unref(packet);
+        if (mpcut_edge_next(patch->encoded, packet) != 0)
+            return fail(writer, "The Smart Trim encoder did not produce the indexed pictures");
+        int code = mpcut_splice_encoded(packet, video->codecpar, patch->consumed == 0);
+        if (code < 0)
+            return ff_error(writer, code, "Cannot package encoded edge headers for", input->url);
+        Wide absolute = (Wide)packet->pts + writer->video_origin_pts;
+        if (packet->pts == AV_NOPTS_VALUE || absolute < patch->start_pts || absolute >= patch->end_pts ||
+            (!writer->video_dts && dts != AV_NOPTS_VALUE && dts > absolute))
+            return fail(writer, "A replacement picture cannot fit the source decode timestamps in %s", input->url);
+        packet->pts = (int64_t)absolute;
+        packet->dts = dts;
+        packet->stream_index = index;
+        patch->source_times[patch->consumed] = pts;
+        patch->encoded_times[patch->consumed] = packet->pts;
+        if (++patch->consumed == patch->plan.frame_count) {
+            qsort(patch->source_times, patch->consumed, sizeof(int64_t), compare_pts);
+            if (memcmp(patch->source_times, patch->encoded_times, patch->consumed * sizeof(int64_t)))
+                return fail(writer, "Smart Trim changed a source picture’s presentation time in %s", input->url);
+            av_freep(&patch->source_times);
+            av_freep(&patch->encoded_times);
+            mpcut_edge_free(patch->encoded);
+            patch->encoded = NULL;
+        }
+        writer->restore_video_config = 1;
+        return 0;
+    }
+    MPCutTime time = time_ticks(pts, video->time_base);
+    if (!range->whole_file && (time_compare(time, range->source_start) < 0 || time_compare(time, range->source_end) >= 0))
+        return 0;
+    const uint8_t *extra = writer->active_config ? writer->active_config : video->codecpar->extradata;
+    int size = writer->active_config ? (int)writer->active_config_size : video->codecpar->extradata_size;
+    if (writer->smart_trim) {
+        int code = mpcut_splice_check_copy(packet, video->codecpar, extra, size);
+        if (code == AVERROR(ENOTSUP))
+            return fail(writer, "Smart Trim cannot preserve in-band parameter sets in copied AVC/HEVC samples from %s", input->url);
+        if (code < 0)
+            return ff_error(writer, code, "Invalid copied video sample or configuration in", input->url);
+    }
+    if (writer->restore_video_config) {
+        int code = mpcut_splice_restore(packet, video->codecpar, extra, size);
+        if (code == AVERROR_INVALIDDATA && video->codecpar->codec_id == AV_CODEC_ID_AV1)
+            return fail(writer, "The copied AV1 sequence in %s needs a key packet and a recoverable sequence header", input->url);
+        if (code < 0)
+            return ff_error(writer, code, "Cannot restore source decoder configuration at the Smart Trim splice in", input->url);
+        writer->restore_video_config = 0;
+    }
+    return 0;
+}
+
 static int write_range(Writer *writer, AVFormatContext *input, unsigned video_index,
                        int timecode_index, const Range *range, double total_duration) {
     if (input->nb_streams != writer->range_track_count) {
@@ -1092,9 +1303,9 @@ static int write_range(Writer *writer, AVFormatContext *input, unsigned video_in
         }
     }
 
-    if (range->opus_prefix) {
-        writer->opus_prefix = av_calloc(input->nb_streams, sizeof(*writer->opus_prefix));
-        if (!writer->opus_prefix) {
+    if (range->opus_trim) {
+        writer->opus_trim = av_calloc(input->nb_streams, sizeof(*writer->opus_trim));
+        if (!writer->opus_trim) {
             return fail(writer, "Cannot allocate Opus trim state");
         }
     }
@@ -1144,12 +1355,18 @@ static int write_range(Writer *writer, AVFormatContext *input, unsigned video_in
             return result;
         }
 
+        if (video && (writer->smart_trim || writer->track_video_config)) {
+            result = splice_video(writer, input, input_track, range);
+            if (result)
+                return result;
+        }
+
         if (writer->aac_edits && !range->whole_file && input_track->codecpar->codec_id == AV_CODEC_ID_AAC) {
             AVRational output_base = writer->output->streams[packet->stream_index]->time_base;
             result = mpcut_aac_packet(writer->aac_edits, packet, input_track->time_base,
                                      output_base, writer->error, writer->error_capacity);
-        } else if (writer->opus_prefix && input_track->codecpar->codec_id == AV_CODEC_ID_OPUS) {
-            result = trim_opus_prefix(writer, input_track, range, &writer->opus_prefix[input_index]);
+        } else if (writer->opus_trim && input_track->codecpar->codec_id == AV_CODEC_ID_OPUS) {
+            result = trim_opus_packet(writer, input_track, range, &writer->opus_trim[input_index]);
         } else {
             int frame_size = range->whole_file ? 0 : pcm_frame_size(input_track->codecpar);
             result = frame_size ? slice_pcm(writer, input_track, range, frame_size)
@@ -1171,9 +1388,10 @@ static int write_range(Writer *writer, AVFormatContext *input, unsigned video_in
              * Audio PTS is monotonic, and testing after selection preserves
              * packets still needed by a rounded sample-clock boundary. */
             MPCutTime pts = retained ? (MPCutTime){0, 0} : time_ticks(source_pts, input_track->time_base);
-            int opus_finished = writer->opus_prefix && input_track->codecpar->codec_id == AV_CODEC_ID_OPUS
-                                && writer->opus_prefix[input_index].finished;
-            if (opus_finished || (pts.denominator && time_compare(pts, range->source_end) >= 0)) {
+            int opus_finished = writer->opus_trim && input_track->codecpar->codec_id == AV_CODEC_ID_OPUS
+                                && writer->opus_trim[input_index].finished;
+            if (opus_finished || (pts.denominator && time_compare(pts, range->source_end) >= 0
+                                  && (!video || !pending_patches(writer)))) {
                 writer->range_tracks[input_index] = 1;
                 remaining--;
             }
@@ -1188,11 +1406,14 @@ static int write_range(Writer *writer, AVFormatContext *input, unsigned video_in
     if (result != AVERROR_EOF) {
         return ff_error(writer, result, "Cannot read packet from", input->url);
     }
+    if (pending_patches(writer))
+        return fail(writer, "The source ended before every Smart Trim edge picture was written");
     if (!written_video) {
         return fail(writer, "No video samples in the selected range of %s", input->url);
     }
-    for (unsigned index = 0; writer->opus_prefix && index < input->nb_streams; index++) {
-        if (input->streams[index]->codecpar->codec_id == AV_CODEC_ID_OPUS && !writer->opus_prefix[index].finished) {
+    for (unsigned index = 0; writer->opus_trim && index < input->nb_streams; index++) {
+        if (input->streams[index]->codecpar->codec_id == AV_CODEC_ID_OPUS && (!writer->opus_trim[index].copied
+                || (!range->keep_audio_end && !writer->opus_trim[index].finished))) {
             return fail(writer, "Opus track %u ends before the requested trim", index);
         }
     }
@@ -1253,6 +1474,8 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             || segment->start.numerator < 0 || time_compare(segment->end, segment->start) <= 0) {
             return fail(&writer, "Segment %zu has an invalid range", index + 1);
         }
+        writer.track_video_config |= segment->multiple_descriptions;
+        writer.smart_trim |= segment->head_edge.frame_count > 0 || segment->tail_edge.frame_count > 0;
         total = time_add(total, time_add(segment->end, segment->start, -1), 1);
         if (!total.denominator) {
             return fail(&writer, "The requested duration cannot be represented");
@@ -1303,7 +1526,7 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             goto cleanup;
         }
         unsigned video_index = 0;
-        MPCutTime origin;
+        MPCutTime origin = {0, 0};
         result = video_origin(&writer, &input, &video_index, &origin);
         if (result) {
             goto cleanup;
@@ -1318,7 +1541,7 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             .keep_audio_start = index == 0 && segment->start.numerator == 0,
             .keep_audio_end = index == count - 1 && segment->reaches_end,
             .whole_file = count == 1 && segment->start.numerator == 0 && segment->reaches_end,
-            .opus_prefix = count == 1 && segment->start.numerator == 0 && !segment->reaches_end
+            .opus_trim = count == 1 && (segment->start.numerator != 0 || !segment->reaches_end)
                 && is_matroska(writer.output->oformat) && av_match_name("matroska", input->iformat->name)
         };
         range.shift = time_add(range.output_start, range.source_start, -1);
@@ -1355,17 +1578,40 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             result = fail(&writer, "Cannot allocate track read state");
             goto cleanup;
         }
-        result = position_range(&writer, &input, segment->path, video_index, timecode_index, &range);
+        /* A MOV description change can occur on a packet preceding the selected
+         * range. Scan multi-description sources from their initial state so the
+         * first retained picture gets the active configuration even after a trim. */
+        if (segment->multiple_descriptions && !is_mov(writer.output->oformat)) {
+            result = fail(&writer, "Multiple video sample descriptions require MOV or MP4 output");
+            goto cleanup;
+        }
+        av_freep(&writer.active_config);
+        writer.active_config_size = 0;
+        if (writer.track_video_config)
+            writer.restore_video_config = 1;
+        result = segment->multiple_descriptions ? 0 :
+            position_range(&writer, &input, segment->path, video_index, timecode_index, &range);
         if (result) {
             goto cleanup;
         }
         result = index ? validate_layout(&writer, input, timecode_index)
-                       : configure_output(&writer, input, range.whole_file, timecode_index, &timecode, initial_timecode);
+                       : configure_output(&writer, input, range.whole_file, timecode_index, &timecode, initial_timecode, segment);
         if (result) {
             goto cleanup;
         }
+        result = prepare_patches(&writer, input->streams[video_index], segment, origin);
+        if (result)
+            goto cleanup;
+        writer.video_dts = segment->video_dts;
+        writer.video_dts_count = segment->video_dts_count;
+        writer.video_dts_used = 0;
         result = write_range(&writer, input, video_index, timecode_index, &range, time_seconds(total));
         if (result) {
+            goto cleanup;
+        }
+
+        if (writer.video_dts_used != writer.video_dts_count) {
+            result = fail(&writer, "Fewer video samples than indexed in the Smart Trim edit");
             goto cleanup;
         }
 
@@ -1396,12 +1642,18 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
     result = progress_at(&writer, 1);
 
 cleanup:
+    for (unsigned i = 0; i < 2; i++) {
+        mpcut_edge_free(writer.patches[i].encoded);
+        av_free(writer.patches[i].source_times);
+        av_free(writer.patches[i].encoded_times);
+    }
+    av_free(writer.active_config);
     avformat_close_input(&input);
     av_packet_free(&writer.packet);
     mpcut_aac_source_free(writer.aac_source);
     mpcut_aac_free(writer.aac_edits);
     av_free(writer.last_dts);
-    av_free(writer.opus_prefix);
+    av_free(writer.opus_trim);
     av_free(writer.range_tracks);
     if (writer.output) {
         avio_closep(&writer.output->pb);

@@ -723,11 +723,11 @@ class MediaRegression(unittest.TestCase):
                     self.assertEqual(sample_hashes(output, track), sample_hashes(source, track))
                 self.assertEqual(audio(output), audio(source), "WebM priming or padding changed")
 
-    def test_webm_opus_exact_prefix_and_unsupported_join(self):
+    def test_webm_opus_range_trims_and_unsupported_join(self):
         source = self.fixture("opus-prefix.webm",
                               ["-c:v", "libvpx-vp9", "-deadline", "realtime",
                                "-pix_fmt", "yuv420p", "-g", "25"],
-                              audio_encoder="libopus", rate="25", frame_count=75)
+                              audio_encoder="libopus", rate="25", frame_count=100)
         output = self.root / "prefix.webm"
         edits = [self.edit(source, stop="1")]
         dry_run = self.export(output, edits, dry_run=True)
@@ -745,10 +745,27 @@ class MediaRegression(unittest.TestCase):
         self.assertEqual(frames(adjacent), frames(source)[:50])
         self.assertEqual(audio(adjacent), audio(source)[:4 * RATE])
 
-        invalid = self.root / "interior.webm"
-        error = self.export(invalid, [self.edit(source, "1", "2")], dry_run=True, ok=False)
-        self.assertEqual(error["error"]["segment"], 1)
-        self.assertFalse(invalid.exists())
+        trimmed = self.root / "head-trim.webm"
+        self.export(trimmed, [self.edit(source, "1")])
+        self.assertEqual(sample_hashes(trimmed), sample_hashes(source)[25:])
+        self.assertEqual(frames(trimmed), frames(source)[25:])
+        self.assertEqual(audio(trimmed), audio(source)[2 * RATE:])
+        original_audio = sample_hashes(source, "a:0")
+        kept_audio = sample_hashes(trimmed, "a:0")
+        first_packet = original_audio.index(kept_audio[0])
+        self.assertEqual(kept_audio, original_audio[first_packet:])
+
+        interior = self.root / "interior.mkv"
+        self.export(interior, [self.edit(source, "2", "3")])
+        self.assertEqual(Fraction(probe(interior, "-show_format")["format"]["duration"]), 1)
+        self.assertEqual(audio(interior), audio(source)[4 * RATE:6 * RATE])
+        reopened = self.root / "reopened.webm"
+        self.export(reopened, [self.edit(trimmed, "1", "2")])
+        self.assertEqual(Fraction(probe(reopened, "-show_format")["format"]["duration"]), 1)
+        self.assertEqual(audio(reopened), audio(interior))
+        self.assertEqual(sample_hashes(reopened), sample_hashes(interior))
+
+        invalid = self.root / "discontinuous.webm"
         self.export(invalid, [self.edit(source, stop="1"), self.edit(source, stop="1")],
                     dry_run=True, ok=False)
         self.assertFalse(invalid.exists())
