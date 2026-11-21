@@ -6,33 +6,136 @@ public struct CutEngine: Sendable {
     private let cancelled: (@Sendable () -> Bool)?
 
     private let smartTrim: Bool
+    private let useSidecar: Bool
+    let tracks: ExportTracks
+    let audioStream: Int?
+    let audioTrackOrdinal: Int?
 
-    public init(cancelled: (@Sendable () -> Bool)? = nil, smartTrim: Bool = false) {
-        self.smartTrim = smartTrim
+    /// Select an audio track by absolute stream index, or by zero-based position among each source’s audio tracks.
+    public init(cancelled: (@Sendable () -> Bool)? = nil, smartTrim: Bool = false, useSidecar: Bool = true,
+                tracks: ExportTracks = .all, audioStream: Int? = nil, audioTrackOrdinal: Int? = nil) {
+        self.tracks = tracks
+        self.audioStream = audioStream
+        self.audioTrackOrdinal = audioTrackOrdinal
+        self.smartTrim = smartTrim && tracks == .all
+        self.useSidecar = useSidecar
         self.cancelled = cancelled
     }
 
-    public func inspect(_ file: URL, keyframes: Bool = false, matchingPreview: MediaInfo? = nil) throws -> MediaInfo {
+    init(multicamSmartPicture: Bool, cancelled: (@Sendable () -> Bool)?) {
+        tracks = .video
+        audioStream = nil
+        audioTrackOrdinal = nil
+        smartTrim = multicamSmartPicture
+        useSidecar = true
+        self.cancelled = cancelled
+    }
+
+    /// Read a complete editing index if one was saved alongside the source.
+    public func cachedIndex(_ file: URL, progress: ((Double) -> Void)? = nil) throws -> MediaInfo? {
+        try checkCancellation()
+        return try cachedMedia(file.standardizedFileURL, detail: .full, progress: progress)
+    }
+
+    /// Report metadata and mux eligibility. Sample indexes may be omitted.
+    public func inspectSummary(_ file: URL) throws -> MediaInfo {
+        try checkCancellation()
+        if let cached = try cachedMedia(file.standardizedFileURL, detail: .summary) { return cached }
+        guard file.isFileURL else { throw CutError(code: "invalid_input", message: "Choose a local media file.") }
+        return try inspect(file, keyframes: false)
+    }
+
+    /// An exact audio analysis clock, including presented MOV edits when present.
+    /// A validated sidecar can supply this without reading the packet or picture index.
+    public func inspectForAudioAnalysis(_ file: URL) throws -> MediaInfo {
+        try checkCancellation()
+        guard file.isFileURL else { throw CutError(code: "invalid_input", message: "Choose a local media file.") }
+        let source = file.standardizedFileURL
+        if let cached = try cachedMedia(source, detail: .analysis) { return cached }
+        return try inspectFresh(source, keyframes: false, audioAnalysis: true)
+    }
+
+    private func cachedMedia(_ file: URL, detail: SidecarIndexDetail,
+                             expectedIdentity: SourceIdentity? = nil, progress: ((Double) -> Void)? = nil) throws -> MediaInfo? {
+        guard useSidecar, AnalysisSidecar.readsEnabled, file.isFileURL,
+              FileManager.default.fileExists(atPath: AnalysisSidecar.url(for: file).path)
+        else { return nil }
+        let sidecar = try AnalysisSidecar(source: file)
+        let identity = sidecar.identity
+        if let expectedIdentity, expectedIdentity != identity {
+            throw CutError(code: "source_changed", message: "The source changed while opening the clip.")
+        }
+        let media = try sidecar.loadIndex(detail: detail, progress: progress, cancelled: cancelled ?? { false })
+        try checkCancellation()
+        guard try SourceIdentity(file) == identity else {
+            throw CutError(code: "source_changed", message: "The source changed while loading its index.")
+        }
+        return media
+    }
+
+    public func inspect(_ file: URL, keyframes: Bool = false, matchingPreview: MediaInfo? = nil, progress: ((Double) -> Void)? = nil) throws -> MediaInfo {
+        try inspect(file, keyframes: keyframes, expectedIdentity: matchingPreview?.identity, progress: progress)
+    }
+
+    package func inspect(_ file: URL, keyframes: Bool, expectedIdentity: SourceIdentity?,
+                         progress: ((Double) -> Void)? = nil) throws -> MediaInfo {
         try checkCancellation()
         guard file.isFileURL else {
-            throw CutError(code: "invalid_input", message: "Choose a local video file.")
+            throw CutError(code: "invalid_input", message: "Choose a local media file.")
         }
-        return try Probe.read(file.standardizedFileURL, keyframes: keyframes, expectedIdentity: matchingPreview?.identity,
-                              cancelled: cancelled)
+        let url = file.standardizedFileURL
+        var restoredFraction = 0.0
+        let cacheProgress = progress.map { update in
+            { (fraction: Double) in
+                restoredFraction = max(restoredFraction, fraction)
+                update(restoredFraction)
+            }
+        }
+        if let cached = try cachedMedia(url, detail: keyframes ? .full : .audio,
+                                        expectedIdentity: expectedIdentity, progress: cacheProgress) {
+            return cached
+        }
+        // If a later section failed validation, continue from the work already reported.
+        let scanProgress = progress.map { update in
+            { (fraction: Double) in update(restoredFraction + (1 - restoredFraction) * fraction) }
+        }
+        return try inspectFresh(url, keyframes: keyframes, expectedIdentity: expectedIdentity, progress: scanProgress)
+    }
+
+    /// Continue an import after a cache miss. The editor may publish a provisional clip before this call.
+    package func inspectFresh(_ file: URL, keyframes: Bool, expectedIdentity: SourceIdentity? = nil,
+                              progress: ((Double) -> Void)? = nil, audioAnalysis: Bool = false,
+                              allowAutomaticSave: @escaping () -> Bool = { true }) throws -> MediaInfo {
+        try checkCancellation()
+        guard file.isFileURL else { throw CutError(code: "invalid_input", message: "Choose a local media file.") }
+        let url = file.standardizedFileURL
+        let persist = useSidecar && AnalysisSidecar.readsEnabled && AnalysisSidecar.automaticWritesEnabled && allowAutomaticSave()
+        let scanShare = persist ? 0.98 : 1.0
+        let media = try Probe.read(url, keyframes: keyframes || persist, audioAnalysis: audioAnalysis, expectedIdentity: expectedIdentity,
+                                   progress: progress.map { update in { update($0 * scanShare) } }, cancelled: cancelled)
+        if persist, media.hasFullEditIndex, allowAutomaticSave() {
+            let check = { [cancelled] in cancelled?() == true || !allowAutomaticSave() }
+            AnalysisSidecar(media: media).saveAutomatically(try AnalysisSidecar.indexSections(for: media,
+                progress: { progress?(scanShare + (0.999 - scanShare) * $0) }, cancelled: check), cancelled: check)
+            try verifyIdentity(url, identity: media.identity)
+        }
+        try checkCancellation()
+        progress?(1)
+        return keyframes || media.frames.isEmpty ? media : media.omittingFrames()
     }
 
     /// Container metadata for early playback. Exact edit times require inspection.
     public func inspectForPreview(_ file: URL) throws -> MediaInfo {
         try checkCancellation()
         guard file.isFileURL else {
-            throw CutError(code: "invalid_input", message: "Choose a local video file.")
+            throw CutError(code: "invalid_input", message: "Choose a local media file.")
         }
-        return try Probe.read(file.standardizedFileURL, keyframes: false, previewOnly: true, cancelled: cancelled)
+        let url = file.standardizedFileURL
+        if let cached = try cachedMedia(url, detail: .preview) { return cached }
+        return try Probe.read(url, keyframes: false, previewOnly: true, cancelled: cancelled)
     }
 
     public func checkCompatibility(_ media: MediaInfo, with reference: MediaInfo) throws {
-        let presentVideo = media.video
-        let referenceVideo = reference.video
 
         func match<Value: Equatable>(_ label: String, _ present: Value, _ expected: Value) throws {
             guard present == expected else {
@@ -47,30 +150,43 @@ public struct CutEngine: Sendable {
             }
         }
 
-        try match("video codec", presentVideo.codec, referenceVideo.codec)
-        try match("coded dimensions", "\(presentVideo.width)×\(presentVideo.height)",
-                  "\(referenceVideo.width)×\(referenceVideo.height)")
-        try match("display dimensions", "\(presentVideo.displayWidth)×\(presentVideo.displayHeight)",
-                  "\(referenceVideo.displayWidth)×\(referenceVideo.displayHeight)")
-        try match("orientation", presentVideo.rotation, referenceVideo.rotation)
-        try match("pixel aspect ratio", presentVideo.sampleAspectRatio, referenceVideo.sampleAspectRatio)
-        try match("video profile", presentVideo.profile, referenceVideo.profile)
-        try match("frame rate", presentVideo.frameRate, referenceVideo.frameRate)
-        try match("bit depth", presentVideo.bitDepth, referenceVideo.bitDepth)
-        try match("pixel format", presentVideo.pixelFormat, referenceVideo.pixelFormat)
-        try match("field order", presentVideo.fieldOrder, referenceVideo.fieldOrder)
-        try match("chroma location", presentVideo.chromaLocation, referenceVideo.chromaLocation)
-        try match("alpha depth", presentVideo.alphaBits, referenceVideo.alphaBits)
-        try match("additional video layers", presentVideo.hasAdditionalVideoLayers, referenceVideo.hasAdditionalVideoLayers)
-        try match("color primaries", presentVideo.colorPrimaries, referenceVideo.colorPrimaries)
-        try match("transfer function", presentVideo.colorTransfer, referenceVideo.colorTransfer)
-        try match("color matrix", presentVideo.colorMatrix, referenceVideo.colorMatrix)
-        try match("color range", presentVideo.colorRange, referenceVideo.colorRange)
-        try matchMetadata("video side data", presentVideo.codecMetadata, referenceVideo.codecMetadata)
-        try matchMetadata("video codec configuration", presentVideo.configuration, referenceVideo.configuration)
+        func configuration(_ stream: StreamInfo) -> Data {
+            var bytes = stream.configuration
+            if stream.codec == "flac" {
+                bytes.withUnsafeMutableBytes { (buffer: UnsafeMutableRawBufferPointer) in
+                    mpcut_normalize_flac_streaminfo(buffer.bindMemory(to: UInt8.self).baseAddress, buffer.count)
+                }
+            }
+            return bytes
+        }
+
+        try match("media type", media.hasVideo ? "video" : "audio", reference.hasVideo ? "video" : "audio")
+        if let presentVideo = media.videoStream, let referenceVideo = reference.videoStream {
+            try match("video codec", presentVideo.codec, referenceVideo.codec)
+            try match("coded dimensions", "\(presentVideo.width)×\(presentVideo.height)",
+                      "\(referenceVideo.width)×\(referenceVideo.height)")
+            try match("display dimensions", "\(presentVideo.displayWidth)×\(presentVideo.displayHeight)",
+                      "\(referenceVideo.displayWidth)×\(referenceVideo.displayHeight)")
+            try match("orientation", presentVideo.rotation, referenceVideo.rotation)
+            try match("pixel aspect ratio", presentVideo.sampleAspectRatio, referenceVideo.sampleAspectRatio)
+            try match("video profile", presentVideo.profile, referenceVideo.profile)
+            try match("frame rate", presentVideo.frameRate, referenceVideo.frameRate)
+            try match("bit depth", presentVideo.bitDepth, referenceVideo.bitDepth)
+            try match("pixel format", presentVideo.pixelFormat, referenceVideo.pixelFormat)
+            try match("field order", presentVideo.fieldOrder, referenceVideo.fieldOrder)
+            try match("chroma location", presentVideo.chromaLocation, referenceVideo.chromaLocation)
+            try match("alpha depth", presentVideo.alphaBits, referenceVideo.alphaBits)
+            try match("additional video layers", presentVideo.hasAdditionalVideoLayers, referenceVideo.hasAdditionalVideoLayers)
+            try match("color primaries", presentVideo.colorPrimaries, referenceVideo.colorPrimaries)
+            try match("transfer function", presentVideo.colorTransfer, referenceVideo.colorTransfer)
+            try match("color matrix", presentVideo.colorMatrix, referenceVideo.colorMatrix)
+            try match("color range", presentVideo.colorRange, referenceVideo.colorRange)
+            try matchMetadata("video side data", presentVideo.codecMetadata, referenceVideo.codecMetadata)
+            try matchMetadata("video codec configuration", presentVideo.configuration, referenceVideo.configuration)
+        }
 
         func layout(_ media: MediaInfo) -> [String] {
-            media.streams.map { "\($0.kind)/\($0.kind == "data" ? $0.codecTag : $0.codec)" }
+            media.streams.filter { media.hasVideo || $0.kind == "audio" }.map { "\($0.kind)/\($0.kind == "data" ? $0.codecTag : $0.codec)" }
         }
         try match("track layout", layout(media), layout(reference))
         try match("audio track count", media.audio.count, reference.audio.count)
@@ -89,13 +205,21 @@ public struct CutEngine: Sendable {
             try match("\(label) sample rate", present.sampleRate, expected.sampleRate)
             try match("\(label) channel count", present.channels, expected.channels)
             try match("\(label) channel layout", present.channelLayout, expected.channelLayout)
-            try matchMetadata("\(label) codec configuration", present.configuration, expected.configuration)
+            try matchMetadata("\(label) codec configuration", configuration(present), configuration(expected))
             try matchMetadata("\(label) side data", present.codecMetadata, expected.codecMetadata)
         }
     }
 
-    public func suggestedContainers(for media: MediaInfo) -> [String] {
-        guard media.copyIssue == nil else { return [] }
+    public func suggestedContainers(for original: MediaInfo) -> [String] {
+        guard let media = try? selectedMedia(original), media.copyIssue == nil else { return [] }
+        if !media.hasVideo {
+            return preferredAudioContainers(media).filter { container in
+                if let supported = media.reportedContainers {
+                    return supported.contains(container) && singlePacketOpusMuxIssue(media, container: container) == nil
+                }
+                return muxIssue(media, container: container) == nil
+            }
+        }
         let sources = Set(media.format.split(separator: ","))
         let original = media.url.pathExtension.lowercased()
         let aliases: [(demuxer: String, extensions: [String])] = [
@@ -123,12 +247,15 @@ public struct CutEngine: Sendable {
             !container.isEmpty && considered.insert(container).inserted &&
                 (!media.video.multipleDescriptions || ["mov", "mp4", "m4v"].contains(container)) &&
                 media.audio.allSatisfy { $0.presentationEdits.isEmpty || supportsAACEdits($0.stream, container: container) } &&
-                muxIssue(media, container: container) == nil
+                singlePacketOpusMuxIssue(media, container: container) == nil &&
+                (media.reportedContainers?.contains(container) ?? (muxIssue(media, container: container) == nil))
         }
     }
 
     public func validBoundaries(in media: MediaInfo, start: Bool, first: Bool = true,
                                 last: Bool = true, container: String? = nil) -> [RationalTime] {
+        guard let media = try? selectedMedia(media) else { return [] }
+        if !media.hasVideo { return audioPacketBoundaries(media, starting: start) }
         let effectiveContainer = container ?? suggestedContainers(for: media).first
             ?? media.url.pathExtension.lowercased()
         return boundarySet(in: media, start: start, first: first, last: last, container: effectiveContainer,
@@ -137,6 +264,7 @@ public struct CutEngine: Sendable {
 
     public func linkedAudioBoundaryIssue(in media: MediaInfo, at time: RationalTime, start: Bool,
                                          first: Bool, last: Bool, container: String) -> CutError? {
+        guard media.hasVideo else { return nil }
         let boundaries = boundarySet(in: media, start: start, first: first, last: last, container: container)
         guard boundaries.rejected[time] != nil else { return nil }
         do {
@@ -168,15 +296,17 @@ public struct CutEngine: Sendable {
             let file = clip.file.standardizedFileURL
             let info: MediaInfo
             do {
-                if let cached = indexed[file], cached.url == file, !cached.frames.isEmpty {
+                let original: MediaInfo
+                if let cached = indexed[file], cached.url == file, cached.hasFullEditIndex {
                     if firstOccurrence[file] == nil {
                         try verifyIdentity(file, identity: cached.identity)
                     }
-                    info = cached
+                    original = cached
                 } else {
-                    info = try inspect(file, keyframes: true)
-                    indexed[file] = info
+                    original = try inspect(file, keyframes: true)
+                    indexed[file] = original
                 }
+                info = try selectedMedia(original)
                 if let issue = info.copyIssue {
                     throw CutError(code: "unsupported_tracks", message: issue)
                 }
@@ -205,7 +335,7 @@ public struct CutEngine: Sendable {
             }
             for info in uniqueMedia {
                 try checkCancellation()
-                if info.video.multipleDescriptions && !["mov", "mp4", "m4v"].contains(explicit) {
+                if info.videoStream?.multipleDescriptions == true && !["mov", "mp4", "m4v"].contains(explicit) {
                     throw CutError(code: "unsupported_container",
                                    message: "This source uses multiple video sample descriptions and requires MOV or MP4 output.",
                                    segment: firstOccurrence[info.url])
@@ -220,10 +350,10 @@ public struct CutEngine: Sendable {
         }
 
         var defaultFailure: CutError?
-        for candidate in suggestedContainers(for: sequence[0]) {
+        for candidate in suggestedContainers(for: indexed[sequence[0].url] ?? sequence[0], clips: clips) {
             try checkCancellation()
             if !uniqueMedia.dropFirst().allSatisfy({
-                (!$0.video.multipleDescriptions || ["mov", "mp4", "m4v"].contains(candidate))
+                ($0.videoStream?.multipleDescriptions != true || ["mov", "mp4", "m4v"].contains(candidate))
                     && muxIssue($0, container: candidate) == nil
             }) {
                 continue
@@ -242,6 +372,10 @@ public struct CutEngine: Sendable {
 
     private func resolveSequence(_ clips: [ClipRequest], sequence: [MediaInfo], uniqueMedia: [MediaInfo],
                                  container: String, snap: SnapMode) throws -> ResolvedEdit {
+        if !sequence[0].hasVideo {
+            return try resolveAudioRanges(clips, sequence: sequence, uniqueMedia: uniqueMedia,
+                                          container: container, snap: snap)
+        }
         var boundaries: [BoundaryKey: Boundaries] = [:]
         do {
             return try resolveRanges(clips, sequence: sequence, uniqueMedia: uniqueMedia,
@@ -277,8 +411,11 @@ public struct CutEngine: Sendable {
                           other != segment || side != field else { continue }
                     let info = sequence[other - 1]
                     let requested = side == "from" ? clips[other - 1].from ?? .zero : clips[other - 1].to ?? info.duration
-                    let times = cachedBoundaries(in: info, start: side == "from", first: other == 1,
-                                                 last: other == clips.count, container: container,
+                    // Merged ranges report errors by clip index, but their edge rules follow the merged position.
+                    let merged = effectiveRanges(replacement, sequence: sequence, container: container)
+                    let group = merged.firstIndex { ($0.startIndex...$0.endIndex).contains(other) }
+                    let times = cachedBoundaries(in: info, start: side == "from", first: group == 0,
+                                                 last: group == merged.count - 1, container: container,
                                                  cache: &boundaries).times
                     let position = times.lowerBound { $0 >= requested }
                     if position == times.endIndex || times[position] != requested {
@@ -300,14 +437,15 @@ public struct CutEngine: Sendable {
 
     /// Contiguous ranges from the same file can share decoder state across their seam.
     public func coalescesAdjacentRanges(in media: MediaInfo, container: String) -> Bool {
-        smartTrim || container == "webm" || (container == "mkv" &&
+        !media.hasVideo || tracks == .audio || smartTrim || container == "webm" || (container == "mkv" &&
             media.audio.contains(where: { matroskaAudioCodec($0, media: media) != nil }))
     }
 
-    private func resolveRanges(_ clips: [ClipRequest], sequence: [MediaInfo], uniqueMedia: [MediaInfo],
-                               container: String, snap: SnapMode, includeSuggestions: Bool,
-                               boundaries: inout [BoundaryKey: Boundaries]) throws -> ResolvedEdit {
-        var effective: [(startIndex: Int, endIndex: Int, clip: ClipRequest, info: MediaInfo)] = []
+    private typealias EffectiveRange = (startIndex: Int, endIndex: Int, clip: ClipRequest, info: MediaInfo)
+
+    /// Requested clips after merging contiguous ranges that share decoder state. Indices are one-based.
+    private func effectiveRanges(_ clips: [ClipRequest], sequence: [MediaInfo], container: String) -> [EffectiveRange] {
+        var effective: [EffectiveRange] = []
         for (offset, pair) in zip(clips, sequence).enumerated() {
             let (request, info) = pair
             let index = offset + 1
@@ -321,6 +459,13 @@ public struct CutEngine: Sendable {
                 effective.append((index, index, request, info))
             }
         }
+        return effective
+    }
+
+    private func resolveRanges(_ clips: [ClipRequest], sequence: [MediaInfo], uniqueMedia: [MediaInfo],
+                               container: String, snap: SnapMode, includeSuggestions: Bool,
+                               boundaries: inout [BoundaryKey: Boundaries]) throws -> ResolvedEdit {
+        let effective = effectiveRanges(clips, sequence: sequence, container: container)
 
         var segments: [ResolvedSegment] = []
         var silentAACSegments: [Int: Int] = [:]
@@ -414,7 +559,7 @@ public struct CutEngine: Sendable {
             }
             let whole = first && last && from == .zero && to == info.duration
             let movieOrigin = whole && ["mov", "mp4", "m4v", "3gp", "3g2"].contains(container)
-                ? min(.zero, info.audio.lazy.filter { $0.stream.hasDeclaredStart }.map { $0.stream.start }.min() ?? .zero)
+                ? min(.zero, info.audio.lazy.map { $0.stream.hasDeclaredStart ? $0.stream.start : $0.start }.min() ?? .zero)
                 : .zero
             let trackStart = try duration.subtracting(movieOrigin)
             let trackEnd = try end.subtracting(movieOrigin)
@@ -448,6 +593,7 @@ public struct CutEngine: Sendable {
                                             tracks: tracks, sourceOrigin: info.origin, lastVideoFrame: lastFrame.time,
                                             reachesEnd: to == info.duration,
                                             multipleDescriptions: info.video.multipleDescriptions,
+                                            sourceClipIndex: index - 1,
                                             encodedEdges: edges.isEmpty ? nil : edges))
             duration = end
         }
@@ -462,7 +608,7 @@ public struct CutEngine: Sendable {
                 let kept = frames[lower..<upper]
                 let decodeTimes = kept.compactMap(\.dts).sorted()
                 guard decodeTimes.count == kept.count else {
-                    throw CutError(code: "unsupported_container", message: "Missing video decode timestamps.", segment: index + 1)
+                    throw CutError(code: "unsupported_container", message: "Missing video decode timestamps.", segment: request.startIndex)
                 }
                 // Leave at least the source decoder's lead at every retained packet slot,
                 // including reordered B pictures. Replacing an edge sorts its PTS within
@@ -479,9 +625,11 @@ public struct CutEngine: Sendable {
             }
         }
 
-        for track in silentAACSegments.keys.sorted() where !audibleAACTracks.contains(track) {
+        for position in silentAACSegments.keys.sorted() where !audibleAACTracks.contains(position) {
+            let segment = silentAACSegments[position]!
+            let track = sequence[segment - 1].audio[position].stream.index
             throw CutError(code: "unsafe_boundary", message: "AAC track \(track) has no audible samples in the selected ranges.",
-                           segment: silentAACSegments[track], track: track)
+                           segment: segment, track: track)
         }
         if let track = sequence[0].streams.first(where: { $0.kind == "data" && $0.codecTag == "tmcd" }) {
             try checkTimecode(segments, duration: duration, container: container, track: track.index)
@@ -490,7 +638,7 @@ public struct CutEngine: Sendable {
             try verifyIdentity(info.url, identity: info.identity)
         }
         return ResolvedEdit(segments: segments, duration: duration, container: container,
-                            identities: Dictionary(uniqueKeysWithValues: uniqueMedia.map { ($0.url, $0.identity) }))
+                            identities: Dictionary(uniqueKeysWithValues: uniqueMedia.map { ($0.url, $0.identity) }), tracks: tracks)
     }
 
     public func export(_ edit: ResolvedEdit, to output: URL,
@@ -498,7 +646,7 @@ public struct CutEngine: Sendable {
         try export(edit, to: output, audioOnly: false, progress: progress)
     }
 
-    func export(_ edit: ResolvedEdit, to output: URL, audioOnly: Bool,
+    func export(_ edit: ResolvedEdit, to output: URL, audioOnly: Bool, programAudio: Bool = false,
                 progress: ((Double) -> Bool)? = nil) throws {
         try checkCancellation()
         try checkDestination(output)
@@ -527,9 +675,12 @@ public struct CutEngine: Sendable {
         }
         var diagnostic = [CChar](repeating: 0, count: 2048)
         let diagnosticCapacity = diagnostic.count
-        let result = try withNativeSegments(edit.segments) { buffer in
+        let result = try withNativeSegments(edit.segments, useAudioStreamOverride: programAudio || edit.usesPerSourceAudioStream) { buffer in
             withExtendedLifetime(bridge) {
-                mpcut_write(buffer.baseAddress, buffer.count, partial.path, audioOnly ? 1 : 0, ExportProgress.callback,
+                let selection = programAudio ? Int32(MPCUT_TRACKS_PROGRAM_AUDIO)
+                    : audioOnly ? Int32(MPCUT_TRACKS_LINKED_AUDIO) : edit.tracks.native
+                return mpcut_write(buffer.baseAddress, buffer.count, partial.path, selection,
+                            Int32(edit.audioStream ?? -1), ExportProgress.callback,
                             Unmanaged.passUnretained(bridge).toOpaque(), &diagnostic, diagnosticCapacity)
             }
         }
@@ -549,9 +700,10 @@ public struct CutEngine: Sendable {
             try verifyIdentity(source, identity: identity)
         }
         try checkCancellation()
-        guard renamex_np(partial.path, destination.path, UInt32(RENAME_EXCL)) == 0 else {
-            if errno == EEXIST { throw destinationExists }
-            throw CutError(code: "write_failed", message: String(cString: strerror(errno)))
+        let failure = publishExclusively(from: partial, to: destination)
+        guard failure == 0 else {
+            if failure == EEXIST { throw destinationExists }
+            throw CutError(code: "write_failed", message: String(cString: strerror(failure)))
         }
     }
 
@@ -576,7 +728,7 @@ public struct CutEngine: Sendable {
         }
     }
 
-    private func withNativeSegments<Result>(_ segments: [ResolvedSegment],
+    private func withNativeSegments<Result>(_ segments: [ResolvedSegment], useAudioStreamOverride: Bool = false,
                                             body: (UnsafeBufferPointer<MPCutSegment>) -> Result) throws -> Result {
         let paths = segments.map { segment in
             segment.file.withUnsafeFileSystemRepresentation { path in path.flatMap { strdup($0) } }
@@ -613,7 +765,8 @@ public struct CutEngine: Sendable {
                     let count = segment.videoDecodeTimes.count
                     let start = count == 0 ? nil : ticks.baseAddress?.advanced(by: cursor)
                     cursor += count
-                    return MPCutSegment(path: UnsafePointer(path), start: nativeTime(segment.from), end: nativeTime(segment.to),
+                    return MPCutSegment(path: UnsafePointer(path), start: nativeTime(segment.wholeAudioOrigin == nil ? segment.from : .zero),
+                                        end: nativeTime(segment.wholeAudioOrigin == nil ? segment.to : segment.duration),
                                         last_video_frame: segment.lastVideoFrame.map(nativeTime) ?? MPCutTime(),
                                         reaches_end: segment.reachesEnd ? 1 : 0,
                                         opus_pre_skip: skips.baseAddress, opus_track_count: skips.count,
@@ -621,20 +774,38 @@ public struct CutEngine: Sendable {
                                         tail_edge: nativeEdge(segment.encodedEdges?.last(where: { $0.from != segment.from })),
                                         multiple_descriptions: segment.multipleDescriptions ? 1 : 0,
                                         video_dts: start, video_dts_count: count,
-                                        source_origin: segment.sourceOrigin.map(nativeTime) ?? MPCutTime())
+                                        source_origin: (segment.wholeAudioOrigin ?? segment.sourceOrigin).map(nativeTime) ?? MPCutTime(),
+                                        output_start: nativeTime(segment.outputStart),
+                                        audio_stream_override: useAudioStreamOverride && segment.tracks.count == 1 && segment.tracks[0].kind == "audio"
+                                            ? UInt32(segment.tracks[0].index) + 1 : 0)
                 }
                 return native.withUnsafeBufferPointer(body)
             }
         }
     }
 
-    private func verifyIdentity(_ source: URL, identity: SourceIdentity) throws {
+    func verifyIdentity(_ source: URL, identity: SourceIdentity) throws {
         guard (try? SourceIdentity(source)) == identity else {
             throw CutError(code: "source_changed", message: "The source changed since inspection: \(source.lastPathComponent)")
         }
     }
 
-    private func muxIssue(_ media: MediaInfo, container: String) -> String? {
+    private func singlePacketOpusMuxIssue(_ media: MediaInfo, container: String) -> String? {
+        // A single Matroska packet cannot preserve both Opus preskip and tail padding
+        // through the muxer's timestamp adjustment. Ogg granule positions retain both.
+        if ["mka", "mkv", "webm"].contains(container),
+           let track = media.audio.first(where: { audio in
+               guard audio.stream.codec == "opus", audio.packets.count == 1,
+                     let packet = audio.packets.first else { return false }
+               return (packet.skipSamples > 0 || audio.stream.initialPadding > 0) && packet.discardSamples > 0
+           }) {
+            return "Matroska cannot preserve both leading and trailing trim in the single packet on Opus track \(track.stream.index). Use Ogg Opus for this soundtrack."
+        }
+        return nil
+    }
+
+    func muxIssue(_ media: MediaInfo, container: String) -> String? {
+        if let issue = singlePacketOpusMuxIssue(media, container: container) { return issue }
         var diagnostic = [CChar](repeating: 0, count: 2048)
         let capacity = diagnostic.count
         let paddedOpus = media.audio.first { audio in
@@ -648,8 +819,11 @@ public struct CutEngine: Sendable {
             let ticks = try? delay.multiplied(by: RationalTime(numerator: clock.denominator, denominator: clock.numerator))
             return ticks?.denominator != 1
         }
+        if !media.hasVideo, let issue = audioContainerIssue(media, container: container) { return issue }
+        let selection: ExportTracks = media.hasVideo ? tracks : .audio
+        let selectedStream = audioTrackOrdinal == nil ? audioStream : media.streams.first?.index
         let result = mpcut_check_mux(media.url.path, "movie.\(container)", Int32(paddedOpus?.stream.index ?? -1),
-                                     &diagnostic, capacity)
+                                     selection.native, Int32(selectedStream ?? -1), &diagnostic, capacity)
         return result == 0 ? nil : String(cString: diagnostic)
     }
 
@@ -657,7 +831,25 @@ public struct CutEngine: Sendable {
         CutError(code: "cancelled", message: "The operation was cancelled.")
     }
 
-    private func checkCancellation() throws {
+    private func validateMP3Crop(_ stream: StreamInfo, in media: MediaInfo, from: RationalTime, to: RationalTime,
+                                segment: Int) throws {
+        let start = try media.origin.adding(from).roundedToSamples(stream.sampleRate)
+        let end = try media.origin.adding(to).roundedToSamples(stream.sampleRate)
+        var error = [CChar](repeating: 0, count: 512)
+        let capacity = error.count
+        let bridge = ExportProgress { _ in self.cancelled?() != true }
+        let result = withExtendedLifetime(bridge) {
+            mpcut_check_mp3_crop(media.url.path, Int32(stream.index), start, end, ExportProgress.callback,
+                                 Unmanaged.passUnretained(bridge).toOpaque(), &error, capacity)
+        }
+        if result == 2 { throw cancellationError }
+        try checkCancellation()
+        guard result == 0 else {
+            throw CutError(code: "unsafe_boundary", message: String(cString: error), segment: segment, track: stream.index)
+        }
+    }
+
+    func checkCancellation() throws {
         if cancelled?() == true { throw cancellationError }
     }
 
@@ -665,7 +857,7 @@ public struct CutEngine: Sendable {
         CutError(code: "output_exists", message: "A file already exists at the destination.")
     }
 
-    private func checkDestination(_ url: URL) throws {
+    package func checkDestination(_ url: URL) throws {
         guard url.isFileURL, !url.hasDirectoryPath else {
             throw CutError(code: "invalid_output", message: "Choose a local destination file.")
         }
@@ -675,7 +867,8 @@ public struct CutEngine: Sendable {
         let failure = errno
         guard failure == ENOENT,
               stat(destination.deletingLastPathComponent().path, &status) == 0,
-              (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else {
+              (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR),
+              access(destination.deletingLastPathComponent().path, W_OK | X_OK) == 0 else {
             throw CutError(code: "invalid_output", message: "The destination folder is unavailable.")
         }
     }
@@ -739,7 +932,9 @@ private extension CutEngine {
         // The index is already in presentation order, including for sources with B pictures.
         var candidates: [RationalTime] = []
         if frameAccurate || media.video.codec == "prores" { candidates.reserveCapacity(media.frames.count) }
-        if start && media.sourceStartSafe { candidates.append(.zero) }
+        if start && media.sourceStartSafe, let first = media.frames.first, first.time >= .zero {
+            candidates.append(first.time)
+        }
         for frame in media.frames where frameAccurate || (start ? frame.canStart : frame.canEnd) {
             if frame.time > .zero && frame.time < media.duration && candidates.last != frame.time {
                 candidates.append(frame.time)
@@ -837,19 +1032,22 @@ private extension CutEngine {
         return [before, after].compactMap { $0 }
     }
 
-    func supportsAACEdits(_ track: StreamInfo, container: String) -> Bool {
-        track.codec == "aac" && ["mov", "mp4", "m4v"].contains(container)
-    }
+}
 
+extension CutEngine {
     func trackWindows(_ media: MediaInfo, from: RationalTime, to: RationalTime,
                       outputStart: RationalTime, outputEnd: RationalTime, first: Bool, last: Bool,
                       whole: Bool, container: String, segment: Int,
                       silentAACSegments: inout [Int: Int], audibleAACTracks: inout Set<Int>) throws -> [ResolvedTrack] {
-        var tracks: [ResolvedTrack] = [
-            ResolvedTrack(index: media.video.index, kind: "video", sourceStart: from, sourceEnd: to,
-                          outputStart: outputStart, outputEnd: outputEnd)
-        ]
-        for audio in media.audio {
+        var tracks: [ResolvedTrack] = []
+        if let video = media.videoStream {
+            tracks.append(ResolvedTrack(index: video.index, kind: "video", sourceStart: from, sourceEnd: to,
+                                        outputStart: outputStart, outputEnd: outputEnd))
+        }
+        let reachesAudioEnd = to == media.duration && (media.hasVideo || preservesAudioEnd(media))
+        // Output audio tracks are matched by position. Absolute stream indexes can
+        // change between files when a selection omits picture or auxiliary streams.
+        for (position, audio) in media.audio.enumerated() {
             let track = audio.stream
             var opusPreSkip: Int32?
             // Reopened crops can contain multiple full packets of hidden decoder history.
@@ -874,19 +1072,25 @@ private extension CutEngine {
                     sourceStart = try RationalTime(numerator: window.start, denominator: 48_000).subtracting(media.origin)
                     sourceEnd = try RationalTime(numerator: window.end, denominator: 48_000).subtracting(media.origin)
                 } else {
-                    sourceStart = audio.start
-                    sourceEnd = audio.end
+                    let span = media.hasVideo ? audio.start...audio.end : try audio.audibleBounds(origin: media.origin)
+                    sourceStart = span.lowerBound
+                    sourceEnd = span.upperBound
                 }
                 trackOutputStart = try outputStart.adding(sourceStart)
                 trackOutputEnd = try outputStart.adding(sourceEnd)
-                if track.codec == "aac" { audibleAACTracks.insert(track.index) }
+                if track.codec == "aac" { audibleAACTracks.insert(position) }
+            } else if first && last && supportsMP3Crop(track, media: media, container: container) {
+                try validateMP3Crop(track, in: media, from: from, to: to, segment: segment)
+                sourceStart = from
+                sourceEnd = to
+                trackOutputStart = outputStart
+                trackOutputEnd = outputEnd
             } else if first && last && supportsOpusTrim(audio, media: media, container: container) {
-                let reachesEnd = to == media.duration
-                guard let window = audio.opusWindow, !reachesEnd || window.complete else {
+                guard let window = audio.opusWindow, !reachesAudioEnd || window.complete else {
                     throw CutError(code: "unsafe_boundary", message: "Opus track \(track.index) has discontinuous packet timing.",
                                    segment: segment, boundary: "to", track: track.index)
                 }
-                let endSample = reachesEnd ? window.end : try media.origin.adding(to).roundedToSamples(48_000)
+                let endSample = reachesAudioEnd ? window.end : try media.origin.adding(to).roundedToSamples(48_000)
                 guard window.containsEnd(endSample) else {
                     throw CutError(code: "unsafe_boundary", message: "Opus track \(track.index) cannot preserve the requested end.",
                                    segment: segment, boundary: "to", track: track.index)
@@ -914,7 +1118,11 @@ private extension CutEngine {
                 }
                 if track.isPCM {
                     let ticksPerSample = try track.timeBase.multiplied(by: RationalTime(numerator: Int64(sampleRate)))
-                    guard ticksPerSample.numerator == 1, container == "mov", audio.pcmContinuity else {
+                    if !media.hasVideo && ["mka", "mkv", "webm"].contains(container) {
+                        throw CutError(code: "unsupported_container",
+                                       message: "Matroska uses a millisecond clock. Choose WAV, AIFF, CAF or MOV for an exact PCM cut.")
+                    }
+                    guard ticksPerSample.numerator == 1, container == "mov" || !media.hasVideo, audio.pcmContinuity else {
                         throw CutError(code: "unsupported_tracks",
                                        message: "Track \(track.index) needs a sample-accurate PCM clock for this edit.",
                                        segment: segment, track: track.index)
@@ -941,9 +1149,9 @@ private extension CutEngine {
                 if supportsAACEdits(track, container: container) {
                     if try checkAACCoverage(audio, origin: media.origin, start: sourceSample,
                                             end: wantedEnd, segment: segment) {
-                        audibleAACTracks.insert(track.index)
-                    } else if silentAACSegments[track.index] == nil {
-                        silentAACSegments[track.index] = segment
+                        audibleAACTracks.insert(position)
+                    } else if silentAACSegments[position] == nil {
+                        silentAACSegments[position] = segment
                     }
                 }
                 var sourceAnchor = sourceSample
@@ -974,12 +1182,13 @@ private extension CutEngine {
                 )
             } else {
                 let keepLeading = first && from == .zero
-                let keepTrailing = last && to == media.duration
+                let keepTrailing = last && reachesAudioEnd
                 var audibleStart: RationalTime?
                 var audibleEnd: RationalTime?
-                for (index, packet) in audio.packets.enumerated() {
+                let lower = keepLeading ? 0 : audio.packets.lowerBound { $0.time >= from }
+                let upper = keepTrailing ? audio.packets.count : audio.packets.lowerBound { $0.time >= to }
+                for (index, packet) in audio.packets[lower..<upper].enumerated() {
                     if index.isMultiple(of: 1_024) { try checkCancellation() }
-                    if (!keepLeading && packet.time < from) || (!keepTrailing && packet.time >= to) { continue }
                     let packetEnd = try packet.time.adding(packet.duration)
                     if !keepTrailing && (packetEnd > to || packet.discardSamples > 0) {
                         throw CutError(code: "unsafe_boundary", message: "The end crosses a compressed audio packet or its padding.",
@@ -989,6 +1198,8 @@ private extension CutEngine {
                         throw CutError(code: "unsafe_boundary", message: "The start crosses compressed audio priming.",
                                        segment: segment, boundary: "from", track: track.index)
                     }
+                    // The first Vorbis packet initializes the overlap window but yields no PCM.
+                    if track.codec == "vorbis" && lower == 0 && index == 0 { continue }
                     guard track.sampleRate > 0 else { continue }
                     let clock = Int64(track.sampleRate)
                     let start = try packet.time.adding(RationalTime(numerator: Int64(packet.skipSamples), denominator: clock))
@@ -1002,12 +1213,12 @@ private extension CutEngine {
                         audibleEnd = max(audibleEnd ?? end, end)
                     }
                 }
-                guard let audibleStart, let audibleEnd else {
+                guard let audibleStart, let audibleEnd, max(audibleStart, audio.start) < min(audibleEnd, audio.end) else {
                     throw CutError(code: "unsafe_boundary", message: "The range contains no audible compressed audio packets.",
                                    segment: segment, boundary: "to", track: track.index)
                 }
-                sourceStart = audibleStart
-                sourceEnd = audibleEnd
+                sourceStart = max(audibleStart, audio.start)
+                sourceEnd = min(audibleEnd, audio.end)
                 trackOutputStart = try outputStart.adding(sourceStart.subtracting(from))
                 trackOutputEnd = try outputStart.adding(sourceEnd.subtracting(from))
             }
@@ -1029,9 +1240,10 @@ private extension CutEngine {
         if !audio.presentationEdits.isEmpty {
             var covered = start
             var audible = false
-            for (index, edit) in audio.presentationEdits.enumerated() {
+            let lower = audio.presentationEdits.lowerBound { $0.samples.upperBound > start }
+            for index in lower..<audio.presentationEdits.count {
                 if index.isMultiple(of: 1_024) { try checkCancellation() }
-                if edit.samples.upperBound <= covered { continue }
+                let edit = audio.presentationEdits[index]
                 guard edit.samples.lowerBound <= covered else { throw discontinuity(covered) }
                 audible = audible || edit.isAudible
                 covered = edit.samples.upperBound
@@ -1044,7 +1256,10 @@ private extension CutEngine {
         let (prerollStart, prerollOverflow) = start.subtractingReportingOverflow(2_048)
         var nextSample: Int64?
         var covered = start
-        for (index, packet) in audio.packets.enumerated() {
+        let prerollTime = try RationalTime(numerator: prerollOverflow ? start : prerollStart,
+                                          denominator: Int64(rate)).subtracting(origin)
+        let lower = max(0, audio.packets.lowerBound { $0.time >= prerollTime } - 1)
+        for (index, packet) in audio.packets[lower...].enumerated() {
             if index.isMultiple(of: 1_024) { try checkCancellation() }
             let first = try origin.adding(packet.time).roundedToSamples(rate)
             if first >= end { break }

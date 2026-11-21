@@ -107,7 +107,7 @@ int mpcut_aac_begin(MPCutAAC *aac, unsigned index, int sample_rate, MPCutTime sr
 }
 
 int mpcut_aac_packet(MPCutAAC *aac, AVPacket *packet, AVRational input_tb,
-                     AVRational output_tb, char *error, size_t cap) {
+                     AVRational output_tb, int keep_tail_duration, char *error, size_t cap) {
     AudioTrack *track = &aac->tracks[packet->stream_index];
     AVRational sample_tb = {1, track->sample_rate};
     int64_t first = av_rescale_q(packet->pts, input_tb, sample_tb);
@@ -160,8 +160,10 @@ int mpcut_aac_packet(MPCutAAC *aac, AVPacket *packet, AVRational input_tb,
                                AV_PKT_DATA_SKIP_SAMPLES);
     packet->dts = track->media_end;
     packet->pts = track->media_end;
-    packet->duration = coded_length;
-    track->media_end += coded_length;
+    // Preserve an explicitly shortened last stts sample in a complete
+    // soundtrack. Splices need the full decoder cadence between access units.
+    packet->duration = keep_tail_duration ? length : coded_length;
+    track->media_end += packet->duration;
     return 0;
 }
 
@@ -515,6 +517,27 @@ int mpcut_aac_finalize(MPCutAAC *aac, const char *path, char *error, size_t cap)
     return ok ? 0 : errorf(error, cap, "Cannot write AAC track edits to %s", path);
 }
 
+int mpcut_align_copied_aac(const char *path, unsigned index, int rate, int64_t priming,
+                           MPCutTime start, MPCutTime end, int movie_timescale,
+                           char *error, size_t cap) {
+    if (index >= INT_MAX || rate <= 0 || priming < 0 || movie_timescale <= 0)
+        return errorf(error, cap, "Invalid AAC track timing.");
+    MPCutAAC *layout = mpcut_aac_create(index + 1, movie_timescale);
+    if (!layout)
+        return errorf(error, cap, "Could not allocate the AAC edit list.");
+    int status = 0;
+    if (start.numerator > 0)
+        status = mpcut_aac_empty(layout, index, rate, (MPCutTime){0, 1}, start, error, cap);
+    if (!status)
+        status = mpcut_aac_begin(layout, index, rate, (MPCutTime){0, 1}, start, end, error, cap);
+    if (!status)
+        status = append_edit(layout, index, priming, error, cap);
+    if (!status)
+        status = mpcut_aac_finalize(layout, path, error, cap);
+    mpcut_aac_free(layout);
+    return status;
+}
+
 typedef struct AACSourceTrack {
     struct AACSourceTrack *next;
     int id;
@@ -650,7 +673,15 @@ int mpcut_aac_source_open(const char *path, MPCutAACSource **source, char *error
     uint8_t *bytes = malloc(size);
     int ok = bytes && !fseeko(file, offset, SEEK_SET) && fread(bytes, 1, size, file) == size;
     fclose(file);
-    MPCutAACSource *map = ok ? calloc(1, sizeof(*map)) : NULL;
+    if (!ok) {
+        free(bytes);
+        return errorf(error, cap, "Cannot read MOV AAC track metadata in %s", path);
+    }
+    MPCutAACSource *map = calloc(1, sizeof(*map));
+    if (!map) {
+        free(bytes);
+        return errorf(error, cap, "Cannot allocate AAC edit state");
+    }
     Box moov, mvhd;
     uint32_t timescale;
     size_t duration_offset, duration_width;
@@ -680,4 +711,53 @@ int mpcut_aac_source_open(const char *path, MPCutAACSource **source, char *error
         mpcut_aac_source_free(map);
     }
     return 0;
+}
+
+/* A raw (-ignore_editlist) copy retains all coded access units in the source's
+ * media clock. Install its original sample-to-presentation mapping on the new
+ * track, shifting only its presentation in the destination movie. */
+int mpcut_restore_copied_aac(const char *source_path, int source_id, const char *output_path,
+                             unsigned index, MPCutTime shift, int movie_timescale,
+                             char *error, size_t cap) {
+    MPCutAACSource *source = NULL;
+    int status = mpcut_aac_source_open(source_path, &source, error, cap);
+    if (status) return status;
+    size_t count = 0;
+    int rate = 0;
+    const MPCutAACSourceEdit *edits = mpcut_aac_source_track(source, source_id, &count, &rate);
+    if (!edits || !count || index >= INT_MAX || rate <= 0 || movie_timescale <= 0) {
+        mpcut_aac_source_free(source);
+        return errorf(error, cap, "The copied AAC presentation edits are unavailable.");
+    }
+    MPCutAAC *layout = mpcut_aac_create(index + 1, movie_timescale);
+    if (!layout) {
+        mpcut_aac_source_free(source);
+        return errorf(error, cap, "Could not allocate the copied AAC edit list.");
+    }
+    int64_t offset = ticks(shift, rate);
+    if (offset == INT64_MIN) status = errorf(error, cap, "Invalid AAC presentation offset.");
+    if (!status && offset > 0)
+        status = mpcut_aac_empty(layout, index, rate, (MPCutTime){0, 1},
+                                 (MPCutTime){offset, rate}, error, cap);
+    for (size_t i = 0; i < count && !status; i++) {
+        if (offset > 0 && edits[i].presentation_end > INT64_MAX - offset) {
+            status = errorf(error, cap, "The AAC presentation offset overflows.");
+            break;
+        }
+        int64_t from = edits[i].presentation_start + offset;
+        int64_t end = edits[i].presentation_end + offset;
+        if (edits[i].media_start >= 0 && from < 0) {
+            status = errorf(error, cap, "The AAC presentation starts before movie time zero.");
+            break;
+        }
+        if (end <= 0) continue; /* The original leading silence preceded the new movie. */
+        if (from < 0) from = 0;
+        status = mpcut_aac_begin(layout, index, rate, (MPCutTime){0, 1},
+                                 (MPCutTime){from, rate}, (MPCutTime){end, rate}, error, cap);
+        if (!status) status = append_edit(layout, index, edits[i].media_start, error, cap);
+    }
+    if (!status) status = mpcut_aac_finalize(layout, output_path, error, cap);
+    mpcut_aac_free(layout);
+    mpcut_aac_source_free(source);
+    return status;
 }

@@ -1,41 +1,67 @@
 # Frame editing and export modes
 
-Proposed design for the next MPCut update. A new GUI session starts with **Snap to Keyframes** off and **Smart Trim** selected for export.
+On first launch, the desktop app starts with **Snap To → Off** and **Smart Trim** for video. Change these defaults in **MPCut → Settings… → General**. Standalone audio uses **Lossless Copy**. [Editor settings](USAGE.md#set-editing-and-export-defaults)
 
 ## Timeline
 
-Put one **Snap to Keyframes** checkbox beside timeline zoom. Put the three export modes in the export sheet. Each control has one job.
+Choose **Off**, **Keyframes**, **Scenes**, or **Silence** in the **Snap To** menu beside timeline zoom. Choose the export mode in the export sheet.
 
 - With snapping off, a trim handle lands on the nearest actual source-frame boundary. Use presentation timestamps for variable-frame-rate footage. The preview shows the first retained frame at the left handle and the last retained frame at the right handle. The right boundary is exclusive.
-- With snapping on, a handle lands on a verified copy-safe boundary for that edge and the current sequence, using the preferred copy container. Show the effective time and picture during the drag. Apply the same rule when committing a split or marked deletion. If a linked audio track prevents a cut, identify the affected track.
-- Scrubbing, frame stepping, keyframe stepping, and placing marks remain available in either state. Changing the checkbox affects subsequent edits. Previously chosen ranges stay where the user placed them. Dragging into faded footage still restores it.
+- With **Keyframes** selected, a handle lands on a verified copy-safe boundary for that edge and the current sequence, using the preferred copy container. The preview shows the effective time and picture during the drag. Splits and marked deletions follow the same rule. If linked audio prevents the cut, MPCut identifies the affected track.
+- **Scenes** and **Silence** use detected scene changes or pause edges. Video edits follow picture boundaries. On an audio-only timeline, use **Off** or **Silence** with the audio edit clock.
+- On video timelines, scrubbing, frame stepping, keyframe stepping, and placing marks are available with any snap target. Changing the target affects subsequent edits. Previously chosen ranges stay where the user placed them. Dragging into faded footage still restores it.
 
 ## Export sheet
 
-Use one native save sheet with filename, location, mode, and container. Remember the last explicit choice within the open session. Recheck availability for the selected container and the entire timeline.
+From an ordinary timeline, press **⌘E** to choose the filename, location, mode, and container. The sheet starts with the movie export mode from Settings and checks the selected container against the entire timeline. Use **File → Export Media As** to open it in a particular mode.
 
 | Mode | Result | Information in the sheet |
 | --- | --- | --- |
-| Smart Trim | Copy complete sections. Encode the necessary video edges at a source-matched bitrate on supported footage. Copy the entire range when all cuts are safe, including frame-aligned ProRes. | Show copied duration and encoded duration. If a short selection needs every frame encoded, show that before export. |
-| Lossless Copy | Copy the retained picture and sound into a compatible container. This is also the whole-file remux path. | Show the duration and container. If a cut is unsafe, identify its clip, time and nearest verified alternatives. |
-| Re-encode | Encode the complete retained video timeline with the selected hardware encoder. Audio follows the displayed audio setting. | Show the codec, quality, effective audio choice, and output dimensions. |
+| Smart Trim | Copies complete sections and encodes the necessary video edges at a source-matched bitrate on supported footage. Copies the entire range when all cuts are safe, including frame-aligned ProRes. | Copied and encoded video duration, with a message when every selected picture needs encoding. |
+| Lossless Copy | Copies the retained picture and sound into a compatible container. Use it to remux a whole file. | Duration and container. For an unsafe cut, review the clip, time and verified alternatives when available. |
+| Re-encode | Encodes the retained timeline with the selected hardware video encoder. | Video codec, quality, output dimensions, and the planned action for each audio track. |
 
-Changing a mode or cancelling the sheet preserves the edit. If Lossless Copy requires different bounds, offer **Review Cuts** with the original and proposed times and total duration change. **Apply to Timeline** makes one undoable edit and returns to the timeline for preview. The user can also keep their cuts and select any eligible mode. If Smart Trim cannot handle a particular edge or audio join, name the reason and offer Re-encode explicitly.
+Changing a mode or cancelling the sheet preserves the edit. If Lossless Copy requires different bounds, choose **Review Cuts** to compare the original and proposed times and total duration change. **Apply to Timeline** makes one undoable edit and returns to the timeline for preview. To keep the original ranges, choose another eligible mode. If Smart Trim reports an unsupported edge or audio join, preflight Re-encode.
+
+The **Video** and **Audio** checkboxes also let you copy just one track type into an eligible container. With audio alone, the **Tracks** picker can select one soundtrack from a multitrack recording. The export queue offers the same track choices for a batch. To swap one soundtrack in a whole movie and preserve its start time, use **File → Replace Source Audio…** or the CLI's `export --replace-audio`. [Track export and replacement](USAGE.md#edit-audio-and-export-tracks)
 
 ## Basic conversion settings
 
-| Setting | Proposed first version |
+| Setting | Supported choices |
 | --- | --- |
-| Container | MP4, MOV, MKV for conversion. Copy and Smart Trim retain the existing compatible containers, including WebM. |
-| Video | H.264, HEVC, ProRes via VideoToolbox. Offer combinations verified for the selected Mac, output container and source format. |
+| Container | MP4, MOV or MKV for H.264 and HEVC. MOV or MKV for ProRes. Copy and Smart Trim support other compatible containers, including WebM. |
+| Video | H.264, HEVC or ProRes via VideoToolbox. Availability depends on the Mac, container and source format. |
 | Quality | Smaller File, Balanced, High Quality for H.264 and HEVC. Use 422 LT, 422 and 422 HQ for ProRes. |
-| Audio | Auto, Copy Original, AAC, PCM, Remove Audio. Auto prefers exact copying. Otherwise it shows the chosen conversion before export. Preserve linked tracks, channel layouts and sync. |
+| Audio | Auto, Copy Original, AAC, PCM. Clear Audio in the desktop export sheet to copy only the picture. Auto copies audio when the edit and destination permit it. The sheet shows which tracks need conversion. |
 
-Default to MP4, H.264, Balanced and Auto audio for ordinary SDR footage. Selecting ProRes suggests MOV, ProRes 422 and PCM when audio needs conversion. Carry through display orientation, resolution, frame timing and color where the selected combination can represent them. Flag incompatible choices such as an alpha source with a 422 output profile. Keep the existing compatible-clip timeline and RAW exclusion.
+Conversion starts with MP4, H.264, Balanced and Auto audio. ProRes starts with MOV and the 422 profile. Auto uses PCM when ProRes output needs audio conversion. Preflight checks display orientation, resolution, frame timing, and color against the selected format. It rejects combinations that would discard alpha, such as a transparent source with a ProRes 422 output profile.
 
-## Implementation and acceptance
+## CLI defaults and preflight
 
-1. Store the ordered source ranges at frame precision. Today the editor validates ordinary handle drags and imports through the copy planner. Split basic timeline validity from mode-specific export eligibility, so a playable clip can be edited for conversion even when a packet-copy join is impossible.
-2. Extend the shared preflight to report the effective mode, ranges, copied and encoded durations, and per-track actions or reasons. Reuse the existing copy and Smart Trim writers. The GUI defaults to Smart Trim. Existing CLI commands keep the copy-only default, `--smart-trim` remains an alias, and explicit `--mode copy|smart|encode` works with dry runs and JSON.
-3. Bundle the arm64 FFmpeg executable and capabilities needed for conversion. The current shipping build contains media libraries and selected edge encoders. Pass structured arguments directly to the helper. Honor exact ordered ranges, feed the video encoder once across the assembled sequence, and support progress, cancellation and staged output. Check actual hardware encoder availability before starting.
-4. On a long-GOP clip, drag to 3.000 s between safe points at 0 and 5 s. Verify both handles, preview, split, delete and undo with snapping off and on. Open and cancel each export mode and compare the saved frame bounds. With Smart Trim, hash the copied middle. With Lossless Copy, hash retained packets. With Re-encode, verify first and last pictures, total frames, A/V sync and orientation. Include a VFR clip, rotated footage, ProRes, a discontinuous audio join, and a Mac or configuration lacking the selected encoder.
+| Request | Default mode and boundaries |
+| --- | --- |
+| Ordinary `export` without an explicit order | Copy at exact boundaries |
+| `export --project` or `export --stdin` with multicam project clips | Smart Trim at exact boundaries |
+| `export --order`, `bulk`, scene exports | Smart Trim at exact boundaries for video |
+| Silence exports | Smart Trim for video. The planner chooses eligible boundaries inside the detected pauses |
+| `rearrange` | Smart Trim with nearest boundaries for video |
+| Explicit `--tracks audio` or `--tracks video` | Copy the selected streams |
+| `export --replace-audio` | Copy a matching track into a new version of the whole source |
+
+Use `mpcut help export --json` for supported combinations and a request template. An export validates the edit and destination before writing. Add `--dry-run --json` to review its resolved ranges, copied and encoded durations, and per-track actions without writing the output. Conversion checks hardware availability on the Mac running the command.
+
+## Multicam exports
+
+Multicam resolves picture and sound separately on the same output clock. A continuous fixed master is checked across each retained range, independent of camera switches. Audio joins still need validation when the soundtrack changes or the assembly jumps in time.
+
+From the CLI, `mpcut export --project interview.multicam.json --output interview.mov --json` validates and writes the saved assembly, or the whole group if there is no assembly. Add `--dry-run` for an optional preflight with the same settings. In a multicam window, press **⌘E** to open the **Export** inspector. Choose **Current assembly** or **Whole group**, then run **Check Export** or go directly to **Export…**. Both choices use the current edit, including unsaved changes. For full conversion in the inspector, run **Check Re-encode** to enable **Export Re-encoded…**. Use **Export Queue** (⇧⌘E) to preflight and export multiple selections to separate numbered files. [Multicam export queue](USAGE.md#queue-multicam-exports-and-replace-the-soundtrack)
+
+| Mode | Requirements for a multicam project |
+| --- | --- |
+| Smart Trim | The chosen picture boundaries must be exact and the selected video streams compatible. MPCut copies safe ranges and encodes supported video edges as needed. Sound must support copy at its own boundaries. |
+| Lossless Copy | At each picture switch, both the outgoing end and incoming start must be copy-safe at the same group time. Choose a new switch time explicitly if preflight suggests one. Real audio joins must also be copy-safe. |
+| Re-encode | The selected video streams must fit the conversion planner's compatibility checks. `--audio auto` and `--audio copy` require sound that can be copied. Choose `--audio aac` for AAC in MOV, MP4, or M4V, `--audio pcm` for PCM in MOV or MKV, or `--audio remove` to encode just the picture. |
+
+`--tracks video` checks and copies only picture. `--tracks audio` checks and copies only the project's selected sound. With one track type, omit `--mode` or choose `--mode copy`. Change soundtrack sources in the project. For project cuts, submit revised times explicitly when preflight reports an unsafe boundary. The CLI accepts MOV, MP4, M4V, MKV, or WebM when both tracks are eligible for the container. The desktop inspector offers MOV, MP4, M4V and MKV, with WAV also available for sound-only export. [Multicam CLI examples](USAGE.md#inspect-and-export-a-project-from-the-cli)
+
+The shared integration suite compares packet hashes, decoded samples and picture order, including variable frame rate, rotation, linked audio, and unavailable encoders. [Release checks](../AUDIT.md#reproduce-the-release-checks)

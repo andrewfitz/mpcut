@@ -29,6 +29,10 @@ struct MPPreviewDecoder {
     int audio_rate;
     enum AVSampleFormat audio_format;
     bool audio_unavailable;
+    int audio_failures;
+    int video_failures;
+    bool met_damage;
+    bool late_damage;
     bool audio_enabled;
     bool audio_only;
     bool eof;
@@ -97,10 +101,22 @@ static CMTime timestamp_time(int64_t timestamp, AVRational base)
     return CMTimeMultiplyByRatio(CMTimeMake(timestamp, base.den), base.num, 1);
 }
 
-static bool open_stream(MPPreviewDecoder *preview, PreviewStream *stream, enum AVMediaType type)
+static int find_stream(const AVFormatContext *format, enum AVMediaType type, int ordinal)
+{
+    for (unsigned index = 0; index < format->nb_streams; index++) {
+        const AVStream *stream = format->streams[index];
+        if (stream->codecpar->codec_type != type || (stream->disposition & AV_DISPOSITION_ATTACHED_PIC))
+            continue;
+        if (ordinal-- == 0)
+            return (int)index;
+    }
+    return -1;
+}
+
+static bool open_stream(MPPreviewDecoder *preview, PreviewStream *stream, int index, enum AVMediaType type)
 {
     const AVCodec *decoder = NULL;
-    stream->index = av_find_best_stream(preview->format, type, -1, -1, NULL, 0);
+    stream->index = index;
     if (stream->index < 0)
         return false;
     AVStream *source = preview->format->streams[stream->index];
@@ -130,7 +146,8 @@ failure:
     return false;
 }
 
-MPPreviewDecoder *mp_preview_open(const char *path, bool video_only, MPPreviewCancelled cancelled,
+MPPreviewDecoder *mp_preview_open(const char *path, enum MPPreviewTracks tracks, int audio_ordinal, CMTime origin,
+                                 MPPreviewCancelled cancelled,
                                  void *context, const char **error)
 {
     *error = "Could not allocate the preview decoder.";
@@ -152,27 +169,50 @@ MPPreviewDecoder *mp_preview_open(const char *path, bool video_only, MPPreviewCa
     preview->format->max_analyze_duration = 2 * AV_TIME_BASE;
     if (avformat_find_stream_info(preview->format, NULL) < 0)
         goto failure;
-    *error = "This video stream has no compatible VideoToolbox decoder.";
-    if (!open_stream(preview, &preview->video, AVMEDIA_TYPE_VIDEO))
-        goto failure;
+    preview->audio_only = tracks == MPPreviewSoundOnly;
+    preview->audio_enabled = tracks != MPPreviewPictureOnly;
+    preview->video.index = -1;
     preview->audio.index = -1;
-    preview->audio_enabled = !video_only;
-    if (video_only) {
-        for (unsigned i = 0; i < preview->format->nb_streams; i++) {
-            if ((int)i != preview->video.index)
-                preview->format->streams[i]->discard = AVDISCARD_ALL;
-        }
-    } else if (!open_stream(preview, &preview->audio, AVMEDIA_TYPE_AUDIO)) {
-        preview->audio_unavailable = preview->audio.index >= 0;
+    int picture = find_stream(preview->format, AVMEDIA_TYPE_VIDEO, 0);
+    // Match the index's picture selection. A default cover image is still
+    // attached artwork and must not replace the timed stream or its clock.
+    if (!preview->audio_only && !open_stream(preview, &preview->video, picture, AVMEDIA_TYPE_VIDEO)) {
+        *error = "This video stream has no compatible VideoToolbox decoder.";
+        goto failure;
     }
-    AVStream *video = preview->format->streams[preview->video.index];
-    preview->origin = video->start_time == AV_NOPTS_VALUE ? preview->format->start_time
-        : av_rescale_q(video->start_time, video->time_base, AV_TIME_BASE_Q);
-    if (preview->origin == AV_NOPTS_VALUE)
-        preview->origin = 0;
-    preview->timeline_origin = video->start_time == AV_NOPTS_VALUE
-        ? CMTimeMake(preview->origin, AV_TIME_BASE)
-        : timestamp_time(video->start_time, video->time_base);
+    int first_audio = find_stream(preview->format, AVMEDIA_TYPE_AUDIO, 0);
+    int audio = audio_ordinal >= 0 ? find_stream(preview->format, AVMEDIA_TYPE_AUDIO, audio_ordinal) :
+        picture < 0 ? first_audio : av_find_best_stream(preview->format, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    if (preview->audio_enabled && !open_stream(preview, &preview->audio, audio, AVMEDIA_TYPE_AUDIO)) {
+        preview->audio_unavailable = preview->audio.index >= 0;
+        if (preview->audio_only && preview->audio_unavailable) {
+            *error = "This audio stream has no compatible decoder.";
+            goto failure;
+        }
+    }
+    for (unsigned i = 0; i < preview->format->nb_streams; i++) {
+        if ((int)i != preview->video.index && (int)i != preview->audio.index)
+            preview->format->streams[i]->discard = AVDISCARD_ALL;
+    }
+
+    // A scrub of a movie's audio uses its picture clock even when decoding sound alone.
+    int clock = preview->video.index;
+    if (clock < 0)
+        clock = picture >= 0 ? picture : first_audio;
+    if (clock < 0) {
+        *error = "The source contains no playable stream.";
+        goto failure;
+    }
+    AVStream *stream = preview->format->streams[clock];
+    if (CMTIME_IS_NUMERIC(origin))
+        preview->timeline_origin = origin;
+    else if (stream->start_time != AV_NOPTS_VALUE)
+        preview->timeline_origin = timestamp_time(stream->start_time, stream->time_base);
+    else
+        preview->timeline_origin = CMTimeMake(preview->format->start_time == AV_NOPTS_VALUE ?
+                                              0 : preview->format->start_time, AV_TIME_BASE);
+    preview->origin = CMTimeConvertScale(preview->timeline_origin, AV_TIME_BASE,
+                                         kCMTimeRoundingMethod_RoundHalfAwayFromZero).value;
     preview->awaiting_keyframe = true;
     *error = NULL;
     return preview;
@@ -184,24 +224,30 @@ failure:
 
 const AVStream *mp_preview_prepare_edge(MPPreviewDecoder *preview)
 {
-    if (!preview || preview->hardware.session)
+    if (!preview || !preview->video.codec || preview->hardware.session)
         return NULL;
     const AVStream *stream = preview->format->streams[preview->video.index];
     const AVCodecParameters *codec = stream->codecpar;
     bool full_range = codec->color_range == AVCOL_RANGE_JPEG || codec->format == AV_PIX_FMT_YUVJ420P;
-    if (codec->format != AV_PIX_FMT_YUV420P && codec->format != AV_PIX_FMT_YUVJ420P)
+    bool main10 = codec->codec_id == AV_CODEC_ID_HEVC && codec->profile == AV_PROFILE_HEVC_MAIN_10 &&
+                  codec->format == AV_PIX_FMT_YUV420P10LE;
+    if (!main10 && codec->format != AV_PIX_FMT_YUV420P && codec->format != AV_PIX_FMT_YUVJ420P)
         return NULL;
     preview->encoding_edge = true;
     preview->video.codec->err_recognition |= AV_EF_EXPLODE;
-    preview->hardware.cv_pix_fmt_type = full_range ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+    if (main10)
+        preview->hardware.cv_pix_fmt_type = full_range ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                                                       : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+    else
+        preview->hardware.cv_pix_fmt_type = full_range ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
                                                   : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     return stream;
 }
 
 void mp_preview_coded_size(const MPPreviewDecoder *preview, int *width, int *height)
 {
-    *width = preview->video.codec->coded_width;
-    *height = preview->video.codec->coded_height;
+    *width = preview->video.codec ? preview->video.codec->coded_width : 0;
+    *height = preview->video.codec ? preview->video.codec->coded_height : 0;
 }
 
 void mp_preview_close(MPPreviewDecoder *preview)
@@ -233,12 +279,6 @@ void mp_preview_enable_audio(MPPreviewDecoder *preview, bool enabled)
     }
 }
 
-void mp_preview_select_audio_only(MPPreviewDecoder *preview)
-{
-    preview->audio_only = true;
-    preview->format->streams[preview->video.index]->discard = AVDISCARD_ALL;
-}
-
 bool mp_preview_has_audio(const MPPreviewDecoder *preview)
 {
     return preview->audio_enabled && preview->audio.codec && !preview->audio_unavailable;
@@ -251,6 +291,8 @@ bool mp_preview_has_unavailable_audio(const MPPreviewDecoder *preview)
 
 CGAffineTransform mp_preview_transform(const MPPreviewDecoder *preview)
 {
+    if (preview->video.index < 0)
+        return CGAffineTransformIdentity;
     const AVStream *stream = preview->format->streams[preview->video.index];
     const AVPacketSideData *side = av_packet_side_data_get(stream->codecpar->coded_side_data,
         stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
@@ -303,7 +345,7 @@ static int seek_transport_stream(MPPreviewDecoder *preview, int64_t target)
     return av_seek_frame(preview->format, -1, 0, AVSEEK_FLAG_BYTE);
 }
 
-bool mp_preview_seek(MPPreviewDecoder *preview, double seconds)
+static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_timeline_origin)
 {
     if (!isfinite(seconds) || seconds < 0 || seconds >= (double)INT64_MAX / AV_TIME_BASE)
         return false;
@@ -311,9 +353,15 @@ bool mp_preview_seek(MPPreviewDecoder *preview, double seconds)
     if (preview->origin > 0 && target > INT64_MAX - preview->origin)
         return false;
     int result;
-    if (preview->audio_only && mp_preview_has_audio(preview)) {
+    if (preview->audio_only) {
+        if (!preview->audio.codec)
+            return !preview->audio_unavailable;
         // Decode a little audio preroll for transform codecs, independently of the video GOP.
         int64_t absolute = preview->origin + FFMAX(0, target - AV_TIME_BASE / 4);
+        // The raw MP3 demuxer gives encoded packet zero PTS zero, but the
+        // first audible sample can be several reservoir frames later.
+        if (target <= AV_TIME_BASE / 4 && strcmp(preview->format->iformat->name, "mp3") == 0)
+            absolute = 0;
         int64_t ticks = av_rescale_q(absolute, AV_TIME_BASE_Q, preview->format->streams[preview->audio.index]->time_base);
         result = av_seek_frame(preview->format, preview->audio.index, ticks, AVSEEK_FLAG_BACKWARD);
     } else if (strcmp(preview->format->iformat->name, "mpegts") == 0) {
@@ -329,13 +377,21 @@ bool mp_preview_seek(MPPreviewDecoder *preview, double seconds)
             ticks = nearest;
         int64_t start = video->start_time != AV_NOPTS_VALUE ? video->start_time :
             av_rescale_q(preview->origin, AV_TIME_BASE_Q, video->time_base);
+        // Presented times count from the timeline origin. A caller can place it before
+        // the first picture, as multicam does for a movie whose picture starts late.
+        // Round down so the backward seek cannot start after the requested picture.
+        CMTime origin = preview->timeline_origin;
+        if (from_timeline_origin && CMTIME_IS_NUMERIC(origin) && origin.timescale > 0)
+            start = av_rescale_q_rnd(origin.value, (AVRational){1, origin.timescale}, video->time_base,
+                                     (origin.value < 0 ? AV_ROUND_UP : AV_ROUND_DOWN) | AV_ROUND_PASS_MINMAX);
         if (ticks >= 0x1p63L || (start > 0 && (int64_t)ticks > INT64_MAX - start))
             return false;
         result = av_seek_frame(preview->format, preview->video.index, start + (int64_t)ticks, AVSEEK_FLAG_BACKWARD);
     }
     if (result < 0)
         return false;
-    avcodec_flush_buffers(preview->video.codec);
+    if (preview->video.codec)
+        avcodec_flush_buffers(preview->video.codec);
     if (preview->audio.codec)
         avcodec_flush_buffers(preview->audio.codec);
     swr_free(&preview->resampler);
@@ -344,9 +400,27 @@ bool mp_preview_seek(MPPreviewDecoder *preview, double seconds)
     preview->receiving = NULL;
     preview->eof = false;
     preview->awaiting_keyframe = true;
+    // A damaged packet silences the rest of that pass only. A missing decoder stays unavailable.
+    preview->audio_unavailable = preview->audio.index >= 0 && !preview->audio.codec;
+    preview->audio_failures = 0;
+    preview->video_failures = 0;
+    preview->met_damage = false;
+    preview->late_damage = false;
     av_packet_unref(preview->packet);
     av_frame_unref(preview->frame);
     return true;
+}
+
+/* Seconds count from the video track's first picture, whatever origin was given to mp_preview_open. */
+bool mp_preview_seek(MPPreviewDecoder *preview, double seconds)
+{
+    return seek_preview(preview, seconds, false);
+}
+
+/* Seconds count from the origin that presented sample times are measured from. */
+bool mp_preview_seek_timeline(MPPreviewDecoder *preview, double seconds)
+{
+    return seek_preview(preview, seconds, true);
 }
 
 static CMTime sample_time(const MPPreviewDecoder *preview, const PreviewStream *stream)
@@ -490,6 +564,49 @@ static bool edge_metadata_supported(const AVFrame *frame)
     return true;
 }
 
+// The decoder drops a packet it rejects, so one damaged packet is a brief
+// dropout. About two seconds of consecutive failures is an undecodable stream.
+static bool damaged_audio_packet(MPPreviewDecoder *preview, int result)
+{
+    return result == AVERROR_INVALIDDATA && ++preview->audio_failures <= 100;
+}
+
+static const char *const damaged_edge_picture =
+    "A source picture needed to re-encode this cut is damaged and could not be decoded. "
+    "Move the cut to a keyframe or away from the damage.";
+
+bool mp_preview_met_damage(const MPPreviewDecoder *preview)
+{
+    return preview->met_damage;
+}
+
+bool mp_preview_edge_intact_before_damage(const MPPreviewDecoder *preview)
+{
+    return preview->met_damage && !preview->late_damage;
+}
+
+// libavcodec reports a packet it cannot parse as invalid data. VideoToolbox reports a picture
+// it cannot decode as an unknown or external error. Later pictures can be predicted from the
+// rejected one, so none is returned until a keyframe restarts decoding. A preview drops the
+// decoder's state and resumes at the next keyframe. A Smart Trim edge must not lose a picture:
+// it stops reading and drains the pictures that were decoded before the damage. A session
+// that keeps failing is a decoder fault rather than damage.
+static bool is_picture_damage(int result)
+{
+    return result == AVERROR_INVALIDDATA || result == AVERROR_UNKNOWN || result == AVERROR_EXTERNAL;
+}
+
+static bool damaged_video_picture(MPPreviewDecoder *preview, int result)
+{
+    if (preview->encoding_edge || !is_picture_damage(result) || ++preview->video_failures > 32)
+        return false;
+    if (getenv("MPCUT_DAMAGE_TRACE")) fprintf(stderr, "preview damage %d\n", result);
+    preview->met_damage = true;
+    avcodec_flush_buffers(preview->video.codec);
+    preview->awaiting_keyframe = true;
+    return true;
+}
+
 int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const char **error)
 {
     *sample = NULL;
@@ -520,8 +637,10 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
                         *error = "VideoToolbox could not decode this stream in hardware.";
                         return MPPreviewError;
                     }
+                    preview->video_failures = 0;
                     *sample = video_sample(preview);
                 } else {
+                    preview->audio_failures = 0;
                     *sample = audio_sample(preview);
                 }
                 av_frame_unref(preview->frame);
@@ -539,14 +658,32 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
                 stream->drained = true;
             else if (result != AVERROR(EAGAIN)) {
                 if (stream == &preview->video) {
-                    *error = "VideoToolbox could not decode this stream.";
+                    if (getenv("MPCUT_DAMAGE_TRACE")) fprintf(stderr, "receive failure %d\n", result);
+                    if (damaged_video_picture(preview, result))
+                        continue;
+                    // A failure reported here can follow packets that were already sent, so
+                    // an edge has no later picture that is known to be intact.
+                    if (is_picture_damage(result)) {
+                        preview->late_damage = preview->late_damage || !preview->met_damage;
+                        preview->met_damage = true;
+                    }
+                    *error = preview->encoding_edge && preview->met_damage
+                        ? damaged_edge_picture : "VideoToolbox could not decode this stream.";
                     return MPPreviewError;
+                }
+                if (damaged_audio_packet(preview, result)) {
+                    preview->receiving = stream;
+                    continue;
                 }
                 preview->audio_unavailable = true;
             }
         }
         if (preview->eof) {
             PreviewStream *stream = &preview->video;
+            if (preview->encoding_edge && preview->met_damage && stream->drained) {
+                *error = damaged_edge_picture;
+                return MPPreviewError;
+            }
             if (preview->audio_only || stream->drained)
                 stream = &preview->audio;
             if (stream->drained || !stream->codec || (stream == &preview->audio && !mp_preview_has_audio(preview)))
@@ -557,6 +694,11 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
             } else if (result == 0 || result == AVERROR(EAGAIN)) {
                 preview->receiving = stream;
             } else if (stream == &preview->video) {
+                if (is_picture_damage(result)) {
+                    preview->met_damage = true;
+                    stream->drained = true;
+                    continue;
+                }
                 *error = "VideoToolbox could not finish decoding this stream.";
                 return MPPreviewError;
             } else {
@@ -589,10 +731,21 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
             continue;
         if (result < 0) {
             if (stream == &preview->video) {
+                if (getenv("MPCUT_DAMAGE_TRACE")) fprintf(stderr, "send failure %d\n", result);
+                if (damaged_video_picture(preview, result))
+                    continue;
+                if (preview->encoding_edge && is_picture_damage(result)) {
+                    // Nothing after the rejected packet is sent. The pictures still held by
+                    // the decoder came from earlier packets and are returned before the error.
+                    preview->met_damage = true;
+                    preview->eof = true;
+                    continue;
+                }
                 *error = "VideoToolbox could not decode this stream.";
                 return MPPreviewError;
             }
-            preview->audio_unavailable = true;
+            if (!damaged_audio_packet(preview, result))
+                preview->audio_unavailable = true;
         } else {
             preview->receiving = stream;
         }

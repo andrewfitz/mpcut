@@ -1,14 +1,23 @@
 import AVFoundation
+import MPCutCore
 
 struct ScrubAudioRequest {
     let source: URL
     let composition: AVAsset?
+    let audioOrigin: RationalTime?
+    let audioTrack: Int?
+    let presentationTrackID: CMPersistentTrackID?
     let window: Range<Double>
     let reverse: Bool
 
-    init?(source: URL, composition: AVAsset?, position: Double, bounds: Range<Double>, reverse: Bool) {
+    init?(source: URL, composition: AVAsset?, position: Double, bounds: Range<Double>, reverse: Bool,
+          audioOrigin: RationalTime? = nil, audioTrack: Int? = nil,
+          presentationTrackID: CMPersistentTrackID? = nil) {
         guard bounds.lowerBound < bounds.upperBound else { return nil }
         self.source = source
+        self.audioOrigin = audioOrigin
+        self.audioTrack = audioTrack
+        self.presentationTrackID = presentationTrackID
         self.composition = composition
         self.reverse = reverse
         let point = min(max(position, bounds.lowerBound), bounds.upperBound)
@@ -26,7 +35,7 @@ struct ScrubGrain {
     let rate: Double
     var stereo: [Float]
 
-    init?(samples: [CMSampleBuffer], window: Range<Double>, reverse: Bool) {
+    init?(samples: [CMSampleBuffer], window: Range<Double>, reverse: Bool, fadeEdges: Bool = true) {
         guard let format = samples.first?.formatDescription,
               let first = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
               first.mSampleRate > 0, first.mSampleRate <= 768_000 else { return nil }
@@ -61,6 +70,7 @@ struct ScrubGrain {
                 stereo.swapAt(i * 2 + 1, j * 2 + 1)
             }
         }
+        guard fadeEdges else { return }
         let ramp = max(1, Int(rate * 0.003))
         for i in 0..<min(count, ramp) {
             let gain = Float(i) / Float(ramp)
@@ -77,10 +87,28 @@ actor ScrubAudioReader {
     private let fallback = FFPreviewReader(audioOnly: true)
 
     func grain(_ request: ScrubAudioRequest) -> ScrubGrain? {
+        read(source: request.source, composition: request.composition, window: request.window,
+             reverse: request.reverse, fadeEdges: true, audioOrigin: request.audioOrigin, audioTrack: request.audioTrack,
+             presentationTrackID: request.presentationTrackID)
+    }
+
+    func read(source: URL, composition: AVAsset?, window: Range<Double>, reverse: Bool, fadeEdges: Bool,
+              audioOrigin: RationalTime? = nil, audioTrack: Int? = nil,
+              presentationTrackID: CMPersistentTrackID? = nil) -> ScrubGrain? {
         guard !Task.isCancelled else { return nil }
         let samples: [CMSampleBuffer]
-        if let asset = request.composition {
-            let tracks = asset.tracks(withMediaType: .audio)
+        if composition != nil || presentationTrackID != nil {
+            let asset = composition ?? AVURLAsset(url: source, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+            let origin: CMTime
+            let tracks: [AVAssetTrack]
+            if let presentationTrackID {
+                guard let track = asset.track(withTrackID: presentationTrackID), track.mediaType == .audio else { return nil }
+                tracks = [track]
+                origin = audioOrigin.map(previewTime) ?? .zero
+            } else {
+                tracks = asset.tracks(withMediaType: .audio)
+                origin = .zero
+            }
             guard !tracks.isEmpty, let reader = try? AVAssetReader(asset: asset) else { return nil }
             let output = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: [
                 AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2,
@@ -89,20 +117,28 @@ actor ScrubAudioReader {
             ])
             guard reader.canAdd(output) else { return nil }
             reader.add(output)
-            reader.timeRange = CMTimeRange(start: CMTime(seconds: request.window.lowerBound, preferredTimescale: 1_000_000_000),
-                                           end: CMTime(seconds: request.window.upperBound, preferredTimescale: 1_000_000_000))
+            reader.timeRange = CMTimeRange(start: origin + CMTime(seconds: window.lowerBound, preferredTimescale: 1_000_000_000),
+                                           end: origin + CMTime(seconds: window.upperBound, preferredTimescale: 1_000_000_000))
             guard reader.startReading() else { return nil }
             defer { reader.cancelReading() }
             var buffers: [CMSampleBuffer] = []
-            while !Task.isCancelled, let sample = output.copyNextSampleBuffer() { buffers.append(sample) }
+            while !Task.isCancelled, let sample = output.copyNextSampleBuffer() {
+                if origin == .zero {
+                    buffers.append(sample)
+                } else if let mapped = FFPreviewReader.timelineAudio(sample, target: window.lowerBound + origin.seconds,
+                                                                   end: window.upperBound + origin.seconds,
+                                                                   offset: .zero - origin) {
+                    buffers.append(mapped)
+                }
+            }
             samples = buffers
         } else {
             samples = (try? fallback.perform(cancelled: { Task.isCancelled }) {
-                try fallback.scrubSamples(url: request.source, range: request.window)
+                try fallback.scrubSamples(url: source, range: window, audioOrigin: audioOrigin, audioTrack: audioTrack)
             }) ?? []
         }
         guard !Task.isCancelled else { return nil }
-        return ScrubGrain(samples: samples, window: request.window, reverse: request.reverse)
+        return ScrubGrain(samples: samples, window: window, reverse: reverse, fadeEdges: fadeEdges)
     }
 }
 

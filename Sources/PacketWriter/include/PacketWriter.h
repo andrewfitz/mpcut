@@ -4,6 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Clear recording-specific fields in a FLAC STREAMINFO decoder configuration. */
+void mpcut_normalize_flac_streaminfo(uint8_t *bytes, size_t size);
+
 typedef struct {
     int64_t numerator;
     int64_t denominator;
@@ -30,7 +33,9 @@ typedef struct {
     int multiple_descriptions; /* Source MOV contains multiple video sample descriptions. */
     const MPCutTime *video_dts; /* Optional output decode slots for Smart Trim MOV splices. */
     size_t video_dts_count;
-    MPCutTime source_origin; /* Indexed video presentation origin, when available. */
+    MPCutTime source_origin; /* Indexed video or audio presentation origin, when available. */
+    MPCutTime output_start; /* Planned movie time of the range start. Positive in a whole MOV copy whose linked audio leads. */
+    unsigned audio_stream_override; /* Absolute audio stream index + 1, or 0 to use the export-wide selector. */
 } MPCutSegment;
 
 /* AAC presentation edits in their track's native sample clock. */
@@ -46,11 +51,32 @@ void mpcut_aac_source_free(MPCutAACSource *source);
 const MPCutAACSourceEdit *mpcut_aac_source_track(const MPCutAACSource *source, int track_id,
                                                 size_t *count, int *sample_rate);
 
+/* Restore a copied AAC stream's decoder priming after moving it to a positive
+ * presentation time. The MOV payload and its sample tables stay byte-identical. */
+int mpcut_align_copied_aac(const char *path, unsigned track_index, int sample_rate,
+                           int64_t priming, MPCutTime start, MPCutTime end, int movie_timescale,
+                           char *error, size_t capacity);
+
+int mpcut_restore_copied_aac(const char *source_path, int source_track_id, const char *output_path,
+                             unsigned output_index, MPCutTime shift, int movie_timescale,
+                             char *error, size_t capacity);
+
 /* Return a nonzero value from progress to cancel. Fraction is in [0, 1]. */
 typedef int (*MPCutProgress)(void *context, double fraction);
 
-/* Checks the input tracks against the output container without creating a file. */
-int mpcut_check_mux(const char *input_path, const char *output_path, int padded_opus_track,
+/* Selected primary tracks. Linked copies also preserve supported MOV timecode. */
+enum {
+    MPCUT_TRACKS_ALL = 0, MPCUT_TRACKS_AUDIO = 1, MPCUT_TRACKS_VIDEO = 2,
+    MPCUT_TRACKS_LINKED_AUDIO = 3, /* A temporary soundtrack aligned to the linked movie's clock. */
+    MPCUT_TRACKS_PROGRAM_AUDIO = 4 /* An independent soundtrack bounded by its planned ranges. */
+};
+
+/* Validate one standalone MP3 crop on its absolute decoded-sample clock. */
+int mpcut_check_mp3_crop(const char *path, int stream_index, int64_t start_sample, int64_t end_sample,
+                         MPCutProgress progress, void *context, char *error, size_t capacity);
+
+/* Checks the selected tracks against the output container without creating a file. */
+int mpcut_check_mux(const char *input_path, const char *output_path, int padded_opus_track, int tracks, int audio_stream,
                     char *error, size_t error_capacity);
 
 /* Write presentation end times (nanoseconds) into a staged WebM or MKV. */
@@ -62,11 +88,12 @@ int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime d
                          MPCutProgress progress, void *context, char *error, size_t error_capacity);
 
 /*
- * Ranges are prevalidated and relative to the primary video presentation origin.
+ * Ranges are prevalidated and relative to source_origin. audio_stream is an
+ * absolute FFmpeg stream index, or -1 for every selected audio stream.
  * output_path is a temporary file with the destination's real extension.
  * Returns 0 on success, 1 on failure, or 2 on cancellation.
  */
-int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_path, int audio_only,
+int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_path, int tracks, int audio_stream,
                 MPCutProgress progress, void *context, char *error, size_t error_capacity);
 
 #endif

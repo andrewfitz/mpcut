@@ -1,5 +1,7 @@
 # MPCut v1 implementation plan
 
+This document records the original release scope. For the current desktop and CLI capabilities, see the [README](README.md) and [user guide](docs/USAGE.md).
+
 A single-session, Apple Silicon–only utility for joining and trimming matching video clips. Drop files, arrange them on one timeline, check the cuts, and export one movie. The window holds the edit in memory. Closing it ends the session.
 
 The follow-up proposal covers frame-level handles, optional keyframe snapping, and three export modes. [Frame editing and export modes](docs/EXPORT-MODES.md)

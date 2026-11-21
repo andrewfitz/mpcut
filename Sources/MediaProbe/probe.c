@@ -2,9 +2,12 @@
 #include "codec_header.h"
 #include "../CFFmpeg/copy_probe.h"
 #include "mov_index.h"
+#include "video_clock.h"
+#include "wave_pcm.h"
 #include "../CFFmpeg/opus_packet.h"
 
 #include <libavcodec/avcodec.h>
+#include <libavcodec/vorbis_parser.h>
 #include <libavformat/avformat.h>
 #include <libavutil/display.h>
 #include <libavutil/avstring.h>
@@ -32,6 +35,10 @@ void mp_probe_free(MPProbeResult *result)
         return;
     for (int i = 0; result->streams && i < result->stream_count; i++) {
         MPProbeStream *stream = &result->streams[i];
+        av_vorbis_parse_free(&stream->vorbis_parser);
+        if (stream->flac_parser)
+            av_parser_close(stream->flac_parser);
+        avcodec_free_context(&stream->flac_context);
         av_free(stream->packets);
         av_free(stream->config);
         av_free(stream->metadata);
@@ -144,7 +151,7 @@ static int describe_stream(AVFormatContext *file, AVStream *input, MPProbeStream
         if (!stream->language)
             return AVERROR(ENOMEM);
     }
-    stream->kind = av_get_media_type_string(params->codec_type);
+    stream->kind = (input->disposition & AV_DISPOSITION_ATTACHED_PIC) ? "attachment" : av_get_media_type_string(params->codec_type);
     stream->codec = avcodec_get_name(params->codec_id);
     av_fourcc_make_string(stream->codec_tag, params->codec_tag);
     stream->profile = params->profile;
@@ -441,6 +448,26 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
         issue(result, "An audio or video packet is missing its presentation timestamp.");
         return 0;
     }
+    bool nonincreasing = false;
+    if (!video) {
+        nonincreasing = stream->count && packet->pts <= stream->last_audio_pts;
+        stream->last_audio_pts = packet->pts;
+    }
+    const bool coarse_audio = result->video_index < 0 &&
+                              (int64_t)stream->tb_num * params->sample_rate > stream->tb_den;
+    // Keep coarse-clock PCM packets individually so a rounded duration cannot
+    // hide which sample count and timestamp belong to each block.
+    if (stream->pcm && !coarse_audio && stream->count && !nonincreasing && packet->duration > 0 &&
+        !av_packet_get_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, &side_size)) {
+        MPProbePacket *previous = &stream->packets[stream->count - 1];
+        if (!previous->skip && !previous->discard && previous->duration > 0 &&
+            previous->pts <= INT64_MAX - previous->duration &&
+            previous->pts + previous->duration == packet->pts &&
+            previous->duration <= INT64_MAX - packet->duration) {
+            previous->duration += packet->duration;
+            return 0;
+        }
+    }
     if (stream->count == stream->capacity) {
         size_t capacity = stream->capacity ? stream->capacity * 2 : 1024;
         if (capacity <= stream->capacity)
@@ -501,25 +528,56 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
             }
         }
     } else {
+        if (coarse_audio && stream->pcm && packet->size > 0) {
+            const int bits = av_get_exact_bits_per_sample(params->codec_id);
+            const int64_t align = (int64_t)(bits / 8) * params->ch_layout.nb_channels;
+            if (bits % 8 == 0 && align > 0 && packet->size % align == 0)
+                sample->decoded_samples = packet->size / align;
+        }
+        if (coarse_audio && params->codec_id == AV_CODEC_ID_FLAC && packet->size > 0) {
+            if (!stream->flac_parser) {
+                stream->flac_parser = av_parser_init(AV_CODEC_ID_FLAC);
+                stream->flac_context = avcodec_alloc_context3(NULL);
+                if (!stream->flac_parser || !stream->flac_context)
+                    return AVERROR(ENOMEM);
+                stream->flac_parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
+                stream->flac_context->sample_rate = params->sample_rate;
+            }
+            uint8_t *parsed = NULL;
+            int parsed_size = 0;
+            stream->flac_parser->duration = 0;
+            if (av_parser_parse2(stream->flac_parser, stream->flac_context, &parsed, &parsed_size,
+                                 packet->data, packet->size, packet->pts, packet->dts, packet->pos) == packet->size &&
+                parsed_size == packet->size && stream->flac_parser->duration > 0)
+                sample->decoded_samples = stream->flac_parser->duration;
+        }
         if (params->codec_id == AV_CODEC_ID_OPUS)
             sample->decoded_samples = mpcut_opus_samples(packet->data, packet->size);
+        if (params->codec_id == AV_CODEC_ID_VORBIS) {
+            if (!stream->count)
+                stream->vorbis_parser = av_vorbis_parse_init(params->extradata, params->extradata_size);
+            if (stream->vorbis_parser) {
+                int samples = av_vorbis_parse_frame(stream->vorbis_parser, packet->data, packet->size);
+                if (samples > 0)
+                    sample->decoded_samples = samples;
+            }
+        }
         const uint8_t *skip = av_packet_get_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, &side_size);
         if (skip && side_size >= 10) {
             sample->skip = AV_RL32(skip);
             sample->discard = AV_RL32(skip + 4);
         }
-        bool nonincreasing = stream->count && packet->pts <= stream->packets[stream->count - 1].pts;
         if (params->codec_id == AV_CODEC_ID_AAC && av_match_name("mov", result->format)) {
             /* The advanced MOV demuxer can re-emit preroll across presentation edits. */
             if (nonincreasing)
                 stream->deferred_aac_issue = 1;
             else if (packet->duration <= 0 && !stream->deferred_aac_issue)
                 stream->deferred_aac_issue = 2;
-        } else {
-            if (nonincreasing)
-                issue(result, "An audio track has non-increasing presentation timestamps.");
-            if (packet->duration <= 0)
-                issue(result, "An audio packet is missing its duration.");
+        } else if (!stream->audio_clock_issue[0]) {
+            const char *message = nonincreasing ? "An audio track has non-increasing presentation timestamps." :
+                packet->duration <= 0 ? "An audio packet is missing its duration." : NULL;
+            if (message)
+                snprintf(stream->audio_clock_issue, sizeof(stream->audio_clock_issue), "%s", message);
         }
     }
     stream->count++;
@@ -570,7 +628,10 @@ static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska
             packet->dts = (int64_t)i; // Keep the coded packet ordinal through the presentation sort.
     }
     *source_start = cuts[0].start;
-    qsort(packets, video->count, sizeof(*packets), compare_pts);
+    if (video->count >= 65536)
+        psort(packets, video->count, sizeof(*packets), compare_pts);
+    else
+        qsort(packets, video->count, sizeof(*packets), compare_pts);
     if (video->reconstructed_dts) {
         // Matroska AVC/HEVC blocks store PTS in coded order. A packet-only demux
         // may report these same values as DTS. Assign presentation-clock slots
@@ -603,6 +664,33 @@ static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska
     }
     av_free(cuts);
     return 0;
+}
+
+int64_t mp_video_presentation_end(const char *format, const AVStream *video, int64_t duration,
+                                  int64_t origin, int64_t last_pts, int64_t packet_end)
+{
+    int64_t end = packet_end;
+    if (av_match_name("mov", format) && duration > 0 && origin <= INT64_MAX - duration) {
+        // MOV sample durations are DTS intervals. With reordered VFR samples
+        // they do not give presentation widths or the presentation end.
+        int64_t track_end = origin + duration;
+        if (track_end > last_pts)
+            end = track_end;
+    }
+    if (av_match_name("matroska", format) && av_cmp_q(video->time_base, AV_TIME_BASE_Q) >= 0) {
+        // Matroska demux rounds a track's default block duration down to whole
+        // ticks. FFmpeg's per-track DURATION tag records its absolute end on
+        // the segment clock. Use it only to resolve a one-tick rounding error.
+        const AVDictionaryEntry *tag = av_dict_get(video->metadata, "DURATION", NULL, 0);
+        int64_t us;
+        if (tag && av_parse_time(&us, tag->value, 1) == 0 && us >= 0) {
+            int64_t tagged_end = av_rescale_q(us, AV_TIME_BASE_Q, video->time_base);
+            int64_t delta = av_sat_sub64(tagged_end, packet_end);
+            if (tagged_end > last_pts && delta >= -1 && delta <= 1)
+                end = tagged_end;
+        }
+    }
+    return end;
 }
 
 static int build_video_index(MPProbeResult *result, const AVStream *input_video)
@@ -652,28 +740,8 @@ static int build_video_index(MPProbeResult *result, const AVStream *input_video)
             return AVERROR_INVALIDDATA;
         packet_end = FFMAX(packet_end, frame->pts + frame->duration);
     }
-    result->end = packet_end;
-    if (av_match_name("mov", result->format) && video->duration > 0 &&
-        result->origin <= INT64_MAX - video->duration) {
-        // MOV sample durations are DTS intervals. With reordered VFR samples
-        // they do not give presentation widths or the presentation end.
-        int64_t track_end = result->origin + video->duration;
-        if (track_end > packets[video->count - 1].pts)
-            result->end = track_end;
-    }
-    if (av_match_name("matroska", result->format) && av_cmp_q(time_base, AV_TIME_BASE_Q) >= 0) {
-        // Matroska demux rounds a track's default block duration down to whole
-        // ticks. FFmpeg's per-track DURATION tag records its absolute end on
-        // the segment clock. Use it only to resolve a one-tick rounding error.
-        const AVDictionaryEntry *tag = av_dict_get(input_video->metadata, "DURATION", NULL, 0);
-        int64_t us;
-        if (tag && av_parse_time(&us, tag->value, 1) == 0 && us >= 0) {
-            int64_t tagged_end = av_rescale_q(us, AV_TIME_BASE_Q, time_base);
-            int64_t delta = av_sat_sub64(tagged_end, packet_end);
-            if (tagged_end > packets[video->count - 1].pts && delta >= -1 && delta <= 1)
-                result->end = tagged_end;
-        }
-    }
+    result->end = mp_video_presentation_end(result->format, input_video, video->duration, result->origin,
+                                            packets[video->count - 1].pts, packet_end);
     for (size_t i = 0; i < video->count; i++) {
         int64_t next = i + 1 < video->count ? packets[i + 1].pts : result->end;
         if (next > packets[i].pts)
@@ -726,9 +794,9 @@ static void update_header_description(MPProbeStream *stream, const AVCodecParame
 /* For simple intraframe MOV, FFmpeg's index already describes the packets.
  * Read each real ProRes frame header to preserve the frame and alpha checks. */
 static int indexed_prores(const MPMOVIndex *index, AVFormatContext *file, MPProbeResult *result,
-                          MPProbeCancelled cancelled, void *context)
+                          MPProbeCancelled cancelled, MPProbeProgress progress, void *context)
 {
-    if (index->fd < 0 || result->issue[0] ||
+    if (index->fd < 0 || result->issue[0] || result->has_unsupported_auxiliary ||
         file->streams[result->video_index]->codecpar->codec_id != AV_CODEC_ID_PRORES)
         return 0;
     for (int i = 0; i < result->stream_count; i++) {
@@ -739,6 +807,11 @@ static int indexed_prores(const MPMOVIndex *index, AVFormatContext *file, MPProb
             return 0;
     }
 
+    int64_t entries = 0, completed = 0;
+    if (progress) {
+        for (int i = 0; i < result->stream_count; i++)
+            entries += avformat_index_get_entries_count(file->streams[i]);
+    }
     int status = 0;
     for (int i = 0; i < result->stream_count; i++) {
         AVStream *stream = file->streams[i];
@@ -759,6 +832,8 @@ static int indexed_prores(const MPMOVIndex *index, AVFormatContext *file, MPProb
                 status = AVERROR_EXIT;
                 goto done;
             }
+            if (progress && entries > 0 && (j % 128) == 0)
+                progress(context, (double)(completed + j) / entries);
             const AVIndexEntry *entry = avformat_index_get_entry(stream, j);
             if (!entry || entry->timestamp != expected || entry->pos < end ||
                 entry->pos >= index->payload_end || entry->size <= 0 ||
@@ -798,6 +873,7 @@ static int indexed_prores(const MPMOVIndex *index, AVFormatContext *file, MPProb
             MPProbeStream *indexed = &result->streams[i];
             indexed->packets[indexed->count - 1].byte_count = entry->size;
         }
+        completed += count;
         if (expected != stream->duration)
             goto fallback;
     }
@@ -904,8 +980,21 @@ static void describe_pcm_bit_depths(AVFormatContext *file)
     }
 }
 
-MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
-                            MPProbeCancelled cancelled, void *context,
+/* A simple PCM WAVE data chunk has one frame per block and no edits or
+ * packet timestamps. Validate its declared span against the physical file
+ * before using its implicit sample clock for analysis. */
+static int indexed_wave_audio(AVFormatContext *file, MPProbeResult *result)
+{
+    int64_t start;
+    if (!mp_wave_pcm_layout(file, &start)) return 0;
+    AVStream *stream = file->streams[0];
+    AVPacket packet = {.pts = 0, .dts = 0, .duration = stream->duration};
+    int status = record_packet(result, stream->codecpar, &packet, NULL);
+    return status < 0 ? status : 1;
+}
+
+MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only, int audio_analysis,
+                            MPProbeCancelled cancelled, MPProbeProgress progress, void *context,
                             char *error, size_t error_capacity)
 {
     AVFormatContext *file = avformat_alloc_context();
@@ -932,7 +1021,7 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
         // pixel format for codecs such as Animation, PNG and FFV1, whose
         // container parameters may give no indication that alpha is present.
         if (!conversion) {
-            status = av_opt_set(file, "codec_whitelist", MPCUT_PROBE_DECODERS, 0);
+            status = mpcut_probe_decoder_policy(file);
             if (status < 0)
                 goto fail;
         }
@@ -955,6 +1044,8 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
     }
     snprintf(result->format, sizeof(result->format), "%s", file->iformat->name);
     bool timecode = false;
+    int first_audio = -1;
+    bool cover_art = false;
     for (int i = 0; i < result->stream_count; i++) {
         AVStream *stream = file->streams[i];
         status = describe_stream(file, stream, &result->streams[i]);
@@ -973,21 +1064,28 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
                 issue(result, "RAW video is unsupported.");
                 snprintf(result->timeline_issue, sizeof(result->timeline_issue), "RAW video is unsupported.");
             }
+        } else if (type == AVMEDIA_TYPE_VIDEO && (stream->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+            cover_art = true;
+        } else if (type == AVMEDIA_TYPE_AUDIO) {
+            if (first_audio == -1) first_audio = i;
         } else if (type == AVMEDIA_TYPE_DATA && stream->codecpar->codec_tag == MKTAG('t', 'm', 'c', 'd') &&
                    av_match_name("mov", file->iformat->name) && !timecode) {
             timecode = true;
         } else if (type != AVMEDIA_TYPE_AUDIO) {
-            issue(result, "The file contains an unsupported auxiliary, subtitle, or data track.");
+            result->has_unsupported_auxiliary = 1;
         }
     }
-    if (result->video_index == -1) {
+    if (cover_art && result->video_index >= 0)
+        result->has_unsupported_auxiliary = 1;
+    int primary = result->video_index >= 0 ? result->video_index : first_audio;
+    if (primary < 0) {
         status = AVERROR_STREAM_NOT_FOUND;
         goto fail;
     }
     if (preview_only) {
         // Use declared timing for an early preview. The full scan determines
         // the edit duration and verified boundaries independently.
-        const AVStream *video = file->streams[result->video_index];
+        const AVStream *video = file->streams[primary];
         int64_t duration = video->duration;
         if (duration <= 0 && av_match_name("matroska", result->format)) {
             const AVDictionaryEntry *tag = av_dict_get(video->metadata, "DURATION", NULL, 0);
@@ -1001,7 +1099,7 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
             duration = av_rescale_q(file->duration, AV_TIME_BASE_Q, video->time_base);
         result->origin = video->start_time == AV_NOPTS_VALUE ? 0 : video->start_time;
         result->end = av_sat_add64(result->origin, duration);
-        if (result->end <= result->origin || video->codecpar->width <= 0 || video->codecpar->height <= 0) {
+        if (result->end <= result->origin || (result->video_index >= 0 && (video->codecpar->width <= 0 || video->codecpar->height <= 0))) {
             status = AVERROR_INVALIDDATA;
             goto fail;
         }
@@ -1009,14 +1107,18 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
         avformat_close_input(&file);
         return result;
     }
-    AVCodecParameters *video_params = file->streams[result->video_index]->codecpar;
+    AVCodecParameters *video_params = file->streams[primary]->codecpar;
     bool prores_video = video_params->codec_id == AV_CODEC_ID_PRORES;
     bool needs_video_header = video_params->format < 0 &&
                               (prores_video || mp_has_header_probe(video_params->codec_id));
     bool inspect_scan = video_params->codec_id == AV_CODEC_ID_H264 || video_params->codec_id == AV_CODEC_ID_HEVC;
-    status = indexed_prores(&mov_index, file, result, cancelled, context);
+    status = result->video_index >= 0 ? indexed_prores(&mov_index, file, result, cancelled, progress, context) :
+             audio_analysis ? indexed_wave_audio(file, result) : 0;
     if (status < 0)
         goto fail;
+    int64_t file_size = progress && file->pb && status == 0 ? avio_size(file->pb) : 0;
+    unsigned packet_number = 0;
+    double packet_bytes = 0;
     MPDescriptionShape first_description = {0};
     while (status == 0) {
         if (cancelled && cancelled(context)) {
@@ -1026,6 +1128,13 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
         status = av_read_frame(file, packet);
         if (status < 0)
             break;
+        if (progress && file_size > 0) {
+            // Demuxers can alternate between tracks stored far apart in the file.
+            // Payload bytes count work even when packet offsets jump or are unavailable.
+            packet_bytes += packet->size;
+            if ((packet_number++ % 128) == 0)
+                progress(context, fmin(1.0, packet_bytes / file_size));
+        }
         if ((needs_video_header || inspect_scan) && packet->stream_index == result->video_index &&
             (prores_video || (packet->flags & AV_PKT_FLAG_KEY))) {
             bool may_interlace = false;
@@ -1052,9 +1161,14 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
         goto fail;
     if (needs_video_header)
         issue(result, "The video codec headers do not identify the pixel format.");
-    status = build_video_index(result, file->streams[result->video_index]);
-    if (status < 0)
-        goto fail;
+    if (result->video_index >= 0) {
+        status = build_video_index(result, file->streams[result->video_index]);
+        if (status < 0) goto fail;
+    } else {
+        // Swift uses the actual packet times and decoder padding in each track's
+        // own sample clock to establish the audible start and end.
+        result->source_start_safe = 1;
+    }
     av_packet_free(&packet);
     avformat_close_input(&file);
     if (mov_index.fd >= 0)

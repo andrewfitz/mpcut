@@ -17,7 +17,27 @@ output_dir=$(cd "$output_dir" && pwd)
 mkdir -p "$root/.build"
 if [[ ${MPCUT_APP_BUILD_LOCK:-} != "$root" ]]; then
     export MPCUT_APP_BUILD_LOCK="$root"
-    exec /usr/bin/lockf -k "$root/.build/.mpcut-app.lock" /bin/bash "$root/scripts/build-app.sh" "$output_dir"
+    # Different checkouts can publish to the same destination. Hold its lock
+    # while recovering abandoned stages and replacing the bundle.
+    exec /usr/bin/lockf -k "$root/.build/.mpcut-app.lock" \
+        /usr/bin/lockf -k "$output_dir/.mpcut-publish.lock" /bin/bash "$root/scripts/build-app.sh" "$output_dir"
+fi
+
+final="$output_dir/MPCut.app"
+# A build that was killed outright never ran its exit handler. Its stage folder
+# may hold the only copy of the previous bundle, moved aside just before the new
+# one was to take its place. This build holds the lock, so every stage folder
+# found here is abandoned: put that bundle back, then remove the leftovers.
+if [[ -n "$output_dir" && -d "$output_dir" ]]; then
+    for stale in "$output_dir"/.MPCut-stage.??????; do
+        if [[ ! -d "$stale" || -L "$stale" ]]; then
+            continue
+        fi
+        if [[ ( -e "$stale/previous.app" || -L "$stale/previous.app" ) && ! -e "$final" && ! -L "$final" ]]; then
+            mv "$stale/previous.app" "$final"
+        fi
+        rm -rf "$stale"
+    done
 fi
 
 "$root/scripts/build-ffmpeg.sh"
@@ -33,7 +53,6 @@ bin_dir=$(xcrun swift build "${swift_args[@]}" --show-bin-path)
 staging=$(mktemp -d "$output_dir/.MPCut-stage.XXXXXX")
 app="$staging/MPCut.app"
 contents="$app/Contents"
-final="$output_dir/MPCut.app"
 previous="$staging/previous.app"
 cleanup() {
     if [[ ( -e "$previous" || -L "$previous" ) && ! -e "$final" && ! -L "$final" ]]; then
@@ -48,6 +67,12 @@ install -m 755 "$bin_dir/mpcut" "$contents/Helpers/mpcut"
 install -m 755 "$ffmpeg/install/bin/ffmpeg" "$contents/Helpers/ffmpeg"
 install -m 644 "$root/packaging/Info.plist" "$contents/Info.plist"
 install -m 644 "$root/packaging/Credits.html" "$contents/Resources/Credits.html"
+manual="$contents/Resources/Documentation"
+mkdir -p "$manual/packaging"
+# Finder metadata on screenshots is invalid inside a signed application bundle.
+cp -RX "$root/docs" "$manual/docs"
+install -m 644 "$root/packaging/FFmpeg-Notice.txt" "$manual/packaging/"
+install -m 644 "$root/README.md" "$root/CHANGELOG.md" "$root/AUDIT.md" "$manual/"
 install -m 644 "$root/Resources/MPCut.icns" "$contents/Resources/MPCut.icns"
 
 for library in "$ffmpeg"/install/lib/*.dylib; do

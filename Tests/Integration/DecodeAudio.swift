@@ -4,12 +4,13 @@ import Foundation
 @main
 struct DecodeAudio {
     static func main() async throws {
-        guard CommandLine.arguments.count == 2 else {
+        guard (2...3).contains(CommandLine.arguments.count),
+              let index = Int(CommandLine.arguments.count == 3 ? CommandLine.arguments[2] : "0"), index >= 0 else {
             throw CocoaError(.fileReadInvalidFileName)
         }
         let url = URL(fileURLWithPath: CommandLine.arguments[1])
         let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-        guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
+        guard let track = try await asset.loadTracks(withMediaType: .audio).dropFirst(index).first else {
             throw CocoaError(.fileReadCorruptFile)
         }
         let reader = try AVAssetReader(asset: asset)

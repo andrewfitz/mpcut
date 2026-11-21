@@ -8,9 +8,11 @@ extension CutEngine {
     /// the choices when we can reproduce the source's picture format at the edges.
     public func smartTrimEligible(in media: MediaInfo, container: String) -> Bool {
         let video = media.video
+        let main10 = video.codec == "hevc" && video.profile == 2 && video.bitDepth == 10
+            && video.pixelFormat == "yuv420p10le"
+        let planar8 = video.bitDepth == 8 && ["yuv420p", "yuvj420p"].contains(video.pixelFormat)
         guard media.sourceStartSafe, !video.multipleDescriptions, !video.hasAdditionalVideoLayers,
-              video.bitDepth == 8, !video.hasAlpha, !video.complexPicture,
-              ["yuv420p", "yuvj420p"].contains(video.pixelFormat),
+              (planar8 || main10), !video.hasAlpha, !video.complexPicture,
               ["unknown", "bt709", "bt470m", "bt470bg", "smpte170m", "smpte240m", "iec61966-2-1"].contains(video.colorTransfer),
               video.width > 0, video.height > 0, video.width.isMultiple(of: 2), video.height.isMultiple(of: 2) else {
             return false
@@ -29,7 +31,7 @@ extension CutEngine {
             if video.codec == "h264", video.width < 192 || video.height < 96 { return false }
             let lengthField = video.codec == "h264" ? 4 : 21
             return video.configuration.count > lengthField && video.configuration[lengthField] & 3 == 3
-                && (video.codec == "hevc" ? video.profile == 1 : [66, 578, 77, 100].contains(video.profile))
+                && (video.codec == "hevc" ? (video.profile == 1 || main10) : [66, 578, 77, 100].contains(video.profile))
         default:
             return false
         }

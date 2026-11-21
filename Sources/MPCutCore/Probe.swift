@@ -5,7 +5,7 @@ import PacketWriter
 
 public struct StreamInfo: Encodable, Sendable {
     public let index: Int
-    let trackID: Int32
+    package let trackID: Int32
     public let kind: String
     public let codec: String
     public let codecTag: String
@@ -24,7 +24,7 @@ public struct StreamInfo: Encodable, Sendable {
     public let frameRate: RationalTime
     public let sampleAspectRatio: RationalTime
     public let timeBase: RationalTime
-    public let start: RationalTime
+    public internal(set) var start: RationalTime
     let hasDeclaredStart: Bool
     public let duration: RationalTime
     public let sampleRate: Int
@@ -112,18 +112,71 @@ public struct MediaInfo: Encodable, Sendable {
     public let streams: [StreamInfo]
     public let frames: [FrameInfo]
     public let audio: [AudioIndex]
+    static let auxiliaryTrackIssue = "The file contains an unsupported auxiliary, subtitle, or data track."
     public let copyIssue: String?
+    /// The first issue found on each audio track, by stream index. `copyIssue` reports
+    /// only one issue for the file, which can belong to a track the caller excluded.
+    let audioIssues: [Int: String]
     public let timelineIssue: String?
     public let sourceStartSafe: Bool
-    let identity: SourceIdentity
+    // Present only on a sidecar-backed inspection summary. Edit plans open and
+    // validate the current muxer as usual.
+    let reportedContainers: Set<String>?
+    package let identity: SourceIdentity
     private let videoIndex: Int
+    private let metadataOnly: Bool
+    let hasProvisionalClock: Bool
+    package let multicamClockOffset: RationalTime
 
-    public var video: StreamInfo { streams[videoIndex] }
+    public var hasVideo: Bool { videoIndex >= 0 }
+    package var hasFullEditIndex: Bool {
+        guard !metadataOnly else { return false }
+        if hasVideo { return !frames.isEmpty }
+        return !audio.isEmpty && audio.allSatisfy { $0.stream.isPCM || !$0.packets.isEmpty || !$0.presentationEdits.isEmpty }
+    }
+    /// Estimates the retained index's row and stream storage without walking packet arrays.
+    package var indexStorageBytes: Int {
+        let streamBytes = streams.reduce(0) {
+            $0 + MemoryLayout<StreamInfo>.stride + $1.configuration.count + $1.codecMetadata.count
+        }
+        let audioBytes = audio.reduce(0) {
+            $0 + MemoryLayout<AudioIndex>.stride
+                + $1.packets.count * MemoryLayout<AudioPacket>.stride
+                + $1.presentationEdits.count * MemoryLayout<AACPresentationEdit>.stride
+                + ($1.opusWindow?.packetStarts.count ?? 0) * MemoryLayout<Int64>.stride
+        }
+        return frames.count * MemoryLayout<FrameInfo>.stride + streamBytes + audioBytes
+    }
+
+    func omittingFrames() -> MediaInfo {
+        // Video-only editing metadata may have been built just to populate the sidecar.
+        var tracks = audio
+        if hasVideo { for index in tracks.indices { tracks[index].opusWindow = nil } }
+        return MediaInfo(url: url, format: format, duration: duration, origin: origin, streams: streams,
+                  frames: [], audio: tracks, copyIssue: copyIssue, sourceStartSafe: sourceStartSafe,
+                  identity: identity, videoIndex: videoIndex, timelineIssue: timelineIssue,
+                  reportedContainers: reportedContainers, metadataOnly: metadataOnly, hasProvisionalClock: hasProvisionalClock,
+                  multicamClockOffset: multicamClockOffset, audioIssues: audioIssues)
+    }
+
+    public var videoStream: StreamInfo? { hasVideo ? streams[videoIndex] : nil }
+    public var primaryStream: StreamInfo { streams[primaryIndex] }
+    // Existing picture paths use the source's primary clock. New mixed-media
+    // callers can ask for videoStream when actual pictures are required.
+    public var video: StreamInfo { primaryStream }
+    private let primaryIndex: Int
+
+    public func requiresPresentationAudioAnalysis(stream: Int) -> Bool {
+        audio.contains { $0.stream.index == stream && !$0.presentationEdits.isEmpty }
+    }
 
     init(url: URL, format: String, duration: RationalTime, origin: RationalTime, streams: [StreamInfo],
          frames: [FrameInfo], audio: [AudioIndex], copyIssue: String?, sourceStartSafe: Bool,
-         identity: SourceIdentity, videoIndex: Int, timelineIssue: String? = nil) {
+         identity: SourceIdentity, videoIndex: Int, timelineIssue: String? = nil,
+         reportedContainers: Set<String>? = nil, metadataOnly: Bool = false, hasProvisionalClock: Bool = false,
+         multicamClockOffset: RationalTime = .zero, audioIssues: [Int: String] = [:]) {
         self.url = url
+        self.audioIssues = audioIssues
         self.format = format
         self.duration = duration
         self.origin = origin
@@ -133,8 +186,27 @@ public struct MediaInfo: Encodable, Sendable {
         self.copyIssue = copyIssue
         self.timelineIssue = timelineIssue
         self.sourceStartSafe = sourceStartSafe
+        self.reportedContainers = reportedContainers
+        self.metadataOnly = metadataOnly
+        self.hasProvisionalClock = hasProvisionalClock
+        self.multicamClockOffset = multicamClockOffset
         self.identity = identity
         self.videoIndex = videoIndex
+        primaryIndex = videoIndex >= 0 ? videoIndex : streams.firstIndex { $0.kind == "audio" }!
+    }
+
+    /// Audio extraction can retain samples past the final picture on the same source clock.
+    package func extendingToAudioEnd(stream: Int?) throws -> MediaInfo {
+        guard hasVideo else { return self }
+        let ends = try audio.filter { stream == nil || $0.stream.index == stream }.map {
+            try $0.audibleBounds(origin: origin).upperBound
+        }
+        guard let end = ends.max(), end > duration else { return self }
+        return MediaInfo(url: url, format: format, duration: end, origin: origin, streams: streams,
+                         frames: frames, audio: audio, copyIssue: copyIssue, sourceStartSafe: sourceStartSafe,
+                         identity: identity, videoIndex: videoIndex, timelineIssue: timelineIssue,
+                         reportedContainers: reportedContainers, metadataOnly: metadataOnly, hasProvisionalClock: hasProvisionalClock,
+                         audioIssues: audioIssues)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -142,14 +214,14 @@ public struct MediaInfo: Encodable, Sendable {
     }
 }
 
-struct SourceIdentity: Equatable, Sendable {
+package struct SourceIdentity: Codable, Hashable, Sendable {
     let device: Int32
     let inode: UInt64
     let size: Int64
     let modifiedSeconds: Int
     let modifiedNanoseconds: Int
 
-    init(_ url: URL) throws {
+    package init(_ url: URL) throws {
         var info = stat()
         let status = url.withUnsafeFileSystemRepresentation { path in
             guard let path else { return Int32(-1) }
@@ -166,12 +238,20 @@ struct SourceIdentity: Equatable, Sendable {
         // ctime also changes for metadata such as tags, permissions and
         // file-provider state. Those updates leave the media bytes intact.
     }
+
+    /// Compares against an identity saved by an earlier session. A volume's
+    /// device number can change whenever it is mounted again.
+    func matches(saved: SourceIdentity) -> Bool {
+        inode == saved.inode && size == saved.size && modifiedSeconds == saved.modifiedSeconds &&
+            modifiedNanoseconds == saved.modifiedNanoseconds
+    }
 }
 
 enum Probe {
     static func read(_ url: URL, keyframes: Bool = true, conversion: Bool = false, previewOnly: Bool = false,
+                     audioAnalysis: Bool = false,
                      expectedIdentity: SourceIdentity? = nil,
-                     cancelled: (() -> Bool)? = nil) throws -> MediaInfo {
+                     progress: ((Double) -> Void)? = nil, cancelled: (() -> Bool)? = nil) throws -> MediaInfo {
         let before = try SourceIdentity(url)
         if let expectedIdentity, expectedIdentity != before {
             throw CutError(code: "source_changed", message: "The source changed while opening the clip.")
@@ -182,11 +262,15 @@ enum Probe {
             let control = Unmanaged<ProbeCancellation>.fromOpaque(context).takeUnretainedValue()
             return control.cancelled() ? 1 : 0
         }
-        let control = cancelled.map(ProbeCancellation.init)
+        let report: MPProbeProgress? = progress == nil ? nil : { context, fraction in
+            guard let context else { return }
+            Unmanaged<ProbeCancellation>.fromOpaque(context).takeUnretainedValue().report(packetScanShare * fraction)
+        }
+        let control = ProbeCancellation(cancelled ?? { false }, progress: progress)
         let pointer = withExtendedLifetime(control) {
             url.withUnsafeFileSystemRepresentation { path in
-                mp_probe_read(path, conversion ? 1 : 0, previewOnly ? 1 : 0, callback,
-                              control.map { Unmanaged.passUnretained($0).toOpaque() },
+                mp_probe_read(path, conversion ? 1 : 0, previewOnly ? 1 : 0, audioAnalysis ? 1 : 0, callback, report,
+                              Unmanaged.passUnretained(control).toOpaque(),
                               &error, error.count)
             }
         }
@@ -195,11 +279,13 @@ enum Probe {
             throw CutError(code: "probe_failed", message: String(cString: error))
         }
         defer { mp_probe_free(pointer) }
+        progress?(packetScanShare)
         let media = try makeMedia(pointer.pointee, url: url, identity: before,
-                                  keyframes: keyframes, previewOnly: previewOnly, cancelled: cancelled)
+                                  keyframes: keyframes, previewOnly: previewOnly, progress: progress, cancelled: cancelled)
         guard try SourceIdentity(url) == before else {
             throw CutError(code: "source_changed", message: "The source changed during inspection.")
         }
+        progress?(1)
         return media
     }
 
@@ -210,25 +296,48 @@ enum Probe {
     }
 }
 
+// Reading and validating compressed packets dominates the first open of long movies.
+private let packetScanShare = 0.97
+
 private final class ProbeCancellation {
     let cancelled: () -> Bool
-    init(_ cancelled: @escaping () -> Bool) { self.cancelled = cancelled }
+    private let progress: ((Double) -> Void)?
+    private var lastFraction = -1.0
+
+    func report(_ fraction: Double) {
+        // An incompatible ProRes sample table can trigger a packet-by-packet retry.
+        guard fraction > lastFraction else { return }
+        lastFraction = fraction
+        progress?(fraction)
+    }
+
+    init(_ cancelled: @escaping () -> Bool, progress: ((Double) -> Void)?) {
+        self.cancelled = cancelled
+        self.progress = progress
+    }
 }
 
 private extension Probe {
     static func makeMedia(_ native: MPProbeResult, url: URL, identity: SourceIdentity, keyframes: Bool, previewOnly: Bool,
-                          cancelled: (() -> Bool)?) throws -> MediaInfo {
+                          progress: ((Double) -> Void)?, cancelled: (() -> Bool)?) throws -> MediaInfo {
         let storage = UnsafeBufferPointer(start: native.streams, count: Int(native.stream_count))
         let videoIndex = Int(native.video_index)
-        let videoBase = timeBase(storage[videoIndex])
-        let origin = try timestamp(native.origin, base: videoBase)
-        let duration = try timestamp(native.end, base: videoBase).subtracting(origin)
+        let primaryIndex = videoIndex >= 0 ? videoIndex : storage.firstIndex { string($0.kind) == "audio" }
+        guard let primaryIndex else { throw CutError(code: "unsupported_tracks", message: "The file has no playable audio or video.") }
+        let base = timeBase(storage[primaryIndex])
+        var origin = try timestamp(native.origin, base: base)
+        var duration = try timestamp(native.end, base: base).subtracting(origin)
         var frames: [FrameInfo] = []
         var streams: [StreamInfo] = []
         var audio: [AudioIndex] = []
         let timelineIssue = fixedString(native.timeline_issue)
         var copyIssue: String? = fixedString(native.issue)
         if copyIssue?.isEmpty == true { copyIssue = nil }
+        var audioIssues: [Int: String] = [:]
+        func audioIssue(_ track: Int, _ message: String) {
+            audioIssues[track] = audioIssues[track] ?? message
+            copyIssue = copyIssue ?? message
+        }
         let format = fixedString(native.format)
         var aacSource: OpaquePointer?
         defer { mpcut_aac_source_free(aacSource) }
@@ -244,7 +353,53 @@ private extension Probe {
             }
         }
 
+        if videoIndex < 0, !previewOnly {
+            var first: RationalTime?
+            for track in storage where string(track.kind) == "audio" && track.sample_rate > 0 {
+                let packets = UnsafeBufferPointer(start: track.packets, count: track.count)
+                // Vorbis overlap-add primes the decoder with its first packet. Only
+                // the second packet can produce the first audible sample.
+                let firstAudible = string(track.codec) == "vorbis" ? 1 : 0
+                guard packets.indices.contains(firstAudible) else { continue }
+                let packet = packets[firstAudible]
+                let base = timeBase(track)
+                let raw = try timestamp(packet.pts, base: base)
+                let skip = Swift.max(Int64(packet.skip), Int64(track.initial_padding))
+                var start = try raw.adding(RationalTime(numerator: skip, denominator: Int64(track.sample_rate)))
+                if string(track.codec) == "opus", format.split(separator: ",").contains("matroska"),
+                   base == RationalTime(numerator: 1, denominator: 1000), track.sample_rate == 48_000 {
+                    // Matroska stores the leading codec delay rounded to milliseconds.
+                    start = try raw.adding(RationalTime(numerator: (skip + 24) / 48, denominator: 1000))
+                }
+                var editCount = 0
+                var editRate: Int32 = 0
+                if let aacSource, string(track.codec) == "aac",
+                   let edits = mpcut_aac_source_track(aacSource, track.track_id, &editCount, &editRate),
+                   editCount > 0, editRate > 0 {
+                    start = RationalTime(numerator: edits[0].presentation_start, denominator: Int64(editRate))
+                }
+                first = min(first ?? start, start)
+            }
+            guard let first else { throw CutError(code: "unsupported_tracks", message: "The file has no usable audio samples.") }
+            origin = first
+        }
+
+        let rowCounts = storage.enumerated().map { index, track -> Double in
+            if index == videoIndex { return keyframes ? Double(track.count) : 0 }
+            guard !previewOnly, string(track.kind) == "audio" else { return 0 }
+            var count = 0
+            var rate: Int32 = 0
+            if let aacSource, string(track.codec) == "aac",
+               mpcut_aac_source_track(aacSource, track.track_id, &count, &rate) != nil, count > 0 { return 0 }
+            return Double(track.count)
+        }
+        let totalRows = max(1, rowCounts.reduce(0, +))
+        var completedRows = 0.0
         for (index, value) in storage.enumerated() {
+            func reportRows(_ count: Int) {
+                progress?(packetScanShare + (1 - packetScanShare) * (completedRows + Double(count)) / totalRows)
+            }
+            defer { completedRows += rowCounts[index] }
             try checkCancellation(cancelled)
             let base = timeBase(value)
             let packets = UnsafeBufferPointer(start: value.packets, count: value.count)
@@ -270,18 +425,26 @@ private extension Probe {
             }
             if index == videoIndex, keyframes {
                 frames.reserveCapacity(packets.count)
-                for (position, packet) in packets.enumerated() {
-                    if position.isMultiple(of: 1_024) { try checkCancellation(cancelled) }
-                    let time = try relativeTime(packet.pts, base: base, origin: origin)
-                    frames.append(FrameInfo(
-                        dts: packet.dts == packet.pts ? time : try relativeDTS(packet, base: base, origin: origin),
-                        time: time, duration: try timestamp(packet.duration, base: base),
-                        keyframe: packet.key != 0, canStart: packet.start != 0, canEnd: packet.end != 0,
-                        byteCount: packet.byte_count))
-                }
+                try forEachOrderedBatch(count: packets.count, batchSize: 2048, check: {
+                    try checkCancellation(cancelled)
+                }, transform: { range in
+                    try packets[range].map { packet in
+                        let time = try relativeTime(packet.pts, base: base, origin: origin)
+                        return FrameInfo(
+                            dts: packet.dts == packet.pts ? time : try relativeDTS(packet, base: base, origin: origin),
+                            time: time, duration: try timestamp(packet.duration, base: base),
+                            keyframe: packet.key != 0, canStart: packet.start != 0, canEnd: packet.end != 0,
+                            byteCount: packet.byte_count)
+                    }
+                }, consume: {
+                    frames.append(contentsOf: $0)
+                    reportRows(frames.count)
+                })
             } else if !previewOnly, stream.kind == "audio" {
+                let clockIssue = fixedString(value.audio_clock_issue)
+                if !clockIssue.isEmpty { audioIssue(index, clockIssue) }
                 if packets.isEmpty || stream.sampleRate <= 0 {
-                    copyIssue = copyIssue ?? "Audio track \(index) has no usable presentation clock."
+                    audioIssue(index, "Audio track \(index) has no usable presentation clock.")
                 }
                 let edits = try makeAACEdits(aacSource, trackID: value.track_id, stream: stream)
                 if let edits {
@@ -293,21 +456,42 @@ private extension Probe {
                                             hasPriming: true, pcmContinuity: false, presentationEdits: edits))
                 } else {
                     if value.deferred_aac_issue == 1 {
-                        copyIssue = copyIssue ?? "AAC track \(index) has non-increasing presentation timestamps without a supported edit list."
+                        audioIssue(index, "AAC track \(index) has non-increasing presentation timestamps without a supported edit list.")
                     } else if value.deferred_aac_issue == 2 {
-                        copyIssue = copyIssue ?? "AAC track \(index) has a packet with missing duration."
+                        audioIssue(index, "AAC track \(index) has a packet with missing duration.")
                     }
-                    var index = try buildAudio(stream, packets: packets, origin: origin, cancelled: cancelled)
-                    if keyframes, stream.codec == "opus", format.split(separator: ",").contains("matroska") {
-                        index.opusWindow = try opusTrimWindow(index, origin: origin) { try checkCancellation(cancelled) }
+                    var index = try buildAudio(stream, packets: packets, origin: origin, standalone: videoIndex < 0,
+                                               progress: reportRows, cancelled: cancelled)
+                    if (keyframes || videoIndex < 0), stream.codec == "opus",
+                       format.split(separator: ",").contains(where: { $0 == "matroska" || $0 == "ogg" }) {
+                        let window = try opusTrimWindow(index, origin: origin) { try checkCancellation(cancelled) }
+                        if videoIndex < 0, let window, window.complete {
+                            index = AudioIndex(stream: stream, packets: index.packets,
+                                               start: try RationalTime(numerator: window.start, denominator: 48_000).subtracting(origin),
+                                               end: try RationalTime(numerator: window.end, denominator: 48_000).subtracting(origin),
+                                               hasPriming: index.hasPriming, pcmContinuity: index.pcmContinuity,
+                                               presentationEdits: index.presentationEdits)
+                        }
+                        index.opusWindow = window
                     }
                     audio.append(index)
                 }
             }
         }
+        if videoIndex < 0, !previewOnly {
+            duration = audio.map(\.end).max() ?? .zero
+            guard duration > .zero else { throw CutError(code: "unsupported_tracks", message: "The audio has no positive presentation duration.") }
+        }
+        // Explicit stream selection can drop an auxiliary track. Preserve any
+        // packet, clock or codec issue discovered while indexing the retained media.
+        if copyIssue == nil, native.has_unsupported_auxiliary != 0 {
+            copyIssue = MediaInfo.auxiliaryTrackIssue
+        }
         return MediaInfo(url: url, format: format, duration: duration,
                          origin: origin, streams: streams, frames: frames, audio: audio, copyIssue: copyIssue,
-                         sourceStartSafe: native.source_start_safe != 0, identity: identity, videoIndex: videoIndex, timelineIssue: timelineIssue.isEmpty ? nil : timelineIssue)
+                         sourceStartSafe: native.source_start_safe != 0, identity: identity, videoIndex: videoIndex,
+                         timelineIssue: timelineIssue.isEmpty ? nil : timelineIssue, metadataOnly: previewOnly,
+                         hasProvisionalClock: previewOnly, audioIssues: audioIssues)
     }
 
     static func makeAACEdits(_ source: OpaquePointer?, trackID: Int32, stream: StreamInfo) throws -> [AACPresentationEdit]? {
@@ -333,18 +517,26 @@ private extension Probe {
     }
 
     static func buildAudio(_ stream: StreamInfo, packets: UnsafeBufferPointer<MPProbePacket>,
-                           origin: RationalTime, cancelled: (() -> Bool)?) throws -> AudioIndex {
+                           origin: RationalTime, standalone: Bool, progress: (Int) -> Void, cancelled: (() -> Bool)?) throws -> AudioIndex {
         let sampleRate = Int64(max(1, stream.sampleRate))
+        let samplePeriod = RationalTime(numerator: 1, denominator: sampleRate)
+        let useSampleClock = standalone && (stream.isPCM || stream.codec == "flac") && stream.timeBase > samplePeriod
         var start: RationalTime?
         var end: RationalTime?
         var indexed: [AudioPacket] = []
         var hasPriming = stream.initialPadding > 0 || stream.seekPreroll > 0
+        var firstAudibleSample: RationalTime?
+        var lastAudibleSample: RationalTime?
         var aacFrameSamples = 0
         var priorPCMEnd: RationalTime?
+        var priorSampleEnd: RationalTime?
         var pcmContinuity = true
         if !stream.isPCM { indexed.reserveCapacity(packets.count) }
         for (index, packet) in packets.enumerated() {
-            if index.isMultiple(of: 1_024) { try checkCancellation(cancelled) }
+            if index.isMultiple(of: 1_024) {
+                try checkCancellation(cancelled)
+                progress(index)
+            }
             let rawStart = try relativeTime(packet.pts, base: stream.timeBase, origin: origin)
             let duration = try timestamp(packet.duration, base: stream.timeBase)
             let rawEnd = try rawStart.adding(duration)
@@ -372,16 +564,30 @@ private extension Probe {
                 }
             }
             hasPriming = hasPriming || skip > 0 || discard > 0
-            let audibleStart = skip == 0 ? rawStart : try rawStart.adding(RationalTime(numerator: Int64(skip), denominator: sampleRate))
+            // Matroska may round both the packet timestamp and its duration
+            // to whole milliseconds. Keep the decoded sample clock through
+            // ordinary rounding, and restart it after a real discontinuity.
+            var sampleStart = rawStart
+            let hasSampleClock = useSampleClock && decodedSamples > 0
+            if hasSampleClock, let priorSampleEnd,
+               abs(rawStart.seconds - priorSampleEnd.seconds) <= stream.timeBase.seconds + 0.5 / Double(sampleRate) {
+                sampleStart = priorSampleEnd
+            }
+            let audibleStart = skip == 0 ? sampleStart : try sampleStart.adding(RationalTime(numerator: Int64(skip), denominator: sampleRate))
             let decodedEnd = decodedSamples > 0
-                ? try rawStart.adding(RationalTime(numerator: Int64(decodedSamples), denominator: sampleRate))
+                ? try sampleStart.adding(RationalTime(numerator: Int64(decodedSamples), denominator: sampleRate))
                 : rawEnd
+            priorSampleEnd = hasSampleClock ? decodedEnd : nil
             // A demuxer can report an already shortened final packet together
             // with the padding that must be discarded from its coded samples.
             let trimmedEnd = discard == 0 ? decodedEnd : try decodedEnd.subtracting(
                 RationalTime(numerator: Int64(discard), denominator: sampleRate))
-            let audibleEnd = min(rawEnd, trimmedEnd)
-            if audibleStart < audibleEnd {
+            let audibleEnd = hasSampleClock ? trimmedEnd : min(rawEnd, trimmedEnd)
+            // A gapless encoder can place several packets of decoder priming or
+            // terminal padding in one skip/discard tag (for example a cropped MP3).
+            if index == 0 && skip > 0 { firstAudibleSample = audibleStart }
+            if index == packets.count - 1 && discard > 0 { lastAudibleSample = audibleEnd }
+            if audibleStart < audibleEnd && !(index == 0 && stream.codec == "vorbis") {
                 start = min(start ?? audibleStart, audibleStart)
                 end = max(end ?? audibleEnd, audibleEnd)
             }
@@ -392,8 +598,12 @@ private extension Probe {
                                            decodedSamples: decodedSamples))
             }
         }
-        return AudioIndex(stream: stream, packets: indexed, start: start ?? stream.start,
-                          end: end ?? stream.start, hasPriming: hasPriming,
+        var trackStart = start ?? stream.start
+        var trackEnd = end ?? trackStart
+        if let firstAudibleSample { trackStart = max(trackStart, firstAudibleSample) }
+        if let lastAudibleSample { trackEnd = min(trackEnd, lastAudibleSample) }
+        return AudioIndex(stream: stream, packets: indexed, start: trackStart,
+                          end: max(trackStart, trackEnd), hasPriming: hasPriming,
                           pcmContinuity: pcmContinuity, presentationEdits: [])
     }
 

@@ -3,11 +3,14 @@
 import argparse
 import itertools
 import json
+import os
 from pathlib import Path
 import re
 import statistics
 import subprocess
+import sys
 import tempfile
+import threading
 from time import perf_counter
 
 
@@ -34,7 +37,7 @@ TEARS_HOLDOUT_CUTS = (1778, 1905, 1971, 2036, 2218)
 
 
 def run(argv):
-    result = subprocess.run(argv, capture_output=True, text=True)
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=3600)
     if result.returncode:
         raise RuntimeError(f"{argv[0]} exited {result.returncode}\n{result.stderr[-4000:]}")
     return result
@@ -94,28 +97,86 @@ def scene_start(scene):
     return scene["startSeconds"]
 
 
-def mpcut(mpcut_cli, path):
-    report = json.loads(run([mpcut_cli, "scenes", str(path), "--json"]).stdout)
-    return [scene_start(scene) for scene in report["scenes"]][1:], report
-
-
-def scdet(ffmpeg, path, threshold=10):
-    # Decode and scale on the media engine, then convert the tiny frame for scdet.
-    video_filter = f"scale_vt=w=64:h=36,hwdownload,format=nv12,format=yuv420p,scdet=t={threshold}"
-    result = run([ffmpeg, "-hide_banner", "-nostats",
-                  "-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld",
-                  "-i", str(path), "-map", "0:v:0", "-an", "-sn", "-dn",
-                  "-vf", video_filter, "-f", "null", "-"])
-    return [float(time) for time in re.findall(r"lavfi\.scd\.time:\s*([0-9.]+)", result.stderr)], {}
-
-
-def sample(operation, count):
-    times = []
-    for _ in range(count):
+def measured_run(argv):
+    # wait4 returns usage for this CLI invocation, including decoder allocations.
+    # Temporary files let FFmpeg fill stderr without blocking on a pipe.
+    with tempfile.TemporaryFile(mode="w+") as stdout, tempfile.TemporaryFile(mode="w+") as stderr:
         started = perf_counter()
-        cuts, report = operation()
-        times.append(perf_counter() - started)
-    return cuts, report, round(statistics.median(times), 3)
+        with subprocess.Popen(argv, stdout=stdout, stderr=stderr) as child:
+            # wait4 has no timeout of its own. A stalled child is killed, which
+            # surfaces below as a nonzero exit instead of blocking the benchmark.
+            watchdog = threading.Timer(3600, child.kill)
+            watchdog.daemon = True
+            watchdog.start()
+            try:
+                _, status, usage = os.wait4(child.pid, 0)
+            finally:
+                watchdog.cancel()
+            elapsed = perf_counter() - started
+            child.returncode = os.waitstatus_to_exitcode(status)
+        stderr.seek(0)
+        if child.returncode:
+            raise RuntimeError(f"{argv[0]} exited {child.returncode}\n{stderr.read()[-4000:]}")
+        stdout.seek(0)
+        rss_mib = usage.ru_maxrss / (1024 ** 2 if sys.platform == "darwin" else 1024)
+        return stdout.read(), stderr.read(), (elapsed, rss_mib, usage.ru_utime + usage.ru_stime)
+
+
+def mpcut(mpcut_command, path):
+    stdout, _, metrics = measured_run([*mpcut_command, "scenes", str(path), "--json"])
+    report = json.loads(stdout)
+    return [scene_start(scene) for scene in report["scenes"]][1:], report, metrics
+
+
+def uncached_command(binary):
+    help_output = run([binary, "--help"])
+    if "--no-sidecar" in help_output.stdout or "--no-sidecar" in help_output.stderr:
+        return [binary, "--no-sidecar"]
+    return [binary]
+
+
+def scdet(ffmpeg, path, threshold, pixel_format):
+    if pixel_format is None:
+        decode = []
+        scale = "scale=w=64:h=36:flags=neighbor"
+    else:
+        decode = ["-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld"]
+        scale = f"scale_vt=w=64:h=36,hwdownload,format={pixel_format}"
+    _, stderr, metrics = measured_run([ffmpeg, "-hide_banner", "-nostats", *decode,
+                                      "-i", str(path), "-map", "0:v:0", "-an", "-sn", "-dn",
+                                      "-vf", f"{scale},format=yuv420p,scdet=t={threshold}",
+                                      "-f", "null", "-"])
+    return [float(time) for time in re.findall(r"lavfi\.scd\.time:\s*([0-9.]+)", stderr)], {}, metrics
+
+
+def measure(args, path, score, pixel_format="nv12"):
+    operations = {"mpcut": lambda: mpcut(args.mpcut, path)}
+    if args.baseline:
+        operations["baseline"] = lambda: mpcut(args.baseline, path)
+    if not args.skip_scdet:
+        operations["scdet"] = lambda: scdet(args.ffmpeg, path, args.scdet_threshold, pixel_format)
+    samples = {name: [] for name in operations}
+    outputs = {}
+    for repeat in range(-args.warmups, args.runs):
+        # Reverse alternating rounds to share first-reader/cache and thermal effects.
+        order = list(operations) if repeat % 2 == 0 else reversed(operations)
+        for name in order:
+            cuts, report, metrics = operations[name]()
+            if repeat < 0:
+                continue
+            if name in outputs and outputs[name] != (cuts, report):
+                raise RuntimeError(f"{name} produced inconsistent results on {path}")
+            outputs[name] = (cuts, report)
+            samples[name].append(metrics)
+    result = {}
+    for name, history in samples.items():
+        times, rss, cpu = zip(*history)
+        result[name] = {**score(*outputs[name]), "seconds": round(statistics.median(times), 3),
+                        "peakRSSMiB": round(statistics.median(rss), 1),
+                        "cpuSeconds": round(statistics.median(cpu), 3)}
+    if args.baseline:
+        result["reportsIdentical"] = outputs["mpcut"][1] == outputs["baseline"][1]
+    return result
 
 
 def summarize_view_groups(report, expected):
@@ -131,21 +192,48 @@ def summarize_view_groups(report, expected):
 def benchmark(args, directory):
     durations = list(itertools.accumulate(frames for _, frames in ORDER))
     expected = [frame / FPS for frame in durations[:-1]]
+    def score_montage(cuts, report):
+        accuracy = quality(expected, cuts)
+        if report:
+            accuracy.update(summarize_view_groups(report, [name for name, _ in ORDER]))
+        return accuracy
+
+    def score_unlabeled(cuts, report):
+        result = {"cuts": len(cuts)}
+        if report:
+            result["estimatedViews"] = report["viewCount"]
+        return result
+
     results = {}
     for name, flash in [("multicam", False), ("multicam-with-flashes", True)]:
         path = directory / f"{name}.mp4"
         make_source(args.fixture_ffmpeg, path, flash=flash)
-        cuts, report, elapsed = sample(lambda: mpcut(args.mpcut, path), args.runs)
-        baseline, _, baseline_seconds = sample(lambda: scdet(args.ffmpeg, path, args.scdet_threshold), args.runs)
         results[name] = {"durationSeconds": durations[-1] / FPS,
-                         "mpcut": {**quality(expected, cuts), "seconds": elapsed,
-                                   **summarize_view_groups(report, [name for name, _ in ORDER])},
-                         "scdet": {**quality(expected, baseline), "seconds": baseline_seconds}}
+                         **measure(args, path, score_montage)}
+
+    if args.codec_matrix:
+        # Remux one Main10 encode so only the HEVC sample entry changes.
+        hevc = "hevc-main10-2160p.mp4"
+        matrix = [
+            (hevc, "multicam.mp4", "p010le",
+             ["-vf", "scale=3840:2160", "-c:v", "hevc_videotoolbox", "-profile:v", "main10",
+              "-pix_fmt", "p010le", "-b:v", "12M", "-tag:v", "hev1"]),
+            ("hevc-main10-hvc1-2160p.mp4", hevc, "p010le", ["-c:v", "copy", "-tag:v", "hvc1"]),
+            ("prores-422-2160p.mov", "multicam.mp4", "p210le",
+             ["-vf", "scale=3840:2160", "-c:v", "prores_videotoolbox", "-profile:v", "standard", "-pix_fmt", "p210le"]),
+            ("ffv1-1080p.mkv", "multicam.mp4", None,
+             ["-vf", "scale=1920:1080", "-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p", "-threads", "4"]),
+        ]
+        for name, source, decoder_format, options in matrix:
+            path = directory / name
+            run([args.fixture_ffmpeg, "-hide_banner", "-v", "error", "-i", str(directory / source),
+                 *options, "-an", str(path)])
+            results[name] = {"durationSeconds": durations[-1] / FPS,
+                             **measure(args, path, score_montage, decoder_format)}
+
     for path in args.extra:
-        cuts, report, elapsed = sample(lambda: mpcut(args.mpcut, path), args.runs)
-        baseline, _, baseline_seconds = sample(lambda: scdet(args.ffmpeg, path, args.scdet_threshold), args.runs)
-        results[str(path)] = {"mpcut": {"cuts": len(cuts), "estimatedViews": report["viewCount"], "seconds": elapsed},
-                              "scdet": {"cuts": len(baseline), "seconds": baseline_seconds}}
+        # An arbitrary codec may have no VideoToolbox output surface.
+        results[str(path)] = measure(args, path, score_unlabeled, pixel_format=None)
     if args.tears_of_steel:
         def tuning_excerpt(times):
             return [time for time in times if 40 <= time < 64 and round(time * 24) not in TEARS_GRADUAL_TRANSITION]
@@ -159,15 +247,14 @@ def benchmark(args, directory):
                 "holdoutExcerpt": quality([frame / 24 for frame in TEARS_HOLDOUT_CUTS], holdout_excerpt(times)),
             }
 
-        cuts, report, elapsed = sample(lambda: mpcut(args.mpcut, args.tears_of_steel), args.runs)
-        baseline, _, baseline_seconds = sample(
-            lambda: scdet(args.ffmpeg, args.tears_of_steel, args.scdet_threshold), args.runs)
-        results["tears-of-steel"] = {
-            "durationSeconds": 17620 / 24,
-            "mpcut": {**scored_excerpts(cuts), "cutsTotal": len(cuts),
-                      "estimatedViews": report["viewCount"], "seconds": elapsed},
-            "scdet": {**scored_excerpts(baseline), "cutsTotal": len(baseline), "seconds": baseline_seconds},
-        }
+        def score_film(cuts, report):
+            result = {**scored_excerpts(cuts), "cutsTotal": len(cuts)}
+            if report:
+                result["estimatedViews"] = report["viewCount"]
+            return result
+
+        results["tears-of-steel"] = {"durationSeconds": 17620 / 24,
+                                    **measure(args, args.tears_of_steel, score_film)}
     return results
 
 
@@ -177,6 +264,13 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg", default="ffmpeg", help="Reference FFmpeg with VideoToolbox and scdet")
     parser.add_argument("--fixture-ffmpeg", default="ffmpeg", help="Fixture generator with libx264")
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--baseline", help="Previous MPCut CLI to compare on identical inputs")
+    parser.add_argument("--warmups", type=int, default=1, help="Untimed warmup rounds per input (default 1)")
+    parser.add_argument("--skip-scdet", action="store_true", help="Skip the independent FFmpeg comparison")
+    parser.add_argument("--require-identical", action="store_true",
+                        help="Exit with a failure if the baseline and candidate detection reports differ")
+    parser.add_argument("--codec-matrix", action="store_true",
+                        help="Also score 4K HEVC Main10 (hev1 and hvc1), 4K ProRes 422, and 1080p software-decoded FFV1")
     parser.add_argument("--scdet-threshold", type=float, default=10, help="FFmpeg scene score threshold")
     parser.add_argument("--extra", action="append", default=[], type=Path,
                         help="Additional unlabeled source for throughput measurements")
@@ -185,7 +279,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
+    if args.warmups < 0:
+        parser.error("--warmups must be nonnegative")
+    if args.require_identical and not args.baseline:
+        parser.error("--require-identical requires --baseline")
     if not 0 <= args.scdet_threshold <= 100:
         parser.error("--scdet-threshold must be between 0 and 100")
+    args.mpcut = uncached_command(args.mpcut)
+    if args.baseline:
+        args.baseline = uncached_command(args.baseline)
     with tempfile.TemporaryDirectory(prefix="mpcut-scene-benchmark-") as temporary:
-        print(json.dumps(benchmark(args, Path(temporary)), indent=2))
+        results = benchmark(args, Path(temporary))
+    print(json.dumps(results, indent=2))
+    if args.require_identical and not all(result["reportsIdentical"] for result in results.values()):
+        raise SystemExit(1)

@@ -356,13 +356,15 @@ class MediaRegression(unittest.TestCase):
             self.assertEqual(report["error"]["code"], code)
             self.assertFalse(output.exists())
         wrong_muxer = self.root / "invalid.webm"
-        self.export(wrong_muxer, [self.edit(source)], ok=False)
+        report = self.export(wrong_muxer, [self.edit(source)], ok=False)
+        self.assertEqual(report["error"]["code"], "unsupported_container", report)
         self.assertFalse(wrong_muxer.exists())
         output.write_bytes(b"preserve this destination")
         report = self.export(output, [self.edit(source)], ok=False)
         self.assertEqual(report["error"]["code"], "output_exists")
         self.assertEqual(output.read_bytes(), b"preserve this destination")
-        self.assertEqual(set(self.root.iterdir()), {source, other, audio_mismatch, output})
+        inputs = {source, other, audio_mismatch}
+        self.assertEqual(set(self.root.iterdir()), inputs | {output} | {Path(str(p) + ".mpcut") for p in inputs})
 
     def test_prores_alpha_color_and_orientation(self):
         for profile in ["4", "5"]:
@@ -396,7 +398,8 @@ class MediaRegression(unittest.TestCase):
         scanned.write_bytes(indexed.read_bytes() + b"\x00\x00\x00\x18uuidMPCut scan test\x00")
         reports = [self.cli("inspect", "--json", "--keyframes", str(source))
                    for source in (indexed, scanned)]
-        for report in reports:
+        for report, source in zip(reports, (indexed, scanned)):
+            self.assertEqual(Path(report.pop("file")).resolve(), source.resolve())
             report["media"].pop("url")
         self.assertEqual(*reports)
 
@@ -556,7 +559,9 @@ class MediaRegression(unittest.TestCase):
         self.assertEqual(result["media"]["format"], "avi")
         self.assertIn("RAW video", result["media"]["copyIssue"])
         output = self.root / "raw-copy.mkv"
-        self.export(output, [{"file": str(renamed)}], ok=False)
+        report = self.export(output, [{"file": str(renamed)}], ok=False)
+        self.assertEqual(report["error"]["code"], "unsupported_tracks", report)
+        self.assertIn("RAW video", report["error"]["message"])
         self.assertFalse(output.exists())
 
     def test_open_gop_cuts_and_snap(self):
@@ -582,9 +587,11 @@ class MediaRegression(unittest.TestCase):
                 # Frame 1 is a reordered inter picture, so decoding from it is unsafe.
                 output = self.root / f"{codec}-bad.mp4"
                 rejected = self.export(output, [self.edit(source, FRAME)], ok=False)["error"]
+                self.assertEqual(rejected["code"], "unsafe_boundary", rejected)
                 self.assertEqual(rejected["segment"], 1)
                 self.assertIn(rejected["boundary"], ["start", "from"])
                 self.assertFalse(output.exists())
+                self.assertTrue(rejected["nearest"], rejected)
                 for index, nearest in enumerate(rejected["nearest"]):
                     start = ratio(nearest)
                     alternative = self.root / f"{codec}-alternative-{index}.mp4"
@@ -612,7 +619,9 @@ class MediaRegression(unittest.TestCase):
                     report = json.loads(result.stdout)
                     if result.returncode:
                         self.assertFalse(target.exists())
-                        for index, option in enumerate(report["error"].get("nearest", [])):
+                        self.assertEqual(report["error"]["code"], "unsafe_boundary", report)
+                        self.assertTrue(report["error"]["nearest"], report)
+                        for index, option in enumerate(report["error"]["nearest"]):
                             alternate = ratio(option)
                             alternate_target = self.root / f"{codec}-{position}-alt-{index}.mp4"
                             alternate_edit = (self.edit(source, alternate) if position == "start"
@@ -664,7 +673,8 @@ class MediaRegression(unittest.TestCase):
 
         # These cuts are inside AAC packets. MKV has no equivalent edit list.
         unsupported = self.root / "aac-edits.mkv"
-        self.export(unsupported, edits, dry_run=True, ok=False)
+        report = self.export(unsupported, edits, dry_run=True, ok=False)
+        self.assertEqual((report["error"]["code"], report["error"]["track"]), ("unsafe_boundary", 1), report)
         self.assertFalse(unsupported.exists())
 
     def test_aac_whole_clip_joins_preserve_priming_and_tail_padding(self):
@@ -707,6 +717,27 @@ class MediaRegression(unittest.TestCase):
         # Eight seconds of presentation requires a wider track duration even
         # though the muxer initially wrote under two seconds of coded AAC.
         self.assertEqual(decode(joined), decoded * 4)
+        # Hidden AAC decoder history in each empty edit must not appear as a
+        # second copy of the tone. Compare every 20 ms waveform bin against
+        # the native presentation, including the explicitly silent bins.
+        wave = self.cli("silence", "--json", "--waveform", "400", joined)["waveformPeakDBFS"]
+        presented = memoryview(decoded * 4).cast("h")
+        self.assertEqual(len(wave), 400)
+        for bin_index, level in enumerate(wave):
+            samples = presented[bin_index * (RATE // 50):(bin_index + 1) * (RATE // 50)]
+            amplitude = max(map(abs, samples)) / 32768
+            self.assertIsNotNone(level)
+            self.assertAlmostEqual(10 ** (level / 20), amplitude, delta=0.0001)
+
+        # Zoom through a MOV empty edit into the following tone. The signed
+        # envelope uses the same source clock as both movie playback and trimming.
+        detail = self.cli("waveform", "--json", "--from", "1.5", "--to", "4", "--columns", "2500", joined)["envelope"]
+        start = 3 * RATE // 2
+        self.assertEqual((len(detail["low"]), len(detail["high"])), (2500, 2500))
+        for i, (low, high) in enumerate(zip(detail["low"], detail["high"], strict=True)):
+            block = presented[start + i * 48:start + (i + 1) * 48]
+            self.assertAlmostEqual(low, min(block) / 32768, delta=0.0001)
+            self.assertAlmostEqual(high, max(block) / 32768, delta=0.0001)
 
         reopened = self.root / "aac-delay-reopened.mov"
         self.export(reopened, [self.edit(joined, 1, 6)])
@@ -831,8 +862,10 @@ class MediaRegression(unittest.TestCase):
         self.assertEqual(sample_hashes(reopened), sample_hashes(interior))
 
         invalid = self.root / "discontinuous.webm"
-        self.export(invalid, [self.edit(source, stop="1"), self.edit(source, stop="1")],
-                    dry_run=True, ok=False)
+        report = self.export(invalid, [self.edit(source, stop="1"), self.edit(source, stop="1")],
+                             dry_run=True, ok=False)
+        self.assertEqual(report["error"]["code"], "unsafe_boundary", report)
+        self.assertIn("Opus", report["error"]["message"])
         self.assertFalse(invalid.exists())
 
     def test_silent_webm_interior_cuts_and_joins(self):
@@ -908,14 +941,14 @@ class MediaRegression(unittest.TestCase):
         ]:
             with self.subTest(field=field):
                 result = subprocess.run([CLI, "export", "--json", "--stdin", "--dry-run"], input=text,
-                                        capture_output=True, text=True, cwd=self.root)
+                                        capture_output=True, text=True, timeout=60, cwd=self.root)
                 self.assertEqual(result.returncode, 2, result.stdout)
                 error = json.loads(result.stdout)["error"]
                 self.assertEqual(error["code"], "invalid_json")
                 self.assertIn(f"'{field}'", error["message"])
         text = '{"output": "o {\\"a\\", \\"a\\"}.mov", "clips": [%s, %s]}' % (clip, clip)
         result = subprocess.run([CLI, "export", "--json", "--stdin", "--dry-run"], input=text,
-                                capture_output=True, text=True, cwd=self.root)
+                                capture_output=True, text=True, timeout=60, cwd=self.root)
         self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_times_outside_the_source_are_rejected_in_every_mode(self):
@@ -1021,7 +1054,7 @@ class MediaRegression(unittest.TestCase):
         for encoding in ["utf-16-le", "utf-32-be"]:
             with self.subTest(encoding=encoding):
                 result = subprocess.run([CLI, "export", "--stdin", "--json"], input=request.encode(encoding),
-                                        capture_output=True, cwd=self.root)
+                                        capture_output=True, timeout=60, cwd=self.root)
                 self.assertEqual(result.returncode, 2, result.stdout)
                 self.assertEqual(json.loads(result.stdout)["error"]["code"], "invalid_json")
                 self.assertFalse((self.root / "unexpected.mov").exists())
@@ -1045,7 +1078,7 @@ class MediaRegression(unittest.TestCase):
         # Watch for a staging file to send SIGINT during the writer, after the
         # process has installed its handler and passed argument validation.
         with request_file.open() as request_input, tempfile.TemporaryFile() as progress:
-            process = subprocess.Popen([CLI, "export", "--json", "--stdin"],
+            process = subprocess.Popen([CLI, "--no-sidecar", "export", "--json", "--stdin"],
                                        stdin=request_input, stdout=subprocess.PIPE,
                                        stderr=progress, cwd=self.root)
             try:
@@ -1062,9 +1095,11 @@ class MediaRegression(unittest.TestCase):
                 if process.poll() is None:
                     process.kill()
                     process.communicate()
-        self.assertNotEqual(process.returncode, 0, stdout)
+        # The destination is named "canceled", so match the code, not a substring.
+        self.assertEqual(process.returncode, 130, stdout)
         report = json.loads(stdout)
-        self.assertIn("cancel", json.dumps(report).lower())
+        self.assertIs(report["ok"], False)
+        self.assertEqual(report["error"]["code"], "cancelled", report)
         self.assertEqual(set(self.root.iterdir()), {source, request_file})
 
 

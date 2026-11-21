@@ -21,6 +21,25 @@ if [[ ${MPCUT_FFMPEG_BUILD_LOCK:-} != "$build_dir" ]]; then
     export MPCUT_FFMPEG_BUILD_LOCK="$build_dir"
     exec /usr/bin/lockf -k "$build_dir/.lock" /bin/bash "$root/scripts/build-ffmpeg.sh"
 fi
+# A build that was killed outright never ran its exit handlers. This build holds
+# the lock, so any stage folder or partial download found here is abandoned.
+# Put back an install that was moved aside for replacement, then remove them.
+if [[ -n "$build_dir" && -d "$build_dir" ]]; then
+    for stale in "$build_dir"/.stage.??????; do
+        if [[ ! -d "$stale" || -L "$stale" ]]; then
+            continue
+        fi
+        if [[ -d "$stale/previous-install" && ! -e "$prefix" ]]; then
+            mv "$stale/previous-install" "$prefix"
+        fi
+        rm -rf "$stale"
+    done
+    for stale in "$build_dir"/.source-download.??????; do
+        if [[ -f "$stale" && ! -L "$stale" ]]; then
+            rm -f "$stale"
+        fi
+    done
+fi
 fetch_source() (
     file=$1 expected=$2 url=$3
     if [[ ! -f "$file" ]]; then
@@ -42,7 +61,9 @@ fetch_source "$svt_archive" "$svt_digest" "https://gitlab.com/AOMediaCodec/SVT-A
 
 # Only a successful install marks the recipe and its outputs valid.
 hardware_patch="$root/packaging/ffmpeg-require-hardware.patch"
-export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+# Assign before exporting: `export NAME=$(command)` reports the status of export.
+SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
+export SDKROOT
 compiler=$(xcrun --sdk macosx --find clang)
 for required_tool in cmake pkg-config; do
     if ! command -v "$required_tool" >/dev/null; then
@@ -50,15 +71,16 @@ for required_tool in cmake pkg-config; do
         exit 1
     fi
 done
+# Collect each input first so that a failing tool stops the build instead of
+# contributing nothing to the recipe hash.
+recipe_files=$(shasum -a 256 "${BASH_SOURCE[0]}" "$hardware_patch")
+sdk_build=$(xcrun --sdk macosx --show-sdk-build-version)
+compiler_version=$("$compiler" --version)
+cmake_version=$(cmake --version)
+pkg_config_version=$(pkg-config --version)
 recipe=$(
-    {
-        shasum -a 256 "${BASH_SOURCE[0]}" "$hardware_patch"
-        printf '%s\n' "$SDKROOT"
-        xcrun --sdk macosx --show-sdk-build-version
-        "$compiler" --version
-        cmake --version
-        pkg-config --version
-    } | shasum -a 256 | cut -d ' ' -f 1
+    printf '%s\n' "$recipe_files" "$SDKROOT" "$sdk_build" "$compiler_version" \
+        "$cmake_version" "$pkg_config_version" | shasum -a 256 | cut -d ' ' -f 1
 )
 if [[ -f "$build_dir/.recipe" && $(cat "$build_dir/.recipe") == "$recipe" &&
       -f "$prefix/ffmpeg-source-name" && -f "$prefix/svt-source-name" &&

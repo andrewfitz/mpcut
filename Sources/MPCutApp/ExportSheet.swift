@@ -4,6 +4,9 @@ import MPCutCore
 
 struct ExportSheetOptions: Sendable {
     var mode: ExportMode = .smart
+    var tracks: ExportTracks = .all
+    var audioTrackOrdinal: Int?
+    var effectiveMode: ExportMode { tracks == .all ? mode : .copy }
     var copyContainer = "mp4"
     var encodeContainer = "mp4"
     var proResContainer = "mov"
@@ -13,7 +16,7 @@ struct ExportSheetOptions: Sendable {
     var audio: ReencodeAudio = .auto
 
     var container: String {
-        guard mode == .encode else { return copyContainer }
+        guard effectiveMode == .encode else { return copyContainer }
         return codec == .prores ? proResContainer : encodeContainer
     }
     var quality: ReencodeQuality { codec == .prores ? proResQuality : standardQuality }
@@ -21,21 +24,54 @@ struct ExportSheetOptions: Sendable {
     var settings: ReencodeSettings { .init(codec: codec, quality: quality, audio: effectiveAudio) }
 }
 
+struct ExportContainerChoices: Sendable {
+    let tracks: [ExportTracks: [String]]
+    let audioStreams: [Int: [String]]
+
+    init(source: MediaInfo, clips: [ClipRequest], preferred: String?, cancelled: @escaping @Sendable () -> Bool) {
+        var available: [ExportTracks: [String]] = [:]
+        let audio = source.streams.filter { $0.kind == "audio" }
+        if source.hasVideo {
+            let all = CutEngine(cancelled: cancelled).suggestedContainers(for: source, clips: clips)
+            available[.all] = all.isEmpty ? [preferred ?? "mp4"] : all
+            available[.video] = CutEngine(cancelled: cancelled, tracks: .video).suggestedContainers(for: source, clips: clips)
+        }
+        if !audio.isEmpty {
+            available[.audio] = CutEngine(cancelled: cancelled, tracks: .audio).suggestedContainers(for: source, clips: clips)
+        }
+        tracks = available
+        audioStreams = audio.count > 1 ? Dictionary(uniqueKeysWithValues: audio.indices.map { ordinal in
+            (ordinal, CutEngine(cancelled: cancelled, tracks: .audio, audioTrackOrdinal: ordinal).suggestedContainers(for: source, clips: clips))
+        }) : [:]
+    }
+
+    func choices(for options: ExportSheetOptions) -> [String] {
+        if options.tracks == .audio, let index = options.audioTrackOrdinal { return audioStreams[index] ?? [] }
+        return tracks[options.tracks] ?? []
+    }
+}
+
 enum EditorExportPlan: Sendable {
-    case packets(ResolvedEdit, mode: ExportMode)
+    case packets(ResolvedEdit, mode: ExportMode, tracks: ExportTracks)
     case conversion(ReencodePlan)
 
     var summary: String {
         switch self {
-        case .packets(let edit, .smart):
+        case .packets(let edit, .smart, .all):
             guard let encoded = try? edit.encodedVideoDuration(for: .smart),
                   let copied = try? edit.copiedVideoDuration(for: .smart) else {
                 return "The video durations could not be calculated."
             }
             let durations = "Copied video: \(Self.seconds(copied.seconds)) · Encoded video: \(Self.seconds(encoded.seconds))"
             return copied == .zero && encoded > .zero ? durations + "\nEvery selected video frame will be encoded." : durations
-        case .packets(let edit, _):
-            return "Copy \(Self.seconds(edit.duration.seconds)) of picture and sound to \(edit.container.uppercased())."
+        case .packets(let edit, _, let tracks):
+            let contents: String
+            switch tracks {
+            case .video: contents = "video"
+            case .audio: contents = "audio"
+            case .all: contents = "media"
+            }
+            return "Copy \(Self.seconds(edit.duration.seconds)) of \(contents) to \(edit.container.uppercased())."
         case .conversion(let plan):
             let video = "\(plan.settings.codec.displayName) · \(plan.settings.quality.displayName) · \(plan.width) × \(plan.height)"
             let groups = Dictionary(grouping: plan.audioActions, by: \.action)
@@ -110,20 +146,23 @@ struct ExportCutReview: Sendable {
     }
 }
 
-private enum ExportAvailability: Sendable {
+enum ExportAvailability: Sendable {
     case ready(EditorExportPlan)
     case unavailable(String, ExportCutReview?)
 
-    static func check(_ options: ExportSheetOptions, clips: [ClipRequest], media: [URL: MediaInfo]) -> Self {
+    static func check(_ options: ExportSheetOptions, clips: [ClipRequest], media: [URL: MediaInfo], useSidecar: Bool = true) -> Self {
         let cancelled: @Sendable () -> Bool = { Task.isCancelled }
-        let engine = CutEngine(cancelled: cancelled, smartTrim: options.mode == .smart)
+        let engine = CutEngine(cancelled: cancelled, smartTrim: options.effectiveMode == .smart, useSidecar: useSidecar,
+                               tracks: options.tracks, audioTrackOrdinal: options.audioTrackOrdinal)
         do {
-            if options.mode == .encode {
-                return .ready(.conversion(try ReencodeEngine(cancelled: cancelled)
-                    .resolve(clips, media: media, container: options.container, settings: options.settings)))
+            if options.effectiveMode == .encode {
+                return try AnalysisSidecar.$readsEnabled.withValue(useSidecar && AnalysisSidecar.readsEnabled) {
+                    .ready(.conversion(try ReencodeEngine(cancelled: cancelled)
+                        .resolve(clips, media: media, container: options.container, settings: options.settings)))
+                }
             }
             let edit = try engine.resolve(clips, media: media, container: options.container)
-            return .ready(.packets(edit, mode: options.mode))
+            return .ready(.packets(edit, mode: options.effectiveMode, tracks: options.tracks))
         } catch {
             var message = error.localizedDescription
             var review: ExportCutReview?
@@ -137,7 +176,7 @@ private enum ExportAvailability: Sendable {
                 if let times = issue.nearest, !times.isEmpty {
                     message += "\nVerified alternatives: " + times.map { EditorExportPlan.seconds($0.seconds) }.joined(separator: ", ")
                 }
-                if options.mode == .copy, issue.code == "unsafe_boundary", !cancelled(),
+                if options.mode == .copy, options.tracks == .all, issue.code == "unsafe_boundary", !cancelled(),
                    let snapped = try? engine.resolve(clips, snap: .nearest, media: media, container: options.container) {
                     review = ExportCutReview(original: clips, snapped: snapped, media: media,
                                              engine: engine, cancelled: cancelled)
@@ -152,9 +191,13 @@ private enum ExportAvailability: Sendable {
 final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private weak var panel: NSSavePanel?
     private var options: ExportSheetOptions
-    private let copyContainers: [String]
+    private let copyContainers: ExportContainerChoices
+    private let audioStreams: [StreamInfo]
+    private let sourceHasVideo: Bool
+    private let sourceHasAudio: Bool
     private let clips: [ClipRequest]
     private let media: [URL: MediaInfo]
+    private let useSidecar: Bool
     private let changed: (ExportSheetOptions, Bool) -> Void
     private let directoryChanged: (URL) -> Void
     private var preflight: Task<ExportAvailability, Never>?
@@ -170,19 +213,23 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private let modes: [ExportMode] = [.smart, .copy, .encode]
     private let codecs: [ReencodeCodec] = [.h264, .hevc, .prores]
     private var audioChoices: [ReencodeAudio] {
-        ReencodeAudio.allCases.filter { options.container != "mp4" || $0 != .pcm }
+        ReencodeAudio.allCases.filter { $0 != .removeAudio && (options.container != "mp4" || $0 != .pcm) }
     }
     private var qualities: [ReencodeQuality] {
         options.codec == .prores ? [.proresLT, .prores422, .proresHQ] : [.smallerFile, .balanced, .highQuality]
     }
     private var containers: [String] {
-        options.mode == .encode ? (options.codec == .prores ? ["mov", "mkv"] : ["mp4", "mov", "mkv"]) : copyContainers
+        options.effectiveMode == .encode ? (options.codec == .prores ? ["mov", "mkv"] : ["mp4", "mov", "mkv"]) : copyContainers.choices(for: options)
     }
+    private let videoCheck = NSButton(checkboxWithTitle: "Video", target: nil, action: nil)
+    private let audioCheck = NSButton(checkboxWithTitle: "Audio", target: nil, action: nil)
     private let modePicker = NSPopUpButton()
     private let containerPicker = NSPopUpButton()
     private let codecPicker = NSPopUpButton()
     private let qualityPicker = NSPopUpButton()
     private let audioPicker = NSPopUpButton()
+    private let audioTrackPicker = NSPopUpButton()
+    private let trackRow = NSStackView()
     private let settings = NSStackView()
     private let statusIcon = NSImageView()
     private let summary = NSTextField(wrappingLabelWithString: "")
@@ -193,8 +240,8 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private let reviewText = NSTextView(frame: NSRect(x: 0, y: 0, width: 470, height: 124))
     private let accessory = NSStackView()
 
-    init(panel: NSSavePanel, options: ExportSheetOptions, copyContainers: [String],
-         clips: [ClipRequest], media: [URL: MediaInfo],
+    init(panel: NSSavePanel, options: ExportSheetOptions, copyContainers: ExportContainerChoices,
+         clips: [ClipRequest], media: [URL: MediaInfo], useSidecar: Bool = true,
          changed: @escaping (ExportSheetOptions, Bool) -> Void,
          directoryChanged: @escaping (URL) -> Void) {
         self.panel = panel
@@ -202,11 +249,21 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         self.copyContainers = copyContainers
         self.clips = clips
         self.media = media
+        self.useSidecar = useSidecar
+        audioStreams = clips.first.flatMap { media[$0.file] }?.streams.filter { $0.kind == "audio" } ?? []
+        sourceHasVideo = media.values.contains(where: \.hasVideo)
+        sourceHasAudio = media.values.contains { $0.streams.contains { $0.kind == "audio" } }
         self.changed = changed
         self.directoryChanged = directoryChanged
         super.init()
         panel.delegate = self
 
+        videoCheck.target = self
+        videoCheck.action = #selector(selectTracks)
+        audioCheck.target = self
+        audioCheck.action = #selector(selectTracks)
+        configure(audioTrackPicker, label: "Audio tracks", action: #selector(selectAudioTrack))
+        trackRow.addArrangedSubview(row("Tracks", audioTrackPicker))
         configure(modePicker, label: "Mode", action: #selector(selectMode))
         configure(containerPicker, label: "Container", action: #selector(selectContainer))
         configure(codecPicker, label: "Video", action: #selector(selectCodec))
@@ -250,7 +307,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         accessory.alignment = .leading
         accessory.spacing = 8
         accessory.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 12, right: 16)
-        [paired(row("Mode", modePicker), row("Container", containerPicker)), settings, result,
+        [paired(videoCheck, audioCheck), trackRow, paired(row("Mode", modePicker), row("Container", containerPicker)), settings, result,
          reviewButton, encodeButton, reviewScroll, applyButton].forEach(accessory.addArrangedSubview)
         summary.widthAnchor.constraint(equalToConstant: 446).isActive = true
         updatePickers()
@@ -292,17 +349,25 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private func fill(_ picker: NSPopUpButton, titles: [String], selected: Int?) {
         picker.removeAllItems()
         picker.addItems(withTitles: titles)
-        picker.selectItem(at: selected ?? 0)
+        if !titles.isEmpty { picker.selectItem(at: selected ?? 0) }
         picker.isEnabled = titles.count > 1
     }
 
     private func updatePickers() {
-        fill(modePicker, titles: modes.map(\.displayName), selected: modes.firstIndex(of: options.mode))
-        fill(containerPicker, titles: containers.map { $0.uppercased() }, selected: containers.firstIndex(of: options.container))
+        videoCheck.state = options.tracks != .audio && sourceHasVideo ? .on : .off
+        audioCheck.state = options.tracks != .video && sourceHasAudio ? .on : .off
+        videoCheck.isEnabled = sourceHasVideo && audioCheck.state == .on
+        audioCheck.isEnabled = sourceHasAudio && videoCheck.state == .on
+        trackRow.isHidden = options.tracks != .audio || audioStreams.count < 2
+        fill(audioTrackPicker, titles: ["All audio tracks"] + audioStreams.map(\.exportLabel),
+             selected: options.audioTrackOrdinal.flatMap { audioStreams.indices.contains($0) ? $0 + 1 : nil })
+        fill(modePicker, titles: modes.map(\.displayName), selected: modes.firstIndex(of: options.effectiveMode))
+        modePicker.isEnabled = options.tracks == .all
+        fill(containerPicker, titles: containers.map(containerDisplayName), selected: containers.firstIndex(of: options.container))
         fill(codecPicker, titles: codecs.map(\.displayName), selected: codecs.firstIndex(of: options.codec))
         fill(qualityPicker, titles: qualities.map(\.displayName), selected: qualities.firstIndex(of: options.quality))
         fill(audioPicker, titles: audioChoices.map(\.displayName), selected: audioChoices.firstIndex(of: options.effectiveAudio))
-        settings.isHidden = options.mode != .encode
+        settings.isHidden = options.effectiveMode != .encode
     }
 
     private func didChange(from previousContainer: String, explicitCopyContainer: Bool = false) {
@@ -315,6 +380,28 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         changed(options, explicitCopyContainer)
         updatePickers()
         checkAvailability()
+    }
+
+    @objc private func selectTracks() {
+        let previousContainer = options.container
+        if videoCheck.state == .on && audioCheck.state == .on { options.tracks = .all }
+        else { options.tracks = videoCheck.state == .on ? .video : .audio }
+        options.audioTrackOrdinal = nil
+        let available = copyContainers.choices(for: options)
+        if options.tracks == .audio || !available.contains(previousContainer) {
+            options.copyContainer = available.first ?? previousContainer
+        } else {
+            options.copyContainer = previousContainer
+        }
+        didChange(from: previousContainer)
+    }
+
+    @objc private func selectAudioTrack() {
+        let previousContainer = options.container
+        let index = audioTrackPicker.indexOfSelectedItem
+        options.audioTrackOrdinal = index > 0 ? index - 1 : nil
+        options.copyContainer = copyContainers.choices(for: options).first ?? previousContainer
+        didChange(from: previousContainer)
     }
 
     @objc private func selectMode() {
@@ -331,14 +418,14 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     @objc private func selectContainer() {
         let previousContainer = options.container
         let container = containers[containerPicker.indexOfSelectedItem]
-        if options.mode != .encode {
+        if options.effectiveMode != .encode {
             options.copyContainer = container
         } else if options.codec == .prores {
             options.proResContainer = container
         } else {
             options.encodeContainer = container
         }
-        didChange(from: previousContainer, explicitCopyContainer: options.mode != .encode)
+        didChange(from: previousContainer, explicitCopyContainer: options.tracks == .all && options.effectiveMode != .encode)
     }
 
     @objc private func selectCodec() {
@@ -369,8 +456,8 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         availability = nil
         review = nil
         updateActions()
-        let task = Task.detached(priority: .userInitiated) { [options, clips, media] in
-            ExportAvailability.check(options, clips: clips, media: media)
+        let task = Task.detached(priority: .userInitiated) { [options, clips, media, useSidecar] in
+            ExportAvailability.check(options, clips: clips, media: media, useSidecar: useSidecar)
         }
         preflight = task
         Task { [weak self] in
@@ -389,7 +476,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
             symbol = "clock"
             description = "Checking export"
             statusIcon.contentTintColor = .secondaryLabelColor
-            summary.stringValue = "Checking \(options.mode.displayName) for this timeline…"
+            summary.stringValue = "Checking \(options.effectiveMode.displayName) for this timeline…"
         case .ready(let plan):
             symbol = "checkmark.circle"
             description = "Export ready"
@@ -399,13 +486,13 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
             symbol = "exclamationmark.triangle.fill"
             description = "Export unavailable"
             statusIcon.contentTintColor = .systemOrange
-            summary.stringValue = "\(options.mode.displayName) unavailable\n\(message)"
+            summary.stringValue = "\(options.effectiveMode.displayName) unavailable\n\(message)"
         }
         statusIcon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)
         statusIcon.setAccessibilityLabel(description)
         if case .unavailable(_, let proposed) = availability {
             reviewButton.isHidden = proposed == nil || review != nil
-            encodeButton.isHidden = options.mode != .smart
+            encodeButton.isHidden = options.effectiveMode != .smart
         } else {
             reviewButton.isHidden = true
             encodeButton.isHidden = true
@@ -442,16 +529,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         guard selected != nil else {
             throw CutError(code: "export_preflight_pending", message: "Wait for the export check to finish.")
         }
-        guard options.container == url.pathExtension.lowercased() else {
-            throw CutError(code: "unsupported_container", message: "The filename must use the selected movie format.")
-        }
-        var info = stat()
-        if lstat(url.path, &info) == 0 {
-            throw CutError(code: "output_exists", message: "Choose a new filename. MPCut preserves existing files.")
-        }
-        if errno != ENOENT {
-            throw CutError(code: "invalid_output", message: "MPCut couldn’t check the selected destination.")
-        }
+        try validateExportDestination(url, container: options.container)
     }
 
     func panel(_ sender: Any, userEnteredFilename filename: String, confirmed okFlag: Bool) -> String? {
@@ -503,5 +581,25 @@ extension ReencodeAudio {
         case .pcm: return "PCM"
         case .removeAudio: return "Remove Audio"
         }
+    }
+}
+
+extension StreamInfo {
+    var exportLabel: String {
+        let lang = language.isEmpty || language == "und" ? "" : " · " + language
+        return "Track \(index) · \(codec.uppercased()) · \(channels) ch" + lang
+    }
+}
+
+func validateExportDestination(_ url: URL, container: String) throws {
+    guard container == url.pathExtension.lowercased() else {
+        throw CutError(code: "unsupported_container", message: "The filename must use the selected container.")
+    }
+    var info = stat()
+    if lstat(url.path, &info) == 0 {
+        throw CutError(code: "output_exists", message: "Choose a new filename. MPCut preserves existing files.")
+    }
+    if errno != ENOENT {
+        throw CutError(code: "invalid_output", message: "MPCut couldn’t check the selected destination.")
     }
 }

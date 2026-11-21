@@ -15,7 +15,7 @@ void mpcut_aac_free(MPCutAAC *aac);
 int mpcut_aac_begin(MPCutAAC *aac, unsigned index, int sample_rate, MPCutTime src_start,
                     MPCutTime out_start, MPCutTime out_end, char *error, size_t error_capacity);
 int mpcut_aac_packet(MPCutAAC *aac, AVPacket *packet, AVRational input_tb,
-                     AVRational output_tb, char *error, size_t error_capacity);
+                     AVRational output_tb, int keep_tail_duration, char *error, size_t error_capacity);
 int mpcut_aac_end(MPCutAAC *aac, unsigned index, char *error, size_t error_capacity);
 int mpcut_aac_empty(MPCutAAC *aac, unsigned index, int sample_rate, MPCutTime out_start,
                    MPCutTime out_end, char *error, size_t error_capacity);

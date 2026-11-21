@@ -1,4 +1,5 @@
 import Foundation
+import PacketWriter
 
 public struct CutError: Error, LocalizedError, Codable, Sendable {
     public let code: String
@@ -7,15 +8,18 @@ public struct CutError: Error, LocalizedError, Codable, Sendable {
     public let boundary: String?
     public let nearest: [RationalTime]?
     public let track: Int?
+    public let multicam: MulticamDiagnostic?
+    public var multicamAt: RationalTime? { multicam?.at }
 
     public init(code: String, message: String, segment: Int? = nil, boundary: String? = nil,
-                nearest: [RationalTime]? = nil, track: Int? = nil) {
+                nearest: [RationalTime]? = nil, track: Int? = nil, multicam: MulticamDiagnostic? = nil) {
         self.code = code
         self.message = message
         self.segment = segment
         self.boundary = boundary
         self.nearest = nearest
         self.track = track
+        self.multicam = multicam
     }
 
     public var errorDescription: String? { message }
@@ -24,6 +28,19 @@ public struct CutError: Error, LocalizedError, Codable, Sendable {
 public enum SnapMode: String, Codable, CaseIterable, Sendable {
     case exact
     case nearest
+}
+
+/// Media kinds retained by the packet-copy writer.
+public enum ExportTracks: String, Codable, CaseIterable, Sendable {
+    case all, video, audio
+
+    var native: Int32 {
+        switch self {
+        case .all: return Int32(MPCUT_TRACKS_ALL)
+        case .audio: return Int32(MPCUT_TRACKS_AUDIO)
+        case .video: return Int32(MPCUT_TRACKS_VIDEO)
+        }
+    }
 }
 
 public enum ExportMode: String, Codable, CaseIterable, Sendable {
@@ -73,10 +90,13 @@ public struct ResolvedSegment: Codable, Sendable {
     public let outputStart: RationalTime
     public let tracks: [ResolvedTrack]
     var sourceOrigin: RationalTime?
+    // Whole soundtrack extraction keeps decoder history and normalizes its audible start.
+    var wholeAudioOrigin: RationalTime? = nil
     var lastVideoFrame: RationalTime?
     let reachesEnd: Bool
     var multipleDescriptions = false
     var videoDecodeTimes: [RationalTime] = []
+    package var sourceClipIndex: Int? = nil
     public internal(set) var encodedEdges: [EncodedEdge]? = nil
 
     enum CodingKeys: String, CodingKey {
@@ -91,6 +111,9 @@ public struct ResolvedEdit: Encodable, Sendable {
     public let duration: RationalTime
     public let container: String
     let identities: [URL: SourceIdentity]
+    public internal(set) var tracks: ExportTracks = .all
+    public internal(set) var audioStream: Int? = nil
+    var usesPerSourceAudioStream = false
 
     enum CodingKeys: String, CodingKey { case segments, duration, container }
 

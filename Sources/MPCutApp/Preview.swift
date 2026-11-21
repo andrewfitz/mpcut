@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Combine
 import CoreImage
 import CoreFoundation
 import Metal
@@ -11,9 +12,21 @@ struct PreviewRange: Equatable, Sendable {
     let url: URL
     let exactStart: RationalTime
     let exactEnd: RationalTime
+    var isAudioOnly = false
+    var audioOrigin: RationalTime?
+    var usesMP3GaplessClock = false
+    var audioTrack: Int?
 
     var start: Double { exactStart.seconds }
     var end: Double { exactEnd.seconds }
+}
+
+extension PreviewRange {
+    init(media: MediaInfo, from: RationalTime, to: RationalTime) {
+        self.init(url: media.url, exactStart: from, exactEnd: to, isAudioOnly: !media.hasVideo,
+                  audioOrigin: media.hasVideo ? nil : media.origin,
+                  usesMP3GaplessClock: !media.hasVideo && media.format.split(separator: ",").contains("mp3"))
+    }
 }
 
 func previewOffsets(_ ranges: [PreviewRange]) -> (offsets: [Double], duration: Double) {
@@ -25,6 +38,16 @@ func previewOffsets(_ ranges: [PreviewRange]) -> (offsets: [Double], duration: D
     return (offsets, end.seconds)
 }
 
+func previewShuttleRate(_ rate: Float, direction: Int) -> Float {
+    let sign: Float = direction < 0 ? -1 : 1
+    let speed = rate * sign
+    return sign * (speed > 0 ? min(8, speed * 2) : 1)
+}
+
+func previewAudioGain(volume: Float, muted: Bool) -> Float {
+    muted ? 0 : min(max(volume, 0), 1)
+}
+
 private struct PreviewFailure: LocalizedError {
     let errorDescription: String?
 
@@ -33,11 +56,11 @@ private struct PreviewFailure: LocalizedError {
     }
 }
 
-private func previewTime(_ seconds: Double) -> CMTime {
+func previewTime(_ seconds: Double) -> CMTime {
     CMTime(seconds: seconds, preferredTimescale: 1_000_000_000)
 }
 
-private func previewTime(_ time: RationalTime) -> CMTime {
+func previewTime(_ time: RationalTime) -> CMTime {
     guard let timescale = CMTimeScale(exactly: time.denominator) else { return previewTime(time.seconds) }
     return CMTime(value: time.numerator, timescale: timescale)
 }
@@ -52,7 +75,7 @@ struct PreviewFrame: @unchecked Sendable {
     }
 }
 
-private final class HardwareFrames: @unchecked Sendable {
+final class HardwareFrames: @unchecked Sendable {
     private let asset: AVURLAsset
     private let track: AVAssetTrack
     private let origin: CMTime
@@ -90,6 +113,12 @@ private final class HardwareFrames: @unchecked Sendable {
         generator = AVSampleBufferGenerator(asset: asset, timebase: nil)
         origin = mapping.target.start
         transform = track.preferredTransform
+    }
+
+    func indexedFrame(at time: RationalTime, cancelled: () -> Bool) throws -> PreviewFrame? {
+        guard let result = try frame(at: time.seconds, cancelled: cancelled),
+              result.time - origin == previewTime(time) else { return nil }
+        return result
     }
 
     deinit {
@@ -365,29 +394,56 @@ final class SequencePreview: ObservableObject {
     @Published private(set) var playbackRate: Float = 0
     var isPlaying: Bool { playbackRate != 0 }
     @Published private(set) var issue: String?
+    // Damaged audio stops one decoding pass. Seeking or playing again may get past it.
+    private var issueAllowsRetry = false
+    var hasBlockingIssue: Bool { issue != nil && !issueAllowsRetry }
     @Published private(set) var audioWarning: String?
 
-    @Published var volume: Float = 1 { didSet { updateGain() } }
-    @Published var isMuted = false { didSet { updateGain() } }
-    @Published var scrubSoundEnabled = true { didSet { if !scrubSoundEnabled { scrubAudio.stop() } } }
-    private let scrubAudio = ScrubAudioPlayer()
+    @Published var volume: Float = 1 {
+        didSet {
+            updateGain()
+            if let preferences, preferences.volume != volume { preferences.volume = volume }
+        }
+    }
+    @Published var isMuted = false {
+        didSet {
+            updateGain()
+            if let preferences, preferences.isMuted != isMuted { preferences.isMuted = isMuted }
+        }
+    }
+    @Published var scrubSoundEnabled = true {
+        didSet {
+            if !scrubSoundEnabled { scrubAudio.stop() }
+            if let preferences, preferences.scrubSoundEnabled != scrubSoundEnabled {
+                preferences.scrubSoundEnabled = scrubSoundEnabled
+            }
+        }
+    }
+    private let preferences: EditorPreferences?
+    private var preferenceObservation: AnyCancellable?
+    private let scrubAudio: ScrubAudioPlayer
+    private let reverseAudio: ReverseAudioPlayer
     private var scrubPicture: (source: URL, pts: Double, end: Double)?
-    private var isScrubbing = false
+    private var scrubRangeIndex: Int?
 
     private func updateGain() {
-        let gain = isMuted ? 0 : min(max(volume, 0), 1)
-        audioPlayer.volume = gain
+        let gain = previewAudioGain(volume: volume, muted: isMuted)
+        audioPlayer?.volume = gain
         fallback?.setGain(gain)
+        reverseAudio.gain = gain
         scrubAudio.gain = gain
         if gain == 0 { scrubAudio.stop() }
     }
 
     private let requests = DecodeRequests(label: "mpcut.preview.video", qos: .userInteractive)
-    private let audioPlayer = AVPlayer()
+    private var audioPlayer: AVPlayer?
     private var ranges: [PreviewRange] = []
     private var offsets: [Double] = []
     private var duration = 0.0
     private var playable = false
+    private var readyForTransport: Bool {
+        frame != nil || (ranges.first?.isAudioOnly == true && (playable || fallback != nil))
+    }
     private var audioEnd = 0.0
     private var usingAudioClock = false
     private var loading: Task<Void, Never>?
@@ -404,7 +460,32 @@ final class SequencePreview: ObservableObject {
     private var auditionPosition: (url: URL, time: Double)?
     private var frame: PreviewFrame?
     private var thumbnails = ThumbnailDecoder()
-    private weak var surface: PreviewSurface?
+    private let surfaces = NSHashTable<PreviewSurface>.weakObjects()
+
+    init(reverseAudioEngine: AVAudioEngine? = nil, scrubAudioEngine: AVAudioEngine? = nil,
+         preferences: EditorPreferences? = nil) {
+        self.preferences = preferences
+        reverseAudio = ReverseAudioPlayer(engine: reverseAudioEngine)
+        scrubAudio = ScrubAudioPlayer(engine: scrubAudioEngine)
+        guard let preferences else { return }
+        volume = preferences.volume
+        isMuted = preferences.isMuted
+        scrubSoundEnabled = preferences.scrubSoundEnabled
+        updateGain()
+        preferenceObservation = preferences.observeChanges { [weak self, weak preferences] change in
+            guard let self, let preferences else { return }
+            switch change {
+            case .volume where volume != preferences.volume:
+                volume = preferences.volume
+            case .isMuted where isMuted != preferences.isMuted:
+                isMuted = preferences.isMuted
+            case .scrubSoundEnabled where scrubSoundEnabled != preferences.scrubSoundEnabled:
+                scrubSoundEnabled = preferences.scrubSoundEnabled
+            default:
+                break
+            }
+        }
+    }
 
     deinit {
         loading?.cancel()
@@ -430,17 +511,23 @@ final class SequencePreview: ObservableObject {
         self.time = min(max(time, 0), duration)
         playable = false
         issue = nil
+        issueAllowsRetry = false
         audioWarning = nil
-        displayedURL = nil
-        frame = nil
-        surface?.clear()
+        clearPicture()
         removeAudioItem()
         guard !ranges.isEmpty else {
+            audioPlayer = nil
             requests.releaseDecoder()
             thumbnails = ThumbnailDecoder()
             return
         }
 
+        // Read Xing/LAME delay and padding on the same clock used by the index
+        // and copy export. One transport owns the full sequence across joins.
+        if ranges.contains(where: \.usesMP3GaplessClock) {
+            startFallback()
+            return
+        }
         renderTimeline(immediate: true)
         loading = Task { [weak self] in
             do {
@@ -450,17 +537,22 @@ final class SequencePreview: ObservableObject {
                 if audioEnd.isFinite && audioEnd > 0 {
                     self.audioEnd = audioEnd
                     let item = AVPlayerItem(asset: composition)
-                    self.audioPlayer.replaceCurrentItem(with: item)
+                    let player = self.audioPlayer ?? AVPlayer()
+                    player.volume = previewAudioGain(volume: self.volume, muted: self.isMuted)
+                    self.audioPlayer = player
+                    player.replaceCurrentItem(with: item)
                     self.observedAudioItem = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
                         guard item.status == .failed else { return }
                         let message = item.error?.localizedDescription ?? "The source audio could not be played."
                         Task { @MainActor in
-                            guard let self, self.audioPlayer.currentItem === item else { return }
+                            guard let self, self.audioPlayer?.currentItem === item else { return }
                             self.startFallback(nativeIssue: message)
                         }
                     }
-                    if !self.isScrubbing && self.playbackRate >= 0 { self.seekAudio() }
+                    if self.playbackRate < 0 { self.startReverseAudio() }
+                    else if self.scrubRangeIndex == nil { self.seekAudio() }
                 }
+                if self.audioEnd == 0 { self.audioPlayer = nil }
                 self.playable = true
             } catch {
                 guard let self, !Task.isCancelled else { return }
@@ -478,19 +570,38 @@ final class SequencePreview: ObservableObject {
             try Task.checkCancellation()
             let asset = assets[range.url] ?? AVURLAsset(url: range.url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
             assets[range.url] = asset
-            guard let video = try await asset.loadTracks(withMediaType: .video).first else {
-                throw PreviewFailure("macOS cannot read preview tracks in \(range.url.lastPathComponent).")
+            var audio = try await asset.loadTracks(withMediaType: .audio)
+            let origin: CMTime
+            if range.isAudioOnly {
+                var earliest: CMTime?
+                for track in audio {
+                    let start = try await track.load(.timeRange).start
+                    earliest = earliest.map { min($0, start) } ?? start
+                }
+                guard let earliest else {
+                    throw PreviewFailure("macOS could not read audio in \(range.url.lastPathComponent).")
+                }
+                origin = earliest
+            } else {
+                guard let video = try await asset.loadTracks(withMediaType: .video).first else {
+                    throw PreviewFailure("macOS cannot read preview tracks in \(range.url.lastPathComponent).")
+                }
+                origin = try nativeVideoMapping(try await video.load(.segments), url: range.url).target.start
             }
-            let videoStart = try nativeVideoMapping(try await video.load(.segments), url: range.url).target.start
-            let audio = try await asset.loadTracks(withMediaType: .audio)
+            if let index = range.audioTrack ?? (range.isAudioOnly ? 0 : nil) {
+                guard audio.indices.contains(index) else {
+                    throw PreviewFailure("macOS could not read the selected audio track in \(range.url.lastPathComponent).")
+                }
+                audio = [audio[index]]
+            }
             for _ in tracks.count..<max(tracks.count, audio.count) {
                 guard let target = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
                     throw PreviewFailure("Could not create an audio track for preview.")
                 }
                 tracks.append(target)
             }
-            let sourceRange = CMTimeRange(start: videoStart + previewTime(range.exactStart),
-                                          end: videoStart + previewTime(range.exactEnd))
+            let sourceRange = CMTimeRange(start: origin + previewTime(range.exactStart),
+                                          end: origin + previewTime(range.exactEnd))
             let end = offset + sourceRange.duration
             for (track, target) in zip(audio, tracks) {
                 let available = try await track.load(.timeRange)
@@ -520,18 +631,18 @@ final class SequencePreview: ObservableObject {
         usingAudioClock = false
         audioSeeking = false
         observedAudioItem = nil
-        audioPlayer.currentItem?.cancelPendingSeeks()
-        audioPlayer.replaceCurrentItem(with: nil)
+        audioPlayer?.currentItem?.cancelPendingSeeks()
+        audioPlayer?.replaceCurrentItem(with: nil)
     }
 
     private func seekAudio() {
         audioSeekGeneration += 1
         let generation = audioSeekGeneration
-        audioPlayer.pause()
-        usingAudioClock = time < audioEnd
+        audioPlayer?.pause()
+        usingAudioClock = audioPlayer != nil && time < audioEnd
         audioSeeking = usingAudioClock
-        guard usingAudioClock else {
-            audioPlayer.currentItem?.cancelPendingSeeks()
+        guard usingAudioClock, let audioPlayer else {
+            audioPlayer?.currentItem?.cancelPendingSeeks()
             return
         }
         audioPlayer.seek(to: previewTime(time), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
@@ -541,13 +652,13 @@ final class SequencePreview: ObservableObject {
                 if !finished {
                     self.startFallback(nativeIssue: "The source audio could not seek to this position.")
                 } else if self.playbackRate > 0 {
-                    self.audioPlayer.rate = self.playbackRate
+                    self.audioPlayer?.rate = self.playbackRate
                 }
             }
         }
     }
 
-    private func startFallback(nativeIssue: String) {
+    private func startFallback(nativeIssue: String? = nil) {
         guard fallback == nil else { return }
         let priorRate = playbackRate
         pause()
@@ -556,12 +667,14 @@ final class SequencePreview: ObservableObject {
         requests.releaseDecoder()
         rendering = false
         removeAudioItem()
+        audioPlayer = nil
         let generation = sequenceGeneration
         let alternative = WebSequencePlayback(ranges: ranges, onFrame: { [weak self] frame in
             guard let self, self.sequenceGeneration == generation else { return }
             if self.issue != nil { self.issue = nil }
+            self.issueAllowsRetry = false
             self.frame = frame
-            self.surface?.display(frame)
+            self.surfaces.allObjects.forEach { $0.display(frame) }
         }, onTime: { [weak self] position in
             guard let self, self.sequenceGeneration == generation else { return }
             let time = min(max(0, position), self.duration)
@@ -571,7 +684,9 @@ final class SequencePreview: ObservableObject {
             }
         }, onIssue: { [weak self] error in
             guard let self, self.sequenceGeneration == generation else { return }
-            self.issue = "\(error) \(nativeIssue)"
+            self.clearPicture()
+            self.issueAllowsRetry = error == WebSequencePlayback.undecodableAudio
+            self.issue = nativeIssue.map { "\(error) \($0)" } ?? error
             self.pause()
         }, onAudioWarning: { [weak self] message in
             guard let self, self.sequenceGeneration == generation else { return }
@@ -590,17 +705,31 @@ final class SequencePreview: ObservableObject {
     }
 
     func pause() {
+        if auditionPosition != nil { scrubAudio.stop() }
         endScrub()
+        if playbackRate < 0, let position = reverseAudio.position { time = min(time, position) }
+        reverseAudio.stop()
         fallback?.pause()
-        audioPlayer.pause()
+        audioPlayer?.pause()
         ticker?.cancel()
         ticker = nil
         playbackRate = 0
     }
 
-    func audition(_ range: PreviewRange, at sourceTime: Double) {
-        pause()
+    func audition(_ range: PreviewRange, at sourceTime: Double, sourceDuration: Double? = nil, reverse: Bool = false) {
+        if !range.isAudioOnly || auditionPosition?.url != range.url || isPlaying { pause() }
         auditionPosition = (range.url, sourceTime)
+        if range.isAudioOnly {
+            // A handle can be dragged into previously excluded material. Use the
+            // source clock here even when playback currently has a composition.
+            if scrubSoundEnabled, !isMuted, volume > 0, let end = sourceDuration, end > 0,
+               let request = ScrubAudioRequest(source: range.url, composition: nil, position: sourceTime,
+                                               bounds: 0..<end, reverse: reverse, audioOrigin: range.audioOrigin,
+                                               audioTrack: range.audioTrack) {
+                scrubAudio.submit(request)
+            }
+            return
+        }
         if let fallback {
             fallback.audition(url: range.url, at: sourceTime)
         } else {
@@ -615,50 +744,66 @@ final class SequencePreview: ObservableObject {
         let end = rangeIndex + 1 < offsets.count ? offsets[rangeIndex + 1] : duration
         let target = min(max(position, start), end)
         let reverse = target < time
-        if !isScrubbing {
+        if scrubRangeIndex == nil {
             pause()
             audioSeekGeneration += 1
-            audioPlayer.currentItem?.cancelPendingSeeks()
-            isScrubbing = true
+            audioPlayer?.currentItem?.cancelPendingSeeks()
+        } else if scrubRangeIndex != rangeIndex {
+            scrubAudio.stop()
         }
+        scrubRangeIndex = rangeIndex
         auditionPosition = nil
         time = target
-        if scrubPicture?.source != range.url || scrubPicture?.pts != sourceFrame || scrubPicture?.end != range.end {
+        if !range.isAudioOnly && (scrubPicture?.source != range.url || scrubPicture?.pts != sourceFrame || scrubPicture?.end != range.end) {
             scrubPicture = (range.url, sourceFrame, range.end)
-            if let fallback { fallback.audition(url: range.url, at: sourceFrame) }
+            if let fallback { fallback.audition(url: range.url, at: sourceFrame, before: range.end) }
             else { render(url: range.url, time: sourceFrame, before: range.end) }
         }
         guard scrubSoundEnabled, !isMuted, volume > 0 else { return }
-        let composition = audioPlayer.currentItem?.asset
+        let composition = audioPlayer?.currentItem?.asset
         guard composition != nil || fallback != nil else { return }
         let point = composition == nil ? min(range.end, range.start + (target - start)) : target
         let bounds = composition == nil ? range.start..<range.end : start..<end
         if let request = ScrubAudioRequest(source: range.url, composition: composition,
-                                           position: point, bounds: bounds, reverse: reverse) {
+                                           position: point, bounds: bounds, reverse: reverse, audioOrigin: range.audioOrigin,
+                                           audioTrack: range.audioTrack) {
             scrubAudio.submit(request)
         }
     }
 
     func endScrub() {
-        guard isScrubbing else { return }
-        isScrubbing = false
-        scrubPicture = nil
-        scrubAudio.stop()
+        guard scrubRangeIndex != nil else { return }
+        stopScrub()
         fallback?.park(at: time)
         if audioEnd > 0 { seekAudio() }
     }
 
+    private func stopScrub() {
+        scrubRangeIndex = nil
+        scrubPicture = nil
+        scrubAudio.stop()
+    }
+
+    private func clearRetryableIssue() {
+        guard issueAllowsRetry else { return }
+        issueAllowsRetry = false
+        issue = nil
+    }
+
     func seek(to time: Double) {
         guard time.isFinite else { return }
+        clearRetryableIssue()
+        if scrubRangeIndex != nil || auditionPosition != nil { stopScrub() }
         auditionPosition = nil
         self.time = min(max(time, 0), duration)
+        clockStart = .now
+        startTime = self.time
+        if playbackRate < 0 { startReverseAudio() }
         if let fallback {
             fallback.seek(to: self.time)
             return
         }
-        clockStart = .now
-        startTime = self.time
-        if audioEnd > 0 {
+        if playbackRate >= 0 && audioEnd > 0 {
             seekAudio()
         }
         renderTimeline(immediate: true)
@@ -667,20 +812,22 @@ final class SequencePreview: ObservableObject {
     func togglePlayback() {
         if isPlaying {
             pause()
-        } else if frame != nil && issue == nil {
+            return
+        }
+        clearRetryableIssue()
+        if readyForTransport && issue == nil {
             if time >= duration { seek(to: 0) }
             startPlayback(at: 1)
         }
     }
 
     func shuttle(_ direction: Int) {
-        let sign: Float = direction < 0 ? -1 : 1
-        let speed = playbackRate * sign
-        startPlayback(at: sign * (speed > 0 ? min(8, speed * 2) : 1))
+        clearRetryableIssue()
+        startPlayback(at: previewShuttleRate(playbackRate, direction: direction))
     }
 
     private func startPlayback(at rate: Float) {
-        guard frame != nil, issue == nil, rate != playbackRate, duration > 0 else { return }
+        guard readyForTransport, issue == nil, rate != playbackRate, duration > 0 else { return }
         if (rate > 0 && time >= duration) || (rate < 0 && time <= 0) {
             pause()
             return
@@ -695,7 +842,7 @@ final class SequencePreview: ObservableObject {
             startTime = time
             clockStart = .now
             if let fallback { fallback.play(rate: rate) }
-            else if usingAudioClock && !audioSeeking { audioPlayer.rate = rate }
+            else if usingAudioClock && !audioSeeking { audioPlayer?.rate = rate }
             return
         }
 
@@ -709,6 +856,7 @@ final class SequencePreview: ObservableObject {
             return
         }
         if rate > 0, audioEnd > 0 { seekAudio() }
+        if rate < 0 { startReverseAudio() }
         ticker = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(16))
@@ -718,16 +866,31 @@ final class SequencePreview: ObservableObject {
         }
     }
 
+    private func startReverseAudio() {
+        let composition = audioPlayer?.currentItem?.asset
+        guard composition != nil || fallback != nil else { return }
+        let timeline = ReverseAudioTimeline(ranges: ranges, offsets: offsets, composition: composition)
+        reverseAudio.start(timeline, at: time, speed: Int(-playbackRate))
+    }
+
     private func tick() {
         let elapsed = clockStart.duration(to: .now).components
         let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
         let clock = startTime + seconds * Double(playbackRate)
         if playbackRate < 0 {
-            time = max(0, clock)
+            reverseAudio.tick()
+            if let position = reverseAudio.position {
+                time = min(time, position)
+                // Preserve continuity if the output device becomes unavailable.
+                startTime = time
+                clockStart = .now
+            } else {
+                time = max(0, clock)
+            }
             if time == 0 {
                 pause()
                 seek(to: 0)
-            } else if let fallback {
+            } else if let fallback, ranges.first?.isAudioOnly != true {
                 fallback.displayStill(at: time)
             } else {
                 renderTimeline(immediate: false)
@@ -735,19 +898,19 @@ final class SequencePreview: ObservableObject {
             return
         }
         guard !audioSeeking else { return }
-        let next = usingAudioClock ? audioPlayer.currentTime().seconds : clock
+        let next = usingAudioClock ? (audioPlayer?.currentTime().seconds ?? clock) : clock
         guard next.isFinite else { return }
         let position = min(max(time, next), duration)
         if position != time { time = position }
-        if audioPlayer.currentItem?.status == .failed {
-            startFallback(nativeIssue: audioPlayer.currentItem?.error?.localizedDescription ?? "The source audio could not be played.")
+        if audioPlayer?.currentItem?.status == .failed {
+            startFallback(nativeIssue: audioPlayer?.currentItem?.error?.localizedDescription ?? "The source audio could not be played.")
             return
         }
         if usingAudioClock && next >= audioEnd {
             // A composition omits empty trailing edits from its duration.
             // Continue on the host clock through the sequence's silent tail.
             usingAudioClock = false
-            audioPlayer.pause()
+            audioPlayer?.pause()
             startTime = time
             clockStart = .now
         }
@@ -763,6 +926,7 @@ final class SequencePreview: ObservableObject {
         guard immediate || !rendering, !offsets.isEmpty else { return }
         let index = max(0, offsets.lowerBound { $0 > time } - 1)
         let range = ranges[index]
+        guard !range.isAudioOnly else { return }
         let sourceTime = time == duration ? range.end
             : min(range.end, range.start + (time - offsets[index]))
         render(url: range.url, time: sourceTime, before: range.end, scrubbing: immediate)
@@ -785,7 +949,7 @@ final class SequencePreview: ObservableObject {
                     if self.displayedURL != url || self.frame?.time != frame.time {
                         self.displayedURL = url
                         self.frame = frame
-                        self.surface?.display(frame)
+                        self.surfaces.allObjects.forEach { $0.display(frame) }
                     }
                 case .success(nil):
                     self.startFallback(nativeIssue: "The source produced no picture at this position.")
@@ -796,25 +960,52 @@ final class SequencePreview: ObservableObject {
         }
     }
 
-    func thumbnail(source: UUID, url: URL, at time: Double, size: CGSize) async -> CGImage? {
+    func thumbnail(source: UUID, url: URL, at time: Double, size: CGSize,
+                   saved: (AnalysisSidecar, FilmstripTileKey)? = nil,
+                   cacheEnabled: @escaping @Sendable () -> Bool = { true },
+                   preserveAlpha: Bool = false, onRender: (CGImage) -> Void = { _ in }) async -> CGImage? {
         guard !Task.isCancelled, size.width > 0, size.height > 0 else { return nil }
         let request = ThumbnailRequest()
         let thumbnails = thumbnails
-        return await withTaskCancellationHandler {
+        let result: (image: CGImage?, restored: Bool) = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 thumbnails.queue.async {
+                    let skipCache = { request.isCancelled || !cacheEnabled() }
+                    if let (sidecar, key) = saved, let image = key.image(in: sidecar, cancelled: skipCache), !skipCache() {
+                        continuation.resume(returning: (image, true))
+                        return
+                    }
                     let image = thumbnails.image(source: source, url: url, time: time, size: size, request: request)
-                    continuation.resume(returning: request.isCancelled ? nil : image)
+                    if let image, let (sidecar, key) = saved, !skipCache(),
+                       let bytes = key.encoded(image, preserveAlpha: preserveAlpha) {
+                        sidecar.saveAutomatically([key.section: bytes],
+                            retainingLatest: [FilmstripTileKey.sectionPrefix: FilmstripTileBuffer.countLimit],
+                            cancelled: skipCache)
+                    }
+                    continuation.resume(returning: (image, false))
                 }
             }
         } onCancel: {
             request.cancel()
         }
+        guard !Task.isCancelled, let image = result.image else { return nil }
+        if !result.restored { onRender(image) }
+        return image
     }
 
     fileprivate func attach(_ surface: PreviewSurface) {
-        self.surface = surface
+        surfaces.add(surface)
         if let frame { surface.display(frame) }
+    }
+
+    private func clearPicture() {
+        displayedURL = nil
+        frame = nil
+        surfaces.allObjects.forEach { $0.clear() }
+    }
+
+    fileprivate func detach(_ surface: PreviewSurface) {
+        surfaces.remove(surface)
     }
 }
 
@@ -822,6 +1013,8 @@ final class PreviewSurface: NSView {
     private let displayLayer = AVSampleBufferDisplayLayer()
     private var cachedFormat: CMVideoFormatDescription?
     private var pictureTransform = CGAffineTransform.identity
+    var windowChanged: ((PreviewSurface) -> Void)?
+    private(set) var displayedFrameTime: CMTime?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -834,6 +1027,12 @@ final class PreviewSurface: NSView {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { clear() }
+        windowChanged?(self)
+    }
 
     override func layout() {
         super.layout()
@@ -850,12 +1049,13 @@ final class PreviewSurface: NSView {
         CATransaction.commit()
     }
 
-    fileprivate func clear() {
+    func clear() {
+        displayedFrameTime = nil
         cachedFormat = nil
         displayLayer.flushAndRemoveImage()
     }
 
-    fileprivate func display(_ frame: PreviewFrame) {
+    func display(_ frame: PreviewFrame) {
         if pictureTransform != frame.displayTransform {
             pictureTransform = frame.displayTransform
             layoutPicture()
@@ -881,6 +1081,7 @@ final class PreviewSurface: NSView {
         }
         if displayLayer.status == .failed { displayLayer.flush() }
         displayLayer.enqueue(sample)
+        displayedFrameTime = frame.time
     }
 }
 
@@ -889,7 +1090,10 @@ struct PreviewView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> PreviewSurface {
         let surface = PreviewSurface(frame: .zero)
-        preview.attach(surface)
+        surface.windowChanged = { [weak preview] surface in
+            if surface.window == nil { preview?.detach(surface) }
+            else { preview?.attach(surface) }
+        }
         return surface
     }
 

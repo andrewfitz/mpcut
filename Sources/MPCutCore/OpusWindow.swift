@@ -1,7 +1,9 @@
 import Foundation
 
 func supportsOpusTrim(_ audio: AudioIndex, media: MediaInfo, container: String) -> Bool {
-    (container == "webm" || container == "mkv") && matroskaAudioCodec(audio, media: media) == "Opus"
+    guard ["webm", "mkv", "mka"].contains(container), audio.stream.codec == "opus" else { return false }
+    let formats = media.format.split(separator: ",")
+    return formats.contains("matroska") || formats.contains("ogg")
 }
 
 func matroskaAudioCodec(_ audio: AudioIndex, media: MediaInfo) -> String? {
@@ -45,11 +47,13 @@ struct OpusTrimWindow: Sendable {
 func opusTrimWindow(_ audio: AudioIndex, origin: RationalTime, checkCancellation: () throws -> Void = {}) rethrows -> OpusTrimWindow? {
     let stream = audio.stream
     let padding = stream.initialPadding
-    guard stream.sampleRate == 48_000, stream.timeBase == RationalTime(numerator: 1, denominator: 1_000),
+    let sampleClock = stream.timeBase == RationalTime(numerator: 1, denominator: 48_000)
+    guard stream.sampleRate == 48_000, sampleClock || stream.timeBase == RationalTime(numerator: 1, denominator: 1_000),
           padding >= 0, let first = audio.packets.first,
           padding <= 65_535, first.skipSamples == padding, first.decodedSamples > 0,
           let firstPTSSamples = try? origin.adding(first.time).roundedToSamples(48_000) else { return nil }
-    let (start, startOverflow) = firstPTSSamples.addingReportingOverflow(Int64((padding + 24) / 48 * 48))
+    let initialOffset = sampleClock ? padding : (padding + 24) / 48 * 48
+    let (start, startOverflow) = firstPTSSamples.addingReportingOverflow(Int64(initialOffset))
     guard !startOverflow else { return nil }
     let (decodedStart, decodedOverflow) = start.subtractingReportingOverflow(Int64(padding))
     guard !decodedOverflow else { return nil }
@@ -63,7 +67,8 @@ func opusTrimWindow(_ audio: AudioIndex, origin: RationalTime, checkCancellation
         guard let pts = try? origin.adding(packet.time).roundedToSamples(48_000) else { break }
         let (delta, deltaOverflow) = pts.subtractingReportingOverflow(expected)
         let (next, packetOverflow) = expected.addingReportingOverflow(Int64(packet.decodedSamples))
-        guard !deltaOverflow, (-24...24).contains(delta), !packetOverflow, packet.dts == packet.time,
+        let tolerance: Int64 = sampleClock ? 0 : 24
+        guard !deltaOverflow, (-tolerance...tolerance).contains(delta), !packetOverflow, packet.dts == packet.time,
               packet.skipSamples == (index == 0 ? padding : 0),
               packet.decodedSamples > packet.discardSamples,
               index > 0 || packet.discardSamples == 0 else { break }

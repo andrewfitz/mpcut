@@ -40,6 +40,45 @@ final class ScrubAudioTests: XCTestCase {
         XCTAssertFalse(engine.isRunning)
     }
 
+    func testReverseBlocksRetainEveryStereoSampleAcrossBufferBoundariesAtAllShuttleSpeeds() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".caf")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 24_000))
+        buffer.frameLength = buffer.frameCapacity
+        for i in 0..<24_000 {
+            buffer.floatChannelData![0][i] = sinf(Float(i) * 0.041)
+            buffer.floatChannelData![1][i] = 0.4 * cosf(Float(i) * 0.017)
+        }
+        do {
+            var settings = format.settings
+            settings[AVLinearPCMIsNonInterleaved] = false
+            let output = try AVAudioFile(forWriting: file, settings: settings)
+            try output.write(from: buffer)
+        }
+        let range = PreviewRange(url: file, exactStart: .zero, exactEnd: .init(numerator: 1, denominator: 2))
+        let timeline = ReverseAudioTimeline(ranges: [range], offsets: [0], composition: AVURLAsset(url: file))
+        let reader = ScrubAudioReader()
+        for speed in [1, 2, 4, 8] {
+            let upper = 21_603
+            let boundary = upper - speed * 941
+            let first = await reader.reverseBlock(timeline, from: Int64(boundary), to: Int64(upper), speed: speed)
+            let second = await reader.reverseBlock(timeline, from: 0, to: Int64(boundary), speed: speed)
+            let samples = first + second
+            XCTAssertEqual(samples.count, ((upper + speed - 1) / speed) * 2)
+            let offsets = [0, 939, 940, 941, 942, samples.count / 2 - 1]
+            for offset in offsets {
+                let end = upper - offset * speed
+                let start = max(0, end - speed)
+                for ch in 0..<2 {
+                    let source = buffer.floatChannelData![ch]
+                    let mean = (start..<end).reduce(Float(0)) { $0 + source[$1] } / Float(end - start)
+                    XCTAssertEqual(samples[2 * offset + ch], mean, accuracy: 0.0001, "speed \(speed), offset \(offset)")
+                }
+            }
+        }
+    }
+
     func testNativeAndWebMGrainsPlaySelectedStereoSamplesInEitherDirection() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".caf")
         defer { try? FileManager.default.removeItem(at: temp) }

@@ -18,7 +18,7 @@ SAMPLE_RATE = 48_000
 CLI = None
 
 
-def movie(path, codec, width=320, transfer="bt709", height=96):
+def movie(path, codec, width=320, transfer="bt709", height=96, pixel_format="yuv420p"):
     # Eight luma blocks encode the picture number, surviving both lossy encoders.
     marker = "geq=lum='if(lt(Y,16)*lt(X,128),if(bitand(N,pow(2,floor(X/16))),210,32),lum(X,Y))'"
     marker += f",setparams=range=limited:color_primaries=bt709:color_trc={transfer}:colorspace=bt709"
@@ -31,7 +31,7 @@ def movie(path, codec, width=320, transfer="bt709", height=96):
     sound = ["-c:a", "libopus"] if codec == "av1" else ["-c:a", "aac", "-aac_pns", "0"]
     ffmpeg("-f", "lavfi", "-i", f"testsrc2=s={width}x{height}:r={FPS}:d=5",
            "-f", "lavfi", "-i", f"sine=r={SAMPLE_RATE}:d=5:f=930",
-           "-vf", marker, *settings[codec], "-pix_fmt", "yuv420p", "-color_range", "tv",
+           "-vf", marker, *settings[codec], "-pix_fmt", pixel_format, "-color_range", "tv",
            "-color_trc", transfer, "-color_primaries", "bt709", "-colorspace", "bt709",
            *sound, path, allow_diagnostics=True)
     return path
@@ -300,6 +300,15 @@ class SmartTrimTests(unittest.TestCase):
                                 if t >= Fraction(offset, FPS)}
                     self.assertEqual(dict(timestamped_hashes(reopened)), expected, "re-open changed picture packets")
 
+    def test_main10_hevc_smart_edges_keep_the_source_profile_and_frame_order(self):
+        source = movie(self.root / "main10.mov", "hevc", pixel_format="yuv420p10le")
+        self.sources = {**self.sources, "hevc": source}
+        self.check_trim("hevc", [(7, 88)], [[(7, 25), (75, 88)]])
+        output = self.root / "hevc-7-88.mov"
+        pictures = probe(output, "-select_streams", "v:0", "-show_frames",
+                         "-show_entries", "frame=pix_fmt")["frames"]
+        self.assertEqual([picture["pix_fmt"] for picture in pictures], ["yuv420p10le"] * 81)
+
     def test_hevc_bottom_padding_change_decodes_seeks_and_reopens(self):
         source = movie(self.root / "unpadded-hevc.mov", "hevc", width=640, height=360)
         output = self.root / "cut.mov"
@@ -313,7 +322,7 @@ class SmartTrimTests(unittest.TestCase):
         self.export(reopened, [(output, 18, 81)], smart=False)
         self.assertEqual(run([self.fixtures / "DecodeFrameIDs", reopened]), sequence[18:])
 
-    def test_hardware_edges_avoid_periodic_keyframes_inside_short_gops(self):
+    def test_hardware_splices_keep_independent_starts_and_copied_keyframes(self):
         for codec in ("h264", "hevc"):
             with self.subTest(codec=codec):
                 source = self.sources[codec]
@@ -322,7 +331,30 @@ class SmartTrimTests(unittest.TestCase):
                 packets = probe(output, "-select_streams", "v:0", "-show_packets",
                                 "-show_entries", "packet=pts_time,flags")["packets"]
                 keys = sorted(Fraction(p["pts_time"]) * FPS for p in packets if "K" in p["flags"])
-                self.assertEqual(keys, [0, 18, 43, 68])
+                self.assertIn(0, keys)
+                self.assertEqual([key for key in keys if 18 <= key < 68], [18, 43])
+                self.assertIn(68, keys)
+
+    def test_hardware_edges_avoid_periodic_keyframes_inside_short_gops(self):
+        for codec in ("h264", "hevc"):
+            with self.subTest(codec=codec):
+                source = self.root / f"still-{codec}.mp4"
+                gop = "keyint=100:min-keyint=100:scenecut=0:open-gop=0"
+                settings = (["-c:v", "libx264", "-x264-params", gop] if codec == "h264" else
+                            ["-c:v", "libx265", "-x265-params", gop + ":pools=1:log-level=error", "-tag:v", "hvc1"])
+                ffmpeg("-f", "lavfi", "-i", "smptebars=size=320x96:rate=25:duration=4",
+                       "-threads", "1", *settings, source, allow_diagnostics=True)
+                output = self.root / f"edge-{codec}.mp4"
+                plan = self.export(output, [(source, 5, 75)])
+                self.assertEqual([edge["frameCount"] for edge in plan["segments"][0]["encodedEdges"]], [70])
+                packets = probe(output, "-select_streams", "v:0", "-show_packets",
+                                "-show_entries", "packet=pts_time,flags")["packets"]
+                self.assertEqual(len(packets), 70)
+                keys = sorted(Fraction(packet["pts_time"]) * FPS for packet in packets if "K" in packet["flags"])
+                self.assertEqual(keys[0], 0)
+                # VideoToolbox may independently add a sync frame. A forced interval
+                # of 12 would cap every run at 12, even on this unchanging picture.
+                self.assertGreater(max(b - a for a, b in zip(keys, keys[1:] + [70])), 12, keys)
 
     def test_avc_coded_width_change_is_native_playable_or_rejected(self):
         # Some VideoToolbox encoders pad 160px AVC to a 192px coded picture.
@@ -337,8 +369,13 @@ class SmartTrimTests(unittest.TestCase):
             self.assertTrue(report["ok"])
             self.assertEqual(run([self.fixtures / "DecodeFrameIDs", output]), bytes(range(7, 88)))
         else:
+            # Narrow AVC is ineligible for an encoded edge, so the request falls
+            # back to copy boundaries: frame 7 is refused with both neighbours.
             self.assertFalse(report["ok"], report)
-            self.assertTrue(report["error"]["message"], report)
+            error = report["error"]
+            self.assertEqual((error["code"], error["boundary"], error["segment"]),
+                             ("unsafe_boundary", "from", 1), report)
+            self.assertEqual([Fraction(t["numerator"], t["denominator"]) for t in error["nearest"]], [0, 1], report)
             self.assertFalse(output.exists())
             self.assertFalse(any(self.root.glob(".mpcut-*")))
 

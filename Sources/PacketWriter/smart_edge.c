@@ -75,7 +75,9 @@ static int configure_encoder(EdgeEncoder *work, const AVStream *video, int64_t t
     case AV_CODEC_ID_AV1: name = "libsvtav1"; break;
     default: return AVERROR_ENCODER_NOT_FOUND;
     }
-    if ((source->format != AV_PIX_FMT_YUV420P && source->format != AV_PIX_FMT_YUVJ420P) ||
+    bool main10 = source->codec_id == AV_CODEC_ID_HEVC && source->profile == AV_PROFILE_HEVC_MAIN_10 &&
+                  source->format == AV_PIX_FMT_YUV420P10LE;
+    if ((!main10 && source->format != AV_PIX_FMT_YUV420P && source->format != AV_PIX_FMT_YUVJ420P) ||
         source->color_trc == AVCOL_TRC_SMPTE2084 || source->color_trc == AVCOL_TRC_ARIB_STD_B67)
         return AVERROR(ENOTSUP);
     const AVCodec *encoder = avcodec_find_encoder_by_name(name);
@@ -114,7 +116,7 @@ static int configure_encoder(EdgeEncoder *work, const AVStream *video, int64_t t
         // Each edge already starts independently and ends at the next copy seam.
         codec->gop_size = (int)FFMIN(work->edge->count, INT_MAX);
         codec->pix_fmt = AV_PIX_FMT_VIDEOTOOLBOX;
-        codec->sw_pix_fmt = AV_PIX_FMT_NV12;
+        codec->sw_pix_fmt = main10 ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
         av_dict_set(&options, "allow_sw", "0", 0);
     }
     int result = avcodec_open2(codec, encoder, &options);
@@ -174,8 +176,11 @@ static int fill_frame(AVFrame *frame, const AVCodecContext *codec, CMSampleBuffe
         CVPixelBufferGetHeight(image) != (size_t)codec->height || CVPixelBufferGetPlaneCount(image) != 2)
         return AVERROR(ENOTSUP);
     OSType format = CVPixelBufferGetPixelFormatType(image);
-    bool full_range = format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
-    if ((!full_range && format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) ||
+    bool main10 = codec->sw_pix_fmt == AV_PIX_FMT_P010LE;
+    OSType full = main10 ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    OSType limited = main10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    bool full_range = format == full;
+    if ((!full_range && format != limited) ||
         (codec->color_range != AVCOL_RANGE_UNSPECIFIED && full_range != (codec->color_range == AVCOL_RANGE_JPEG)))
         return AVERROR(ENOTSUP);
     frame->format = codec->pix_fmt;
@@ -265,7 +270,7 @@ static int encode(EdgeEncoder *work, AVFrame *frame)
     return (frame && result == AVERROR(EAGAIN)) || (!frame && result == AVERROR_EOF) ? 0 : result;
 }
 
-static MPCutEdge *encode_edge(const char *path, const AVStream *video, MPCutTime decode_from,
+static MPCutEdge *encode_edge(const char *path, const AVStream *video, int64_t origin_pts, MPCutTime decode_from,
                               MPCutTime from, MPCutTime to, size_t expected_frames,
                               int64_t target_bit_rate, int max_qp, MPCutProgress progress,
                               void *context, double fraction, char *error, size_t capacity)
@@ -274,6 +279,7 @@ static MPCutEdge *encode_edge(const char *path, const AVStream *video, MPCutTime
     MPPreviewDecoder *decoder = NULL;
     AVFrame *frame = NULL;
     const char *message = "Cannot initialize Smart Trim";
+    bool complete_message = false; /* The decoder's own sentence needs no libav error text. */
     int result = AVERROR_INVALIDDATA;
     int64_t anchor, first, end;
     if (!video || target_bit_rate <= 0 || target_bit_rate > INT32_MAX || !expected_frames || expected_frames >= SIZE_MAX / sizeof(int64_t) ||
@@ -281,6 +287,19 @@ static MPCutEdge *encode_edge(const char *path, const AVStream *video, MPCutTime
         !exact_ticks(from.numerator, from.denominator, video->time_base, &first) ||
         !exact_ticks(to.numerator, to.denominator, video->time_base, &end) || anchor < 0 || first < anchor || end <= first)
         goto done;
+    /* The plan counts from origin_pts. A multicam movie clock puts that before a
+     * video track that starts late, so report decoded times from the same origin.
+     * The decoder's seek still counts from the track's own first picture. */
+    CMTime timeline = kCMTimeInvalid;
+    double seek = (double)decode_from.numerator / decode_from.denominator;
+    if (origin_pts != AV_NOPTS_VALUE && video->start_time != AV_NOPTS_VALUE && origin_pts != video->start_time) {
+        __int128 origin = (__int128)origin_pts * video->time_base.num;
+        __int128 lead = (__int128)origin_pts + anchor - video->start_time;
+        if (origin < INT64_MIN || origin > INT64_MAX || lead < INT64_MIN || lead > INT64_MAX)
+            goto done;
+        timeline = CMTimeMake((int64_t)origin, video->time_base.den);
+        seek = lead > 0 ? (double)lead * video->time_base.num / video->time_base.den : 0;
+    }
     result = AVERROR(ENOMEM);
     work.edge = av_mallocz(sizeof(*work.edge));
     if (!work.edge)
@@ -298,7 +317,7 @@ static MPCutEdge *encode_edge(const char *path, const AVStream *video, MPCutTime
         goto done;
     }
     result = AVERROR_EXTERNAL;
-    decoder = mp_preview_open(path, true, is_cancelled, &work, &message);
+    decoder = mp_preview_open(path, MPPreviewPictureOnly, -1, timeline, is_cancelled, &work, &message);
     if (!decoder)
         goto done;
     const AVStream *probed = mp_preview_prepare_edge(decoder);
@@ -314,14 +333,19 @@ static MPCutEdge *encode_edge(const char *path, const AVStream *video, MPCutTime
         goto done;
     result = AVERROR_EXTERNAL;
     message = "Cannot seek to the Smart Trim edge";
-    if (!mp_preview_seek(decoder, (double)decode_from.numerator / decode_from.denominator))
+    if (!mp_preview_seek(decoder, seek))
         goto done;
 
     while (!is_cancelled(&work)) {
         CMSampleBufferRef sample = NULL;
         int kind = mp_preview_next(decoder, &sample, &message);
         if (kind == MPPreviewError) {
+            // Reading ahead can reach a damaged picture that follows the edge. The edge is
+            // complete when every indexed picture was decoded before the damage.
+            if (mp_preview_edge_intact_before_damage(decoder) && work.submitted == expected_frames)
+                break;
             result = AVERROR_EXTERNAL;
+            complete_message = true;
             goto done;
         }
         if (kind == MPPreviewEnd)
@@ -390,6 +414,8 @@ done:
             if (result == AVERROR_INPUT_CHANGED)
                 snprintf(error, capacity, "The hardware encoder's coded picture dimensions do not match the source. "
                          "Use a lossless cut point for this clip.");
+            else if (complete_message && message)
+                snprintf(error, capacity, "%s", message);
             else
                 snprintf(error, capacity, "%s: %s", message ? message : "Smart Trim failed", av_err2str(result));
         }
@@ -399,7 +425,7 @@ done:
     return work.edge;
 }
 
-MPCutEdge *mpcut_edge_open(const char *path, const AVStream *video, MPCutTime decode_from,
+MPCutEdge *mpcut_edge_open(const char *path, const AVStream *video, int64_t origin_pts, MPCutTime decode_from,
                            MPCutTime from, MPCutTime to, size_t expected_frames,
                            int64_t target_bit_rate, MPCutProgress progress, void *context,
                            double fraction, char *error, size_t capacity)
@@ -407,7 +433,7 @@ MPCutEdge *mpcut_edge_open(const char *path, const AVStream *video, MPCutTime de
     // Protect the quality of the first few AV1 pictures after a cut. If this
     // costs over 25% more than the local byte budget, let SVT use its full QP
     // range for one retry. Keep whichever result consumes fewer video bytes.
-    MPCutEdge *edge = encode_edge(path, video, decode_from, from, to, expected_frames,
+    MPCutEdge *edge = encode_edge(path, video, origin_pts, decode_from, from, to, expected_frames,
                                   target_bit_rate, 44, progress, context, fraction, error, capacity);
     if (!edge || video->codecpar->codec_id != AV_CODEC_ID_AV1)
         return edge;
@@ -415,7 +441,7 @@ MPCutEdge *mpcut_edge_open(const char *path, const AVStream *video, MPCutTime de
     long double seconds = (long double)to.numerator / to.denominator - (long double)from.numerator / from.denominator;
     if (edge->payload_bytes <= seconds * target_bit_rate / 8 * 1.25L)
         return edge;
-    MPCutEdge *retry = encode_edge(path, video, decode_from, from, to, expected_frames,
+    MPCutEdge *retry = encode_edge(path, video, origin_pts, decode_from, from, to, expected_frames,
                                    target_bit_rate, 63, progress, context, fraction, error, capacity);
     if (!retry) {
         // The first encode is still valid. Only a cancellation discards it.

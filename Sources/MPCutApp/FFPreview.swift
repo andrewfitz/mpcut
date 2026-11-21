@@ -1,5 +1,6 @@
 import AVFoundation
 import FFPreview
+import MPCutCore
 
 private func ffTime(_ seconds: Double) -> CMTime {
     CMTime(seconds: seconds, preferredTimescale: 1_000_000)
@@ -15,7 +16,7 @@ private enum FFPreviewError: LocalizedError {
     }
 }
 
-private struct FFPreviewBatch {
+struct FFPreviewBatch {
     var video: [PreviewFrame] = []
     var audio: [CMSampleBuffer] = []
     var end = false
@@ -27,6 +28,9 @@ final class FFPreviewReader: @unchecked Sendable {
     private let audioOnly: Bool
     private var decoder: OpaquePointer?
     private var url: URL?
+    private var openedSoundOnly = false
+    private var openedAudioTrack: Int?
+    private var openedOrigin: RationalTime?
     private var transform = CGAffineTransform.identity
     private var pendingFrame: PreviewFrame?
     private var videoFinished = false
@@ -53,23 +57,30 @@ final class FFPreviewReader: @unchecked Sendable {
         return try operation()
     }
 
-    func seek(url: URL, to time: Double, withAudio: Bool = false) throws {
+    func seek(url: URL, to time: Double, withAudio: Bool = false,
+              soundOnlySource: Bool = false, audioOrigin: RationalTime? = nil, audioTrack: Int? = nil) throws {
+        let soundOnly = audioOnly || soundOnlySource
         pendingFrame = nil
-        videoFinished = false
+        videoFinished = soundOnly
         audioFinished = false
-        if self.url != url || decoder == nil {
+        if self.url != url || decoder == nil || openedSoundOnly != soundOnly || openedOrigin != audioOrigin
+            || openedAudioTrack != audioTrack {
             mp_preview_close(decoder)
             var error: UnsafePointer<CChar>?
             let context = Unmanaged.passUnretained(self).toOpaque()
+            let tracks = soundOnly ? MPPreviewSoundOnly : videoOnly ? MPPreviewPictureOnly : MPPreviewPictureAndSound
+            let origin = audioOrigin.map(previewTime) ?? .invalid
             decoder = url.path.withCString {
-                mp_preview_open($0, videoOnly, { context in
+                mp_preview_open($0, tracks, Int32(clamping: audioTrack ?? -1), origin, { context in
                     guard let context else { return false }
                     let reader = Unmanaged<FFPreviewReader>.fromOpaque(context).takeUnretainedValue()
                     return reader.cancelled?() ?? false
                 }, context, &error)
             }
             guard let decoder else { throw failure(error) }
-            if audioOnly { mp_preview_select_audio_only(decoder) }
+            openedSoundOnly = soundOnly
+            openedAudioTrack = audioTrack
+            openedOrigin = audioOrigin
             transform = mp_preview_transform(decoder)
             self.url = url
             mp_preview_enable_audio(decoder, withAudio)
@@ -77,7 +88,7 @@ final class FFPreviewReader: @unchecked Sendable {
         } else {
             mp_preview_enable_audio(decoder, withAudio)
         }
-        guard mp_preview_seek(decoder, time) else {
+        guard mp_preview_seek_timeline(decoder, time) else {
             throw FFPreviewError.decode("FFmpeg could not seek in \(url.lastPathComponent).")
         }
     }
@@ -94,11 +105,14 @@ final class FFPreviewReader: @unchecked Sendable {
         return (kind, sample)
     }
 
-    func scrubSamples(url: URL, range: Range<Double>) throws -> [CMSampleBuffer] {
-        try seek(url: url, to: range.lowerBound, withAudio: true)
+    func scrubSamples(url: URL, range: Range<Double>, audioOrigin: RationalTime? = nil,
+                      audioTrack: Int? = nil) throws -> [CMSampleBuffer] {
+        if audioOnly, self.url == url, openedOrigin == audioOrigin, openedAudioTrack == audioTrack,
+           let decoder, !mp_preview_has_audio(decoder), !mp_preview_has_unavailable_audio(decoder) { return [] }
+        try seek(url: url, to: range.lowerBound, withAudio: true, audioOrigin: audioOrigin, audioTrack: audioTrack)
         guard let decoder, mp_preview_has_audio(decoder) else { return [] }
         var samples: [CMSampleBuffer] = []
-        while !Task.isCancelled {
+        while !Task.isCancelled && cancelled?() != true {
             let (kind, sample) = try read()
             if kind == MPPreviewEnd.rawValue || !mp_preview_has_audio(decoder) { break }
             guard kind == MPPreviewAudio.rawValue, let sample else { continue }
@@ -128,9 +142,36 @@ final class FFPreviewReader: @unchecked Sendable {
         return nil
     }
 
-    fileprivate func batch(from target: Double, end: Double, timelineOffset: Double, first: Bool,
-                           cancelled: () -> Bool) throws -> FFPreviewBatch {
+    // Multicam supplies the exact indexed picture timestamp and decodes the
+    // active view sequentially until a seek or camera switch.
+    func indexedFrame(at target: CMTime, cancelled: () -> Bool) throws -> PreviewFrame? {
+        while !cancelled() {
+            let (kind, sample) = try read()
+            if kind == MPPreviewEnd.rawValue { break }
+            guard kind == MPPreviewVideo.rawValue, let sample, let buffer = sample.imageBuffer else { continue }
+            if sample.presentationTimeStamp >= target {
+                guard sample.presentationTimeStamp == target else { return nil }
+                return PreviewFrame(buffer: buffer, time: sample.presentationTimeStamp, transform: transform)
+            }
+        }
+        return nil
+    }
+
+    func batch(from target: Double, end: Double, timelineOffset: Double, first: Bool,
+               cancelled: () -> Bool) throws -> FFPreviewBatch {
+        try batch(from: target, end: end,
+                  timelineOffset: CMTime(seconds: timelineOffset, preferredTimescale: 1_000_000_000), first: first,
+                  cancelled: cancelled)
+    }
+
+    func batch(from target: Double, end: Double, timelineOffset: CMTime, first: Bool,
+               cancelled: () -> Bool, audioLimit: Int = 20) throws -> FFPreviewBatch {
         var output = FFPreviewBatch()
+        if videoFinished && !mp_preview_has_audio(decoder) {
+            output.end = true
+            output.noAudio = mp_preview_has_unavailable_audio(decoder)
+            return output
+        }
         var preceding = first ? pendingFrame : nil
         var needsFirst = first
         // Let the caller process UI events between batches even during long preroll.
@@ -148,12 +189,14 @@ final class FFPreviewReader: @unchecked Sendable {
             if kind == MPPreviewVideo.rawValue, let image = sample.imageBuffer {
                 if sourceTime >= end {
                     videoFinished = true
+                    // Audio that stopped before the cut never reports its own end.
+                    if sourceTime >= end + 1 { audioFinished = true }
                     if needsFirst, let preceding {
                         output.video.append(preceding)
                         needsFirst = false
                     }
                 } else if !videoFinished {
-                    let frame = PreviewFrame(buffer: image, time: ffTime(max(sourceTime, target) + timelineOffset),
+                    let frame = PreviewFrame(buffer: image, time: ffTime(max(sourceTime, target) + timelineOffset.seconds),
                                              transform: transform)
                     if needsFirst && sourceTime < target {
                         preceding = frame
@@ -175,16 +218,15 @@ final class FFPreviewReader: @unchecked Sendable {
                 output.end = true
                 break
             }
-            if !needsFirst && (output.video.count >= 5 || output.audio.count >= 20) { break }
-            if needsFirst && output.audio.count >= 20 { break }
+            if (!needsFirst && output.video.count >= 5) || output.audio.count >= audioLimit { break }
         }
         pendingFrame = needsFirst && !output.end ? preceding : nil
         output.noAudio = mp_preview_has_unavailable_audio(decoder)
         return output
     }
 
-    private static func timelineAudio(_ sample: CMSampleBuffer, target: Double, end: Double,
-                                      offset: Double) -> CMSampleBuffer? {
+    static func timelineAudio(_ sample: CMSampleBuffer, target: Double, end: Double,
+                              offset: CMTime) -> CMSampleBuffer? {
         guard let format = sample.formatDescription,
               let rate = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee.mSampleRate,
               rate > 0 else { return nil }
@@ -204,8 +246,9 @@ final class FFPreviewReader: @unchecked Sendable {
             ) == noErr else { return nil }
         }
         guard let clipped else { return nil }
+        let sampleOffset = CMTime(value: Int64(startSample), timescale: Int32(rate))
         var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: Int32(rate)),
-                                        presentationTimeStamp: ffTime(source + Double(startSample) / rate + offset),
+                                        presentationTimeStamp: sample.presentationTimeStamp + sampleOffset + offset,
                                         decodeTimeStamp: .invalid)
         var mapped: CMSampleBuffer?
         CMSampleBufferCreateCopyWithNewTiming(
@@ -261,6 +304,7 @@ final class WebSequencePlayback {
     private var playbackRate: Float = 1
     private var renderingStill = false
     private var hasStartedClock = false
+    private var lastClockCommand: ContinuousClock.Instant = .now
     private var audioWarning: String?
     private var video: [PreviewFrame] = []
     private var audio: [CMSampleBuffer] = []
@@ -283,6 +327,9 @@ final class WebSequencePlayback {
         _ = requests.next()
     }
 
+    /// Raised for one decoding pass. A seek or a new playback request starts another.
+    static let undecodableAudio = "The source audio could not be decoded."
+
     func park(at position: Double) { time = min(max(position, 0), duration) }
 
     func setGain(_ gain: Float) { audioRenderer.volume = gain }
@@ -291,7 +338,10 @@ final class WebSequencePlayback {
         guard duration > 0 else { return }
         playbackRate = rate
         if playing {
-            if hasStartedClock { synchronizer.rate = rate }
+            if hasStartedClock {
+                readClock()
+                setClockRate()
+            }
             return
         }
         playing = true
@@ -307,10 +357,7 @@ final class WebSequencePlayback {
 
     func pause() {
         guard playing else { return }
-        if hasStartedClock {
-            let clock = synchronizer.currentTime().seconds
-            if clock.isFinite { time = min(max(time, clock), duration) }
-        }
+        if hasStartedClock { readClock() }
         playing = false
         ticker?.cancel()
         ticker = nil
@@ -328,14 +375,14 @@ final class WebSequencePlayback {
             : min(range.end, range.start + (self.time - offsets[rangeIndex]))
         if playing {
             fill()
-        } else {
+        } else if !range.isAudioOnly {
             still(url: range.url, at: requestedSourceTime, before: range.end)
         }
     }
 
-    func audition(url: URL, at time: Double) {
+    func audition(url: URL, at time: Double, before end: Double = .infinity) {
         if playing { pause() } else { resetRequests() }
-        still(url: url, at: time)
+        if ranges.first(where: { $0.url == url })?.isAudioOnly != true { still(url: url, at: time, before: end) }
     }
 
     func displayStill(at position: Double) {
@@ -343,6 +390,7 @@ final class WebSequencePlayback {
         park(at: position)
         let index = max(0, offsets.lowerBound { $0 > time } - 1)
         let range = ranges[index]
+        guard !range.isAudioOnly else { return }
         let sourceTime = min(range.end, range.start + (time - offsets[index]))
         still(url: range.url, at: sourceTime, before: range.end)
     }
@@ -398,13 +446,17 @@ final class WebSequencePlayback {
         let target = requestedSourceTime
         let offset = offsets[rangeIndex] - range.start
         let open = openingRange
-        let first = waitingForFirstFrame
+        let first = waitingForFirstFrame && !range.isAudioOnly
         reading = true
         requests.queue.async { [weak self] in
             guard requests.current(generation) else { return }
             let result = Result {
                 try requests.reader.perform(cancelled: { !requests.current(generation) }) {
-                    if open { try requests.reader.seek(url: range.url, to: target, withAudio: true) }
+                    if open {
+                        try requests.reader.seek(url: range.url, to: target, withAudio: true,
+                                                 soundOnlySource: range.isAudioOnly, audioOrigin: range.audioOrigin,
+                                                 audioTrack: range.audioTrack)
+                    }
                     return try requests.reader.batch(from: target, end: range.end, timelineOffset: offset,
                                                      first: first) { !requests.current(generation) }
                 }
@@ -415,6 +467,11 @@ final class WebSequencePlayback {
                 self.openingRange = false
                 switch result {
                 case .success(let batch):
+                    if range.isAudioOnly && batch.noAudio {
+                        self.pause()
+                        self.onIssue(Self.undecodableAudio)
+                        return
+                    }
                     self.video.append(contentsOf: batch.video)
                     self.audio.append(contentsOf: batch.audio)
                     self.reachedRangeEnd = batch.end
@@ -439,13 +496,29 @@ final class WebSequencePlayback {
         onAudioWarning(message)
     }
 
+    private func readClock() {
+        let position = synchronizer.currentTime().seconds
+        if position.isFinite { time = min(max(time, position), duration) }
+    }
+
+    private func setClockRate() {
+        // Anchor the rate change at the current position and host timestamp. The
+        // synchronizer reports the new rate before the timebase applies it.
+        synchronizer.setRate(playbackRate, time: ffTime(time),
+                             atHostTime: CMClockGetTime(CMClockGetHostTimeClock()))
+        lastClockCommand = .now
+    }
+
     private func tick() {
         guard playing else { return }
         if !hasStartedClock {
             if let frame = video.first {
                 onFrame(frame)
                 video.removeFirst()
-                synchronizer.setRate(playbackRate, time: ffTime(time))
+                setClockRate()
+                hasStartedClock = true
+            } else if ranges[rangeIndex].isAudioOnly && (!audio.isEmpty || reachedRangeEnd) {
+                setClockRate()
                 hasStartedClock = true
             } else if reachedRangeEnd {
                 pause()
@@ -455,13 +528,18 @@ final class WebSequencePlayback {
                 // Some containers store a run of audio before their first
                 // picture. Start the timeline so the renderer can consume this
                 // audio and the bounded demux queue can reach the picture.
-                synchronizer.setRate(playbackRate, time: ffTime(time))
+                setClockRate()
                 hasStartedClock = true
             }
         }
         if hasStartedClock {
-            let clock = synchronizer.currentTime().seconds
-            if clock.isFinite { time = min(max(time, clock), duration) }
+            readClock()
+            if lastClockCommand.duration(to: .now) >= .milliseconds(150),
+               CMTimebaseGetRate(synchronizer.timebase) == 0 {
+                // A rate change can leave the timebase stopped even when the
+                // cached synchronizer rate is nonzero.
+                setClockRate()
+            }
             if audioRenderer.status == .failed {
                 audio.removeAll()
                 reportAudioWarning("Audio preview could not be played.")

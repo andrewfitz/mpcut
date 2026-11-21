@@ -36,21 +36,23 @@ final class FallbackPreviewTests: XCTestCase {
                                                           subdirectory: "Fixtures"))
             let preview = SequencePreview()
             defer { preview.pause() }
-            preview.update([PreviewRange(url: source, exactStart: .zero, exactEnd: .init(numerator: 1))], at: 0.4)
+            preview.update([PreviewRange(url: source, exactStart: .zero, exactEnd: .init(numerator: 2))], at: 0.4)
             let deadline = clock.now + .seconds(3)
             while preview.playbackRate == 0, preview.issue == nil, clock.now < deadline {
                 preview.shuttle(1)
                 if preview.playbackRate == 0 { try await Task.sleep(for: .milliseconds(10)) }
             }
             XCTAssertEqual(preview.playbackRate, 1, ext)
-            preview.shuttle(1)
-            XCTAssertEqual(preview.playbackRate, 2, ext)
-            let forward = preview.time
-            let forwardDeadline = clock.now + .seconds(3)
-            while preview.time <= forward, preview.issue == nil, clock.now < forwardDeadline {
-                try await Task.sleep(for: .milliseconds(10))
+            for rate: Float in [2, 4, 8] {
+                preview.shuttle(1)
+                XCTAssertEqual(preview.playbackRate, rate, ext)
+                let forward = preview.time
+                let forwardDeadline = clock.now + .seconds(3)
+                while preview.time <= forward, preview.issue == nil, clock.now < forwardDeadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                XCTAssertGreaterThan(preview.time, forward, "\(ext) at \(rate)×")
             }
-            XCTAssertGreaterThan(preview.time, forward, ext)
             preview.shuttle(-1)
             XCTAssertEqual(preview.playbackRate, -1, ext)
             preview.shuttle(-1)
@@ -64,6 +66,30 @@ final class FallbackPreviewTests: XCTestCase {
             preview.pause()
             XCTAssertEqual(preview.playbackRate, 0, ext)
             XCTAssertNil(preview.issue, ext)
+        }
+    }
+
+    @MainActor
+    func testReverseShuttleDrainsAtSequenceStartAndResumesForward() async throws {
+        for ext in ["mov", "webm"] {
+            let url = try XCTUnwrap(Bundle.module.url(forResource: "Shuttle-Chirp", withExtension: ext, subdirectory: "Fixtures"))
+            let preview = SequencePreview()
+            preview.isMuted = true
+            defer { preview.pause() }
+            let segment = PreviewRange(url: url, exactStart: .zero, exactEnd: .init(numerator: 1))
+            preview.update([segment], at: 0.16)
+            let deadline = ContinuousClock.now + .seconds(4)
+            while !preview.isPlaying && preview.issue == nil && .now < deadline {
+                preview.shuttle(-1)
+                if !preview.isPlaying { try await Task.sleep(for: .milliseconds(5)) }
+            }
+            XCTAssertEqual(preview.playbackRate, -1, ext)
+            while preview.isPlaying && .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertNil(preview.issue, ext)
+            XCTAssertEqual(preview.time, 0, ext)
+            XCTAssertFalse(preview.isPlaying, ext)
+            preview.shuttle(1)
+            XCTAssertEqual(preview.playbackRate, 1, ext)
         }
     }
 
@@ -96,6 +122,23 @@ final class FallbackPreviewTests: XCTestCase {
         player.seek(to: 0.6)
         await fulfillment(of: [rendered], timeout: 5)
         player.pause()
+    }
+
+    @MainActor
+    func testFallbackScrubHoldsTheLastPictureBeforeTheClipEnd() async throws {
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
+                                                      subdirectory: "Fixtures"))
+        let range = PreviewRange(url: source, exactStart: .zero, exactEnd: .init(numerator: 1))
+        let rendered = expectation(description: "The first excluded keyframe is not displayed")
+        let player = WebSequencePlayback(ranges: [range], onFrame: { frame in
+            XCTAssertEqual(frame.time.seconds, 0.96, accuracy: 1e-8)
+            rendered.fulfill()
+        }, onTime: { _ in }, onIssue: { message in
+            XCTFail(message)
+            rendered.fulfill()
+        }, onAudioWarning: { _ in })
+        player.audition(url: source, at: range.end, before: range.end)
+        await fulfillment(of: [rendered], timeout: 3)
     }
 
     @MainActor

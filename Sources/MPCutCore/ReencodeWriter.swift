@@ -67,7 +67,7 @@ extension ReencodeEngine {
         if plan.settings.codec == .hevc, container != "mkv" { args += ["-tag:v", "hvc1"] }
         if container != "mkv" {
             args += ["-movflags", "+faststart", "-video_track_timescale", "\(plan.timeScale)",
-                     "-movie_timescale", "1000000"]
+                     "-movie_timescale", "\(plan.movieTimeScale)"]
         }
         if let first = plan.edit.segments.first, let reference = plan.media[first.file] {
             for (index, pair) in zip(plan.audioActions, reference.audio).enumerated() {
@@ -117,14 +117,20 @@ extension ReencodeEngine {
         }
         do {
             try encode(preferred)
-        } catch let error as CutError where preferred != .compatible && error.code == "encode_failed" {
+        } catch let error as CutError where error.code == "encode_failed" {
+            if let damage = try damagedPicture(error, inputs: inputs, plan: plan) { throw damage }
             // Hardware support varies by profile and Mac. Retry decoder/filter
             // failures using the compatibility path, reusing the staged audio.
             let reason = error.message.lowercased()
-            guard ["decoder", "hwaccel", "videotoolbox", "auto_scale", "convert between the formats",
+            guard preferred != .compatible,
+                  ["decoder", "hwaccel", "videotoolbox", "auto_scale", "convert between the formats",
                    "filter network", "filtergraph", "transpose_vt"].contains(where: reason.contains),
                   !reason.contains("no space left"), !reason.contains("permission denied") else { throw error }
-            try encode(.compatible)
+            do {
+                try encode(.compatible)
+            } catch let error as CutError where error.code == "encode_failed" {
+                throw try damagedPicture(error, inputs: inputs, plan: plan) ?? error
+            }
         }
         try checkCancellation()
         if container == "mkv", let tracks = plan.edit.segments.last?.tracks,
@@ -139,11 +145,53 @@ extension ReencodeEngine {
         }
         for (file, identity) in plan.edit.identities { try verifyIdentity(file, identity) }
         try checkCancellation()
-        guard renamex_np(partial.path, destination.path, UInt32(RENAME_EXCL)) == 0 else {
-            if errno == EEXIST { throw CutError(code: "output_exists", message: "A file already exists at the destination.") }
-            throw CutError(code: "write_failed", message: String(cString: strerror(errno)))
+        let failure = publishExclusively(from: partial, to: destination)
+        guard failure == 0 else {
+            if failure == EEXIST { throw CutError(code: "output_exists", message: "A file already exists at the destination.") }
+            throw CutError(code: "write_failed", message: String(cString: strerror(failure)))
         }
         progress?(1)
+    }
+
+    /// Recognize a decoder that rejected one coded picture. The software HEVC decoder conceals
+    /// such a picture without an error, so a rejection by VideoToolbox must end the export
+    /// here and must not be retried in software.
+    private func damagedPicture(_ error: CutError, inputs: [ReencodeInput], plan: ReencodePlan) throws -> CutError? {
+        let reason = error.message.lowercased()
+        let hardware = reason.contains("hardware accelerator failed to decode picture")
+        let software = reason.contains("corrupt decoded frame")
+            || reason.contains("packet in decoder: invalid data found")
+            || reason.contains("packet to decoder: invalid data found")
+        guard hardware || software else { return nil }
+        // The helper names the failing input as "vist#<input>:<stream>".
+        var named: URL?
+        for line in reason.split(separator: "\n") where line.contains("decoder") || line.contains("corrupt") {
+            guard let mark = line.range(of: "vist#") else { continue }
+            if let index = Int(line[mark.upperBound...].prefix(while: \.isNumber)), inputs.indices.contains(index) {
+                named = inputs[index].file
+            }
+        }
+        var files: [URL] = []
+        for file in named.map({ [$0] }) ?? inputs.map(\.file) where !files.contains(file) { files.append(file) }
+        if hardware {
+            // A stream that VideoToolbox cannot decode at all fails at its first picture.
+            // That is a missing capability, which the compatibility path handles.
+            for file in files {
+                guard let media = plan.media[file] else { continue }
+                let probe = ["-xerror"] + ReencodeDecode.hardware.options(for: media.video) + [
+                    "-i", file.path, "-map", "0:\(media.video.index)", "-frames:v", "1", "-f", "null", "-"
+                ]
+                do {
+                    try runHelper(plan.helper, arguments: probe, in: FileManager.default.temporaryDirectory)
+                } catch let failure as CutError where failure.code == "encode_failed" {
+                    return nil
+                }
+            }
+        }
+        let name = files.count == 1 ? files[0].lastPathComponent : "a source"
+        return CutError(code: "encode_failed",
+                        message: "A picture in \(name) is damaged and could not be decoded. "
+                            + "Re-encode decodes from before each selected range. Choose a range away from the damage.")
     }
 
     private func filterInputs(_ plan: ReencodePlan) throws -> [ReencodeInput] {

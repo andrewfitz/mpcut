@@ -17,6 +17,13 @@ FIXTURE = Path(__file__).resolve().parents[1] / "MPCutAppTests/Fixtures/SmartTri
 
 
 class ExportModes(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sources = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(sources.cleanup)
+        cls.fixture = Path(sources.name) / FIXTURE.name
+        cls.fixture.write_bytes(FIXTURE.read_bytes())
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -29,7 +36,7 @@ class ExportModes(unittest.TestCase):
         if request is not None:
             command.append("--stdin")
         else:
-            command.extend(["--output", str(self.output), "--clip", str(FIXTURE)])
+            command.extend(["--output", str(self.output), "--clip", str(self.fixture)])
             if start is not None:
                 command.extend(["--from", start])
         result = subprocess.run(command, input=json.dumps(request) if request is not None else None,
@@ -41,16 +48,51 @@ class ExportModes(unittest.TestCase):
             self.assertFalse(self.output.exists())
         return report
 
+    def test_installed_command_help_and_edit_templates(self):
+        def query(*args):
+            return json.loads(subprocess.check_output([CLI, *args, "--json"]))
+
+        index = query("help")
+        self.assertEqual(index["version"], query("--version")["version"])
+        self.assertEqual(set(index["commands"]), {"help", "version", "inspect", "export", "bulk", "rearrange",
+                                                 "sidecar", "frames", "waveform", "silence", "scenes", "multicam"})
+        for name, expected in index["commands"].items():
+            verb = "--version" if name == "version" else name
+            self.assertEqual(query("help", name), expected)
+            self.assertEqual(query(verb, "--help"), expected)
+            self.assertTrue(expected["usage"] and expected["examples"] and expected["result"])
+        self.assertEqual(subprocess.check_output([CLI, "help", "silence"]),
+                         subprocess.check_output([CLI, "silence", "--help"]))
+        self.assertIn("mpcut", query("help", "manual")["manual"])
+        invalid = subprocess.run([CLI, "help", "unknown-command", "--json"], capture_output=True)
+        self.assertEqual(invalid.returncode, 2)
+        self.assertEqual(json.loads(invalid.stdout)["error"]["code"], "invalid_arguments")
+
+        request = index["commands"]["export"]["stdinExample"] | {"file": str(self.fixture), "output": str(self.output)}
+        self.assertTrue(self.export(request=request)["dryRun"])
+        request = index["commands"]["bulk"]["stdinExample"] | {"file": str(self.fixture),
+                                                              "outputDirectory": str(self.output.parent),
+                                                              "ranges": [{"from": "0", "to": "1/25"}]}
+        plan = subprocess.check_output([CLI, "bulk", "--json", "--stdin", "--dry-run"],
+                                       input=json.dumps(request).encode())
+        self.assertEqual(len(json.loads(plan)["outputs"]), 1)
+        self.assertFalse(self.output.exists())
+
     def test_agent_can_discover_inspect_preflight_and_export_exact_frames(self):
         help_report = json.loads(subprocess.check_output([CLI, "help", "--json"]))
         self.assertEqual(set(help_report["exportModes"]), {"copy", "smart", "encode"})
+        source = self.output.with_name("source with spaces.mp4")
+        source.write_bytes(self.fixture.read_bytes())
         report = json.loads(subprocess.check_output([CLI, "inspect", "--json", "--frames",
-                                                     "--from", "0.2", "--to", "0.4", FIXTURE]))
+                                                     "--from", "0.2", "--to", "0.4", source.name],
+                                                    cwd=source.parent))
+        self.assertEqual(Path(report["file"]).resolve(), source.resolve())
+        self.assertIn("%20", report["media"]["url"])
         frames = report["media"]["frames"]
         self.assertEqual([ratio(frame["time"]) for frame in frames], [Fraction(i, 25) for i in range(5, 10)])
         self.assertFalse(frames[0]["keyframe"])
-        clips = [{"file": str(FIXTURE), "from": frames[2]["time"], "to": frames[4]["time"]},
-                 {"file": str(FIXTURE), "from": frames[0]["time"], "to": frames[1]["time"]}]
+        clips = [{"file": report["file"], "from": frames[2]["time"], "to": frames[4]["time"]},
+                 {"file": report["file"], "from": frames[0]["time"], "to": frames[1]["time"]}]
         edit = {"mode": "smart", "snap": "exact", "clips": clips, "output": str(self.output)}
         self.assertEqual(self.export("--snap", "nearest", request=edit, exit_code=2)["error"]["code"],
                          "invalid_arguments")
@@ -73,13 +115,13 @@ class ExportModes(unittest.TestCase):
         self.export(start="0.28", exit_code=1)
 
     def test_order_flags_and_json_validate_before_writing(self):
-        request = {"output": str(self.output), "file": str(FIXTURE),
+        request = {"output": str(self.output), "file": str(self.fixture),
                    "clips": [{"from": "2/25", "to": "5/25"}, {"from": "14/25", "to": "19/25"}]}
         plan = self.export("--order", "2,1", request=request)
         self.assertEqual(plan, self.export(request={**request, "order": [2, 1]}))
         result = subprocess.run([CLI, "export", "--json", "--dry-run", "--order", "2,1", "--output", self.output,
-                                 "--clip", FIXTURE, "--from", "2/25", "--to", "5/25",
-                                 "--clip", FIXTURE, "--from", "14/25", "--to", "19/25"],
+                                 "--clip", self.fixture, "--from", "2/25", "--to", "5/25",
+                                 "--clip", self.fixture, "--from", "14/25", "--to", "19/25"],
                                 capture_output=True, text=True, check=True, timeout=30)
         self.assertEqual(plan, json.loads(result.stdout))
         self.assertEqual([ratio(part["from"]) for part in plan["segments"]], [Fraction(14, 25), Fraction(2, 25)])
@@ -95,7 +137,7 @@ class ExportModes(unittest.TestCase):
         self.assertEqual(self.export(request=copy)["mode"], "copy")
 
     def test_rearrange_joins_clock_ranges_in_the_written_order(self):
-        command = [CLI, "rearrange", "--json", FIXTURE, "--output", self.output]
+        command = [CLI, "rearrange", "--json", self.fixture, "--output", self.output]
         request = "00:01.361–00:01.559, 0:00.12-0:00.28"
         preflight = subprocess.run([*command, "--dry-run", request], capture_output=True, text=True,
                                    check=True, timeout=30)
@@ -121,8 +163,8 @@ class ExportModes(unittest.TestCase):
         directory = self.output.parent
         ranges = [{"from": {"numerator": i, "denominator": 25}, "to": f"{i + 4}/25"}
                   for i in (2, 6, 10, 15, 22, 29)]
-        request = {"file": str(FIXTURE), "outputDirectory": str(directory), "ranges": ranges}
-        names = [f"{FIXTURE.stem}-{i:03d}.mp4" for i in range(1, 7)]
+        request = {"file": str(self.fixture), "outputDirectory": str(directory), "ranges": ranges}
+        names = [f"{self.fixture.stem}-{i:03d}.mp4" for i in range(1, 7)]
 
         def bulk(*flags, payload=request, exit_code=0):
             result = subprocess.run([CLI, "bulk", "--json", "--stdin", *flags], input=json.dumps(payload),
@@ -160,7 +202,7 @@ class ExportModes(unittest.TestCase):
         for field, edge in [("from", "start"), ("to", "end")]:
             with self.subTest(field=field):
                 report = self.export(request={
-                    "output": str(self.output), "clips": [{"file": str(FIXTURE), field: "7/25"}],
+                    "output": str(self.output), "clips": [{"file": str(self.fixture), field: "7/25"}],
                 }, exit_code=1)
                 self.assertEqual(report["error"]["boundary"], field)
                 self.assertEqual(report["error"]["message"], f"There is no verified video {edge} boundary at 7/25.")
@@ -170,7 +212,7 @@ class ExportModes(unittest.TestCase):
         self.assertEqual(smart, self.export("--smart-trim", start="0.28"))
         self.assertEqual(smart, self.export(request={
             "mode": "smart", "output": str(self.output),
-            "clips": [{"file": str(FIXTURE), "from": "0.28"}],
+            "clips": [{"file": str(self.fixture), "from": "0.28"}],
         }))
         self.assertEqual(smart["mode"], "smart")
         self.assertEqual(ratio(smart["segments"][0]["from"]), Fraction(7, 25))
@@ -180,7 +222,7 @@ class ExportModes(unittest.TestCase):
 
         single_frame = self.export(request={
             "mode": "smart", "output": str(self.output),
-            "clips": [{"file": str(FIXTURE), "from": "0.28", "to": "0.32"}],
+            "clips": [{"file": str(self.fixture), "from": "0.28", "to": "0.32"}],
         })
         self.assertEqual(ratio(single_frame["encodedDuration"]), Fraction(1, 25))
         self.assertEqual(ratio(single_frame["copiedDuration"]), 0)
@@ -189,7 +231,7 @@ class ExportModes(unittest.TestCase):
     def test_encode_settings_reach_dry_run(self):
         request = {
             "mode": "encode", "video": "h264", "quality": "high", "audio": "remove",
-            "output": str(self.output), "clips": [{"file": str(FIXTURE), "from": "0.28"}],
+            "output": str(self.output), "clips": [{"file": str(self.fixture), "from": "0.28"}],
         }
         report = self.export(request=request)
         self.assertEqual(report, self.export("--mode", "encode", "--video", "h264",
@@ -226,7 +268,7 @@ class ExportModes(unittest.TestCase):
         env = {**os.environ, "PATH": str(command.parent) + ":/usr/bin:/bin"}
         env.pop("MPCUT_FFMPEG_HELPER", None)
         result = subprocess.run(["mpcut", "export", "--json", "--mode", "encode",
-                                 "--output", self.output, "--clip", FIXTURE, "--to", "1/25"],
+                                 "--output", self.output, "--clip", self.fixture, "--to", "1/25"],
                                 cwd=self.output.parent, env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(ratio(json.loads(result.stdout)["duration"]), Fraction(1, 25))
@@ -244,7 +286,7 @@ class ExportModes(unittest.TestCase):
             with self.subTest(flags=flags):
                 self.assertEqual(self.export(*flags, exit_code=2)["error"]["code"], "invalid_arguments")
 
-        request = {"mode": "smart", "output": str(self.output), "clips": [{"file": str(FIXTURE)}]}
+        request = {"mode": "smart", "output": str(self.output), "clips": [{"file": str(self.fixture)}]}
         self.assertEqual(self.export("--mode", "copy", request=request, exit_code=2)["error"]["code"],
                          "invalid_arguments")
         self.assertEqual(self.export(request={**request, "mode": "bad"}, exit_code=2)["error"]["code"],

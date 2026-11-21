@@ -30,7 +30,9 @@ class WriterRegression(unittest.TestCase):
         return report
 
     def test_mp4_export_respects_cropped_webm_opus_padding(self):
-        source = Path(__file__).resolve().parents[1] / "MPCutAppTests/Fixtures/WebM-Opus-GOP.webm"
+        fixture = Path(__file__).resolve().parents[1] / "MPCutAppTests/Fixtures/WebM-Opus-GOP.webm"
+        source = self.root / fixture.name
+        source.write_bytes(fixture.read_bytes())
         cropped = self.root / "cropped.webm"
         self.export(source, cropped, "--from", "1", "--to", "3")
         out = self.root / "assembly.mp4"

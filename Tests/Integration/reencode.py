@@ -451,7 +451,8 @@ class ReencodeTests(unittest.TestCase):
         self.assertIn("HEVC layers", report["error"]["message"])
         cut = self.root / "edge.mov"
         result = subprocess.run([CLI, "export", "--json", "--mode", "smart", "--output", cut,
-                                 "--clip", source, "--from", "1/25", "--to", "12/25"], capture_output=True)
+                                 "--clip", source, "--from", "1/25", "--to", "12/25"],
+                                capture_output=True, timeout=90)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout)["error"]["code"], "unsafe_boundary")
         self.assertFalse(cut.exists())
@@ -507,7 +508,10 @@ class ReencodeTests(unittest.TestCase):
     def test_hardware_probe_failure_is_reported_before_output_creation(self):
         cli = Path(CLI)
         if cli.parent.name != "Helpers" or cli.parent.parent.name != "Contents":
-            self.skipTest("requires the packaged CLI layout")
+            self.skipTest("requires the packaged CLI layout: this check copies the binary into a scratch "
+                          "MPCut.app/Contents/Helpers beside a failing ffmpeg and links the bundle's Frameworks, "
+                          f"but {cli} is not under Contents/Helpers. Run this suite with "
+                          "dist/MPCut.app/Contents/Helpers/mpcut to exercise it")
         contents = self.root / "MPCut.app" / "Contents"
         helpers = contents / "Helpers"
         helpers.mkdir(parents=True)

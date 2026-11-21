@@ -57,6 +57,8 @@ public struct ReencodePlan: Encodable, Sendable {
     let timeScale: Int
     let exactPCM: Set<Int>
 
+    var movieTimeScale = 1_000_000
+
     enum CodingKeys: String, CodingKey { case edit, settings, audioActions, width, height, warnings }
 }
 
@@ -94,16 +96,7 @@ public struct ReencodeEngine: Sendable {
                 if let existing = media[file] {
                     info = existing
                 } else {
-                    if let indexed = cached[file], indexed.url == file, !indexed.frames.isEmpty {
-                        info = indexed.video.pixelFormat == "unknown"
-                            ? try Probe.read(file, conversion: true, cancelled: cancelled) : indexed
-                        try verifyIdentity(file, indexed.identity)
-                    } else {
-                        guard file.isFileURL else {
-                            throw CutError(code: "invalid_input", message: "Choose a local video file.")
-                        }
-                        info = try Probe.read(file, conversion: true, cancelled: cancelled)
-                    }
+                    info = try conversionMedia(file, indexed: cached[file])
                     try checkSource(info)
                     for stream in info.streams where stream.index != info.video.index && stream.kind != "audio" {
                         warnings.append("Clip \(index) \(stream.codecTag == "tmcd" ? "timecode" : stream.kind) track \(stream.index) will be omitted.")
@@ -199,7 +192,33 @@ public struct ReencodeEngine: Sendable {
                             audioCopy: audioCopy, timeScale: timeScale, exactPCM: exactPCM)
     }
 
+    func conversionMedia(_ file: URL, indexed: MediaInfo? = nil) throws -> MediaInfo {
+        guard file.isFileURL else { throw CutError(code: "invalid_input", message: "Choose a local video file.") }
+        let source: MediaInfo?
+        if let indexed, indexed.url == file, !indexed.frames.isEmpty {
+            source = indexed
+        } else if AnalysisSidecar.readsEnabled {
+            // Share the normal packet index with the editor and copy exports.
+            // An explicit fresh conversion can go straight to the decoded probe.
+            do {
+                source = try CutEngine(cancelled: cancelled).inspect(file, keyframes: true)
+            } catch let error as CutError where error.code == "probe_failed" || error.code == "unsupported_tracks" {
+                // Some formats need a decoder to discover their stream metadata.
+                source = nil
+            }
+        } else {
+            source = nil
+        }
+        if let source, !source.hasVideo || source.video.pixelFormat != "unknown" {
+            try verifyIdentity(file, source.identity)
+            return source
+        }
+        // Image-based codecs can require a decoded picture to establish alpha and pixel format.
+        return try Probe.read(file, conversion: true, expectedIdentity: source?.identity, cancelled: cancelled)
+    }
+
     private func checkSource(_ info: MediaInfo) throws {
+        guard info.hasVideo else { throw CutError(code: "no_video", message: "Video re-encoding requires a video track. Choose Copy to export audio.") }
         if let issue = info.timelineIssue {
             throw CutError(code: "unsupported_tracks", message: issue)
         }
@@ -378,7 +397,8 @@ public struct ReencodeEngine: Sendable {
             throw CutError(code: "output_exists", message: "A file already exists at the destination.")
         }
         guard errno == ENOENT, stat(destination.deletingLastPathComponent().path, &metadata) == 0,
-              metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+              metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              access(destination.deletingLastPathComponent().path, W_OK | X_OK) == 0 else {
             throw CutError(code: "invalid_output", message: "The destination folder is unavailable.")
         }
     }

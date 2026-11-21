@@ -1,0 +1,325 @@
+{
+  "machine": "Apple M4 Max Mac Studio, 48 GB",
+  "system": "macOS 27.0.1",
+  "ffmpeg": "9.0.2",
+  "runs": 3,
+  "warmups": 1,
+  "results": {
+    "multicam": {
+      "durationSeconds": 21.366666666666667,
+      "mpcut": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 0.149,
+        "peakRSSMiB": 26.3,
+        "cpuSeconds": 0.135
+      },
+      "baseline": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 0.443,
+        "peakRSSMiB": 25.0,
+        "cpuSeconds": 0.12
+      },
+      "scdet": {
+        "found": 6,
+        "missed": 6,
+        "falsePositives": 0,
+        "seconds": 0.467,
+        "peakRSSMiB": 36.1,
+        "cpuSeconds": 0.271
+      },
+      "reportsIdentical": true
+    },
+    "multicam-with-flashes": {
+      "durationSeconds": 21.366666666666667,
+      "mpcut": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 0.15,
+        "peakRSSMiB": 26.5,
+        "cpuSeconds": 0.133
+      },
+      "baseline": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 0.406,
+        "peakRSSMiB": 24.3,
+        "cpuSeconds": 0.111
+      },
+      "scdet": {
+        "found": 6,
+        "missed": 6,
+        "falsePositives": 2,
+        "seconds": 0.435,
+        "peakRSSMiB": 36.1,
+        "cpuSeconds": 0.258
+      },
+      "reportsIdentical": true
+    },
+    "hevc-main10-2160p.mp4": {
+      "durationSeconds": 21.366666666666667,
+      "mpcut": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 1.275,
+        "peakRSSMiB": 105.7,
+        "cpuSeconds": 0.172
+      },
+      "baseline": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 1.267,
+        "peakRSSMiB": 107.2,
+        "cpuSeconds": 0.171
+      },
+      "scdet": {
+        "found": 6,
+        "missed": 6,
+        "falsePositives": 0,
+        "seconds": 2.527,
+        "peakRSSMiB": 481.3,
+        "cpuSeconds": 0.541
+      },
+      "reportsIdentical": true
+    },
+    "hevc-main10-hvc1-2160p.mp4": {
+      "durationSeconds": 21.366666666666667,
+      "mpcut": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 0.962,
+        "peakRSSMiB": 31.2,
+        "cpuSeconds": 0.319
+      },
+      "baseline": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 1.686,
+        "peakRSSMiB": 107.1,
+        "cpuSeconds": 0.385
+      },
+      "scdet": {
+        "found": 6,
+        "missed": 6,
+        "falsePositives": 0,
+        "seconds": 2.782,
+        "peakRSSMiB": 481.4,
+        "cpuSeconds": 0.936
+      },
+      "reportsIdentical": true
+    },
+    "prores-422-2160p.mov": {
+      "durationSeconds": 21.366666666666667,
+      "mpcut": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 3.624,
+        "peakRSSMiB": 71.1,
+        "cpuSeconds": 0.622
+      },
+      "baseline": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 4.716,
+        "peakRSSMiB": 153.9,
+        "cpuSeconds": 1.801
+      },
+      "scdet": {
+        "found": 6,
+        "missed": 6,
+        "falsePositives": 0,
+        "seconds": 3.343,
+        "peakRSSMiB": 95.0,
+        "cpuSeconds": 0.838
+      },
+      "reportsIdentical": true
+    },
+    "ffv1-1080p.mkv": {
+      "durationSeconds": 21.366666666666667,
+      "mpcut": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 0.667,
+        "peakRSSMiB": 20.2,
+        "cpuSeconds": 2.584
+      },
+      "baseline": {
+        "found": 12,
+        "missed": 0,
+        "falsePositives": 0,
+        "estimatedViews": 6,
+        "expectedViews": 6,
+        "correctFrameGroupPairs": 78,
+        "frameGroupPairs": 78,
+        "seconds": 1.117,
+        "peakRSSMiB": 24.7,
+        "cpuSeconds": 2.055
+      },
+      "scdet": {
+        "found": 6,
+        "missed": 6,
+        "falsePositives": 0,
+        "seconds": 0.214,
+        "peakRSSMiB": 87.7,
+        "cpuSeconds": 2.362
+      },
+      "reportsIdentical": true
+    },
+    "v3-one-intra.mkv": {
+      "mpcut": {
+        "cuts": 6,
+        "estimatedViews": 7,
+        "seconds": 0.525,
+        "peakRSSMiB": 14.6,
+        "cpuSeconds": 0.992
+      },
+      "baseline": {
+        "cuts": 6,
+        "estimatedViews": 7,
+        "seconds": 0.515,
+        "peakRSSMiB": 14.7,
+        "cpuSeconds": 0.986
+      },
+      "scdet": {
+        "cuts": 6,
+        "seconds": 0.124,
+        "peakRSSMiB": 26.1,
+        "cpuSeconds": 1.112
+      },
+      "reportsIdentical": true
+    },
+    "vp9-444-untiled.webm": {
+      "mpcut": {
+        "cuts": 1,
+        "estimatedViews": 2,
+        "seconds": 0.093,
+        "peakRSSMiB": 29.1,
+        "cpuSeconds": 0.205
+      },
+      "baseline": {
+        "cuts": 1,
+        "estimatedViews": 2,
+        "seconds": 0.131,
+        "peakRSSMiB": 24.4,
+        "cpuSeconds": 0.197
+      },
+      "scdet": {
+        "cuts": 1,
+        "seconds": 0.091,
+        "peakRSSMiB": 58.4,
+        "cpuSeconds": 0.23
+      },
+      "reportsIdentical": true
+    },
+    "tears-of-steel": {
+      "durationSeconds": 734.1666666666666,
+      "mpcut": {
+        "tuningExcerpt": {
+          "found": 7,
+          "missed": 0,
+          "falsePositives": 0
+        },
+        "holdoutExcerpt": {
+          "found": 5,
+          "missed": 0,
+          "falsePositives": 0
+        },
+        "cutsTotal": 138,
+        "estimatedViews": 109,
+        "seconds": 2.748,
+        "peakRSSMiB": 80.3,
+        "cpuSeconds": 2.706
+      },
+      "baseline": {
+        "tuningExcerpt": {
+          "found": 7,
+          "missed": 0,
+          "falsePositives": 0
+        },
+        "holdoutExcerpt": {
+          "found": 5,
+          "missed": 0,
+          "falsePositives": 0
+        },
+        "cutsTotal": 138,
+        "estimatedViews": 109,
+        "seconds": 15.547,
+        "peakRSSMiB": 44.1,
+        "cpuSeconds": 2.632
+      },
+      "scdet": {
+        "tuningExcerpt": {
+          "found": 7,
+          "missed": 0,
+          "falsePositives": 0
+        },
+        "holdoutExcerpt": {
+          "found": 5,
+          "missed": 0,
+          "falsePositives": 0
+        },
+        "cutsTotal": 148,
+        "seconds": 14.393,
+        "peakRSSMiB": 70.4,
+        "cpuSeconds": 6.793
+      },
+      "reportsIdentical": true
+    }
+  }
+}

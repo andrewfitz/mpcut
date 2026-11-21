@@ -16,7 +16,10 @@ final class ReencodeProcessTests: XCTestCase {
         }
         let rawPID = try String(contentsOf: directory.appendingPathComponent("pid"), encoding: .utf8)
         let pid = try XCTUnwrap(Int32(rawPID.trimmingCharacters(in: .whitespacesAndNewlines)))
-        XCTAssertEqual(kill(pid, 0), -1)
-        XCTAssertEqual(errno, ESRCH)
+        // Read errno before any other call can overwrite it.
+        let status = kill(pid, 0)
+        let code = errno
+        XCTAssertEqual(status, -1, "The stalled helper \(pid) is still running")
+        XCTAssertEqual(code, ESRCH)
     }
 }
