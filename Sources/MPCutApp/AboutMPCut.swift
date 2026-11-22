@@ -8,12 +8,16 @@ struct AboutCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .appInfo) {
             Button("About MPCut") { openWindow(id: "about") }
+                .help("Show app information")
         }
         CommandGroup(replacing: .help) {
             Button("MPCut User Guide") { NSWorkspace.shared.open(MPCutDocument.guide.url) }
                 .keyboardShortcut("?", modifiers: .command)
+                .help("Open user guide")
             Button("MPCut Agent Guide") { NSWorkspace.shared.open(MPCutDocument.agentGuide.url) }
+                .help("Open agent guide")
             Button("Release Notes") { NSWorkspace.shared.open(MPCutDocument.releaseNotes.url) }
+                .help("Open release notes")
         }
     }
 }
@@ -34,6 +38,7 @@ enum MPCutDocument: String {
 
 struct AboutMPCut: View {
     @State private var copied = false
+    @State private var openError: NSError?
 
     private var cliURL: URL? {
         let bundle = Bundle.main
@@ -52,10 +57,10 @@ struct AboutMPCut: View {
             Text("Trim, rearrange, and analyze local video and audio on Apple Silicon.")
                 .multilineTextAlignment(.center)
             HStack(spacing: 16) {
-                Link("User guide", destination: MPCutDocument.guide.url)
-                Link("Release notes", destination: MPCutDocument.releaseNotes.url)
+                documentLink("User guide", to: MPCutDocument.guide.url)
+                documentLink("Release notes", to: MPCutDocument.releaseNotes.url)
                 if let credits = Bundle.main.url(forResource: "Credits", withExtension: "html") {
-                    Link("Credits", destination: credits)
+                    documentLink("Credits", to: credits)
                 }
             }
             if let cliURL {
@@ -65,17 +70,35 @@ struct AboutMPCut: View {
                     .font(.system(.caption, design: .monospaced))
                     .multilineTextAlignment(.center)
                     .textSelection(.enabled)
-                Text("Run the CLI with help --json to list commands.")
+                Text("Run mpcut help --json to list commands.")
                     .font(.callout)
                 Button(copied ? "CLI Path Copied" : "Copy CLI Path") {
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
                     copied = pasteboard.setString(cliURL.path, forType: .string)
                 }
-                .help(cliURL.path)
+                .help("Copy CLI path")
             }
         }
         .padding(26)
         .frame(width: 380)
+        .alert("Couldn’t open the document", isPresented: Binding(
+            get: { openError != nil }, set: { if !$0 { openError = nil } }
+        )) {
+            Button("OK") { openError = nil }
+                .help("Dismiss error")
+        } message: {
+            Text(openError?.localizedDescription ?? "")
+        }
+    }
+
+    private func documentLink(_ title: String, to url: URL) -> some View {
+        Button(title) {
+            NSWorkspace.shared.open(url, configuration: .init()) { _, error in
+                if let error { DispatchQueue.main.async { openError = error as NSError } }
+            }
+        }
+        .buttonStyle(.link)
+        .help("Open \(title.lowercased())")
     }
 }

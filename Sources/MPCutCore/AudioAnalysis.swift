@@ -39,6 +39,14 @@ public struct AudioWaveform: Sendable {
         sourceClock = AudioAnalysisClock(media: media, stream: stream)
     }
 
+    /// Use after refresh has verified the result's audio stream and presentation clock.
+    package func forRefreshedMedia(_ media: MediaInfo, stream: Int) -> AudioWaveform {
+        guard sourceClock == AudioAnalysisClock(media: media, stream: stream) else { return self }
+        var result = self
+        result.finish(for: media, stream: stream)
+        return result
+    }
+
     func matches(_ media: MediaInfo, stream: Int) -> Bool {
         sourceIdentity == media.identity && sourceClock == AudioAnalysisClock(media: media, stream: stream)
     }

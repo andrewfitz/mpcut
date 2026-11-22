@@ -15,7 +15,13 @@ typealias MCPFailure = MCPCommandError
 final class MCPSocket: @unchecked Sendable {
     typealias Handler = @MainActor (Data) async -> Data
     static let limit = 4 * 1024 * 1024
-    static let directory = "/tmp/mpcut-\(getuid())"
+    static var directory: String {
+        // Packaged tests launch alongside the normal listener in a private /tmp directory.
+        guard let name = ProcessInfo.processInfo.environment["MPCUT_TEST_SOCKET_DIRECTORY"], !name.isEmpty else {
+            return "/tmp/mpcut-\(getuid())"
+        }
+        return name.wholeMatch(of: #/mpcut-test-[a-zA-Z0-9]{1,64}/#) != nil ? "/tmp/" + name : ""
+    }
     private let directory: String
     private var path: String { directory + "/control.sock" }
     private let queue = DispatchQueue(label: "mpcut.mcp.connections")
@@ -60,6 +66,9 @@ final class MCPSocket: @unchecked Sendable {
     func start(handler: @escaping Handler) throws {
         try queue.sync {
             guard source == nil else { return }
+            guard !directory.isEmpty else {
+                throw MCPFailure("listener_error", "Invalid MPCut test socket directory.")
+            }
             guard mkdir(directory, 0o700) == 0 || errno == EEXIST else { throw Self.systemError("Create socket directory") }
             var info = stat()
             guard lstat(directory, &info) == 0, info.st_uid == getuid(),

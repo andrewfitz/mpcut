@@ -6,11 +6,13 @@ import SwiftUI
 struct ExportQueueChoices {
     let hasVideo: Bool
     let hasAudio: Bool
+    let placements: ExportPlacementScope
     /// The codec of the first queued audio track, whose own format leads the conversions.
     let audioCodec: String?
 
-    init(media: [MediaInfo], audioCodec: String? = nil) {
-        hasVideo = media.contains(where: \.hasVideo)
+    init(media: [MediaInfo], audioCodec: String? = nil, placements: ExportPlacementScope = .none) {
+        self.placements = placements
+        hasVideo = placements != .none || media.contains(where: \.hasVideo)
         hasAudio = media.contains { $0.streams.contains { $0.kind == "audio" } }
         self.audioCodec = audioCodec
     }
@@ -24,14 +26,17 @@ struct ExportQueueChoices {
     }
 
     func cell(tracks: ExportTracks, mode: ExportMode) -> ExportCell {
-        ExportEntryPoint.queue.answer(source: source, tracks: tracks, mode: mode)
+        ExportEntryPoint.queue.answer(source: source, tracks: tracks, mode: mode, placements: placements)
     }
-    func modes(tracks: ExportTracks) -> [ExportMode] { ExportEntryPoint.queue.selectableModes(source: source, tracks: tracks) }
+    func modes(tracks: ExportTracks) -> [ExportMode] { ExportEntryPoint.queue.selectableModes(source: source, tracks: tracks, placements: placements) }
     func title(_ mode: ExportMode, tracks: ExportTracks) -> String { cell(tracks: tracks, mode: mode).displayName }
     /// The named formats of Convert Audio, the source's own first.
-    var conversions: [ReencodeAudio] { ExportRules.namedConversions(sourceCodec: audioCodec) }
+    var conversions: [ReencodeAudio] {
+        let formats = ExportRules.namedConversions(sourceCodec: audioCodec)
+        return placements == .insertion ? formats.filter(ExportRules.stillSoundConversions.contains) : formats
+    }
     /// The audio actions of a movie re-encode.
-    var movieAudio: [ReencodeAudio] { cell(tracks: .all, mode: .encode).audioActions }
+    func movieAudio(mode: ExportMode) -> [ReencodeAudio] { cell(tracks: .all, mode: mode).audioActions }
 
     /// Plans every range as the export will, without writing. Nil when all of them can be written.
     static func check(_ groups: [[ClipRequest]], media: [URL: MediaInfo], options: ExportSheetOptions,
@@ -61,7 +66,27 @@ struct ExportQueueChoices {
 extension EditorModel {
     /// Checks the queued ranges with these settings: nil, or the failure with the alternatives of the export rules.
     func checkQueuedRanges(options: ExportSheetOptions) async -> CutError? {
-        let groups = queuedRanges.map(\.clips)
+        if let issue = queuedMediaRefreshIssue() { return issue }
+        let ranges = queuedRanges
+        let useSidecar = useAnalysisSidecars
+        if ranges.contains(where: { $0.stillProject != nil }) {
+            return await Task.detached(priority: .userInitiated) {
+                let scratch = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("mpcut-queue-check-\(UUID())", isDirectory: true)
+                do {
+                    try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: false)
+                    defer { try? FileManager.default.removeItem(at: scratch) }
+                    _ = try SequenceQueuePlan(ranges, directory: scratch, options: options, useSidecar: useSidecar,
+                                              cancelled: { Task.isCancelled })
+                    return nil
+                } catch let issue as CutError {
+                    return issue
+                } catch {
+                    return CutError(code: "export_failed", message: error.localizedDescription)
+                }
+            }.value
+        }
+        let groups = ranges.map(\.clips)
         var media: [URL: MediaInfo] = [:]
         for range in queuedRanges { media.merge(range.media) { first, _ in first } }
         let indexed = media
@@ -82,20 +107,132 @@ struct ExportOffersView: View {
         VStack(alignment: .leading, spacing: 6) {
             IssueLabel(message)
             if let first = alternatives.first {
-                HStack {
-                    Button(first.label) { apply(first) }
-                    if alternatives.count > 1 {
-                        Menu("More Alternatives") {
-                            ForEach(alternatives.dropFirst(), id: \.id) { alternative in
-                                Button(alternative.label) { apply(alternative) }
-                            }
-                        }
-                        .fixedSize()
-                        .accessibilityLabel("More export alternatives")
-                    }
+                // Side by side where the whole label fits, as in the queue. In a narrow inspector the menu goes
+                // below, so the label of the first alternative is not cut short.
+                // Where even that is too narrow, as in the multicam inspector at its minimum width, the button shows
+                // the label without its remark and the whole label stays in the tooltip.
+                ViewThatFits(in: .horizontal) {
+                    HStack { choices(first) }
+                    VStack(alignment: .leading, spacing: 6) { choices(first) }
+                    VStack(alignment: .leading, spacing: 6) { choices(first, compact: true) }
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The label without its remark in parentheses: "Use Smart Trim (encodes only the cut edges) in MOV" is "Use Smart Trim in MOV".
+    static func compactLabel(_ label: String) -> String {
+        let withoutRemark = label.replacingOccurrences(of: #" \([^()]*\)"#, with: "", options: .regularExpression)
+        return withoutRemark.replacingOccurrences(of: "Copy with cuts on the nearest audio sample", with: "Copy at nearest audio samples")
+    }
+
+    @ViewBuilder private func choices(_ first: ExportAlternative, compact: Bool = false) -> some View {
+        Button(compact ? Self.compactLabel(first.label) : first.label) { apply(first) }
+            .help(first.label)
+            .accessibilityLabel(first.label)
+        if alternatives.count > 1 {
+            Menu("More Alternatives") {
+                ForEach(alternatives.dropFirst(), id: \.id) { alternative in
+                    Button(alternative.label) { apply(alternative) }
+                        .help("Use this export alternative")
+                }
+            }
+            .fixedSize()
+            .accessibilityLabel("More export alternatives")
+            .help("Show more export alternatives")
+        }
+    }
+}
+
+/// A queue can mix retained-range exports and exports of versioned snapshots with visible stills.
+struct SequenceQueuePlan: Sendable {
+    enum Payload: Sendable {
+        case ordinary(BulkExport.Item)
+        case still(StillExportPlan)
+    }
+
+    struct Item: Sendable {
+        let output: URL
+        let payload: Payload
+    }
+
+    let items: [Item]
+    let folder: URL
+    private let directory: URL
+    private let organization: ExportOrganization
+    private let useSidecar: Bool
+    private let cancelled: @Sendable () -> Bool
+
+    init(_ ranges: [QueuedRange], directory: URL, options: ExportSheetOptions, useSidecar: Bool = true,
+         ordinaryModeWhenUnspecified: ExportMode? = nil, cancelled: @escaping @Sendable () -> Bool) throws {
+        self.directory = directory
+        organization = options.organization
+        self.useSidecar = useSidecar
+        self.cancelled = cancelled
+        let folder = try organization.directory(in: directory, create: false)
+        self.folder = folder
+        let stem = ranges.first?.clips.first?.file.deletingPathExtension().lastPathComponent ?? "Stills"
+        let destinationCheck = CutEngine(cancelled: cancelled)
+        let plannedSubfolder = organization.subfolder.isEmpty ? nil : folder
+        var result: [Item] = []
+        for (index, range) in ranges.enumerated() {
+            let suffix = String(format: "%03ld", index + 1)
+            do {
+                if let project = range.stillProject {
+                    for media in range.media.values where !media.identity.isCurrentSnapshot(at: media.url) {
+                        throw CutError(code: "source_changed", message: "\(media.url.lastPathComponent) changed after the range was queued.")
+                    }
+                    var requested = options
+                    requested.placements = range.placements
+                    let plan = try requested.planStills(project, useSidecar: useSidecar, cancelled: cancelled)
+                    let name = organization.filename(stem: stem, suffix: suffix, container: plan.container)
+                    let output = folder.appendingPathComponent(name, isDirectory: false)
+                    try destinationCheck.checkDestination(output, plannedSubfolder: plannedSubfolder)
+                    result.append(.init(output: output, payload: .still(plan)))
+                } else {
+                    let batch = try BulkExport(groups: [range.clips], directory: directory, outputSuffixes: [suffix],
+                                               organization: organization,
+                                               mode: ordinaryModeWhenUnspecified ?? options.effectiveMode, tracks: options.tracks,
+                                               audioTrackOrdinal: options.audioTrackOrdinal,
+                                               container: options.container.isEmpty ? nil : options.container,
+                                               settings: options.batchSettings, media: range.media, cancelled: cancelled)
+                    let planned = batch.items[0]
+                    if options.requireCameraCopy && options.tracks != .audio {
+                        switch planned.plan {
+                        case .conversion:
+                            throw CutError(code: "camera_copy_required", message: "Re-encode changes retained camera picture.")
+                        case .packets(let edit, .smart, _):
+                            if try edit.encodedVideoDuration(for: .smart) > .zero {
+                                throw CutError(code: "camera_copy_required", message: "This range has a camera edge that must be encoded.")
+                            }
+                        default: break
+                        }
+                    }
+                    let name = organization.filename(stem: stem, suffix: suffix, container: planned.plan.edit.container)
+                    let output = folder.appendingPathComponent(name, isDirectory: false)
+                    try destinationCheck.checkDestination(output, plannedSubfolder: plannedSubfolder)
+                    result.append(.init(output: output, payload: .ordinary(planned)))
+                }
+            } catch let issue as CutError {
+                let message = issue.message.hasPrefix("Range 1: ") ? String(issue.message.dropFirst(9)) : issue.message
+                var failure = CutError(code: issue.code, message: "Range \(index + 1): \(message)",
+                                       segment: index + 1, boundary: issue.boundary, nearest: issue.nearest, track: issue.track)
+                failure.alternatives = issue.alternatives
+                failure.reason = issue.factor
+                throw failure
+            }
+        }
+        items = result
+    }
+
+    func write(_ item: Item, progress: @escaping @Sendable (Double) -> Bool) throws {
+        _ = try organization.directory(in: directory, create: true)
+        switch item.payload {
+        case .ordinary(let planned):
+            try ExportPlanner(cancelled: cancelled, useSidecar: useSidecar).write(planned.plan, to: item.output, progress: progress)
+        case .still(let plan):
+            try StillExportPlanner(useSidecar: useSidecar, cancelled: cancelled).write(plan, to: item.output, progress: progress)
+        }
     }
 }

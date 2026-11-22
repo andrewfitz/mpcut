@@ -162,8 +162,8 @@ struct EditorTransportBar<Player: EditorPlayback, Accessory: View>: View {
     }
 
     private func tools(compact: Bool) -> some View {
-        HStack(spacing: compact ? 3 : 10) {
-            HStack(spacing: 4) {
+        HStack(spacing: compact ? 3 : 5) {
+            HStack(spacing: 3) {
                 steps(-1)
                 PreviewPlayButton(preview: preview)
                 steps(1)
@@ -176,9 +176,9 @@ struct EditorTransportBar<Player: EditorPlayback, Accessory: View>: View {
             // Clear Marks keeps its place so the tools after it never shift.
             HStack(spacing: compact ? 2 : 4) {
                 ClipTool(icon: "text.cursor", label: "Range Selection Tool", shortcut: "R",
+                         toolTip: rangeTools.active ? "Use pointer (A)" : "Select range (R)",
                          active: rangeTools.active) { rangeTools.active.toggle() }
                     .accessibilityValue(rangeTools.active ? "On" : "Off")
-                    .help("Drag to select a timeline range (R). Return to the pointer with A.")
                 ClipTool(icon: nil, label: "Mark In", visibleTitle: compact ? "In" : nil,
                          shortcut: "I", active: marks.hasIn, action: marks.setIn)
                     .fixedSize(horizontal: true, vertical: false)
@@ -197,7 +197,8 @@ struct EditorTransportBar<Player: EditorPlayback, Accessory: View>: View {
                 }
                 ClipTool(icon: "xmark.circle", label: "Clear Marks", shortcut: "⌥X or Esc", action: marks.clear)
                     .disabled(!marks.hasIn && !marks.hasOut)
-                editTool(addRange, icon: "text.badge.plus", shortcut: "⇧⌘A")
+                editTool(addRange, icon: "text.badge.plus", shortcut: "⇧⌘A",
+                         toolTip: "Queue marked range (⇧⌘A)")
             }
             .disabled(!canEdit)
 
@@ -212,6 +213,7 @@ struct EditorTransportBar<Player: EditorPlayback, Accessory: View>: View {
                         .disabled(!rangeTools.canDelete)
                 } else {
                     editTool(split, icon: "scissors", shortcut: "⌘B", visibleTitle: compact ? nil : "Split")
+                        .fixedSize(horizontal: true, vertical: false)
                     editTool(delete, icon: "trash", shortcut: "⌫")
                 }
             }
@@ -235,8 +237,11 @@ struct EditorTransportBar<Player: EditorPlayback, Accessory: View>: View {
     private var cameraButtons: some View {
         HStack(spacing: 4) {
             ForEach(cameras) { camera in
+                let shortcut = camera.number <= 9 ? String(camera.number) : ""
+                let action = "Switch to camera \(camera.number)"
                 ClipTool(icon: nil, label: "Camera \(camera.number), \(camera.name)",
-                         visibleTitle: camera.number.formatted(), shortcut: camera.number <= 9 ? String(camera.number) : "",
+                         visibleTitle: camera.number.formatted(), shortcut: shortcut,
+                         toolTip: shortcut.isEmpty ? action : "\(action) (\(shortcut))",
                          active: camera.active, outlined: true, action: camera.perform)
             }
         }
@@ -280,9 +285,9 @@ struct EditorTransportBar<Player: EditorPlayback, Accessory: View>: View {
     }
 
     private func editTool(_ action: EditorEditAction, icon: String, shortcut: String,
-                          visibleTitle: String? = nil) -> some View {
+                          visibleTitle: String? = nil, toolTip: String? = nil) -> some View {
         ClipTool(icon: icon, label: action.title, visibleTitle: visibleTitle,
-                 shortcut: shortcut, action: action.perform)
+                 shortcut: shortcut, toolTip: toolTip, action: action.perform)
             .disabled(!action.enabled)
     }
 }
@@ -343,12 +348,14 @@ struct StatusIconButton: View {
 struct EditorToolbarButton: View {
     let title: String
     let symbol: String
+    let toolTip: String
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             Label(title, systemImage: symbol).labelStyle(.titleAndIcon)
         }
+        .help(toolTip)
     }
 }
 
@@ -363,7 +370,7 @@ struct ExportQueueToolbarButton: View {
                 .labelStyle(.titleAndIcon)
                 .monospacedDigit()
         }
-        .help("Review and export queued ranges (⇧⌘E)")
+        .help("Open export queue (⇧⌘E)")
     }
 }
 
@@ -431,7 +438,7 @@ struct PreviewSoundControls: View {
                 }
             }
         }
-        .help("Preview volume, mute, and audio scrubbing")
+        .help("Show preview audio controls")
         .popover(isPresented: $showVolume, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
@@ -447,6 +454,7 @@ struct PreviewSoundControls: View {
                         isMuted = false
                     }), in: 0...1)
                     .accessibilityLabel("Preview volume")
+                    .help("Adjust preview volume")
                     Text(progressPercent(Double(isMuted ? 0 : volume)))
                         .font(.callout.monospacedDigit())
                         .foregroundStyle(.secondary)
@@ -455,6 +463,7 @@ struct PreviewSoundControls: View {
                 }
                 Divider()
                 Toggle("Play audio while scrubbing", isOn: $scrubSoundEnabled)
+                    .help("Hear audio while scrubbing")
             }
             .padding(16)
             .frame(width: 264)
@@ -484,13 +493,16 @@ struct PreviewSpeedMenu<Player: EditorPlayback>: View {
                     Text(speed.label).tag(speed)
                 }
             }
+            .pickerStyle(.inline)
+            .labelsHidden()
+            .help("Set playback speed")
         } label: {
             Text(preview.playbackRate < 0 ? PlaybackSpeed.label(for: preview.playbackRate) : preview.displayedSpeed.label)
                 .monospacedDigit()
         }
         .fixedSize()
         .accessibilityLabel("Playback Speed")
-        .help("Playback speed · [ slower · ] faster · backslash normal")
+        .help("Choose playback speed")
         .disabled(preview.hasBlockingIssue)
     }
 }
@@ -548,6 +560,7 @@ struct ClipTool: View {
     let label: String
     var visibleTitle: String? = nil
     let shortcut: String
+    var toolTip: String? = nil
     var active = false
     var prominent = false
     var outlined = false
@@ -572,7 +585,7 @@ struct ClipTool: View {
             .frame(minWidth: controlSize == .small ? 24 : 28, minHeight: 28)
         }
         .buttonStyle(ToolButtonStyle(active: active, outlined: outlined))
-        .help(shortcut.isEmpty ? label : "\(label) (\(shortcut))")
+        .help(toolTip ?? (shortcut.isEmpty ? label : "\(label) (\(shortcut))"))
         .accessibilityLabel(label)
         .accessibilityAddTraits(active ? [.isSelected] : [])
     }

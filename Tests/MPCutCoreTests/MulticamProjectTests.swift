@@ -92,7 +92,7 @@ final class MulticamProjectTests: XCTestCase {
         var edit = project
         let data = try JSONEncoder().encode(edit)
         var document = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        document["schemaVersion"] = 2
+        document["schemaVersion"] = 3
         let future = try JSONSerialization.data(withJSONObject: document)
         XCTAssertThrowsError(try JSONDecoder().decode(MulticamProject.self, from: future)) {
             XCTAssertEqual(($0 as? CutError)?.code, "unsupported_multicam_version")
@@ -147,7 +147,8 @@ final class MulticamProjectTests: XCTestCase {
         for (location, change) in cases {
             XCTAssertThrowsError(try JSONDecoder().decode(MulticamProject.self, from: document(change)), location) {
                 let issue = $0 as? CutError
-                XCTAssertEqual(issue?.code, "invalid_multicam_project", location)
+                // A malformed time has one code wherever it is written, so the CLI exits 2 for it.
+                XCTAssertEqual(issue?.code, "invalid_time", location)
                 XCTAssertTrue(issue?.message.hasSuffix(" in " + location) == true, issue?.message ?? "")
             }
         }

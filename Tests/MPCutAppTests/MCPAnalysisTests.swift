@@ -4,6 +4,91 @@ import XCTest
 
 @MainActor
 final class MCPAnalysisTests: XCTestCase {
+    func testSceneSubscribersCancelIndependently() async {
+        let request = MCPSceneRequest(target: nil, policy: .reuse)
+        let worker = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        worker.sceneRequest = request
+        let first = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        let last = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        var nativeCancelCount = 0
+        worker.cancelNative = { nativeCancelCount += 1 }
+        worker.subscribe(first)
+        worker.subscribe(last)
+        first.cancel()
+        XCTAssertEqual(first.state, "cancelled")
+        XCTAssertEqual(last.state, "running")
+        XCTAssertEqual(nativeCancelCount, 0)
+        last.cancel()
+        XCTAssertEqual(last.state, "running")
+        XCTAssertEqual(nativeCancelCount, 1)
+        worker.finish("cancelled", detail: ["checkpoint": "flushed"])
+        await last.cleanup.wait()
+        XCTAssertEqual(last.snapshot["checkpoint"] as? String, "flushed")
+        XCTAssertEqual(last.state, "cancelled")
+
+        let editorWorker = MCPAnalysisReceipt(owner: "", revision: 0, kind: "scenes")
+        editorWorker.sceneRequest = request
+        editorWorker.cancelNative = { nativeCancelCount += 1 }
+        let observer = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        editorWorker.subscribe(observer)
+        observer.cancel()
+        XCTAssertEqual(observer.state, "cancelled")
+        XCTAssertEqual(editorWorker.state, "running")
+        XCTAssertEqual(nativeCancelCount, 1)
+
+        let remaining = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        editorWorker.subscribe(remaining)
+        editorWorker.cancelFromEditor()
+        XCTAssertEqual(nativeCancelCount, 1)
+        remaining.cancel()
+        XCTAssertEqual(nativeCancelCount, 2)
+        editorWorker.finish("cancelled")
+        XCTAssertEqual(remaining.state, "cancelled")
+    }
+
+    func testSelectedSceneSubscriberTracksItsCapturedSourceAndRange() throws {
+        let worker = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        worker.sceneRequest = MCPSceneRequest(target: nil, policy: .reuse)
+        let all = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        let selected = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        let late = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        let start = RationalTime(numerator: 10)
+        let end = RationalTime(numerator: 20)
+        let interval = SceneScanScope.range(start: start, end: end)
+        var workerCoverage = SceneScanProgress(requested: .fullSource, decoded: RationalTime(numerator: 5))
+        worker.sceneCoverage = { ["source": workerCoverage, "other": SceneScanProgress(requested: .fullSource)] }
+        worker.subscribe(all)
+        let selection = MCPSceneSelection(source: "source", target: "clip", interval: interval)
+        worker.subscribe(selected, selection: selection)
+
+        func selectedCoverage(_ job: MCPAnalysisReceipt) throws -> [String: Any] {
+            let coverage = try XCTUnwrap(job.snapshot["coverage"] as? [String: [String: Any]])
+            XCTAssertEqual(Set(coverage.keys), ["clip"])
+            return try XCTUnwrap(coverage["clip"])
+        }
+        XCTAssertEqual(selected.snapshot["target"] as? String, "clip")
+        XCTAssertEqual(selected.snapshot["scope"] as? String, "selected")
+        XCTAssertNil(try selectedCoverage(selected)["decoded"])
+        worker.finishSceneSources(["other"])
+        XCTAssertEqual(selected.state, "running")
+
+        workerCoverage = SceneScanProgress(requested: .fullSource, decoded: RationalTime(numerator: 15),
+                                           confirmed: RationalTime(numerator: 14), durable: RationalTime(numerator: 11))
+        XCTAssertEqual(try selectedCoverage(selected)["fraction"] as? Double, 0.5)
+        workerCoverage = SceneScanProgress(requested: .fullSource, decoded: RationalTime(numerator: 30),
+                                           confirmed: RationalTime(numerator: 30), durable: RationalTime(numerator: 30), fraction: 1)
+        XCTAssertEqual(selected.state, "running")
+        worker.finishSceneSources(["source"])
+        XCTAssertEqual(selected.state, "succeeded")
+        XCTAssertEqual(selected.snapshot["sources"] as? [String], ["clip"])
+        XCTAssertEqual((try selectedCoverage(selected)["durable"] as? [String: Int])?["numerator"], 20)
+        XCTAssertEqual(all.state, "running")
+        worker.subscribe(late, selection: selection)
+        XCTAssertEqual(late.state, "succeeded")
+        worker.finish("succeeded", detail: ["sources": ["source", "other"]])
+        XCTAssertEqual(all.snapshot["sources"] as? [String], ["source", "other"])
+    }
+
     func testReadAndRejectConditionsForEmptyEditor() async throws {
         let preferences = EditorPreferences()
         let sessions = ProjectSessions(preferences: preferences)
@@ -169,12 +254,36 @@ final class MCPAnalysisTests: XCTestCase {
         func waitForJob(_ result: [String: Any]) async throws -> [String: Any] {
             let job = try XCTUnwrap(result["job"] as? String)
             let receipt = try sessions.mcpAnalysisJobs.lookup(job, session: project)
-            while receipt.state == "running" && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+            let jobDeadline = ContinuousClock.now + .seconds(15)
+            while receipt.state == "running" && ContinuousClock.now < jobDeadline { try await Task.sleep(for: .milliseconds(20)) }
             return try await call("analysis_job_status", ["job": job])
         }
-        let scenes = try await waitForJob(call("scan_analysis", ["kind": "scenes"]))
+        let clip = try XCTUnwrap(project.editor.timelineClips.first?.id.uuidString)
+        let allStarted = try await call("scan_analysis", ["kind": "scenes"])
+        let clipStarted = try await call("scan_analysis", ["kind": "scenes", "scope": "selected", "target": clip])
+        XCTAssertNotEqual(allStarted["job"] as? String, clipStarted["job"] as? String)
+        let joined = try await waitForJob(clipStarted)
+        XCTAssertEqual(joined["status"] as? String, "succeeded")
+        XCTAssertEqual(joined["sources"] as? [String], [clip])
+        let joinedCoverage = try XCTUnwrap(joined["coverage"] as? [String: [String: Any]])
+        XCTAssertEqual(Set(joinedCoverage.keys), [clip])
+        XCTAssertEqual(joinedCoverage[clip]?["fraction"] as? Double, 1)
+
+        let scenes = try await waitForJob(allStarted)
         XCTAssertEqual(scenes["status"] as? String, "succeeded")
         XCTAssertEqual(scenes["sources"] as? [String], [source])
+        XCTAssertEqual(scenes["scope"] as? String, "all")
+        let coverage = try XCTUnwrap((scenes["coverage"] as? [String: [String: Any]])?[source])
+        XCTAssertNotNil(coverage["requested"])
+        XCTAssertNotNil(coverage["confirmed"])
+        XCTAssertNil(coverage["durable"])
+        let selected = try await waitForJob(call("scan_analysis", ["kind": "scenes", "scope": "selected", "target": clip]))
+        XCTAssertEqual(selected["status"] as? String, "succeeded")
+        XCTAssertEqual(selected["scope"] as? String, "selected")
+        XCTAssertEqual(selected["target"] as? String, clip)
+        let clipScenes = try await call("list_scenes", ["clip": clip, "limit": 1])
+        XCTAssertEqual(clipScenes["clip"] as? String, clip)
+        XCTAssertEqual(clipScenes["source"] as? String, source)
         let listed = try await call("list_scenes", ["source": source, "limit": 1])
         let first = try XCTUnwrap((listed["items"] as? [[String: Any]])?.first)
         let view = try XCTUnwrap(first["view"] as? Int)
@@ -185,6 +294,10 @@ final class MCPAnalysisTests: XCTestCase {
         let reopened = try XCTUnwrap(AnalysisSidecar(media: media.value).sceneReport(for: media.value))
         XCTAssertEqual(reopened.views.first { $0.view == view }?.name, "Wide shot")
 
+        let unchanged = try await waitForJob(call("refresh_project_media"))
+        XCTAssertEqual(unchanged["status"] as? String, "succeeded")
+        XCTAssertEqual((unchanged["sources"] as? [[String: Any]])?.first?["state"] as? String, "unchanged")
+
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: 5)], ofItemAtPath: copy.path)
         do {
             _ = try await call("list_scenes", ["source": source])
@@ -192,6 +305,15 @@ final class MCPAnalysisTests: XCTestCase {
         } catch let issue as MCPCommandError {
             XCTAssertEqual(issue.code, "source_changed")
         }
+
+        let replacement = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov", subdirectory: "Fixtures"))
+        try Data(contentsOf: replacement).write(to: copy, options: .atomic)
+        let refreshed = try await waitForJob(call("refresh_project_media", ["deep": true]))
+        XCTAssertEqual(refreshed["status"] as? String, "succeeded")
+        let archived = try await call("list_scenes", ["source": source, "includeStale": true])
+        XCTAssertEqual(archived["stale"] as? Bool, true)
+        XCTAssertNotNil(archived["staleReason"])
+        XCTAssertEqual((archived["sourceStamp"] as? [String: Any])?["bytes"] as? Int64, SceneSourceStamp(media: media.value).bytes)
     }
 
     func testMulticamPauseReviewAndRoomToneInRepeatedAssembly() async throws {

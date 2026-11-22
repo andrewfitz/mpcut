@@ -38,6 +38,9 @@ public enum FCPLibraryInterchange {
     public static func write(_ project: CutProject, relativeTo location: URL, to output: URL,
                              allowLoss: Bool, cancelled: @escaping @Sendable () -> Bool = { false }) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled)
+        try project.validateDestination(output, relativeTo: location, includesContents: true)
+        let conversion = try ProjectConverter.prepareStills(project, for: "Final Cut Pro .fcpbundle", allowLoss: allowLoss,
+                                                            supportsStillInserts: true)
         let app = try finalCut()
         let destination = output.standardizedFileURL
         let manager = FileManager.default
@@ -54,7 +57,8 @@ public enum FCPLibraryInterchange {
         let xml = library.deletingPathExtension().appendingPathExtension("fcpxml")
         var sentToHost = false
         do {
-            var warnings = try FCPInterchange.write(project, relativeTo: location, to: xml, allowLoss: allowLoss, cancelled: cancelled)
+            var warnings = try conversion.warnings + FCPInterchange.write(conversion.project, relativeTo: location, to: xml,
+                                                                          allowLoss: allowLoss, cancelled: cancelled)
             try setImportLibrary(library, in: xml)
             try ProjectConverter.checkCancellation(cancelled)
             try open(xml, in: app)

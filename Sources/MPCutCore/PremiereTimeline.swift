@@ -35,8 +35,9 @@ enum PremiereTimeline {
 
     static func write(_ project: CutProject, relativeTo location: URL, to xml: URL,
                       name: String, allowLoss: Bool, flattenMulticam: Bool = false) throws -> [String] {
+        let conversion = try ProjectConverter.prepareStills(project, for: "Adobe Premiere Pro", allowLoss: allowLoss)
         var edits: [Edit] = []
-        var warnings = Set<String>()
+        var warnings = Set(conversion.warnings)
         var media: [URL: MediaInfo] = [:]
         var nativeGroup: MulticamProject?
         let engine = CutEngine(useSidecar: false)
@@ -54,7 +55,9 @@ enum PremiereTimeline {
             guard allowLoss else { throw CutError(code: "premiere_conversion_loss", message: message + " Use --allow-loss to continue.") }
             warnings.insert(message)
         }
-        switch project {
+        switch conversion.project {
+        case .stillSequence:
+            throw issue("Premiere timeline XML has no verified mapping for MPCut stills.")
         case .sequence(let clips):
             var position = RationalTime.zero
             for clip in clips {

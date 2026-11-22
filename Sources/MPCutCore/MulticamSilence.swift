@@ -73,11 +73,12 @@ package enum MulticamSilencePlanner {
                              ranges: [MulticamRange], silences: [MulticamAudioSelection: SilenceAnalysisResult],
                              scope: AudioSpan?, minimum: Double, leave: Double, protected: Set<AudioSpan>,
                              keyframesOnly: Bool = false, container: String = "mov",
-                             occurrenceScopes: [AudioSpan?]? = nil) -> [MulticamPauseEdit] {
+                             occurrenceScopes: [AudioSpan?]? = nil,
+                             assemblyIndices: [Int]? = nil) -> [MulticamPauseEdit] {
         guard !silences.isEmpty else { return [] }
         return plan(project: project, media: media, ranges: ranges, scope: scope, minimum: minimum,
                     leave: leave, protected: protected, keyframesOnly: keyframesOnly, container: container,
-                    occurrenceScopes: occurrenceScopes) {
+                    occurrenceScopes: occurrenceScopes, assemblyIndices: assemblyIndices) {
             intervals, offsets in
             let routes = intervals.compactMap { interval -> MulticamSilenceRoute? in
                 guard let selection = interval.audio, let offset = offsets[selection.source],
@@ -92,10 +93,10 @@ package enum MulticamSilencePlanner {
     private static func plan(project: MulticamProject, media: [String: MediaInfo], ranges: [MulticamRange],
                              scope: AudioSpan?, minimum: Double, leave: Double, protected: Set<AudioSpan>,
                              keyframesOnly: Bool, container: String,
-                             occurrenceScopes: [AudioSpan?]? = nil,
+                             occurrenceScopes: [AudioSpan?]? = nil, assemblyIndices: [Int]? = nil,
                              pausesForOccurrence: ([MulticamInterval], [String: RationalTime]) -> [AudioSpan])
         -> [MulticamPauseEdit] {
-        guard let plan = try? project.plan(ranges: ranges) else { return [] }
+        guard let plan = try? project.plan(ranges: assemblyIndices == nil ? ranges : nil) else { return [] }
         let intervalGroups = Dictionary(grouping: plan.intervals, by: \.assemblyIndex)
         let offsets = Dictionary(uniqueKeysWithValues: project.sources.map { ($0.id, $0.offset) })
         let pictureEngine = CutEngine(multicamSmartPicture: !keyframesOnly, cancelled: nil)
@@ -106,7 +107,7 @@ package enum MulticamSilencePlanner {
         return ranges.enumerated().flatMap { index, range -> [MulticamPauseEdit] in
             let clip = span(range)
             guard let scoped = scoped(clip, at: index, group: scope, occurrences: occurrenceScopes) else { return [] }
-            let intervals = intervalGroups[index] ?? []
+            let intervals = intervalGroups[assemblyIndices?[index] ?? index] ?? []
             let pauses = pausesForOccurrence(intervals, offsets)
             let first = pauses.lowerBound { $0.to > scoped.from }
             return pauses[first...].prefix { $0.from < scoped.to }.compactMap { pause in

@@ -71,14 +71,17 @@ final class JPEGExportOptions: NSObject, ObservableObject, NSOpenSavePanelDelega
     @Published var sample = JPEGSample.midpoint
     @Published var limitText = ""
     @Published var allSwitches = false
+    @Published var programPicture = false
 
     init(preset: JPEGPreset = .review) {
         self.preset = preset
         super.init()
     }
 
-    func panel(source: URL, directory: URL? = nil, hasAudio: Bool, hasPictureAtPlayhead: Bool = true, multicam: Bool = false) -> NSSavePanel {
+    func panel(source: URL, directory: URL? = nil, hasAudio: Bool, hasPictureAtPlayhead: Bool = true, multicam: Bool = false,
+               hasAnalysisSource: Bool = true, hasProgramStill: Bool = false) -> NSSavePanel {
         if !hasPictureAtPlayhead { mode = .scenes }
+        programPicture = hasProgramStill
         let panel = NSSavePanel()
         panel.title = "Export JPEG Frames"
         panel.prompt = "Export"
@@ -88,7 +91,8 @@ final class JPEGExportOptions: NSObject, ObservableObject, NSOpenSavePanelDelega
         panel.canCreateDirectories = true
         panel.delegate = self
         let accessory = NSHostingView(rootView: JPEGExportAccessory(source: source, hasAudio: hasAudio,
-                                                                    hasPictureAtPlayhead: hasPictureAtPlayhead, multicam: multicam, options: self))
+                                                                    hasPictureAtPlayhead: hasPictureAtPlayhead, multicam: multicam,
+                                                                    hasAnalysisSource: hasAnalysisSource, hasProgramStill: hasProgramStill, options: self))
         accessory.frame.size = accessory.fittingSize
         panel.accessoryView = accessory
         return panel
@@ -116,39 +120,53 @@ private struct JPEGExportAccessory: View {
     let hasAudio: Bool
     let hasPictureAtPlayhead: Bool
     let multicam: Bool
+    let hasAnalysisSource: Bool
+    let hasProgramStill: Bool
     @ObservedObject var options: JPEGExportOptions
 
     var body: some View {
         Form {
-            LabeledContent(multicam ? "On-air camera" : "Source") {
+            LabeledContent(hasProgramStill ? "Program image" : multicam ? "On-air camera" : "Source") {
                 Text(source.lastPathComponent).lineLimit(1).truncationMode(.middle).help(source.path)
             }
             Picker("Frames", selection: $options.mode) {
-                Text(multicam ? "Compare all camera angles" : "Current picture at playhead").tag(JPEGExportMode.playhead)
+                Text(multicam && !hasProgramStill ? "Compare all camera angles" : "Current picture at playhead").tag(JPEGExportMode.playhead)
                     .disabled(!hasPictureAtPlayhead)
-                Text("Each scene in the whole source").tag(JPEGExportMode.scenes)
-                Text("Each non-silent range in the whole source").tag(JPEGExportMode.nonSilent)
+                Text("Each scene in the source file").tag(JPEGExportMode.scenes)
+                    .disabled(!hasAnalysisSource)
+                Text("Each non-silent section in the source file").tag(JPEGExportMode.nonSilent)
                     .disabled(!hasAudio)
             }
-            if multicam && options.mode == .playhead {
+            .help("Choose frames to export")
+            if multicam && options.mode == .playhead && hasProgramStill && hasAnalysisSource {
+                Picker("Picture", selection: $options.programPicture) {
+                    Text("Program still").tag(true)
+                    Text("Compare all camera angles").tag(false)
+                }
+                .help("Choose picture source")
+            }
+            if multicam && options.mode == .playhead && !options.programPicture {
                 Picker("Group times", selection: $options.allSwitches) {
                     Text("Playhead").tag(false)
                     Text("Every camera switch").tag(true)
                 }
+                .help("Choose switches to export")
             }
             Picker("Image size", selection: $options.preset) {
                 Text("Small review JPEG (up to 640 px)").tag(JPEGPreset.review)
                 Text("Full resolution, high quality").tag(JPEGPreset.full)
             }
+            .help("Set JPEG image size")
             Picker("Picture in range", selection: $options.sample) {
                 Text("Midpoint").tag(JPEGSample.midpoint)
                 Text("First frame").tag(JPEGSample.first)
             }
             .disabled(options.mode == .playhead)
+            .help("Choose frame within range")
             TextField("Image limit", text: $options.limitText, prompt: Text("All"))
                 .disabled(options.mode == .playhead)
-                .help("Limit the number of images by sampling across the source.")
-            Text("The new folder contains JPEGs and a JSON manifest with their source times.")
+                .help("Limit exported images")
+            Text("The folder includes the JPEGs and a JSON manifest with frame timing.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .padding(10)

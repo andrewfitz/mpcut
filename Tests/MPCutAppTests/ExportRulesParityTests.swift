@@ -42,6 +42,22 @@ final class ExportRulesParityTests: XCTestCase {
                        "docs/EXPORT-RULES.md is out of date. Regenerate it with MPCUT_WRITE_EXPORT_RULES=1 swift test --filter ExportRulesParityTests.")
     }
 
+    func testVisiblePlacementsKeepTrackSelectionInTheExportRules() {
+        for (source, entry) in [(ExportSourceKind.movie, ExportEntryPoint.sheet), (.multicam, .multicamSheet)] {
+            XCTAssertEqual(entry.selectableModes(source: source, tracks: .video, placements: .replacement), [.smart, .copy, .encode])
+            XCTAssertEqual(entry.answer(source: source, tracks: .video, mode: .copy,
+                                        placements: .replacement).refusal?.factor, .placementPicture)
+            XCTAssertEqual(entry.answer(source: source, tracks: .audio, mode: .copy,
+                                        placements: .insertion).refusal?.factor, .placementSilence)
+            XCTAssertTrue(entry.answer(source: source, tracks: .audio, mode: .copy,
+                                       placements: .replacement).isAllowed)
+            XCTAssertTrue(entry.answer(source: source, tracks: .audio, mode: .encode,
+                                       placements: .insertion).isAllowed)
+        }
+        XCTAssertEqual(ExportRules.defaultStillMode(tracks: .all, placements: .replacement, otherwise: .copy), .smart)
+        XCTAssertEqual(ExportRules.defaultStillMode(tracks: .audio, placements: .replacement, otherwise: .copy), .copy)
+    }
+
     func testLadderOrderFollowsTheNamedRankingCriteria() {
         let ranked = ExportRung.allCases.sorted { $0.rank < $1.rank }
         XCTAssertEqual(ranked, [.copyOtherContainer, .copySampleAligned, .smartTrim, .convertSameFormat, .convertPCM, .convertAAC, .reencode])
@@ -71,7 +87,12 @@ final class ExportRulesParityTests: XCTestCase {
             "[.smallerFile, .balanced, .highQuality]",
             "[.copyOriginal, .aac, .pcm, .removeAudio]", // audio actions
             "Choose MOV or MKV for PCM audio", // refusal wording
-            "Choose MP4, MOV, or MKV for Re-encode"
+            "Choose MP4, MOV, or MKV for Re-encode",
+            "[\"mov\", \"mp4\", \"mkv\", \"webm\"]", // Replace Source Audio containers
+            "\"mka\", \"m4a\", \"wav\"",
+            "Choose a supported replacement container",
+            "\"Matroska Audio (.mka)\"",       // container names
+            "\"MPEG-4 Audio (.m4a)\""
         ]
         // The MCP front end is being rewritten separately. Every other file asks ExportRules.
         let notMigrated: Set<String> = ["MCPOutputs.swift"]
@@ -352,6 +373,68 @@ final class ExportRulesParityTests: XCTestCase {
                                options: soundOptions("wav", converting: .pcm))
     }
 
+    /// A sound-only timeline whose exact copy is unavailable opens on Lossless Copy, where the alternatives that work
+    /// are listed best first. Opening on the tier's conversion, PCM, hid `copySampleAligned`, which ranks above it.
+    /// `--audio auto` applies the same first alternative.
+    @MainActor
+    func testSoundOnlyExportOpensOnCopyWithTheBestWorkingAlternativeFirst() async throws {
+        _ = NSApplication.shared
+        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: cli.path), "The mpcut binary is not built at \(cli.path).")
+        let wave = try converted("between-samples.wav", to: .pcm)
+        let media = try CutEngine(useSidecar: false).inspect(wave)
+        // A cut between two samples: the copy is refused, the copy on the nearest samples works, and so does a PCM rewrite.
+        let clips = [ClipRequest(file: wave, from: time(100_001, 1_000_000), to: time(3, 10))]
+        let tier = TimelineTierEvaluator(useSidecar: false).evaluate(clips, media: [wave: media])
+        XCTAssertEqual(tier.tier, .lossless, "\(tier.factors.map(\.message))")
+
+        // The opening state, as EditorModel.chooseExport builds it for a new installation.
+        let mode = ExportRules.openingMode(preferred: EditorPreferences.factoryExportMode, tier: tier.tier, source: .audio)
+        XCTAssertEqual(mode, .copy)
+        let request = ExportRequest(clips: clips, mode: mode, tracks: .audio)
+        let verified = ExportPlanner(useSidecar: false).openingContainer(for: request, preferred: nil, media: [wave: media])
+        let choices = ExportContainerChoices(source: media, clips: clips, preferred: nil, cancelled: { false })
+        let options = EditorModel.openingExportOptions(ExportSheetOptions(), mode: mode, convertingByName: false, source: media,
+                                                       choices: choices, preferred: nil, verified: verified)
+        XCTAssertEqual(options.tracks, .audio)
+        XCTAssertFalse(options.convertsAudio, "The sheet opens on Lossless Copy, not on Convert Audio.")
+        XCTAssertEqual(options.effectiveMode, .copy)
+
+        let sheet = Sheet(options, clips: clips, media: media)
+        try await sheet.settle()
+        let offered = sheet.outcome.alternatives
+        XCTAssertEqual(sheet.outcome.code, "unsafe_boundary", sheet.outcome.description)
+        XCTAssertEqual(offered.first, ExportRung.copySampleAligned.rawValue, "The best-ranked alternative that works comes first.")
+        XCTAssertTrue(offered.contains(ExportRung.convertPCM.rawValue), "\(offered)")
+        let ranks = offered.compactMap { id in ExportRung(rawValue: String(id.prefix { $0 != ":" }))?.rank }
+        XCTAssertEqual(ranks, ranks.sorted(), "No lower-ranked alternative is listed ahead of a better one.")
+
+        // Convert Audio asked for by name still opens on the conversion.
+        let named = EditorModel.openingExportOptions(ExportSheetOptions(), mode: .encode, convertingByName: true, source: media,
+                                                     choices: choices, preferred: nil, verified: nil)
+        XCTAssertTrue(named.convertsAudio)
+
+        // The CLI: a copy reports the same alternatives, and `--audio auto` applies the first of them.
+        let flags = ["--tracks", "audio"]
+        let copied = try runCLI(["--mode", "copy"] + flags, clips: arguments(clips), container: "wav")
+        XCTAssertEqual(copied.outcome.alternatives, offered)
+        let process = Process()
+        process.executableURL = cli
+        process.arguments = ["export", "--json", "--no-sidecar", "--dry-run", "--mode", "encode", "--audio", "auto"] + flags
+            + ["--output", scratch.appendingPathComponent("auto.wav").path] + arguments(clips)
+        var environment = ProcessInfo.processInfo.environment
+        environment["MPCUT_FFMPEG_HELPER"] = Self.helper
+        process.environment = environment
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let report = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any], String(decoding: data, as: UTF8.self))
+        XCTAssertEqual(report["applied"] as? String, offered.first, String(decoding: data, as: UTF8.self))
+        XCTAssertEqual(report["mode"] as? String, ExportMode.copy.rawValue)
+    }
+
     @MainActor
     func testMissingEncoderIsSkippedIdenticallyInBothFrontEnds() async throws {
         _ = NSApplication.shared
@@ -484,7 +567,10 @@ final class ExportRulesParityTests: XCTestCase {
         case .cliRearrange: return try tool(["rearrange"] + common + flags + [file, "--output", output, "\(from)-\(to)"])
         case .cliSilence: return try tool(["silence"] + common + flags + ["--output", output, file])
         case .cliScenes: return try tool(["scenes"] + common + ["--export-to", folder.path] + flags + [file])
-        default: return try tool(["export"] + common + flags + ["--output", output, "--clip", file, "--from", from, "--to", to])
+        default:
+            var arguments = ["export"] + common + flags + ["--output", output, "--clip", file, "--from", from]
+            if clip.to != nil { arguments += ["--to", to] }
+            return try tool(arguments)
         }
     }
 
@@ -699,6 +785,15 @@ final class ExportRulesParityTests: XCTestCase {
         let movie = try fixture("SmartTrim-GOP", "mp4")
         let picture = try CutEngine(useSidecar: false).inspect(movie, keyframes: true)
         let cut = ClipRequest(file: movie, from: time(7, 25), to: picture.duration)
+        for mode in [ExportMode.smart, .copy] {
+            let denied = try run(.cliExport, flags: ["--mode", mode.rawValue], clip: cut, container: "webm")
+            XCTAssertEqual(denied.outcome.code, "unsupported_container")
+            XCTAssertFalse(denied.outcome.alternatives.contains { $0.hasPrefix("copyOtherContainer") })
+            let trim = try XCTUnwrap(denied.alternatives.first { $0["id"] as? String == "smartTrim:mp4" })
+            XCTAssertEqual(trim["lossless"] as? Bool, false)
+            let replay = try run(.cliExport, flags: XCTUnwrap(trim["arguments"] as? [String]), clip: cut, container: "mp4")
+            XCTAssertEqual([replay.outcome.code, replay.outcome.mode, replay.outcome.container], ["", "smart", "mp4"])
+        }
         var copy = ExportSheetOptions()
         copy.mode = .copy
         copy.copyContainer = "mp4"
@@ -758,6 +853,13 @@ final class ExportRulesParityTests: XCTestCase {
             return XCTFail("A copy cut inside a GOP is unavailable for a multicam program and offers alternatives. \(tool.outcome)")
         }
         XCTAssertTrue(programOffers.map(\.alternative.rung).contains(.smartTrim))
+        // Every alternative has its own id, whatever container and audio action were asked for.
+        for flags in [["--mode", "copy"], ["--mode", "encode", "--audio", "auto"], ["--mode", "encode", "--audio", "pcm"]] {
+            for container in ["mkv", "mp4"] {
+                let listed = try exportProject(program.file, flags: flags, container: container).outcome.alternatives
+                XCTAssertEqual(Set(listed).count, listed.count, "\(flags) .\(container): \(listed)")
+            }
+        }
         XCTAssertEqual(programOffers.map(\.alternative.rung), programOffers.map(\.alternative.rung).sorted { $0.rank < $1.rank })
         let queue = AnalysisSidecar.$readsEnabled.withValue(false) {
             MulticamBulkExport.check([MulticamQueuedRange(name: "Program", range: MulticamRange(from: time(7, 25), to: picture.duration),
@@ -773,7 +875,165 @@ final class ExportRulesParityTests: XCTestCase {
         }
     }
 
+    func testDestinationExtensionConstrainsExportPlannerWithoutExplicitContainer() throws {
+        let movie = try fixture("SmartTrim-GOP", "mp4")
+        let videoRequest = ExportRequest(clips: [.init(file: movie, from: time(7, 25))], mode: .smart)
+        let planner = ExportPlanner(useSidecar: false)
+        let rejected = scratch.appendingPathComponent("rejected.webm")
+        guard case .unavailable(let issue, let trims) = planner.resolve(videoRequest, output: rejected) else {
+            return XCTFail("WebM cannot carry this H.264 video.")
+        }
+        XCTAssertEqual(issue.code, "unsupported_container")
+        XCTAssertTrue(trims.contains { $0.alternative.id == "smartTrim:mp4" })
+
+        let audio = try fixture("Covered-Audio", "mp3")
+        let audioRequest = ExportRequest(clips: [.init(file: audio)], mode: .encode)
+        guard case .unavailable(let audioIssue, let remuxes) = planner.resolve(audioRequest, output: rejected) else {
+            return XCTFail("Automatic audio export must not write another container to the requested WebM output.")
+        }
+        XCTAssertEqual(audioIssue.code, "unsupported_container")
+        XCTAssertTrue(remuxes.contains { $0.alternative.rung == .copyOtherContainer && $0.alternative.mode == .copy })
+        let wav = scratch.appendingPathComponent("sound.wav")
+        guard case .ready(let plan, _, _) = planner.resolve(audioRequest, output: wav) else {
+            return XCTFail("Automatic audio export should still convert to the named container if supported.")
+        }
+        XCTAssertEqual(plan.edit.container, "wav")
+
+        var conflicting = audioRequest
+        conflicting.container = "mp3"
+        guard case .unavailable(let conflict, _) = planner.resolve(conflicting, output: wav) else {
+            return XCTFail("A conflicting container request must not produce a plan for the wrong extension.")
+        }
+        XCTAssertEqual(conflict.code, "unsupported_container")
+    }
+
     // MARK: Help
+
+    /// `silence --project --output` resolves its retained ranges through the export rules, as `export --project`
+    /// resolves the same ranges saved as an assembly: one refusal, one wording, and the alternatives it can request.
+    func testProjectSilenceResolvesItsRangesLikeProjectExport() throws {
+        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: cli.path), "The mpcut binary is not built at \(cli.path).")
+        let movie = try fixture("Pause-Quiet", "mov")
+        let saved = try program(movie)
+        let silence = ["silence", "--project", saved.file.path, "--json", "--no-sidecar", "--min-pause", "0.3", "--leave", "0.1"]
+        for mode in ExportEntryPoint.cliSilence.modes {
+            // The retained ranges of the report, saved as the assembly of a second project.
+            let process = Process()
+            process.executableURL = cli
+            process.arguments = silence + ["--mode", mode.rawValue]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            let report = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any], String(decoding: data, as: UTF8.self))
+            let clips = try XCTUnwrap(report["clips"] as? [[String: Any]])
+            XCTAssertFalse(clips.isEmpty)
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: saved.file)) as? [String: Any])
+            object["assembly"] = try clips.map { clip -> [String: String] in
+                let group = try XCTUnwrap(clip["group"] as? [String: Any])
+                func text(_ key: String) throws -> String {
+                    if let written = group[key] as? String { return written }
+                    let time = try XCTUnwrap(group[key] as? [String: Any])
+                    return "\(try XCTUnwrap(time["numerator"] as? Int))/\(try XCTUnwrap(time["denominator"] as? Int))"
+                }
+                return ["from": try text("from"), "to": try text("to")]
+            }
+            let assembled = scratch.appendingPathComponent("\(UUID().uuidString).cut")
+            try JSONSerialization.data(withJSONObject: object).write(to: assembled)
+
+            for container in ["mov", "mp4", "mkv", "webm"] {
+                let output = scratch.appendingPathComponent("\(UUID().uuidString).\(container)").path
+                // The pauses are planned for the container that is written, and the report above planned for the
+                // default one. For the other containers nothing is removed, so the ranges are the saved program's.
+                let ranged = container == ExportRules.multicamContainers[0]
+                let command = ranged ? silence : ["silence", "--project", saved.file.path, "--json", "--no-sidecar", "--min-pause", "100"]
+                let shortened = try tool(command + ["--mode", mode.rawValue, "--output", output, "--dry-run"])
+                let exported = try exportProject(ranged ? assembled : saved.file, flags: ["--mode", mode.rawValue], container: container)
+                if ranged { XCTAssertTrue(shortened.outcome.code.isEmpty, shortened.outcome.description) }
+                let name = "\(mode.rawValue) .\(container)"
+                XCTAssertEqual(shortened.outcome.code, exported.outcome.code, name)
+                XCTAssertEqual(shortened.outcome.message, exported.outcome.message, name)
+                // Silence lists the alternatives of the same ladder that it can request itself.
+                let requestable = exported.alternatives.filter { offer in
+                    ExportEntryPoint.cliSilence.modes.contains { $0.rawValue == offer["mode"] as? String }
+                }
+                XCTAssertEqual(shortened.outcome.alternatives, requestable.compactMap { $0["id"] as? String }, name)
+                XCTAssertEqual(shortened.outcome.labels, requestable.compactMap { $0["label"] as? String }, name)
+                if exported.outcome.code.isEmpty { XCTAssertTrue(shortened.outcome.code.isEmpty, name) }
+            }
+            // A mode this command does not write is refused in the table's words.
+            let refused = try tool(silence + ["--mode", "encode", "--output", scratch.appendingPathComponent("refused.mov").path, "--dry-run"])
+            XCTAssertEqual(refused.outcome.code, "invalid_arguments")
+        }
+        XCTAssertTrue(ExportEntryPoint.cliSilence.restrictions.contains { $0.hasPrefix("projectRanges") })
+        XCTAssertFalse(ExportRules.markdown().contains("plans its retained ranges with the engine directly"))
+    }
+
+    /// "GUI and CLI behaviour should be identical": for each source kind, a request without a mode is written with
+    /// the table's default by every CLI command, and that default is the app's factory setting.
+    @MainActor
+    func testDefaultModeIsTheTablesInTheCLIAndTheAppsFactorySettings() throws {
+        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: cli.path), "The mpcut binary is not built at \(cli.path).")
+        let movie = try fixture("SmartTrim-GOP", "mp4"), sound = try fixture("Covered-Audio", "mp3")
+        let suite = "mpcut.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let factory = EditorPreferences(defaults: defaults).defaultExportMode
+
+        let process = Process()
+        process.executableURL = cli
+        process.arguments = ["help", "--json"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let help = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let listed = try XCTUnwrap(help["defaultExportModes"] as? [String: String])
+
+        for kind in ExportSourceKind.allCases {
+            let table = ExportRules.defaultMode(for: kind, tracks: .all)
+            XCTAssertEqual(table, ExportRules.cell(source: kind, tracks: .all, mode: ExportRules.defaultMode(for: kind)).resolvedMode)
+            XCTAssertEqual(listed[kind.rawValue], table.rawValue, "help, \(kind.rawValue)")
+            // The app: the sheet's options as a new installation opens them for this kind of source.
+            let app: ExportMode
+            let commands: [(name: String, mode: String)]
+            switch kind {
+            case .movie:
+                var options = ExportSheetOptions()
+                XCTAssertEqual(options.mode, factory)
+                options.mode = ExportRules.openingMode(preferred: factory, tier: nil, source: .movie)
+                app = options.effectiveMode
+                let clip = ClipRequest(file: movie, from: time(1, 1), to: time(2, 1))
+                let talkie = try fixture("Shuttle-Chirp", "mov")
+                commands = try [ExportEntryPoint.cliExport, .cliBulk, .cliRearrange, .cliScenes].map {
+                    ($0.rawValue, try run($0, flags: [], clip: clip, container: nil).outcome.mode)
+                } + [(ExportEntryPoint.cliSilence.rawValue, try run(.cliSilence, flags: [], clip: ClipRequest(file: talkie), container: nil).outcome.mode),
+                     ("export --order", try tool(["export", "--json", "--no-sidecar", "--dry-run", "--order", "1", "--output",
+                                                 scratch.appendingPathComponent("ordered.mp4").path, "--clip", movie.path]).outcome.mode)]
+            case .audio:
+                var options = ExportSheetOptions()
+                options.mode = ExportRules.openingMode(preferred: factory, tier: nil, source: .audio)
+                options.tracks = .audio
+                app = options.effectiveMode
+                let whole = ClipRequest(file: sound, from: .zero, to: try CutEngine(useSidecar: false).inspect(sound).duration)
+                commands = try [ExportEntryPoint.cliExport, .cliBulk].map {
+                    ($0.rawValue, try run($0, flags: [], clip: whole, container: nil).outcome.mode)
+                }
+            case .multicam:
+                app = MulticamExportChoices(entry: .multicamSheet, preferred: factory).effectiveMode
+                XCTAssertEqual(MulticamExportChoices(entry: .multicamSheet).effectiveMode, app)
+                let project = try program(movie).file
+                commands = [("export --project", try exportProject(project, flags: [], container: "mov").outcome.mode)]
+            }
+            XCTAssertEqual(app, table, "app, \(kind.rawValue)")
+            for command in commands {
+                XCTAssertEqual(command.mode, table.rawValue, "\(command.name), \(kind.rawValue)")
+            }
+        }
+    }
 
     func testCommandHelpListsWhatTheRulesAllow() throws {
         try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: cli.path), "The mpcut binary is not built at \(cli.path).")
@@ -792,11 +1052,14 @@ final class ExportRulesParityTests: XCTestCase {
         XCTAssertEqual(help["exportTracks"] as? [String], ExportTracks.allCases.map(\.rawValue))
         XCTAssertEqual(help["defaultBulkMode"] as? String, ExportRules.defaultMode(for: .movie).rawValue)
         XCTAssertEqual(help["defaultMulticamExportMode"] as? String, ExportRules.defaultMode(for: .multicam).rawValue)
-        // The CLI default of `export` is a pending decision. It stays, and stays visible in the written matrix.
-        XCTAssertEqual(help["defaultExportMode"] as? String, ExportMode.copy.rawValue)
-        XCTAssertTrue(ExportRules.markdown().contains("defaultCopy"))
-        XCTAssertTrue(ExportEntryPoint.cliExport.restrictions.contains { $0.hasPrefix("defaultCopy") })
+        // `export` has no default of its own: with or without --order it is the table's, like every other command.
+        XCTAssertEqual(help["defaultExportMode"] as? String, ExportRules.defaultMode(for: .movie).rawValue)
+        XCTAssertEqual(help["defaultOrderedExportMode"] as? String, ExportRules.defaultMode(for: .movie).rawValue)
+        XCTAssertFalse(ExportRules.markdown().contains("defaultCopy"))
+        XCTAssertFalse(ExportEntryPoint.allCases.contains { $0.restrictions.contains { $0.hasPrefix("defaultCopy") } })
         let commands = try XCTUnwrap(help["commands"] as? [String: Any])
+        let exportHelp = try XCTUnwrap(commands["export"] as? [String: Any])
+        XCTAssertTrue((exportHelp["instructions"] as? [String] ?? []).joined(separator: " ").contains(ExportRules.modeHelp(.cliExport)))
         // Usage and instructions list the modes, tracks and multicam rules of the module.
         let usages: [(String, ExportEntryPoint)] = [("export", .cliExport), ("bulk", .cliBulk), ("silence", .cliSilence), ("multicam", .cliProject)]
         for (name, entry) in usages {

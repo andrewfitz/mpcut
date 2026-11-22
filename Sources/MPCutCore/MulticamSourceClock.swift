@@ -61,6 +61,6 @@ extension CutEngine {
                              sourceStartSafe: media.sourceStartSafe, identity: media.identity,
                              videoIndex: videoIndex ?? -1, timelineIssue: media.timelineIssue, metadataOnly: provisional,
                              hasProvisionalClock: media.hasProvisionalClock, multicamClockOffset: offset,
-                             audioIssues: media.audioIssues)
+                             audioIssues: media.audioIssues, refreshEvidence: media.refreshEvidence)
     }
 }

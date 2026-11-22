@@ -92,7 +92,8 @@ class MediaRegression(unittest.TestCase):
             args.append("--dry-run")
         if snap:
             args += ["--snap", "nearest"]
-        return self.cli(*args, request={"output": str(output), "clips": clips}, ok=ok)
+        # This suite checks the packet copy. The CLI default is Smart Trim, so the mode is named.
+        return self.cli(*args, request={"output": str(output), "clips": clips, "mode": "copy"}, ok=ok)
 
     def native_audio_decoder(self):
         decoder = self.root / "decode-audio"
@@ -334,7 +335,7 @@ class MediaRegression(unittest.TestCase):
         self.export(output, edits)
         self.assert_assembly(output, ranges)
 
-        args = ["export", "--json", "--output", "argv.mp4"]
+        args = ["export", "--json", "--mode", "copy", "--output", "argv.mp4"]
         for edit in edits:
             args += ["--clip", edit["file"], "--from", edit["from"], "--to", edit["to"]]
         self.cli(*args)
@@ -592,6 +593,15 @@ class MediaRegression(unittest.TestCase):
                 self.assertIn(rejected["boundary"], ["start", "from"])
                 self.assertFalse(output.exists())
                 self.assertTrue(rejected["nearest"], rejected)
+                # unsafe_boundary is the copy's answer. Asked as Smart Trim, which is also the default without a mode,
+                # the same cut is Smart Trim's to answer: every picture group of the HEVC source is open, so it has no
+                # keyframe to resume copying at and says unsafe_smart_join. A copy request never reports that code.
+                for named in ({"mode": "smart"}, {}):
+                    smart = self.cli("export", "--json", "--stdin", "--dry-run", ok=False,
+                                     request={"output": str(output), "clips": [self.edit(source, FRAME)], **named})["error"]
+                    self.assertEqual((smart["code"], smart["reason"]),
+                                     {"h264": ("unsafe_boundary", "cut.videoStart"),
+                                      "hevc": ("unsafe_smart_join", "join.smartOpenGOP")}[codec], smart)
                 for index, nearest in enumerate(rejected["nearest"]):
                     start = ratio(nearest)
                     alternative = self.root / f"{codec}-alternative-{index}.mp4"
@@ -611,7 +621,7 @@ class MediaRegression(unittest.TestCase):
                 for position, edit in [("start", self.edit(source, cue)),
                                        ("end", self.edit(source, stop=cue))]:
                     target = self.root / f"{codec}-{position}.mp4"
-                    request = {"output": str(target), "clips": [edit]}
+                    request = {"output": str(target), "clips": [edit], "mode": "copy"}
                     result = subprocess.run(
                         [CLI, "export", "--json", "--stdin"], input=json.dumps(request),
                         capture_output=True, text=True, timeout=60, cwd=self.root
@@ -940,6 +950,51 @@ class MediaRegression(unittest.TestCase):
                 self.assertEqual(sample_hashes(output),
                                  sample_hashes(b)[25:50] + sample_hashes(a)[:25])
 
+    def test_smart_export_offers_packet_copy_in_another_container(self):
+        source = self.h264("recording.mov", width=320, rate="25", audio_encoder="aac")
+        rejected = self.root / "recording.webm"
+        problem = self.cli("export", "--json", "--mode", "smart", "--clip", source,
+                           "--output", rejected, ok=False)
+        self.assertFalse(rejected.exists())
+        offers = problem["error"]["alternatives"]
+        self.assertEqual(offers[0]["rung"], "copyOtherContainer")
+        remux = next(offer for offer in offers if offer["id"] == "copyOtherContainer:mp4")
+        self.assertEqual(remux["mode"], "copy")
+        output = self.root / "remux.mp4"
+        report = self.cli("export", "--json", *remux["arguments"], "--clip", source, "--output", output)
+        self.assertEqual(ratio(report["encodedDuration"]), 0)
+        for track in ["v:0", "a:0"]:
+            original = sample_hashes(source, track)
+            self.assertTrue(original)
+            self.assertEqual(sample_hashes(output, track), original)
+
+    def test_multicam_lossless_container_offer_uses_copy_mode(self):
+        source = self.h264("angle.mov", width=320, rate="25", frame_count=50)
+        project = self.root / "switches.cut"
+        project.write_text(json.dumps({
+            "format": "mpcut", "schemaVersion": 1, "kind": "multicam",
+            "angles": [{"id": "a", "file": source.name}], "referenceAngle": "a",
+            "range": {"from": "0", "to": "2"}, "audio": {"mode": "none"},
+            "switches": [{"at": "0", "angle": "a"}],
+        }))
+        command = ["export", "--project", project, "--json"]
+        problem = self.cli(*command, "--mode", "smart", "--output", "program.webm", ok=False)
+        offers = problem["error"]["alternatives"]
+        remux = next(offer for offer in offers if offer["id"] == "copyOtherContainer:mp4")
+        self.assertEqual(remux["mode"], "copy")
+        output = self.root / "program.mp4"
+        report = self.cli(*command, *remux["arguments"], "--output", output)
+        self.assertEqual(ratio(report["encodedVideoDuration"]), 0)
+        self.assertEqual(sample_hashes(output), sample_hashes(source))
+
+        edit = json.loads(project.read_text())
+        edit["assembly"] = [{"from": "7/25", "to": "2"}]
+        project.write_text(json.dumps(edit))
+        cut = self.cli(*command, "--mode", "smart", "--output", "program.webm", ok=False)
+        ids = [offer["id"] for offer in cut["error"].get("alternatives", [])]
+        self.assertNotIn("copyOtherContainer:mp4", ids)
+        self.assertIn("smartTrim:mp4", ids)
+
     def test_other_containers_and_probe_by_content(self):
         source = self.h264("source.mp4")
         for extension in ["mkv", "ts"]:
@@ -964,7 +1019,7 @@ class MediaRegression(unittest.TestCase):
         env = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"]}
         inspected = self.cli("inspect", "--json", source.name, env=env)
         self.assertEqual(inspected["preview"], "unchecked")
-        args = ["export", "--json", "--output", "clock-cut.mov", "--clip", source.name,
+        args = ["export", "--json", "--mode", "copy", "--output", "clock-cut.mov", "--clip", source.name,
                 "--from", "00:00:00.04", "--to", "0.08"]
         dry_run = self.cli(*args, "--dry-run", env=env)
         self.assertEqual(ratio(dry_run["duration"]), Fraction(1, 25))

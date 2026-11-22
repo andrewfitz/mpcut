@@ -28,6 +28,7 @@ struct FFPreviewBatch {
 
 final class FFPreviewReader: @unchecked Sendable {
     private let videoOnly: Bool
+    private let preservesSurround: Bool
     private let audioOnly: Bool
     private var decoder: OpaquePointer?
     private var url: URL?
@@ -41,7 +42,8 @@ final class FFPreviewReader: @unchecked Sendable {
     private var audioFinished = false
     private var cancelled: (() -> Bool)?
 
-    init(videoOnly: Bool = false, audioOnly: Bool = false) {
+    init(videoOnly: Bool = false, audioOnly: Bool = false, preservesSurround: Bool = false) {
+        self.preservesSurround = preservesSurround
         self.audioOnly = audioOnly
         self.videoOnly = videoOnly
     }
@@ -82,6 +84,7 @@ final class FFPreviewReader: @unchecked Sendable {
                 }, context, &error)
             }
             guard let decoder else { throw failure(error) }
+            if preservesSurround { mp_preview_preserve_surround(decoder) }
             openedSoundOnly = soundOnly
             openedAudioTrack = audioTrack
             openedOrigin = audioOrigin
@@ -134,7 +137,7 @@ final class FFPreviewReader: @unchecked Sendable {
         return samples
     }
 
-    func still(at target: Double, before end: Double = .infinity,
+    func still(at target: Double, before end: Double = .infinity, nearbyKeyframe: Bool = false,
                cancelled: () -> Bool) throws -> PreviewFrame? {
         var preceding: PreviewFrame?
         var precedingEnd = -Double.infinity
@@ -157,6 +160,8 @@ final class FFPreviewReader: @unchecked Sendable {
             guard kind == MPPreviewVideo.rawValue, let sample,
                   let buffer = sample.imageBuffer else { continue }
             let frame = PreviewFrame(buffer: buffer, time: sample.presentationTimeStamp, transform: transform)
+            if nearbyKeyframe, !mp_preview_met_damage(decoder), frame.time.seconds >= target - 8,
+               frame.time.seconds <= target, frame.time.seconds < end { return frame }
             if frame.time.seconds > target + 0.000_000_001, missing() {
                 throw FFPreviewError.decode(WebSequencePlayback.damagedPicture)
             }
@@ -299,7 +304,7 @@ final class FFPreviewReader: @unchecked Sendable {
 
 private final class FFPreviewRequests: @unchecked Sendable {
     let queue = DispatchQueue(label: "mpcut.web-preview", qos: .userInitiated, autoreleaseFrequency: .workItem)
-    let reader = FFPreviewReader()
+    let reader = FFPreviewReader(preservesSurround: true)
     var recent = ScrubFrameCache()
     private let lock = NSLock()
     private var generation = 0
@@ -323,6 +328,7 @@ final class WebSequencePlayback {
     private let offsets: [Double]
     private let duration: Double
     private let onFrame: (PreviewFrame) -> Void
+    private let separatesPicture: Bool
     private let onTime: (Double) -> Void
     private let onIssue: (String) -> Void
     private let onGap: () -> Void
@@ -353,11 +359,13 @@ final class WebSequencePlayback {
 
     init(ranges: [PreviewRange], screen: @escaping () -> NSScreen? = { nil }, onFrame: @escaping (PreviewFrame) -> Void,
          onTime: @escaping (Double) -> Void, onIssue: @escaping (String) -> Void,
-         onAudioWarning: @escaping (String?) -> Void, onGap: @escaping () -> Void = {}) {
+         onAudioWarning: @escaping (String?) -> Void, onGap: @escaping () -> Void = {},
+         separatesPicture: Bool = false) {
         (self.offsets, self.duration) = previewOffsets(ranges)
         self.screen = screen
         self.ranges = ranges
         self.onFrame = onFrame
+        self.separatesPicture = separatesPicture
         self.onTime = onTime
         self.onIssue = onIssue
         self.onGap = onGap
@@ -415,7 +423,7 @@ final class WebSequencePlayback {
             : min(range.end, range.start + (self.time - offsets[rangeIndex]))
         if playing {
             fill()
-        } else if !range.isAudioOnly {
+        } else if !range.isAudioOnly && !separatesPicture {
             still(url: range.url, at: requestedSourceTime, before: range.end)
         }
     }
@@ -430,7 +438,7 @@ final class WebSequencePlayback {
         park(at: position)
         let index = max(0, offsets.lowerBound { $0 > time } - 1)
         let range = ranges[index]
-        guard !range.isAudioOnly else { return }
+        guard !range.isAudioOnly, !separatesPicture else { return }
         let sourceTime = min(range.end, range.start + (time - offsets[index]))
         still(url: range.url, at: sourceTime, before: range.end)
     }
@@ -492,10 +500,15 @@ final class WebSequencePlayback {
         let requests = requests
         let generation = generation
         let range = ranges[rangeIndex]
+        if range.isSilentInsert {
+            reachedRangeEnd = true
+            return
+        }
         let target = requestedSourceTime
         let offset = offsets[rangeIndex] - range.start
         let open = openingRange
-        let first = waitingForFirstFrame && !range.isAudioOnly
+        let soundOnly = separatesPicture || range.isAudioOnly
+        let first = waitingForFirstFrame && !soundOnly
         reading = true
         requests.queue.async { [weak self] in
             guard requests.current(generation) else { return }
@@ -503,7 +516,7 @@ final class WebSequencePlayback {
                 try requests.reader.perform(cancelled: { !requests.current(generation) }) {
                     if open {
                         try requests.reader.seek(url: range.url, to: target, withAudio: true,
-                                                 soundOnlySource: range.isAudioOnly, audioOrigin: range.audioOrigin,
+                                                 soundOnlySource: soundOnly, audioOrigin: range.audioOrigin,
                                                  audioTrack: range.audioTrack)
                     }
                     return try requests.reader.batch(from: target, end: range.end, timelineOffset: offset,
@@ -516,12 +529,12 @@ final class WebSequencePlayback {
                 self.openingRange = false
                 switch result {
                 case .success(let batch):
-                    if range.isAudioOnly && batch.noAudio {
+                    if range.isAudioOnly && batch.noAudio && !self.separatesPicture {
                         self.pause()
                         self.onIssue(Self.undecodableAudio)
                         return
                     }
-                    self.video.append(contentsOf: batch.video)
+                    self.video.append(contentsOf: batch.video.map { $0.tagged(transfer: range.programTransfer) })
                     self.audio.append(contentsOf: batch.audio)
                     self.reachedRangeEnd = batch.end
                     if batch.hasPictureGap && self.waitingForFirstFrame { self.startsWithoutPicture = true }
@@ -539,8 +552,14 @@ final class WebSequencePlayback {
                     }
                     if self.hasStartedClock { self.fill() } else { self.tick() }
                 case .failure(let error):
-                    self.pause()
-                    self.onIssue(error.localizedDescription)
+                    if self.separatesPicture {
+                        self.reachedRangeEnd = true
+                        self.reportAudioWarning(error.localizedDescription)
+                        self.tick()
+                    } else {
+                        self.pause()
+                        self.onIssue(error.localizedDescription)
+                    }
                 }
             }
         }
@@ -571,7 +590,7 @@ final class WebSequencePlayback {
             if !video.isEmpty || startsWithoutPicture {
                 setClockRate()
                 hasStartedClock = true
-            } else if ranges[rangeIndex].isAudioOnly && (!audio.isEmpty || reachedRangeEnd) {
+            } else if (separatesPicture || ranges[rangeIndex].isAudioOnly) && (!audio.isEmpty || reachedRangeEnd) {
                 setClockRate()
                 hasStartedClock = true
             } else if reachedRangeEnd {

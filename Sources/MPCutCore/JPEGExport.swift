@@ -134,29 +134,14 @@ public enum JPEGExport {
     package static func writeStill(_ media: MediaInfo, at time: RationalTime, to output: URL,
                                    replacing confirmed: SourceIdentity?, exclusiveEnd: Bool = false,
                                    cancelled: @escaping @Sendable () -> Bool) throws {
-        guard output.isFileURL, output.resolvingSymlinksInPath() != media.url.resolvingSymlinksInPath() else {
-            throw CutError(code: "invalid_output", message: "Choose a separate JPEG file.")
-        }
-        func checkDestination() throws {
-            var info = stat()
-            if lstat(output.path, &info) == 0 {
-                guard info.st_mode & S_IFMT == S_IFREG,
-                      let identity = try? SourceIdentity(output), identity != media.identity else {
-                    throw CutError(code: "invalid_output", message: "Choose a separate, regular JPEG file.")
-                }
-                guard identity == confirmed else {
-                    throw CutError(code: "output_exists", message: "The destination exists and was not confirmed for replacement.")
-                }
-            } else if errno != ENOENT {
-                throw CutError(code: "invalid_output", message: "Choose a JPEG file in an existing output folder.")
-            } else if confirmed != nil {
-                throw CutError(code: "output_changed", message: "The confirmed JPEG destination changed before export.")
-            }
-        }
         let control = JPEGControl(cancelled)
         try control.check()
-        try checkSource(media)
-        try checkDestination()
+        // The index can precede permission changes or new hard links. Pin
+        // the current snapshot before rendering and revalidate at publication.
+        guard let sourceIdentity = try? SourceIdentity(media.url), sourceIdentity == media.identity else {
+            throw CutError(code: "source_changed", message: "The source changed after indexing.")
+        }
+        try validateStillDestination(output, source: media.url, sourceIdentity: sourceIdentity, replacing: confirmed)
         guard media.hasVideo, !media.frames.isEmpty, media.video.timeBase > .zero else {
             throw CutError(code: "no_frame", message: "No indexed picture is available at the playhead.")
         }
@@ -164,23 +149,59 @@ public enum JPEGExport {
         let plan = try plan(media, .times([frameTime]), useSidecar: false, cancelled: cancelled)
         _ = try render(media, ranges: plan.ranges, sample: .first, preset: .full, control: control,
                        fileName: { _ in output.lastPathComponent }, progress: { _, _ in }) { jpeg, _ in
-            let staging = output.deletingLastPathComponent().appendingPathComponent(".mpcut-frame-" + UUID().uuidString)
-            try writing("the JPEG file") { try jpeg.write(to: staging, options: .withoutOverwriting) }
-            defer { try? FileManager.default.removeItem(at: staging) }
-            try checkSource(media)
-            try control.check()
-            try checkDestination()
-            let failure: Int32
-            if confirmed != nil {
-                failure = rename(staging.path, output.path) == 0 ? 0 : errno
-            } else {
-                failure = publishExclusively(from: staging, to: output)
+            try publishStillJPEG(jpeg, source: media.url, sourceIdentity: sourceIdentity,
+                                 to: output, replacing: confirmed, cancelled: cancelled) {
+                guard sourceIdentity.isCurrentSnapshot(at: media.url) else {
+                    throw CutError(code: "source_changed", message: "The source changed during frame export.")
+                }
             }
-            guard failure == 0 else {
-                let exists = failure == EEXIST || failure == ENOTEMPTY
-                throw CutError(code: exists ? "output_exists" : "write_failed",
-                               message: exists ? "The JPEG destination already exists." : "Could not publish the JPEG file.")
+        }
+    }
+
+    package static func publishStillJPEG(_ jpeg: Data, source: URL, sourceIdentity: SourceIdentity,
+                                         to output: URL, replacing confirmed: SourceIdentity?,
+                                         cancelled: @escaping @Sendable () -> Bool,
+                                         validate: () throws -> Void) throws {
+        let control = JPEGControl(cancelled)
+        try control.check()
+        try validateStillDestination(output, source: source, sourceIdentity: sourceIdentity, replacing: confirmed)
+        let staging = output.deletingLastPathComponent().appendingPathComponent(".mpcut-frame-" + UUID().uuidString)
+        try writing("the JPEG file") { try jpeg.write(to: staging, options: .withoutOverwriting) }
+        defer { try? FileManager.default.removeItem(at: staging) }
+        try validate()
+        try control.check()
+        try validateStillDestination(output, source: source, sourceIdentity: sourceIdentity, replacing: confirmed)
+        let failure: Int32
+        if confirmed != nil {
+            failure = rename(staging.path, output.path) == 0 ? 0 : errno
+        } else {
+            failure = publishExclusively(from: staging, to: output)
+        }
+        guard failure == 0 else {
+            let exists = failure == EEXIST || failure == ENOTEMPTY
+            throw CutError(code: exists ? "output_exists" : "write_failed",
+                           message: exists ? "The JPEG destination already exists." : "Could not publish the JPEG file.")
+        }
+    }
+
+    package static func validateStillDestination(_ output: URL, source: URL, sourceIdentity: SourceIdentity,
+                                                 replacing confirmed: SourceIdentity?) throws {
+        guard output.isFileURL, output.resolvingSymlinksInPath() != source.resolvingSymlinksInPath() else {
+            throw CutError(code: "invalid_output", message: "Choose a separate JPEG file.")
+        }
+        var info = stat()
+        if lstat(output.path, &info) == 0 {
+            guard info.st_mode & S_IFMT == S_IFREG,
+                  let identity = try? SourceIdentity(output), identity != sourceIdentity else {
+                throw CutError(code: "invalid_output", message: "Choose a separate, regular JPEG file.")
             }
+            guard identity == confirmed else {
+                throw CutError(code: "output_exists", message: "The destination exists and was not confirmed for replacement.")
+            }
+        } else if errno != ENOENT {
+            throw CutError(code: "invalid_output", message: "Choose a JPEG file in an existing output folder.")
+        } else if confirmed != nil {
+            throw CutError(code: "output_changed", message: "The confirmed JPEG destination changed before export.")
         }
     }
 
@@ -360,7 +381,7 @@ public enum JPEGExport {
     }
 
     private static func checkSource(_ media: MediaInfo) throws {
-        guard (try? SourceIdentity(media.url)) == media.identity else {
+        guard media.identity.isCurrentSnapshot(at: media.url) else {
             throw CutError(code: "source_changed", message: "The source changed after indexing.")
         }
     }
@@ -674,8 +695,18 @@ private final class JPEGRenderer {
 }
 
 extension JPEGExport {
+    package static func writeProgramFrameDirectory<Manifest: Encodable>(
+        to directory: URL, cancelled: @escaping @Sendable () -> Bool, validate: () throws -> Void,
+        produce: (URL) throws -> Manifest
+    ) throws -> Manifest {
+        try writeDirectory(to: directory, control: JPEGControl(cancelled), validate: validate) { staging, _ in
+            try produce(staging)
+        }
+    }
+
     /// Renders one bounded review image using the same decoder, transforms and frame rules as JPEG export.
     package static func reviewFrame(_ media: MediaInfo, at time: RationalTime, exclusiveEnd: Bool,
+                                    preset: JPEGPreset = .review,
                                     cancelled: @escaping @Sendable () -> Bool) throws -> (Data, JPEGFrame) {
         let control = JPEGControl(cancelled)
         try control.check()
@@ -683,9 +714,9 @@ extension JPEGExport {
         let target = try stillFrameTime(in: media, at: time, exclusiveEnd: exclusiveEnd)
         let selected = try plan(media, .times([target]), useSidecar: false, cancelled: cancelled)
         var bytes: Data?
-        let frames = try render(media, ranges: selected.ranges, sample: .first, preset: .review, control: control,
+        let frames = try render(media, ranges: selected.ranges, sample: .first, preset: preset, control: control,
                                 fileName: { _ in "review.jpg" }, progress: { _, _ in }) { data, _ in
-            guard data.count <= 1_048_576 else {
+            guard preset != .review || data.count <= 1_048_576 else {
                 throw CutError(code: "image_too_large", message: "The review JPEG exceeds 1 MiB.")
             }
             bytes = data

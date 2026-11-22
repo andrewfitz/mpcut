@@ -47,13 +47,14 @@ struct TimelineTimeControl: View {
                                     if editing { focused = true }
                                 }
                             }
+                            .help("Enter playhead time")
                     } else {
                         Button(action: beginEditing) {
                             Text(timelineTime(playhead, milliseconds: true))
                                 .font(Self.font.weight(.medium))
                         }
                         .buttonStyle(.plain)
-                        .help("Go to a timeline time (click, then type a time)")
+                        .help("Enter playhead time")
                         .accessibilityLabel("Timeline position")
                         .accessibilityValue(timelineTime(playhead, milliseconds: true))
                     }
@@ -168,7 +169,7 @@ struct TimelineViewControls: View {
                 .controlSize(.small)
                 .frame(width: 96)
                 .accessibilityValue(zoomDescription)
-                .help("Timeline zoom · \(zoomDescription)")
+                .help("Adjust timeline zoom")
             zoomButton("Zoom In", symbol: "plus.magnifyingglass", amount: 1)
         }
 
@@ -181,7 +182,7 @@ struct TimelineViewControls: View {
             .buttonStyle(ToolButtonStyle())
             .disabled(zoom == 0)
             .accessibilityLabel("Fit Timeline")
-            .help("Fit the entire timeline in the window")
+            .help("Fit timeline in window")
     }
 
     private var sizeLabel: String {
@@ -216,12 +217,21 @@ func timelineRulerStep(scale: CGFloat) -> Double {
 }
 
 struct TimelineFilmstrip {
+    static let openingFrameLimit = 10
     let count: Int
     let tileWidth: CGFloat
 
     init(width: CGFloat, targetWidth: CGFloat) {
-        count = max(1, Int((width / targetWidth).rounded()))
+        count = max(1, Int(ceil(width / targetWidth)))
         tileWidth = width / CGFloat(count)
+    }
+
+    func tileRange(_ index: Int, origin: CGFloat, displayScale: CGFloat) -> Range<CGFloat> {
+        // Both neighboring pictures must end and start on the same backing pixel.
+        func edge(_ index: Int) -> CGFloat {
+            ((origin + CGFloat(index) * tileWidth) * displayScale).rounded() / displayScale
+        }
+        return edge(index)..<edge(index + 1)
     }
 
     func visibleTiles(origin: CGFloat, visible: Range<CGFloat>) -> Range<Int> {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -31,7 +32,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	return serveEditor(exe, fmt.Sprintf("/tmp/mpcut-%d/control.sock", os.Getuid()))
+	directory := fmt.Sprintf("mpcut-%d", os.Getuid())
+	if name := os.Getenv("MPCUT_TEST_SOCKET_DIRECTORY"); name != "" {
+		if !regexp.MustCompile(`^mpcut-test-[a-zA-Z0-9]{1,64}$`).MatchString(name) {
+			return errors.New("invalid MPCut test socket directory")
+		}
+		directory = name
+	}
+	return serveEditor(exe, filepath.Join("/tmp", directory, "control.sock"))
 }
 
 func serveEditor(exe, path string) error {

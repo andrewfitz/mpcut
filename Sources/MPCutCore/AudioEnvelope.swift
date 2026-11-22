@@ -12,6 +12,14 @@ public struct AudioEnvelope: Codable, Sendable {
     var analysisClock: AudioAnalysisClock?
     var sourceIdentity: SourceIdentity?
 
+    /// Use after refresh has verified the result's audio stream and presentation clock.
+    package func forRefreshedMedia(_ media: MediaInfo, stream: Int) -> AudioEnvelope {
+        guard analysisClock == AudioAnalysisClock(media: media, stream: stream) else { return self }
+        var result = self
+        result.sourceIdentity = media.identity
+        return result
+    }
+
     enum CodingKeys: String, CodingKey { case from, to, low, high }
 
     public init(from: Double, to: Double, low: [Float], high: [Float]) {

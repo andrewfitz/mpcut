@@ -150,12 +150,14 @@ final class SidecarStorageTests: XCTestCase {
     }
 
     func testRelatedSectionsStayInOneGenerationDuringAReplacement() throws {
-        let sidecar = try makeSidecar()
+        let source = try makeSidecar().source
         let old = Data([1]), new = Data([2])
-        try sidecar.save(["header": old, "rows": old])
         // Publish a second complete database with the same source identity.
-        let alias = sidecar.source.deletingLastPathComponent().appendingPathComponent("alias.mov")
-        XCTAssertEqual(link(sidecar.source.path, alias.path), 0)
+        let alias = source.deletingLastPathComponent().appendingPathComponent("alias.mov")
+        XCTAssertEqual(link(source.path, alias.path), 0)
+        // Creating the alias changes ctime. Pin both snapshots after linking.
+        let sidecar = try AnalysisSidecar(source: source)
+        try sidecar.save(["header": old, "rows": old])
         let replacement = try AnalysisSidecar(source: alias)
         try replacement.save(["header": new, "rows": new])
 

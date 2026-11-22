@@ -270,7 +270,7 @@ extension CutEngine {
            let segment = silentAAC[position] {
             let track = sequence[segment - 1].audio[position].stream.index
             throw CutError(code: "unsafe_boundary", message: "AAC track \(track) contains only empty presentation edits in this selection.",
-                           segment: segment, track: track)
+                           segment: segment, track: track).because(.cutAACCoverage)
         }
         for media in uniqueMedia { try verifyIdentity(media.url, identity: media.identity) }
         return ResolvedEdit(segments: segments, duration: duration, container: container,
@@ -302,7 +302,7 @@ extension CutEngine {
                 if ["opus", "vorbis", "mp3", "aac"].contains(stream.codec),
                    (start && !originalEdge || !start && !last || !sound.presentationEdits.isEmpty) {
                     throw CutError(code: "unsafe_boundary", message: "\(stream.codec.uppercased()) track \(stream.index) requires its original decoder history at this join.",
-                                   segment: segment, boundary: field, track: stream.index)
+                                   segment: segment, boundary: field, track: stream.index).because(.joinDecoderHistory)
                 }
                 if !originalEdge { packets.append(sound) }
             }
@@ -315,7 +315,7 @@ extension CutEngine {
             let nearest = RationalTime(numerator: try target.roundedToSamples(rate), denominator: Int64(rate))
             if nearest == target || snap == .nearest { return nearest }
             throw CutError(code: "unsafe_boundary", message: "The requested \(field) falls between audio samples.",
-                           segment: segment, boundary: field, nearest: [nearest])
+                           segment: segment, boundary: field, nearest: [nearest]).because(.cutAudioSample)
         }
         var neighbors: [RationalTime]
         if packets.count == 1 {
@@ -362,6 +362,6 @@ extension CutEngine {
             return target.isCloserToEarlier(low, than: high) ? low : high
         }
         throw CutError(code: "unsafe_boundary", message: "The requested \(field) falls between copyable audio packets.",
-                       segment: segment, boundary: field, nearest: neighbors)
+                       segment: segment, boundary: field, nearest: neighbors).because(.cutAudioPacket)
     }
 }

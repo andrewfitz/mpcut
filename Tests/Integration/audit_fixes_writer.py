@@ -45,7 +45,7 @@ class WriterAuditFixes(unittest.TestCase):
         self.root = Path(directory.name)
 
     def export(self, source, destination, *extra):
-        process = subprocess.run([str(CLI), "export", "--json", "--output", str(destination),
+        process = subprocess.run([str(CLI), "export", "--json", "--mode", "copy", "--output", str(destination),
                                   "--clip", str(source), *extra], capture_output=True, text=True, timeout=60)
         self.assertEqual(process.returncode, 0, process.stderr + process.stdout)
         report = json.loads(process.stdout)

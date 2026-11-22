@@ -71,7 +71,7 @@ extension ProjectSessions {
         let flatten: PremiereFlattenOption?
         if format == .premiere && session.isMulticam {
             let option = PremiereFlattenOption(checkboxWithTitle: "Flatten multicam for Premiere round trip", target: nil, action: nil)
-            option.toolTip = "Export the selected picture and sound as ordinary clips. The exported timeline loses editable camera angles."
+            option.toolTip = "Flatten multicam to clips"
             option.updateApproval(loss)
             loss.target = option
             loss.action = #selector(PremiereFlattenOption.updateApproval(_:))
@@ -94,7 +94,7 @@ extension ProjectSessions {
                     snapshot = .multicam(project)
                 } else {
                     try session.editor.validateHistoryDestination(output, includesContents: format.isPackage)
-                    snapshot = .sequence(session.editor.sequenceClips)
+                    snapshot = session.editor.stillProject
                 }
             } catch {
                 ProjectPanels.present(NSAlert(error: error), in: session.window)
@@ -117,6 +117,7 @@ extension ProjectSessions {
     private static func lossOption(in panel: NSSavePanel) -> NSButton {
         let option = NSButton(checkboxWithTitle: "Allow conversion with reported losses", target: nil, action: nil)
         option.state = .off
+        option.toolTip = "Permit reported conversion losses"
         option.sizeToFit()
         panel.accessoryView = option
         return option

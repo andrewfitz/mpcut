@@ -31,7 +31,7 @@ public struct BulkExport: Sendable {
     private let tracks: ExportTracks
     private let cancelled: @Sendable () -> Bool
 
-    public init(groups: [[ClipRequest]], directory: URL, outputSuffixes: [String]? = nil, organization: ExportOrganization = .init(), mode: ExportMode = .smart, tracks: ExportTracks = .all, audioStream: Int? = nil, audioTrackOrdinal: Int? = nil,
+    public init(groups: [[ClipRequest]], directory: URL, outputSuffixes: [String]? = nil, organization: ExportOrganization = .init(), mode: ExportMode = ExportRules.defaultMode(for: .movie), tracks: ExportTracks = .all, audioStream: Int? = nil, audioTrackOrdinal: Int? = nil,
                 container: String? = nil, snap: SnapMode = .exact, settings: ReencodeSettings = .init(),
                 media: [URL: MediaInfo] = [:], cancelled: @escaping @Sendable () -> Bool = { false }) throws {
         guard let first = groups.first?.first else {
@@ -129,6 +129,7 @@ public struct BulkExport: Sendable {
                 var failure = CutError(code: issue.code, message: "Range \(offset + 1): \(issue.message)", segment: offset + 1,
                                        boundary: issue.boundary, nearest: issue.nearest, track: issue.track)
                 failure.alternatives = issue.alternatives
+                failure.reason = issue.factor
                 throw failure
             }
         }

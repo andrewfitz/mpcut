@@ -9,7 +9,16 @@ struct ReencodeVideo: Sendable {
     let arguments: [String]
     let warning: String?
 
-    init(_ stream: StreamInfo, settings: ReencodeSettings) throws {
+    /// The picture a mixed timeline is fitted into. A uniform timeline has none and keeps its source's picture.
+    struct Frame: Sendable {
+        let width: Int
+        let height: Int
+        /// True when any source has more than eight bits, so HEVC keeps ten.
+        let deep: Bool
+    }
+
+    init(_ stream: StreamInfo, settings: ReencodeSettings, frame: Frame? = nil,
+         stillColor: StillProgramColorPolicy? = nil) throws {
         guard !stream.hasAlpha else {
             throw CutError(code: "unsupported_format", message: "The selected hardware profiles do not preserve the source’s alpha channel.")
         }
@@ -19,16 +28,17 @@ struct ReencodeVideo: Sendable {
         guard ["progressive", "unknown"].contains(stream.fieldOrder) else {
             throw CutError(code: "unsupported_format", message: "Re-encode cannot preserve this source’s interlaced field order.")
         }
-        width = stream.displayWidth
-        height = stream.displayHeight
+        width = frame?.width ?? stream.displayWidth
+        height = frame?.height ?? stream.displayHeight
         let turn = !stream.rotation.isMultiple(of: 180)
-        codedWidth = turn ? stream.height : stream.width
-        codedHeight = turn ? stream.width : stream.height
+        codedWidth = frame?.width ?? (turn ? stream.height : stream.width)
+        codedHeight = frame?.height ?? (turn ? stream.width : stream.height)
         guard codedWidth > 0, codedHeight > 0, codedWidth.isMultiple(of: 2),
               settings.codec == .prores || codedHeight.isMultiple(of: 2) else {
             throw CutError(code: "unsupported_format", message: "The selected hardware profile cannot preserve these picture dimensions.")
         }
-        let hdr = ["smpte2084", "arib-std-b67"].contains(stream.colorTransfer)
+        let transfer = stillColor?.transfer ?? stream.colorTransfer
+        let hdr = ["smpte2084", "arib-std-b67"].contains(transfer)
         let maximumDepth = settings.codec == .h264 ? 8 : 10
         guard !hdr || maximumDepth >= 10 else {
             throw CutError(code: "unsupported_format", message: "The selected hardware profile cannot preserve the source’s HDR transfer function.")
@@ -58,14 +68,14 @@ struct ReencodeVideo: Sendable {
 
         if settings.codec == .prores {
             pixelFormat = "p210le"
-        } else if settings.codec == .hevc, stream.bitDepth > 8 || hdr {
+        } else if settings.codec == .hevc, stream.bitDepth > 8 || hdr || frame?.deep == true {
             pixelFormat = "p010le"
         } else {
             pixelFormat = "nv12"
         }
-        let matrix = stream.colorMatrix == "gbr" ? "bt709" : stream.colorMatrix
-        let values = [("-color_primaries", stream.colorPrimaries), ("-color_trc", stream.colorTransfer),
-                      ("-colorspace", matrix), ("-color_range", stream.colorRange)]
+        let matrix = stillColor?.matrix ?? (stream.colorMatrix == "gbr" ? "bt709" : stream.colorMatrix)
+        let values = [("-color_primaries", stillColor?.primaries ?? stream.colorPrimaries), ("-color_trc", transfer),
+                      ("-colorspace", matrix), ("-color_range", stillColor?.range ?? stream.colorRange)]
         let color = values.flatMap { option, value in
             value.isEmpty || ["unknown", "unspecified", "reserved"].contains(value) ? [] : [option, value]
         }
@@ -151,23 +161,33 @@ extension ReencodeEngine {
     }
 
     func verifyHardware(_ helper: URL, encoding: ReencodeVideo, container: String, actions: [ReencodeAudioAction],
-                        audio: [StreamInfo], exactPCM: Set<Int>) throws {
+                        audio: [StreamInfo], exactPCM: Set<Int>, canvas: ReencodeCanvas? = nil) throws {
         try checkCancellation()
         var args = ["-xerror",
                     "-f", "lavfi", "-i", "testsrc=size=\(encoding.codedWidth)x\(encoding.codedHeight):rate=30:duration=0.1"]
-        let converted = zip(actions, audio).filter {
-            [.aac, .pcm].contains($0.0.action) || exactPCM.contains($0.0.track)
+        // The sound formats the encoder is asked for: the first clip's, or the canvas of a mixed timeline.
+        struct Sound { let rate: Int; let channels: Int; let layout: String; let index: Int; let options: [String] }
+        var converted: [Sound] = []
+        if let canvas {
+            for (action, sound) in zip(actions, canvas.audio) where [.aac, .pcm].contains(action.action) {
+                converted.append(Sound(rate: sound.sampleRate, channels: sound.channels, layout: sound.layout, index: action.track,
+                                       options: audioOptions(action.action, sound: sound, outputIndex: converted.count)))
+            }
+        } else {
+            for (action, track) in zip(actions, audio) where [.aac, .pcm].contains(action.action) || exactPCM.contains(action.track) {
+                converted.append(Sound(rate: track.sampleRate, channels: track.channels, layout: try audioLayout(track), index: track.index,
+                                       options: audioOptions(action.action, track: track, outputIndex: converted.count,
+                                                             exactPCM: exactPCM.contains(action.track))))
+            }
         }
-        for (_, track) in converted {
+        for track in converted {
             args += ["-f", "lavfi", "-i",
-                     "anullsrc=r=\(track.sampleRate):cl=\(try audioLayout(track)):d=0.1"]
+                     "anullsrc=r=\(track.rate):cl=\(track.layout):d=0.1"]
         }
         args += ["-map", "0:v:0"]
         for (position, _) in converted.enumerated() { args += ["-map", "\(position + 1):a:0"] }
         args += encoding.arguments + ["-pix_fmt", encoding.pixelFormat]
-        for (position, pair) in converted.enumerated() {
-            args += audioOptions(pair.0.action, track: pair.1, outputIndex: position, exactPCM: exactPCM.contains(pair.0.track))
-        }
+        for track in converted { args += track.options }
         args += ["-f", muxerName(container), "verify.\(container)"]
         let key = ReencodeCapabilityKey(helper: helper, identity: try? SourceIdentity(helper), args: args)
         if ReencodeCapabilities.shared.contains(key) { return }
@@ -193,11 +213,11 @@ extension ReencodeEngine {
         guard verification.audio.count == converted.count else {
             throw CutError(code: "unsupported_audio", message: "The selected container could not preserve the requested audio tracks.")
         }
-        for (source, output) in zip(converted.map(\.1), verification.audio.map(\.stream)) {
+        for (source, output) in zip(converted, verification.audio.map(\.stream)) {
             // Some PCM muxers omit channel-order tags for standard mono or stereo.
-            let expected = try audioLayout(source)
+            let expected = source.layout
             let actual = try? audioLayout(output)
-            guard output.sampleRate == source.sampleRate, output.channels == source.channels, actual == expected else {
+            guard output.sampleRate == source.rate, output.channels == source.channels, actual == expected else {
                 throw CutError(code: "unsupported_audio",
                                message: "The selected format cannot preserve the sample rate and channel layout of audio track \(source.index).",
                                track: source.index)
@@ -210,11 +230,13 @@ extension ReencodeEngine {
 enum ReencodeDecode {
     case surfaces, hardware, compatible
 
-    static func preferred(for streams: [StreamInfo], output: String) -> Self {
+    /// `surfaces` is false when each source is fitted into a canvas: the fitting filters read decoded buffers.
+    static func preferred(for streams: [StreamInfo], output: String, surfaces: Bool = true) -> Self {
         let codecs = ["h264", "hevc", "av1", "vp9", "prores", "mpeg2video", "mpeg4"]
         guard !streams.isEmpty, streams.allSatisfy({ codecs.contains($0.codec) && nativeFormat($0) != nil }) else {
             return .compatible
         }
+        guard surfaces else { return .hardware }
         // Quarter-turn camera matrices can be baked into a hardware surface.
         // The surface encoder can tag full-range input as video-range. Let FFmpeg
         // supply a buffer with the explicit range for those clips and conversions.

@@ -21,7 +21,9 @@
 #include <libavutil/dovi_meta.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/mem.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
+#include <libavutil/sha.h>
 #include <libavutil/stereo3d.h>
 
 typedef __int128 Wide;
@@ -82,6 +84,11 @@ typedef struct {
     int has_timecode;
     AVRational timecode_rate;
     int smart_trim;
+    int generated_stills;
+    const uint32_t *still_mastering_display;
+    struct AVSHA *picture_hash;
+    uint8_t *picture_config;
+    size_t picture_config_size;
     int restore_video_config;
     int edge_cancelled;
     int track_video_config;
@@ -403,30 +410,48 @@ static int prepare_output(Writer *writer) {
     return 0;
 }
 
-int mpcut_check_mux(const char *input_path, const char *output_path, int padded_opus_track, int tracks, int audio_stream,
-                    char *error, size_t error_capacity) {
-    Writer writer = {.output_path = output_path, .tracks = tracks, .audio_stream = audio_stream, .error = error, .error_capacity = error_capacity};
-    AVFormatContext *input = NULL;
-
-    int result = prepare_output(&writer);
-    if (!result && tracks != MPCUT_TRACKS_VIDEO && padded_opus_track >= 0 &&
-        (tracks != MPCUT_TRACKS_AUDIO || audio_stream < 0 || audio_stream == padded_opus_track) &&
-        is_mov(writer.output->oformat)) {
-        result = fail(&writer, "Copying Opus track %d to %s would change its audible range. "
+static int check_mux(Writer *writer, AVFormatContext **input, const char *input_path, int padded_opus_track)
+{
+    int result = prepare_output(writer);
+    if (!result && writer->tracks != MPCUT_TRACKS_VIDEO && padded_opus_track >= 0 &&
+        (writer->tracks != MPCUT_TRACKS_AUDIO || writer->audio_stream < 0 || writer->audio_stream == padded_opus_track) &&
+        is_mov(writer->output->oformat)) {
+        result = fail(writer, "Copying Opus track %d to %s would change its audible range. "
                       "Use MKV for lossless audio or choose Re-encode with AAC.", padded_opus_track,
-                      writer.output->oformat->name);
+                      writer->output->oformat->name);
     }
-    if (!result) {
-        result = input_open(&writer, &input, input_path);
+    if (!result && !*input) {
+        result = input_open(writer, input, input_path);
+        if (result) avformat_close_input(input);
     }
     if (!result) {
         int timecode_index;
         MPCutTimecode timecode;
-        result = validate_streams(&writer, input, &timecode_index, &timecode);
+        result = validate_streams(writer, *input, &timecode_index, &timecode);
+    }
+    avformat_free_context(writer->output);
+    return result;
+}
+
+int mpcut_check_mux(const char *input_path, const char *output_path, int padded_opus_track, int tracks, int audio_stream,
+                    char *error, size_t error_capacity)
+{
+    Writer writer = {.output_path = output_path, .tracks = tracks, .audio_stream = audio_stream, .error = error, .error_capacity = error_capacity};
+    AVFormatContext *input = NULL;
+    int result = check_mux(&writer, &input, input_path, padded_opus_track);
+    avformat_close_input(&input);
+    return result;
+}
+
+void mpcut_check_muxes(const char *input_path, const char *const *output_paths, size_t count,
+                      int padded_opus_track, int tracks, int audio_stream, uint8_t *supported)
+{
+    AVFormatContext *input = NULL;
+    for (size_t i = 0; i < count; i++) {
+        Writer writer = {.output_path = output_paths[i], .tracks = tracks, .audio_stream = audio_stream};
+        supported[i] = output_paths[i] && !check_mux(&writer, &input, input_path, padded_opus_track);
     }
     avformat_close_input(&input);
-    avformat_free_context(writer.output);
-    return result;
 }
 
 /* Each input can put its selected tracks at different stream indices. */
@@ -530,6 +555,30 @@ done:
     return failed ? fail(writer, "Cannot finish the MP3 header in %s", writer->output_path) : 0;
 }
 
+static int set_still_hdr(Writer *writer, AVCodecParameters *codec)
+{
+    av_packet_side_data_remove(codec->coded_side_data, &codec->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+    const uint32_t *values = writer->still_mastering_display;
+    if (!values)
+        return 0;
+
+    AVPacketSideData *side = av_packet_side_data_new(&codec->coded_side_data, &codec->nb_coded_side_data,
+                                                     AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
+                                                     sizeof(AVMasteringDisplayMetadata), 0);
+    if (!side)
+        return fail(writer, "Cannot set mastering-display metadata on the assembled picture track");
+    AVMasteringDisplayMetadata *display = (AVMasteringDisplayMetadata *)side->data;
+    memset(display, 0, sizeof(*display));
+    for (int i = 0; i < 6; i++)
+        display->display_primaries[(i / 2 + 1) % 3][i % 2] = (AVRational){(int)values[i], 50000};
+    display->white_point[0] = (AVRational){(int)values[6], 50000};
+    display->white_point[1] = (AVRational){(int)values[7], 50000};
+    display->max_luminance = av_make_q((int)values[8], 10000);
+    display->min_luminance = av_make_q((int)values[9], 10000);
+    display->has_primaries = display->has_luminance = 1;
+    return 0;
+}
+
 static int configure_output(Writer *writer, AVFormatContext *input, int whole_file,
                             int timecode_index, const MPCutTimecode *timecode, const char *initial_timecode,
                             const MPCutSegment *segment) {
@@ -563,6 +612,11 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
         result = avcodec_parameters_copy(destination->codecpar, source->codecpar);
         if (result < 0) {
             return ff_error(writer, result, "Cannot copy stream configuration from", input->url);
+        }
+        if (writer->generated_stills && destination->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            result = set_still_hdr(writer, destination->codecpar);
+            if (result)
+                return result;
         }
         // The MP4 muxer writes the Dolby Vision configuration box only at this
         // compliance level. Without it, the base-layer pictures survive but the
@@ -1114,6 +1168,90 @@ static int slice_pcm(Writer *writer, const AVStream *input_track, const Range *r
     return 0;
 }
 
+static int hash_picture(struct AVSHA *hash, const AVPacket *packet, uint8_t **config, size_t *config_size) {
+    size_t size = 0;
+    const uint8_t *extra = av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &size);
+    if (extra) {
+        uint8_t *copy = av_memdup(extra, size);
+        if (!copy)
+            return AVERROR(ENOMEM);
+        av_free(*config);
+        *config = copy;
+        *config_size = size;
+    }
+    int64_t fields[] = {packet->pts, packet->size, *config_size};
+    av_sha_update(hash, (const uint8_t *)fields, sizeof(fields));
+    if (*config_size)
+        av_sha_update(hash, *config, *config_size);
+    av_sha_update(hash, packet->data, packet->size);
+    return 0;
+}
+
+/* Reopen the staged picture lane and confirm that the muxer selected the
+ * expected descriptions and preserved each length-prefixed sample verbatim. */
+static int verify_picture(Writer *writer, MPCutTime duration) {
+    AVFormatContext *input = NULL;
+    uint8_t *config = NULL;
+    size_t config_size = 0;
+    struct AVSHA *hash = av_sha_alloc();
+    int result = hash ? input_open(writer, &input, writer->output_path) :
+                        fail(writer, "Cannot allocate still picture verification");
+    if (result)
+        goto done;
+    const AVStream *written = writer->output->streams[0];
+    if (input->nb_streams != 1 || !primary_video(input->streams[0]) ||
+        av_cmp_q(input->streams[0]->time_base, written->time_base) != 0 ||
+        time_compare(time_ticks(input->streams[0]->duration, input->streams[0]->time_base), duration) != 0) {
+        result = fail(writer, "Muxing changed the generated picture lane or its clock");
+        goto done;
+    }
+    AVCodecParameters *codec = input->streams[0]->codecpar;
+    if (codec->codec_id != written->codecpar->codec_id || codec->codec_tag != written->codecpar->codec_tag ||
+        codec->width != written->codecpar->width || codec->height != written->codecpar->height) {
+        result = fail(writer, "Muxing changed the generated picture lane's codec or dimensions");
+        goto done;
+    }
+    /* ProRes decoder properties are in each frame. FFmpeg exposes the entire
+     * sample entry as extradata even though it is not decoder configuration. */
+    if (codec->codec_id == AV_CODEC_ID_H264 || codec->codec_id == AV_CODEC_ID_HEVC)
+        config_size = codec->extradata_size;
+    if (config_size && !(config = av_memdup(codec->extradata, config_size))) {
+        result = fail(writer, "Cannot read generated picture descriptions");
+        goto done;
+    }
+    av_sha_init(hash, 256);
+    int64_t last_dts = AV_NOPTS_VALUE;
+    int code;
+    while ((code = av_read_frame(input, writer->packet)) >= 0) {
+        const AVPacket *packet = writer->packet;
+        if (packet->pts == AV_NOPTS_VALUE || packet->dts == AV_NOPTS_VALUE ||
+            packet->dts > packet->pts || (last_dts != AV_NOPTS_VALUE && packet->dts <= last_dts) ||
+            hash_picture(hash, packet, &config, &config_size) < 0) {
+            result = fail(writer, "Cannot verify a sample in the muxed still picture lane");
+            goto done;
+        }
+        last_dts = packet->dts;
+        av_packet_unref(writer->packet);
+        result = progress_at(writer, writer->fraction);
+        if (result)
+            goto done;
+    }
+    if (code != AVERROR_EOF) {
+        result = ff_error(writer, code, "Cannot verify", writer->output_path);
+        goto done;
+    }
+    uint8_t expected[32], actual[32];
+    av_sha_final(writer->picture_hash, expected);
+    av_sha_final(hash, actual);
+    if (memcmp(expected, actual, sizeof(expected)))
+        result = fail(writer, "Muxing changed a picture sample, presentation timestamp, or decoder description");
+done:
+    av_free(config);
+    av_free(hash);
+    avformat_close_input(&input);
+    return result;
+}
+
 static int write_packet(Writer *writer, const char *path) {
     AVPacket *packet = writer->packet;
     int index = packet->stream_index;
@@ -1128,6 +1266,11 @@ static int write_packet(Writer *writer, const char *path) {
         writer->last_dts[index] = packet->dts;
     }
 
+    if (writer->picture_hash) {
+        int result = hash_picture(writer->picture_hash, packet, &writer->picture_config, &writer->picture_config_size);
+        if (result < 0)
+            return fail(writer, "Cannot retain the generated picture configuration");
+    }
     packet->pos = -1;
     int result = av_interleaved_write_frame(writer->output, packet);
     return result < 0 ? ff_error(writer, result, "Cannot write packet to", writer->output_path) : 0;
@@ -1536,12 +1679,19 @@ static int splice_video(Writer *writer, const AVFormatContext *input, const AVSt
         return 0;
     const uint8_t *extra = writer->active_config ? writer->active_config : video->codecpar->extradata;
     int size = writer->active_config ? (int)writer->active_config_size : video->codecpar->extradata_size;
-    if (writer->smart_trim) {
+    if (writer->smart_trim || writer->generated_stills) {
         int code = mpcut_splice_check_copy(packet, video->codecpar, extra, size);
         if (code == AVERROR(ENOTSUP))
             return fail(writer, "Smart Trim cannot preserve in-band parameter sets in copied AVC/HEVC samples from %s", input->url);
         if (code < 0)
             return ff_error(writer, code, "Invalid copied video sample or configuration in", input->url);
+    }
+    if (writer->generated_stills && video->codecpar->codec_id == AV_CODEC_ID_HEVC) {
+        int code = mpcut_splice_check_still_hdr(packet, extra, size);
+        if (code == AVERROR(ENOTSUP))
+            return fail(writer, "Generated stills require HEVC without Dolby Vision, HDR10+ or additional picture layers in %s", input->url);
+        if (code < 0)
+            return ff_error(writer, code, "Cannot verify HEVC sample metadata in", input->url);
     }
     if (writer->restore_video_config) {
         int code = mpcut_splice_restore(packet, video->codecpar, extra, size);
@@ -1743,8 +1893,10 @@ static int validate_layout(Writer *writer, const AVFormatContext *input, int tim
 }
 
 int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_path, int tracks, int audio_stream,
+                const uint32_t *still_mastering_display,
                 MPCutProgress progress, void *context, char *error, size_t error_capacity) {
     Writer writer = {
+        .still_mastering_display = still_mastering_display,
         .output_path = output_path,
         .progress = progress,
         .progress_context = context,
@@ -1771,6 +1923,7 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             return fail(&writer, "Segment %zu has an invalid range", index + 1);
         }
         writer.track_video_config |= segment->multiple_descriptions;
+        writer.generated_stills |= segment->generated_still;
         writer.smart_trim |= segment->head_edge.frame_count > 0 || segment->tail_edge.frame_count > 0;
         total = time_add(total, time_add(segment->end, segment->start, -1), 1);
         if (!total.denominator) {
@@ -1785,6 +1938,18 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
     result = prepare_output(&writer);
     if (result) {
         goto cleanup;
+    }
+    if (writer.generated_stills && (tracks != MPCUT_TRACKS_VIDEO || !is_mov(writer.output->oformat))) {
+        result = fail(&writer, "Generated still spans require a separate MOV-family picture lane");
+        goto cleanup;
+    }
+    if (writer.generated_stills && !writer.smart_trim) {
+        writer.picture_hash = av_sha_alloc();
+        if (!writer.picture_hash) {
+            result = fail(&writer, "Cannot allocate still picture verification");
+            goto cleanup;
+        }
+        av_sha_init(writer.picture_hash, 256);
     }
     if (!strcmp(writer.output->oformat->name, "flac") &&
         (count != 1 || segments[0].start.numerator != 0 || !segments[0].reaches_end)) {
@@ -1907,6 +2072,9 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
         }
         av_freep(&writer.active_config);
         writer.active_config_size = 0;
+        if (writer.generated_stills && (input->streams[video_index]->codecpar->codec_id == AV_CODEC_ID_H264 ||
+                input->streams[video_index]->codecpar->codec_id == AV_CODEC_ID_HEVC))
+            writer.track_video_config = 1;
         if (writer.track_video_config)
             writer.restore_video_config = 1;
         result = segment->multiple_descriptions ? 0 :
@@ -1980,6 +2148,8 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             goto cleanup;
         }
     }
+    if (writer.picture_hash && (result = verify_picture(&writer, total)))
+        goto cleanup;
     result = progress_at(&writer, 1);
 
 cleanup:
@@ -1989,6 +2159,8 @@ cleanup:
         av_free(writer.patches[i].encoded_times);
     }
     av_free(writer.active_config);
+    av_free(writer.picture_hash);
+    av_free(writer.picture_config);
     avformat_close_input(&input);
     av_packet_free(&writer.packet);
     mpcut_aac_source_free(writer.aac_source);

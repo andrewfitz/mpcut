@@ -22,6 +22,13 @@ struct ProjectSilenceReport: Encodable {
         }
     }
 
+    struct RetainedCard: Encodable {
+        let assemblyIndex: Int
+        let placementID: String
+        let output: AudioSpan
+        let retainedOutput: AudioSpan
+    }
+
     let ok = true
     var project: String
     let duration: RationalTime
@@ -29,26 +36,35 @@ struct ProjectSilenceReport: Encodable {
     let thresholds: [Threshold]
     let minimumPause: Double
     let leave: Double
-    let mode: ExportMode
+    var mode: ExportMode
     let pauses: [Interval]
     let removals: [Interval]
     let clips: [Interval]
     let skippedPauses: Int
     let removedDuration: RationalTime
+    let retainedAssembly: [StillAssemblyItem]
+    let retainedDuration: RationalTime
+    let cards: [RetainedCard]?
     let indexedSources: [String: MediaInfo]
     var output: String?
     var dryRun: Bool?
     var preflight: MulticamExportPlan?
+    var stillPreflight: StillExportReport?
+    /// The tier of the retained ranges, reported with `--output`.
+    var tier: TierSummary?
 
     private enum CodingKeys: String, CodingKey {
         case ok, project, duration, thresholdMode, thresholds, minimumPause, leave, mode
-        case pauses, removals, clips, skippedPauses, removedDuration, output, dryRun, preflight
+        case pauses, removals, clips, skippedPauses, removedDuration, output, dryRun, preflight, stillPreflight, tier
+        case cards, retainedDuration
     }
 
     init(_ document: MulticamProject, at location: URL, options: SilenceOptions, container: String,
          cancelled: @escaping @Sendable () -> Bool) throws {
-        let ranges = document.assembly ?? [document.range]
-        let mapping = try document.plan(ranges: ranges)
+        let assembly = document.assemblyItems ?? [.group(document.range)]
+        let indices = assembly.indices.filter { assembly[$0].group != nil }
+        let ranges = assembly.compactMap(\.group)
+        let mapping = try document.plan()
         guard !mapping.audio.isEmpty else {
             throw CutError(code: "no_audio", message: "The project assembly has no selected soundtrack.")
         }
@@ -118,23 +134,55 @@ struct ProjectSilenceReport: Encodable {
         minimumPause = options.minimum
         let leave = options.leave ?? 0.4
         self.leave = leave
-        let mode = options.mode ?? .smart
+        let stills = try CutProject.multicam(document).exportPlacementScope()
+        let mode = options.mode ?? ExportRules.defaultStillMode(tracks: .all, placements: stills,
+                                                                  otherwise: ExportRules.defaultMode(for: .multicam))
         self.mode = mode
         indexedSources = media
 
         let edits = MulticamSilencePlanner.plan(project: document, media: media, ranges: ranges, silences: results,
                                                 scope: nil, minimum: options.minimum, leave: leave, protected: [],
-                                                keyframesOnly: mode == .copy, container: container)
+                                                keyframesOnly: mode == .copy, container: container, assemblyIndices: indices)
         let retained = MulticamSilencePlanner.retainedOccurrences(ranges, pauses: edits)
         var cursor = RationalTime.zero
         var outputStarts: [RationalTime] = []
-        for range in ranges {
+        for item in assembly {
             outputStarts.append(cursor)
-            cursor = try cursor.adding(range.to.subtracting(range.from))
+            if let range = item.group { cursor = try cursor.adding(range.to.subtracting(range.from)) }
+            if let card = item.still { cursor = try cursor.adding(card.duration) }
         }
+        let retainedByOccurrence = Dictionary(grouping: retained, by: \.occurrence)
+        let groupIndices = Dictionary(uniqueKeysWithValues: indices.enumerated().map { ($1, $0) })
+        var retainedItems: [StillAssemblyItem] = []
+        var retainedCards: [RetainedCard] = []
+        var retainedCursor = RationalTime.zero
+        for (index, item) in assembly.enumerated() {
+            if let card = item.still {
+                let end = try retainedCursor.adding(card.duration)
+                retainedCards.append(try .init(assemblyIndex: index, placementID: card.id,
+                                               output: .init(from: outputStarts[index], to: outputStarts[index].adding(card.duration)),
+                                               retainedOutput: .init(from: retainedCursor, to: end)))
+                retainedItems.append(item)
+                retainedCursor = end
+            } else if let occurrence = groupIndices[index] {
+                for retained in retainedByOccurrence[occurrence] ?? [] {
+                    retainedItems.append(.group(MulticamSilencePlanner.range(retained.span)))
+                    retainedCursor = try retainedCursor.adding(retained.span.to.subtracting(retained.span.from))
+                }
+            }
+        }
+        retainedAssembly = retainedItems
+        if !retainedItems.isEmpty && options.mode == nil {
+            var retained = document
+            retained.assemblyItems = retainedItems
+            self.mode = try ExportRules.defaultStillMode(tracks: .all, placements: CutProject.multicam(retained).exportPlacementScope(),
+                                                         otherwise: ExportRules.defaultMode(for: .multicam))
+        }
+        retainedDuration = retainedCursor
+        cards = retainedCards.isEmpty ? nil : retainedCards
         func interval(_ index: Int, _ span: AudioSpan) throws -> Interval {
-            try Interval(assemblyIndex: index, group: span, groupStart: ranges[index].from,
-                         outputStart: outputStarts[index])
+            try Interval(assemblyIndex: indices[index], group: span, groupStart: ranges[index].from,
+                         outputStart: outputStarts[indices[index]])
         }
 
         pauses = try edits.map { try interval($0.id.occurrence, $0.visible) }

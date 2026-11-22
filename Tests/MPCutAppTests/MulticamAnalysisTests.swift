@@ -44,7 +44,7 @@ final class MulticamAnalysisTests: XCTestCase {
         XCTAssertTrue(analysis.useRoomTone(in: room))
         try await waitUntil { analysis.hasSilenceResults(project: project, media: media) }
         let snapshot = analysis.snapshot(for: quiet)
-        let measured = try XCTUnwrap(first.waveform.peak(from: 1.5, to: 2.5))
+        let measured = try XCTUnwrap(first.waveform?.peak(from: 1.5, to: 2.5))
         XCTAssertEqual(snapshot.silence.first?.requestedThresholdDB, AudioAnalysis.roomToneThresholdDB(forPeak: measured))
     }
 
@@ -72,6 +72,15 @@ final class MulticamAnalysisTests: XCTestCase {
         XCTAssertGreaterThan(pause.from, pictureEnd)
         let snapshot = analysis.snapshot(for: shortPicture)
         XCTAssertGreaterThan(try XCTUnwrap(snapshot.waveforms[stream]).duration, pictureEnd)
+        let span = try XCTUnwrap(analysis.soundtrack(in: project.range).first)
+        XCTAssertEqual(span.selection, microphone)
+        var detail: DisplayEnvelope?
+        try await waitUntil {
+            detail = analysis.waveformDetail.envelope(for: span.selection, surface: .multicam(span.group.from),
+                                                      from: 1.8, to: 1.9, pixels: 400)
+            return detail != nil
+        }
+        XCTAssertLessThan(try XCTUnwrap(detail).secondsPerBin, 0.001)
         XCTAssertNotNil(try snapshot.sections(for: shortPicture, cancelled: { false })["wave.v1.\(stream)"])
     }
 
@@ -155,6 +164,11 @@ final class MulticamAnalysisTests: XCTestCase {
         let analysis = MulticamAnalysisStore()
         defer { analysis.reset() }
         analysis.update(project: project, media: media, ordinary: ["early": other, "scene": scene], useSidecars: false)
+        XCTAssertFalse(analysis.canScanScenes(camera: "missing"))
+        analysis.scanScenes(camera: "scene")
+        try await waitUntil { !analysis.isScanning(.scenes) }
+        XCTAssertEqual(Set(analysis.sceneReports.keys), ["scene"])
+        XCTAssertEqual(analysis.sceneCoverage["scene"]?.requested, .fullSource)
         analysis.scan(.scenes)
         try await waitUntil { !analysis.isScanning(.scenes) }
         let sourceStarts = analysis.sourceScenes("scene")

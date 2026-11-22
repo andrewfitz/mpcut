@@ -1,7 +1,7 @@
 [
   {
     "name": "split_at",
-    "description": "Split the specified clip or assembly occurrence using native snapping and undo history.",
+    "description": "Split the specified clip, assembly range or inserted still with native undo history. Split a still at an interior presentation boundary in sequence or assembly time.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -34,7 +34,7 @@
           "oneOf": [
             {
               "type": "string",
-              "description": "Ordinary clip occurrence UUID."
+              "description": "Ordinary clip occurrence UUID or still placement ID."
             },
             {
               "type": "integer",
@@ -88,7 +88,7 @@
           "oneOf": [
             {
               "type": "string",
-              "description": "Ordinary clip occurrence UUID."
+              "description": "Ordinary clip occurrence UUID or still placement ID."
             },
             {
               "type": "integer",

@@ -159,24 +159,44 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     public var audioSources: [MulticamSource]
     public var audio: MulticamAudioPolicy
     public var switches: [MulticamSwitch]
-    public var assembly: [MulticamRange]?
+    public var assemblyItems: [StillAssemblyItem]?
+    public var stillAssets: [StillAsset]
+    public var stillReplacements: [StillReplacement]
+    public var programColorPolicy: StillProgramColorPolicy?
+
+    /// Group ranges for clients that only work in group coordinates.
+    public var assembly: [MulticamRange]? {
+        get { assemblyItems?.compactMap(\.group) }
+        set { assemblyItems = newValue?.map(StillAssemblyItem.group) }
+    }
+
+    var requiresV2: Bool {
+        !stillAssets.isEmpty || !stillReplacements.isEmpty || programColorPolicy != nil
+            || (assemblyItems?.contains { $0.still != nil } ?? false)
+    }
 
     public var sources: [MulticamSource] { angles + audioSources }
 
     public init(referenceAngle: String, range: MulticamRange, angles: [MulticamSource],
                 audioSources: [MulticamSource] = [], audio: MulticamAudioPolicy,
-                switches: [MulticamSwitch], assembly: [MulticamRange]? = nil) {
+                switches: [MulticamSwitch], assembly: [MulticamRange]? = nil,
+                assemblyItems: [StillAssemblyItem]? = nil, stillAssets: [StillAsset] = [],
+                stillReplacements: [StillReplacement] = [], programColorPolicy: StillProgramColorPolicy? = nil) {
         self.referenceAngle = referenceAngle
         self.range = range
         self.angles = angles
         self.audioSources = audioSources
         self.audio = audio
         self.switches = switches
-        self.assembly = assembly
+        self.assemblyItems = assemblyItems ?? assembly?.map(StillAssemblyItem.group)
+        self.stillAssets = stillAssets
+        self.stillReplacements = stillReplacements
+        self.programColorPolicy = programColorPolicy
     }
 
     private enum CodingKeys: String, CodingKey {
         case format, schemaVersion, kind, referenceAngle, range, angles, audioSources, audio, switches, assembly, history
+        case stillAssets, stillReplacements, programColorPolicy
     }
 
     public init(from decoder: Decoder) throws {
@@ -185,11 +205,23 @@ public struct MulticamProject: Codable, Equatable, Sendable {
             throw Self.invalid("Expected an MPCut project document")
         }
         let version = try values.decode(Int.self, forKey: .schemaVersion)
-        guard version == Self.schemaVersion else {
+        guard version == Self.schemaVersion || version == CutProject.stillSchemaVersion else {
             throw CutError(code: "unsupported_multicam_version",
                            message: "Multicam schema version \(version) is unsupported")
         }
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
+        let v2 = version == CutProject.stillSchemaVersion
+        let stillFields: [CodingKeys] = [.stillAssets, .stillReplacements, .programColorPolicy]
+        guard v2 || !stillFields.contains(where: values.contains) else {
+            throw Self.invalid("Still fields require schema v2")
+        }
+        if v2 {
+            for key in stillFields + [.assembly] where values.contains(key) {
+                guard try !values.decodeNil(forKey: key) else {
+                    throw Self.invalid("Null value in multicam field ‘\(key.stringValue)’")
+                }
+            }
+        }
         guard try values.decode(String.self, forKey: .kind) == "multicam" else {
             throw Self.invalid("Expected a multicam project")
         }
@@ -199,15 +231,24 @@ public struct MulticamProject: Codable, Equatable, Sendable {
                   audioSources: try values.decodeIfPresent([MulticamSource].self, forKey: .audioSources) ?? [],
                   audio: try values.decode(MulticamAudioPolicy.self, forKey: .audio),
                   switches: try values.decode([MulticamSwitch].self, forKey: .switches),
-                  assembly: try values.decodeIfPresent([MulticamRange].self, forKey: .assembly))
+                  assembly: v2 ? nil : try values.decodeIfPresent([MulticamRange].self, forKey: .assembly),
+                  assemblyItems: v2 ? try values.decodeIfPresent([StillAssemblyItem].self, forKey: .assembly) : nil,
+                  stillAssets: try values.decodeIfPresent([StillAsset].self, forKey: .stillAssets) ?? [],
+                  stillReplacements: try values.decodeIfPresent([StillReplacement].self, forKey: .stillReplacements) ?? [],
+                  programColorPolicy: try values.decodeIfPresent(StillProgramColorPolicy.self, forKey: .programColorPolicy))
         try validate()
     }
 
     public func encode(to encoder: Encoder) throws {
+        try encode(to: encoder, forceV2: false)
+    }
+
+    func encode(to encoder: Encoder, forceV2: Bool) throws {
         try validate()
         var values = encoder.container(keyedBy: CodingKeys.self)
+        let v2 = requiresV2 || forceV2
         try values.encode(CutProject.format, forKey: .format)
-        try values.encode(Self.schemaVersion, forKey: .schemaVersion)
+        try values.encode(v2 ? CutProject.stillSchemaVersion : Self.schemaVersion, forKey: .schemaVersion)
         try values.encode("multicam", forKey: .kind)
         try values.encode(referenceAngle, forKey: .referenceAngle)
         try values.encode(range, forKey: .range)
@@ -215,7 +256,14 @@ public struct MulticamProject: Codable, Equatable, Sendable {
         if !audioSources.isEmpty { try values.encode(audioSources, forKey: .audioSources) }
         try values.encode(audio, forKey: .audio)
         try values.encode(switches, forKey: .switches)
-        try values.encodeIfPresent(assembly, forKey: .assembly)
+        if v2 {
+            try values.encodeIfPresent(assemblyItems, forKey: .assembly)
+            if !stillAssets.isEmpty { try values.encode(stillAssets, forKey: .stillAssets) }
+            if !stillReplacements.isEmpty { try values.encode(stillReplacements, forKey: .stillReplacements) }
+            try values.encodeIfPresent(programColorPolicy, forKey: .programColorPolicy)
+        } else {
+            try values.encodeIfPresent(assembly, forKey: .assembly)
+        }
     }
 
     /// Media stream indices are 32-bit.
@@ -233,7 +281,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     }
 
     public func save(to url: URL) throws {
-        try ProjectFile.write(self, to: url, sources: sources.map { ($0.id, $0.file) }, multicam: true)
+        try ProjectFile.write(self, to: url, sources: CutProject.multicam(self).mediaPaths, multicam: true)
     }
 
     public func sourceURL(for source: MulticamSource, relativeTo projectURL: URL) -> URL {
@@ -288,7 +336,14 @@ public struct MulticamProject: Codable, Equatable, Sendable {
             previous = marker.at
             if let override = marker.audio { try validateAudio(override) }
         }
-        if let assembly { try validateRanges(assembly) }
+        if let assemblyItems {
+            guard !assemblyItems.isEmpty else { throw Self.invalid("Assembly must contain at least one item") }
+            let ranges = assemblyItems.compactMap(\.group)
+            if !ranges.isEmpty { try validateRanges(ranges) }
+        }
+        try validateStillCollections(assets: stillAssets, inserts: assemblyItems?.compactMap(\.still) ?? [],
+                                     replacements: stillReplacements, color: programColorPolicy, group: range)
+        if requiresV2 { try CutProject.multicam(self).validateStillTimelineDuration() }
     }
 
     private func validateRanges(_ ranges: [MulticamRange]) throws {
@@ -333,15 +388,19 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     /// Explicit ranges address group time and take precedence over the saved assembly.
     public func plan(ranges: [MulticamRange]? = nil) throws -> MulticamPlan {
         try validate()
-        let ranges = ranges ?? assembly ?? [range]
-        try validateRanges(ranges)
+        if let ranges { try validateRanges(ranges) }
+        let items = ranges.map { $0.map(StillAssemblyItem.group) } ?? assemblyItems ?? [.group(range)]
         let sourcesByID = Dictionary(uniqueKeysWithValues: sources.map { ($0.id, $0) })
         var intervals: [MulticamInterval] = []
         var picture: [MulticamSpan] = []
         var sound: [MulticamSpan] = []
         var outputStart = RationalTime.zero
 
-        for (assemblyIndex, requested) in ranges.enumerated() {
+        for (assemblyIndex, item) in items.enumerated() {
+            guard let requested = item.group else {
+                if let insert = item.still { outputStart = try outputStart.adding(insert.duration) }
+                continue
+            }
             guard var markerIndex = switchIndex(at: requested.from) else {
                 throw Self.invalid("No active switch at \(requested.from)")
             }

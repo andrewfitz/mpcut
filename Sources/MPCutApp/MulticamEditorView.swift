@@ -30,15 +30,15 @@ struct MulticamEditorView: View {
                     ExportQueueToolbarButton(count: model.queuedRanges.count, action: model.showBulkQueue)
                         .disabled(!model.canShowBulkQueue)
                     MulticamPreviewSoundControls(preview: model.preview)
-                    EditorToolbarButton(title: "Add Sources", symbol: "plus", action: model.chooseSources)
-                        .help("Add cameras or audio recordings to the multicam group (⌘O)")
+                    EditorToolbarButton(title: "Add Sources", symbol: "plus", toolTip: "Add multicam sources (⌘O)",
+                                        action: model.chooseSources)
                         .disabled(!model.canChooseSources)
-                    EditorToolbarButton(title: "Export", symbol: "square.and.arrow.up", action: model.chooseProgramExport)
-                    .help("Show the export options (⌘E)")
-                    .disabled(model.isBusy)
+                    EditorToolbarButton(title: "Export", symbol: "square.and.arrow.up", toolTip: "Export multicam (⌘E)",
+                                        action: model.chooseProgramExport)
+                        .disabled(model.isBusy)
                     Button("Save Project", systemImage: "square.and.arrow.down") { _ = model.saveProject() }
                         .labelStyle(.iconOnly)
-                        .help("Save the multicam project (⌘S)")
+                        .help("Save multicam project (⌘S)")
                         .disabled(model.isBusy)
                     Button(presentation.inspectorVisible ? "Hide Inspector" : "Show Inspector", systemImage: "sidebar.trailing") {
                         presentation.inspectorVisible.toggle()
@@ -99,7 +99,9 @@ struct MulticamEditorView: View {
             HStack(spacing: 10) {
                 Button("Add as Multicam…", action: model.chooseSources)
                     .buttonStyle(.borderedProminent)
+                    .help("Add multicam sources")
                 Button("Open MPCut Project…", action: model.chooseProject)
+                    .help("Open saved project")
             }
             .controlSize(.large)
         }
@@ -136,12 +138,21 @@ struct MulticamEditorView: View {
     private func inspectorPanel(_ project: MulticamProject) -> some View {
         VStack(spacing: 0) {
             Picker("Multicam inspector", selection: $presentation.inspector) {
-                ForEach(EditorPresentation.Inspector.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                ForEach(EditorPresentation.Inspector.allCases, id: \.self) { inspector in
+                    let toolTip = switch inspector {
+                    case .switches: "Inspect camera switches"
+                    case .sources: "Inspect multicam sources"
+                    case .assembly: "Inspect assembly ranges"
+                    case .export: "Configure multicam export"
+                    }
+                    Text(inspector.rawValue).help(toolTip).tag(inspector)
+                }
             }
             .labelsHidden()
             .pickerStyle(.segmented)
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
+            .help("Choose inspector panel")
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
@@ -169,6 +180,7 @@ struct MulticamEditorView: View {
                 Picker("Picture", selection: Binding(get: { item.angle }, set: { model.changeSwitch(item.at, angle: $0) })) {
                     ForEach(project.angles, id: \.id) { Text($0.displayName).tag($0.id) }
                 }
+                .help("Choose camera angle")
             }
             InspectorRow("Microphone") {
                 Picker("Microphone", selection: Binding(get: { item.audio }, set: { model.changeSwitch(item.at, audio: $0) })) {
@@ -178,13 +190,14 @@ struct MulticamEditorView: View {
                         Text("\(selected.source) · stream \(selected.stream) (unavailable)").tag(Optional(selected))
                     }
                 }
+                .help("Choose active microphone")
             }
             if item.at != project.range.from {
                 MulticamTimeField(label: "Time", value: item.at) { time in
                     model.parseTime(time) { model.moveSwitch(item.at, to: $0) }
                 }
                 Button("Delete Switch", systemImage: "trash", role: .destructive) { model.deleteSwitch(item.at) }
-                    .help("Delete this switch (⌫)")
+                    .help("Delete switch (⌫)")
                 if model.suggestionAnchor == item.at && !model.suggestions.isEmpty {
                     SectionHeading("Timing Alternatives").padding(.top, 4)
                     ForEach(model.suggestions, id: \.self) { at in
@@ -194,14 +207,16 @@ struct MulticamEditorView: View {
                                 .help("\(at.description) s")
                             Spacer()
                             Button("Preview") { model.seekGroup(at) }
+                                .help("Preview switch timing")
                             Button("Apply") { model.moveSwitch(item.at, to: at) }
+                                .help("Apply switch timing")
                         }
                     }
                 }
             }
         } else {
             SectionHeading("Switch")
-            Text("Select a switch marker on the timeline to edit its picture, microphone, or time.")
+            Text("Select a switch marker to change its camera, microphone, or time.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -211,7 +226,7 @@ struct MulticamEditorView: View {
             SectionHeading("Compare at the Playhead")
             Spacer()
             Button("Show Program", action: model.preview.endAudition)
-                .help("Stop auditioning a camera and show the edited program again.")
+                .help("Resume program preview")
         }
         ForEach(Array(project.angles.enumerated()), id: \.element.id) { index, source in
             HStack(spacing: 8) {
@@ -226,7 +241,7 @@ struct MulticamEditorView: View {
                 Spacer(minLength: 4)
                 Button("Audition", systemImage: "eye") { model.audition(source.id) }
                     .labelStyle(.iconOnly)
-                    .help("Audition \(source.displayName) at the playhead without switching")
+                    .help("Audition \(source.displayName)")
                     .accessibilityLabel("Audition \(source.displayName)")
                 Button("Take") { model.takeCamera(number: index + 1) }
                     .help(index < 9 ? "Switch to \(source.displayName) (\(index + 1))" : "Switch to \(source.displayName)")
@@ -252,9 +267,10 @@ struct MulticamEditorView: View {
                     model.edit { $0.range = MulticamRange(from: $0.range.from, to: end) }
                 }
             }
-            .help("Move the end of the group to the end of the longest camera.")
+            .help("Extend to longest camera")
             Divider().padding(.vertical, 2)
             SectionHeading("Sources")
+            let mediaIssues = model.mediaRefreshIssues
             ForEach(project.sources, id: \.id) { source in
                 let index = project.angles.firstIndex(where: { $0.id == source.id })
                 VStack(alignment: .leading, spacing: 8) {
@@ -270,10 +286,10 @@ struct MulticamEditorView: View {
                             ControlGroup {
                                 Button("Move Earlier", systemImage: "chevron.up") { model.moveSource(source.id, by: -1) }
                                     .disabled(index == 0)
-                                    .help("Move this camera earlier in the angle order")
+                                    .help("Move camera earlier")
                                 Button("Move Later", systemImage: "chevron.down") { model.moveSource(source.id, by: 1) }
                                     .disabled(index == project.angles.count - 1)
-                                    .help("Move this camera later in the angle order")
+                                    .help("Move camera later")
                             }
                             .fixedSize()
                         }
@@ -287,20 +303,20 @@ struct MulticamEditorView: View {
                     HStack {
                         ControlGroup {
                             Button("−1 \(index == nil ? "sample" : "frame")") { model.moveOffset(source.id, by: -1) }
-                                .help("Nudge this source one \(index == nil ? "sample" : "frame") earlier")
+                                .help("Shift earlier one \(index == nil ? "sample" : "frame")")
                             Button("+1 \(index == nil ? "sample" : "frame")") { model.moveOffset(source.id, by: 1) }
-                                .help("Nudge this source one \(index == nil ? "sample" : "frame") later")
+                                .help("Shift later one \(index == nil ? "sample" : "frame")")
                         }
                         .fixedSize()
                         Spacer()
                         Button("Relink…") { model.relink(source.id) }
-                            .help("Point this source at a moved or renamed file")
+                            .help("Locate missing source")
                     }
                     if let progress = model.sourceIndexProgress[source.id] {
                         ProgressView("Indexing \(source.displayName)", value: progress)
                             .controlSize(.small)
                     }
-                    if let message = model.sourceIssues[source.id] ?? model.sourceIndexIssues[source.id] {
+                    if let message = mediaIssues[source.id] ?? model.sourceIssues[source.id] ?? model.sourceIndexIssues[source.id] {
                         IssueLabel(message)
                     }
                     if index != nil {
@@ -318,8 +334,8 @@ struct MulticamEditorView: View {
     private func assemblyInspector(_ project: MulticamProject) -> some View {
         Group {
             SectionHeading("Marked Range")
-            if project.assembly == nil {
-                Text("The full group is selected for export. Mark and add a range to create an assembly.")
+            if project.assemblyItems == nil {
+                Text("Export includes the whole group. To export part of it, mark a range and add it to the assembly.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -327,14 +343,14 @@ struct MulticamEditorView: View {
             HStack {
                 ControlGroup {
                     Button("Mark In") { model.markIn = model.markAnalysisTime() }
-                        .help("Mark In at the playhead (I)")
+                        .help("Mark range start (I)")
                     Button("Mark Out") { model.markOut = model.markAnalysisTime() }
-                        .help("Mark Out at the playhead (O)")
+                        .help("Mark range end (O)")
                 }
                 .fixedSize()
                 Spacer()
                 Button("Clear") { model.markIn = nil; model.markOut = nil }
-                    .help("Clear Marks (⌥X or Esc)")
+                    .help("Clear marks (⌥X / Esc)")
                     .disabled(model.displayedMarkIn == nil && model.displayedMarkOut == nil)
             }
             if model.displayedMarkIn != nil || model.displayedMarkOut != nil {
@@ -346,34 +362,54 @@ struct MulticamEditorView: View {
             HStack {
                 Button("Add to Assembly", action: model.addMarkedRange)
                     .fixedSize()
-                    .help("Add the marked range to the assembly (⌥⌘A).")
+                    .help("Add range to assembly (⌥⌘A)")
                     .disabled(!model.canAddMarkedRange)
                 Button("Queue", action: model.enqueueMarkedRange)
                     .fixedSize()
                     .accessibilityLabel("Queue Range")
-                    .help("Add the marked range to the export queue (⇧⌘A).")
+                    .help("Queue marked range (⇧⌘A)")
                     .disabled(!model.canEnqueueMarkedRange)
                 Spacer(minLength: 0)
                 Button("Remove", systemImage: "trash", role: .destructive, action: model.deleteSelectedRange)
                     .labelStyle(.iconOnly)
-                    .help("Remove the marked range from the assembly")
+                    .help("Remove range from assembly")
                     .accessibilityLabel("Remove Marked Range")
                     .disabled(!model.canDeleteSelectedRange)
             }
             Divider().padding(.vertical, 2)
+            SectionHeading("Assets")
+            StillAuthoringControls(rows: model.multicamStillRows, enabled: !model.isBusy,
+                                   canReplace: model.canReplaceMulticamPicture, canInsert: true,
+                                   replace: model.chooseReplaceMulticamPicture, insert: model.chooseInsertMulticamStill,
+                                   manage: model.manageMulticamStill)
+            ForEach(model.multicamStillRows) { row in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(row.title).font(.callout)
+                    Text(row.details).font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Divider().padding(.vertical, 2)
             SectionHeading("Assembly")
             VStack(spacing: 2) {
-                ForEach(Array(model.ranges.enumerated()), id: \.offset) { index, range in
+                ForEach(Array(model.assemblyItems.enumerated()), id: \.offset) { index, item in
                     let selected = model.selectedOccurrence == index
                     Button {
                         model.selectOccurrence(index)
                     } label: {
                         HStack {
-                            Text("Range \(index + 1)").fontWeight(selected ? .semibold : .regular)
+                            Text(item.still.flatMap { still in project.stillAssets.first(where: { $0.id == still.assetID })?.displayName }
+                                 ?? "Range \(index + 1)").fontWeight(selected ? .semibold : .regular)
                             Spacer()
-                            Text("\(timelineTime(range.from.seconds, milliseconds: true)) – \(timelineTime(range.to.seconds, milliseconds: true))")
-                                .font(.system(size: 12, design: .monospaced))
-                                .foregroundStyle(selected ? .primary : .secondary)
+                            if let range = item.group {
+                                Text("\(timelineTime(range.from.seconds, milliseconds: true)) – \(timelineTime(range.to.seconds, milliseconds: true))")
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundStyle(selected ? .primary : .secondary)
+                            } else if let still = item.still {
+                                Text("\(timelineTime(still.duration.seconds, milliseconds: true))")
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundStyle(selected ? .primary : .secondary)
+                            }
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
@@ -383,10 +419,10 @@ struct MulticamEditorView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(selected ? [.isSelected] : [])
+                    .help("Select assembly item")
                 }
             }
-            if model.ranges.indices.contains(model.selectedOccurrence) {
-                let range = model.ranges[model.selectedOccurrence]
+            if let range = model.assemblyRange(at: model.selectedOccurrence) {
                 MulticamTimeField(label: "Range Start", value: range.from) { text in
                     model.parseTime(text) { model.changeOccurrence(from: $0) }
                 }
@@ -394,22 +430,24 @@ struct MulticamEditorView: View {
                     model.parseTime(text) { model.changeOccurrence(to: $0) }
                 }
                 MulticamRangeActions(model: model, preview: model.preview)
+            }
+            if model.assemblyItems.indices.contains(model.selectedOccurrence) {
                 HStack {
                     ControlGroup {
                         Button("Earlier", systemImage: "arrow.up") { model.moveOccurrence(-1) }
                             .disabled(model.selectedOccurrence == 0)
-                            .help("Move this range earlier in the assembly")
+                            .help("Move range earlier")
                         Button("Later", systemImage: "arrow.down") { model.moveOccurrence(1) }
-                            .disabled(model.selectedOccurrence >= model.ranges.count - 1)
-                            .help("Move this range later in the assembly")
+                            .disabled(model.selectedOccurrence >= model.assemblyItems.count - 1)
+                            .help("Move range later")
                     }
                     .fixedSize()
                     Spacer()
                     Button("Remove", systemImage: "trash", role: .destructive, action: model.removeOccurrence)
                         .labelStyle(.iconOnly)
-                        .help("Remove this range from the assembly")
+                        .help("Remove assembly item")
                         .accessibilityLabel("Remove Range")
-                        .disabled(project.assembly == nil)
+                        .disabled(project.assemblyItems == nil)
                 }
             }
         }
@@ -437,6 +475,7 @@ struct MulticamEditorView: View {
                 Text(model.status).lineLimit(1).help(model.status)
                 Spacer(minLength: 8)
                 Button("Cancel", action: model.cancel)
+                    .help("Cancel current operation")
             } else {
                 if model.project != nil {
                     Button {
@@ -447,7 +486,7 @@ struct MulticamEditorView: View {
                               systemImage: "waveform")
                     }
                     .popover(isPresented: $presentation.pauseControls, arrowEdge: .top) { MulticamPauseControls(model: model) }
-                    .help("Find quiet ranges in the routed program audio and open pause editing controls.")
+                    .help("Find and edit pauses")
                     if model.canStepAnalysis(.silence) {
                         HStack(spacing: 0) {
                             StatusIconButton(title: "Previous Silence", symbol: "chevron.left",
@@ -457,21 +496,33 @@ struct MulticamEditorView: View {
                         }
                     }
                     StatusBarDivider()
-                    if model.analysis.isScanning(.scenes) {
-                        Button("Cancel Scene Scan") { model.cancelAnalysis(.scenes) }
+                    if let progress = model.analysis.sceneProgress {
+                        ProgressView(value: progress).frame(width: 72)
+                            .accessibilityLabel("Scene analysis progress")
+                        Text(progressPercent(progress)).monospacedDigit()
+                        Button("Cancel Scene Scan", action: model.analysis.cancelSceneAnalysisFromEditor)
+                            .help("Cancel scene scan")
                     } else {
-                        Button {
-                            model.scanAnalysis(.scenes)
+                        Menu {
+                            MulticamFindSceneCommands(model: model)
                         } label: {
-                            Label("Scan for Scenes", systemImage: "viewfinder")
+                            Label("Find Scenes", systemImage: "viewfinder")
                         }
-                        .disabled(!model.canScanAnalysis(.scenes))
-                        .help("Find scene cuts in the background and enable scene navigation.")
+                        .disabled(!model.analysis.canScanScenes(camera: nil))
+                        .help("Find camera scene changes")
+                        .task(id: model.analysis.sceneInspectionKey(camera: nil)) {
+                            await model.analysis.inspectSceneChoices(camera: nil)
+                        }
                     }
                     MulticamSceneStatus(model: model, preview: model.preview)
                     if model.analysis.status != nil || !model.sourceIndexProgress.isEmpty || !model.status.isEmpty {
                         StatusBarDivider()
                     }
+                    // The tier of the saved program, as the editor's status bar shows it for a file timeline.
+                    MulticamTierBadge(model: model)
+                }
+                if let issue = model.mediaRefreshIssues.values.sorted().first {
+                    Label("Media refresh", systemImage: "exclamationmark.triangle").help(issue)
                 }
                 if let analysis = model.analysis.status {
                     Text(analysis).lineLimit(1).help(analysis)
@@ -489,7 +540,7 @@ struct MulticamEditorView: View {
     }
 
     private var reportSheet: some View {
-        EditorSheet(title: "Multicam Export Plan", message: "The checked plan for this export. Nothing has been written.") {
+        EditorSheet(title: "Multicam Export Plan", message: "Review the settings before you export.") {
             ScrollView {
                 Text(model.report ?? "")
                     .font(.system(size: 11, design: .monospaced))
@@ -504,8 +555,10 @@ struct MulticamEditorView: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(model.report ?? "", forType: .string)
             }
+            .help("Copy report as JSON")
             Spacer()
             Button("Done") { showingReport = false }.keyboardShortcut(.defaultAction)
+                .help("Close export report")
         }
         .frame(width: 660, height: 480)
     }
@@ -575,10 +628,13 @@ private struct MulticamRangeActions: View {
         HStack {
             Button("Trim Start") { model.trimOccurrence(.start) }
                 .disabled(!model.canTrimOccurrence)
+                .help("Trim start to playhead")
             Button("Trim End") { model.trimOccurrence(.end) }
                 .disabled(!model.canTrimOccurrence)
+                .help("Trim end to playhead")
             Button("Split", action: model.splitOccurrence)
                 .disabled(!model.canCutOccurrence)
+                .help("Split assembly range")
         }
     }
 }
@@ -596,7 +652,7 @@ private struct MulticamSceneStatus: View {
                 .monospacedDigit()
                 .lineLimit(1)
                 .disabled(!model.canRenameCurrentView)
-                .help("Rename this view across all matching scenes")
+                .help("Rename matching scene views")
         }
     }
 }
@@ -650,6 +706,19 @@ private struct MulticamTimelineHost: View {
                          snapTarget: Binding(get: { model.analysis.snapTarget }, set: model.setAnalysisSnap),
                          jump: { model.preview.pause(); model.seekGroup($0) },
                          markIn: model.markIn, markOut: model.markOut, assemblySelection: model.assemblySelection,
+                         showGroupAssets: !model.assemblyPreview,
+                         groupStillFrames: model.groupStillFrames,
+                         dropGroupStills: { urls, group in
+                             guard !model.isBusy else { return }
+                             if NSEvent.modifierFlags.contains(.option), urls.count == 1, let url = urls.first,
+                                model.canReplaceMulticamPicture {
+                                 model.replaceMulticamPicture(with: url)
+                             } else if let time = model.assemblyPosition(for: group) {
+                                 model.insertMulticamStills(urls, atAssembly: time)
+                             } else {
+                                 model.fail("This group position is outside the assembled ranges. Drop the still on the assembly timeline.")
+                             }
+                         },
                          assembly: model.assemblyPreview || inspectingAssembly
                             ? MulticamAssemblyTimeline(model: model, preview: preview) : nil)
         if model.rangeTool && !model.isBusy { timeline.selectRange = model.selectGroupRange }
@@ -684,7 +753,7 @@ struct MulticamTransport: View {
             cameras: cameras,
             addRange: .init(title: "Add Marked Range to Export Queue", enabled: model.canEnqueueMarkedRange,
                             perform: model.enqueueMarkedRange),
-            split: .init(title: "Split Assembly Range at Playhead", enabled: model.canCutOccurrence,
+            split: .init(title: "Split Assembly Item at Playhead", enabled: model.canCutOccurrence,
                          perform: model.splitOccurrence),
             delete: .init(title: model.deleteTitle, enabled: model.canDeleteSelection, perform: model.deleteSelection),
             undo: .init(title: model.undoTitle, enabled: !model.isBusy && !model.undoStack.isEmpty, perform: model.undo),
@@ -696,13 +765,14 @@ struct MulticamTransport: View {
             preview: preview
         ) {
             Picker("Preview", selection: Binding(get: { model.assemblyPreview }, set: model.setAssemblyPreview)) {
-                Text("Group").tag(false)
-                Text("Assembly").tag(true)
+                Text("Group").help("Preview entire group").tag(false)
+                Text("Assembly").help("Preview assembly").tag(true)
             }
             .labelsHidden()
             .pickerStyle(.segmented)
             .controlSize(.small)
             .fixedSize()
+            .help("Choose preview timeline")
         }
         .disabled(model.isBusy)
     }
@@ -729,7 +799,7 @@ private struct MulticamTimeField: View {
                     commit(text)
                     text = value.description
                 }
-                .help("\(timelineTime(value.seconds, milliseconds: true)) · exact seconds; press Return to apply")
+                .help("Edit \(label.lowercased()) in seconds")
             Text("s").foregroundStyle(.secondary)
         }
         .onAppear { text = value.description }
@@ -750,6 +820,7 @@ private struct MulticamNameField: View {
             .onChange(of: name) { _, name in if !editing { text = name } }
             .onChange(of: editing) { _, editing in if !editing { save() } }
             .onSubmit { save(); editing = false }
+            .help("Rename source")
     }
 
     private func save() {
@@ -768,12 +839,13 @@ private struct MulticamSourceTrackPicker: View {
           Picker("Camera microphone", selection: $stream) {
             Text("None assigned").tag(nil as Int?)
             ForEach(media?.audio ?? [], id: \.stream.index) { audio in
-                Text("Stream \(audio.stream.index) · \(audio.stream.codec)").tag(Optional(audio.stream.index))
+                Text(audio.stream.exportLabel).tag(Optional(audio.stream.index))
             }
             if let stream, !(media?.audio.contains { $0.stream.index == stream } ?? false) {
                 Text("Stream \(stream) (unavailable)").tag(Optional(stream))
             }
           }
+          .help("Choose camera microphone")
         }
     }
 }
@@ -782,7 +854,7 @@ private struct MulticamSourceTrackPicker: View {
 private func audioOptions(_ sources: [MulticamSource], media: [String: MediaInfo]) -> some View {
     ForEach(sources, id: \.id) { source in
         ForEach(media[source.id]?.audio ?? [], id: \.stream.index) { audio in
-            Text("\(source.displayName) · stream \(audio.stream.index) · \(audio.stream.codec)")
+            Text("\(source.displayName) · \(audio.stream.exportLabel)")
                 .tag(Optional(MulticamAudioSelection(source: source.id, stream: audio.stream.index)))
         }
     }
@@ -826,6 +898,7 @@ private struct MulticamAudioPolicyControl: View {
         })) {
             ForEach(Policy.allCases, id: \.self) { option in Text(option.rawValue).tag(option) }
           }
+          .help("Choose soundtrack policy")
         }
         if let selection {
             InspectorRow("Master track", labelWidth: labelWidth) {
@@ -835,6 +908,7 @@ private struct MulticamAudioPolicyControl: View {
                         Text("\(selection.source) · stream \(selection.stream) (unavailable)").tag(Optional(selection))
                     }
                 }
+                .help("Choose fixed audio track")
             }
         }
     }
@@ -850,7 +924,7 @@ private struct MulticamSetupSheet: View {
 
     var body: some View {
         EditorSheet(title: model.project == nil ? "Set Up Multicam" : "Add Multicam Sources",
-                    message: "Name each source and set the camera order. Cameras 1–9 switch with the number keys.") {
+                    message: "Name the sources and arrange the cameras. Press 1–9 to switch cameras.") {
             ScrollView {
                 VStack(spacing: 6) {
                     ForEach(drafts.indices, id: \.self) { index in
@@ -862,11 +936,14 @@ private struct MulticamSetupSheet: View {
                             TextField("Source name", text: Binding(get: { drafts[index].source.displayName }, set: {
                                 drafts[index].source.name = $0
                             }))
+                                .help("Rename source")
                             ControlGroup {
                                 Button("Move Up", systemImage: "chevron.up") { drafts.swapAt(index, index - 1) }
                                     .disabled(index == 0)
+                                    .help("Move camera earlier")
                                 Button("Move Down", systemImage: "chevron.down") { drafts.swapAt(index, index + 1) }
                                     .disabled(index == drafts.count - 1)
+                                    .help("Move camera later")
                             }
                             .fixedSize()
                         }
@@ -882,6 +959,7 @@ private struct MulticamSetupSheet: View {
                         Picker("Opening camera", selection: $opening) {
                             ForEach(drafts.filter { $0.media.hasVideo }) { Text($0.source.displayName).tag($0.id) }
                         }
+                        .help("Choose first camera")
                     }
                     MulticamAudioPolicyControl(audio: Binding(get: { audio }, set: { audio = $0; customizedAudio = true }),
                                                sources: drafts.map(\.source),
@@ -892,11 +970,13 @@ private struct MulticamSetupSheet: View {
         } actions: {
             Spacer()
             Button("Cancel") { model.dismissSetup(ifCurrent: setupID) }.keyboardShortcut(.cancelAction)
+                .help("Cancel multicam setup")
             Button(model.project == nil ? "Create Multicam" : "Add Sources") {
                 model.confirmSetup(drafts: drafts, opening: opening, audio: audio, ifCurrent: setupID)
             }
             .keyboardShortcut(.defaultAction)
             .disabled(model.isBusy)
+            .help(model.project == nil ? "Create multicam group" : "Add sources to group")
         }
         .frame(width: 520)
         .background(MulticamSetupWindowBinding(model: model, setupID: setupID))
@@ -953,15 +1033,31 @@ private struct MulticamExportControls: View {
     private var selectionRanges: [MulticamRange]? {
         model.exportProgram == .selection ? model.selectedExportRanges : nil
     }
+    private var stillScope: ExportPlacementScope {
+        guard let document = model.stillExportDocument(wholeGroup: wholeGroup, selection: selectionRanges) else { return .none }
+        return (try? document.exportPlacementScope()) ?? .none
+    }
     @State private var checkedConversion: Conversion?
+    @State private var pendingBoundary: StillBoundaryAdjustment?
 
     init(model: MulticamEditorModel, project: MulticamProject) {
         self.model = model
         self.project = project
         // Re-encode has its own section below, so the Mode control starts from a copying mode.
-        let preferred = model.preferences.defaultExportMode
-        _choices = State(initialValue: MulticamExportChoices(entry: .multicamSheet,
-                                                            preferred: preferred == .encode ? ExportRules.defaultMode(for: .multicam) : preferred))
+        // A failed check moves the inspector to the switch it names. Coming back, the offers still on show are about
+        // the mode that failed, so the control reopens on it rather than on the preference.
+        let preferred = model.unavailableExportMode ?? model.preferences.defaultExportMode
+        var initial = MulticamExportChoices(entry: .multicamSheet,
+            preferred: preferred == .encode ? ExportRules.defaultMode(for: .multicam) : preferred)
+        let selection = model.exportProgram == .selection ? model.selectedExportRanges : nil
+        let document = model.stillExportDocument(wholeGroup: model.exportProgram == .group, selection: selection)
+        initial.placements = (try? document?.exportPlacementScope()) ?? .none
+        if initial.placements != .none {
+            initial.mode = model.unavailableExportMode ?? .smart
+            initial.container = document?.stillFormat?.container ?? "mov"
+            initial.settle()
+        }
+        _choices = State(initialValue: initial)
     }
 
     private struct Conversion: Equatable {
@@ -977,7 +1073,9 @@ private struct MulticamExportControls: View {
                    settings: ReencodeSettings(codec: choices.codec, audio: choices.audio))
     }
     /// The copying modes of the Mode control. Re-encode is requested from its own section.
-    private var copyModes: [ExportMode] { choices.modes.filter { $0 != .encode } }
+    private var copyModes: [ExportMode] {
+        choices.placements == .none ? choices.modes.filter { $0 != .encode } : choices.modes
+    }
 
     var body: some View {
         SectionHeading("Export")
@@ -987,59 +1085,140 @@ private struct MulticamExportControls: View {
                 Text("Whole group").tag(MulticamExportProgram.group)
                 Text("Selected range").tag(MulticamExportProgram.selection)
             }
+            .help("Choose program to export")
         }
         InspectorRow("Tracks") {
             Picker("Tracks", selection: $choices.tracks) {
                 let silent = project.audio == .none && project.switches.allSatisfy { $0.audio == nil }
                 ForEach(ExportTracks.allCases, id: \.self) {
-                    Text(MulticamExportChoices.title(of: $0, silentProject: silent)).tag($0)
+                    Text(MulticamExportChoices.title(of: $0, silentProject: silent, placements: choices.placements)).tag($0)
                 }
             }
+            .help("Choose output tracks")
         }
         if copyModes.count > 1 {
             InspectorRow("Mode") {
-                Picker("Mode", selection: $choices.mode) {
+                Picker("Mode", selection: Binding(get: { effectiveMode }, set: { choices.mode = $0 })) {
                     ForEach(copyModes, id: \.self) { Text(choices.title(of: $0)).tag($0) }
                 }
+                .help("Choose export mode")
             }
         }
         InspectorRow("Container") {
             Picker("Container", selection: $choices.container) {
-                ForEach(choices.containers(mode: tracks == .all ? nil : .copy), id: \.self) { Text(containerDisplayName($0)).tag($0) }
+                ForEach(choices.containers(mode: choices.placements == .none && tracks != .all ? .copy : nil), id: \.self) { Text(containerDisplayName($0)).tag($0) }
+            }
+            .help("Choose file format")
+        }
+        if choices.placements != .none && tracks != .audio {
+            InspectorRow("Camera") {
+                Toggle("Preserve camera picture", isOn: $choices.requireCameraCopy)
+                    .help("Copy camera footage")
             }
         }
-        let sourceIssue = model.exportSourceIssue(tracks: tracks, wholeGroup: wholeGroup, selection: selectionRanges)
+        if choices.placements != .none && effectiveMode == .encode && tracks != .audio {
+            InspectorRow("Video") {
+                Picker("Video", selection: $choices.codec) {
+                    ForEach(ReencodeCodec.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                }
+                .help("Choose video codec")
+            }
+            InspectorRow("Quality") {
+                Picker("Quality", selection: choices.codec == .prores ? $choices.proResQuality : $choices.standardQuality) {
+                    ForEach(choices.qualities, id: \.self) { Text($0.displayName).tag($0) }
+                }
+                .help("Set video quality")
+            }
+        }
+        if choices.placements != .none && tracks != .video && (effectiveMode == .smart || effectiveMode == .encode) {
+            InspectorRow("Audio") {
+                Picker("Audio", selection: $choices.audio) {
+                    let actions = tracks == .audio ? ExportRules.stillSoundConversions : ExportRules.stillMovieAudioActions
+                    ForEach(actions, id: \.self) { Text($0.displayName).tag($0) }
+                }
+                .help("Choose audio encoding")
+            }
+        }
+        let sourceIssue = model.exportSourceIssue(tracks: tracks, wholeGroup: wholeGroup, mode: effectiveMode,
+                                                  settings: choices.settings, selection: selectionRanges)
         if let sourceIssue {
             IssueLabel(sourceIssue)
         }
         HStack {
             Button("Check Export") { checkExport() }
-                .help("Plan this export and show the report without writing a file.")
+                .help("Check export settings")
             Spacer()
-            Button("Export…") { chooseDestination(mode: effectiveMode, tracks: tracks) }
+            Button("Export…") {
+                chooseDestination(mode: effectiveMode, tracks: tracks, settings: choices.settings)
+            }
                 .buttonStyle(.borderedProminent)
+                .help("Export multicam program")
         }
         .disabled(sourceIssue != nil)
+        .onChange(of: stillScope) { previous, scope in
+            choices.placements = scope
+            if scope != .none && previous == .none { choices.mode = .smart }
+            if scope == .none && choices.mode == .encode { choices.mode = ExportRules.defaultMode(for: .multicam) }
+        }
         .onChange(of: choices) { _, _ in
+            if choices.placements == .insertion && choices.tracks == .audio && choices.effectiveMode == .encode,
+               ![ReencodeAudio.pcm, .aac].contains(choices.audio) {
+                choices.audio = .pcm
+            }
             choices.settle()
             model.exportAlternatives = []
+            model.stillExportBoundaryChoices = []
+            pendingBoundary = nil
+        }
+        .onChange(of: project) { _, _ in
+            model.stillExportBoundaryChoices = []
+            pendingBoundary = nil
         }
         // An unavailable export offers what the export rules report for it, least destructive first.
         if !model.exportAlternatives.isEmpty {
             ExportOffersView(message: "This export is unavailable. These alternatives work.", alternatives: model.exportAlternatives) {
                 choices.apply($0)
                 // Re-encode is requested from its own section, so the Mode control keeps a copying mode.
-                if $0.mode == .encode { choices.mode = ExportRules.defaultMode(for: .multicam) }
+                if choices.placements == .none && $0.mode == .encode {
+                    choices.mode = ExportRules.defaultMode(for: .multicam)
+                }
+            }
+        }
+        if !model.stillExportBoundaryChoices.isEmpty {
+            ForEach(Array(model.stillExportBoundaryChoices.enumerated()), id: \.offset) { _, choice in
+                Button(choice.reviewDescription) {
+                    pendingBoundary = choice
+                    if choice.clock == "group" {
+                        model.seekGroup(choice.adjustedTime)
+                    } else {
+                        model.seekAssembly(at: choice.adjustedTime, scrubbing: false)
+                    }
+                }
+                .help("Preview verified boundary")
+            }
+            if let pendingBoundary {
+                Button("Apply to Timeline") {
+                    model.applyStillExportBoundary(pendingBoundary)
+                    self.pendingBoundary = nil
+                }
+                .help("Apply reviewed boundary")
+            }
+        }
+        // An unsafe edge of an assembly range offers its verified times. Applying one moves that edge.
+        if let suggestion = model.currentEdgeSuggestion {
+            MulticamEdgeSuggestionsView(suggestion: suggestion, preview: { model.seekGroup($0) }) {
+                model.applyEdgeSuggestion($0)
             }
         }
 
-        if choices.modes.contains(.encode) {
+        if choices.placements == .none && choices.modes.contains(.encode) {
             Divider().padding(.vertical, 2)
             SectionHeading(choices.title(of: .encode))
             InspectorRow("Video") {
                 Picker("Video", selection: $choices.codec) {
                     ForEach(ReencodeCodec.allCases, id: \.self) { Text($0.displayName).tag($0) }
                 }
+                .help("Choose video codec")
             }
             InspectorRow("Audio") {
                 Picker("Audio", selection: $choices.audio) {
@@ -1047,28 +1226,28 @@ private struct MulticamExportControls: View {
                         Text($0.displayName).tag($0)
                     }
                 }
+                .help("Choose audio encoding")
             }
             let conversionIssue = sourceIssue.flatMap { _ in
                 model.exportSourceIssue(tracks: .all, wholeGroup: wholeGroup, mode: .encode, settings: conversion.settings, selection: selectionRanges)
             }
             HStack {
                 Button("Check \(choices.title(of: .encode))") { checkConversion() }
-                    .help("A re-encode must pass this check before it can be exported.")
+                    .help("Check encoder settings")
                 Spacer()
                 Button("Export Re-encoded…") {
                     chooseDestination(mode: .encode, tracks: .all, settings: conversion.settings)
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(checkedConversion != conversion)
-                .help(checkedConversion == conversion ? "Export with these re-encode settings"
-                                                      : "Choose Check \(choices.title(of: .encode)) first.")
+                .help(checkedConversion == conversion ? "Export re-encoded program" : "Check encoder settings first")
             }
             .disabled(conversionIssue != nil)
         }
         Divider().padding(.vertical, 2)
         SectionHeading("Source Audio")
         Button("Replace Source Audio…", action: model.chooseReplacementAudio)
-            .help("Use one soundtrack for the whole multicam program.")
+            .help("Replace program soundtrack")
             .disabled(!model.canReplaceSourceAudio)
     }
 
@@ -1079,7 +1258,9 @@ private struct MulticamExportControls: View {
     }
 
     private func checkExport() {
-        model.export(output: checkDestination, mode: effectiveMode, tracks: tracks, dryRun: true, wholeGroup: wholeGroup, selection: selectionRanges)
+        model.export(output: checkDestination, mode: effectiveMode, tracks: tracks, dryRun: true, wholeGroup: wholeGroup,
+                     settings: choices.settings, selection: selectionRanges,
+                     requireCameraCopy: choices.placements != .none && choices.requireCameraCopy)
     }
 
     private func checkConversion() {
@@ -1097,9 +1278,10 @@ private struct MulticamExportControls: View {
         panel.nameFieldStringValue = "Multicam.\(container)"
         let wholeGroup = wholeGroup
         let selection = selectionRanges
+        let requireCameraCopy = choices.placements != .none && choices.requireCameraCopy
         ProjectPanels.present(panel, in: model.window) { [weak model] accepted in
             guard accepted, let output = panel.url else { return }
-            model?.export(output: output, mode: mode, tracks: tracks, dryRun: false, wholeGroup: wholeGroup, settings: settings, selection: selection)
+            model?.export(output: output, mode: mode, tracks: tracks, dryRun: false, wholeGroup: wholeGroup, settings: settings, selection: selection, requireCameraCopy: requireCameraCopy)
         }
     }
 }

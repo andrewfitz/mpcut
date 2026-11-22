@@ -53,6 +53,25 @@
         </dict>
         <dict>
             <key>CFBundleTypeName</key>
+            <string>Still Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.jpeg</string>
+                <string>public.jpeg-xl</string>
+                <string>public.avif</string>
+                <string>org.webmproject.webp</string>
+                <string>public.heif</string>
+                <string>public.heic</string>
+                <string>public.png</string>
+                <string>public.tiff</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
             <string>MPCut Project</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>

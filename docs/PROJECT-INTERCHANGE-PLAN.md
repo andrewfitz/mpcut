@@ -14,6 +14,12 @@ I found no documented workflow in which MPCut can repeatedly overwrite an open n
 
 Local verification covered native Resolve project and timeline archives, native Premiere projects and FCPXML interchange. Final Cut Pro was unavailable for a native library round trip. Live editing remains deferred. [Resolve verification](RESOLVE-VERIFICATION.md) · [Premiere verification and limitations](PREMIERE.md)
 
+### Stills in project conversion
+
+- A `.cut` copy preserves the typed still placements and relative media references in the current state and retained history.
+- FCPXML and FCPXML bundles can represent opaque SDR JPEG, PNG and TIFF inserts with centered Fit or Fill at the destination frame cadence. Each insert is a primary-storyline video item linked to the original image, with its own exact duration and no audio component. The following recording starts after that interval. This mapping works for a sequence, multicam assembly with retained group ranges, or a still-only sequence with a declared canvas. MPCut metadata retains placement identity, asset identity, and the source fingerprint when the receiving tool preserves that metadata. [Apple’s FCPXML DTD](https://developer.apple.com/documentation/professional-video-applications/document-type-definition)
+- Replace Picture placements, unsupported insert framing, color, format or timing, and stills in Premiere and Resolve archive conversion require explicit conversion-loss approval. Approved omission removes an insert and its silent interval or restores the original picture under a replacement. Resolve timeline handoff reports unsupported placements before writing. The Final Cut Pro library route uses FCPXML and requires a host import to verify playback.
+
 ## Shared converter design
 
 1. **Define the MPCut document.** A `.cut` JSON document identifies its format, schema version and kind. Sequence and multicam edits use the same extension. A separate `.cutdb` SQLite file holds disposable analysis for each source. CLI render requests remain a separate input. [Project examples](../README.md)

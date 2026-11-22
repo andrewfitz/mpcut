@@ -86,6 +86,7 @@ final class EditorModelTests: XCTestCase {
         XCTAssertNotNil(model.sceneProgress)
         XCTAssertFalse(model.canStepScenes)
         model.cancelSceneAnalysis()
+        try await waitForSceneScan(model)
         XCTAssertTrue(model.canScanScenes)
         XCTAssertFalse(model.canStepScenes)
         model.scanForScenes()
@@ -113,6 +114,54 @@ final class EditorModelTests: XCTestCase {
         model.endSession()
         XCTAssertTrue(model.scenesBySource.isEmpty)
         XCTAssertTrue(model.viewNamesBySource.isEmpty)
+    }
+
+    @MainActor
+    func testSelectedSceneScanKeepsItsClipAndScopeAcrossSelectionAndHistory() async throws {
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "Scene-Cadence-Change", withExtension: "mov",
+                                                     subdirectory: "Fixtures"))
+        let model = EditorModel()
+        defer { model.endSession() }
+        model.useAnalysisSidecars = false
+        model.importFiles([fixture])
+        try await waitForEdit(model)
+
+        model.snapTarget = .off
+        model.seek(1.0)
+        model.split()
+        try await waitForEdit(model)
+        XCTAssertEqual(model.timelineClips.count, 2)
+        let selected = try XCTUnwrap(model.timelineClips.last)
+        let other = try XCTUnwrap(model.timelineClips.first)
+        model.select(selected.id)
+        let bounds = try XCTUnwrap(model.mcpOccurrence(selected.id))
+        model.scanForScenes(clipID: selected.id)
+        model.select(other.id)
+        try await waitForSceneScan(model)
+
+        XCTAssertEqual(model.sceneCoverage[selected.id.uuidString]?.requested, .range(start: bounds.start, end: bounds.end))
+        XCTAssertNil(model.sceneReport(clipID: other.id))
+        XCTAssertNil(model.sceneReports[selected.sourceID])
+        let report = try XCTUnwrap(model.sceneReport(clipID: selected.id)?.1)
+        XCTAssertEqual(report.scenes.first?.start, bounds.start)
+        XCTAssertEqual(report.scenes.last?.end, bounds.end)
+
+        model.undo()
+        try await waitForEdit(model)
+        XCTAssertNil(model.sceneOverlaysByClip[selected.id])
+        model.redo()
+        try await waitForEdit(model)
+        XCTAssertEqual(model.sceneOverlaysByClip[selected.id]?.from, bounds.start.seconds)
+        XCTAssertEqual(model.sceneOverlaysByClip[selected.id]?.to, bounds.end.seconds)
+    }
+
+    @MainActor
+    private func waitForSceneScan(_ model: EditorModel) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while model.sceneProgress != nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertNil(model.sceneProgress)
     }
 
     @MainActor
@@ -467,6 +516,14 @@ final class EditorModelTests: XCTestCase {
         XCTAssertEqual(clips.map { Int(($0.sourceEnd / frame).rounded()) }, [4, 7, 10])
         XCTAssertEqual(clips.compactMap { $0.displayRange }.map { Int(($0.from.seconds / frame).rounded()) }, [0, 4, 7])
         XCTAssertEqual(clips.compactMap { $0.displayRange }.map { Int(($0.to.seconds / frame).rounded()) }, [4, 7, 12])
+
+        let middle = clips[1].id
+        for (edge, frameIndex) in [(TimelineEdge.start, 2), (.end, 9), (.start, 3), (.end, 8)] {
+            XCTAssertNotNil(model.trim(middle, edge: edge, sourceTime: Double(frameIndex) * frame, commit: true))
+        }
+        let display = try XCTUnwrap(model.timelineClips[1].displayRange)
+        XCTAssertEqual(display.from.seconds, 2 * frame, accuracy: 1e-9)
+        XCTAssertEqual(display.to.seconds, 9 * frame, accuracy: 1e-9)
     }
 
     @MainActor
@@ -1164,6 +1221,9 @@ final class EditorModelTests: XCTestCase {
         model.snapTarget = .off
         let trimmed = try XCTUnwrap(model.trim(first.id, edge: .start, sourceTime: 2.2, commit: true))
         model.snapTarget = .scenes
+        XCTAssertEqual(model.pointerTarget(offset + 0.005, tolerance: 0.01), offset, accuracy: 1e-9)
+        let movedScene = offset + secondCut - trimmed
+        XCTAssertEqual(model.pointerTarget(movedScene - 0.005, tolerance: 0.01), movedScene, accuracy: 1e-9)
         model.seek(offset + 0.05)
         model.setOut()
         XCTAssertEqual(try XCTUnwrap(model.markOut), offset + secondCut - trimmed, accuracy: 1e-9)
@@ -1227,6 +1287,7 @@ final class EditorModelTests: XCTestCase {
         model.seek(1.0)
         model.split()
         model.dismissNotice()
+        try await waitForSceneScan(model)
         XCTAssertNil(model.sceneProgress)
         XCTAssertTrue(model.canScanScenes)
 
@@ -1266,7 +1327,8 @@ final class EditorModelTests: XCTestCase {
     func testMixedBatchKeepsCompatibleClipsAndReportsFailuresInDropOrder() async throws {
         let source = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
                                                      subdirectory: "Fixtures"))
-        let incompatible = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
+        // A movie in another format now joins the timeline as a mixed one. A sound-only recording never does.
+        let incompatible = try XCTUnwrap(Bundle.module.url(forResource: "Gapless-Crop", withExtension: "mp3",
                                                            subdirectory: "Fixtures"))
         let missing = source.deletingLastPathComponent().appendingPathComponent("missing.mov")
         let model = EditorModel()

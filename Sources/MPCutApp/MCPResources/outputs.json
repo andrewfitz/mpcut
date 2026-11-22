@@ -82,7 +82,7 @@
   },
   {
     "name": "render_project",
-    "description": "Check or render an unsaved timeline snapshot using the native export planner. Read the job with live_job_status. A completed preflight can report eligible false with a structured issue. Ordinary copy preflight can offer verified boundaries and export alternatives.",
+    "description": "Check or render a live sequence or multicam snapshot. Use mode copy to remux compatible streams. Poll live_job_status. When preflight reports eligible false, inspect result.alternatives for verified modes and containers. Ordinary copy preflight can also offer revised boundaries.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -121,9 +121,13 @@
             "audio"
           ]
         },
+        "requireCameraCopy": {
+          "type": "boolean",
+          "description": "Require zero encoded camera duration when generating stills."
+        },
         "mode": {
           "type": "string",
-          "description": "Defaults to the native movie preference for full-track movies and copy for a single track type or audio-only sources.",
+          "description": "Defaults to Smart Trim for visible still picture. Other outputs use the native defaults.",
           "enum": [
             "smart",
             "copy",
@@ -187,7 +191,7 @@
   },
   {
     "name": "apply_export_review",
-    "description": "Recompute the native ordinary timeline lossless-copy boundary proposal for this output extension and apply it as one undoable edit. Use render_project with dryRun first.",
+    "description": "Apply one verified boundary change as a native undo step. Use render_project with dryRun first. For a still-bearing timeline supply the exact still adjustment from its camera-copy preflight.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -204,6 +208,36 @@
           "type": "string",
           "minLength": 1,
           "description": "Unique operation identifier; repeat the exact request after a lost reply."
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["smart", "copy"],
+          "description": "Mode used to review the still boundary. Defaults to smart."
+        },
+        "tracks": {
+          "type": "string",
+          "enum": ["all", "video"],
+          "description": "Tracks used to review the still boundary. Defaults to all."
+        },
+        "audio": {
+          "type": "string",
+          "enum": ["auto", "copy", "aac", "pcm", "remove"],
+          "description": "Sound action used to review the still boundary."
+        },
+        "stillAdjustment": {
+          "type": "object",
+          "description": "Exact adjustment from result.issue.stillBoundaryAdjustments for a whole-timeline dry run with requireCameraCopy.",
+          "properties": {
+            "placementID": {"type": "string", "minLength": 1},
+            "boundary": {"type": "string", "enum": ["start", "end", "insertion"]},
+            "clock": {"type": "string", "enum": ["source", "group", "sequence", "assembly"]},
+            "occurrenceID": {"type": "string", "minLength": 1},
+            "requestedTime": {"type": "object", "properties": {"numerator": {"type": "integer"}, "denominator": {"type": "integer", "minimum": 1}}, "required": ["numerator", "denominator"], "additionalProperties": false},
+            "adjustedTime": {"type": "object", "properties": {"numerator": {"type": "integer"}, "denominator": {"type": "integer", "minimum": 1}}, "required": ["numerator", "denominator"], "additionalProperties": false},
+            "durationChange": {"type": "object", "properties": {"numerator": {"type": "integer"}, "denominator": {"type": "integer", "minimum": 1}}, "required": ["numerator", "denominator"], "additionalProperties": false}
+          },
+          "required": ["placementID", "boundary", "clock", "requestedTime", "adjustedTime", "durationChange"],
+          "additionalProperties": false
         },
         "output": {
           "type": "string",
@@ -256,6 +290,10 @@
             "video",
             "audio"
           ]
+        },
+        "requireCameraCopy": {
+          "type": "boolean",
+          "description": "Require zero encoded camera duration when generating stills."
         },
         "mode": {
           "type": "string",
@@ -317,7 +355,7 @@
   },
   {
     "name": "export_review_frames",
-    "description": "Export a full-resolution still at the playhead, or a manifest and JPEGs to a new directory. Explicit times use source time on the active ordinary clip and group time on multicam. Playhead, explicit times and switches on multicam sample all angles. Poll live_job_status for the count of written frames and unavailable angle samples.",
+    "description": "Export review JPEGs from the live editor. Still and playhead selections sample the program when still placements exist. Supply space to sample exact program times. With no space, times follow native source or multicam group and angle review.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -350,6 +388,11 @@
             "scenes",
             "nonSilent"
           ]
+        },
+        "space": {
+          "type": "string",
+          "enum": ["sequence", "group", "assembly"],
+          "description": "Select the program clock for still, playhead or explicit time samples. Omit for the native source and angle review modes."
         },
         "times": {
           "type": "array",

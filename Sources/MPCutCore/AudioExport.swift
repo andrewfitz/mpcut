@@ -123,7 +123,7 @@ public struct AudioExportEngine: Sendable {
                 sources.append((selected, sound))
             } catch let issue as CutError where issue.code != "cancelled" {
                 throw CutError(code: issue.code, message: issue.message, segment: offset + 1,
-                               boundary: issue.boundary, nearest: issue.nearest, track: issue.track)
+                               boundary: issue.boundary, nearest: issue.nearest, track: issue.track).because(issue.reason)
             }
         }
 
@@ -150,6 +150,7 @@ public struct AudioExportEngine: Sendable {
                 throw CutError(code: "audio_copy_unavailable",
                                message: "Exact audio copy could not be verified. \(issue.message)",
                                segment: issue.segment, boundary: issue.boundary, nearest: issue.nearest, track: issue.track)
+                    .because(issue.factor)
             }
         }
 
@@ -213,6 +214,7 @@ public struct AudioExportEngine: Sendable {
             } catch let issue as CutError where issue.code != "cancelled" {
                 throw CutError(code: issue.code, message: issue.message, segment: offset + 1,
                                boundary: issue.boundary, nearest: issue.nearest, track: issue.track ?? sound.stream.index)
+                    .because(issue.reason)
             }
         }
         return (lane, duration)
@@ -223,7 +225,7 @@ public struct AudioExportEngine: Sendable {
             .resolveConvertedSound(lane, duration: duration, container: container, action: action) { issue, index in
                 guard issue.code != "cancelled", issue.code != "source_changed" else { return issue }
                 return CutError(code: issue.code, message: issue.message, segment: index + 1, boundary: issue.boundary,
-                                nearest: issue.nearest, track: issue.track ?? lane[index].stream)
+                                nearest: issue.nearest, track: issue.track ?? lane[index].stream).because(issue.reason)
             }
         let streams = sources.map(\.audio.stream)
         let resampled = !plan.warnings.isEmpty

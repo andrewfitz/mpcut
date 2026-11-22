@@ -244,7 +244,8 @@ final class ExportFallbackTests: XCTestCase {
             return ExportFallback.find(after: options, clips: clips, media: [file: media], containers: choices, useSidecar: false)
         }
         let lossless = try XCTUnwrap(try offer(flac, "flac", packetAligned: true))
-        XCTAssertEqual(lossless.title, "Copy to MKA (lossless)")
+        XCTAssertEqual(lossless.title, "Copy to \(ExportRules.containerDisplayName("mka")) (lossless)")
+        XCTAssertEqual(ExportRules.containerDisplayName("mka"), "Matroska Audio (.mka)")
         XCTAssertEqual(lossless.options.effectiveMode, .copy)
         XCTAssertEqual(lossless.options.container, "mka")
         // Cuts inside FLAC frames cannot be copied. Re-encoding FLAC returns the same samples.

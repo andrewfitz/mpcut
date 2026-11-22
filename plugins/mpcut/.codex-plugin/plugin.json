@@ -1,0 +1,19 @@
+{
+  "name": "mpcut",
+  "version": "0.1.0",
+  "author": { "name": "MPCut" },
+  "description": "Review and edit open MPCut timelines on your Mac.",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "MPCut",
+    "shortDescription": "Review footage, cut timelines and export from MPCut.",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "List my open MPCut timelines and tell me which have unsaved edits.",
+      "Show me the picture at the playhead in MPCut.",
+      "Check whether my current MPCut timeline can export without re-encoding."
+    ]
+  }
+}

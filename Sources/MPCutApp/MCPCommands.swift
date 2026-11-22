@@ -15,6 +15,12 @@ extension ProjectSessions {
         guard let session else {
             throw MCPCommandError("project_required", "Supply the project handle returned by list_projects.")
         }
+        if let result = try await mcpStills(tool: tool, arguments: arguments, session: session, checkAccess: checkAccess) {
+            return result
+        }
+        if tool == "split_at", let result = try session.mcpSplitInlineStill(arguments: arguments, checkAccess: checkAccess) {
+            return result
+        }
         if tool == "review_frame" {
             return try await mcpReviewFrame(arguments: arguments, session: session, checkAccess: checkAccess)
         }

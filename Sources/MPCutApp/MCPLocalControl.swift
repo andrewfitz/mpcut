@@ -88,7 +88,9 @@ final class MCPLocalControl {
     private static func errorData(_ error: Error) -> Data {
         let failure = error as? MCPFailure ?? (error as? CutError).map { MCPFailure($0.code, $0.message) }
             ?? (error is CancellationError ? cancelled() : MCPFailure("operation_failed", error.localizedDescription))
-        return (try? JSONSerialization.data(withJSONObject: ["error": ["code": failure.code, "message": failure.message]])) ?? Data()
+        var fields: [String: Any] = ["code": failure.code, "message": failure.message]
+        if let ids = (error as? CutError)?.placementIDs { fields["placementIDs"] = ids }
+        return (try? JSONSerialization.data(withJSONObject: ["error": fields])) ?? Data()
     }
 
     private func receive(_ data: Data, generation token: UUID) async -> Data {
@@ -334,14 +336,16 @@ final class MCPLocalControl {
             else { unavailable[tool] = modal ? "The project window has an open sheet." : reason }
         }
         if session.isMulticam {
-            let model = session.multicam, ranges = model.ranges, ends = model.assemblyRangeEnds
-            guard ends.count == ranges.count else { throw MCPFailure("invalid_result", "The assembly timeline is inconsistent.") }
-            result["total"] = ranges.count
+            let model = session.multicam, items = model.assemblyItems, ends = model.assemblyRangeEnds
+            guard ends.count == items.count else { throw MCPFailure("invalid_result", "The assembly timeline is inconsistent.") }
+            result["total"] = items.count
             result["busy"] = model.isBusy
             if let notice = model.notice { result["notice"] = ["title": notice.title, "message": notice.message] }
             result["playhead"] = model.preview.currentTime().description
             result["clock"] = model.assemblyPreview ? "assembly" : "group"
-            result["groupTime"] = model.currentGroupTime().description
+            if !model.assemblyPreview || model.assemblyStill(at: model.activeOccurrenceIndex) == nil {
+                result["groupTime"] = model.currentGroupTime().description
+            }
             result["playing"] = model.preview.isPlaying
             result["selectedOccurrence"] = model.selectedOccurrence
             result["selectedSwitch"] = model.selectedSwitch?.description
@@ -351,11 +355,7 @@ final class MCPLocalControl {
             result["rangeTool"] = model.rangeTool
             result["snap"] = model.analysis.snapTarget.rawValue
             result["angles"] = model.project?.angles.map { ["id": $0.id, "name": $0.name ?? URL(fileURLWithPath: $0.file).lastPathComponent] } ?? []
-            result["occurrences"] = page(ranges.count).map { i -> [String: Any] in
-                let start = i == 0 ? RationalTime.zero : ends[i - 1]
-                return ["index": i, "groupFrom": ranges[i].from.description, "groupTo": ranges[i].to.description,
-                        "assemblyFrom": start.description, "assemblyTo": ends[i].description]
-            }
+            result["occurrences"] = model.mcpAssemblyRows(in: page(items.count))
             let idle = model.project != nil && !model.isBusy && model.notice == nil
             let canEdit = idle && model.setup.isEmpty
             result["canEdit"] = canEdit && !modal
@@ -369,12 +369,15 @@ final class MCPLocalControl {
             capability("scan_analysis", idle && canScan, "No available scan.")
             capability("save_analysis_sidecars", idle && model.canSaveSidecars, "An indexed source and an idle editor are required.")
         } else {
-            let model = session.editor, clips = model.sequenceClips, timeline = model.timelineClips
+            let model = session.editor, clips = model.sequenceClips, timeline = model.timelineClips.filter { !$0.isStill }
             let offsets = model.mcpSequenceOffsets
             guard clips.count == timeline.count, clips.count == offsets.count else {
                 throw MCPFailure("invalid_result", "The sequence timeline is inconsistent.")
             }
-            result["total"] = clips.count
+            let inserts = try session.mcpStillProject?.mcpStillOccurrences() ?? []
+            let entriesByIndex = Dictionary(uniqueKeysWithValues: inserts.map { ($0.index, $0) })
+            let total = clips.count + inserts.count
+            result["total"] = total
             result["busy"] = model.isBusy
             if let notice = model.alert { result["notice"] = ["title": notice.title, "message": notice.message] }
             let canEdit = model.canEdit && !model.mcpHasActiveTrim
@@ -384,19 +387,28 @@ final class MCPLocalControl {
             result["playhead"] = model.playhead
             result["clock"] = "sequence"
             result["snap"] = model.effectiveSnapTarget.rawValue
-            result["selectedClip"] = model.selectedID?.uuidString
+            result["selectedClip"] = model.mcpSelectedItemID
             result["markIn"] = model.markIn
             result["markOut"] = model.markOut
             result["markSpace"] = "sequence"
             result["rangeTool"] = model.rangeTool
             var entries = [[String: Any]]()
-            for i in page(clips.count) {
+            let window = page(total)
+            var i = window.lowerBound - inserts.prefix { $0.index < window.lowerBound }.count
+            for index in window {
+                if let card = entriesByIndex[index] {
+                    entries.append(["id": card.insert.id, "type": "still", "placement": card.insert.id,
+                                    "asset": card.insert.assetID, "sequenceFrom": card.from.description,
+                                    "sequenceTo": card.to.description])
+                    continue
+                }
                 let clip = clips[i], start = offsets[i]
                 let end = try start.adding(clip.to.subtracting(clip.from))
-                entries.append(["id": timeline[i].id.uuidString, "documentID": clip.id, "file": clip.file,
+                entries.append(["id": timeline[i].id.uuidString, "type": "source", "documentID": clip.id, "file": clip.file,
                                 "sourceID": timeline[i].sourceID.uuidString, "name": timeline[i].name,
                                 "sourceFrom": clip.from.description, "sourceTo": clip.to.description,
                                 "sequenceFrom": start.description, "sequenceTo": end.description])
+                i += 1
             }
             result["clips"] = entries
             capability("seek", canNavigate, "A navigable preview is required.")
@@ -407,6 +419,15 @@ final class MCPLocalControl {
             let canScan = model.canScanSilence || model.canScanScenes || model.sceneProgress != nil || model.silenceProgress != nil
             capability("scan_analysis", canEdit && canScan, "No available scan.")
             capability("save_analysis_sidecars", canEdit && model.canSaveAnalysisSidecars, "An indexed source and an idle editor are required.")
+        }
+        capability("list_stills", session.mcpStillProject != nil, "Open a timeline to list still placements.")
+        for tool in ["add_still", "update_still", "remove_still", "relink_still"] {
+            capability(tool, session.mcpCanEditStills, "An editable picture timeline is required.")
+        }
+        if let project = session.mcpStillProject, project.mcpHasStills || project.programColorPolicy != nil {
+            let stills = try project.mcpStillList(location: session.mcpStillLocation, offset: offset, limit: limit)
+            result["stills"] = stills
+            result["programColorPolicy"] = stills["programColorPolicy"]
         }
         result["availableOperations"] = available
         result["unavailableOperations"] = unavailable

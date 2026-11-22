@@ -165,6 +165,42 @@ private struct IndexHeader: Codable {
 private enum IndexCodingError: Error { case invalid }
 enum SidecarIndexDetail { case preview, summary, analysis, audio, full }
 
+private struct CachedSceneClock: Codable {
+    let format: String
+    let duration: RationalTime
+    let origin: RationalTime
+    let video: IndexStream
+    let changedSeconds: Int
+    let changedNanoseconds: Int
+}
+
+extension AnalysisSidecar {
+    // A scene-only sidecar can resolve later ranges and resumes without
+    // opening the media or storing the editor's complete packet index.
+    static let sceneClockKey = "scene.clock.v1"
+
+    static func encodeSceneClock(_ media: MediaInfo) throws -> Data? {
+        guard let video = media.videoStream, !media.hasProvisionalClock,
+              media.multicamClockOffset == .zero, let change = media.identity.changeTime else { return nil }
+        return try PropertyListEncoder().encode(CachedSceneClock(format: media.format, duration: media.duration,
+                                                                 origin: media.origin, video: IndexStream(video),
+                                                                 changedSeconds: change.seconds,
+                                                                 changedNanoseconds: change.nanoseconds))
+    }
+
+    func loadSceneClock(cancelled: () -> Bool) -> MediaInfo? {
+        guard let change = identity.changeTime,
+              let data = read(Self.sceneClockKey, cancelled: cancelled),
+              let clock = try? PropertyListDecoder().decode(CachedSceneClock.self, from: data),
+              clock.changedSeconds == change.seconds, clock.changedNanoseconds == change.nanoseconds,
+              clock.duration > .zero, clock.video.value.kind == "video",
+              clock.video.value.index >= 0, clock.video.value.timeBase > .zero else { return nil }
+        return MediaInfo(url: source, format: clock.format, duration: clock.duration, origin: clock.origin,
+                         streams: [clock.video.value], frames: [], audio: [], copyIssue: nil,
+                         sourceStartSafe: false, identity: identity, videoIndex: 0, metadataOnly: true)
+    }
+}
+
 // Unsigned LEB128 and zigzag integers retain the exact rational values without
 // storing repeated field names, padding, or a second timestamp when PTS == DTS.
 private struct IndexWriter {
@@ -310,7 +346,11 @@ extension AnalysisSidecar {
             }
         }
         try checkIndexCancellation(cancelled)
-        return ["index.v1": try encoder.encode(header), "index.frames.v1": frames, "index.audio.v1": audio]
+        var sections = ["index.v1": try encoder.encode(header), "index.frames.v1": frames, "index.audio.v1": audio]
+        if let evidence = media.refreshEvidence {
+            sections[MediaRefreshEvidence.sectionKey] = try evidence.encoded()
+        }
+        return sections
     }
 
     func loadIndex(detail: SidecarIndexDetail, progress: ((Double) -> Void)? = nil, cancelled: () -> Bool) throws -> MediaInfo? {
@@ -398,7 +438,8 @@ extension AnalysisSidecar {
                          sourceStartSafe: header.sourceStartSafe, identity: identity, videoIndex: header.videoIndex,
                          timelineIssue: header.timelineIssue, reportedContainers: suggestions,
                          metadataOnly: detail == .preview || detail == .summary || detail == .analysis,
-                         audioIssues: header.audioIssues ?? [:])
+                         audioIssues: header.audioIssues ?? [:],
+                         refreshEvidence: MediaRefreshEvidence.decode(read(MediaRefreshEvidence.sectionKey)))
     }
 }
 

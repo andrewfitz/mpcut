@@ -39,21 +39,37 @@ final class MCPAnalysisReceipt {
     private var detail: [String: Any] = [:]
     var cancelNative: (() -> Void)?
     var nativeProgress: (() -> Double?)?
+    var nativeDetail: (() -> [String: Any])?
     var cancelledDetail: (() -> [String: Any])?
+    var sceneRequest: MCPSceneRequest?
+    var sceneCoverage: (() -> [String: SceneScanProgress])?
+    fileprivate var sceneWorkerOrigin: String?
+    fileprivate var hasEditorSubscriber: Bool
+    private var sceneSubscribers: MCPSceneSubscribers?
+    private var finishedSceneSources = Set<String>()
 
     init(owner: String, revision: Int, kind: String) {
         self.owner = owner
         self.revision = revision
         self.kind = kind
+        hasEditorSubscriber = owner.isEmpty
     }
 
     func finish(_ state: String, detail: [String: Any] = [:]) {
         guard self.state == "running" else { return }
         self.state = state
-        self.detail = state == "cancelled" ? (cancelledDetail?() ?? [:]).merging(detail) { _, new in new } : detail
+        self.detail = runningDetail()
+        if state == "cancelled" {
+            self.detail.merge(cancelledDetail?() ?? [:]) { _, new in new }
+        }
+        self.detail.merge(detail) { _, new in new }
         cancelNative = nil
         nativeProgress = nil
+        nativeDetail = nil
         cancelledDetail = nil
+        sceneSubscribers?.finish(state, detail: self.detail)
+        sceneSubscribers = nil
+        sceneCoverage = nil
     }
 
     func cancel() {
@@ -62,8 +78,37 @@ final class MCPAnalysisReceipt {
         cancelNative?()
     }
 
+    func subscribe(_ receipt: MCPAnalysisReceipt, selection: MCPSceneSelection? = nil) {
+        let subscribers = sceneSubscribers ?? MCPSceneSubscribers(worker: self)
+        sceneSubscribers = subscribers
+        subscribers.add(receipt, selection: selection)
+        if let selection, finishedSceneSources.contains(selection.source) {
+            subscribers.finishSources([selection.source])
+        }
+    }
+
+    func finishSceneSources(_ ids: [String]) {
+        finishedSceneSources.formUnion(ids)
+        sceneSubscribers?.finishSources(ids)
+    }
+
+    func cancelFromEditor() {
+        if owner.isEmpty {
+            guard hasEditorSubscriber else { return }
+            hasEditorSubscriber = false
+            if sceneSubscribers?.hasSubscribers == true { return }
+        }
+        cancel()
+    }
+
     var snapshot: [String: Any] {
-        var result = detail
+        var result = detail.merging(runningDetail()) { _, new in new }
+        if let sceneRequest {
+            result["scope"] = sceneRequest.target == nil ? "all" : "selected"
+            result["target"] = sceneRequest.target
+            result["policy"] = sceneRequest.policyName
+            result["workerOrigin"] = sceneWorkerOrigin
+        }
         result["job"] = id
         result["inputRevision"] = revision
         result["kind"] = kind
@@ -73,6 +118,129 @@ final class MCPAnalysisReceipt {
         if let progress = nativeProgress?() { result["progress"] = progress }
         if state == "succeeded" { result["progress"] = 1.0 }
         return result
+    }
+
+    private func runningDetail() -> [String: Any] {
+        var result = nativeDetail?() ?? [:]
+        if let sceneCoverage { result["coverage"] = mcpSceneCoverage(sceneCoverage()) }
+        return result
+    }
+}
+
+struct MCPSceneSelection {
+    let source: String
+    let target: String
+    let interval: SceneScanScope?
+
+    func project(_ progress: SceneScanProgress?) -> SceneScanProgress {
+        guard case let .range(start, end)? = interval else {
+            return progress ?? SceneScanProgress(requested: .fullSource)
+        }
+        func covered(_ value: RationalTime?) -> RationalTime? {
+            guard let value, value >= start else { return nil }
+            return min(value, end)
+        }
+        let decoded = covered(progress?.decoded)
+        let confirmed = covered(progress?.confirmed)
+        let ratio = ((decoded ?? start).seconds - start.seconds) / (end.seconds - start.seconds)
+        let published = progress?.fraction == 1 && confirmed == end
+        return SceneScanProgress(requested: .range(start: start, end: end), requestedThrough: end,
+                                 decoded: decoded, confirmed: confirmed, durable: covered(progress?.durable),
+                                 fraction: published ? 1 : min(0.999, max(0, ratio)),
+                                 persistenceError: progress?.persistenceError)
+    }
+}
+
+/// A scene worker is owned by the editor. Each MCP caller owns a separate
+/// receipt and can release its own interest without cancelling another caller.
+@MainActor
+private final class MCPSceneSubscribers {
+    private weak var worker: MCPAnalysisReceipt?
+    private struct Subscription {
+        let receipt: MCPAnalysisReceipt
+        let endWork: @MainActor () -> Void
+        let selection: MCPSceneSelection?
+    }
+
+    private var subscriptions: [String: Subscription] = [:]
+    var hasSubscribers: Bool { !subscriptions.isEmpty }
+
+    init(worker: MCPAnalysisReceipt) { self.worker = worker }
+
+    func add(_ receipt: MCPAnalysisReceipt, selection: MCPSceneSelection?) {
+        guard let worker else { return }
+        subscriptions[receipt.id] = Subscription(receipt: receipt, endWork: receipt.cleanup.begin(), selection: selection)
+        receipt.sceneRequest = selection.map { MCPSceneRequest(target: $0.target, policy: .reuse, interval: $0.interval) }
+            ?? worker.sceneRequest
+        receipt.sceneWorkerOrigin = worker.owner.isEmpty ? "editor" : "mcp"
+        if let selection {
+            receipt.sceneCoverage = { [weak worker] in
+                [selection.target: selection.project(worker?.sceneCoverage?()[selection.source])]
+            }
+            receipt.nativeProgress = { [weak receipt] in
+                min(0.999, receipt?.sceneCoverage?()[selection.target]?.fraction ?? 0)
+            }
+        } else {
+            receipt.nativeProgress = { [weak worker] in worker?.nativeProgress?() }
+            receipt.nativeDetail = { [weak worker] in worker?.nativeDetail?() ?? [:] }
+            receipt.sceneCoverage = { [weak worker] in worker?.sceneCoverage?() ?? [:] }
+        }
+        receipt.cancelNative = { [weak self, weak receipt] in
+            guard let self, let receipt else { return }
+            self.remove(receipt)
+        }
+    }
+
+    func finishSources(_ ids: [String]) {
+        let completed = subscriptions.values.filter { item in
+            item.selection.map { ids.contains($0.source) } ?? false
+        }
+        for subscription in completed {
+            subscriptions.removeValue(forKey: subscription.receipt.id)
+            let target = subscription.selection?.target
+            subscription.receipt.finish("succeeded", detail: ["sources": target.map { [$0] } ?? []])
+            subscription.endWork()
+        }
+        if !completed.isEmpty, subscriptions.isEmpty, worker?.hasEditorSubscriber == false {
+            worker?.cancel()
+        }
+    }
+
+    private func remove(_ receipt: MCPAnalysisReceipt) {
+        guard let worker else { return }
+        if subscriptions.count == 1 && !worker.hasEditorSubscriber {
+            // The final MCP subscriber stays attached until the flush has
+            // reported its actual durable coverage.
+            worker.cancel()
+        } else if let subscription = subscriptions.removeValue(forKey: receipt.id) {
+            receipt.finish("cancelled")
+            subscription.endWork()
+        }
+    }
+
+    func finish(_ state: String, detail: [String: Any]) {
+        let subscriptions = Array(subscriptions.values)
+        self.subscriptions.removeAll()
+        for subscription in subscriptions {
+            let item = subscription.receipt
+            if let selection = subscription.selection {
+                let sources = detail["sources"] as? [String] ?? []
+                var subset = detail
+                subset["coverage"] = nil
+                subset["sources"] = sources.contains(selection.source) ? [selection.target] : []
+                item.finish(state, detail: subset)
+            } else {
+                item.finish(state, detail: detail)
+            }
+        }
+        if let cleanup = worker?.cleanup, cleanup.pending {
+            Task {
+                await cleanup.wait()
+                for subscription in subscriptions { subscription.endWork() }
+            }
+        } else {
+            for subscription in subscriptions { subscription.endWork() }
+        }
     }
 }
 

@@ -16,9 +16,18 @@ extension MulticamEditorModel {
         guard canReplaceSourceAudio,
               let indexed = media[selection.source], indexed.hasFullEditIndex,
               indexed.audio.contains(where: { $0.stream.index == selection.stream }) else { return false }
+        guard soundtrackIsCurrent(indexed) else { return false }
         let replaced = edit("Replace Program Audio") { $0.replaceProgramAudio(with: selection) }
         if replaced { status = "Updated the multicam soundtrack." }
         return replaced
+    }
+
+    private func soundtrackIsCurrent(_ indexed: MediaInfo) -> Bool {
+        guard (try? SourceIdentity(indexed.url)) == indexed.identity else {
+            fail("The soundtrack changed or moved after indexing. Choose the recording again.")
+            return false
+        }
+        return true
     }
 
     func chooseExternalSoundtrack(onFailure: @escaping (String) -> Void,
@@ -27,8 +36,9 @@ extension MulticamEditorModel {
         let panel = NSOpenPanel()
         panel.title = "Choose External Soundtrack"
         panel.prompt = "Choose"
+        let generation = mcpGeneration
         ProjectPanels.present(panel, in: window, fromSheet: true) { [weak self] accepted in
-            guard let self, accepted, let url = panel.url else { return }
+            guard let self, self.mcpGeneration == generation, accepted, let url = panel.url else { return }
             self.indexExternalSoundtrack(url, onFailure: onFailure, onIndexed: onIndexed)
         }
     }
@@ -70,6 +80,14 @@ extension MulticamEditorModel {
     func replaceProgramAudio(with selection: MulticamAudioSelection, external: SourceDraft) -> Bool {
         guard canReplaceSourceAudio, selection.source == external.id,
               external.media.audio.contains(where: { $0.stream.index == selection.stream }) else { return false }
+        guard soundtrackIsCurrent(external.media) else { return false }
+        if let existing = project?.sources.first(where: { $0.id == external.id }) {
+            guard URL(fileURLWithPath: existing.file).standardizedFileURL == external.media.url.standardizedFileURL,
+                  media[existing.id].map({ $0.identity == external.media.identity }) ?? true else {
+                fail("This project recording changed. Relink the source before replacing its soundtrack.")
+                return false
+            }
+        }
         cacheIndexedSource(external.media, ordinary: external.ordinaryMedia)
         let replaced = edit("Replace Program Audio") { project in
             if !project.sources.contains(where: { $0.id == external.id }) {
@@ -99,7 +117,7 @@ struct MulticamReplacementAudioView: View {
 
     var body: some View {
         EditorSheet(title: "Replace Source Audio",
-                    message: "Choose one soundtrack for the multicam program. It replaces the audio selected at individual switches.") {
+                    message: "Use the same soundtrack across camera switches. This replaces any audio choices you made at those switches.") {
             Form {
                 Picker("Source stream", selection: $selection) {
                     Text("Select a recording and stream").tag(nil as MulticamAudioSelection?)
@@ -111,6 +129,7 @@ struct MulticamReplacementAudioView: View {
                     }
                 }
                 .disabled(model.isBusy)
+                .help("Choose soundtrack stream")
             }
             if model.isBusy {
                 ProgressView("Indexing external soundtrack…")
@@ -125,7 +144,7 @@ struct MulticamReplacementAudioView: View {
                     selection = draft.source.audioStream.map { .init(source: draft.id, stream: $0) }
                 }
             }
-            .help("Choose audio from a movie or audio recording")
+            .help("Browse for soundtrack file")
             .disabled(model.isBusy)
             Spacer()
             Button("Cancel") {
@@ -133,6 +152,7 @@ struct MulticamReplacementAudioView: View {
                 model.isReplacementAudioPresented = false
             }
             .keyboardShortcut(.cancelAction)
+            .help("Cancel soundtrack replacement")
             Button("Use Soundtrack") {
                 guard let selection else { return }
                 let replaced: Bool
@@ -147,6 +167,7 @@ struct MulticamReplacementAudioView: View {
             .disabled(model.isBusy || selection.map { choice in
                 !streams(for: choice.source).contains(where: { $0.index == choice.stream })
             } ?? true)
+                .help("Apply selected soundtrack")
         }
         .frame(width: 500)
     }

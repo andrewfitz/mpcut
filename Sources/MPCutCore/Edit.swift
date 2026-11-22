@@ -9,12 +9,24 @@ public struct CutError: Error, LocalizedError, Codable, Sendable {
     public let nearest: [RationalTime]?
     public let track: Int?
     public let multicam: MulticamDiagnostic?
+    public let placementIDs: [String]?
     public var multicamAt: RationalTime? { multicam?.at }
     /// The exports that work instead, least destructive first. Set by the front end from `ExportPlanner`.
     public var alternatives: [ExportAlternative]? = nil
+    public var stillBoundaryAdjustments: [StillBoundaryAdjustment]? = nil
+    /// The timeline tier factor this failure stands for, when the throw site names one. `factor` also covers the rest.
+    public var reason: TierFactorID? = nil
+
+    /// The same failure, named as a tier factor.
+    func because(_ reason: TierFactorID?) -> CutError {
+        var named = self
+        named.reason = reason ?? self.reason
+        return named
+    }
 
     public init(code: String, message: String, segment: Int? = nil, boundary: String? = nil,
-                nearest: [RationalTime]? = nil, track: Int? = nil, multicam: MulticamDiagnostic? = nil) {
+                nearest: [RationalTime]? = nil, track: Int? = nil, multicam: MulticamDiagnostic? = nil,
+                placementIDs: [String]? = nil) {
         self.code = code
         self.message = message
         self.segment = segment
@@ -22,6 +34,7 @@ public struct CutError: Error, LocalizedError, Codable, Sendable {
         self.nearest = nearest
         self.track = track
         self.multicam = multicam
+        self.placementIDs = placementIDs
     }
 
     public var errorDescription: String? { message }
@@ -98,6 +111,7 @@ public struct ResolvedSegment: Codable, Sendable {
     var lastVideoFrame: RationalTime?
     let reachesEnd: Bool
     var multipleDescriptions = false
+    var generatedStill = false
     var videoDecodeTimes: [RationalTime] = []
     package var sourceClipIndex: Int? = nil
     public internal(set) var encodedEdges: [EncodedEdge]? = nil
@@ -117,6 +131,7 @@ public struct ResolvedEdit: Encodable, Sendable {
     public internal(set) var tracks: ExportTracks = .all
     public internal(set) var audioStream: Int? = nil
     var usesPerSourceAudioStream = false
+    var stillMasteringDisplay: [UInt32] = []
 
     enum CodingKeys: String, CodingKey { case segments, duration, container }
 

@@ -1,7 +1,7 @@
 [
   {
     "name": "analysis_state",
-    "description": "Read native scene and silence scan progress, issues, current settings and a bounded page of analyzed source IDs and absolute audio stream indices.",
+    "description": "Read scene and silence scan status, scene coverage, current scene selection, media refresh status and issues, settings, and a bounded page of source IDs and audio streams.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -51,7 +51,7 @@
   },
   {
     "name": "list_scenes",
-    "description": "Read one analyzed source’s scenes, exact source-relative boundaries and recurring view names.",
+    "description": "Read exact source-relative scene boundaries and recurring views for a source or a sequence clip.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -69,13 +69,33 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 500
+        },
+        "clip": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Sequence occurrence ID. Read the report that covers the clip’s current source interval."
+        },
+        "includeStale": {
+          "type": "boolean",
+          "description": "Prefer the archived report from a prior source generation when available. Archived rows carry their stale reason and original source stamp."
         }
       },
       "required": [
-        "project",
-        "source"
+        "project"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "source"
+          ]
+        },
+        {
+          "required": [
+            "clip"
+          ]
+        }
+      ]
     }
   },
   {
@@ -116,7 +136,7 @@
   },
   {
     "name": "scan_analysis",
-    "description": "Start native background scene or silence analysis or rescan completed silence. Poll analysis_job_status using the returned job ID. An existing GUI scan returns its origin.",
+    "description": "Start native background scene or silence analysis. Scene scans default to all sources with reuse. Poll analysis_job_status using the returned job ID.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -136,6 +156,28 @@
             "scenes",
             "silence"
           ]
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "all",
+            "selected"
+          ],
+          "description": "Scene scope. All scans every referenced recording. Selected scans a sequence clip’s source interval or a multicam recording."
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Clip UUID from get_editor_state or camera ID from get_multicam. Applies to selected scope and defaults to the current editor selection."
+        },
+        "policy": {
+          "type": "string",
+          "enum": [
+            "reuse",
+            "resume",
+            "restart"
+          ],
+          "description": "Reuse returns current results or resumes unfinished analysis. Resume prefers a saved replacement attempt. Restart begins a replacement identified by operationID."
         }
       },
       "required": [
@@ -424,7 +466,7 @@
   },
   {
     "name": "analysis_job_status",
-    "description": "Return the state, original revision, progress when available, and terminal details for a retained native analysis or sidecar job.",
+    "description": "Read a retained scene, silence, sidecar save or media refresh job. Scene jobs include requested, decoded, confirmed and durable source coverage as available.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -444,7 +486,7 @@
   },
   {
     "name": "analysis_job_cancel",
-    "description": "Request cancellation of this specific MCP-started scan or sidecar save. Poll analysis_job_status for its terminal state.",
+    "description": "Request cancellation of this specific MCP-started scan, sidecar save or media refresh. Poll analysis_job_status for its terminal state.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -494,6 +536,35 @@
         "project",
         "source",
         "stream"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "refresh_project_media",
+    "description": "Check indexed project recordings and refresh changed sources using the native editor. Poll analysis_job_status for updated sources and review issues.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string"
+        },
+        "deep": {
+          "type": "boolean",
+          "description": "Verify stream content even when the file stamp is unchanged."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID"
       ],
       "additionalProperties": false
     }

@@ -1,4 +1,5 @@
 #include "MediaProbe.h"
+#include "codec_header.h"
 #include "scene_distance.h"
 #include "scene_reader.h"
 #include "video_clock.h"
@@ -10,8 +11,10 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/avstring.h>
+#include <CommonCrypto/CommonDigest.h>
 #include <libswscale/swscale.h>
 #include <math.h>
+#include <string.h>
 
 // Equal-area spatial samples compare color and composition without decoding a
 // full-resolution RGB image. Hardware NV12/P010 surfaces stay in shared memory.
@@ -20,6 +23,29 @@ typedef struct {
     _Alignas(16) uint8_t planes[CHANNELS][W * H + AV_INPUT_BUFFER_PADDING_SIZE];
     int64_t pts;
 } ScenePicture;
+
+enum { DIGEST_SIZE = 32, CHECKPOINT_VERSION = 1 };
+enum { SCAN_RANGE_END = 3, SCAN_RETRY_FROM_START = 4, SCAN_RETRY_SOFTWARE = 5 };
+typedef struct {
+    int64_t position, dts;
+    bool independent;
+} ScenePacket;
+typedef struct {
+    int64_t pts, seek, ordinal;
+    uint8_t picture[DIGEST_SIZE], sequence[DIGEST_SIZE];
+} SceneAnchor;
+
+typedef struct {
+    int version, stream, tb_num, tb_den;
+    unsigned decoder_version, scaler_version;
+    int has_range, started, finished, has_leading, software;
+    int64_t start_pts, end_pts, initial_seek;
+    int64_t count, confirmed;
+    double motion, pending, last_delta;
+    ScenePicture frames[3];
+    SceneAnchor initial, previous, latest;
+    uint8_t leading[MP_SCENE_FEATURE_SIZE];
+} SceneCheckpoint;
 
 typedef struct {
     ScenePicture frames[3];
@@ -31,6 +57,14 @@ typedef struct {
     MPSceneVisit visit;
     MPProbeCancelled cancelled;
     void *context;
+    const MPSceneScanOptions *options;
+    MPSceneCheckpointVisit checkpoint;
+    CC_SHA256_CTX sha;
+    SceneCheckpoint saved;
+    SceneAnchor replay;
+    const SceneAnchor *replay_anchor;
+    int64_t replay_count;
+    bool restoring;
 } Scan;
 
 static double distance(const ScenePicture *a, const ScenePicture *b)
@@ -140,6 +174,13 @@ done:
     return ret;
 }
 
+static void start_range(Scan *scan)
+{
+    if (scan->saved.started || !scan->saved.has_leading) return;
+    scan->saved.started = 1;
+    scan->visit(scan->context, MP_SCENE_RANGE_LEADING_PTS, scan->saved.leading);
+}
+
 static void emit(Scan *scan, const ScenePicture *frame)
 {
     // Average 4x4 neighborhoods for the recurring-view descriptor.
@@ -153,6 +194,15 @@ static void emit(Scan *scan, const ScenePicture *frame)
                         sum += frame->planes[c][(4*y+j)*W+4*x+k];
                 layout[(y*(W/4)+x)*3+c] = sum/16;
             }
+    if (scan->saved.has_range) {
+        if (frame->pts < scan->saved.start_pts || scan->count == 0) {
+            memcpy(scan->saved.leading, layout, sizeof(layout));
+            scan->saved.has_leading = 1;
+            return;
+        }
+        if (frame->pts >= scan->saved.end_pts) return;
+        start_range(scan);
+    }
     scan->visit(scan->context, frame->pts, layout);
 }
 
@@ -183,8 +233,66 @@ static int advance(Scan *scan, ScenePicture *now)
         scan->last_delta = delta;
     }
     scan->count++;
-    if ((scan->count % 32) == 0) scan->visit(scan->context, now->pts, NULL);
+    if (!scan->checkpoint && (scan->count % 32) == 0)
+        scan->visit(scan->context, now->pts, NULL);
     return 0;
+}
+
+static void checkpoint(Scan *scan)
+{
+    if (!scan->checkpoint || scan->restoring || !scan->count ||
+        (scan->saved.has_range && !scan->saved.started)) return;
+    SceneCheckpoint *state = &scan->saved;
+    state->count = scan->count;
+    state->motion = scan->motion;
+    state->pending = scan->pending;
+    state->last_delta = scan->last_delta;
+    memcpy(state->frames, scan->frames, sizeof(scan->frames));
+    scan->checkpoint(scan->context, scan->frames[(scan->count-1)%3].pts,
+                     state->confirmed, scan->count, (const uint8_t *)state, sizeof(*state));
+}
+
+static void picture_digest(Scan *scan, const ScenePicture *picture, const AVFrame *frame,
+                           int64_t position, uint8_t digest[DIGEST_SIZE])
+{
+    const int64_t identity[] = { picture->pts, position, frame->format, frame->width, frame->height };
+    CC_SHA256_Init(&scan->sha);
+    CC_SHA256_Update(&scan->sha, (const uint8_t *)identity, sizeof(identity));
+    for (int c = 0; c < CHANNELS; c++)
+        CC_SHA256_Update(&scan->sha, picture->planes[c], W * H);
+    CC_SHA256_Final(digest, &scan->sha);
+}
+
+static void extend_anchor(Scan *scan, SceneAnchor *anchor, const uint8_t digest[DIGEST_SIZE])
+{
+    CC_SHA256_Init(&scan->sha);
+    CC_SHA256_Update(&scan->sha, anchor->sequence, DIGEST_SIZE);
+    CC_SHA256_Update(&scan->sha, digest, DIGEST_SIZE);
+    CC_SHA256_Final(anchor->sequence, &scan->sha);
+}
+
+static void begin_anchor(SceneAnchor *anchor, int64_t pts, int64_t seek, int64_t ordinal,
+                         const uint8_t digest[DIGEST_SIZE])
+{
+    *anchor = (SceneAnchor){ .pts = pts, .seek = seek, .ordinal = ordinal };
+    memcpy(anchor->picture, digest, DIGEST_SIZE);
+}
+
+static int reconcile(Scan *scan, const ScenePicture *picture, const uint8_t digest[DIGEST_SIZE])
+{
+    const SceneAnchor *anchor = scan->replay_anchor;
+    if (!scan->replay_count) {
+        if (picture->pts < anchor->pts && anchor != &scan->saved.initial) return 0;
+        if (picture->pts != anchor->pts || memcmp(digest, anchor->picture, DIGEST_SIZE))
+            return picture->pts == anchor->pts && anchor != &scan->saved.initial
+                ? 0 : MP_SCENE_RESUME_MISMATCH;
+    }
+    extend_anchor(scan, &scan->replay, digest);
+    if (++scan->replay_count < scan->count - anchor->ordinal + 1) return 0;
+    if (picture->pts != scan->frames[(scan->count-1)%3].pts ||
+        memcmp(scan->replay.sequence, anchor->sequence, DIGEST_SIZE)) return MP_SCENE_RESUME_MISMATCH;
+    scan->restoring = false;
+    return scan->saved.finished ? SCAN_RANGE_END : 0;
 }
 
 static int consume(Scan *scan, AVFrame *frame)
@@ -192,10 +300,57 @@ static int consume(Scan *scan, AVFrame *frame)
     if (scan->cancelled(scan->context)) return AVERROR_EXIT;
     // A picture without a timestamp cannot start a scene. Compare its neighbors instead.
     if (frame->best_effort_timestamp == AV_NOPTS_VALUE) return 0;
-    ScenePicture *now = &scan->frames[scan->count % 3];
+    const bool damaged = frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT);
+    const bool initial_range_seek = scan->saved.initial_seek != AV_NOPTS_VALUE &&
+        (scan->restoring ? scan->replay_anchor == &scan->saved.initial && !scan->replay_count
+                         : !scan->count);
+    if (scan->checkpoint && initial_range_seek && damaged) return 0;
+    ScenePicture replay_picture;
+    ScenePicture *now = scan->restoring ? &replay_picture : &scan->frames[scan->count % 3];
     now->pts = frame->best_effort_timestamp;
     int ret = sample(scan, frame, now);
-    return ret < 0 ? ret : advance(scan, now);
+    if (ret < 0) return ret;
+    if (!scan->checkpoint) return advance(scan, now);
+    ScenePacket packet = { .position = -1, .dts = AV_NOPTS_VALUE };
+    if (frame->opaque_ref && frame->opaque_ref->size == sizeof(packet))
+        memcpy(&packet, frame->opaque_ref->data, sizeof(packet));
+    uint8_t digest[DIGEST_SIZE];
+    picture_digest(scan, now, frame, packet.position, digest);
+    if (scan->restoring) return reconcile(scan, now, digest);
+
+    SceneCheckpoint *state = &scan->saved;
+    if (!scan->count) {
+        // If a seek landed on the far side of the requested trim, find its
+        // leading scene from the verified source start instead.
+        if (state->initial_seek != AV_NOPTS_VALUE && now->pts >= state->start_pts)
+            return SCAN_RETRY_FROM_START;
+        begin_anchor(&state->initial, now->pts, state->initial_seek, 1, digest);
+    }
+    if (scan->count && now->pts < scan->frames[(scan->count-1)%3].pts)
+        return AVERROR_INVALIDDATA;
+    // Only a seekable coded keyframe with a stable packet position can anchor
+    // replay. Retain the preceding anchor to preroll through open GOPs.
+    if (!damaged && (frame->flags & AV_FRAME_FLAG_KEY) && packet.independent) {
+        state->previous = state->latest;
+        int64_t seek = packet.dts == AV_NOPTS_VALUE ? now->pts : FFMIN(packet.dts, now->pts);
+        begin_anchor(&state->latest, now->pts, seek, scan->count + 1, digest);
+    }
+    if (!state->previous.ordinal) extend_anchor(scan, &state->initial, digest);
+    else extend_anchor(scan, &state->previous, digest);
+    if (state->latest.ordinal) extend_anchor(scan, &state->latest, digest);
+
+    const bool range_started = state->started;
+    advance(scan, now);
+    if (scan->count >= 2) state->confirmed = scan->frames[(scan->count-2)%3].pts;
+    if (state->has_range && now->pts >= state->start_pts) start_range(scan);
+    if (state->has_range && now->pts >= state->end_pts) {
+        state->confirmed = state->end_pts;
+        state->finished = 1;
+        return SCAN_RANGE_END;
+    }
+    if ((!range_started && state->started) || scan->count == 1 || scan->count % 32 == 0)
+        checkpoint(scan);
+    return 0;
 }
 
 static int consume_surface(void *context, CVPixelBufferRef surface, int64_t pts)
@@ -237,7 +392,7 @@ static int ffv1_slice_count(const AVPacket *packet, int trailer)
     return remaining == 0 ? count : 0;
 }
 
-static int open_decoder(AVCodecContext *codec, const AVCodec *decoder, const AVPacket *first)
+static int open_decoder(AVCodecContext *codec, const AVCodec *decoder, const AVPacket *first, bool software)
 {
     codec->thread_count = 2;
     if (codec->codec_id == AV_CODEC_ID_FFV1 && codec->extradata_size && first) {
@@ -257,7 +412,7 @@ static int open_decoder(AVCodecContext *codec, const AVCodec *decoder, const AVP
         if (bytes > 0 && bytes <= 8 * 1024 * 1024)
             codec->thread_count = FFMIN(av_cpu_count(), 4);
     }
-    for (int i = 0; ; ++i) {
+    for (int i = 0; !software; ++i) {
         const AVCodecHWConfig *hw = avcodec_get_hw_config(decoder, i);
         if (!hw) break;
         if (hw->device_type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX &&
@@ -279,15 +434,72 @@ static bool damaged_picture(const AVCodecContext *codec, int ret, int *hardware_
     return ++*hardware_failures <= 512;
 }
 
-int mp_scene_scan(const char *path, int index, int allow_asset_reader,
-                  MPProbeCancelled cancelled, MPSceneVisit visit,
-                  void *context, MPSceneTiming *timing, char *error, size_t capacity)
+static int prepare_checkpoint(Scan *scan, AVFormatContext *format, int index, bool seek_range, bool software)
+{
+    const AVStream *stream = format->streams[index];
+    const MPSceneScanOptions *options = scan->options;
+    SceneCheckpoint *state = &scan->saved;
+    if (stream->time_base.num <= 0 || stream->time_base.den <= 0) return AVERROR_INVALIDDATA;
+    *state = (SceneCheckpoint){
+        .version = CHECKPOINT_VERSION, .stream = index,
+        .tb_num = stream->time_base.num, .tb_den = stream->time_base.den,
+        .decoder_version = avcodec_version(), .scaler_version = swscale_version(),
+        .has_range = !!options->has_range, .start_pts = options->start_pts, .end_pts = options->end_pts,
+        .initial_seek = AV_NOPTS_VALUE, .confirmed = AV_NOPTS_VALUE, .software = software
+    };
+    int64_t seek = AV_NOPTS_VALUE;
+    if (options->resume_size) {
+        SceneCheckpoint restored;
+        if (!options->resume || options->resume_size != sizeof(restored)) return MP_SCENE_RESUME_MISMATCH;
+        memcpy(&restored, options->resume, sizeof(restored));
+        if (restored.version != state->version || restored.stream != state->stream ||
+            restored.tb_num != state->tb_num || restored.tb_den != state->tb_den ||
+            restored.decoder_version != state->decoder_version || restored.scaler_version != state->scaler_version ||
+            restored.has_range != state->has_range || restored.start_pts != state->start_pts ||
+            restored.end_pts != state->end_pts || restored.count <= 0 || restored.count == INT64_MAX ||
+            restored.initial.ordinal != 1 || restored.previous.ordinal < 0 ||
+            restored.latest.ordinal < restored.previous.ordinal || restored.latest.ordinal > restored.count ||
+            (restored.software != 0 && restored.software != 1) ||
+            !isfinite(restored.motion) || !isfinite(restored.pending) || !isfinite(restored.last_delta) ||
+            restored.pending < 0 || (restored.pending > 0 && restored.count < 2))
+            return MP_SCENE_RESUME_MISMATCH;
+        *state = restored;
+        scan->count = state->count;
+        scan->motion = state->motion;
+        scan->pending = state->pending;
+        scan->last_delta = state->last_delta;
+        memcpy(scan->frames, state->frames, sizeof(scan->frames));
+        scan->restoring = true;
+        scan->replay_anchor = state->previous.ordinal ? &state->previous : &state->initial;
+        seek = scan->replay_anchor->seek;
+    } else if (options->has_range && seek_range) {
+        // One second of detector history after the requested seek point. The
+        // demuxer seeks to a keyframe at or before that point.
+        int64_t warmup = av_rescale_q(1, (AVRational){1, 1}, stream->time_base);
+        if (options->start_pts > INT64_MIN + warmup) {
+            seek = options->start_pts - warmup;
+            if (stream->start_time != AV_NOPTS_VALUE && seek <= stream->start_time)
+                seek = AV_NOPTS_VALUE;
+        }
+        state->initial_seek = seek;
+    }
+    if (seek != AV_NOPTS_VALUE && av_seek_frame(format, index, seek, AVSEEK_FLAG_BACKWARD) < 0)
+        return scan->restoring ? MP_SCENE_RESUME_MISMATCH : SCAN_RETRY_FROM_START;
+    return 0;
+}
+
+static int scan_video(const char *path, int index, int allow_asset_reader,
+                      MPProbeCancelled cancelled, MPSceneVisit visit, void *context,
+                      MPSceneTiming *timing, const MPSceneScanOptions *options,
+                      MPSceneCheckpointVisit progress, bool seek_range, bool software,
+                      char *error, size_t capacity)
 {
     AVFormatContext *format = avformat_alloc_context();
     AVCodecContext *codec = NULL;
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
-    Scan scan = { .visit = visit, .cancelled = cancelled, .context = context };
+    Scan scan = { .visit = visit, .cancelled = cancelled, .context = context,
+                  .options = options, .checkpoint = progress };
     int64_t first_pts = INT64_MAX, last_pts = INT64_MIN, packet_end = INT64_MIN;
     bool complete_clock = true;
     int hardware_failures = 0;
@@ -320,18 +532,40 @@ int mp_scene_scan(const char *path, int index, int allow_asset_reader,
     }
     for (unsigned i = 0; i < format->nb_streams; i++)
         if (i != (unsigned)index) format->streams[i]->discard = AVDISCARD_ALL;
+    if (options && (ret = prepare_checkpoint(&scan, format, index, seek_range, software)) != 0) goto done;
     const int64_t declared_duration = stream->duration;
     const AVCodec *decoder = avcodec_find_decoder(stream->codecpar->codec_id);
     if (!decoder) { ret = AVERROR_DECODER_NOT_FOUND; goto done; }
     if (!(codec = avcodec_alloc_context3(decoder))) { ret = AVERROR(ENOMEM); goto done; }
     if ((ret = avcodec_parameters_to_context(codec, stream->codecpar)) < 0) goto done;
     codec->pkt_timebase = stream->time_base;
+    if (options) codec->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
     while (!cancelled(context)) {
         ret = av_read_frame(format, packet);
         bool eof = ret == AVERROR_EOF;
         if (ret < 0 && !eof) goto done;
         if (!eof && packet->stream_index != index) { av_packet_unref(packet); continue; }
-        if (!avcodec_is_open(codec) && (ret = open_decoder(codec, decoder, eof ? NULL : packet)) < 0)
+        ScenePacket identity = {0};
+        if (options && !eof) {
+            identity.position = packet->pos;
+            identity.dts = packet->dts;
+            identity.independent = !!(packet->flags & AV_PKT_FLAG_KEY);
+            if (codec->codec_id == AV_CODEC_ID_H264 || codec->codec_id == AV_CODEC_ID_HEVC) {
+                int multilayer = 0;
+                identity.independent = identity.independent &&
+                    mp_h26x_random_access(packet, stream->codecpar, false, &multilayer) && !multilayer;
+                // VideoToolbox may reject an entire open GOP when its first
+                // reference pictures precede the demuxer's nominal keyframe.
+                if (!identity.independent && !scan.restoring && !scan.count && !software &&
+                    scan.saved.initial_seek != AV_NOPTS_VALUE && !avcodec_is_open(codec)) {
+                    ret = SCAN_RETRY_SOFTWARE;
+                    goto done;
+                }
+            }
+            identity.independent = identity.independent && packet->pos >= 0;
+        }
+        if (!avcodec_is_open(codec) && (ret = open_decoder(codec, decoder, eof ? NULL : packet,
+                                                          scan.saved.software)) < 0)
             goto done;
         if (timing && !eof) {
             if (packet->pts == AV_NOPTS_VALUE || packet->duration <= 0 ||
@@ -342,6 +576,12 @@ int mp_scene_scan(const char *path, int index, int allow_asset_reader,
                 last_pts = FFMAX(last_pts, packet->pts);
                 packet_end = FFMAX(packet_end, packet->pts + packet->duration);
             }
+        }
+        if (options && !eof && packet->pos >= 0) {
+            av_buffer_unref(&packet->opaque_ref);
+            packet->opaque_ref = av_buffer_alloc(sizeof(identity));
+            if (!packet->opaque_ref) { ret = AVERROR(ENOMEM); goto done; }
+            memcpy(packet->opaque_ref->data, &identity, sizeof(identity));
         }
         ret = avcodec_send_packet(codec, eof ? NULL : packet);
         av_packet_unref(packet);
@@ -358,11 +598,20 @@ int mp_scene_scan(const char *path, int index, int allow_asset_reader,
             hardware_failures = 0;
             ret = consume(&scan, frame);
             av_frame_unref(frame);
-            if (ret < 0) goto done;
+            if (ret != 0) goto done;
         }
         if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) goto done;
         if (eof) {
+            if (cancelled(context)) { ret = AVERROR_EXIT; goto done; }
+            if (scan.restoring) { ret = MP_SCENE_RESUME_MISMATCH; goto done; }
             if (scan.pending > 0) emit(&scan, &scan.frames[(scan.count-1)%3]);
+            if (options && scan.count) {
+                if (scan.saved.has_range) start_range(&scan);
+                scan.pending = 0;
+                scan.saved.finished = 1;
+                scan.saved.confirmed = scan.saved.has_range ? scan.saved.end_pts
+                    : scan.frames[(scan.count-1)%3].pts;
+            }
             if (timing && complete_clock && first_pts <= last_pts) {
                 int64_t origin = stream->start_time == AV_NOPTS_VALUE ? first_pts : stream->start_time;
                 *timing = (MPSceneTiming){
@@ -378,6 +627,18 @@ int mp_scene_scan(const char *path, int index, int allow_asset_reader,
     }
     ret = AVERROR_EXIT;
 done:
+    if (ret == SCAN_RANGE_END) ret = 0;
+    if (options && (ret == 0 || ret == AVERROR_EXIT || cancelled(context))) {
+        checkpoint(&scan);
+        if (ret != 0) ret = AVERROR_EXIT;
+    } else if (scan.restoring && ret < 0) {
+        ret = MP_SCENE_RESUME_MISMATCH;
+    } else if (scan.saved.has_range && !scan.restoring && !scan.count &&
+               scan.saved.initial_seek != AV_NOPTS_VALUE &&
+               (ret == SCAN_RETRY_FROM_START || ret == AVERROR_INVALIDDATA ||
+                ret == AVERROR_EXTERNAL || ret == AVERROR_UNKNOWN)) {
+        ret = !software && codec && codec->hw_device_ctx ? SCAN_RETRY_SOFTWARE : SCAN_RETRY_FROM_START;
+    }
     if (ret < 0) av_strerror(ret, error, capacity);
     sws_freeContext(scan.scale);
     av_frame_free(&frame);
@@ -385,4 +646,32 @@ done:
     avcodec_free_context(&codec);
     avformat_close_input(&format);
     return ret;
+}
+
+int mp_scene_scan(const char *path, int index, int allow_asset_reader,
+                  MPProbeCancelled cancelled, MPSceneVisit visit,
+                  void *context, MPSceneTiming *timing, char *error, size_t capacity)
+{
+    return scan_video(path, index, allow_asset_reader, cancelled, visit, context, timing,
+                      NULL, NULL, false, false, error, capacity);
+}
+
+int mp_scene_scan_resumable(const char *path, int index, const MPSceneScanOptions *options,
+                            MPProbeCancelled cancelled, MPSceneVisit visit,
+                            MPSceneCheckpointVisit progress, void *context, char *error, size_t capacity)
+{
+    if (!options || !cancelled || !visit || !progress ||
+        (options->has_range && options->start_pts > options->end_pts)) {
+        av_strerror(AVERROR(EINVAL), error, capacity);
+        return AVERROR(EINVAL);
+    }
+    int ret = scan_video(path, index, 0, cancelled, visit, context, NULL,
+                         options, progress, true, false, error, capacity);
+    if (ret == SCAN_RETRY_SOFTWARE)
+        ret = scan_video(path, index, 0, cancelled, visit, context, NULL,
+                         options, progress, true, true, error, capacity);
+    if (ret == SCAN_RETRY_FROM_START)
+        ret = scan_video(path, index, 0, cancelled, visit, context, NULL,
+                         options, progress, false, false, error, capacity);
+    return ret == AVERROR_EXIT ? MP_SCENE_SCAN_CANCELLED : ret;
 }

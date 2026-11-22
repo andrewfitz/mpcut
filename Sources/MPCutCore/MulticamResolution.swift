@@ -39,7 +39,7 @@ extension MulticamEngine {
                                 _ candidate: Bool) throws -> MulticamExportPlan
 
     /// Codes that describe the request, the project or the destination, for which no other export helps.
-    private static let terminal: Set<String> = ["cancelled", "source_changed", "output_exists", "invalid_output", "invalid_arguments",
+    static let terminal: Set<String> = ["cancelled", "source_changed", "output_exists", "invalid_output", "invalid_arguments",
                                                 "empty_edit", "invalid_range", "invalid_time", "missing_source", "missing_audio",
                                                 "probe_failed", "time_overflow"]
 
@@ -102,18 +102,19 @@ extension MulticamEngine {
         func alternative(_ candidate: Candidate, plan: MulticamExportPlan) -> ExportAlternative {
             // A re-encode offered for a re-encode names its container and audio action.
             let variant = candidate.rung == .reencode && mode == .encode
-            let sameAudio = variant && candidate.settings.audio == settings.audio
             let request = ExportRequest(clips: [], mode: candidate.mode, tracks: tracks, container: candidate.container,
                                         audio: candidate.settings.audio, codec: candidate.settings.codec,
                                         quality: candidate.settings.quality, movieSettings: mode == .encode)
             let lossless = candidate.rung.rank.encodedScope == 0
+            let smartOtherContainer = candidate.rung == .smartTrim && candidate.container != named
+            let label = candidate.rung.label(container: candidate.container,
+                                             audio: variant || (candidate.rung == .reencode && candidate.settings.audio != .copyOriginal)
+                                                 ? candidate.settings.audio : nil,
+                                             lossless: lossless, source: .multicam)
             return ExportAlternative(
-                id: candidate.rung == .copyOtherContainer || sameAudio ? "\(candidate.rung.rawValue):\(candidate.container)" : candidate.rung.rawValue,
+                id: candidate.rung == .copyOtherContainer || variant || smartOtherContainer ? "\(candidate.rung.rawValue):\(candidate.container)" : candidate.rung.rawValue,
                 rung: candidate.rung,
-                label: candidate.rung.label(container: candidate.container,
-                                            audio: variant || (candidate.rung == .reencode && candidate.settings.audio != .copyOriginal)
-                                                ? candidate.settings.audio : nil,
-                                            lossless: lossless, source: .multicam),
+                label: smartOtherContainer ? "\(label) in \(ExportRules.containerDisplayName(candidate.container))" : label,
                 mode: candidate.mode, tracks: tracks, container: candidate.container,
                 audio: candidate.mode == .encode ? candidate.settings.audio : plan.audioAction, codec: nil, bitRate: nil, quality: nil,
                 lossless: lossless, warnings: plan.warnings, arguments: ExportRules.arguments(for: request), clips: nil)
@@ -147,13 +148,14 @@ extension MulticamEngine {
         var candidates: [Candidate] = []
         for rung in cell.rungs {
             switch rung {
-            case .copyOtherContainer:
-                for container in ExportRules.multicamListedContainers(tracks: tracks, mode: mode, codec: settings.codec)
-                where written(container) == container && container != written(named) {
-                    candidates.append(Candidate(rung: rung, mode: mode, container: container, settings: settings))
+            case .copyOtherContainer, .smartTrim:
+                let alternativeMode: ExportMode = rung == .copyOtherContainer ? .copy : .smart
+                let sameContainer = rung == .smartTrim && mode == .copy ? [named] : []
+                let containers = sameContainer + ExportRules.multicamListedContainers(tracks: tracks, mode: alternativeMode, codec: settings.codec)
+                    .filter { written($0) == $0 && $0 != written(named) }
+                for container in containers {
+                    candidates.append(Candidate(rung: rung, mode: alternativeMode, container: container, settings: settings))
                 }
-            case .smartTrim:
-                candidates.append(Candidate(rung: rung, mode: .smart, container: named, settings: settings))
             case .convertPCM, .convertAAC:
                 guard mode == .encode, ExportRules.multicamAudio(settings.audio) == .copyOriginal else { continue }
                 let audio: ReencodeAudio = rung == .convertPCM ? .pcm : .aac
@@ -178,6 +180,11 @@ extension MulticamEngine {
         var offers: [MulticamOffer] = []
         for candidate in candidates {
             if cancelled?() == true { break }
+            if candidate.rung == .smartTrim, candidate.container != named,
+               offers.contains(where: { ($0.container == named && $0.mode == .smart)
+                   || ($0.container == candidate.container && $0.mode == .copy) }) {
+                continue
+            }
             // An alternative in the requested container is planned for the requested destination.
             let destination = candidate.container == named ? output : stand.appendingPathExtension(candidate.container)
             guard let plan = planned(candidate, at: destination) else { continue }
@@ -187,6 +194,26 @@ extension MulticamEngine {
             }
             offers.append(MulticamOffer(alternative: alternative(offered, plan: plan), mode: offered.mode, tracks: tracks,
                                         container: offered.container, settings: offered.settings, plan: plan))
+        }
+        // A picture-only or sound-only program is written as a copy, and its row of the rules offers another container
+        // only. When no container takes the cut either, there is nothing to offer, so the refusal says what does help:
+        // the verified times it lists, and the export of picture and sound together when that one plans.
+        if offers.isEmpty, tracks != .all, issue.code == "unsafe_boundary" || issue.code == "invalid_frame_boundary" {
+            let together = [ExportMode.smart, .encode].first { other in
+                guard cancelled?() != true, ExportRules.cell(source: .multicam, tracks: .all, mode: other).isAllowed else { return false }
+                let fits = other == .encode ? ExportRules.multicamReencodeContainers(settings.codec) : ExportRules.multicamContainers
+                guard let container = fits.contains(named) ? named : fits.first else { return false }
+                let actions = other == .encode
+                    ? [ReencodeAudio.copyOriginal] + ExportRules.automaticAudio(codec: settings.codec, container: container, source: .multicam)
+                    : [settings.audio]
+                return actions.contains { (try? attempt(stand.appendingPathExtension(container), other, .all, with($0), true)) != nil }
+            }
+            let advice = ExportRules.multicamSingleTypeAdvice(tracks: tracks, hasNearest: !(issue.nearest ?? []).isEmpty, together: together)
+            var advised = CutError(code: issue.code, message: issue.message + " " + advice, segment: issue.segment, boundary: issue.boundary,
+                                   nearest: issue.nearest, track: issue.track, multicam: issue.multicam, placementIDs: issue.placementIDs)
+            advised.stillBoundaryAdjustments = issue.stillBoundaryAdjustments
+            advised.reason = issue.reason
+            return .unavailable(advised, offers: [])
         }
         return .unavailable(issue, offers: offers)
     }

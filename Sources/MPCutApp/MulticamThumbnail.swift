@@ -5,7 +5,7 @@ import SwiftUI
 /// One active request per recording preserves decoder seek order. A shared limit
 /// also bounds simultaneous hardware sessions doing work across project windows.
 @MainActor
-private final class MulticamThumbnailWork {
+final class MulticamThumbnailWork {
     static let shared = MulticamThumbnailWork(limit: min(4, ProcessInfo.processInfo.activeProcessorCount))
 
     private struct Waiter {
@@ -56,7 +56,7 @@ private final class MulticamThumbnailWork {
 }
 
 @MainActor
-final class MulticamThumbnailService {
+final class MulticamThumbnailService: ObservableObject {
     @MainActor
     private struct Decoder {
         let id: UUID
@@ -85,6 +85,8 @@ final class MulticamThumbnailService {
 
     let sidecarPreference = SidecarPreference()
     private static let byteLimit = 16 * 1024 * 1024
+    @Published private(set) var revisions: [URL: Int] = [:]
+    private var displayIdentity: [URL: SourceIdentity] = [:]
     private var sources: [URL: (identity: SourceIdentity, id: UUID)] = [:]
     private var decoders: [URL: Decoder] = [:]
     private var decoderOrder: [URL] = []
@@ -215,7 +217,40 @@ final class MulticamThumbnailService {
         }
     }
 
+    func displayIdentity(for media: MediaInfo) -> SourceIdentity {
+        guard sources[media.url]?.identity == media.identity else { return media.identity }
+        return displayIdentity[media.url] ?? media.identity
+    }
+
+    func accept(_ media: MediaInfo, displayChanged: Bool) {
+        let url = media.url
+        if !displayChanged, let previous = sources[url] {
+            displayIdentity[url] = displayIdentity[url] ?? previous.identity
+            sources[url] = (media.identity, previous.id)
+            decoders.removeValue(forKey: url)
+            decoderOrder.removeAll { $0 == url }
+            decoderUse[url] = nil
+            return
+        }
+        invalidate(url)
+    }
+
+    func invalidate(_ url: URL) {
+        revisions[url, default: 0] += 1
+        displayIdentity[url] = nil
+        if let id = sources.removeValue(forKey: url)?.id {
+            for key in imageOrder.filter({ $0.source == id }) { remove(key) }
+        }
+        decoders[url] = nil
+        decoderOrder.removeAll { $0 == url }
+        decoderUse[url] = nil
+        coverage[url] = nil
+    }
+
     func reset() {
+        revisions.removeAll()
+        displayIdentity.removeAll()
+
         decoderCleanup?.cancel()
         decoderCleanup = nil
         sources.removeAll()
@@ -317,7 +352,7 @@ enum MulticamFilmstrip {
 
 @MainActor
 struct MulticamThumbnail: View {
-    let service: MulticamThumbnailService
+    @ObservedObject var service: MulticamThumbnailService
     let media: MediaInfo
     let time: Double
     let size: CGSize
@@ -327,11 +362,12 @@ struct MulticamThumbnail: View {
         let url: URL
         let identity: SourceIdentity
         let indexed: Bool
+        let revision: Int
         let tile: FilmstripTileKey?
         let useAnalysisSidecars: Bool
 
         func displaysSameTile(as other: Self) -> Bool {
-            url == other.url && identity == other.identity && tile == other.tile
+            url == other.url && identity == other.identity && revision == other.revision && tile == other.tile
                 && useAnalysisSidecars == other.useAnalysisSidecars
         }
     }
@@ -339,8 +375,8 @@ struct MulticamThumbnail: View {
     @State private var loaded: (request: Request, image: CGImage)?
 
     var body: some View {
-        let request = Request(url: media.url, identity: media.identity, indexed: media.hasFullEditIndex,
-                              tile: FilmstripTileKey(time: time, size: size),
+        let request = Request(url: media.url, identity: service.displayIdentity(for: media), indexed: media.hasFullEditIndex,
+                              revision: service.revisions[media.url] ?? 0, tile: FilmstripTileKey(time: time, size: size),
                               useAnalysisSidecars: useAnalysisSidecars)
         GeometryReader { geometry in
             ZStack {
@@ -352,7 +388,7 @@ struct MulticamThumbnail: View {
                         ? CGFloat(width) / CGFloat(height) : CGFloat(loaded.image.width) / CGFloat(loaded.image.height)
                     Image(decorative: loaded.image, scale: 1)
                         .resizable()
-                        .aspectRatio(aspect, contentMode: .fit)
+                        .aspectRatio(aspect, contentMode: .fill)
                         .frame(width: geometry.size.width, height: geometry.size.height)
                 }
             }

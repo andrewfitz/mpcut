@@ -65,8 +65,11 @@ class Sidecar(unittest.TestCase):
         self.assertTrue({"wave.v1.1", "wave.v1.2", "scenes.v2", "index.v1"} <= set(result["sections"]))
         status = self.save("--status")
         self.assertEqual(result["sections"], status["sections"])
-        self.assertEqual(result["inventory"], status["inventory"])
         self.assertEqual(status["inventory"], {
+            **result["inventory"],
+            "sceneAttempts": automatic["inventory"]["sceneAttempts"],
+        })
+        self.assertEqual(result["inventory"], {
             "hasIndex": True, "hasScenes": True, "waveformStreams": [1, 2], "thumbnailCount": 0,
             "silence": automatic["inventory"]["silence"],
         })

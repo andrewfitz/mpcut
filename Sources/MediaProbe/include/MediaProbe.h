@@ -15,6 +15,8 @@ typedef struct {
     uint32_t checksum;
 } MPProbeMP3Anchor;
 
+enum { MP_PROBE_DIGEST_SIZE = 32 };
+
 typedef struct {
     const char *kind, *codec, *pixel_format;
     char codec_tag[32], channel_layout[128];
@@ -40,6 +42,9 @@ typedef struct {
     int mp3_unindexed;
     MPProbePacket *packets;
     size_t count, capacity;
+    uint8_t payload_digest[MP_PROBE_DIGEST_SIZE], timing_digest[MP_PROBE_DIGEST_SIZE];
+    uint8_t layout_digest[MP_PROBE_DIGEST_SIZE];
+    int has_payload_evidence;
 } MPProbeStream;
 
 typedef struct {
@@ -49,14 +54,37 @@ typedef struct {
     int64_t origin, end;
 } MPProbeResult;
 
+// Writes the layout two descriptions are compared by: a layout that names no speakers ("2 channels") becomes the
+// standard layout of its channel count ("stereo", "5.1"); a layout that names them is written as it is.
+// Returns 0 and writes nothing when the description cannot be read.
+int mp_canonical_channel_layout(const char *layout, int channels, char *canonical, size_t capacity);
+
 int mp_source_timecode(const char *path, int stream, int rate_num, int rate_den,
                        int64_t *units, int *scale_num, int *scale_den);
 
 typedef int (*MPProbeCancelled)(void *context);
 typedef void (*MPProbeProgress)(void *context, double fraction);
-MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only, int audio_analysis,
+MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only, int audio_analysis, int force_payload,
                             MPProbeCancelled cancelled, MPProbeProgress progress, void *context,
                             char *error, size_t error_capacity);
+typedef struct {
+    int64_t start, end;
+    int scale;
+} MPProbeHDRRange;
+typedef struct {
+    uint32_t mastering[10]; /* G, B, R, white, max/min luminance in MOV mdcv units */
+    int has_mastering, conflicting_mastering, content_light, inband_content_light;
+    int dolby_vision, hdr10plus, additional_layers;
+} MPProbeHDR;
+int mp_probe_hdr(const char *path, int stream, const MPProbeHDRRange *ranges, size_t count,
+                 MPProbeCancelled cancelled, void *context, MPProbeHDR *result,
+                 char *error, size_t capacity);
+enum {
+    MP_PROBE_SIDE_MASTERING_DISPLAY = 1,
+    MP_PROBE_SIDE_CONTENT_LIGHT = 2
+};
+int mp_probe_hdr_side_type(uint32_t type);
+
 enum { MP_SCENE_FEATURE_SIZE = 16 * 9 * 3 };
 // Layouts are packed descriptors. Returns count when none match.
 size_t mp_scene_match_view(const uint8_t *feature, const uint8_t *layouts, size_t count);
@@ -68,9 +96,32 @@ typedef struct {
     int valid, tb_num, tb_den;
     int64_t first_pts, origin, end;
 } MPSceneTiming;
+int mp_scene_verify_clock(const char *path, int stream, MPProbeCancelled cancelled,
+                          void *context, MPSceneTiming *timing);
 int mp_scene_scan(const char *path, int stream, int allow_asset_reader,
                   MPProbeCancelled cancelled, MPSceneVisit visit,
                   void *context, MPSceneTiming *timing, char *error, size_t capacity);
+
+enum { MP_SCENE_RESUME_MISMATCH = 1, MP_SCENE_SCAN_CANCELLED = 2 };
+// Leading scene's descriptor, emitted separately from actual scene boundaries.
+#define MP_SCENE_RANGE_LEADING_PTS (INT64_MIN + 1)
+typedef struct {
+    int has_range;
+    int64_t start_pts, end_pts;
+    const uint8_t *resume;
+    size_t resume_size;
+} MPSceneScanOptions;
+// The state is only valid during the callback. The confirmed timestamp is the
+// settled cut frontier, or INT64_MIN until a picture's successor is available.
+typedef void (*MPSceneCheckpointVisit)(void *context, int64_t decoded_pts,
+                                       int64_t confirmed_pts, int64_t ordinal,
+                                       const uint8_t *state, size_t size);
+// A resume mismatch emits no markers or checkpoints. The caller may discard
+// the saved attempt and retry with an empty resume state.
+int mp_scene_scan_resumable(const char *path, int stream, const MPSceneScanOptions *options,
+                            MPProbeCancelled cancelled, MPSceneVisit visit,
+                            MPSceneCheckpointVisit checkpoint, void *context,
+                            char *error, size_t capacity);
 // One peak per 20 ms, in source-picture time. Negative peaks indicate unobserved audio.
 enum { MP_PEAK_RATE = 50 };
 typedef void (*MPPeakVisit)(void *context, int64_t bin, float peak);

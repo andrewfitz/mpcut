@@ -2,15 +2,15 @@
 
 This reference describes the inputs advertised by the bundled stdio helper. The connected host can retrieve the complete JSON Schemas through `tools/list`. Tool calls use the running app and its local-control setting. Successful project-bound results carry the project handle and the current or applied revision. Inspect `isError` first. MPCut domain errors carry a code and message in `structuredContent`. Invalid requests can also return an MCP protocol or SDK validation error. [Setup, clocks, history and recovery](MCP-AGENT-GUIDE.md)
 
-**83 tools.**
+**90 tools.**
 
 ## Live analysis
 
 ### `analysis_job_cancel`
 
-Request cancellation of this specific MCP-started scan or sidecar save. Poll analysis_job_status for its terminal state.
+Request cancellation of this specific MCP-started scan, sidecar save or media refresh. Poll analysis_job_status for its terminal state.
 
-Reads the project-bound analysis receipt with `job`, `inputRevision`, `kind`, `status` and progress when available. Poll until succeeded, failed or cancelled. Sidecar saves report published outputs even when interrupted.
+Reads the project-bound analysis receipt with `job`, `inputRevision`, `kind`, `status` and progress when available. Poll until succeeded, failed or cancelled. Scene receipts report `coverage` by clip or source ID, including decoded, confirmed and durable positions. A cancelled scene job can leave resumable coverage. See persistence errors and the durable position to determine what reached disk. Sidecar saves report published outputs even when interrupted.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -19,9 +19,9 @@ Reads the project-bound analysis receipt with `job`, `inputRevision`, `kind`, `s
 
 ### `analysis_job_status`
 
-Return the state, original revision, progress when available, and terminal details for a retained native analysis or sidecar job.
+Read a retained scene, silence, sidecar save or media refresh job. Scene jobs include requested, decoded, confirmed and durable source coverage as available.
 
-Reads the project-bound analysis receipt with `job`, `inputRevision`, `kind`, `status` and progress when available. Poll until succeeded, failed or cancelled. Sidecar saves report published outputs even when interrupted.
+Reads the project-bound analysis receipt with `job`, `inputRevision`, `kind`, `status` and progress when available. Poll until succeeded, failed or cancelled. Scene receipts report `coverage` by clip or source ID, including decoded, confirmed and durable positions. A cancelled scene job can leave resumable coverage. See persistence errors and the durable position to determine what reached disk. Sidecar saves report published outputs even when interrupted.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -30,9 +30,9 @@ Reads the project-bound analysis receipt with `job`, `inputRevision`, `kind`, `s
 
 ### `analysis_state`
 
-Read native scene and silence scan progress, issues, current settings and a bounded page of analyzed source IDs and absolute audio stream indices.
+Read scene and silence scan status, scene coverage, current scene selection, media refresh status and issues, settings, and a bounded page of source IDs and audio streams.
 
-Returns scan settings, readiness, progress where available, status and issues. Page `sources.items` for source IDs, index availability, and absolute audio stream indices. Sequence state also identifies the source at the playhead.
+Returns scan settings, readiness, progress and issues. `sceneCoverage` shows source-clock progress by clip or source ID. Use `selectedSceneClip` or `selectedSceneCamera` for the current selection. `mediaRefreshProgress` and `mediaRefreshIssues` describe the refresh and sources that need attention. Page `sources.items` for source IDs, index availability and audio stream indices.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -127,16 +127,50 @@ Returns `items`, `offset` and `total`. Use returned pause IDs for reviews. Read 
 
 ### `list_scenes`
 
-Read one analyzed source’s scenes, exact source-relative boundaries and recurring view names.
+Read exact source-relative scene boundaries and recurring views for a source or a sequence clip.
 
-Returns `items`, `offset` and `total`. Each item pairs source-clock scene boundaries with its view ID and label.
+Returns `items`, `offset` and `total`. Each item pairs source-clock scene boundaries with its view ID and label. View IDs for a range-local scan belong to that report. Archived results include `stale`, `staleReason` and their original `sourceStamp`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project` | required | string |  |
-| `source` | required | string |  |
+| `source` | optional | string |  |
 | `offset` | optional | integer, minimum `0` |  |
 | `limit` | optional | integer, minimum `1`, maximum `500` |  |
+| `clip` | optional | string, format `uuid` | Sequence occurrence ID. Read the report that covers the clip’s current source interval. |
+| `includeStale` | optional | boolean | Prefer the archived report from a prior source generation when available. Archived rows carry their stale reason and original source stamp. |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "required": [
+        "source"
+      ]
+    },
+    {
+      "required": [
+        "clip"
+      ]
+    }
+  ]
+}
+```
+
+### `refresh_project_media`
+
+Check indexed project recordings and refresh changed sources using the native editor. Poll analysis_job_status for updated sources and review issues.
+
+Returns an analysis job receipt. Poll `analysis_job_status` for per-source refresh results, preserved analysis, review issues and any persistence errors.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project` | required | string |  |
+| `expectedRevision` | required | integer, minimum `0` |  |
+| `operationID` | required | string |  |
+| `deep` | optional | boolean | Verify stream content even when the file stamp is unchanged. |
 
 ### `rename_view`
 
@@ -185,9 +219,9 @@ Returns an analysis job receipt. Poll `analysis_job_status` for terminal status 
 
 ### `scan_analysis`
 
-Start native background scene or silence analysis or rescan completed silence. Poll analysis_job_status using the returned job ID. An existing GUI scan returns its origin.
+Start native background scene or silence analysis. Scene scans default to all sources with reuse. Poll analysis_job_status using the returned job ID.
 
-Returns an analysis receipt with `job`, `kind`, `inputRevision` and `status`. Poll `analysis_job_status` for that receipt. A scan already running in the editor returns `origin: editor` and can be followed through `analysis_state`.
+Returns an analysis receipt with `job`, `kind`, `inputRevision` and `status`. Poll `analysis_job_status` for that receipt. Compatible scene requests share a worker and return separate receipts. A selected reuse request can join an all-source reuse scan for the same recording and completes when that recording’s report is published. Scene receipts identify the native worker with `workerOrigin`. An existing GUI silence scan can be followed through `analysis_state`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -195,6 +229,9 @@ Returns an analysis receipt with `job`, `kind`, `inputRevision` and `status`. Po
 | `expectedRevision` | required | integer, minimum `0` |  |
 | `operationID` | required | string |  |
 | `kind` | required | `scenes` / `silence` |  |
+| `scope` | optional | `all` / `selected` | Scene scope. All scans every referenced recording. Selected scans a sequence clip’s source interval or a multicam recording. |
+| `target` | optional | string, minimum length `1` | Clip UUID from get_editor_state or camera ID from get_multicam. Applies to selected scope and defaults to the current editor selection. |
+| `policy` | optional | `reuse` / `resume` / `restart` | Reuse returns current results or resumes unfinished analysis. Resume prefers a saved replacement attempt. Restart begins a replacement identified by operationID. |
 
 ### `set_skip_pauses`
 
@@ -307,7 +344,7 @@ Returns a file job receipt. Poll `file_job_status` with `job_id` for the CLI res
 
 ### `file_export`
 
-Render an ordered edit, replace a soundtrack, or export a saved project. For a project provide output; for an edit supply edit.output. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.
+Render an ordered edit, replace a soundtrack, or export a saved project. Use mode copy to remux compatible streams. For a project provide output. For an edit supply edit.output. Poll file_job_status for the native CLI result. Reuse the operationID for an identical retry.
 
 Returns a file job receipt. Poll `file_job_status` with `job_id` for the CLI result. Use `file_job_result` for large payloads. See the bundled CLI help for this command’s JSON output.
 
@@ -340,6 +377,7 @@ Returns a file job receipt. Poll `file_job_status` with `job_id` for the CLI res
 | `edit.replaceAudio` | optional | string, pattern `^/` | Absolute path to the source file. |
 | `edit.replaceTrack` | optional | integer, minimum `0` |  |
 | `edit.replacementStream` | optional | integer, minimum `0` |  |
+| `require_camera_copy` | optional | boolean | Require zero encoded camera duration when rendering a saved or inline project. |
 | `output` | optional | string, pattern `^/` | Absolute destination path. Existing media outputs are protected. |
 | `tracks` | optional | `all` / `video` / `audio` |  |
 | `audio_stream` | optional | integer, minimum `0` |  |
@@ -536,7 +574,7 @@ Additional schema rules
 
 Request cancellation. Poll status until completion to see any outputs the job already published.
 
-Returns `job_id` and `state`. Terminal results include `exit_code` and `result_bytes`. Small output is available as `result` for JSON or `output_text` for text. Poll a cancelling job until its terminal state.
+Returns `job_id` and `state`. For scene scans and refreshes, `progress_event` contains the latest available CLI event. Scene events include durable coverage when it has been saved. Terminal results include `exit_code` and `result_bytes`. Small output is available as `result` for JSON or `output_text` for text. Poll a cancelling job until its terminal state.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -556,9 +594,9 @@ Returns a base64 byte page, `next_offset`, `result_bytes` and `done`. Decode eac
 
 ### `file_job_status`
 
-Get state, native progress when available and the terminal JSON result. For large results, read result_bytes using file_job_result.
+Get state, native progress and the terminal JSON result. Scene scans and refreshes include the latest available progress event. For large results, read result_bytes using file_job_result.
 
-Returns `job_id` and `state`. Terminal results include `exit_code` and `result_bytes`. Small output is available as `result` for JSON or `output_text` for text. Poll a cancelling job until its terminal state.
+Returns `job_id` and `state`. For scene scans and refreshes, `progress_event` contains the latest available CLI event. Scene events include durable coverage when it has been saved. Terminal results include `exit_code` and `result_bytes`. Small output is available as `result` for JSON or `output_text` for text. Poll a cancelling job until its terminal state.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -614,6 +652,20 @@ Additional schema rules
   ]
 }
 ```
+
+### `file_refresh`
+
+Check recordings referenced by a saved project and refresh eligible analysis sidecars. The project file stays untouched.
+
+Returns a file job receipt. Poll `file_job_status` with `job_id` for the CLI result. Use `file_job_result` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operationID` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled. |
+| `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
+| `project` | required | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
+| `deep` | optional | boolean | Verify stream content even when the file stamp is unchanged. |
+| `no_sidecar` | optional | boolean | Check recordings without reading or writing analysis sidecars. |
 
 ### `file_resolve`
 
@@ -719,7 +771,7 @@ Additional schema rules
 
 ### `file_scenes`
 
-Detect scene cuts or export grouped scenes/views from a file or saved report. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.
+Detect scenes in a file, file range or saved project, or export grouped scenes or views from a saved report. Poll file_job_status for progress and the CLI result. Supply the same operationID when retrying.
 
 Returns a file job receipt. Poll `file_job_status` with `job_id` for the CLI result. Use `file_job_result` for large payloads. See the bundled CLI help for this command’s JSON output.
 
@@ -738,6 +790,13 @@ Returns a file job receipt. Poll `file_job_status` with `job_id` for the CLI res
 | `no_sidecar` | optional | boolean |  |
 | `input_file` | optional | string, pattern `^/` | Absolute path to a native CLI input/list file. |
 | `scenes_file` | optional | string, pattern `^/` | Absolute path to a native CLI input/list file. |
+| `project` | optional | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
+| `to` | optional | string | Exclusive source timestamp for a file range. Supply from as well. |
+| `clip_id` | optional | string, format `uuid` | Stable sequence occurrence ID in the saved project. |
+| `camera_id` | optional | string, minimum length `1` | Stable camera ID in the saved multicam project. |
+| `all_sources` | optional | boolean | Scan all referenced video sources in the saved project. This is the default project scope. |
+| `policy` | optional | `reuse` / `resume` / `restart` | Reuse returns current results or resumes unfinished analysis. Resume prefers a saved replacement attempt. Restart begins a replacement identified by operationID. |
+| `from` | optional | string | Inclusive source timestamp for a file range. Supply to as well. |
 
 Additional schema rules
 
@@ -759,6 +818,11 @@ Additional schema rules
         {
           "required": [
             "input_file"
+          ]
+        },
+        {
+          "required": [
+            "project"
           ]
         }
       ]
@@ -799,7 +863,7 @@ Returns a file job receipt. Poll `file_job_status` with `job_id` for the CLI res
 | `operationID` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
 | `file` | required | string, pattern `^/` | Absolute path to the source file. |
-| `status` | optional | boolean |  |
+| `status` | optional | boolean | Inspect persisted sections, scene attempts and stale reasons without writing. |
 | `only` | optional | array of `index` / `scenes` / `audio`, minimum items `1` |  |
 | `stream` | optional | integer, minimum `0` |  |
 | `threshold_db` | optional | number, minimum `-120`, maximum `0` |  |
@@ -1271,14 +1335,14 @@ Returns `project`, `revision`, `kind`, `dirty`, `path`, `setupPending` and `moni
 
 ### `get_multicam`
 
-Inspect the live group, program audio and reference camera. Page sources with offsets, index issues and stream IDs, switches with overrides, or suggested switch boundaries.
+Inspect the live group, program audio and reference camera. Page sources with offsets, index issues and stream IDs, switches with overrides, suggested switch boundaries, assembly occurrences, or still placements.
 
-Returns the chosen page of sources, switches or suggestions, group range, audio policy, `total` and revision. A camera source reports its displayed `number`. Sources report availability and indexing state, with duration when known.
+Returns the chosen page of sources, switches, suggestions, assembly occurrences or stills, group range, audio policy, `total` and revision. A camera source reports its displayed `number`. Sources report availability and indexing state, with duration when known.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project` | required | string |  |
-| `section` | required | `sources` / `switches` / `suggestions` |  |
+| `section` | required | `sources` / `switches` / `suggestions` / `assembly` / `stills` |  |
 | `offset` | optional | integer, minimum `0` |  |
 | `limit` | optional | integer, minimum `1`, maximum `200` |  |
 | `expectedRevision` | optional | integer, minimum `0` |  |
@@ -1381,6 +1445,7 @@ Reports selection and current preview position. Assembly selection uses the occu
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project` | required | string | Live project handle returned by list_projects. |
+| `expectedRevision` | optional | integer, minimum `0` | Required when selecting an occurrence from an assembly with still inserts. |
 | `action` | required | `switch` / `occurrence` / `group_range` / `assembly_range` / `mark_in` / `mark_out` / `clear_marks` / `pointer` / `range_tool` |  |
 | `time` | optional | string | Exact rational seconds on the multicam group clock. |
 | `occurrence` | optional | integer | Zero-based assembly occurrence. |
@@ -1452,6 +1517,7 @@ Take a camera by angle ID or displayed number at an explicit group time with nat
 | `operationID` | required | string | Unique operation ID for this edit. Retry the same request with the same ID. |
 | `angle` | optional | string | Stable camera source ID from the live project. |
 | `number` | optional | integer, minimum `1` | One-based displayed camera number from the current revision. |
+| `occurrence` | optional | integer, minimum `0` | Optional source-backed assembly occurrence from the current revision. |
 | `time` | required | string | Exact rational seconds on the multicam group clock. |
 
 Additional schema rules
@@ -1489,7 +1555,7 @@ Returns current `ranges[]` with IDs and boundaries, and `coordinateSpace`. Mark 
 
 ### `apply_export_review`
 
-Recompute the native ordinary timeline lossless-copy boundary proposal for this output extension and apply it as one undoable edit. Use render_project with dryRun first.
+Apply one verified boundary change as a native undo step. Use render_project with dryRun first. For a still-bearing timeline supply the exact still adjustment from its camera-copy preflight.
 
 Returns the native action, applied revision and review details when the current copy-boundary proposal is committed. A retained action can be undone through native history.
 
@@ -1498,6 +1564,23 @@ Returns the native action, applied revision and review details when the current 
 | `project` | required | string, minimum length `1` | Live project handle from list_projects. |
 | `expectedRevision` | required | integer, minimum `0` |  |
 | `operationID` | required | string, minimum length `1` | Unique operation identifier; repeat the exact request after a lost reply. |
+| `mode` | optional | `smart` / `copy` | Mode used to review the still boundary. Defaults to smart. |
+| `tracks` | optional | `all` / `video` | Tracks used to review the still boundary. Defaults to all. |
+| `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` | Sound action used to review the still boundary. |
+| `stillAdjustment` | optional | object | Exact adjustment from result.issue.stillBoundaryAdjustments for a whole-timeline dry run with requireCameraCopy. |
+| `stillAdjustment.placementID` | required | string, minimum length `1` |  |
+| `stillAdjustment.boundary` | required | `start` / `end` / `insertion` |  |
+| `stillAdjustment.clock` | required | `source` / `group` / `sequence` / `assembly` |  |
+| `stillAdjustment.occurrenceID` | optional | string, minimum length `1` |  |
+| `stillAdjustment.requestedTime` | required | object |  |
+| `stillAdjustment.requestedTime.numerator` | required | integer |  |
+| `stillAdjustment.requestedTime.denominator` | required | integer, minimum `1` |  |
+| `stillAdjustment.adjustedTime` | required | object |  |
+| `stillAdjustment.adjustedTime.numerator` | required | integer |  |
+| `stillAdjustment.adjustedTime.denominator` | required | integer, minimum `1` |  |
+| `stillAdjustment.durationChange` | required | object |  |
+| `stillAdjustment.durationChange.numerator` | required | integer |  |
+| `stillAdjustment.durationChange.denominator` | required | integer, minimum `1` |  |
 | `output` | required | string, minimum length `1` | Absolute local output path. Existing media destinations are protected. |
 
 ### `cancel_live_job`
@@ -1530,7 +1613,7 @@ Returns a live job receipt for `live_job_status`. Published `outputs` can includ
 
 Check or export queued snapshots to an existing directory. Poll live_job_status for completed outputs, including files already written if a later range fails or is cancelled.
 
-Returns a live job receipt with `job`, `inputRevision`, `state`, `progress` and published `outputs`. Poll `live_job_status` with the same project. The terminal result reports planned `destinations`.
+Returns a live job receipt with `job`, `inputRevision`, `state`, `progress` and published `outputs`. Poll `live_job_status` with the same project. The terminal result reports planned `destinations` and still plans for applicable queue entries.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -1540,6 +1623,7 @@ Returns a live job receipt with `job`, `inputRevision`, `state`, `progress` and 
 | `output` | required | string, minimum length `1` | Absolute local output path. Existing media destinations are protected. |
 | `container` | optional | string, minimum length `1` |  |
 | `tracks` | optional | `all` / `video` / `audio` |  |
+| `requireCameraCopy` | optional | boolean | Require zero encoded camera duration when generating stills. |
 | `mode` | optional | `smart` / `copy` / `encode` |  |
 | `codec` | optional | `h264` / `hevc` / `prores` |  |
 | `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` |  |
@@ -1549,7 +1633,7 @@ Returns a live job receipt with `job`, `inputRevision`, `state`, `progress` and 
 
 ### `export_review_frames`
 
-Export a full-resolution still at the playhead, or a manifest and JPEGs to a new directory. Explicit times use source time on the active ordinary clip and group time on multicam. Playhead, explicit times and switches on multicam sample all angles. Poll live_job_status for the count of written frames and unavailable angle samples.
+Export review JPEGs from the live editor. Still and playhead selections sample the program when still placements exist. Supply space to sample exact program times. With no space, times follow native source or multicam group and angle review.
 
 Returns a live job receipt for `live_job_status`. A still produces a JPEG. A batch returns its `manifest` path and the written `frames` count, plus `unavailable` for multicam samples where an angle has no picture.
 
@@ -1560,6 +1644,7 @@ Returns a live job receipt for `live_job_status`. A still produces a JPEG. A bat
 | `operationID` | required | string, minimum length `1` | Unique operation identifier; repeat the exact request after a lost reply. |
 | `output` | required | string, minimum length `1` | Absolute local output path. Existing media destinations are protected. |
 | `selection` | optional | `playhead` / `still` / `times` / `switches` / `scenes` / `nonSilent` |  |
+| `space` | optional | `sequence` / `group` / `assembly` | Select the program clock for still, playhead or explicit time samples. Omit for the native source and angle review modes. |
 | `times` | optional | array of string, minimum length `1`, minimum items `1`, maximum items `4096` |  |
 | `preset` | optional | `review` / `full` |  |
 | `sample` | optional | `first` / `midpoint` |  |
@@ -1601,9 +1686,9 @@ Returns current `ranges[]` with IDs and boundaries, and `coordinateSpace`. Mark 
 
 ### `render_project`
 
-Check or render an unsaved timeline snapshot using the native export planner. Read the job with live_job_status. A completed preflight can report eligible false with a structured issue. Ordinary copy preflight can offer verified boundaries and export alternatives.
+Check or render a live sequence or multicam snapshot. Use mode copy to remux compatible streams. Poll live_job_status. When preflight reports eligible false, inspect result.alternatives for verified modes and containers. Ordinary copy preflight can also offer revised boundaries.
 
-Starts a live job. Poll `live_job_status` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposedRanges`, `alternatives` or `fallback`. An eligible render reports its plan. Confirm published paths in the job’s `outputs`.
+Starts a live job. Poll `live_job_status` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposedRanges`, `alternatives` or `fallback`. An eligible render reports its plan. Still plans report copied and encoded camera duration, generated still duration, placement ranges and sound actions. Confirm published paths in the job’s `outputs`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -1613,7 +1698,8 @@ Starts a live job. Poll `live_job_status` for its result. A successful dry run c
 | `output` | required | string, minimum length `1` | Absolute local output path. Existing media destinations are protected. |
 | `scope` | optional | `timeline` / `selection` / `group` |  |
 | `tracks` | optional | `all` / `video` / `audio` |  |
-| `mode` | optional | `smart` / `copy` / `encode` | Defaults to the native movie preference for full-track movies and copy for a single track type or audio-only sources. |
+| `requireCameraCopy` | optional | boolean | Require zero encoded camera duration when generating stills. |
+| `mode` | optional | `smart` / `copy` / `encode` | Defaults to Smart Trim for visible still picture. Other outputs use the native defaults. |
 | `codec` | optional | `h264` / `hevc` / `prores` |  |
 | `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` | Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. Requires movie encode mode. |
 | `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` |  |
@@ -1703,7 +1789,7 @@ Returns the window’s actual presentation state, including zoom, available scro
 
 Read a live project's revision, editor state and a page of sequence clips or multicam occurrences. Pass the first page's revision on subsequent pages to detect concurrent edits.
 
-State includes `busy`, `modal`, selection, playhead, snapping and `historyLimit`. Use `offset` and `total` to page `clips[]` or `occurrences[]` at a pinned revision. A sequence row identifies an occurrence by `id` and provides `sequenceFrom`, `sequenceTo`, `sourceFrom` and `sourceTo`. A multicam row identifies it by zero-based `index` and provides bounds in assembly and group time.
+State includes `busy`, `modal`, selection, playhead, snapping and `historyLimit`. Use `offset` and `total` to page `clips[]` or `occurrences[]` at a pinned revision. A sequence row identifies an occurrence by `id` and provides `sequenceFrom`, `sequenceTo`, `sourceFrom` and `sourceTo`. A multicam row identifies it by zero-based `index` and provides assembly bounds and group bounds for group rows. Insert rows identify the still placement and asset. Still placements are also paged under `stills` when present.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -1724,9 +1810,9 @@ Pass an empty arguments object.
 
 ### `review_frame`
 
-Return one JPEG image content block from the open project's current playhead, or specify an exact sequence, group or assembly time. For multicam, angle optionally selects a specific camera. Reads the current in-memory edit. Preserves playback, selection, history and disk contents. The longest image edge is at most 640 pixels. Metadata identifies the actual source frame time.
+Return one JPEG image content block from the open project's current playhead, or specify an exact sequence, group or assembly time. For multicam, angle optionally selects a specific camera. Reads the current in-memory edit. Preserves playback, selection, history and disk contents. The longest image edge is at most 640 pixels. Metadata identifies the source frame or still placement, asset and program presentation time.
 
-Returns a JPEG image block in MCP `content` and decoded-frame metadata in `structuredContent`, including `sourceTime`, `duration`, `width` and `height`. A multicam result identifies the requested or active clock, timestamp, group time and camera. An image-capable host can inspect the picture directly.
+Returns a JPEG image block in MCP `content` and decoded-frame metadata in `structuredContent`, including `sourceTime`, `duration`, `width` and `height`. A multicam result identifies the requested or active clock, timestamp, group time and camera. A still result identifies the asset and placement and reports program time. An image-capable host can inspect the picture directly.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -1854,9 +1940,9 @@ Returns resulting transport and editor state. Ordinary editors include `playhead
 
 ### `split_at`
 
-Split the specified clip or assembly occurrence using native snapping and undo history.
+Split the specified clip, assembly range or inserted still with native undo history. Split a still at an interior presentation boundary in sequence or assembly time.
 
-Reports applied `boundary` in the requested clock, `left` and `right` occurrence references and `historyRetained`. Sequence results include `sourceTime` and `sequenceTime`. Multicam results include `groupTime`. Use the returned `revision` with the next edit.
+Reports applied `boundary` in the requested clock, `left` and `right` occurrence references and `historyRetained`. Sequence results include `sourceTime` and `sequenceTime`. Multicam camera range results include `groupTime`. A still split returns independent `leftPlacement` and `rightPlacement` IDs. Use the returned `revision` with the next edit.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -1878,3 +1964,146 @@ Undo one native history action in the specified document.
 | `project` | required | string | Opaque live document handle from list_projects. |
 | `expectedRevision` | required | integer | Document revision observed by the caller. |
 | `operationID` | required | string | Unique mutation ID. Reuse only for an identical retry. |
+
+## Still image placements
+
+### `add_still`
+
+Import an image and replace program picture or insert a duration-bearing card. Inserts ripple the program. Replacements keep the underlying sound.
+
+Returns the affected `placement` or `asset`, native action, revision, changed and historyRetained. Read list_stills or the refreshed timeline after structural edits.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project` | required | string, minimum length `1` |  |
+| `expectedRevision` | required | integer, minimum `0` |  |
+| `operationID` | required | string, minimum length `1` |  |
+| `operation` | required | `insert` / `replace` |  |
+| `path` | required | string, pattern `^/` | Absolute local image path. |
+| `space` | required | `sequence` / `group` / `assembly` |  |
+| `at` | optional | string | Placement position in the selected clock. Exact rational seconds. |
+| `duration` | optional | string | Positive duration. Exact rational seconds. |
+| `cadence` | optional | string | Positive frame interval, for example 1001/30000. Exact rational seconds. |
+| `from` | optional | string | Inclusive replacement start. Exact rational seconds. |
+| `to` | optional | string | Exclusive replacement end. Exact rational seconds. |
+| `fit` | optional | `fit` / `fill` |  |
+| `crop` | optional | object | Normalized crop rectangle as exact rational coordinates. |
+| `crop.x` | required | string |  |
+| `crop.y` | required | string |  |
+| `crop.width` | required | string |  |
+| `crop.height` | required | string |  |
+| `background` | optional | string, pattern `^#[0-9A-Fa-f]{6}$` |  |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "properties": {
+        "operation": {
+          "const": "insert"
+        },
+        "space": {
+          "enum": [
+            "sequence",
+            "assembly"
+          ]
+        }
+      },
+      "required": [
+        "at",
+        "duration"
+      ]
+    },
+    {
+      "properties": {
+        "operation": {
+          "const": "replace"
+        },
+        "space": {
+          "enum": [
+            "sequence",
+            "group"
+          ]
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ]
+    }
+  ]
+}
+```
+
+### `list_stills`
+
+Read a page of image placements, including authored and visible ranges and asset availability.
+
+Page `items` using `offset` and `total`. Each row supplies stable `placement` and `asset` IDs, operation, framing, authored coordinates and visible program ranges, duration and offline status. Hidden replacements have zero visible duration.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project` | required | string, minimum length `1` |  |
+| `expectedRevision` | optional | integer, minimum `0` |  |
+| `offset` | optional | integer, minimum `0` |  |
+| `limit` | optional | integer, minimum `1`, maximum `200` |  |
+
+### `relink_still`
+
+Update all uses of a still asset in one native undo step.
+
+Returns the affected `placement` or `asset`, native action, revision, changed and historyRetained. Read list_stills or the refreshed timeline after structural edits.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project` | required | string, minimum length `1` |  |
+| `expectedRevision` | required | integer, minimum `0` |  |
+| `operationID` | required | string, minimum length `1` |  |
+| `asset` | required | string, minimum length `1` |  |
+| `path` | required | string, pattern `^/` | Absolute local image path. |
+
+### `remove_still`
+
+Remove a placement. Deleting a replacement reveals the underlying picture. Deleting an insert ripples the sequence or assembly.
+
+Returns the affected `placement` or `asset`, native action, revision, changed and historyRetained. Read list_stills or the refreshed timeline after structural edits.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project` | required | string, minimum length `1` |  |
+| `expectedRevision` | required | integer, minimum `0` |  |
+| `operationID` | required | string, minimum length `1` |  |
+| `placement` | required | string, minimum length `1` |  |
+
+### `update_still`
+
+Edit framing, move or resize an insert, or change the bounds of a replacement. Supply sequence time for ordinary projects, assembly time for multicam inserts, and group time for multicam replacements.
+
+Returns the affected `placement` or `asset`, native action, revision, changed and historyRetained. Read list_stills or the refreshed timeline after structural edits.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project` | required | string, minimum length `1` |  |
+| `expectedRevision` | required | integer, minimum `0` |  |
+| `operationID` | required | string, minimum length `1` |  |
+| `asset` | optional | string, minimum length `1` | Use another existing still asset for this placement. |
+| `clearCrop` | optional | boolean | Clear the existing crop rectangle. |
+| `clock` | optional | `sequence` / `source` / `group` | Clock of replacement bounds or destination. Defaults to sequence or group. |
+| `fragmentIndex` | optional | integer, minimum `0` | Current index of the sequence replacement fragment to edit. |
+| `duplicateID` | optional | string, minimum length `1` | New replacement ID when duplicating to the supplied destination. |
+| `detachID` | optional | string, minimum length `1` | New replacement ID when detaching the selected source fragment. |
+| `placement` | required | string, minimum length `1` |  |
+| `at` | optional | string | Placement position in the selected clock. Exact rational seconds. |
+| `duration` | optional | string | Positive duration. Exact rational seconds. |
+| `cadence` | optional | string | Positive frame interval, for example 1001/30000. Exact rational seconds. |
+| `from` | optional | string | Inclusive replacement start. Exact rational seconds. |
+| `to` | optional | string | Exclusive replacement end. Exact rational seconds. |
+| `fit` | optional | `fit` / `fill` |  |
+| `crop` | optional | object | Normalized crop rectangle as exact rational coordinates. |
+| `crop.x` | required | string |  |
+| `crop.y` | required | string |  |
+| `crop.width` | required | string |  |
+| `crop.height` | required | string |  |
+| `background` | optional | string, pattern `^#[0-9A-Fa-f]{6}$` |  |

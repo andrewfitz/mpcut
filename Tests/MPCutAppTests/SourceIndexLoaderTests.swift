@@ -81,6 +81,41 @@ final class SourceIndexLoaderTests: XCTestCase {
     }
 
     @MainActor
+    func testExplicitRefreshReplacesWarmIndexAndRejectsEarlierSnapshot() async throws {
+        let (directory, fixture) = try fixtureDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("source.mov")
+        let fm = FileManager.default
+        try fm.copyItem(at: fixture, to: file)
+        let stamp = Date(timeIntervalSince1970: 1_700_000_000)
+        try fm.setAttributes([.modificationDate: stamp], ofItemAtPath: file.path)
+        let key = SourceIndexLoader.Key(url: file, sidecars: false, preview: false)
+        let loader = SourceIndexLoader()
+        let original = try await read(key, using: loader)
+        let originalIdentity = original.ordinary.identity
+        // Rewrite the same bytes so this remains a readable recording. A writer can
+        // restore mtime, but the old in-flight provider must still drop its snapshot.
+        let bytes = try Data(contentsOf: file)
+        let writer = try FileHandle(forWritingTo: file)
+        try writer.write(contentsOf: bytes)
+        try writer.close()
+        try fm.setAttributes([.modificationDate: stamp], ofItemAtPath: file.path)
+        let fresh = try CutEngine(useSidecar: false).inspect(file, keyframes: true)
+        XCTAssertEqual(originalIdentity, fresh.identity)
+        loader.acceptRefreshedIndex(fresh, sidecars: false)
+        let updated = try await read(key, using: loader)
+        XCTAssertFalse(original === updated)
+        XCTAssertTrue(fresh.identity.matchesSnapshot(updated.ordinary.identity))
+        let stale = SourceIndexLoader.Key(url: file, sidecars: false, preview: false, identity: originalIdentity)
+        do {
+            _ = try await read(stale, using: loader)
+            XCTFail("The superseded recording was accepted")
+        } catch let error as CutError {
+            XCTAssertEqual(error.code, "source_changed")
+        }
+    }
+
+    @MainActor
     func testCompletedIndexCacheEvictsLeastRecentlyUsedEntry() async throws {
         let (directory, fixture) = try fixtureDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

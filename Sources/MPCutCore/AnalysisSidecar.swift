@@ -46,6 +46,11 @@ public struct AnalysisSidecar: Sendable {
         identity = try SourceIdentity(self.source)
     }
 
+    init(source: URL, identity: SourceIdentity) {
+        self.source = source.standardizedFileURL
+        self.identity = identity
+    }
+
     public init(media: MediaInfo) {
         source = media.url.standardizedFileURL
         identity = media.identity
@@ -56,28 +61,36 @@ public struct AnalysisSidecar: Sendable {
     }
 
     private static let applicationID: Int32 = 0x4d504354 // MPCT
-    private static let version: Int32 = 1
+    private static let version: Int32 = 2
 
     package func checkSource() throws {
-        guard (try? SourceIdentity(source)) == identity else {
+        guard identity.isCurrentSnapshot(at: source) else {
             throw CutError(code: "source_changed", message: "The media changed during analysis.")
         }
     }
 
-    private func exists() throws -> Bool {
+    func exists() throws -> Bool {
+        try Self.exists(url, sourceIdentity: identity)
+    }
+
+    static func exists(_ url: URL, sourceIdentity: SourceIdentity?) throws -> Bool {
         var info = stat()
         guard lstat(url.path, &info) == 0 else {
             if errno == ENOENT { return false }
             throw sidecarError(String(cString: strerror(errno)))
         }
-        guard info.st_mode & S_IFMT == S_IFREG, info.st_nlink == 1,
-              info.st_dev != identity.device || info.st_ino != identity.inode else {
+        let aliasesSource = sourceIdentity.map { info.st_dev == $0.device && info.st_ino == $0.inode } ?? false
+        guard info.st_mode & S_IFMT == S_IFREG, info.st_nlink == 1, !aliasesSource else {
             throw sidecarError("The sidecar path must identify a separate regular file.")
         }
         return true
     }
 
-    private func validate(_ db: SidecarDatabase) throws {
+    func validate(_ db: SidecarDatabase) throws {
+        try Self.validate(db, at: url)
+    }
+
+    static func validate(_ db: SidecarDatabase, at url: URL) throws {
         // The first SQLite query can replay a journal or open a write-ahead log.
         // Check the database header on SQLite's own descriptor first.
         let unsupported = CutError(code: "unsupported_sidecar", message: "This file is not a supported MPCut analysis sidecar.")
@@ -87,14 +100,18 @@ public struct AnalysisSidecar: Sendable {
             throw sidecarError("The sidecar has no readable SQLite header.")
         }
         guard !header.usesWriteAheadLog, header.applicationID == Self.applicationID,
-              header.userVersion == Self.version else { throw unsupported }
+              (1...Self.version).contains(header.userVersion) else { throw unsupported }
         let kind = try db.integer("PRAGMA application_id")
-        guard kind == Self.applicationID, try db.integer("PRAGMA user_version") == Self.version else {
+        guard kind == Self.applicationID, (1...Self.version).contains(try db.integer("PRAGMA user_version")) else {
             throw CutError(code: "unsupported_sidecar", message: "This file is not a supported MPCut analysis sidecar.")
         }
     }
 
-    private func storedStamp(_ db: SidecarDatabase) throws -> String {
+    func storedStamp(_ db: SidecarDatabase) throws -> String {
+        try Self.storedStamp(db)
+    }
+
+    static func storedStamp(_ db: SidecarDatabase) throws -> String {
         try db.statement("SELECT stamp FROM source WHERE id = 1") { query in
             guard sqlite3_step(query) == SQLITE_ROW, let value = sqlite3_column_text(query, 0) else {
                 throw sidecarError("The sidecar has no media identity.")
@@ -116,7 +133,7 @@ public struct AnalysisSidecar: Sendable {
     /// The saved stamp when it describes this source. A volume's device number
     /// can change on each mount, so only the fields after it must agree. The
     /// saved text also seeds the section checksums and is therefore kept as is.
-    private func currentStamp(_ db: SidecarDatabase) throws -> String? {
+    func currentStamp(_ db: SidecarDatabase) throws -> String? {
         let saved = try storedStamp(db)
         return saved.drop { $0 != ":" } == stamp.drop { $0 != ":" } ? saved : nil
     }
@@ -136,7 +153,7 @@ public struct AnalysisSidecar: Sendable {
             return false
         } catch {
             guard db.isCorrupt, let header = db.headerVersions() else { return false }
-            return header.applicationID == Self.applicationID && header.userVersion == Self.version
+            return header.applicationID == Self.applicationID && (1...Self.version).contains(header.userVersion)
         }
     }
 
@@ -147,7 +164,7 @@ public struct AnalysisSidecar: Sendable {
             guard try exists() else { return "missing" }
             let db = try SidecarDatabase(url, writing: false)
             try validate(db)
-            return try currentStamp(db) != nil && (try? SourceIdentity(source)) == identity ? "current" : "stale"
+            return try currentStamp(db) != nil && identity.isCurrentSnapshot(at: source) ? "current" : "stale"
         } catch let error as CutError where error.code == "unsupported_sidecar" {
             return "unsupported"
         } catch {
@@ -198,11 +215,11 @@ public struct AnalysisSidecar: Sendable {
                 return try? verifiedSection(key, in: db, stamp: saved, maxBytes: nil, cancelled: check)
             }
         }
-        guard !cancelled(), (try? SourceIdentity(source)) == identity else { return nil }
+        guard !cancelled(), identity.isCurrentSnapshot(at: source) else { return nil }
         return value
     }
 
-    private func openReadSnapshot() throws -> SidecarDatabase? {
+    func openReadSnapshot() throws -> SidecarDatabase? {
         guard !isExcluded, try exists() else { return nil }
         try checkSource()
         let db = try SidecarDatabase(url, writing: false)
@@ -211,9 +228,12 @@ public struct AnalysisSidecar: Sendable {
         return db
     }
 
-    private func verifiedSection(_ key: String, in db: SidecarDatabase, stamp saved: String, maxBytes: Int?,
-                                 cancelled: () -> Bool) throws -> Data? {
-        return try db.statement("SELECT digest, rowid FROM sections WHERE name = ?", [key]) { query in
+    func verifiedSection(_ key: String, in db: SidecarDatabase, stamp saved: String, maxBytes: Int?,
+                         cancelled: () -> Bool, generation: String? = nil) throws -> Data? {
+        let table = generation == nil ? "sections" : "archived_sections"
+        let predicate = generation == nil ? "name = ?" : "name = ? AND generation = ?"
+        let bindings = [key] + (generation.map { [$0] } ?? [])
+        return try db.statement("SELECT digest, rowid FROM \(table) WHERE \(predicate)", bindings) { query in
             let step = sqlite3_step(query)
             if step == SQLITE_DONE { return nil }
             guard step == SQLITE_ROW else { throw db.error() }
@@ -222,7 +242,7 @@ public struct AnalysisSidecar: Sendable {
             // Read into the destination allocation directly. Materializing
             // sqlite3_column_blob would also keep a full SQLite-owned copy.
             var hash = checksumSeed(key, stamp: saved)
-            let data = try db.readBlob(row: sqlite3_column_int64(query, 1), maxBytes: maxBytes, cancelled: cancelled) { chunk in
+            let data = try db.readBlob(table: table, row: sqlite3_column_int64(query, 1), maxBytes: maxBytes, cancelled: cancelled) { chunk in
                 hash.update(bufferPointer: chunk)
             }
             guard let data else { return nil }
@@ -230,7 +250,7 @@ public struct AnalysisSidecar: Sendable {
         }
     }
 
-    private static func validKey(_ key: String) -> Bool {
+    static func validKey(_ key: String) -> Bool {
         !key.isEmpty && key.utf8.count <= 512 && !key.utf8.contains(0)
     }
 
@@ -258,12 +278,19 @@ public struct AnalysisSidecar: Sendable {
     public func save(_ sections: [String: Data], updating: [String: (Data?) throws -> Data] = [:],
                      retainingLatest: [String: Int] = [:],
                      cancelled: () -> Bool = { false }) throws {
-        guard !isExcluded else {
-            throw sidecarError("A recording in this project uses the cache path for \(source.lastPathComponent).")
+        if sections.isEmpty && updating.isEmpty {
+            try validateWrite(cancelled: cancelled)
+            return
         }
-        try checkSource()
-        try checkSidecarCancellation(cancelled)
-        guard !sections.isEmpty || !updating.isEmpty else { return }
+        try transact(sections, updating: updating, retainingLatest: retainingLatest, cancelled: cancelled) { _, _ in }
+    }
+
+    @discardableResult
+    func transact<T>(_ sections: [String: Data] = [:], updating: [String: (Data?) throws -> Data] = [:],
+                     retainingLatest: [String: Int] = [:], cancelled: () -> Bool,
+                     refresh: SidecarGenerationRefresh? = nil,
+                     _ change: (SidecarDatabase, String) throws -> T) throws -> T {
+        try validateWrite(cancelled: cancelled)
         guard sections.keys.allSatisfy(Self.validKey), updating.keys.allSatisfy(Self.validKey),
               sections.keys.allSatisfy({ updating[$0] == nil }) else {
             throw sidecarError("Section names must be valid and unique across writes and updates.")
@@ -281,15 +308,25 @@ public struct AnalysisSidecar: Sendable {
             close(fd)
             let staging = URL(fileURLWithPath: String(cString: template))
             defer { try? FileManager.default.removeItem(at: staging) }
-            try write(sections, updating: updating, to: staging, create: true, retainingLatest: retainingLatest, cancelled: cancelled)
+            let result = try write(sections, updating: updating, to: staging, create: true, retainingLatest: retainingLatest,
+                                   cancelled: cancelled, refresh: refresh, change)
             try checkSource()
             try checkSidecarCancellation(cancelled)
             guard chmod(staging.path, 0o666 & ~creationMask) == 0 else { throw sidecarError(String(cString: strerror(errno))) }
-            if try publish(staging, cancelled: cancelled) { return }
+            if try publish(staging, cancelled: cancelled) { return result }
             // Another writer published first. Merge into its committed database.
             guard try exists() else { throw sidecarError("The destination changed while saving.") }
         }
-        try write(sections, updating: updating, to: url, create: false, retainingLatest: retainingLatest, cancelled: cancelled)
+        return try write(sections, updating: updating, to: url, create: false, retainingLatest: retainingLatest,
+                         cancelled: cancelled, refresh: refresh, change)
+    }
+
+    private func validateWrite(cancelled: () -> Bool) throws {
+        guard !isExcluded else {
+            throw sidecarError("A recording in this project uses the cache path for \(source.lastPathComponent).")
+        }
+        try checkSource()
+        try checkSidecarCancellation(cancelled)
     }
 
     /// A damaged database has no SQLite write lock that all repairers can use.
@@ -330,31 +367,33 @@ public struct AnalysisSidecar: Sendable {
         return false
     }
 
-    private func write(_ sections: [String: Data], updating: [String: (Data?) throws -> Data],
+    private func write<T>(_ sections: [String: Data], updating: [String: (Data?) throws -> Data],
                        to destination: URL, create: Bool, retainingLatest: [String: Int],
-                       cancelled: () -> Bool) throws {
+                       cancelled: () -> Bool, refresh: SidecarGenerationRefresh?,
+                       _ change: (SidecarDatabase, String) throws -> T) throws -> T {
         let db = try SidecarDatabase(destination, writing: true)
-        try db.whileWaitingForLocks(cancelled) {
+        return try db.whileWaitingForLocks(cancelled) {
             if create { try db.execute("PRAGMA auto_vacuum = FULL") }
             else { try validate(db) }
             try db.execute("BEGIN IMMEDIATE")
             try checkSource()
-            var saved = stamp
             if create {
                 try db.execute("""
                     PRAGMA application_id = \(Self.applicationID);
-                    PRAGMA user_version = \(Self.version);
                     CREATE TABLE source(id INTEGER PRIMARY KEY CHECK(id = 1), stamp TEXT NOT NULL);
                     CREATE TABLE sections(name TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL, value BLOB NOT NULL);
                     """)
                 try db.update("INSERT INTO source(id, stamp) VALUES(1, ?)", [stamp])
-            } else if let current = try currentStamp(db) {
-                saved = current
-            } else {
-                try db.execute("DELETE FROM sections")
-                try db.update("UPDATE source SET stamp = ? WHERE id = 1", [stamp])
             }
+            try migrateManifest(db)
+            let indexUpdate = try refresh == nil
+                ? prepareIndexEvidence(sections[Self.evidenceKey], in: db, cancelled: cancelled)
+                : (refresh: nil, evidence: sections[Self.evidenceKey])
+            let saved = try updateGeneration(db, stamp: stamp, refresh: refresh ?? indexUpdate.refresh,
+                                             cancelled: cancelled)
+            let result = try change(db, saved)
             var merged = sections
+            merged[Self.evidenceKey] = indexUpdate.evidence
             for (key, update) in updating {
                 try checkSidecarCancellation(cancelled)
                 let current = try verifiedSection(key, in: db, stamp: saved, maxBytes: nil, cancelled: cancelled)
@@ -362,21 +401,7 @@ public struct AnalysisSidecar: Sendable {
                 if !retainingLatest.isEmpty || current != updated { merged[key] = updated }
             }
             for (key, value) in merged {
-                try checkSidecarCancellation(cancelled)
-                try value.withUnsafeBytes { bytes in
-                    let digest = try checksum(key, stamp: saved, bytes, cancelled: cancelled)
-                    try digest.withUnsafeBytes { digestBytes in
-                        try db.statement("INSERT OR REPLACE INTO sections(name, digest, value) VALUES(?, ?, ?)", [key]) { query in
-                            guard sqlite3_bind_blob(query, 2, digestBytes.baseAddress, Int32(digestBytes.count), nil) == SQLITE_OK
-                            else { throw db.error() }
-                            // SQLITE_STATIC is safe until this statement is finalized,
-                            // inside both withUnsafeBytes scopes. Avoid another payload copy.
-                            let bound = bytes.isEmpty ? sqlite3_bind_zeroblob(query, 3, 0)
-                                : sqlite3_bind_blob64(query, 3, bytes.baseAddress, UInt64(bytes.count), nil)
-                            guard bound == SQLITE_OK, sqlite3_step(query) == SQLITE_DONE else { throw db.error() }
-                        }
-                    }
-                }
+                try writeSection(key, value: value, db: db, stamp: saved, cancelled: cancelled)
             }
             for (prefix, keep) in retainingLatest {
                 // The rowid tracks insertion, including INSERT OR REPLACE above.
@@ -390,19 +415,40 @@ public struct AnalysisSidecar: Sendable {
             try checkSource()
             try checkSidecarCancellation(cancelled)
             try db.execute("COMMIT")
+            return result
+        }
+    }
+
+    func writeSection(_ key: String, value: Data, db: SidecarDatabase, stamp saved: String,
+                      cancelled: () -> Bool) throws {
+        guard Self.validKey(key) else { throw sidecarError("Invalid section name.") }
+        try checkSidecarCancellation(cancelled)
+        try value.withUnsafeBytes { bytes in
+            let digest = try checksum(key, stamp: saved, bytes, cancelled: cancelled)
+            try digest.withUnsafeBytes { digestBytes in
+                try db.statement("INSERT OR REPLACE INTO sections(name, digest, value) VALUES(?, ?, ?)", [key]) { query in
+                    guard sqlite3_bind_blob(query, 2, digestBytes.baseAddress, Int32(digestBytes.count), nil) == SQLITE_OK
+                    else { throw db.error() }
+                    // SQLITE_STATIC is safe until this statement is finalized,
+                    // inside both withUnsafeBytes scopes. Avoid another payload copy.
+                    let bound = bytes.isEmpty ? sqlite3_bind_zeroblob(query, 3, 0)
+                        : sqlite3_bind_blob64(query, 3, bytes.baseAddress, UInt64(bytes.count), nil)
+                    guard bound == SQLITE_OK, sqlite3_step(query) == SQLITE_DONE else { throw db.error() }
+                }
+            }
         }
     }
 }
 
-private func checkSidecarCancellation(_ cancelled: () -> Bool) throws {
+func checkSidecarCancellation(_ cancelled: () -> Bool) throws {
     if cancelled() { throw CutError(code: "cancelled", message: "Saving the analysis sidecar was cancelled.") }
 }
 
-private func sidecarError(_ message: String) -> CutError {
+func sidecarError(_ message: String) -> CutError {
     CutError(code: "sidecar_error", message: "Analysis sidecar: " + message)
 }
 
-private final class SidecarDatabase {
+final class SidecarDatabase {
     private let handle: OpaquePointer
 
     init(_ url: URL, writing: Bool) throws {
@@ -500,7 +546,7 @@ private final class SidecarDatabase {
         guard sqlite3_exec(handle, sql, nil, nil, nil) == SQLITE_OK else { throw error() }
     }
 
-    func whileWaitingForLocks(_ cancelled: () -> Bool, _ body: () throws -> Void) throws {
+    func whileWaitingForLocks<T>(_ cancelled: () -> Bool, _ body: () throws -> T) throws -> T {
         try withoutActuallyEscaping(cancelled) { check in
             try withUnsafePointer(to: check) { predicate in
                 sqlite3_busy_handler(handle, { context, attempt in
@@ -510,7 +556,7 @@ private final class SidecarDatabase {
                     return 1
                 }, UnsafeMutableRawPointer(mutating: predicate))
                 defer { sqlite3_busy_handler(handle, nil, nil) }
-                do { try body() }
+                do { return try body() }
                 catch {
                     try checkSidecarCancellation(check)
                     throw error
@@ -519,11 +565,11 @@ private final class SidecarDatabase {
         }
     }
 
-    func readBlob(row: Int64, maxBytes: Int?, cancelled: () -> Bool,
+    func readBlob(table: String = "sections", row: Int64, maxBytes: Int?, cancelled: () -> Bool,
                   visit: (UnsafeRawBufferPointer) -> Void) throws -> Data? {
         try checkSidecarCancellation(cancelled)
         var blob: OpaquePointer?
-        guard sqlite3_blob_open(handle, "main", "sections", "value", row, 0, &blob) == SQLITE_OK,
+        guard sqlite3_blob_open(handle, "main", table, "value", row, 0, &blob) == SQLITE_OK,
               let blob else { throw error() }
         defer { sqlite3_blob_close(blob) }
         let size = Int(sqlite3_blob_bytes(blob))
@@ -543,6 +589,22 @@ private final class SidecarDatabase {
 
     func update(_ sql: String, _ bindings: [String]) throws {
         try statement(sql, bindings) { query in
+            guard sqlite3_step(query) == SQLITE_DONE else { throw error() }
+        }
+    }
+
+    func updateBlobs(_ sql: String, _ leading: [String], blobs: [Data], trailing: [String] = []) throws {
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let bindings = leading + Array(repeating: "", count: blobs.count) + trailing
+        try statement(sql, bindings) { query in
+            for (offset, blob) in blobs.enumerated() {
+                let index = Int32(leading.count + offset + 1)
+                let result = blob.withUnsafeBytes { bytes in
+                    bytes.isEmpty ? sqlite3_bind_zeroblob(query, index, 0)
+                        : sqlite3_bind_blob64(query, index, bytes.baseAddress, UInt64(bytes.count), transient)
+                }
+                guard result == SQLITE_OK else { throw error() }
+            }
             guard sqlite3_step(query) == SQLITE_DONE else { throw error() }
         }
     }

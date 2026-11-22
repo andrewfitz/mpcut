@@ -4,6 +4,49 @@ import XCTest
 
 final class CutSequenceDocumentTests: XCTestCase {
     @MainActor
+    func testInPlaceSaveRejectsChangesOnlyInStillRedoAndAllowsSaveAs() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("Original.cut")
+        let copy = directory.appendingPathComponent("Recovered.cut")
+        let project = CutProject.sequence([])
+        let asset = StillAsset(id: "asset", file: "offline.png", displayName: "Still", fingerprint: "fixture")
+        let still = StillInsert(id: "card", assetID: asset.id, duration: .init(numerator: 1), cadence: .init(numerator: 1, denominator: 24))
+        let format = StillTimelineFormat(width: 640, height: 360, cadence: still.cadence, codec: .h264, container: "mp4")
+        func redo(with insert: StillInsert) -> [CutHistoryState] {
+            [.init(action: "Insert Still", project: .stillSequence(.init(items: [.still(insert)], stillAssets: [asset], stillFormat: format)))]
+        }
+        let originalRedo = redo(with: still)
+        try project.save(to: url, undo: [], redo: originalRedo)
+        let preferences = EditorPreferences()
+        preferences.historyLimit = 10
+        let editor = EditorModel(preferences: preferences)
+        defer { editor.endSession() }
+        try editor.openProject([], at: url)
+
+        let initial = try XCTUnwrap(CutProjectMedia.load(from: url).diskRevision)
+        var updatedStill = still
+        updatedStill.duration = .init(numerator: 2)
+        let updatedRedo = redo(with: updatedStill)
+        _ = try project.saveRevision(to: url, undo: [], redo: updatedRedo, expected: initial)
+        let published = try Data(contentsOf: url)
+        XCTAssertEqual(try CutProject.loadDocument(from: url, limit: 10).redo, updatedRedo)
+
+        XCTAssertThrowsError(try editor.writeProject(to: url)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "project_save_conflict")
+        }
+        XCTAssertEqual(try Data(contentsOf: url), published)
+        XCTAssertEqual(editor.projectURL, url)
+        try editor.writeProject(to: copy)
+        XCTAssertEqual(editor.projectURL, copy)
+        XCTAssertNoThrow(try editor.writeProject(to: copy))
+        let recovered = try CutProject.loadDocument(from: copy, limit: 10)
+        XCTAssertEqual(recovered.project, project)
+        XCTAssertEqual(recovered.redo, originalRedo)
+    }
+
+    @MainActor
     func testOpenEditSaveAsPreservesExactRepeatedClipsAndReplacementAudio() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

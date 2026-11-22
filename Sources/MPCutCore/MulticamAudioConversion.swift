@@ -7,6 +7,7 @@ struct MulticamAudioConversionPlan: Sendable {
         let decodedStart: Int64?
         let seekablePCM: Bool
         let count: Int64
+        var silence = false
     }
 
     let edit: ResolvedEdit
@@ -25,6 +26,11 @@ struct MulticamAudioConversionPlan: Sendable {
 }
 
 /// One retained range of a soundtrack on the program clock.
+struct ConvertedSoundFormat {
+    let media: MediaInfo
+    let audio: AudioIndex
+}
+
 struct ConvertedSoundSpan {
     let media: MediaInfo?
     let stream: Int?
@@ -47,7 +53,8 @@ extension MulticamEngine {
     /// Plans sample-exact conversion of ordered soundtrack ranges. `contextual` places
     /// a failure of the span at the given zero-based position in the caller's terms.
     func resolveConvertedSound(_ lane: [ConvertedSoundSpan], duration: RationalTime, container: String,
-                               action: ReencodeAudio,
+                               action: ReencodeAudio, allowsSilence: Bool = false,
+                               silenceFormat: ConvertedSoundFormat? = nil,
                                contextual: (CutError, Int) throws -> CutError) throws -> MulticamAudioConversionPlan {
         struct SourceRange {
             let media: MediaInfo
@@ -59,8 +66,9 @@ extension MulticamEngine {
 
         let engine = CutEngine(cancelled: cancelled)
         var aacClocks: [URL: [Int: Bool]] = [:]
-        let spans = try lane.enumerated().map { index, span in
+        let spans: [SourceRange?] = try lane.enumerated().map { index, span in
             try engine.checkCancellation()
+            if allowsSilence && span.media == nil && span.stream == nil { return nil }
             do {
                 guard let media = span.media, let stream = span.stream,
                       let audio = media.audio.first(where: { $0.stream.index == stream }) else {
@@ -100,11 +108,20 @@ extension MulticamEngine {
                 throw try contextual(issue, index)
             }
         }
-        guard let first = spans.first else {
+        var audible = spans.compactMap { $0 }
+        if audible.isEmpty, allowsSilence, let silenceFormat {
+            let audio = silenceFormat.audio
+            guard audio.stream.sampleRate > 0, audio.stream.channels > 0 else {
+                throw CutError(code: "unsupported_audio", message: "The selected audio has no usable sample clock or channel layout.")
+            }
+            audible.append(SourceRange(media: silenceFormat.media, audio: audio, layout: try audioLayout(audio.stream),
+                                       samples: 0..<0, decodedStart: nil))
+        }
+        guard let first = audible.first else {
             throw CutError(code: "missing_audio", message: "There is no soundtrack selected for conversion.")
         }
-        let commonLayout = spans.allSatisfy { $0.layout == first.layout && $0.audio.stream.channels == first.audio.stream.channels }
-        let commonRate = spans.allSatisfy { $0.audio.stream.sampleRate == first.audio.stream.sampleRate }
+        let commonLayout = audible.allSatisfy { $0.layout == first.layout && $0.audio.stream.channels == first.audio.stream.channels }
+        let commonRate = audible.allSatisfy { $0.audio.stream.sampleRate == first.audio.stream.sampleRate }
         let aacRates = [7_350, 8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000]
         let mp3Rates = [8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000]
         let preserveRate = commonRate && (action != .aac || aacRates.contains(first.audio.stream.sampleRate))
@@ -118,7 +135,7 @@ extension MulticamEngine {
         guard action != .mp3 || channels <= 2 else {
             throw CutError(code: "unsupported_audio", message: "MP3 carries mono or stereo sound. Choose PCM for this channel layout.")
         }
-        let floatingPoint = action == .aac || action == .mp3 || spans.contains {
+        let floatingPoint = action == .aac || action == .mp3 || audible.contains {
             $0.audio.stream.codec.hasPrefix("pcm_f") || !$0.audio.presentationEdits.isEmpty
         }
         var warnings: [String] = []
@@ -128,15 +145,17 @@ extension MulticamEngine {
         var segments: [ResolvedSegment] = []
         var inputs: [MulticamAudioConversionPlan.Input] = []
         var identities: [URL: SourceIdentity] = [:]
+        if let silenceFormat { identities[silenceFormat.media.url] = silenceFormat.media.identity }
         var end: Int64 = 0
         for (index, span) in lane.enumerated() {
-            let source = spans[index]
+            let source = spans[index] ?? first
             let media = source.media
             let audio = source.audio
             // Round cumulative boundaries so sample rounding cannot
             // accumulate drift across switches.
             let start = try span.output.from.roundedToSamples(rate)
             let next = try span.output.to.roundedToSamples(rate)
+            if start == end && next == start && spans[index] == nil { continue }
             guard start == end, next > start else {
                 let issue = CutError(code: "unsupported_audio", message: "The soundtrack must cover the program with at least one output sample per span.")
                 throw try contextual(issue, index)
@@ -150,8 +169,8 @@ extension MulticamEngine {
             inputs.append(.init(audio: audio, samples: source.samples, decodedStart: source.decodedStart,
                                 seekablePCM: media.format == "wav" && audio.stream.isPCM && audio.pcmContinuity
                                     && source.decodedStart == 0 && media.origin == .zero,
-                                count: next - start))
-            identities[media.url] = media.identity
+                                count: next - start, silence: spans[index] == nil))
+            if spans[index] != nil { identities[media.url] = media.identity }
             end = next
         }
         guard end == (try duration.roundedToSamples(rate)) else {
@@ -241,12 +260,13 @@ extension MulticamEngine {
         func stageCompressedGroup(from index: Int) throws -> Int {
             let file = plan.edit.segments[index].file
             let stream = plan.inputs[index].audio.stream
-            guard !stream.isPCM, plan.inputs[index].audio.presentationEdits.isEmpty else { return index }
+            guard !plan.inputs[index].silence, !stream.isPCM,
+                  plan.inputs[index].audio.presentationEdits.isEmpty else { return index }
             var capacity = Int64(32 << 20) / Int64(plan.channels * 4)
             var end = index
             while end < plan.inputs.count && end - index < 8 {
                 let input = plan.inputs[end]
-                guard plan.edit.segments[end].file == file, input.audio.stream.index == stream.index,
+                guard !input.silence, plan.edit.segments[end].file == file, input.audio.stream.index == stream.index,
                       input.audio.presentationEdits.isEmpty, input.count <= capacity else { break }
                 capacity -= input.count
                 end += 1
@@ -288,7 +308,11 @@ extension MulticamEngine {
                 if index >= stagedThrough {
                     var arguments = ["-xerror", "-copyts", "-n"]
                     let prefix: String
-                    if !input.audio.presentationEdits.isEmpty {
+                    if input.silence {
+                        let source = "anullsrc=r=\(plan.sampleRate):cl=\(plan.layout)"
+                        arguments += ["-f", "lavfi", "-i", source, "-map", "0:a:0"]
+                        prefix = "atrim=end_sample=\(input.count),"
+                    } else if !input.audio.presentationEdits.isEmpty {
                         if input.audio.presentationEdits.contains(where: { $0.isAudible && $0.samples.overlaps(input.samples) }) {
                             try runner.stageEditedAudio(segment.file, track: track, source: input.samples,
                                                         count: input.samples.upperBound - input.samples.lowerBound,

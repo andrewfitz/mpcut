@@ -8,8 +8,19 @@ final class SourceIndexLoader {
         let url: URL
         let sidecars: Bool
         let preview: Bool
-        var identity: SourceIdentity? = nil
-        var preferCompleted = false
+        let identity: SourceIdentity?
+        let preferCompleted: Bool
+        // SourceIdentity's ordinary equality intentionally ignores metadata-only changes.
+        private let changeTime: SourceIdentity.ChangeTime?
+
+        init(url: URL, sidecars: Bool, preview: Bool, identity: SourceIdentity? = nil, preferCompleted: Bool = false) {
+            self.url = url
+            self.sidecars = sidecars
+            self.preview = preview
+            self.identity = identity
+            self.preferCompleted = preferCompleted
+            changeTime = identity?.changeTime
+        }
     }
 
     final class Index: Sendable {
@@ -63,7 +74,7 @@ final class SourceIndexLoader {
         func index(for key: Key, identity: SourceIdentity) -> Index? {
             lock.withLock {
                 entries.removeAll { entry in
-                    guard entry.url == key.url, entry.index.ordinary.identity != identity else { return false }
+                    guard entry.url == key.url, !entry.index.ordinary.identity.matchesSnapshot(identity) else { return false }
                     bytes -= entry.cost
                     return true
                 }
@@ -73,6 +84,16 @@ final class SourceIndexLoader {
                 let entry = entries.remove(at: position)
                 entries.append(entry)
                 return entry.index
+            }
+        }
+
+        func discard(_ url: URL) {
+            lock.withLock {
+                entries.removeAll { entry in
+                    guard entry.url.standardizedFileURL == url else { return false }
+                    bytes -= entry.cost
+                    return true
+                }
             }
         }
 
@@ -121,6 +142,10 @@ final class SourceIndexLoader {
     }
 
     private final class Conversion {
+        let source: URL
+
+        init(source: URL) { self.source = source }
+
         let token = EditCancellation()
         var completions: [UUID: (Result<MulticamIndex, Error>) -> Void] = [:]
     }
@@ -143,6 +168,33 @@ final class SourceIndexLoader {
         probes.qualityOfService = .userInitiated
         indexes.maxConcurrentOperationCount = 2
         indexes.qualityOfService = .utility
+    }
+
+    /// A manual or watched refresh has already paid to index this recording.
+    func acceptRefreshedIndex(_ media: MediaInfo, sidecars: Bool) {
+        let url = media.url.standardizedFileURL
+        let stale = CutError(code: "source_changed", message: "The recording changed while loading.")
+        let obsolete = requests.filter { $0.key.url.standardizedFileURL == url }
+        for (key, request) in obsolete {
+            requests[key] = nil
+            request.token.cancel()
+        }
+        let obsoleteConversions = conversions.filter { $0.value.source == url }
+        for (id, conversion) in obsoleteConversions {
+            conversions[id] = nil
+            conversion.token.cancel()
+        }
+        completed.discard(url)
+        if media.hasFullEditIndex {
+            completed.store(Index(ordinary: media), for: Key(url: url, sidecars: sidecars, preview: false))
+        }
+        // Detach all requests before notifying callers. Their handlers may immediately retry.
+        for request in obsolete.values {
+            for subscriber in request.subscribers.values { subscriber.completion(.failure(stale)) }
+        }
+        for conversion in obsoleteConversions.values {
+            for completion in conversion.completions.values { completion(.failure(stale)) }
+        }
     }
 
     func read(_ key: Key, token: EditCancellation, preference: EditCancellation,
@@ -207,7 +259,7 @@ final class SourceIndexLoader {
         if let conversion = conversions[id] {
             conversion.completions[subscriber] = completion
         } else {
-            let conversion = Conversion()
+            let conversion = Conversion(source: key.url.standardizedFileURL)
             conversion.completions[subscriber] = completion
             conversions[id] = conversion
             let token = conversion.token
@@ -217,7 +269,7 @@ final class SourceIndexLoader {
                 let result = Result {
                     let engine = CutEngine(cancelled: { token.isCancelled }, useSidecar: key.sidecars)
                     let multicam = try engine.multicamClock(ordinary)
-                    guard try SourceIdentity(key.url) == ordinary.identity else {
+                    guard ordinary.identity.isCurrentSnapshot(at: key.url) else {
                         throw CutError(code: "source_changed", message: "The recording changed while loading. Relink it to continue.")
                     }
                     return MulticamIndex(ordinary: ordinary, multicam: multicam)
@@ -260,22 +312,24 @@ final class SourceIndexLoader {
             requests[key] = request
             let token = request.token
             let completed = self.completed
-            let finish: @Sendable (Result<Index, Error>) -> Void = { [weak self] result in
+            let finish: @Sendable (Result<Index, Error>, Bool) -> Void = { [weak self] result, shouldStore in
                 Task { @MainActor [weak self] in
                     guard let self, let request = self.requests[key], request.token === token else { return }
                     self.requests[key] = nil
+                    if shouldStore, case let .success(index) = result { self.completed.store(index, for: key) }
                     for subscriber in Array(request.subscribers.values) { subscriber.completion(result) }
                 }
             }
             let freshIdentity: @Sendable () throws -> SourceIdentity = {
                 let identity = try SourceIdentity(key.url)
-                guard key.identity.map({ $0 == identity }) ?? true else {
+                guard key.identity.map({ $0.matchesSnapshot(identity) }) ?? true else {
                     throw CutError(code: "source_changed", message: "The recording changed while loading. Relink it to continue.")
                 }
                 return identity
             }
             let work: @Sendable () -> Void = { [weak self] in
                 guard !token.isCancelled else { return }
+                var shouldStore = false
                 let result = Result {
                     let engine = CutEngine(cancelled: { token.isCancelled }, useSidecar: key.sidecars)
                     let identity = try freshIdentity()
@@ -302,14 +356,14 @@ final class SourceIndexLoader {
                         throw CutError(code: "incomplete_index", message: "The recording has no complete editing index.")
                     }
                     let index = Index(ordinary: ordinary)
-                    guard ordinary.identity == identity, try SourceIdentity(key.url) == identity else {
+                    guard ordinary.identity.matchesSnapshot(identity), identity.isCurrentSnapshot(at: key.url) else {
                         throw CutError(code: "source_changed", message: "The recording changed while loading. Relink it to continue.")
                     }
                     if token.isCancelled { throw CancellationError() }
-                    if !key.preview { completed.store(index, for: key) }
+                    shouldStore = !key.preview
                     return index
                 }
-                finish(result)
+                finish(result, shouldStore)
             }
             if key.preview {
                 probes.addOperation(work)
@@ -321,12 +375,12 @@ final class SourceIndexLoader {
                     do {
                         let identity = try freshIdentity()
                         if let cached = completed.index(for: key, identity: identity) {
-                            finish(.success(cached))
+                            finish(.success(cached), false)
                         } else {
                             indexes.addOperation(work)
                         }
                     } catch {
-                        finish(.failure(error))
+                        finish(.failure(error), false)
                     }
                 }
             } else {

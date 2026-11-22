@@ -34,6 +34,95 @@ public enum ProjectConverter {
         if cancelled() { throw CutError(code: "cancelled", message: "Project conversion cancelled.") }
     }
 
+    /// External formats require specific support for each still operation. Keep
+    /// projections here so all entry points report exactly what will be omitted.
+    static func prepareStills(_ project: CutProject, for destination: String, allowLoss: Bool,
+                              supportsStillInserts: Bool = false) throws -> (project: CutProject, warnings: [String]) {
+        var warnings = [String]()
+        func omitReplacements(_ replacements: [StillReplacement]) {
+            warnings += replacements.map {
+                "\(destination) cannot represent Replace Picture placement \($0.id). The underlying picture will be restored."
+            }
+        }
+        func reportUnusedAssets(_ assets: [StillAsset], inserts: [StillInsert], replacements: [StillReplacement]) {
+            let used = Set(inserts.map(\.assetID)).union(replacements.map(\.assetID))
+            warnings += assets.filter { !used.contains($0.id) }.map {
+                "\(destination) omits unplaced still asset \($0.id)."
+            }
+        }
+        let insertLoss: (StillInsert, String) -> String = { insert, reason in
+            "\(destination) cannot represent Insert Still placement \(insert.id): \(reason). The insert and its silence will be removed."
+        }
+        func keepInsert(_ insert: StillInsert, files: [String: String]) -> Bool {
+            guard supportsStillInserts else {
+                warnings.append(insertLoss(insert, "the destination has no verified insert mapping"))
+                return false
+            }
+            guard insert.framing == .fit || insert.framing == .fill else {
+                warnings.append(insertLoss(insert, "the image has a custom crop or background"))
+                return false
+            }
+            guard let file = files[insert.assetID],
+                  ["jpe", "jpeg", "jpg", "png", "tif", "tiff"].contains(URL(fileURLWithPath: file).pathExtension.lowercased())
+            else {
+                warnings.append(insertLoss(insert, "the linked asset is outside the supported JPEG, PNG and TIFF mapping"))
+                return false
+            }
+            return true
+        }
+        let result: CutProject
+        switch project {
+        case .sequence:
+            result = project
+        case .stillSequence(var sequence):
+            reportUnusedAssets(sequence.stillAssets, inserts: sequence.items.compactMap(\.still), replacements: sequence.stillReplacements)
+            omitReplacements(sequence.stillReplacements)
+            let files = Dictionary(sequence.stillAssets.map { ($0.id, $0.file) }, uniquingKeysWith: { first, _ in first })
+            sequence.items = sequence.items.filter { item in
+                item.still.map { keepInsert($0, files: files) } ?? true
+            }
+            sequence.stillReplacements = []
+            let retainedAssets = Set(sequence.items.compactMap(\.still).map(\.assetID))
+            if !retainedAssets.isEmpty {
+                sequence.stillAssets = sequence.stillAssets.filter { retainedAssets.contains($0.id) }
+                result = .stillSequence(sequence)
+            } else {
+                if sequence.programColorPolicy != nil {
+                    warnings.append("\(destination) omits the MPCut program color policy.")
+                }
+                if sequence.stillFormat != nil {
+                    warnings.append("\(destination) omits the MPCut still-only project format.")
+                }
+                result = .sequence(sequence.items.compactMap(\.source))
+            }
+        case .multicam(var group):
+            reportUnusedAssets(group.stillAssets, inserts: group.assemblyItems?.compactMap(\.still) ?? [], replacements: group.stillReplacements)
+            omitReplacements(group.stillReplacements)
+            let files = Dictionary(group.stillAssets.map { ($0.id, $0.file) }, uniquingKeysWith: { first, _ in first })
+            let hasGroupRanges = group.assemblyItems?.contains { $0.group != nil } ?? true
+            group.assemblyItems = group.assemblyItems?.filter { item in
+                guard let insert = item.still else { return true }
+                guard hasGroupRanges else {
+                    warnings.append(insertLoss(insert, "the assembly has no retained camera range"))
+                    return false
+                }
+                return keepInsert(insert, files: files)
+            }
+            let retainedAssets = Set((group.assemblyItems?.compactMap(\.still) ?? []).map(\.assetID))
+            group.stillAssets = group.stillAssets.filter { retainedAssets.contains($0.id) }
+            if retainedAssets.isEmpty {
+                if group.programColorPolicy != nil { warnings.append("\(destination) omits the MPCut program color policy.") }
+                group.programColorPolicy = nil
+            }
+            group.stillReplacements = []
+            result = .multicam(group)
+        }
+        if !warnings.isEmpty && !allowLoss {
+            throw CutError(code: "conversion_loss", message: warnings.joined(separator: "\n"))
+        }
+        return (result, warnings)
+    }
+
     @discardableResult
     public static func convert(input: URL, output: URL, allowLoss: Bool = false,
                                flattenMulticam: Bool = false,

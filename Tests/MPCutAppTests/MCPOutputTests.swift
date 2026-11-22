@@ -99,6 +99,56 @@ final class MCPOutputTests: XCTestCase {
         XCTAssertEqual(exported["outputs"] as? [String], [directory.appendingPathComponent("ProRes-2997-001.mov").path])
     }
 
+    func testLiveMulticamRemuxFromPreflightAlternative() async throws {
+        let preferences = EditorPreferences()
+        let sessions = ProjectSessions(preferences: preferences)
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        session.isMulticam = true
+        defer { session.multicam.reset() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4", subdirectory: "Fixtures"))
+        let source = directory.appendingPathComponent("camera.mp4")
+        try FileManager.default.copyItem(at: fixture, to: source)
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(source)
+        session.multicam.confirmSetup(drafts: [.init(source: .init(id: "a", file: source.path), media: media)],
+                                      opening: "a", audio: .none)
+        func render(_ output: URL, mode: String, dryRun: Bool) async throws -> [String: Any] {
+            let ticket = try await sessions.mcpOutputs(tool: "render_project", arguments: [
+                "project": session.mcpHandle, "output": output.path, "mode": mode, "dryRun": dryRun
+            ], session: session, checkAccess: {})
+            return try await finished(XCTUnwrap(ticket), owner: session.mcpHandle, in: sessions.mcpOutputJobs)
+        }
+        let rejected = directory.appendingPathComponent("program.webm")
+        let job = try await render(rejected, mode: "smart", dryRun: true)
+        let check = try XCTUnwrap(job["result"] as? [String: Any])
+        XCTAssertEqual(check["eligible"] as? Bool, false)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: rejected.path))
+        let offers = try XCTUnwrap(check["alternatives"] as? [[String: Any]])
+        let mov = try XCTUnwrap(offers.first { $0["id"] as? String == "copyOtherContainer:mov" })
+        let mode = try XCTUnwrap(mov["mode"] as? String)
+        XCTAssertEqual(mode, "copy")
+        let output = directory.appendingPathComponent("program.mov")
+        let written = try await render(output, mode: mode, dryRun: false)
+        XCTAssertEqual(written["outputs"] as? [String], [output.path])
+        XCTAssertEqual(try CutEngine(useSidecar: false).inspect(output).duration, media.duration)
+
+        let firstFrame = RationalTime(numerator: 7, denominator: 25)
+        session.multicam.changeOccurrence(0, from: firstFrame)
+        let cutJob = try await render(rejected, mode: "copy", dryRun: true)
+        let cutCheck = try XCTUnwrap(cutJob["result"] as? [String: Any])
+        XCTAssertEqual(cutCheck["eligible"] as? Bool, false)
+        let cutOffers = try XCTUnwrap(cutCheck["alternatives"] as? [[String: Any]])
+        XCTAssertFalse(cutOffers.contains { $0["rung"] as? String == "copyOtherContainer" })
+        let trim = try XCTUnwrap(cutOffers.first { $0["id"] as? String == "smartTrim:mov" })
+        XCTAssertEqual(trim["lossless"] as? Bool, false)
+        let cutOutput = directory.appendingPathComponent("program-trimmed.mov")
+        let cutWritten = try await render(cutOutput, mode: XCTUnwrap(trim["mode"] as? String), dryRun: false)
+        XCTAssertEqual(cutWritten["outputs"] as? [String], [cutOutput.path])
+        XCTAssertEqual(try CutEngine(useSidecar: false).inspect(cutOutput).duration, try media.duration.subtracting(firstFrame))
+    }
+
     func testCancelledJobRetainsPartialOutputsAndTargetIsolation() async throws {
         let jobs = MCPLiveOutputJobs()
         let first = URL(fileURLWithPath: "/example/first.mov")

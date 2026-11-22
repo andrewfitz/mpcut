@@ -4,6 +4,73 @@ import SwiftUI
 
 @MainActor
 enum WaveformDrawing {
+    /// A connected outline of signed peaks. Sample once per visible backing pixel,
+    /// or once per source bin when the display is finer than the available data.
+    static func timelinePath(in area: CGRect, sourceStart: Double, pointsPerSecond: CGFloat,
+                             displayScale: CGFloat, detail: DisplayEnvelope?, coarse: AudioWaveform?) -> CGPath {
+        let path = CGMutablePath()
+        guard area.width > 0, area.height > 0, detail != nil || coarse != nil else { return path }
+        let pixel = 1 / displayScale
+        let bin = detail?.secondsPerBin ?? 1 / Double(AudioWaveform.rate)
+        let step = max(detail == nil ? 1 : pixel, bin * pointsPerSecond)
+        let amplitude = max(0, area.height / 2 - 2)
+        func y(_ value: Float) -> CGFloat {
+            let level = sqrt(min(1, CGFloat(abs(value))))
+            return area.midY - (value < 0 ? -level : level) * amplitude
+        }
+        var lower: [CGPoint] = []
+        var lastTop = area.midY
+        func close(at x: CGFloat) {
+            guard let last = lower.last else { return }
+            path.addLine(to: CGPoint(x: x, y: lastTop))
+            path.addLine(to: CGPoint(x: x, y: last.y))
+            for point in lower.reversed() { path.addLine(to: point) }
+            path.closeSubpath()
+            lower.removeAll(keepingCapacity: true)
+        }
+        var left = area.minX
+        while left < area.maxX {
+            let right = min(area.maxX, left + step)
+            let from = sourceStart + (left - area.minX) / pointsPerSecond
+            let to = sourceStart + (right - area.minX) / pointsPerSecond
+            let levels = detail?.range(from: from, to: to) ?? coarse?.peak(from: from, to: to).map { (-$0, $0) }
+            if let (low, high) = levels {
+                let top = y(high) - pixel / 2, bottom = y(low) + pixel / 2
+                if lower.isEmpty {
+                    path.move(to: CGPoint(x: left, y: top))
+                    lower.append(CGPoint(x: left, y: bottom))
+                }
+                let middle = (left + right) / 2
+                path.addLine(to: CGPoint(x: middle, y: top))
+                lower.append(CGPoint(x: middle, y: bottom))
+                lastTop = top
+            } else {
+                close(at: left)
+            }
+            left = right
+        }
+        close(at: area.maxX)
+        return path
+    }
+
+    static func sparsePath(_ waveform: SparseWaveform, in area: CGRect, sourceStart: Double,
+                           pointsPerSecond: CGFloat) -> CGPath {
+        let end = sourceStart + area.width / pointsPerSecond
+        let step = (waveform.range.upperBound - waveform.range.lowerBound) / Double(waveform.peaks.count)
+        let path = CGMutablePath()
+        for (index, peak) in waveform.peaks.enumerated() {
+            guard let peak else { continue }
+            let start = waveform.range.lowerBound + Double(index) * step
+            let left = max(sourceStart, start), right = min(end, start + step)
+            guard left < right else { continue }
+            let amplitude = max(0.5, sqrt(min(1, CGFloat(peak))) * (area.height / 2 - 2))
+            path.addRect(CGRect(x: area.minX + (left - sourceStart) * pointsPerSecond,
+                                y: area.midY - amplitude, width: (right - left) * pointsPerSecond,
+                                height: amplitude * 2))
+        }
+        return path
+    }
+
     /// Draw one column per backing pixel. The signed envelope preserves transients and DC offset.
     static func draw(in rect: CGRect, visible: CGRect, seconds: Range<Double>, scale: CGFloat,
                      detail: DisplayEnvelope?, coarse: AudioWaveform?, pauses: [AudioSpan], color: NSColor) {
@@ -92,7 +159,11 @@ struct AudioWaveformViewer: NSViewRepresentable {
     let scrub: (Double) -> Void
     let endScrub: () -> Void
 
-    func makeNSView(context: Context) -> AudioWaveformCanvas { AudioWaveformCanvas() }
+    func makeNSView(context: Context) -> AudioWaveformCanvas {
+        let canvas = AudioWaveformCanvas()
+        canvas.toolTip = "Scrub the waveform"
+        return canvas
+    }
     func updateNSView(_ view: AudioWaveformCanvas, context: Context) { view.set(self) }
 }
 

@@ -50,6 +50,7 @@ public enum PremiereInterchange {
         guard output.pathExtension.lowercased() == "prproj" else {
             throw CutError(code: "invalid_premiere_project", message: "Choose a .prproj destination.")
         }
+        let conversion = try ProjectConverter.prepareStills(project, for: "Adobe Premiere Pro .prproj", allowLoss: allowLoss)
         guard !FileManager.default.fileExists(atPath: output.path) else {
             throw CutError(code: "output_exists", message: "The destination already exists at \(output.path).")
         }
@@ -57,7 +58,7 @@ public enum PremiereInterchange {
         return try withStage(in: output.deletingLastPathComponent()) { stage in
             let native = stage.appendingPathComponent(output.lastPathComponent)
             let xml = stage.appendingPathComponent("sequence.xml")
-            var warnings = try PremiereTimeline.write(project, relativeTo: location, to: xml,
+            var warnings = try conversion.warnings + PremiereTimeline.write(conversion.project, relativeTo: location, to: xml,
                                                      name: output.deletingPathExtension().lastPathComponent,
                                                      allowLoss: allowLoss, flattenMulticam: flattenMulticam)
             let expected = try PremiereTimeline.nativeAngles(in: xml)

@@ -11,11 +11,13 @@ public enum ResolveNativeInterchange {
         try ProjectConverter.checkCancellation(cancelled)
         try project.validateDestination(output, relativeTo: location)
         let ext = try archiveExtension(output)
+        let conversion = try ProjectConverter.prepareStills(project, for: "DaVinci Resolve .\(ext)", allowLoss: allowLoss)
+        let project = conversion.project
         let files = FileManager.default
         guard !files.fileExists(atPath: output.path) else {
             throw CutError(code: "output_exists", message: "The destination already exists at \(output.path).")
         }
-        var warnings = [String]()
+        var warnings = conversion.warnings
         if case .sequence(let clips) = project,
            clips.contains(where: { $0.audioTrack != nil || $0.originalFile != nil || !$0.replacementNames.isEmpty }) {
             let message = "Resolve links each playable source with its replacement audio. Its archive omits MPCut’s original recording references, replacement track names and preview-track choices."
@@ -73,11 +75,7 @@ public enum ResolveNativeInterchange {
         let xml = dir.appendingPathComponent("Timeline.fcpxmld")
         try run(helper, operation: "read", native: url, xml: xml, ext: ext, cancelled: cancelled)
         let (project, warnings) = try FCPInterchange.read(xml, allowLoss: allowLoss)
-        let paths: [String]
-        switch project {
-        case .sequence(let clips): paths = clips.flatMap { [$0.file, $0.originalFile].compactMap { $0 } }
-        case .multicam(let group): paths = group.sources.map(\.file)
-        }
+        let paths = project.mediaPaths.map { $0.1 }
         let temporaryPrefix = dir.resolvingSymlinksInPath().standardizedFileURL.path + "/"
         guard !paths.contains(where: { URL(fileURLWithPath: $0).resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(temporaryPrefix) }) else {
             throw CutError(code: "resolve_embedded_media", message: "This timeline references embedded temporary media. Relink those clips to permanent source files in Resolve and export the archive again.")
@@ -263,6 +261,15 @@ public enum ResolveNativeInterchange {
             end
         end
         return table.concat(result,"\n")
+    end
+    -- Resolve starts in an unsaved project. While it is still empty there is nothing
+    -- to lose or to reopen, so only an unsaved project with content blocks a conversion.
+    if original and not exists(originalName) then
+        local root = original:GetMediaPool():GetRootFolder()
+        if original:GetTimelineCount() == 0 and #(root:GetClipList() or {}) == 0
+            and #(root:GetSubFolderList() or {}) == 0 then
+            originalName, originalID = nil, nil
+        end
     end
     local ok, reason = pcall(function()
         checkCancelled()

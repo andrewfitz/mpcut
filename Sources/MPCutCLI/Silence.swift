@@ -16,6 +16,7 @@ struct SilenceOptions {
     var leave: Double?
     var columns: Int?
     var mode: ExportMode?
+    var audio: ReencodeAudio?
     var tracks: ExportTracks?
     var pausesFile: String?
     var stdin = false
@@ -67,6 +68,11 @@ struct SilenceOptions {
                 let raw = try value()
                 guard let choice = ExportTracks(rawValue: raw) else { throw invalid("Choose all, audio, or video.") }
                 tracks = choice
+            case "--audio":
+                guard let choice = ReencodeAudio(rawValue: try value()), [.copyOriginal, .aac, .pcm].contains(choice) else {
+                    throw invalid("Choose copy, aac, or pcm for --audio.")
+                }
+                audio = choice
             case "--mode":
                 let modes = ExportEntryPoint.cliSilence.modes
                 guard let choice = ExportMode(rawValue: try value()), modes.contains(choice) else {
@@ -81,6 +87,9 @@ struct SilenceOptions {
         }
         if project != nil && !seen.isDisjoint(with: ["--stream", "--audio-stream", "--waveform", "--tracks"]) {
             throw invalid("Project silence uses the picture and audio selected in the project. Omit --stream, --audio-stream, --waveform and --tracks.")
+        }
+        if let audio, project == nil || output == nil || (mode == .copy && audio != .copyOriginal) {
+            throw invalid("Use --audio with --project and --output. Converting sound requires Smart Trim.")
         }
         guard minimum > 0, (leave ?? 0) >= 0 else {
             throw invalid("Use a positive minimum pause and nonnegative leave time.")

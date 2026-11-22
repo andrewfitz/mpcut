@@ -1,0 +1,381 @@
+[
+  {
+    "name": "list_stills",
+    "description": "Read a page of image placements, including authored and visible ranges and asset availability.",
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "add_still",
+    "description": "Import an image and replace program picture or insert a duration-bearing card. Inserts ripple the program. Replacements keep the underlying sound.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "insert",
+            "replace"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute local image path."
+        },
+        "space": {
+          "type": "string",
+          "enum": [
+            "sequence",
+            "group",
+            "assembly"
+          ]
+        },
+        "at": {
+          "type": "string",
+          "description": "Placement position in the selected clock. Exact rational seconds."
+        },
+        "duration": {
+          "type": "string",
+          "description": "Positive duration. Exact rational seconds."
+        },
+        "cadence": {
+          "type": "string",
+          "description": "Positive frame interval, for example 1001/30000. Exact rational seconds."
+        },
+        "from": {
+          "type": "string",
+          "description": "Inclusive replacement start. Exact rational seconds."
+        },
+        "to": {
+          "type": "string",
+          "description": "Exclusive replacement end. Exact rational seconds."
+        },
+        "fit": {
+          "type": "string",
+          "enum": [
+            "fit",
+            "fill"
+          ]
+        },
+        "crop": {
+          "type": "object",
+          "description": "Normalized crop rectangle as exact rational coordinates.",
+          "properties": {
+            "x": {
+              "type": "string"
+            },
+            "y": {
+              "type": "string"
+            },
+            "width": {
+              "type": "string"
+            },
+            "height": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "x",
+            "y",
+            "width",
+            "height"
+          ],
+          "additionalProperties": false
+        },
+        "background": {
+          "type": "string",
+          "pattern": "^#[0-9A-Fa-f]{6}$"
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "operation",
+        "path",
+        "space"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "operation": {
+              "const": "insert"
+            },
+            "space": {
+              "enum": [
+                "sequence",
+                "assembly"
+              ]
+            }
+          },
+          "required": [
+            "at",
+            "duration"
+          ]
+        },
+        {
+          "properties": {
+            "operation": {
+              "const": "replace"
+            },
+            "space": {
+              "enum": [
+                "sequence",
+                "group"
+              ]
+            }
+          },
+          "required": [
+            "from",
+            "to"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "update_still",
+    "description": "Edit framing, move or resize an insert, or change the bounds of a replacement. Supply sequence time for ordinary projects, assembly time for multicam inserts, and group time for multicam replacements.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1
+        },
+        "asset": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Use another existing still asset for this placement."
+        },
+        "clearCrop": {
+          "type": "boolean",
+          "description": "Clear the existing crop rectangle."
+        },
+        "clock": {
+          "type": "string",
+          "enum": ["sequence", "source", "group"],
+          "description": "Clock of replacement bounds or destination. Defaults to sequence or group."
+        },
+        "fragmentIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Current index of the sequence replacement fragment to edit."
+        },
+        "duplicateID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "New replacement ID when duplicating to the supplied destination."
+        },
+        "detachID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "New replacement ID when detaching the selected source fragment."
+        },
+        "placement": {
+          "type": "string",
+          "minLength": 1
+        },
+        "at": {
+          "type": "string",
+          "description": "Placement position in the selected clock. Exact rational seconds."
+        },
+        "duration": {
+          "type": "string",
+          "description": "Positive duration. Exact rational seconds."
+        },
+        "cadence": {
+          "type": "string",
+          "description": "Positive frame interval, for example 1001/30000. Exact rational seconds."
+        },
+        "from": {
+          "type": "string",
+          "description": "Inclusive replacement start. Exact rational seconds."
+        },
+        "to": {
+          "type": "string",
+          "description": "Exclusive replacement end. Exact rational seconds."
+        },
+        "fit": {
+          "type": "string",
+          "enum": [
+            "fit",
+            "fill"
+          ]
+        },
+        "crop": {
+          "type": "object",
+          "description": "Normalized crop rectangle as exact rational coordinates.",
+          "properties": {
+            "x": {
+              "type": "string"
+            },
+            "y": {
+              "type": "string"
+            },
+            "width": {
+              "type": "string"
+            },
+            "height": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "x",
+            "y",
+            "width",
+            "height"
+          ],
+          "additionalProperties": false
+        },
+        "background": {
+          "type": "string",
+          "pattern": "^#[0-9A-Fa-f]{6}$"
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "placement"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "remove_still",
+    "description": "Remove a placement. Deleting a replacement reveals the underlying picture. Deleting an insert ripples the sequence or assembly.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1
+        },
+        "placement": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "placement"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "relink_still",
+    "description": "Update all uses of a still asset in one native undo step.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1
+        },
+        "asset": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute local image path."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "asset",
+        "path"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

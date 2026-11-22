@@ -10,6 +10,7 @@ enum ResolveExportPanel {
         panel.allowedContentTypes = [UTType(filenameExtension: "fcpxml") ?? .xml]
         panel.nameFieldStringValue = name + ".fcpxml"
         let open = NSButton(checkboxWithTitle: "Open timeline in the current Resolve project", target: nil, action: nil)
+        open.toolTip = "Open timeline in Resolve"
         open.state = .on
         open.sizeToFit()
         panel.accessoryView = open

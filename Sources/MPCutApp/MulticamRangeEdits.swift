@@ -1,4 +1,5 @@
 import Combine
+import Foundation
 import MPCutCore
 
 @MainActor
@@ -51,12 +52,15 @@ extension MulticamEditorModel {
         return min(range.to, max(range.from, snapped))
     }
 
-    nonisolated static func assemblyEnds(for ranges: [MulticamRange]) -> [RationalTime] {
+    nonisolated static func assemblyEnds(for items: [StillAssemblyItem]) -> [RationalTime] {
         var end = RationalTime.zero
-        return ranges.map { range in
-            if let duration = try? range.to.subtracting(range.from), let next = try? end.adding(duration) {
-                end = next
+        return items.map { item in
+            let duration: RationalTime?
+            switch item {
+            case .group(let range): duration = try? range.to.subtracting(range.from)
+            case .still(let still): duration = still.duration
             }
+            if let duration, let next = try? end.adding(duration) { end = next }
             return end
         }
     }
@@ -88,8 +92,10 @@ extension MulticamEditorModel {
     }
 
     private func assemblySelectionEdge(index: Int, start: RationalTime, offset: RationalTime) -> RationalTime {
-        let range = ranges[index]
-        guard offset != .zero,
+        if let still = assemblyStill(at: index),
+           let snapped = stillFrameBoundary(offset, cadence: still.cadence, nearest: true),
+           let result = try? start.adding(snapped) { return result }
+        guard let range = assemblyRange(at: index), offset != .zero,
               let group = try? range.from.adding(offset),
               let snapped = try? rangeEdge(group, within: range).subtracting(range.from),
               let result = try? start.adding(snapped) else { return start }
@@ -111,9 +117,10 @@ extension MulticamEditorModel {
         let groupSpan = markedGroupSpan
         var canSplit = false
         var removesMedia = false
-        var retainsMedia = false
+        var retainsMedia = assemblyItems.contains { $0.still != nil }
         // Each entry belongs to its assembly occurrence, including repeated source ranges.
-        let portions = ranges.enumerated().map { index, range -> AudioSpan? in
+        let portions = assemblyItems.indices.map { index -> AudioSpan? in
+            guard let range = assemblyRange(at: index) else { return nil }
             let source = MulticamSilencePlanner.span(range)
             let selected: AudioSpan?
             if let assemblySelection {
@@ -146,8 +153,22 @@ extension MulticamEditorModel {
         return edits
     }
 
-    var canSplitSelectedRange: Bool { canActOnRange && selectionEdits.canSplit }
-    var canDeleteSelectedRange: Bool { canActOnRange && selectionEdits.canDelete }
+    var canSplitSelectedRange: Bool {
+        guard canActOnRange else { return false }
+        if assemblySelectionIncludesStill, let selection = assemblySelection {
+            return [selection.from, selection.to].contains { edge in
+                .zero < edge && edge < (assemblyRangeEnds.last ?? .zero) && !assemblyRangeEnds.contains(edge)
+            }
+        }
+        return selectionEdits.canSplit
+    }
+    var canDeleteSelectedRange: Bool {
+        guard canActOnRange else { return false }
+        if assemblySelectionIncludesStill, let selection = assemblySelection, let end = assemblyRangeEnds.last {
+            return selection.from > .zero || selection.to < end
+        }
+        return selectionEdits.canDelete
+    }
 
     var canActOnRange: Bool {
         guard project != nil, !isBusy else { return false }
@@ -156,8 +177,17 @@ extension MulticamEditorModel {
     }
 
     var selectedExportRanges: [MulticamRange] {
+        if assemblySelectionIncludesStill { return [] }
         if assemblySelection == nil { return markedGroupSpan.map { [MulticamSilencePlanner.range($0)] } ?? [] }
         return selectionEdits.assemblyExportRanges
+    }
+
+    var assemblySelectionIncludesStill: Bool {
+        guard let selection = assemblySelection else { return false }
+        return assemblyItems.indices.contains { index in
+            assemblyStill(at: index) != nil && selection.from < assemblyRangeEnds[index]
+                && assemblyStart(at: index) < selection.to
+        }
     }
 
     func chooseProgramExport() {
@@ -174,9 +204,14 @@ extension MulticamEditorModel {
 
     func splitSelectedRange() {
         guard canSplitSelectedRange else { return }
+        if assemblySelectionIncludesStill {
+            editTypedSelection(delete: false)
+            return
+        }
         let assemblySpan = assemblySelection
-        let pieces = zip(ranges, selectionEdits.portions).enumerated().flatMap { index, pair in
-            let (range, selected) = pair
+        let pieces = assemblyGroupIndices.flatMap { index -> [(occurrence: Int, span: AudioSpan)] in
+            guard let range = assemblyRange(at: index) else { return [] }
+            let selected = selectionEdits.portions[index]
             let edges = [range.from] + [selected?.from, selected?.to].compactMap { $0 }.filter {
                 range.from < $0 && $0 < range.to
             } + [range.to]
@@ -187,12 +222,49 @@ extension MulticamEditorModel {
 
     func deleteSelectedRange() {
         guard canDeleteSelectedRange else { return }
-        let pieces = zip(ranges, selectionEdits.portions).enumerated().flatMap { index, pair in
-            let (range, selected) = pair
+        if assemblySelectionIncludesStill {
+            editTypedSelection(delete: true)
+            return
+        }
+        let pieces = assemblyGroupIndices.flatMap { index -> [(occurrence: Int, span: AudioSpan)] in
+            guard let range = assemblyRange(at: index) else { return [] }
+            let selected = selectionEdits.portions[index]
             return AudioAnalysis.retained(in: MulticamSilencePlanner.span(range), removing: selected.map { [$0] } ?? [])
                 .map { (occurrence: index, span: $0) }
         }
         if replaceRetainedRanges(pieces, action: "Delete Selected Range") { markIn = nil; markOut = nil }
+    }
+
+    private func editTypedSelection(delete: Bool) {
+        guard let project, let span = assemblySelection, let end = assemblyRangeEnds.last else { return }
+        var pieces = [MulticamRange(from: .zero, to: span.from)]
+        if !delete { pieces.append(.init(from: span.from, to: span.to)) }
+        pieces.append(.init(from: span.to, to: end))
+        do {
+            var used = Set<String>()
+            var items: [StillAssemblyItem] = []
+            for piece in pieces where piece.from < piece.to {
+                let slice = try project.assemblySelection(piece)
+                for item in slice.assemblyItems ?? [] {
+                    if var insert = item.still, !used.insert(insert.id).inserted {
+                        insert.id = UUID().uuidString
+                        items.append(.still(insert))
+                    } else {
+                        items.append(item)
+                    }
+                }
+            }
+            guard !items.isEmpty else { return }
+            preview.pause()
+            if edit(delete ? "Delete Selected Range" : "Split Selected Range", { $0.assemblyItems = items }) {
+                focusAssemblyEdit()
+                if delete {
+                    seekAssembly(at: span.from, scrubbing: false)
+                } else {
+                    assemblySelection = span
+                }
+            }
+        } catch { fail(error.localizedDescription) }
     }
 
     var markedGroupSpan: AudioSpan? {
@@ -204,7 +276,9 @@ extension MulticamEditorModel {
         if rangeTool { return "Delete Selected Range" }
         switch editSelection {
         case .group: return "Delete Switch"
-        case .assembly: return markIn != nil || markOut != nil ? "Delete Marked Range" : "Delete Assembly Range"
+        case .assembly:
+            if markIn != nil || markOut != nil { return "Delete Marked Range" }
+            return assemblyStill(at: selectedOccurrence) == nil ? "Delete Assembly Range" : "Delete Still"
         }
     }
 
@@ -217,7 +291,8 @@ extension MulticamEditorModel {
             return at != project.range.from && project.switches.contains { $0.at == at }
         case .assembly:
             if markIn != nil || markOut != nil { return canDeleteSelectedRange }
-            return ranges.count > 1 && ranges.indices.contains(selectedOccurrence)
+            return assemblyStill(at: selectedOccurrence) != nil
+                || (assemblyItems.count > 1 && assemblyItems.indices.contains(selectedOccurrence))
         }
     }
 
@@ -233,7 +308,7 @@ extension MulticamEditorModel {
         }
     }
 
-    var canCutOccurrence: Bool { occurrenceCut != nil }
+    var canCutOccurrence: Bool { !isBusy && (occurrenceCut != nil || assemblyStillCut(at: preview.currentTime()) != nil) }
     var canTrimOccurrence: Bool { occurrenceCut(useRangeUnderGroupPlayhead: false) != nil }
 
     var occurrenceCut: (index: Int, time: RationalTime)? {
@@ -242,31 +317,28 @@ extension MulticamEditorModel {
 
     private func occurrenceCut(useRangeUnderGroupPlayhead: Bool) -> (index: Int, time: RationalTime)? {
         guard !isBusy, mapping != nil else { return nil }
-        let ranges = ranges
         let output = preview.currentTime()
         let group = groupTime(at: output)
         let preferred = occurrenceIndex(at: output)
         let index: Int
         if assemblyPreview || !useRangeUnderGroupPlayhead {
-            guard ranges.indices.contains(preferred) else { return nil }
+            guard assemblyRange(at: preferred) != nil else { return nil }
             index = preferred
         } else {
-            let containsPlayhead: (MulticamRange) -> Bool = { $0.from < group && group < $0.to }
-            if ranges.indices.contains(preferred), containsPlayhead(ranges[preferred]) {
-                index = preferred
-            } else if let first = ranges.firstIndex(where: containsPlayhead) {
-                index = first
-            } else {
-                return nil
+            let containsPlayhead: (Int) -> Bool = { index in
+                guard let range = self.assemblyRange(at: index) else { return false }
+                return range.from < group && group < range.to
             }
+            if containsPlayhead(preferred) { index = preferred }
+            else if let first = assemblyGroupIndices.first(where: containsPlayhead) { index = first }
+            else { return nil }
         }
         guard let time = occurrenceSplitBoundary(index: index, group: group) else { return nil }
         return (index, time)
     }
 
     func occurrenceSplitBoundary(index: Int, group: RationalTime) -> RationalTime? {
-        guard !isBusy, mapping != nil, ranges.indices.contains(index) else { return nil }
-        let range = ranges[index]
+        guard !isBusy, mapping != nil, let range = assemblyRange(at: index) else { return nil }
         guard range.from < group, group < range.to else { return nil }
         let time = snappedAnalysisTime(group, within: range, includeEnd: true) ?? snappedFrame(group, delta: 0) ?? group
         guard range.from < time, time < range.to else { return nil }
@@ -275,21 +347,17 @@ extension MulticamEditorModel {
 
     func trimOccurrence(_ edge: TimelineEdge) {
         guard let (index, at) = occurrenceCut(useRangeUnderGroupPlayhead: false) else { return }
-        var revised = ranges
-        switch edge {
-        case .start: revised[index].from = at
-        case .end: revised[index].to = at
-        }
-        if replaceRetainedRanges(revised, action: "Trim Assembly Range") {
-            selectedOccurrence = index
-            if edge == .start { seekAssemblyOccurrence(index, group: at) }
-        }
+        guard let range = assemblyRange(at: index) else { return }
+        preview.pause()
+        changeOccurrence(index, from: edge == .start ? at : range.from, to: edge == .end ? at : range.to)
+        if edge == .start { seekAssemblyOccurrence(index, group: at) }
     }
 
     func removeMarkedRange() {
         guard !isBusy, let markedGroupSpan else { return }
-        let pieces = ranges.enumerated().flatMap { index, original in
-            AudioAnalysis.retained(in: MulticamSilencePlanner.span(original), removing: [markedGroupSpan])
+        let pieces = assemblyGroupIndices.flatMap { index -> [(occurrence: Int, span: AudioSpan)] in
+            guard let original = assemblyRange(at: index) else { return [] }
+            return AudioAnalysis.retained(in: MulticamSilencePlanner.span(original), removing: [markedGroupSpan])
                 .map { (occurrence: index, span: $0) }
         }
         if replaceRetainedRanges(pieces, action: "Delete Marked Range") {
@@ -302,7 +370,9 @@ extension MulticamEditorModel {
         project != nil && !isBusy && analysis.hasSilenceResults(in: pauseAnalysisScope(ranges, occurrenceScopes: selectedPauseOccurrences))
     }
 
-    private var selectedPauseOccurrences: [AudioSpan?]? { assemblySelection.map { _ in selectionEdits.portions } }
+    private var selectedPauseOccurrences: [AudioSpan?]? {
+        assemblySelection.map { _ in assemblyGroupIndices.map { selectionEdits.portions[$0] } }
+    }
 
     var multicamPausePlan: [MulticamPauseEdit] {
         multicamPausePlan(forPlayback: false)
@@ -314,11 +384,18 @@ extension MulticamEditorModel {
         let ranges = groupPlayback ? [project.range] : ranges
         let occurrenceScopes = groupPlayback ? nil : selectedPauseOccurrences
         guard analysis.hasSilenceResults(in: pauseAnalysisScope(ranges, occurrenceScopes: occurrenceScopes)) else { return [] }
-        return MulticamSilencePlanner.plan(project: project, media: media,
+        let result = MulticamSilencePlanner.plan(project: project, media: media,
             ranges: ranges,
             silences: analysis.silenceResults, scope: markedGroupSpan,
             minimum: analysis.pauseMinimum, leave: preferences.leavePause, protected: pauseEdits.protected,
-            keyframesOnly: analysis.snapTarget == .keyframes, occurrenceScopes: occurrenceScopes)
+            keyframesOnly: analysis.snapTarget == .keyframes, occurrenceScopes: occurrenceScopes,
+            assemblyIndices: groupPlayback ? nil : assemblyGroupIndices)
+        guard !groupPlayback else { return result }
+        let indices = assemblyGroupIndices
+        return result.map { pause in
+            .init(id: .init(occurrence: indices[pause.id.occurrence], span: pause.id.span),
+                  visible: pause.visible, removal: pause.removal, isProtected: pause.isProtected)
+        }
     }
 
     private func pauseAnalysisScope(_ ranges: [MulticamRange], occurrenceScopes: [AudioSpan?]?) -> [MulticamRange] {
@@ -341,8 +418,7 @@ extension MulticamEditorModel {
     }
 
     func seekMulticamPause(_ pause: MulticamPauseEdit) {
-        guard !isBusy, ranges.indices.contains(pause.id.occurrence),
-              ranges[pause.id.occurrence].contains(pause.visible.from) else { return }
+        guard !isBusy, assemblyRange(at: pause.id.occurrence)?.contains(pause.visible.from) == true else { return }
         preview.pause()
         if !assemblyPreview { setAssemblyPreview(true) }
         focusAssemblyEdit()
@@ -352,17 +428,23 @@ extension MulticamEditorModel {
     @discardableResult
     func applyMulticamPauses(queueTakes: Bool, plan: [MulticamPauseEdit]) -> Bool {
         guard canApplyPauses, plan.contains(where: { $0.removal != nil }) else { return false }
-        let pieces = MulticamSilencePlanner.retainedOccurrences(ranges, pauses: plan,
+        let indices = assemblyGroupIndices
+        let positions = Dictionary(uniqueKeysWithValues: indices.enumerated().map { ($1, $0) })
+        let groupPauses = plan.compactMap { pause -> MulticamPauseEdit? in
+            guard let index = positions[pause.id.occurrence] else { return nil }
+            return .init(id: .init(occurrence: index, span: pause.id.span), visible: pause.visible,
+                         removal: pause.removal, isProtected: pause.isProtected)
+        }
+        let pieces = MulticamSilencePlanner.retainedOccurrences(ranges, pauses: groupPauses,
                                                                 scope: queueTakes ? markedGroupSpan : nil,
                                                                 occurrenceScopes: queueTakes ? selectedPauseOccurrences : nil)
-        guard !pieces.isEmpty else {
+        let retained = pieces.map { (occurrence: indices[$0.occurrence], span: $0.span) }
+        if queueTakes { return enqueuePauseTakes(retained) }
+        guard !retained.isEmpty || assemblyItems.contains(where: { $0.still != nil }) else {
             notice = Notice(title: "No media to keep", message: "Increase the time left in each pause or keep a pause.")
             return false
         }
-        if queueTakes {
-            return enqueueRanges(pieces.map { MulticamSilencePlanner.range($0.span) })
-        }
-        guard replaceRetainedRanges(pieces, action: "Remove Pauses") else { return false }
+        guard replaceRetainedRanges(retained, action: "Remove Pauses") else { return false }
         setAssemblyPreview(true)
         return true
     }
@@ -375,15 +457,33 @@ extension MulticamEditorModel {
     private func replaceRetainedRanges(_ pieces: [(occurrence: Int, span: AudioSpan)], action: String) -> Bool {
         let output = preview.currentTime()
         let playhead = assemblyPreview ? (occurrence: occurrenceIndex(at: output), group: groupTime(at: output)) : nil
-        let revised = pieces.map { MulticamSilencePlanner.range($0.span) }
-        guard replaceRetainedRanges(revised, action: action) else { return false }
+        let byOccurrence = Dictionary(grouping: pieces, by: \.occurrence)
+        var revised: [StillAssemblyItem] = []
+        var origin: [Int] = []
+        for (index, item) in assemblyItems.enumerated() {
+            let items: [StillAssemblyItem]
+            switch item {
+            case .still: items = [item]
+            case .group: items = (byOccurrence[index] ?? []).map { .group(MulticamSilencePlanner.range($0.span)) }
+            }
+            revised.append(contentsOf: items)
+            origin.append(contentsOf: Array(repeating: index, count: items.count))
+        }
+        guard revised != assemblyItems else { return false }
+        guard !revised.isEmpty else {
+            notice = Notice(title: "No media to keep", message: "Keep at least one item in the assembly.")
+            return false
+        }
+        preview.pause()
+        guard edit(action, { $0.assemblyItems = revised }) else { return false }
+        focusAssemblyEdit()
         guard assemblyPreview, let playhead, let mapping else { return true }
-        let same = pieces.indices.filter { pieces[$0].occurrence == playhead.occurrence }
-        if let index = same.first(where: { revised[$0].contains(playhead.group) }) {
+        let same = origin.indices.filter { origin[$0] == playhead.occurrence }
+        if let index = same.first(where: { assemblyRange(at: $0)?.contains(playhead.group) == true }) {
             seekAssemblyOccurrence(index, group: playhead.group)
-        } else if let index = same.first(where: { revised[$0].from >= playhead.group })
-                    ?? pieces.indices.first(where: { pieces[$0].occurrence > playhead.occurrence }) {
-            seekAssemblyOccurrence(index, group: revised[index].from)
+        } else if let index = same.first(where: { assemblyStill(at: $0) != nil || (assemblyRange(at: $0)?.from ?? .zero) >= playhead.group })
+                    ?? origin.indices.first(where: { origin[$0] > playhead.occurrence }) {
+            seekAssembly(at: assemblyStart(at: index), scrubbing: false)
         } else {
             selectedOccurrence = max(0, revised.count - 1)
             preview.seek(to: mapping.duration)
@@ -391,26 +491,13 @@ extension MulticamEditorModel {
         return true
     }
 
-    @discardableResult
-    private func replaceRetainedRanges(_ revised: [MulticamRange], action: String) -> Bool {
-        guard revised != ranges else { return false }
-        guard !revised.isEmpty else {
-            notice = Notice(title: "No media to keep", message: "Keep at least one range in the assembly.")
-            return false
-        }
-        preview.pause()
-        guard edit(action, { $0.assembly = revised }) else { return false }
-        focusAssemblyEdit()
-        return true
-    }
-
     func reviewMulticamPause(_ pause: MulticamPauseEdit) {
-        guard let project, let cut = pause.removal, ranges.indices.contains(pause.id.occurrence) else { return }
+        guard let project, let cut = pause.removal, let original = assemblyRange(at: pause.id.occurrence) else { return }
         let context = RationalTime(numerator: 3, denominator: 4)
         guard let from = try? cut.from.subtracting(context),
               let to = try? cut.to.adding(context),
               let window = MulticamSilencePlanner.intersection(.init(from: from, to: to),
-                                                            MulticamSilencePlanner.span(ranges[pause.id.occurrence])) else { return }
+                                                            MulticamSilencePlanner.span(original)) else { return }
         let kept = AudioAnalysis.retained(in: window, removing: [cut]).map(MulticamSilencePlanner.range)
         guard !kept.isEmpty, let plan = try? project.plan(ranges: kept) else { return }
         preview.pause()

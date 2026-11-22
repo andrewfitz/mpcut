@@ -40,8 +40,8 @@ public struct CutSequenceClip: Hashable, Codable, Sendable, Identifiable {
         }
         id = try values.decode(String.self, forKey: .id)
         file = try values.decode(String.self, forKey: .file)
-        from = try ProjectField.time(values, .from, code: "invalid_cut_project")
-        to = try ProjectField.time(values, .to, code: "invalid_cut_project")
+        from = try ProjectField.time(values, .from)
+        to = try ProjectField.time(values, .to)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -59,11 +59,23 @@ public struct CutSequenceClip: Hashable, Codable, Sendable, Identifiable {
 public enum CutProject: Equatable, Codable, Sendable {
     public static let format = "mpcut"
     public static let schemaVersion = 1
+    public static let stillSchemaVersion = 2
 
     case sequence([CutSequenceClip])
     case multicam(MulticamProject)
+    case stillSequence(StillSequenceProject)
 
-    private enum CodingKeys: String, CodingKey { case format, schemaVersion, kind, clips, history }
+    private enum CodingKeys: String, CodingKey {
+        case format, schemaVersion, kind, clips, history, stillAssets, stillReplacements, programColorPolicy, stillFormat
+    }
+
+    var requiresV2: Bool {
+        switch self {
+        case .sequence: false
+        case .stillSequence(let project): project.requiresV2
+        case .multicam(let project): project.requiresV2
+        }
+    }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -71,13 +83,33 @@ public enum CutProject: Equatable, Codable, Sendable {
             throw CutError(code: "invalid_cut_project", message: "Expected an MPCut project document")
         }
         let version = try values.decode(Int.self, forKey: .schemaVersion)
-        guard version == Self.schemaVersion else {
+        guard version == Self.schemaVersion || version == Self.stillSchemaVersion else {
             throw CutError(code: "unsupported_cut_version", message: "Unsupported MPCut schema version \(version)")
         }
         switch try values.decode(String.self, forKey: .kind) {
         case "sequence":
             try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_cut_project")
-            self = .sequence(try values.decode([CutSequenceClip].self, forKey: .clips))
+            let stillFields: [CodingKeys] = [.stillAssets, .stillReplacements, .programColorPolicy, .stillFormat]
+            if version == Self.schemaVersion {
+                guard !stillFields.contains(where: values.contains) else {
+                    throw stillError("Still fields require schema v2")
+                }
+                self = .sequence(try values.decode([CutSequenceClip].self, forKey: .clips))
+            } else {
+                for key in stillFields where values.contains(key) {
+                    guard try !values.decodeNil(forKey: key) else {
+                        throw stillError("Null value in still project field ‘\(key.stringValue)’")
+                    }
+                }
+                let project = try StillSequenceProject(
+                    items: values.decode([StillSequenceItem].self, forKey: .clips),
+                    stillAssets: values.decodeIfPresent([StillAsset].self, forKey: .stillAssets) ?? [],
+                    stillReplacements: values.decodeIfPresent([StillReplacement].self, forKey: .stillReplacements) ?? [],
+                    programColorPolicy: values.decodeIfPresent(StillProgramColorPolicy.self, forKey: .programColorPolicy),
+                    stillFormat: values.decodeIfPresent(StillTimelineFormat.self, forKey: .stillFormat)
+                )
+                self = project.requiresV2 ? .stillSequence(project) : .sequence(project.items.compactMap(\.source))
+            }
             try validate()
         case "multicam": self = .multicam(try MulticamProject(from: decoder))
         default: throw CutError(code: "invalid_cut_project", message: "Unknown MPCut project kind")
@@ -85,21 +117,64 @@ public enum CutProject: Equatable, Codable, Sendable {
     }
 
     public func encode(to encoder: Encoder) throws {
-        switch self {
-        case .sequence(let clips):
-            try validate()
-            var values = encoder.container(keyedBy: CodingKeys.self)
-            try values.encode(Self.format, forKey: .format)
-            try values.encode(Self.schemaVersion, forKey: .schemaVersion)
-            try values.encode("sequence", forKey: .kind)
-            try values.encode(clips, forKey: .clips)
-        case .multicam(let project): try project.encode(to: encoder)
+        try encode(to: encoder, forceV2: false)
+    }
+
+    func encode(to encoder: Encoder, forceV2: Bool) throws {
+        try validate()
+        guard stillAudioReference == nil else {
+            throw CutError(code: "transient_selection", message: "A still selection with inherited audio is an export snapshot.")
+        }
+        if case .multicam(let project) = self {
+            try project.encode(to: encoder, forceV2: forceV2)
+            return
+        }
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        let v2 = requiresV2 || forceV2
+        try values.encode(Self.format, forKey: .format)
+        try values.encode(v2 ? Self.stillSchemaVersion : Self.schemaVersion, forKey: .schemaVersion)
+        try values.encode("sequence", forKey: .kind)
+        if v2 {
+            let project = stillSequenceValue!
+            try values.encode(project.items, forKey: .clips)
+            if !project.stillAssets.isEmpty { try values.encode(project.stillAssets, forKey: .stillAssets) }
+            if !project.stillReplacements.isEmpty { try values.encode(project.stillReplacements, forKey: .stillReplacements) }
+            try values.encodeIfPresent(project.programColorPolicy, forKey: .programColorPolicy)
+            try values.encodeIfPresent(project.stillFormat, forKey: .stillFormat)
+        } else {
+            try values.encode(sequenceClips!, forKey: .clips)
         }
     }
 
     public func validate() throws {
         switch self {
         case .multicam(let project): try project.validate()
+        case .stillSequence(let project):
+            let clips = project.items.compactMap(\.source)
+            try Self.sequence(clips).validate()
+            if let reference = project.stillAudioReference {
+                try Self.sequence([reference]).validate()
+                guard clips.isEmpty, project.stillFormat != nil else {
+                    throw stillError("An inherited soundtrack layout requires an insert-only export selection")
+                }
+            }
+            try validateStillCollections(assets: project.stillAssets, inserts: project.items.compactMap(\.still),
+                                         replacements: project.stillReplacements, color: project.programColorPolicy,
+                                         clipIDs: Set(clips.map(\.id)))
+            let inserts = project.items.compactMap(\.still)
+            if let format = project.stillFormat {
+                try format.validate(color: project.programColorPolicy ?? StillTimelineFormat.sdrColorPolicy)
+                guard clips.isEmpty else { throw stillError("An explicit still format requires a still-only sequence") }
+                for insert in inserts {
+                    guard insert.cadence == format.cadence else {
+                        throw stillError("Still ‘\(insert.id)’ cadence differs from the project format")
+                    }
+                    _ = try format.frameCount(for: insert.duration)
+                }
+            } else if clips.isEmpty && !inserts.isEmpty {
+                throw stillError("A still-only sequence requires an explicit program format")
+            }
+            try validateStillTimelineDuration()
         case .sequence(let clips):
             var ids = Set<String>()
             var duration = RationalTime.zero
@@ -133,7 +208,11 @@ public enum CutProject: Equatable, Codable, Sendable {
             return clips.flatMap { clip in
                 [clip.file, clip.originalFile].compactMap { $0 }.map { (clip.id, $0) }
             }
-        case .multicam(let project): return project.sources.map { ($0.id, $0.file) }
+        case .multicam(let project):
+            return project.sources.map { ($0.id, $0.file) } + project.stillAssets.map { ($0.id, $0.file) }
+        case .stillSequence(let project):
+            let references = project.stillAudioReference.map { [$0] } ?? []
+            return Self.sequence(project.items.compactMap(\.source) + references).mediaPaths + project.stillAssets.map { ($0.id, $0.file) }
         }
     }
 
@@ -191,6 +270,20 @@ public enum CutProject: Equatable, Codable, Sendable {
                 clip.originalFile = clip.originalFile.map(rebase)
                 return clip
             })
+        case .stillSequence(var project):
+            project.items = project.items.map { item in
+                guard var clip = item.source else { return item }
+                clip.file = rebase(clip.file)
+                clip.originalFile = clip.originalFile.map(rebase)
+                return .source(clip)
+            }
+            for index in project.stillAssets.indices { project.stillAssets[index].file = rebase(project.stillAssets[index].file) }
+            if var reference = project.stillAudioReference {
+                reference.file = rebase(reference.file)
+                reference.originalFile = reference.originalFile.map(rebase)
+                project.stillAudioReference = reference
+            }
+            return .stillSequence(project)
         case .multicam(var project):
             func rebasedSource(_ source: MulticamSource) -> MulticamSource {
                 var copy = source
@@ -199,6 +292,7 @@ public enum CutProject: Equatable, Codable, Sendable {
             }
             project.angles = project.angles.map(rebasedSource)
             project.audioSources = project.audioSources.map(rebasedSource)
+            for index in project.stillAssets.indices { project.stillAssets[index].file = rebase(project.stillAssets[index].file) }
             return .multicam(project)
         }
     }
@@ -214,15 +308,29 @@ public enum CutProject: Equatable, Codable, Sendable {
 
     private static func physicalParent(of url: URL) -> [String] {
         let directory = url.deletingLastPathComponent()
-        // Foundation may elide /private on macOS. Relative paths must use the
-        // same physical directory components as the project's source resolver.
-        guard let resolved = realpath(directory.path, nil) else { return directory.pathComponents }
-        defer { free(resolved) }
-        return URL(fileURLWithPath: String(cString: resolved), isDirectory: true).pathComponents
+        var ancestor = directory
+        var missing: [String] = []
+        // Resolve the existing part of an offline path too. Foundation may elide
+        // /private on macOS, so both sides of a relative path need the same base.
+        while !ancestor.path.isEmpty {
+            if let resolved = realpath(ancestor.path, nil) {
+                defer { free(resolved) }
+                let physical = URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
+                return physical.pathComponents + missing.reversed()
+            }
+            let parent = ancestor.deletingLastPathComponent()
+            guard parent.path != ancestor.path else { break }
+            missing.append(ancestor.lastPathComponent)
+            ancestor = parent
+        }
+        return directory.pathComponents
     }
 
     /// Resolve media relative to the containing project document's URL.
     public func requests(relativeTo projectURL: URL) throws -> [ClipRequest] {
+        if case .stillSequence = self {
+            throw stillError("A still sequence requires the still timeline planner", code: "still_timeline_required")
+        }
         guard case .sequence(let clips) = self else {
             throw CutError(code: "expected_sequence", message: "A multicam project uses the multicam timeline planner")
         }
@@ -269,15 +377,16 @@ struct ProjectField: CodingKey {
         return text.isEmpty ? "the project root" : text
     }
 
-    /// A malformed time is a fault in the project document, reported with its JSON location.
+    /// A malformed time is reported with its JSON location. It is `invalid_time`, the code of a malformed time in
+    /// every other request, so a command exits with the status of a request the caller must correct.
     static func time<K: CodingKey>(_ values: KeyedDecodingContainer<K>, _ key: K,
-                                   default fallback: String? = nil, code: String = "invalid_multicam_project") throws -> RationalTime {
+                                   default fallback: String? = nil) throws -> RationalTime {
         let text = try values.decodeIfPresent(String.self, forKey: key) ?? fallback
             ?? values.decode(String.self, forKey: key)
         do {
             return try RationalTime(parsing: text)
         } catch {
-            throw CutError(code: code,
+            throw CutError(code: "invalid_time",
                            message: "Invalid timestamp ‘\(text)’ in \(location(values.codingPath + [key]))")
         }
     }
@@ -302,6 +411,10 @@ enum ProjectFile {
     }
 
     static func read<T: Decodable>(_ type: T.Type, from url: URL, multicam: Bool = false) throws -> T {
+        try decode(type, data: readBytes(from: url, multicam: multicam), multicam: multicam)
+    }
+
+    static func readBytes(from url: URL, multicam: Bool = false) throws -> Data {
         let prefix = multicam ? "multicam" : "cut"
         var data = Data()
         do {
@@ -326,7 +439,7 @@ enum ProjectFile {
         catch {
             throw CutError(code: "\(prefix)_project_read_failed", message: "Could not read \(url.path): \(error.localizedDescription)")
         }
-        return try decode(type, data: data, multicam: multicam)
+        return data
     }
 
     static func decode<T: Decodable>(_ type: T.Type, data: Data, multicam: Bool = false) throws -> T {
@@ -364,13 +477,34 @@ enum ProjectFile {
         return data
     }
 
-    static func write(_ bytes: Data, to url: URL, sources: [(String, String)], prefix: String, replacingExisting: Bool = true) throws {
-        var data = bytes
-        guard data.count <= MulticamProject.maximumFileSize else {
+    static func write(_ bytes: Data, to url: URL, sources: [(String, String)], prefix: String,
+                      replacingExisting: Bool = true) throws {
+        let data = try diskBytes(bytes, prefix: prefix)
+        try validateDestination(url, sourceDirectory: directory(of: url), sources: sources, prefix: prefix)
+        try publishProject(data, to: replacingExisting ? documentURL(url) : url, prefix: prefix, replacingExisting: replacingExisting)
+    }
+
+    static func writeRevision(_ bytes: Data, to url: URL, sources: [(String, String)], prefix: String,
+                              replacingExisting: Bool, expected: ProjectDiskRevision?) throws -> ProjectDiskRevision {
+        let data = try diskBytes(bytes, prefix: prefix)
+        return try coordinatedWrite(to: url, prefix: prefix, expected: expected, data: data) { destination in
+            let target = replacingExisting ? destination : url
+            try validateDestination(target, sourceDirectory: directory(of: target), sources: sources, prefix: prefix)
+            try publishProject(data, to: target, prefix: prefix, replacingExisting: replacingExisting)
+        }
+    }
+
+    private static func diskBytes(_ bytes: Data, prefix: String) throws -> Data {
+        guard bytes.count <= MulticamProject.maximumFileSize else {
             throw CutError(code: "invalid_\(prefix)_project", message: "Project exceeds the 64 MB limit")
         }
-        if data.count < MulticamProject.maximumFileSize { data.append(0x0A) }
-        try validateDestination(url, sourceDirectory: directory(of: url), sources: sources, prefix: prefix)
+        guard bytes.count < MulticamProject.maximumFileSize else { return bytes }
+        var data = bytes
+        data.append(0x0A)
+        return data
+    }
+
+    private static func publishProject(_ data: Data, to url: URL, prefix: String, replacingExisting: Bool) throws {
         if !replacingExisting {
             let stage = url.deletingLastPathComponent().appendingPathComponent(".mpcut-" + UUID().uuidString)
             try data.write(to: stage, options: .withoutOverwriting)
@@ -382,12 +516,11 @@ enum ProjectFile {
             }
             return
         }
-        let destination = documentURL(url)
         var info = stat()
-        if lstat(destination.path, &info) == 0, info.st_mode & S_IFMT != S_IFREG {
+        if lstat(url.path, &info) == 0, info.st_mode & S_IFMT != S_IFREG {
             throw CutError(code: "\(prefix)_project_write_failed", message: "Choose a regular project file at \(url.path)")
         }
-        do { try data.write(to: destination, options: .atomic) }
+        do { try data.write(to: url, options: .atomic) }
         catch {
             throw CutError(code: "\(prefix)_project_write_failed", message: "Could not save \(url.path): \(error.localizedDescription)")
         }

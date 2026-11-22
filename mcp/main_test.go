@@ -110,7 +110,7 @@ func TestSDKHostStdio(t *testing.T) {
 				}
 				tools[tool.Name] = tool
 			}
-			for _, name := range []string{"list_projects", "get_editor_state", "review_frame"} {
+			for _, name := range []string{"list_projects", "get_editor_state", "review_frame", "list_stills", "add_still", "update_still", "remove_still", "relink_still"} {
 				if tools[name] == nil {
 					t.Errorf("%s missing", name)
 				}

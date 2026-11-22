@@ -45,6 +45,26 @@ final class MediaExportIdentityTests: XCTestCase {
         }
     }
 
+    func testExportRejectsInPlaceRewriteWithRestoredModificationTime() throws {
+        try withRecording { source, directory in
+            let manager = FileManager.default
+            let stamp = Date(timeIntervalSince1970: 1_700_000_000)
+            try manager.setAttributes([.modificationDate: stamp], ofItemAtPath: source.path)
+            let media = try CutEngine(useSidecar: false).inspect(source, keyframes: true)
+            let writer = try FileHandle(forWritingTo: source)
+            try writer.seek(toOffset: 1)
+            try writer.write(contentsOf: Data([0xff]))
+            try writer.close()
+            try manager.setAttributes([.modificationDate: stamp], ofItemAtPath: source.path)
+
+            let output = directory.appendingPathComponent("stale.jpg")
+            XCTAssertThrowsError(try JPEGExport.writeStill(media, at: .zero, to: output)) { error in
+                XCTAssertEqual((error as? CutError)?.code, "source_changed")
+            }
+            XCTAssertFalse(manager.fileExists(atPath: output.path))
+        }
+    }
+
     func testStillAndReviewExportRejectRemovedRecording() throws {
         try withRecording { source, directory in
             let media = try CutEngine(useSidecar: false).inspect(source, keyframes: true)

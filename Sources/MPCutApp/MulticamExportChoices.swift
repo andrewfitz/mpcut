@@ -6,6 +6,8 @@ import MPCutCore
 struct MulticamExportChoices: Equatable, Sendable {
     let entry: ExportEntryPoint
     var tracks: ExportTracks = .all
+    var placements: ExportPlacementScope = .none
+    var requireCameraCopy = false
     /// The mode held for picture with sound. A single-type selection is written as the rules say.
     var mode: ExportMode
     var container: String
@@ -21,27 +23,34 @@ struct MulticamExportChoices: Equatable, Sendable {
         audio = ExportRules.cell(source: .multicam, tracks: .all, mode: .encode).defaultAudio ?? .auto
     }
 
-    private func cell(_ mode: ExportMode) -> ExportCell { entry.answer(source: .multicam, tracks: tracks, mode: mode) }
-    var effectiveMode: ExportMode { ExportRules.defaultMode(for: .multicam, tracks: tracks, preferred: mode) }
+    private func cell(_ mode: ExportMode) -> ExportCell { entry.answer(source: .multicam, tracks: tracks, mode: mode, placements: placements) }
+    var effectiveMode: ExportMode {
+        if placements != .none && modes.contains(mode) { return mode }
+        return ExportRules.defaultMode(for: .multicam, tracks: tracks, preferred: mode)
+    }
     /// The modes the rules write as themselves for the selected tracks.
-    var modes: [ExportMode] { entry.selectableModes(source: .multicam, tracks: tracks) }
+    var modes: [ExportMode] { entry.selectableModes(source: .multicam, tracks: tracks, placements: placements) }
     func title(of mode: ExportMode) -> String { cell(mode).displayName }
     func containers(mode: ExportMode? = nil) -> [String] {
-        ExportRules.multicamListedContainers(tracks: tracks, mode: mode ?? effectiveMode, codec: codec)
+        let mode = mode ?? effectiveMode
+        if placements != .none {
+            return ExportRules.stillContainers(mode: mode, tracks: tracks, codec: codec, audio: audio)
+        }
+        return ExportRules.multicamListedContainers(tracks: tracks, mode: mode, codec: codec)
     }
     /// The audio actions of a re-encode.
-    var audioActions: [ReencodeAudio] { ExportRules.cell(source: .multicam, tracks: .all, mode: .encode).audioActions }
+    var audioActions: [ReencodeAudio] { cell(.encode).audioActions }
     var qualities: [ReencodeQuality] { ExportRules.qualities(codec) }
     var quality: ReencodeQuality { codec == .prores ? proResQuality : standardQuality }
     var settings: ReencodeSettings { ReencodeSettings(codec: codec, quality: quality, audio: audio) }
 
     /// A single-type selection names the mode the rules write it with.
-    static func title(of tracks: ExportTracks, silentProject: Bool = false) -> String {
+    static func title(of tracks: ExportTracks, silentProject: Bool = false, placements: ExportPlacementScope = .none) -> String {
         let written = ExportRules.cell(source: .multicam, tracks: tracks, mode: .copy).displayName
         switch tracks {
         case .all: return silentProject ? "Project tracks (picture only)" : "Project tracks"
-        case .video: return "Picture only (\(written))"
-        case .audio: return "Sound only (\(written))"
+        case .video: return placements == .none ? "Picture only (\(written))" : "Picture only"
+        case .audio: return placements == .insertion ? "Sound only" : "Sound only (\(written))"
         }
     }
 
@@ -56,6 +65,7 @@ struct MulticamExportChoices: Equatable, Sendable {
         tracks = alternative.tracks
         mode = alternative.mode
         container = alternative.container
-        if alternative.mode == .encode, let action = alternative.audio { audio = action }
+        if alternative.mode == .encode || placements != .none, let action = alternative.audio { audio = action }
+        if placements != .none { requireCameraCopy = alternative.arguments.contains("--require-camera-copy") }
     }
 }

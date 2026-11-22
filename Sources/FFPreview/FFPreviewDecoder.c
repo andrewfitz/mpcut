@@ -30,7 +30,7 @@ struct MPPreviewDecoder {
     AVFrame *frame;
     CMVideoFormatDescriptionRef video_description;
     CMAudioFormatDescriptionRef audio_description;
-    int description_rate;
+    bool preserve_surround;
     SwrContext *resampler;
     AVChannelLayout audio_layout;
     int audio_rate;
@@ -534,6 +534,16 @@ static CMSampleBufferRef video_sample(MPPreviewDecoder *preview)
     return sample;
 }
 
+void mp_preview_preserve_surround(MPPreviewDecoder *preview)
+{
+    if (preview->preserve_surround)
+        return;
+    preview->preserve_surround = true;
+    swr_free(&preview->resampler);
+    if (preview->mix)
+        linked_mix_preserve_surround(preview->mix);
+}
+
 static bool configure_resampler(MPPreviewDecoder *preview)
 {
     AVFrame *frame = preview->frame;
@@ -544,13 +554,22 @@ static bool configure_resampler(MPPreviewDecoder *preview)
 
     swr_free(&preview->resampler);
     av_channel_layout_uninit(&preview->audio_layout);
+    if (preview->audio_description) {
+        CFRelease(preview->audio_description);
+        preview->audio_description = NULL;
+    }
     if (av_channel_layout_copy(&preview->audio_layout, &frame->ch_layout) < 0)
         return false;
     preview->audio_format = frame->format;
     preview->audio_rate = frame->sample_rate;
     AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-    if (swr_alloc_set_opts2(&preview->resampler, &stereo, AV_SAMPLE_FMT_FLT, frame->sample_rate,
-                           &frame->ch_layout, frame->format, frame->sample_rate, 0, NULL) < 0 ||
+    bool surround = preview->preserve_surround && frame->ch_layout.nb_channels > 2;
+    // Convert packing without rematrixing speakers or imposing a default order.
+    AVChannelLayout discrete = { .order = AV_CHANNEL_ORDER_UNSPEC, .nb_channels = frame->ch_layout.nb_channels };
+    AVChannelLayout *input = surround ? &discrete : &frame->ch_layout;
+    AVChannelLayout *output = surround ? &discrete : &stereo;
+    if (swr_alloc_set_opts2(&preview->resampler, output, AV_SAMPLE_FMT_FLT, frame->sample_rate,
+                           input, frame->format, frame->sample_rate, 0, NULL) < 0 ||
         // AVAssetReaderAudioMixOutput duplicates a linked mono track into both channels at unity.
         (preview->linked_lane && frame->ch_layout.nb_channels == 1 &&
          swr_set_matrix(preview->resampler, (double[]){1.0, 1.0}, 1) < 0) ||
@@ -561,17 +580,84 @@ static bool configure_resampler(MPPreviewDecoder *preview)
     return true;
 }
 
+static AudioChannelLabel audio_channel_label(enum AVChannel channel, int index)
+{
+    switch (channel) {
+    // Distinguish rear surrounds from the main surround pair in Core Audio.
+    case AV_CHAN_BACK_LEFT: return kAudioChannelLabel_RearSurroundLeft;
+    case AV_CHAN_BACK_RIGHT: return kAudioChannelLabel_RearSurroundRight;
+    case AV_CHAN_SIDE_LEFT: return kAudioChannelLabel_LeftSurround;
+    case AV_CHAN_SIDE_RIGHT: return kAudioChannelLabel_RightSurround;
+    case AV_CHAN_STEREO_LEFT: return kAudioChannelLabel_LeftTotal;
+    case AV_CHAN_STEREO_RIGHT: return kAudioChannelLabel_RightTotal;
+    case AV_CHAN_WIDE_LEFT: return kAudioChannelLabel_LeftWide;
+    case AV_CHAN_WIDE_RIGHT: return kAudioChannelLabel_RightWide;
+    case AV_CHAN_SURROUND_DIRECT_LEFT: return kAudioChannelLabel_LeftSurroundDirect;
+    case AV_CHAN_SURROUND_DIRECT_RIGHT: return kAudioChannelLabel_RightSurroundDirect;
+    case AV_CHAN_LOW_FREQUENCY_2: return kAudioChannelLabel_LFE2;
+    case AV_CHAN_TOP_SIDE_LEFT: return kAudioChannelLabel_LeftTopMiddle;
+    case AV_CHAN_TOP_SIDE_RIGHT: return kAudioChannelLabel_RightTopMiddle;
+    case AV_CHAN_BOTTOM_FRONT_CENTER: return kAudioChannelLabel_CenterBottom;
+    case AV_CHAN_BOTTOM_FRONT_LEFT: return kAudioChannelLabel_LeftBottom;
+    case AV_CHAN_BOTTOM_FRONT_RIGHT: return kAudioChannelLabel_RightBottom;
+    case AV_CHAN_SIDE_SURROUND_LEFT: return kAudioChannelLabel_LeftSideSurround;
+    case AV_CHAN_SIDE_SURROUND_RIGHT: return kAudioChannelLabel_RightSideSurround;
+    case AV_CHAN_TOP_SURROUND_LEFT: return kAudioChannelLabel_LeftTopSurround;
+    case AV_CHAN_TOP_SURROUND_RIGHT: return kAudioChannelLabel_RightTopSurround;
+    case AV_CHAN_BINAURAL_LEFT: return kAudioChannelLabel_BinauralLeft;
+    case AV_CHAN_BINAURAL_RIGHT: return kAudioChannelLabel_BinauralRight;
+    default:
+        if (channel >= AV_CHAN_FRONT_LEFT && channel <= AV_CHAN_TOP_BACK_RIGHT)
+            return (AudioChannelLabel)channel + 1;
+        if (channel >= AV_CHAN_AMBISONIC_BASE && channel <= AV_CHAN_AMBISONIC_END)
+            return kAudioChannelLabel_HOA_ACN_0 + (channel - AV_CHAN_AMBISONIC_BASE);
+        return kAudioChannelLabel_Discrete_0 + index;
+    }
+}
+
+static CMAudioFormatDescriptionRef make_audio_description(const AudioStreamBasicDescription *format,
+                                                          const AVChannelLayout *source)
+{
+    CMAudioFormatDescriptionRef description = NULL;
+    AudioChannelLayout *layout = NULL;
+    size_t layout_size = 0;
+    if (format->mChannelsPerFrame > 2) {
+        layout_size = offsetof(AudioChannelLayout, mChannelDescriptions) +
+            format->mChannelsPerFrame * sizeof(AudioChannelDescription);
+        layout = calloc(1, layout_size);
+        if (!layout)
+            return NULL;
+        layout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
+        layout->mNumberChannelDescriptions = format->mChannelsPerFrame;
+        for (int i = 0; i < source->nb_channels; i++) {
+            enum AVChannel channel = av_channel_layout_channel_from_index(source, (unsigned)i);
+            AudioChannelLabel label = audio_channel_label(channel, i);
+            for (int j = 0; j < i; j++) {
+                if (layout->mChannelDescriptions[j].mChannelLabel == label) {
+                    label = kAudioChannelLabel_Discrete_0 + i;
+                    break;
+                }
+            }
+            layout->mChannelDescriptions[i].mChannelLabel = label;
+        }
+    }
+    OSStatus status = CMAudioFormatDescriptionCreate(NULL, format, layout_size, layout, 0, NULL, NULL, &description);
+    free(layout);
+    return status == noErr ? description : NULL;
+}
+
 static CMSampleBufferRef audio_sample(MPPreviewDecoder *preview)
 {
     AVFrame *frame = preview->frame;
     CMTime pts = sample_time(preview, &preview->audio);
     if (!CMTIME_IS_VALID(pts) || frame->nb_samples <= 0 || frame->nb_samples > 65536 ||
-        frame->sample_rate <= 0 || !configure_resampler(preview))
+        frame->sample_rate <= 0 || frame->ch_layout.nb_channels <= 0 || !configure_resampler(preview))
         return NULL;
 
-    const size_t stride = 2 * sizeof(float);
-    // Output channel count and packing are fixed. Only the rate can change.
-    if (!preview->audio_description || preview->description_rate != frame->sample_rate) {
+    const int channels = preview->preserve_surround && frame->ch_layout.nb_channels > 2
+        ? frame->ch_layout.nb_channels : 2;
+    const UInt32 stride = (UInt32)channels * (UInt32)sizeof(float);
+    if (!preview->audio_description) {
         AudioStreamBasicDescription format = {
             .mSampleRate = frame->sample_rate,
             .mFormatID = kAudioFormatLinearPCM,
@@ -579,16 +665,12 @@ static CMSampleBufferRef audio_sample(MPPreviewDecoder *preview)
             .mBytesPerPacket = stride,
             .mFramesPerPacket = 1,
             .mBytesPerFrame = stride,
-            .mChannelsPerFrame = 2,
+            .mChannelsPerFrame = channels,
             .mBitsPerChannel = 8 * sizeof(float),
         };
-        CMAudioFormatDescriptionRef description = NULL;
-        if (CMAudioFormatDescriptionCreate(NULL, &format, 0, NULL, 0, NULL, NULL, &description) != noErr)
+        preview->audio_description = make_audio_description(&format, &frame->ch_layout);
+        if (!preview->audio_description)
             return NULL;
-        if (preview->audio_description)
-            CFRelease(preview->audio_description);
-        preview->audio_description = description;
-        preview->description_rate = frame->sample_rate;
     }
     size_t bytes = (size_t)frame->nb_samples * stride;
     CMBlockBufferRef data = NULL;

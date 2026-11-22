@@ -1,5 +1,5 @@
-// Run on a macOS desktop with no active MPCut control listener:
-// cd mcp && go test -v ./integration -count=1 -args -bundle=/absolute/path/MPCut.app
+// Run on a macOS desktop with a packaged test bundle:
+// cd mcp && go test -v ./integration -run '^TestLiveBundle$' -count=1 -args -bundle=/absolute/path/MPCut.app
 package integration
 
 import (
@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -69,10 +68,13 @@ func TestLiveBundle(t *testing.T) {
 	if !filepath.IsAbs(*bundlePath) {
 		t.Fatal("-bundle requires an absolute path")
 	}
-	socket := fmt.Sprintf("/tmp/mpcut-%d/control.sock", os.Getuid())
-	if pid, err := socketPeer(socket); err == nil {
-		t.Fatalf("MPCut control already in use by pid %d; leave that app untouched", pid)
+	socketDirectory, err := os.MkdirTemp("/tmp", "mpcut-test-")
+	if err != nil {
+		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketDirectory) })
+	socket := filepath.Join(socketDirectory, "control.sock")
+	isolatedEndpoint := "MPCUT_TEST_SOCKET_DIRECTORY=" + filepath.Base(socketDirectory)
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -105,7 +107,7 @@ func TestLiveBundle(t *testing.T) {
 		"-localMCPEnabled", "YES", "-historyLimit", "50", "-useAnalysisSidecars", "NO",
 		"-timelineSnapTarget", "off", "-minimumPause", "0.5", "-leavePause", "0",
 		"-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO")
-	app.Env = append(os.Environ(), "CFFIXED_USER_HOME="+dir)
+	app.Env = append(os.Environ(), "CFFIXED_USER_HOME="+dir, isolatedEndpoint)
 	app.Stderr = os.Stderr
 	if err := app.Start(); err != nil {
 		t.Fatal(err)
@@ -131,6 +133,7 @@ func TestLiveBundle(t *testing.T) {
 	})
 
 	helper := exec.Command(filepath.Join(contents, "Helpers", "mpcut-mcp"))
+	helper.Env = append(os.Environ(), isolatedEndpoint)
 	helper.Stderr = os.Stderr
 	client := mcp.NewClient(&mcp.Implementation{Name: "mpcut-integration", Version: "1"}, nil)
 	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: helper}, nil)
@@ -226,20 +229,29 @@ func TestLiveBundle(t *testing.T) {
 		t.Fatalf("retry after undo reapplied the cut: %v", replay)
 	}
 	undo("redo", 2)
+	runGUIProbe := func(t *testing.T, script, argument string) bool {
+		t.Helper()
+		requireSocketOwner(t)
+		probe := exec.CommandContext(ctx, "xcrun", "swift", filepath.Join(filepath.Dir(sourceFile), "testdata", script),
+			strconv.Itoa(app.Process.Pid), argument)
+		output, err := probe.CombinedOutput()
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 77 {
+			t.Log("AX permission unavailable; native GUI probe skipped")
+			return false
+		}
+		if err != nil {
+			t.Fatalf("%s failed: %v %s", argument, err, output)
+		}
+		return true
+	}
 	call("focus_project", object{"project": a["project"]}, "")
 	for _, step := range []struct {
 		menu  string
 		count float64
 	}{{"Undo Split Clip", 1}, {"Redo Split Clip", 2}} {
-		press := exec.CommandContext(ctx, "xcrun", "swift", filepath.Join(filepath.Dir(sourceFile), "testdata", "press_menu.swift"), strconv.Itoa(app.Process.Pid), step.menu)
-		output, err := press.CombinedOutput()
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 77 {
-			t.Log("AX permission unavailable; native Edit menu step skipped")
+		if !runGUIProbe(t, "press_menu.swift", step.menu) {
 			break
-		}
-		if err != nil {
-			t.Fatalf("%s failed: %v %s", step.menu, err, output)
 		}
 		eventually(t, step.menu, func() bool { return state(a["project"])["total"] == step.count })
 		t.Logf("native GUI Edit menu: %s", step.menu)
@@ -313,6 +325,9 @@ func TestLiveBundle(t *testing.T) {
 			checkReviewFrame(t, rawCall(t, "review_frame", args), want)
 		}, dir)
 	})
+	t.Run("StillAuthoring", func(t *testing.T) {
+		checkStillAuthoring(t, toolCaller, rawCall, runGUIProbe, dir)
+	})
 	t.Run("CloseReplayAndSavedHistory", func(t *testing.T) {
 		checkClosedProjectHistory(t, toolCaller(t), pathA, a["project"])
 	})
@@ -320,7 +335,7 @@ func TestLiveBundle(t *testing.T) {
 		checkSilenceToQueue(t, toolCaller(t), dir, b["project"])
 	})
 	t.Run("PackagedWalkthrough", func(t *testing.T) {
-		checkPackagedWalkthrough(t, ctx, contents, b["project"].(string), filepath.Join(dir, "media.mov"), requireSocketOwner)
+		checkPackagedWalkthrough(t, ctx, contents, b["project"].(string), filepath.Join(dir, "media.mov"), isolatedEndpoint, requireSocketOwner)
 	})
 	t.Run("ExactJSONNumbers", func(t *testing.T) {
 		checkExactNumbers(t, b["project"], func(name string, args object) (*mcp.CallToolResult, error) {

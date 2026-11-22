@@ -91,6 +91,11 @@ struct FilmstripTileBuffer {
         entries.compactMap { $0.source == source ? $0.tile : nil }
     }
 
+    mutating func removeSource(_ source: UUID) {
+        entries.removeAll { $0.source == source }
+        bytes = entries.reduce(0) { $0 + $1.cost }
+    }
+
     mutating func keepSources(_ sources: Set<UUID>) {
         entries.removeAll { !sources.contains($0.source) }
         bytes = entries.reduce(0) { $0 + $1.cost }

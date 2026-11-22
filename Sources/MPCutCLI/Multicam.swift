@@ -104,6 +104,124 @@ struct MulticamAssembly {
         clips.append(.file(media, range, segment, tracks))
     }
 
+    /// Nested ranges address group time. Flatten them to one group clock for the
+    /// still planner, carrying the active microphone and each source's clock offset.
+    func projectWithVisibleReplacements() throws -> (project: MulticamProject, referenceAngles: [String: String])? {
+        guard clips.contains(where: { clip in
+            guard case let .project(project, _, range, _) = clip else { return false }
+            return project.hasVisibleReplacement(in: range)
+        }) else { return nil }
+        var assets: [StillAsset] = []
+        var replacements: [StillReplacement] = []
+        var switches: [MulticamSwitch] = []
+        var referenceAngles: [String: String] = [:]
+        var flattenedAngles: [MulticamSource] = []
+        var flattenedSound: [MulticamSource] = []
+        var color: StillProgramColorPolicy?
+        var cursor = RationalTime.zero
+        struct Route: Hashable {
+            let file: URL
+            let offset: RationalTime
+        }
+        var angleIDs: [Route: String] = [:]
+        var soundIDs: [Route: String] = [:]
+
+        func registerAngle(_ route: Route) -> String {
+            if let id = angleIDs[route] { return id }
+            let id = "camera-\(flattenedAngles.count + 1)"
+            angleIDs[route] = id
+            flattenedAngles.append(.init(id: id, file: route.file.path, offset: route.offset))
+            return id
+        }
+
+        for (index, clip) in clips.enumerated() {
+            let intervals: [MulticamInterval]
+            let range: MulticamRange
+            let routes: [String: Route]
+            switch clip {
+            case let .project(project, url, selected, segment):
+                range = selected
+                intervals = try project.plan(ranges: [range]).intervals
+                routes = Dictionary(uniqueKeysWithValues: project.sources.map {
+                    ($0.id, Route(file: project.sourceURL(for: $0, relativeTo: url), offset: $0.offset))
+                })
+                let used = Dictionary(uniqueKeysWithValues: project.stillAssets.map { ($0.id, $0) })
+                var usedAssetIDs: [String: String] = [:]
+                for replacement in project.stillReplacements {
+                    guard case .group(let authored) = replacement.coverage else { continue }
+                    let from = max(authored.from, range.from)
+                    let to = min(authored.to, range.to)
+                    guard from < to, var asset = used[replacement.assetID] else { continue }
+                    if let policy = project.programColorPolicy {
+                        if let color, color != policy {
+                            throw CutError(code: "incompatible_color_policy",
+                                           message: "Project clip \(segment) has a different still rendering color policy.",
+                                           segment: segment)
+                        }
+                        color = policy
+                    }
+                    let assetID: String
+                    if let registered = usedAssetIDs[asset.id] {
+                        assetID = registered
+                    } else {
+                        let original = asset.id
+                        assetID = "\(index + 1)-\(asset.id)"
+                        asset.id = assetID
+                        asset.file = try CutProject.checkedMediaURL(asset.file, relativeTo: url).path
+                        usedAssetIDs[original] = assetID
+                        assets.append(asset)
+                    }
+                    let coverage = try MulticamRange(from: cursor.adding(from.subtracting(range.from)),
+                                                     to: cursor.adding(to.subtracting(range.from)))
+                    let id = "\(index + 1)-\(replacement.id)"
+                    let reference = routes[project.referenceAngle]!
+                    let offset = try reference.offset.adding(cursor.subtracting(range.from))
+                    referenceAngles[id] = registerAngle(.init(file: reference.file, offset: offset))
+                    replacements.append(.init(id: id, assetID: assetID,
+                                              framing: replacement.framing, coverage: .group(coverage)))
+                }
+            case let .file(media, selected, segment, _):
+                range = selected
+                let id = "file"
+                let microphone = media.streams.first(where: { $0.kind == "audio" }).map {
+                    MulticamAudioSelection(source: id, stream: $0.index)
+                }
+                let length = try range.to.subtracting(range.from)
+                intervals = [.init(group: range, output: .init(from: .zero, to: length), angle: id,
+                                   audio: microphone, assemblyIndex: segment - 1)]
+                routes = [id: Route(file: media.url, offset: try RationalTime.zero.subtracting(media.multicamSourceOffset))]
+            }
+
+            let clockShift = try cursor.subtracting(range.from)
+            for interval in intervals {
+                let source = routes[interval.angle]!
+                let angle = registerAngle(try .init(file: source.file, offset: source.offset.adding(clockShift)))
+
+                let audio = try interval.audio.map { selection in
+                    let source = routes[selection.source]!
+                    let route = Route(file: source.file, offset: try source.offset.adding(clockShift))
+                    let id: String
+                    if let existing = soundIDs[route] {
+                        id = existing
+                    } else {
+                        id = "mic-\(flattenedSound.count + 1)"
+                        soundIDs[route] = id
+                        flattenedSound.append(.init(id: id, file: route.file.path, offset: route.offset))
+                    }
+                    return MulticamAudioSelection(source: id, stream: selection.stream)
+                }
+                switches.append(.init(at: try cursor.adding(interval.output.from), angle: angle, audio: audio))
+            }
+            cursor = try cursor.adding(range.to.subtracting(range.from))
+        }
+        guard !replacements.isEmpty, let reference = flattenedAngles.first else { return nil }
+        let project = MulticamProject(referenceAngle: reference.id, range: .init(from: .zero, to: cursor),
+                                      angles: flattenedAngles, audioSources: flattenedSound, audio: .none,
+                                      switches: switches, stillAssets: assets, stillReplacements: replacements,
+                                      programColorPolicy: color)
+        return (project, referenceAngles)
+    }
+
     private mutating func register(_ url: URL, as id: String, segment: Int) -> String {
         var name = id
         if sources[name] != nil {
@@ -142,5 +260,15 @@ struct MulticamAssembly {
         intervals += addedIntervals
         for span in addedPicture { span.appendCoalescing(to: &picture) }
         for span in addedAudio { span.appendCoalescing(to: &audio) }
+    }
+}
+
+
+extension MulticamProject {
+    func hasVisibleReplacement(in selection: MulticamRange) -> Bool {
+        stillReplacements.contains {
+            guard case .group(let group) = $0.coverage else { return false }
+            return max(group.from, selection.from) < min(group.to, selection.to)
+        }
     }
 }

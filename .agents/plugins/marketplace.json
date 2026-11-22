@@ -1,0 +1,12 @@
+{
+  "name": "mpcut-desktop",
+  "interface": { "displayName": "MPCut Desktop" },
+  "plugins": [
+    {
+      "name": "mpcut",
+      "source": { "source": "local", "path": "./plugins/mpcut" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

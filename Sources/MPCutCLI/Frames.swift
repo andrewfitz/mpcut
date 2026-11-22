@@ -4,7 +4,7 @@ import MPCutCore
 struct FrameExportOptions {
     enum Source {
         case video(String, JPEGSelection, sample: JPEGSample, limit: Int?)
-        case project(String, [RationalTime])
+        case project(String, [RationalTime], clock: StillOptions.Clock?)
     }
     let source: Source
     let output: String
@@ -13,6 +13,7 @@ struct FrameExportOptions {
     init(_ arguments: [String]) throws {
         var file: String?, output: String?, mode: String?, sample: JPEGSample?, preset: JPEGPreset?
         var project: String?
+        var clock: StillOptions.Clock?
         var times: [RationalTime] = []
         var stream: Int?, threshold: Double?, minimum: Double?, limit: Int?
         var iterator = arguments.makeIterator()
@@ -35,6 +36,11 @@ struct FrameExportOptions {
             case "--json": break
             case "--output": output = try value(flag)
             case "--project": project = try value(flag)
+            case "--clock":
+                guard let requested = StillOptions.Clock(rawValue: try value(flag)) else {
+                    throw invalid("Choose sequence, group or assembly.")
+                }
+                clock = requested
             case "--at", "--at-file":
                 let raw = try value(flag)
                 let entries = flag == "--at-file" || ListFile.isListPath(raw) ? try ListFile.scalars(raw, header: "time") : [raw]
@@ -74,12 +80,13 @@ struct FrameExportOptions {
         if let project {
             guard !times.isEmpty, mode == nil, sample == nil, limit == nil,
                   stream == nil, threshold == nil, minimum == nil else {
-                throw invalid("Use --project with one or more --at group times and optional --preset.")
+                throw invalid("Use --project with one or more --at times and optional --clock and --preset.")
             }
-            source = .project(project, times)
+            source = .project(project, times, clock: clock)
             return
         }
         guard let file else { throw invalid("Supply a source video.") }
+        guard clock == nil else { throw invalid("--clock applies to project frames.") }
         if mode != "non-silent", stream != nil || threshold != nil || minimum != nil {
             throw invalid("Audio settings require --select non-silent.")
         }

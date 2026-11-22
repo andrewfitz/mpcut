@@ -508,6 +508,33 @@ class MulticamTests(unittest.TestCase):
         intervals = self.cli(*common, "--clip", self.wide, "--ranges", cuts)["plan"]["intervals"]
         self.assertEqual([row["assemblyIndex"] for row in intervals], [0, 1, 1])
 
+    def test_picture_only_cut_without_alternatives_says_what_to_do(self):
+        # The picture-only row of the export rules offers another container only, and no container takes a switch
+        # inside a picture group. The refusal then says what does help, and people read its times in seconds.
+        self.project(switches=[{"at": "0", "angle": "wide"}, {"at": "57/25", "angle": "close"}])
+        failure = self.export("--dry-run", "--tracks", "video", ok=False)["error"]
+        self.assertEqual((failure["code"], failure["reason"]), ("unsafe_boundary", "cut.videoEnd"))
+        self.assertFalse(failure.get("alternatives"))
+        self.assertTrue(failure["nearest"])
+        self.assertIn("boundary at 57/25. A picture-only multicam export is a Lossless Copy, which needs a verified time "
+                      "at every cut. Move the cut to one of the verified times", failure["message"])
+        self.assertIn("or export picture and sound together with ", failure["message"])
+        together = self.export("--dry-run", ok=False)["error"]
+        self.assertNotIn("picture-only", together["message"])
+        self.assertTrue(all(offer["tracks"] == "all" for offer in together["alternatives"]))
+        self.assertTrue(together["alternatives"])
+
+        told = subprocess.run([CLI, "export", "--project", self.project_path, "--dry-run", "--mode", "copy", "--tracks", "video",
+                               "--output", self.output], capture_output=True, text=True, cwd=self.root, timeout=90)
+        self.assertEqual(told.returncode, 1)
+        self.assertIn("group 0.000–2.280 s", told.stderr)
+        self.assertIn("boundary at 2.280 s. A picture-only multicam export", told.stderr)
+        self.assertNotIn("57/25", told.stderr)
+        self.assertIn("Verified alternatives: ", told.stderr)
+        # On a keyframe the picture-only copy is written, and nothing is advised.
+        self.project(switches=[{"at": "0", "angle": "wide"}, {"at": "2", "angle": "close"}])
+        self.export("--dry-run", "--tracks", "video")
+
     def test_copy_offers_joint_boundaries_on_group_clock_without_retiming(self):
         self.project(offset="1", switches=[{"at": "0", "angle": "wide"}, {"at": "57/25", "angle": "close"}])
         original = self.project_path.read_bytes()

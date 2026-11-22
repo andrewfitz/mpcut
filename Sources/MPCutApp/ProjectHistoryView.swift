@@ -35,10 +35,12 @@ struct ProjectHistoryView: View {
                     scroll.scrollTo(index, anchor: .center)
                 }
                 .onChange(of: actions) { _, _ in selection = cursor }
+                .help("Select a project state")
             }
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                    .help("Close project history")
                 Button("Restore State") {
                     guard let selection, (0...actions.count).contains(selection), selection != cursor else { return }
                     restore(selection)
@@ -46,6 +48,7 @@ struct ProjectHistoryView: View {
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(disabled || selection == nil || selection == cursor)
+                .help("Restore selected state")
             }
         }
         .padding(20)

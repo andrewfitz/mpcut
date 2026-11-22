@@ -58,8 +58,7 @@ extension MulticamEngine {
 
                 let from = span.input.from
                 let to = span.input.to
-                let movableLeadingSilence = first && container == "mov" && track.stream.isPCM
-                    && track.stream.hasDeclaredStart && track.stream.start == track.start && from >= .zero
+                let movableLeadingSilence = first && container == "mov" && track.hasDeclaredPCMStart && from >= .zero
                 guard (movableLeadingSilence || from >= max(.zero, track.start)), from < track.end, to <= track.end else {
                     let uncoveredFrom = from < max(.zero, track.start) ? from : max(from, track.end)
                     let uncoveredTo = from < max(.zero, track.start) ? min(to, max(.zero, track.start)) : to
@@ -114,7 +113,7 @@ extension MulticamEngine {
     /// A program soundtrack is written within its planned ranges. Unlike a linked
     /// copy, the writer keeps no packet before the first range or after the last,
     /// so packet-copied codecs cannot rely on priming or padding at those edges.
-    private func checkProgramPackets(_ sound: AudioIndex, media: MediaInfo, from: RationalTime, to: RationalTime,
+    func checkProgramPackets(_ sound: AudioIndex, media: MediaInfo, from: RationalTime, to: RationalTime,
                                      single: Bool, container: String) throws {
         let engine = CutEngine(cancelled: cancelled, tracks: .audio)
         let stream = sound.stream

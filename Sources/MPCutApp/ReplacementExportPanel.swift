@@ -21,7 +21,7 @@ final class ReplacementExportPanel: NSObject, ObservableObject, NSOpenSavePanelD
     private let excludedSources: Set<URL>
     private let useSidecar: Bool
 
-    init(source: MediaInfo, replacement: MediaInfo, sourceName: String? = nil, useSidecar: Bool = true, excludedSources: Set<URL> = []) throws {
+    init(source: MediaInfo, replacement: MediaInfo, sourceName: String? = nil, preferredTrack: Int = 0, useSidecar: Bool = true, excludedSources: Set<URL> = []) throws {
         self.source = source
         self.replacement = replacement
         self.sourceName = sourceName ?? source.url.lastPathComponent
@@ -30,9 +30,9 @@ final class ReplacementExportPanel: NSObject, ObservableObject, NSOpenSavePanelD
         targets = source.streams.filter { $0.kind == "audio" }
         replacements = replacement.streams.filter { $0.kind == "audio" }
         guard let target = targets.first, let processed = replacements.first else {
-            throw CutError(code: "no_audio", message: "Choose a source and a replacement that each contain audio.")
+            throw CutError(code: "no_audio", message: "Both the source file and the replacement need an audio track.")
         }
-        targetIndex = target.index
+        targetIndex = targets.indices.contains(preferredTrack) ? targets[preferredTrack].index : target.index
         replacementIndex = processed.index
         fileExtension = source.url.pathExtension.isEmpty ? "mov" : source.url.pathExtension.lowercased()
         super.init()
@@ -81,7 +81,7 @@ final class ReplacementExportPanel: NSObject, ObservableObject, NSOpenSavePanelD
                     }
                 }
                 fileExtension = plan.container
-                summary = "Copy picture and sound to \(plan.container.uppercased()) · \(EditorExportPlan.seconds(plan.duration.seconds))"
+                summary = "Save the working copy as \(plan.container.uppercased()) · \(EditorExportPlan.seconds(plan.duration.seconds))"
             case .failure(let error):
                 summary = error.localizedDescription
             }
@@ -106,16 +106,25 @@ private struct ReplacementOptionsView: View {
         Form {
             LabeledContent("Whole source", value: options.sourceName)
             Picker("Track to replace", selection: $options.targetIndex) {
-                ForEach(options.targets, id: \.index) { Text($0.exportLabel).tag($0.index) }
+                ForEach(Array(options.targets.enumerated()), id: \.offset) { ordinal, stream in
+                    Text("Track \(ordinal + 1) · \(stream.audioFormatLabel)").tag(stream.index)
+                }
             }
+            .help("Choose track to replace")
             LabeledContent("Replacement file", value: options.replacement.url.lastPathComponent)
             Picker("Use audio track", selection: $options.replacementIndex) {
-                ForEach(options.replacements, id: \.index) { Text($0.exportLabel).tag($0.index) }
+                ForEach(Array(options.replacements.enumerated()), id: \.offset) { ordinal, stream in
+                    Text("Track \(ordinal + 1) · \(stream.audioFormatLabel)").tag(stream.index)
+                }
             }
+            .help("Choose replacement audio track")
             Picker("Container", selection: $options.container) {
                 Text("Source compatible").tag(nil as String?)
-                ForEach(["mov", "mp4", "mkv", "webm"], id: \.self) { Text(containerDisplayName($0)).tag(Optional($0)) }
+                ForEach(ExportRules.replacementContainers(hasVideo: options.source.hasVideo), id: \.self) { container in
+                    Text(ExportRules.containerDisplayName(container)).tag(Optional(container))
+                }
             }
+            .help("Choose file format")
             Text(options.summary).font(.callout).foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, minHeight: 38, alignment: .topLeading)
         }

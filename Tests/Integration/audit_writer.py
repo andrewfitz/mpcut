@@ -20,7 +20,9 @@ class WriterRegression(unittest.TestCase):
         self.root = Path(directory.name)
 
     def export(self, source, destination, *range_args, dry_run=False, ok=True):
-        args = [CLI, "export", "--json", "--output", destination, "--clip", source, *range_args]
+        # The writer audit is about the packet copy. The CLI default is Smart Trim, so the mode is named.
+        named = any(flag in ("--mode", "--smart-trim") for flag in range_args)
+        args = [CLI, "export", "--json", *([] if named else ["--mode", "copy"]), "--output", destination, "--clip", source, *range_args]
         if dry_run:
             args.append("--dry-run")
         process = subprocess.run(args, capture_output=True, text=True, timeout=30)

@@ -65,17 +65,20 @@ public struct ReencodePlan: Encodable, Sendable {
     public let width: Int
     public let height: Int
     public let warnings: [String]
+    /// The shared output format when the clips differ. Nil for clips that match, which keep their own format.
+    public var canvas: ReencodeCanvas? = nil
 
     let media: [URL: MediaInfo]
     let helper: URL
-    let encoding: ReencodeVideo
+    var encoding: ReencodeVideo
     let audioCopy: ResolvedEdit?
     let timeScale: Int
     let exactPCM: Set<Int>
 
     var movieTimeScale = 1_000_000
+    var assemblesStillHDR = false
 
-    enum CodingKeys: String, CodingKey { case edit, settings, audioActions, width, height, warnings }
+    enum CodingKeys: String, CodingKey { case edit, settings, audioActions, width, height, warnings, canvas }
 }
 
 public struct ReencodeEngine: Sendable {
@@ -89,6 +92,26 @@ public struct ReencodeEngine: Sendable {
 
     public func resolve(_ clips: [ClipRequest], output: URL? = nil, media cached: [URL: MediaInfo] = [:],
                         container: String = "mp4", settings: ReencodeSettings = .init()) throws -> ReencodePlan {
+        try plan(clips, output: output, media: cached, container: container, settings: settings, verifyingEncoder: true)
+    }
+
+    func resolveStillPictures(_ clips: [ClipRequest], output: URL, media: [URL: MediaInfo],
+                              generated: Set<URL>, container: String, settings: ReencodeSettings) throws -> ReencodePlan {
+        try plan(clips, output: output, media: media, container: container, settings: settings,
+                 verifyingEncoder: true, normalizedStills: generated)
+    }
+
+    /// Everything a re-encode plan checks before it asks the helper: sources, cuts, timing and the audio treatment.
+    /// The timeline tier asks this on every edit, so it starts no process. The hardware encoder is verified at export.
+    func staticWarnings(_ clips: [ClipRequest], media cached: [URL: MediaInfo], container: String,
+                        settings: ReencodeSettings = .init()) throws -> [String] {
+        try plan(clips, output: nil, media: cached, container: container, settings: settings, verifyingEncoder: false).warnings
+    }
+
+    /// A plan made with `verifyingEncoder` false has no helper and is never written.
+    private func plan(_ clips: [ClipRequest], output: URL?, media cached: [URL: MediaInfo],
+                      container: String, settings: ReencodeSettings, verifyingEncoder: Bool,
+                      normalizedStills: Set<URL> = []) throws -> ReencodePlan {
         try checkCancellation()
         guard !clips.isEmpty else { throw CutError(code: "empty_edit", message: "Add at least one clip before exporting.") }
         let container = container.lowercased()
@@ -105,6 +128,9 @@ public struct ReencodeEngine: Sendable {
         var duration = RationalTime.zero
         var reference: MediaInfo?
         var warnings: [String] = []
+        // The sources in order of first use, and the first one that a uniform timeline would have refused.
+        var sources: [MixedSource] = []
+        var difference: (clip: Int, labels: [String])?
         for (offset, clip) in clips.enumerated() {
             try checkCancellation()
             let index = offset + 1
@@ -115,16 +141,28 @@ public struct ReencodeEngine: Sendable {
                     info = existing
                 } else {
                     info = try conversionMedia(file, indexed: cached[file])
-                    try checkSource(info)
+                    if reference != nil, !info.hasVideo {
+                        throw ExportRules.mixedMediaTypeRefusal(clip: index, name: file.lastPathComponent)
+                    }
+                    try checkSource(info, normalizedStill: normalizedStills.contains(file))
                     for stream in info.streams where stream.index != info.video.index && stream.kind != "audio" {
                         warnings.append("Clip \(index) \(stream.codecTag == "tmcd" ? "timecode" : stream.kind) track \(stream.index) will be omitted.")
                     }
-                    if let reference { try engine.checkCompatibility(info, with: reference) }
-                    else { reference = info }
+                    if let reference {
+                        do {
+                            try engine.checkCompatibility(info, with: reference, reencodingAudio: settings.audio)
+                        } catch let issue as CutError where issue.code == "incompatible_clip" && issue.factor == .joinStreamMismatch {
+                            // Re-encode decodes every clip, so sources that differ are written on one canvas.
+                            if difference == nil { difference = (index, ExportRules.mixedDifferences(info, from: reference)) }
+                        }
+                    } else {
+                        reference = info
+                    }
+                    sources.append(MixedSource(clip: index, media: info))
                     media[file] = info
                 }
             } catch let error as CutError where error.code != "cancelled" {
-                throw CutError(code: error.code, message: error.message, segment: index, track: error.track)
+                throw CutError(code: error.code, message: error.message, segment: index, track: error.track).because(error.reason)
             }
 
             let from = clip.from ?? .zero
@@ -136,11 +174,11 @@ public struct ReencodeEngine: Sendable {
             let upper = info.frames.lowerBound { $0.time >= to }
             guard lower < info.frames.count, info.frames[lower].time == from else {
                 throw CutError(code: "invalid_frame_boundary", message: "The start must be a source frame boundary.",
-                               segment: index, boundary: "from")
+                               segment: index, boundary: "from").because(.cutOffFrame)
             }
             guard to == info.duration || (upper < info.frames.count && info.frames[upper].time == to) else {
                 throw CutError(code: "invalid_frame_boundary", message: "The end must be a source frame boundary.",
-                               segment: index, boundary: "to")
+                               segment: index, boundary: "to").because(.cutOffFrame)
             }
             let end = try duration.adding(to.subtracting(from))
             let tracks = ([info.video] + info.audio.map(\.stream)).compactMap { stream -> ResolvedTrack? in
@@ -154,7 +192,11 @@ public struct ReencodeEngine: Sendable {
             duration = end
         }
         guard let reference else { throw CutError(code: "empty_edit", message: "Add at least one clip before exporting.") }
-        let encoding = try ReencodeVideo(reference.video, settings: settings)
+        let mixed = try difference.map {
+            try resolveMixed(sources, difference: $0, settings: settings, container: container)
+        }
+        let encoding = try mixed?.encoding ?? ReencodeVideo(reference.video, settings: settings)
+        if let mixed { warnings += mixed.warnings }
         if let warning = encoding.warning { warnings.append(warning) }
         if reference.video.complexPicture {
             warnings.append("Additional source display or color metadata may change during video encoding.")
@@ -166,9 +208,11 @@ public struct ReencodeEngine: Sendable {
         } else if media.values.contains(where: { Int64(timeScale) % $0.video.timeBase.denominator != 0 }) {
             warnings.append("The source clock is finer than the output clock. Presentation timestamps will be rounded.")
         }
-        let (actions, audioCopy, exactPCM) = try resolveAudio(reference: reference, settings: settings, clips: clips,
-                                                               segments: segments, media: media, engine: engine,
-                                                               container: container)
+        // A mixed timeline converts its sound to the canvas. Nothing of it is copied.
+        let (actions, audioCopy, exactPCM) = try mixed.map { ($0.actions, nil, []) }
+            ?? resolveAudio(reference: reference, settings: settings, clips: clips,
+                            segments: segments, media: media, engine: engine,
+                            container: container)
         if let audioCopy {
             guard let groups = Self.audioCopyGroups(audioCopy.segments, pictures: segments) else {
                 throw CutError(code: "audio_copy_unavailable", message: "Exact audio copy could not be aligned with the picture.")
@@ -196,17 +240,19 @@ public struct ReencodeEngine: Sendable {
                                        reachesEnd: picture.reachesEnd)
             }
         }
-        let executable = try Self.findHelper(override: helper)
-        for info in media.values where info.video.codec == "av1" {
-            try verifyAV1Decoder(executable, media: info)
+        let executable = verifyingEncoder ? try Self.findHelper(override: helper) : URL(fileURLWithPath: "/dev/null")
+        if verifyingEncoder {
+            for info in media.values where info.video.codec == "av1" {
+                try verifyAV1Decoder(executable, media: info)
+            }
+            try verifyHardware(executable, encoding: encoding, container: container, actions: actions,
+                               audio: reference.audio.map(\.stream), exactPCM: exactPCM, canvas: mixed?.canvas)
         }
-        try verifyHardware(executable, encoding: encoding, container: container, actions: actions,
-                           audio: reference.audio.map(\.stream), exactPCM: exactPCM)
         let identities = media.mapValues(\.identity)
         for (file, identity) in identities { try verifyIdentity(file, identity) }
         let edit = ResolvedEdit(segments: segments, duration: duration, container: container, identities: identities)
         return ReencodePlan(edit: edit, settings: settings, audioActions: actions, width: encoding.width,
-                            height: encoding.height, warnings: warnings, media: media, helper: executable, encoding: encoding,
+                            height: encoding.height, warnings: warnings, canvas: mixed?.canvas, media: media, helper: executable, encoding: encoding,
                             audioCopy: audioCopy, timeScale: timeScale, exactPCM: exactPCM)
     }
 
@@ -235,9 +281,11 @@ public struct ReencodeEngine: Sendable {
         return try Probe.read(file, conversion: true, expectedIdentity: source?.identity, cancelled: cancelled)
     }
 
-    private func checkSource(_ info: MediaInfo) throws {
+    private func checkSource(_ info: MediaInfo, normalizedStill: Bool = false) throws {
         guard info.hasVideo else { throw CutError(code: "no_video", message: "Video re-encoding requires a video track. Choose Copy to export audio.") }
-        if let issue = info.timelineIssue {
+        let stagedRGB = normalizedStill && info.streams.count == 1 &&
+            info.video.codec == "rawvideo" && info.video.codecTag == "b48r"
+        if let issue = info.timelineIssue, !(stagedRGB && issue == "RAW video is unsupported.") {
             throw CutError(code: "unsupported_tracks", message: issue)
         }
         guard !info.frames.isEmpty, info.duration > .zero else {
@@ -318,7 +366,8 @@ public struct ReencodeEngine: Sendable {
                     let rate = RationalTime(numerator: Int64(track.stream.sampleRate))
                     let from = try source.origin.adding(segment.from).multiplied(by: rate)
                     let to = try source.origin.adding(segment.to).multiplied(by: rate)
-                    return audio.pcmContinuity && segment.from >= audio.start && segment.to <= audio.end &&
+                    return audio.stream.codec == track.stream.codec && audio.pcmContinuity &&
+                        segment.from >= audio.start && segment.to <= audio.end &&
                         from.denominator == 1 && to.denominator == 1
                 }) {
                     exactPCM.insert(track.stream.index)
@@ -353,11 +402,13 @@ public struct ReencodeEngine: Sendable {
                     issue = CutError(code: issue.code,
                                      message: "Audio is copied only at cuts where the source picture could also be copied without re-encoding. \(issue.message)",
                                      segment: issue.segment, boundary: issue.boundary, nearest: issue.nearest, track: issue.track)
+                        .because(issue.reason)
                 }
                 if effective == .copyOriginal {
                     throw CutError(code: "audio_copy_unavailable",
                                    message: "Exact audio copy could not be verified. \(issue.message)",
                                    segment: issue.segment, boundary: issue.boundary, nearest: issue.nearest, track: issue.track)
+                        .because(issue.factor)
                 }
                 copyFailure = issue
                 effective = ExportRules.automaticAudio(codec: settings.codec, container: container, source: .movie).first ?? .aac
@@ -397,7 +448,7 @@ public struct ReencodeEngine: Sendable {
     }
 
     func verifyIdentity(_ file: URL, _ identity: SourceIdentity) throws {
-        guard (try? SourceIdentity(file)) == identity else {
+        guard identity.isCurrentSnapshot(at: file) else {
             throw CutError(code: "source_changed", message: "The source changed since inspection: \(file.lastPathComponent)")
         }
     }
@@ -423,7 +474,7 @@ public struct ReencodeEngine: Sendable {
 
 // The filter interleave clock has microsecond resolution. A multiple of each
 // source clock below that ceiling round-trips through interleave exactly.
-private func conversionTimeScale(for denominators: [Int64]) -> Int {
+func conversionTimeScale(for denominators: [Int64]) -> Int {
     let ceiling: Int64 = 1_000_000
     var combined: Int64 = 1
     for denominator in denominators {

@@ -193,7 +193,9 @@ final class SidecarRepairTests: XCTestCase {
         // and a sidecar from a later version.
         var foreign = whole, newer = whole
         foreign.replaceSubrange(68..<72, with: [0, 0, 0, 9])
-        newer.replaceSubrange(60..<64, with: [0, 0, 0, 2])
+        let version = whole[60..<64].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        var laterVersion = (version + 1).bigEndian
+        withUnsafeBytes(of: &laterVersion) { newer.replaceSubrange(60..<64, with: $0) }
         for original in [whole.prefix(40), foreign.prefix(whole.count / 2), foreign, newer, newer.prefix(whole.count / 2)] {
             try original.write(to: sidecar.url)
             XCTAssertThrowsError(try sidecar.save(["x": Data()]))

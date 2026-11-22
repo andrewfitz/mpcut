@@ -1,6 +1,6 @@
 # MPCut
 
-**A native macOS video and audio cutter for Apple Silicon.** Trim clips, remove sections, arrange matching recordings, and export a single edit or a batch of clips. The desktop app’s default video export mode, **Smart Trim**, copies compatible video packets and encodes only the cut edges that need it. Each export writes a new file and preserves your sources.
+**MPCut edits video and audio on Apple Silicon Macs.** Trim a recording, rearrange clips, or export several cuts as separate files. The default video mode, **Smart Trim**, copies the original video and re-encodes frames around a cut when needed. Each export goes to a new file.
 
 **[Download MPCut](https://github.com/andrewfitz/mpcut/releases/latest)** · [Full usage guide](docs/USAGE.md) · [Release notes](CHANGELOG.md)
 
@@ -16,6 +16,7 @@
 | What you want to do | How MPCut handles it |
 | --- | --- |
 | Assemble selects from a shoot | Trim, split, restore, delete, reorder, mark In/Out, and undo or redo on the timeline. Join matching files, repeat ranges with `export --order`, or enter a single source’s selects with `rearrange`. |
+| Add photos or title cards | Replace picture over existing sound, insert a silent card, or start a timeline with images. [Still image guide](docs/STILL-IMAGES.md) |
 | Switch cameras during a recording | Save camera switches, sync offsets, soundtrack choices, and highlight ranges in a multicam project. Keep one microphone across picture switches or let the sound follow the camera. |
 | Deliver one movie or a folder of clips | Export the retained sequence, queue marked ranges, or send a range list to `bulk`. Copy verified packets, Smart Trim the necessary video edges, or convert to hardware H.264, HEVC, or ProRes. Inspect the resolved edit before writing. |
 | Review an interview and remove dead air | See the waveform beneath the filmstrip. Scan the chosen microphone, calibrate automatically or mark room tone, adjust dBFS/minimum duration/padding, jump between pauses, skip them on playback, audition joins, protect a pause, or queue the retained takes. |
@@ -37,6 +38,8 @@ MPCut requires **macOS 14 or later on Apple Silicon**. Download the arm64 ZIP, e
 The **Help** menu opens the bundled **MPCut User Guide** (⌘?) and **Release Notes** offline. **MPCut → About MPCut** also shows the installed version, documentation, credits, and a **Copy CLI Path** button.
 
 ## Control open projects from an agent
+
+To edit from a GUI conversation, install the MPCut plugin for Claude Desktop or ChatGPT Desktop (Work and Codex). [Desktop setup and example editing requests](docs/DESKTOP-PLUGINS.md)
 
 Open **Settings → General → Automation** and enable local MCP control. Configure your agent’s stdio server to launch `/Applications/MPCut.app/Contents/Helpers/mpcut-mcp` or the helper from the app bundle you have open. Ask the agent to list open projects, inspect the timeline and split a specific clip. Edits use the GUI’s native history, including its retention limit. Turn off the setting to end access. **Help → MPCut Agent Guide** opens the instructions offline. [Setup and use cases](docs/MCP-AGENT-GUIDE.md) · [Tool reference](docs/MCP-REFERENCE.md)
 
@@ -200,7 +203,7 @@ The list sets playback order. `rearrange` uses Smart Trim and snaps to nearby va
 JSON
 ```
 
-Remove `--dry-run` to export. An explicit order defaults to Smart Trim. An ordinary `export` defaults to Lossless Copy. Use `--mode smart`, `--mode copy`, or `--mode encode` to choose explicitly. [CLI command and JSON reference](docs/USAGE.md#automate-an-export)
+Remove `--dry-run` to export. Without `--mode`, `export` uses Smart Trim for a movie and Lossless Copy for a recording without picture, as the app does. Use `--mode smart`, `--mode copy`, or `--mode encode` to choose explicitly. [CLI command and JSON reference](docs/USAGE.md#automate-an-export)
 
 ### Export multiple ranges as separate files
 

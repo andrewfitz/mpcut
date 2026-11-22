@@ -38,6 +38,7 @@ typedef struct {
     MPCutEdgeRange head_edge;
     MPCutEdgeRange tail_edge;
     int multiple_descriptions; /* Source MOV contains multiple video sample descriptions. */
+    int generated_still; /* Internally generated video-only span with verified picture properties. */
     const MPCutTime *video_dts; /* Optional output decode slots for Smart Trim MOV splices. */
     size_t video_dts_count;
     MPCutTime source_origin; /* Indexed video or audio presentation origin, when available. */
@@ -93,6 +94,10 @@ int mpcut_check_mp3_crop(const char *path, int stream_index, int64_t start_sampl
 int mpcut_check_mux(const char *input_path, const char *output_path, int padded_opus_track, int tracks, int audio_stream,
                     char *error, size_t error_capacity);
 
+/* Check several output paths against one open source, writing one boolean per path. */
+void mpcut_check_muxes(const char *input_path, const char *const *output_paths, size_t count,
+                      int padded_opus_track, int tracks, int audio_stream, uint8_t *supported);
+
 /* Write presentation end times (nanoseconds) into a staged WebM or MKV. */
 int mpcut_set_matroska_durations(const char *path, const int64_t *ends, size_t count);
 
@@ -108,6 +113,7 @@ int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime d
  * Returns 0 on success, 1 on failure, or 2 on cancellation.
  */
 int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_path, int tracks, int audio_stream,
+                const uint32_t *still_mastering_display, /* Optional 10-element GBR/white/luminance tuple. */
                 MPCutProgress progress, void *context, char *error, size_t error_capacity);
 
 #endif

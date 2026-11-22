@@ -30,7 +30,7 @@ final class MulticamQueueAndAudioTests: XCTestCase {
         let batch = try MulticamBulkExport(ranges: model.queuedRanges, directory: directory, container: "mov",
                                            mode: .copy, tracks: .video, settings: .init(), engine: engine)
         XCTAssertEqual(batch.items.map(\.output.lastPathComponent), ["Multicam-001.mov", "Multicam-002.mov"])
-        XCTAssertEqual(batch.items.map(\.plan.duration), [end, end])
+        XCTAssertEqual(batch.items.map(\.duration), [end, end])
 
         let sentinel = Data("keep".utf8)
         try sentinel.write(to: batch.items[1].output)
@@ -77,7 +77,7 @@ final class MulticamQueueAndAudioTests: XCTestCase {
             try MulticamBulkExport(ranges: model.queuedRanges, directory: directory, container: "mov",
                                    mode: .copy, tracks: .video, settings: .init(), organization: organization, engine: MulticamEngine())
         }
-        XCTAssertEqual(try preflight().items.first?.plan.duration, end)
+        XCTAssertEqual(try preflight().items.first?.duration, end)
         let folder = directory.appendingPathComponent("Review", isDirectory: true)
         XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
         XCTAssertThrowsError(try organization.validateSubfolder(in: directory, protectedMedia: [folder.path: "offline"]))
@@ -129,6 +129,33 @@ final class MulticamQueueAndAudioTests: XCTestCase {
         model.undo()
         XCTAssertTrue(model.project?.audioSources.isEmpty == true)
         XCTAssertEqual(model.project?.switches[0].audio, initial)
+    }
+
+    @MainActor
+    func testChangedDonorCannotReplaceOrRebindTheProgramSoundtrack() async throws {
+        let camera = try fixture("Pause-Noisy", extension: "mov")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let donor = directory.appendingPathComponent("recording.mov")
+        try FileManager.default.copyItem(at: camera, to: donor)
+        let info = try CutEngine(useSidecar: false).inspectMulticamSource(donor)
+        let source = MulticamSource(id: "camera", file: donor.path)
+        let draft = MulticamEditorModel.SourceDraft(source: source, media: info)
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [draft], opening: source.id, audio: .none)
+        let generation = model.mcpRevision
+        let selection = MulticamAudioSelection(source: source.id, stream: try XCTUnwrap(info.audio.last?.stream.index))
+        try FileManager.default.moveItem(at: donor, to: directory.appendingPathComponent("previous.mov"))
+        try FileManager.default.copyItem(at: camera, to: donor)
+        XCTAssertFalse(model.replaceProgramAudio(with: selection))
+        XCTAssertFalse(model.replaceProgramAudio(with: selection, external: draft))
+        let newer = try CutEngine(useSidecar: false).inspectMulticamSource(donor)
+        XCTAssertFalse(model.replaceProgramAudio(with: selection, external: .init(source: source, media: newer)))
+        XCTAssertEqual(model.media[source.id]?.identity, info.identity)
+        XCTAssertEqual(model.mcpRevision, generation)
+        XCTAssertEqual(model.project?.audio, MulticamAudioPolicy.none)
     }
 
     @MainActor

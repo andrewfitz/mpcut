@@ -5,11 +5,12 @@ import Foundation
 enum EditorAnalysisQueues {
     static let scans = queue(named: "MPCut background media analysis")
     static let waveformDetail = queue(named: "MPCut visible audio detail")
+    static let openingAudio = queue(named: "MPCut opening audio preview", priority: .userInitiated)
 
-    private static func queue(named name: String) -> OperationQueue {
+    private static func queue(named name: String, priority: QualityOfService = .utility) -> OperationQueue {
         let queue = OperationQueue()
         queue.name = name
-        queue.qualityOfService = .utility
+        queue.qualityOfService = priority
         queue.maxConcurrentOperationCount = 2
         return queue
     }

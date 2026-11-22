@@ -33,6 +33,8 @@ public final class ResolveExport {
     private var timecodes: [URL: RationalTime] = [:]
     private var formats: [String: String] = [:]
     private var assets: [URL: String] = [:]
+    private var stillResourceCount = 0
+    private var stillMedia: [URL: (info: StillImageInfo, fingerprint: String)] = [:]
     private var soundFiles: [URL: [Int: MediaInfo]] = [:]
     private var audioDirectory: URL?
     private var committed = false
@@ -42,6 +44,7 @@ public final class ResolveExport {
     private var allowLoss = true
     private var warnings = [String]()
     private var warned = Set<String>()
+    private var unsupportedStills = [String]()
     private var bundleDestination: URL?
     private let output: URL
     private var name: String { (bundleDestination ?? output).deletingPathExtension().lastPathComponent }
@@ -62,10 +65,15 @@ public final class ResolveExport {
         if !committed, let audioDirectory { try? FileManager.default.removeItem(at: audioDirectory) }
     }
 
+    public static func rejectUnsupportedStills(_ project: CutProject) throws {
+        _ = try ProjectConverter.prepareStills(project, for: "DaVinci Resolve timeline handoff", allowLoss: false)
+    }
+
     public static func write(_ project: MulticamProject, relativeTo location: URL, to output: URL,
                              useSidecar: Bool = true, matching imported: [String: MediaInfo] = [:],
                              auxiliaryOutput: ((URL) -> Void)? = nil,
                              cancelled: (@Sendable () -> Bool)? = nil) throws {
+        try rejectUnsupportedStills(.multicam(project))
         let writer = try ResolveExport(output, useSidecar: useSidecar, cancelled: cancelled)
         try writer.multicam(project, location: location, imported: imported)
         if let audio = writer.audioDirectory { auxiliaryOutput?(audio) }
@@ -90,14 +98,22 @@ public final class ResolveExport {
         writer.isolateSequenceAudio = isolateSequenceAudio
         writer.allowLoss = allowLoss
         writer.bundleDestination = package
-        switch project {
-        case .sequence(let clips):
-            writer.clipMetadata = try clips.map { clip in
-                try FCPClipMetadata(id: clip.id, audioTrack: clip.audioTrack,
+        writer.clipMetadata = try (project.sequenceClips ?? []).map { clip in
+            try FCPClipMetadata(id: clip.id, audioTrack: clip.audioTrack,
                                 originalFile: clip.originalFile.map { try CutProject.checkedMediaURL($0, relativeTo: location).path },
                                 replacementNames: clip.replacementNames)
-            }
+        }
+        switch project {
+        case .sequence:
             try writer.sequence(project.requests(relativeTo: location))
+        case .stillSequence(let sequence):
+            let inserts = sequence.items.enumerated().compactMap { index, item -> (Int, StillInsert)? in
+                item.still.map { (index, $0) }
+            }
+            try writer.sequence(CutProject.sequence(sequence.items.compactMap(\.source)).requests(relativeTo: location),
+                                inserts: Dictionary(uniqueKeysWithValues: inserts),
+                                stillAssets: Dictionary(uniqueKeysWithValues: sequence.stillAssets.map { ($0.id, $0) }),
+                                colorPolicy: sequence.programColorPolicy, standalone: sequence.stillFormat, location: location)
         case .multicam(let group):
             try writer.multicam(group, location: location, imported: [:])
         }
@@ -108,6 +124,20 @@ public final class ResolveExport {
     private func warnLoss(_ message: String) throws {
         guard allowLoss else { throw CutError(code: "conversion_loss", message: message) }
         if warned.insert(message).inserted { warnings.append(message) }
+    }
+
+    private func recordStillLoss(_ message: String) {
+        if allowLoss {
+            if warned.insert(message).inserted { warnings.append(message) }
+        } else {
+            unsupportedStills.append(message)
+        }
+    }
+
+    private func checkStillLoss() throws {
+        if !unsupportedStills.isEmpty {
+            throw CutError(code: "conversion_loss", message: unsupportedStills.joined(separator: "\n"))
+        }
     }
 
     private func displayName(_ value: String) throws -> String {
@@ -169,8 +199,12 @@ public final class ResolveExport {
 
     private func format(_ video: StreamInfo?) throws -> String {
         let rate = video?.frameRate ?? RationalTime(numerator: 24)
-        guard rate > .zero else { throw CutError(code: "invalid_frame_rate", message: "Missing source frame rate.") }
         let width = video?.displayWidth ?? 1920, height = video?.displayHeight ?? 1080
+        return try format(width: width, height: height, rate: rate)
+    }
+
+    private func format(width: Int, height: Int, rate: RationalTime) throws -> String {
+        guard rate > .zero else { throw CutError(code: "invalid_frame_rate", message: "Missing source frame rate.") }
         let key = "\(width)x\(height)@\(rate)"
         if let id = formats[key] { return id }
         let id = "f\(formats.count + 1)"
@@ -348,11 +382,45 @@ public final class ResolveExport {
             }
             if let mode { metadata.child("md", ["key": FCPGroupMetadata.audio, "value": mode]) }
         }
+        let stillAssets = Dictionary(uniqueKeysWithValues: project.stillAssets.map { ($0.id, $0) })
+        var pending = [(index: Int, position: RationalTime, insert: StillInsert)]()
+        if let items = project.assemblyItems {
+            var position = RationalTime.zero
+            for (index, item) in items.enumerated() {
+                if let range = item.group {
+                    position = try position.adding(range.to.subtracting(range.from))
+                } else if let insert = item.still {
+                    pending.append((index, position, insert))
+                    position = try position.adding(insert.duration)
+                }
+            }
+        }
+        var nextInsert = 0
+        var omittedDuration = RationalTime.zero
+        func writeStills(before nextAssemblyIndex: Int) throws {
+            while nextInsert < pending.count, pending[nextInsert].index < nextAssemblyIndex {
+                let point = pending[nextInsert]
+                let position = try point.position.subtracting(omittedDuration)
+                guard let image = stillAssets[point.insert.assetID] else {
+                    throw CutError(code: "invalid_cut_project", message: "Missing still asset for \(point.insert.id).")
+                }
+                if try !alignedStill(point.insert, at: position, rate: rate) {
+                    recordStillLoss("Final Cut Pro cannot represent Insert Still placement \(point.insert.id) at the assembly's \(rate) fps cadence and exact boundaries. The insert and its silence will be removed.")
+                    omittedDuration = try omittedDuration.adding(point.insert.duration)
+                } else if try !stillVideo(point.insert, image: image, relativeTo: location, at: position,
+                                          colorPolicy: project.programColorPolicy, standalone: nil,
+                                          cameraTransfer: reference.colorTransfer) {
+                    omittedDuration = try omittedDuration.adding(point.insert.duration)
+                }
+                nextInsert += 1
+            }
+        }
         for interval in plan.intervals {
             try engine.checkCancellation()
+            try writeStills(before: interval.assemblyIndex)
             let angle = pictures[interval.angle]!
-            let at = try framePosition(interval.output.from, rate: rate)
-            let length = try framePosition(interval.output.to, rate: rate).subtracting(at)
+            let at = try framePosition(interval.output.from.subtracting(omittedDuration), rate: rate)
+            let length = try framePosition(interval.output.to.subtracting(omittedDuration), rate: rate).subtracting(at)
             try requireFrame(length)
             let sourceStart = try sourceFrame(interval.group.from.subtracting(base), rate: rate)
             let mic = interval.audio.flatMap { microphones[$0] }
@@ -373,7 +441,9 @@ public final class ResolveExport {
             clip.child("mc-source", ["angleID": angle, "srcEnable": mic == angle ? "all" : "video"])
             if let mic, mic != angle { clip.child("mc-source", ["angleID": mic, "srcEnable": "audio"]) }
         }
-        try finish(format: formatID, duration: framePosition(plan.duration, rate: rate))
+        try writeStills(before: Int.max)
+        try checkStillLoss()
+        try finish(format: formatID, duration: framePosition(plan.duration.subtracting(omittedDuration), rate: rate))
     }
 
     private func requireFrame(_ length: RationalTime) throws {
@@ -382,7 +452,15 @@ public final class ResolveExport {
         }
     }
 
-    private func sequence(_ clips: [ClipRequest]) throws {
+    private func alignedStill(_ insert: StillInsert, at position: RationalTime, rate: RationalTime) throws -> Bool {
+        let end = try position.adding(insert.duration)
+        let cadence = RationalTime(numerator: rate.denominator, denominator: rate.numerator)
+        return try insert.cadence == cadence && position.onFrameGrid(rate) == position && end.onFrameGrid(rate) == end
+    }
+
+    private func sequence(_ clips: [ClipRequest], inserts: [Int: StillInsert] = [:], stillAssets: [String: StillAsset] = [:],
+                          colorPolicy: StillProgramColorPolicy? = nil, standalone: StillTimelineFormat? = nil,
+                          location: URL? = nil) throws {
         var cache: [URL: MediaInfo] = [:]
         var video: StreamInfo?
         var position = RationalTime.zero
@@ -391,9 +469,28 @@ public final class ResolveExport {
             cache[clip.file] = info
             if video == nil { video = info.videoStream }
         }
-        let rate = video?.frameRate ?? RationalTime(numerator: 24)
-        for (ordinal, clip) in clips.enumerated() {
+        let standaloneRate = standalone.map { RationalTime(numerator: $0.cadence.denominator, denominator: $0.cadence.numerator) }
+        let rate = video?.frameRate ?? standaloneRate ?? RationalTime(numerator: 24)
+        var ordinal = 0
+        for index in 0..<(clips.count + inserts.count) {
             try engine.checkCancellation()
+            if let insert = inserts[index] {
+                guard let location, let image = stillAssets[insert.assetID] else {
+                    throw CutError(code: "invalid_cut_project", message: "Missing still asset for \(insert.id).")
+                }
+                let end = try position.adding(insert.duration)
+                let aligned = try alignedStill(insert, at: position, rate: rate)
+                if (video == nil && standalone == nil) || !aligned {
+                    recordStillLoss("Final Cut Pro cannot represent Insert Still placement \(insert.id) at the sequence's \(rate) fps cadence and exact boundaries. The insert and its silence will be removed.")
+                    continue
+                }
+                if try stillVideo(insert, image: image, relativeTo: location, at: position, colorPolicy: colorPolicy, standalone: standalone,
+                                  cameraTransfer: video?.colorTransfer) {
+                    position = end
+                }
+                continue
+            }
+            let clip = clips[ordinal]
             let info = cache[clip.file]!
             let rawStart = clip.from ?? .zero, end = clip.to ?? info.duration
             let start = try info.videoStream.map { try sourceFrame(rawStart, rate: $0.frameRate) } ?? rawStart
@@ -437,9 +534,66 @@ public final class ResolveExport {
                     .replacingOccurrences(of: "\u{FFFF}", with: "\\uFFFF")
                 node.child("metadata").child("md", ["key": FCPClipMetadata.key, "value": value])
             }
+            ordinal += 1
         }
+        try checkStillLoss()
         guard position > .zero else { throw CutError(code: "empty_sequence", message: "Add clips to the timeline first.") }
-        try finish(format: format(video), duration: framePosition(position, rate: rate))
+        let formatID = try standalone.map { try format(width: $0.width, height: $0.height, rate: rate) } ?? format(video)
+        try finish(format: formatID, duration: framePosition(position, rate: rate))
+    }
+
+    private func stillVideo(_ insert: StillInsert, image: StillAsset, relativeTo location: URL,
+                            at position: RationalTime, colorPolicy: StillProgramColorPolicy?, standalone: StillTimelineFormat?,
+                            cameraTransfer: String?) throws -> Bool {
+        let url = try CutProject.checkedMediaURL(image.file, relativeTo: location)
+        let media: (info: StillImageInfo, fingerprint: String)
+        if let cached = stillMedia[url] {
+            media = cached
+        } else {
+            guard let identity = try? SourceIdentity(url) else {
+                throw CutError(code: "still_offline", message: "Relink \(image.displayName) for Insert Still placement \(insert.id).")
+            }
+            media = (try StillImage.inspect(url), try StillImage.fingerprint(url, cancelled: cancelled))
+            identities[url] = identity
+            stillMedia[url] = media
+        }
+        guard media.fingerprint == image.fingerprint else {
+            throw CutError(code: "still_source_changed", message: "Relink the edited image for Insert Still placement \(insert.id).")
+        }
+        let hdr = ["smpte2084", "arib-std-b67", "pq", "hlg"]
+        let info = media.info
+        guard [.jpeg, .png, .tiff].contains(info.codec), info.rendition == .sdr, !info.hasAlpha,
+              !hdr.contains(colorPolicy?.transfer.lowercased() ?? ""), !hdr.contains(cameraTransfer?.lowercased() ?? "") else {
+            recordStillLoss("Final Cut Pro cannot preserve the linked format, color or alpha for Insert Still placement \(insert.id). The insert and its silence will be removed.")
+            return false
+        }
+        let key = "still-\(info.displayWidth)x\(info.displayHeight)"
+        let formatID: String
+        if let existing = formats[key] {
+            formatID = existing
+        } else {
+            formatID = "f\(formats.count + 1)"
+            formats[key] = formatID
+            resources.child("format", ["id": formatID, "name": "FFVideoFormatRateUndefined",
+                                       "width": String(info.displayWidth), "height": String(info.displayHeight)])
+        }
+        // A still is timeless in the resources. Its video item carries the exact hold.
+        stillResourceCount += 1
+        let ref = "still\(stillResourceCount)"
+        let name = try displayName(image.displayName)
+        let asset = resources.child("asset", ["id": ref, "name": name, "start": "0s", "duration": "0s",
+                                              "format": formatID, "hasVideo": "1", "videoSources": "1"])
+        asset.child("media-rep", ["kind": "original-media", "src": url.absoluteString])
+        let metadata = FCPStillMetadata(placementID: insert.id, assetID: image.id, fingerprint: image.fingerprint,
+                                       colorPolicy: colorPolicy, standalone: standalone)
+        let value = String(decoding: try JSONEncoder().encode(metadata), as: UTF8.self)
+            .replacingOccurrences(of: "\u{FFFE}", with: "\\uFFFE")
+            .replacingOccurrences(of: "\u{FFFF}", with: "\\uFFFF")
+        asset.child("metadata").child("md", ["key": FCPStillMetadata.key, "value": value])
+        spine.child("video", ["ref": ref, "offset": position.fcpxTime, "start": "0s",
+                              "duration": insert.duration.fcpxTime, "name": name])
+            .child("adjust-conform", ["type": insert.framing == .fill ? "fill" : "fit"])
+        return true
     }
 
     private func finish(format: String, duration: RationalTime) throws {

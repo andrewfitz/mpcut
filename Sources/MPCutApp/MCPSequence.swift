@@ -5,6 +5,15 @@ import MPCutCore
 
 @MainActor
 extension EditorModel {
+    var mcpSelectedItemID: String? {
+        guard let selectedID else { return nil }
+        if let index = timelineClips.firstIndex(where: { $0.id == selectedID && $0.isStill }),
+           let card = try? stillProject.mcpStillOccurrences().first(where: { $0.index == index }) {
+            return card.insert.id
+        }
+        return selectedID.uuidString
+    }
+
     private func mcpHistory() -> [String: Any] {
         let identity = [String(historyCursor)] + historyEntryIDs.map(\.uuidString)
         let token = Data(SHA256.hash(data: Data(identity.joined(separator: "/").utf8))).base64EncodedString()
@@ -72,9 +81,19 @@ extension EditorModel {
             }
         case "seek":
             guard canNavigate, !mcpHasActiveTrim else { throw input.busy() }
-            let occurrence = try arguments["occurrence"].map { _ in try input.occurrence(in: self) }
-            let position = try input.position(in: self, occurrence: occurrence)
-            seek(position.seconds)
+            if let id = arguments["occurrence"] as? String,
+               let still = try stillProject.mcpStillOccurrences().first(where: { $0.insert.id == id }) {
+                let time = try input.time("time")
+                guard arguments["space"] as? String == "sequence", still.from <= time,
+                      time < still.to || time == still.to && time == mcpDuration else {
+                    throw MCPCommandError("invalid_target", "An inserted still has sequence time within its occurrence.")
+                }
+                seek(time.seconds)
+            } else {
+                let occurrence = try arguments["occurrence"].map { _ in try input.occurrence(in: self) }
+                let position = try input.position(in: self, occurrence: occurrence)
+                seek(position.seconds)
+            }
         case "set_playback":
             guard canNavigate, !mcpHasActiveTrim else { throw input.busy() }
             let playing = try input.bool("playing")
@@ -97,7 +116,7 @@ extension EditorModel {
                   let clip = mcpOccurrence(id) {
             result["sourceTime"] = (arguments["edge"] as? String == "start" ? clip.start : clip.end).description
         }
-        if let selectedID { result["selectedOccurrence"] = selectedID.uuidString }
+        result["selectedOccurrence"] = mcpSelectedItemID
         if let markIn { result["markInSeconds"] = markIn }
         if let markOut { result["markOutSeconds"] = markOut }
         return result
@@ -118,7 +137,13 @@ extension EditorModel {
         if input.fields["trimPreview"] != nil && !continuingTrim { throw input.invalid("This trim preview has ended.") }
         switch action {
         case "select":
-            select(try input.occurrence(in: self))
+            if let id = input.fields["occurrence"] as? String,
+               let card = try stillProject.mcpStillOccurrences().first(where: { $0.insert.id == id }),
+               timelineClips.indices.contains(card.index), timelineClips[card.index].isStill {
+                select(timelineClips[card.index].id)
+            } else {
+                select(try input.occurrence(in: self))
+            }
         case "selectRange", "splitRange", "deleteRange":
             let from = try input.time("from"), to = try input.time("to")
             guard from >= .zero, to > from, to <= mcpDuration else { throw input.invalid("Supply a nonempty sequence range.") }

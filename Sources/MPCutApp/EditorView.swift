@@ -21,13 +21,17 @@ struct EditorView: View {
                     ExportQueueToolbarButton(count: editor.queuedRanges.count, action: editor.showBulkQueue)
                         .disabled(!editor.canShowBulkQueue)
                 }
+                StillAuthoringControls(rows: editor.stillPlacementRows, enabled: !editor.isBusy,
+                                       canReplace: editor.canReplacePicture, canInsert: editor.canInsertStill,
+                                       replace: editor.chooseReplacePicture, insert: editor.chooseInsertStill,
+                                       manage: editor.manageStill)
                 if !editor.isEmpty {
                     SequencePreviewSoundControls(preview: editor.preview)
-                    EditorToolbarButton(title: "Add Clips", symbol: "plus", action: editor.chooseFiles)
-                        .help("Add audio or video files to the sequence (⌘O)")
+                    EditorToolbarButton(title: "Add Clips", symbol: "plus", toolTip: "Add clips (⌘O)",
+                                        action: editor.chooseFiles)
                         .disabled(editor.isBusy)
-                    EditorToolbarButton(title: "Export", symbol: "square.and.arrow.up", action: editor.chooseExport)
-                        .help("Export the sequence (⌘E)")
+                    EditorToolbarButton(title: "Export", symbol: "square.and.arrow.up", toolTip: "Export sequence (⌘E)",
+                                        action: editor.chooseExport)
                         .disabled(!editor.canEdit)
                 }
             }
@@ -69,7 +73,7 @@ struct EditorView: View {
                         .fixedSize()
                         .controlSize(.small)
                         .environment(\.colorScheme, .dark)
-                        .help("Choose how much source audio to show around the playhead")
+                        .help("Set waveform time span")
                         .padding(.bottom, 8)
                     }
                     .overlay(alignment: .bottomLeading) {
@@ -100,12 +104,12 @@ struct EditorView: View {
             addRange: .init(title: "Add Marked Range to Export Queue",
                             enabled: editor.canAddMarkedRange, perform: editor.addMarkedRange),
             split: .init(title: "Split at Playhead", perform: editor.split),
-            delete: .init(title: editor.deleteTitle, enabled: editor.canDelete, perform: editor.deleteSelection),
+            delete: .init(title: editor.deleteTitle, enabled: editor.canDelete, perform: { editor.byHand(editor.deleteSelection) }),
             undo: .init(title: editor.undoTitle, enabled: editor.canUndo, perform: editor.undo),
             redo: .init(title: editor.redoTitle, enabled: editor.canRedo, perform: editor.redo),
             rangeTools: .init(active: $editor.rangeTool, canAct: editor.canActOnRange, canSplit: editor.canSplitSelectedRange,
-                              canDelete: editor.canActOnRange, split: editor.splitSelectedRange,
-                              export: editor.chooseSelectionExport, delete: editor.deleteSelection),
+                              canDelete: editor.canActOnRange, split: { editor.byHand(editor.splitSelectedRange) },
+                              export: editor.chooseSelectionExport, delete: { editor.byHand(editor.deleteSelection) }),
             preview: editor.preview
         ) { EmptyView() }
     }
@@ -126,12 +130,14 @@ struct EditorView: View {
             markOut: editor.markOut,
             thumbnailHeight: editor.timelineThumbnailHeight,
             sequenceDuration: editor.duration,
-            scenesBySource: editor.scenesBySource, viewNamesBySource: editor.viewNamesBySource,
+            scenesBySource: editor.scenesBySource, sceneOverlaysByClip: editor.sceneOverlaysByClip,
+            viewNamesBySource: editor.viewNamesBySource,
             sceneRevision: editor.sceneRevision,
             audioOnly: editor.isAudioOnly,
             showsWaveform: !editor.isAudioOnly && !editor.audioTracks.isEmpty,
             envelopeStore: editor.audioStore.detail,
-            waveforms: editor.audioStore.waves, waveformPauses: editor.sourcePauses,
+            waveforms: editor.audioStore.waves, openingWaveform: editor.audioStore.openingWaveform,
+            waveformPauses: editor.sourcePauses,
             waveformRevision: editor.waveformRevision,
             snapTarget: Binding(get: { editor.effectiveSnapTarget }, set: editor.chooseSnapTarget),
             largeThumbnails: $editor.largeThumbnails,
@@ -141,15 +147,26 @@ struct EditorView: View {
             onSelect: editor.select,
             onSeek: editor.seek,
             onTrim: editor.trim,
-            onMove: editor.move,
-            onDrop: { editor.importFiles(openDroppedProjects($0), at: $1) },
+            onMove: { id, slot in editor.byHand { editor.moveTimelineItem(id, to: slot) } },
+            onDrop: { editor.dropOnTimeline($0, slot: $1) },
+            onDropStills: { editor.addDroppedStills($0, at: $1, replacingMarkedRange: $2) },
+            onDropProjects: { openDroppedProjects($0) },
             pointerTarget: editor.pointerTarget, onPointerSeek: editor.seekFromPointer,
             onScrub: editor.scrub, onEndScrub: editor.preview.endScrub,
             onCancelTrim: editor.cancelTrim,
             validateHandle: handleValidation,
             thumbnail: editor.thumbnail
         )
-        if editor.canEdit { timeline.onClipCSV = { editor.applyClipCSV($0, to: $1) } }
+        timeline.assemblyAssets = editor.stillAssetSpans
+        if editor.canEdit {
+            timeline.onClipCSV = { editor.applyClipCSV($0, to: $1) }
+            timeline.audioTrackLabels = { id in
+                let tracks = editor.analysisSourceMedia[id]?.streams.filter { $0.kind == "audio" } ?? []
+                return tracks.enumerated().map { "Track \($0.offset + 1) · \($0.element.audioFormatLabel)" }
+            }
+            timeline.onMonitorAudio = editor.chooseAnalysisTrack(_:forClip:)
+            timeline.onReplaceAudio = editor.chooseReplacementAudio(forClip:)
+        }
         if editor.rangeTool && editor.canEdit { timeline.onRangeSelect = editor.selectRange }
         return timeline.disabled(editor.isBusy && !editor.canNavigate)
     }
@@ -166,6 +183,13 @@ struct EditorView: View {
                 Spacer()
                 Button("Cancel", action: editor.cancelExport)
                     .disabled(editor.isCancelling)
+                    .help("Cancel export")
+            } else if let progress = editor.mediaRefreshProgress {
+                ProgressView(value: progress).frame(width: 100)
+                Text("Refreshing project media…")
+                Spacer()
+                Button("Cancel", action: editor.mediaRefresh.cancel)
+                    .help("Cancel media refresh")
             } else if editor.isImporting {
                 ProgressView(value: editor.importProgress)
                     .progressViewStyle(.linear)
@@ -176,6 +200,7 @@ struct EditorView: View {
                 Spacer()
                 Button("Cancel", action: editor.cancelImport)
                     .disabled(editor.isCancelling)
+                    .help("Cancel import")
             } else if editor.isCheckingEdit || editor.isPreparingCopyBoundaries {
                 ProgressView()
                     .controlSize(.small)
@@ -184,6 +209,35 @@ struct EditorView: View {
                 Spacer()
             } else {
                 if !editor.audioTracks.isEmpty {
+                    Menu {
+                        Picker("Monitor audio", selection: Binding<Int?>(
+                            get: { editor.audioMonitoringTrack },
+                            set: { track in
+                                if let track { editor.chooseAnalysisTrack(track) }
+                                else { editor.monitorSourceAudio() }
+                            }
+                        )) {
+                            Text("Follow Source Audio").tag(nil as Int?)
+                            ForEach(Array(editor.playheadAudioTracks.enumerated()), id: \.offset) { ordinal, stream in
+                                Text("Track \(ordinal + 1) · \(stream.audioFormatLabel)").tag(Optional(ordinal))
+                            }
+                        }
+                        .pickerStyle(.inline)
+                        .help("Choose monitored audio track")
+                        if let note = editor.audioTrackFallbackNote {
+                            // A menu shows text as an item that cannot be chosen.
+                            Text(note)
+                        }
+                        Divider()
+                        Button("Replace Source Audio…", action: editor.chooseReplacementAudio)
+                            .disabled(!editor.canReplaceSourceAudio)
+                            .help("Replace clip audio")
+                    } label: {
+                        Label(editor.useSavedMonitoringTracks ? "Source Audio" : "Track \(editor.playheadAnalysisTrack + 1)",
+                              systemImage: "speaker.wave.2")
+                    }
+                    .fixedSize()
+                    .help("Monitor or replace audio")
                     silenceControls
                     StatusBarDivider()
                 } else if !editor.isEmpty {
@@ -194,17 +248,25 @@ struct EditorView: View {
                 if let progress = editor.sceneProgress {
                     ProgressView(value: progress).frame(width: 72)
                         .accessibilityLabel("Scene analysis progress")
-                    Text("Finding scenes… \(progressPercent(progress))")
+                    Text("\(editor.sceneStatus ?? "Finding scenes…") · \(progressPercent(progress))")
                         .monospacedDigit()
-                    Button("Cancel", action: editor.cancelSceneAnalysis)
+                    Button("Cancel", action: editor.cancelSceneAnalysisFromEditor)
                         .accessibilityLabel("Cancel scene analysis")
+                        .help("Cancel scene scan")
                     StatusBarDivider()
                 } else {
-                    if editor.canScanScenes {
-                        Button(action: editor.scanForScenes) {
-                            Label("Scan for Scenes", systemImage: "viewfinder")
+                    if editor.canScanScenes(clipID: nil) {
+                        Menu {
+                            SequenceFindSceneCommands(editor: editor)
+                        } label: {
+                            Label("Find Scenes", systemImage: "viewfinder")
                         }
-                        .help("Find scene cuts in the background and enable scene navigation.")
+                        .help("Find scene changes")
+                        .task(id: editor.sceneInspectionKey) { await editor.inspectSceneChoices() }
+                        StatusBarDivider()
+                    }
+                    if let status = editor.sceneStatus {
+                        Text(status).lineLimit(1).help(status)
                         StatusBarDivider()
                     }
                     if let label = editor.currentSceneLabel {
@@ -215,10 +277,23 @@ struct EditorView: View {
                             .monospacedDigit()
                             .lineLimit(1)
                             .disabled(!editor.canRenameCurrentView)
-                            .help("Rename this view across all matching scenes")
+                            .help("Rename matching scene views")
                         StatusBarDivider()
                     }
                 }
+                let mediaIssues = Set(editor.mediaRefreshIssues.values).sorted()
+                if !mediaIssues.isEmpty {
+                    Menu {
+                        ForEach(mediaIssues, id: \.self) { Text($0) }
+                    } label: {
+                        Label(editor.mediaClipReview.isEmpty ? "Media refresh" : "Media needs review",
+                              systemImage: "exclamationmark.triangle")
+                    }
+                    .fixedSize()
+                    .help("Show media refresh issues")
+                    StatusBarDivider()
+                }
+                TimelineTierBadge(editor: editor)
                 Text(editor.statusMessage)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -226,6 +301,7 @@ struct EditorView: View {
                 Spacer(minLength: 8)
                 if editor.lastExportedURL != nil {
                     Button("Show in Finder", action: editor.showExportInFinder)
+                        .help("Reveal exported file")
                 }
             }
         }
@@ -244,10 +320,11 @@ struct EditorView: View {
                 .monospacedDigit()
         }
         .popover(isPresented: $presentation.pauseControls, arrowEdge: .top) { PauseControls(editor: editor) }
-        .help("Find quiet ranges and adjust silence detection and editing controls.")
+        .help("Find and edit pauses")
         if progress != nil {
             Button("Cancel", action: editor.cancelSilenceScan)
                 .accessibilityLabel("Cancel silence scan")
+                .help("Cancel silence scan")
         } else if editor.pauseAnalysisReady && count > 0 {
             HStack(spacing: 0) {
                 StatusIconButton(title: "Previous Silence", symbol: "chevron.left",
@@ -330,15 +407,17 @@ private struct ViewerPanel: View {
                 ContentUnavailableView {
                     Label("Add clips to start editing", systemImage: "film.stack")
                 } description: {
-                    Text("Drag audio or video files here to build a sequence.")
+                    Text("Drop audio or video here to start a sequence.")
                 } actions: {
                     HStack(spacing: 10) {
                         Button("Add Clips…", action: add)
                             .buttonStyle(.borderedProminent)
                             .disabled(isBusy)
+                            .help("Add clips to sequence")
                         Button("Add as Multicam…", action: addMulticam)
                             .buttonStyle(.bordered)
                             .disabled(!canAddMulticam)
+                            .help("Create multicam group")
                     }
                     .controlSize(.large)
                 }

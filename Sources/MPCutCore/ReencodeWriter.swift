@@ -70,7 +70,10 @@ extension ReencodeEngine {
             // The final mux measures coded blocks, including hidden AAC priming
             // or Opus padding. A copied track can end before or after the video.
             // The output maps picture first, then sound in the plan's track order.
-            let trackEnds = try tracks.map { try $0.outputEnd.roundedToSamples(1_000_000_000) }
+            // The last clip of a mixed timeline may lack a track that the output has. Every output track ends with the timeline.
+            let trackEnds = try plan.canvas != nil
+                ? Array(repeating: plan.edit.duration.roundedToSamples(1_000_000_000), count: 1 + plan.audioActions.count)
+                : tracks.map { try $0.outputEnd.roundedToSamples(1_000_000_000) }
             guard mpcut_set_matroska_durations(partial.path, trackEnds, trackEnds.count) == 0 else {
                 throw CutError(code: "write_failed", message: "Could not finalize the MKV presentation duration.")
             }
@@ -178,7 +181,12 @@ extension ReencodeEngine {
         args += copiedAudio
         args += ["-map_metadata", "-1", "-map_chapters", "-1", "-map", "0:v:0", "-c:v", "copy"]
         var stagedOrdinal = 0
-        for (index, pair) in zip(plan.audioActions, source.audio).enumerated() {
+        for (index, pair) in zip(plan.audioActions, plan.canvas?.audio ?? []).enumerated() {
+            // Every part carries the canvas sound, whichever clips it holds.
+            args += ["-map", "0:a:\(index)", "-filter:a:\(index)", "asetpts=N/SR/TB"]
+            args += audioOptions(pair.0.action, sound: pair.1, outputIndex: index)
+        }
+        for (index, pair) in zip(plan.audioActions, plan.canvas == nil ? source.audio : []).enumerated() {
             let (action, audio) = pair
             if action.action == .removeAudio { continue }
             if plan.filtersAudio(action) {
@@ -230,7 +238,12 @@ extension ReencodeEngine {
         let duration = try end.subtracting(firstInput.outputStart)
         let lastTicks = try last.outputStart.adding(lastFrame.subtracting(last.from)).roundedToSamples(plan.timeScale) - base
         let endTicks = try end.roundedToSamples(plan.timeScale) - base
-        args += ["-bsf:v", "setts=duration='if(eq(PTS,\(lastTicks)),\(endTicks - lastTicks),DURATION)'"]
+        var bitstreamFilters = "setts=duration='if(eq(PTS,\(lastTicks)),\(endTicks - lastTicks),DURATION)'"
+        if plan.assemblesStillHDR && plan.settings.codec == .hevc {
+            // VideoToolbox may add RPU units to newly encoded HLG pictures.
+            bitstreamFilters += ",filter_units=remove_types=62|63"
+        }
+        args += ["-bsf:v", bitstreamFilters]
         args += plan.encoding.arguments
         if plan.settings.codec == .hevc, container != "mkv" { args += ["-tag:v", "hvc1"] }
         if container != "mkv" {
@@ -240,9 +253,19 @@ extension ReencodeEngine {
             args += ["-video_track_timescale", "\(plan.timeScale)",
                      "-movie_timescale", "\(plan.movieTimeScale)"]
         }
-        let reference = firstInput.media
+        // Every batch uses the first clip's output audio format. Converted input codecs
+        // may differ, including float PCM in one source and integer PCM in another.
+        guard let firstSegment = plan.edit.segments.first, let reference = plan.media[firstSegment.file] else {
+            throw CutError(code: "invalid_input", message: "A source is missing from the export plan.")
+        }
         var outputTrack = 0
-        for (index, pair) in zip(plan.audioActions, reference.audio).enumerated() {
+        for (index, pair) in zip(plan.audioActions, plan.canvas?.audio ?? []).enumerated() {
+            args += ["-map", "[sound\(index)]"]
+            // As below: AAC is encoded once, across the assembled recording.
+            args += intermediate && pair.0.action == .aac ? ["-c:a:\(index)", "pcm_f32le"]
+                : audioOptions(pair.0.action, sound: pair.1, outputIndex: index)
+        }
+        for (index, pair) in zip(plan.audioActions, plan.canvas == nil ? reference.audio : []).enumerated() {
             let (action, audio) = pair
             if action.action == .removeAudio { continue }
             if intermediate && !plan.filtersAudio(action) { continue }
@@ -260,7 +283,8 @@ extension ReencodeEngine {
             outputTrack += 1
         }
         let preferred = ReencodeDecode.preferred(for: decoders.compactMap { plan.media[$0.file]?.video },
-                                                 output: plan.encoding.pixelFormat)
+                                                 output: plan.encoding.pixelFormat,
+                                                 surfaces: plan.canvas?.normalizesPicture != true)
         var lastProgress = 0.0
         func encode(_ route: ReencodeDecode) throws {
             var sources = ["-xerror", "-copyts", "-y"]
@@ -422,9 +446,54 @@ extension ReencodeEngine {
             let videoInput = "[\(decoder):\(media.video.index)]"
             let range = "settb=1/\(scale),trim=start_pts=\(start):end_pts=\(end)"
             let pictureOutput = inputs.count == 1 ? "[picture]" : "[p\(index)]"
-            filters.append("\(videoInput)\(range),setpts=PTS-(\(start))+\(offset)\(pictureOutput)")
+            // On a mixed timeline each picture is fitted into the canvas. Clips that match add nothing here.
+            let fit = (plan.canvas?.fit(media.video) ?? []).map { "," + $0 }.joined()
+            let metadata = plan.assemblesStillHDR
+                ? ",sidedata=mode=delete:type=CONTENT_LIGHT_LEVEL,sidedata=mode=delete:type=MASTERING_DISPLAY_METADATA"
+                : ""
+            filters.append("\(videoInput)\(range),setpts=PTS-(\(start))+\(offset)\(fit)\(metadata)\(pictureOutput)")
 
-            for (position, action) in plan.audioActions.enumerated() where plan.filtersAudio(action) {
+            for (position, sound) in (plan.canvas?.audio ?? []).enumerated() {
+                // Sample counts are differences of cumulative output positions in the canvas rate, so no drift builds up.
+                let rate = sound.sampleRate
+                let outputStart = try segment.outputStart.roundedToSamples(rate)
+                let outputEnd = try segment.outputStart.adding(segment.to.subtracting(segment.from)).roundedToSamples(rate)
+                let count = outputEnd - outputStart
+                let label = inputs.count == 1 ? "[sound\(position)]" : "[s\(position)_\(index)]"
+                let silence = "anullsrc=r=\(rate):cl=\(sound.layout),atrim=end_sample=\(count),asetpts=N/SR/TB\(label)"
+                let conform = "aresample=\(rate),aformat=sample_rates=\(rate):channel_layouts=\(sound.layout),"
+                    + "apad=whole_len=\(count),atrim=end_sample=\(count),asetpts=N/SR/TB\(label)"
+                guard count > 0 else {
+                    throw CutError(code: "unsupported_audio", message: "The selected range is shorter than one audio sample.",
+                                   segment: segment.segment)
+                }
+                guard media.audio.count > position else {
+                    filters.append(silence)
+                    continue
+                }
+                let audio = media.audio[position]
+                let track = audio.stream
+                let inputStart = try absoluteStart.roundedToSamples(track.sampleRate)
+                let inputEnd = try absoluteEnd.roundedToSamples(track.sampleRate)
+                if !audio.presentationEdits.isEmpty {
+                    let samples = inputStart..<inputEnd
+                    guard !samples.isEmpty, audio.presentationEdits.contains(where: { $0.isAudible && $0.samples.overlaps(samples) }) else {
+                        filters.append(silence)
+                        continue
+                    }
+                    let caf = staging.appendingPathComponent("sound-\(index)-\(position).caf")
+                    try stageEditedAudio(segment.file, track: track, source: samples,
+                                         count: Int64(samples.count), to: caf, segment: segment.segment)
+                    inputArguments += ["-i", caf.path]
+                    filters.append("[\(nextInput):a:0]aformat=channel_layouts=\(try audioLayout(track)),asetpts=N/SR/TB,\(conform)")
+                    nextInput += 1
+                } else {
+                    filters.append("[\(decoder):\(track.index)]asettb=1/\(track.sampleRate),"
+                        + "atrim=start_pts=\(inputStart):end_pts=\(inputEnd),asetpts=PTS-(\(inputStart)),"
+                        + "aresample=\(track.sampleRate):async=1:first_pts=0:min_hard_comp=0,\(conform)")
+                }
+            }
+            for (position, action) in plan.audioActions.enumerated() where plan.canvas == nil && plan.filtersAudio(action) {
                 let audio = media.audio[position]
                 let track = audio.stream
                 let rate = track.sampleRate

@@ -2,19 +2,28 @@ import Foundation
 
 enum MulticamMOV {
     static func combine(picture: URL, sound: URL, output: URL, progress: (Double) throws -> Void) throws {
-        let video = try Lane(picture)
-        let audio = try Lane(sound)
-        defer {
-            try? video.file.close()
-            try? audio.file.close()
+        try combine(picture: Optional(picture), sounds: [sound], output: output, progress: progress)
+    }
+
+    static func combine(picture: URL?, sounds: [URL], output: URL, progress: (Double) throws -> Void) throws {
+        var lanes: [Lane] = []
+        defer { for lane in lanes { try? lane.file.close() } }
+        for url in [picture].compactMap({ $0 }) + sounds {
+            lanes.append(try Lane(url))
         }
-        let prefix = try video.read(video.fileType.offset, Int(video.fileType.size))
+        guard let first = lanes.first else { throw invalidMovie }
+        let prefix = try first.read(first.fileType.offset, Int(first.fileType.size))
         let dataStart = UInt64(prefix.count + 16)
-        let (audioStart, videoOverflow) = dataStart.addingReportingOverflow(video.media.contentSize)
-        let (mediaEnd, audioOverflow) = audioStart.addingReportingOverflow(audio.media.contentSize)
-        guard !videoOverflow, !audioOverflow, mediaEnd <= UInt64(Int64.max) else { throw invalidMovie }
+        var mediaEnd = dataStart
+        var starts: [UInt64] = []
+        for lane in lanes {
+            starts.append(mediaEnd)
+            let (end, overflow) = mediaEnd.addingReportingOverflow(lane.media.contentSize)
+            guard !overflow, end <= UInt64(Int64.max) else { throw invalidMovie }
+            mediaEnd = end
+        }
         let mediaSize = mediaEnd - UInt64(prefix.count)
-        let movie = try merge(video: video, audio: audio, videoStart: dataStart, audioStart: audioStart)
+        let movie = try merge(lanes: lanes, starts: starts)
 
         guard FileManager.default.createFile(atPath: output.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
             throw CutError(code: "write_failed", message: "Could not create the staged multicam movie.")
@@ -28,7 +37,7 @@ enum MulticamMOV {
         header.appendInteger(mediaSize)
         try writer.write(contentsOf: header)
         var copied: UInt64 = 0
-        for lane in [video, audio] {
+        for lane in lanes {
             try lane.file.seek(toOffset: lane.media.contentOffset)
             var remaining = lane.media.contentSize
             while remaining > 0 {
@@ -44,40 +53,124 @@ enum MulticamMOV {
         try writer.close()
     }
 
+    // The helper writes unfragmented picture-only media with the movie atom last.
+    // Keep every payload and chunk offset intact while replacing the media clock.
+    static func retimeStill(_ url: URL, schedule: StillSampleSchedule, timescale: Int64) throws {
+        let lane = try Lane(url)
+        defer { try? lane.file.close() }
+        guard lane.movieBox.offset >= lane.media.offset + lane.media.size,
+              lane.movieBox.offset + lane.movieBox.size == (try lane.file.seekToEnd()),
+              schedule.fits(timescale: timescale) else { throw invalidMovie }
+        let ticks = UInt64(try schedule.duration.roundedToSamples(Int(timescale)))
+        var timeTable = Data(repeating: 0, count: 4)
+        timeTable.appendInteger(UInt32(schedule.runs.count))
+        for run in schedule.runs {
+            timeTable.appendInteger(UInt32(run.count))
+            timeTable.appendInteger(UInt32(try run.duration.roundedToSamples(Int(timescale))))
+        }
+
+        func patch(_ data: Data, at path: [String]) throws -> Data {
+            let parts = try children(of: data)
+            if let required = ["moov": "trak", "trak": "mdia", "mdia": "minf", "minf": "stbl", "stbl": "stts"][path[path.count - 1]] {
+                _ = try only(required, in: parts)
+            }
+            var result = Data()
+            for part in parts {
+                var payload = part.data
+                let location = path + [part.type]
+                switch location {
+                case ["moov", "trak"], ["moov", "trak", "mdia"], ["moov", "trak", "mdia", "minf"],
+                     ["moov", "trak", "mdia", "minf", "stbl"]:
+                    payload = try patch(payload, at: location)
+                case ["moov", "mvhd"], ["moov", "trak", "mdia", "mdhd"]:
+                    let clock = try movieClock(payload)
+                    guard clock.rate == timescale else { throw invalidMovie }
+                    try setDuration(&payload, after: clock.durationField, wide: clock.wide, value: ticks)
+                case ["moov", "trak", "tkhd"]:
+                    let wide = try isWide(payload)
+                    try setDuration(&payload, after: wide ? 28 : 20, wide: wide, value: ticks)
+                case ["moov", "trak", "mdia", "minf", "stbl", "stts"]:
+                    guard payload.count == 16, try payload.integer(UInt32.self, at: 4) == 1,
+                          try payload.integer(UInt32.self, at: 8) == schedule.count else { throw invalidMovie }
+                    payload = timeTable
+                case ["moov", "trak", "edts"], ["moov", "trak", "mdia", "minf", "stbl", "ctts"]:
+                    throw invalidMovie
+                default:
+                    break
+                }
+                result.append(try box(part.type, payload))
+            }
+            return result
+        }
+
+        let movie = try box("moov", patch(lane.movie, at: ["moov"]))
+        let writer = try FileHandle(forWritingTo: url)
+        defer { try? writer.close() }
+        try writer.seek(toOffset: lane.movieBox.offset)
+        try writer.write(contentsOf: movie)
+        try writer.truncate(atOffset: lane.movieBox.offset + UInt64(movie.count))
+        try writer.close()
+    }
+
     private static var invalidMovie: CutError {
         CutError(code: "write_failed", message: "The staged video or audio movie has an unsupported track or media layout.")
     }
 
-    private static func merge(video: Lane, audio: Lane, videoStart: UInt64, audioStart: UInt64) throws -> Data {
-        let videoParts = try children(of: video.movie)
-        let audioParts = try children(of: audio.movie)
-        let audioHeader = try only("mvhd", in: audioParts)
-        let videoHeader = try only("mvhd", in: videoParts)
-        let videoTime = try movieClock(videoHeader.data)
-        let audioTime = try movieClock(audioHeader.data)
-        let scale = audioTime.rate
-        let videoTrack = try relocate(only("trak", in: videoParts).data, lane: video, destination: videoStart,
-                                      id: 1, from: videoTime.rate, to: scale)
-        let audioTrack = try relocate(only("trak", in: audioParts).data, lane: audio, destination: audioStart,
-                                      id: 2, from: audioTime.rate, to: scale)
-        let duration = max(videoTrack.duration, audioTrack.duration)
-
-        // Use the header already written in the output movie clock. Track-specific
-        // color, channel layout, display transforms and sample groups stay in their tracks.
-        var header = audioHeader.data
-        try setDuration(&header, after: audioTime.durationField, wide: audioTime.wide, value: duration)
+    private static func merge(lanes: [Lane], starts: [UInt64]) throws -> Data {
+        let parts = try lanes.map { try children(of: $0.movie) }
+        let headers = try parts.map { try only("mvhd", in: $0) }
+        let clocks = try headers.map { try movieClock($0.data) }
+        var scale: UInt64 = 1
+        for clock in clocks {
+            let rate = UInt64(clock.rate)
+            var a = scale
+            var b = rate
+            while b != 0 { (a, b) = (b, a % b) }
+            scale = scale / a * rate
+            if scale > Int32.max {
+                // A track's edit lengths may still convert exactly to a common existing
+                // clock even when the clocks themselves have no representable LCM.
+                scale = UInt64(clocks.map(\.rate).max() ?? 0)
+                guard scale <= Int32.max else { throw invalidMovie }
+                break
+            }
+        }
+        let rate = UInt32(scale)
+        var duration: UInt64 = 0
+        var nextID: UInt32 = 1
+        var tracks = Data()
+        for index in lanes.indices {
+            let entries = parts[index].filter { $0.type == "trak" }
+            guard !entries.isEmpty else { throw invalidMovie }
+            var ids: [UInt32: UInt32] = [:]
+            for entry in entries {
+                let trackHeader = try only("tkhd", in: children(of: entry.data))
+                let id = try trackHeader.data.integer(UInt32.self, at: isWide(trackHeader.data) ? 20 : 12)
+                guard ids.updateValue(nextID, forKey: id) == nil, nextID < UInt32.max else { throw invalidMovie }
+                nextID += 1
+            }
+            for entry in entries {
+                let track = try relocate(entry.data, lane: lanes[index], destination: starts[index],
+                                         ids: ids, from: clocks[index].rate, to: rate)
+                duration = max(duration, track.duration)
+                tracks.append(try box("trak", track.data))
+            }
+        }
+        var header = headers[0].data
+        let clock = clocks[0]
+        header.setInteger(rate, at: clock.durationField - 4)
+        try setDuration(&header, after: clock.durationField, wide: clock.wide, value: duration)
         guard header.count >= 4 else { throw invalidMovie }
-        header.setInteger(UInt32(3), at: header.count - 4)
+        header.setInteger(nextID, at: header.count - 4)
         var payload = try box("mvhd", header)
-        payload.append(try box("trak", videoTrack.data))
-        payload.append(try box("trak", audioTrack.data))
-        for element in videoParts where ["udta", "meta"].contains(element.type) {
+        payload.append(tracks)
+        for element in parts[0] where ["udta", "meta"].contains(element.type) {
             payload.append(try box(element.type, element.data))
         }
         return try box("moov", payload)
     }
 
-    private static func relocate(_ track: Data, lane: Lane, destination: UInt64, id: UInt32,
+    private static func relocate(_ track: Data, lane: Lane, destination: UInt64, ids: [UInt32: UInt32],
                                  from oldRate: UInt32, to newRate: UInt32) throws -> (data: Data, duration: UInt64) {
         var duration: UInt64?
         func transform(_ type: String, data: Data) throws -> Data {
@@ -88,12 +181,25 @@ enum MulticamMOV {
                 let durationField = idField + 8
                 let converted = try rescale(readDuration(data, at: durationField, wide: wide), from: oldRate, to: newRate)
                 var patched = data
+                let oldID = try data.integer(UInt32.self, at: idField)
+                guard let id = ids[oldID] else { throw invalidMovie }
                 patched.setInteger(id, at: idField)
                 try setDuration(&patched, after: durationField, wide: wide, value: converted)
                 duration = converted
                 return try box(type, patched)
             case "tref":
-                throw invalidMovie
+                var references = Data()
+                for reference in try children(of: data) {
+                    guard reference.data.count.isMultiple(of: 4) else { throw invalidMovie }
+                    var body = Data()
+                    for offset in stride(from: 0, to: reference.data.count, by: 4) {
+                        let oldID = try reference.data.integer(UInt32.self, at: offset)
+                        guard let id = ids[oldID] else { throw invalidMovie }
+                        body.appendInteger(id)
+                    }
+                    references.append(try box(reference.type, body))
+                }
+                return try box(type, references)
             case "mdia", "minf", "stbl", "edts":
                 var rebuilt = Data()
                 for child in try children(of: data) {
@@ -253,6 +359,7 @@ enum MulticamMOV {
         let fileType: FileBox
         let media: FileBox
         let movie: Data
+        let movieBox: FileBox
 
         init(_ url: URL) throws {
             let handle = try FileHandle(forReadingFrom: url)
@@ -278,6 +385,7 @@ enum MulticamMOV {
             file = handle
             self.fileType = fileType
             self.media = media
+            movieBox = movie
             try handle.seek(toOffset: movie.contentOffset)
             guard let content = try handle.read(upToCount: Int(movie.contentSize)), content.count == Int(movie.contentSize) else {
                 throw invalidMovie

@@ -35,6 +35,8 @@ void mp_preview_coded_size(const MPPreviewDecoder *preview, int *width, int *hei
 void mp_preview_close(MPPreviewDecoder *preview);
 /* Select picture-only scrubbing or A/V playback before the next seek. */
 void mp_preview_enable_audio(MPPreviewDecoder *preview, bool enabled);
+/* Request the selected stream's surround layout before reading its first sample. */
+void mp_preview_preserve_surround(MPPreviewDecoder *preview);
 bool mp_preview_has_audio(const MPPreviewDecoder *preview);
 bool mp_preview_has_unavailable_audio(const MPPreviewDecoder *preview);
 /* Seconds count from the video track's first picture, whatever origin was given to mp_preview_open. */

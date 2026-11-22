@@ -38,9 +38,12 @@ public enum FCPInterchange {
                              allowLoss: Bool = false, auxiliaryOutput: ((URL) -> Void)? = nil,
                              cancelled: @escaping @Sendable () -> Bool = { false }) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled)
-        try project.validate()
+        try project.validateDestination(output, relativeTo: location, includesContents: output.pathExtension.lowercased() == "fcpxmld")
+        let conversion = try ProjectConverter.prepareStills(project, for: "Final Cut Pro .\(output.pathExtension)",
+                                                            allowLoss: allowLoss, supportsStillInserts: true)
+        let project = conversion.project
         guard output.pathExtension.lowercased() == "fcpxmld" else {
-            return try ResolveExport.writeFCP(project, relativeTo: location, to: output, package: nil, allowLoss: allowLoss,
+            return try conversion.warnings + ResolveExport.writeFCP(project, relativeTo: location, to: output, package: nil, allowLoss: allowLoss,
                                               auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
         }
         let stage = output.deletingLastPathComponent().appendingPathComponent(".mpcut-\(UUID().uuidString)", isDirectory: true)
@@ -54,7 +57,7 @@ public enum FCPInterchange {
             throw CutError(code: error == EEXIST ? "output_exists" : "write_failed",
                            message: "Could not save \(output.path): \(String(cString: strerror(error)))")
         }
-        return warnings
+        return conversion.warnings + warnings
     }
 }
 
@@ -144,15 +147,19 @@ private final class FCPReader {
             try loss("The declared sequence duration differs from its storyline. Imported the storyline duration.")
         }
         guard !clips.isEmpty else { throw invalidFCP("The timeline contains no supported clips.") }
-        try checkFormat(sequence, first: clips[0])
-        if clips.contains(where: { $0.name == "mc-clip" }) {
-            guard clips.allSatisfy({ $0.name == "mc-clip" }) else {
-                throw invalidFCP("Mixed multicam and ordinary storylines cannot be represented in a single MPCut project.")
-            }
-            return .multicam(try multicam(clips))
+        let stillIndices = try Set(clips.indices.filter { try isStillVideo(clips[$0]) })
+        if let first = clips.indices.first(where: { !stillIndices.contains($0) }) {
+            try checkFormat(sequence, first: clips[first])
         }
+        let isMulticam = clips.contains { $0.name == "mc-clip" }
+        let recordingIndices = clips.indices.filter { !stillIndices.contains($0) }
+        if isMulticam, !recordingIndices.allSatisfy({ clips[$0].name == "mc-clip" }) {
+            throw invalidFCP("Mixed multicam and ordinary storylines cannot be represented in a single MPCut project.")
+        }
+        let group = isMulticam ? try multicam(recordingIndices.map { clips[$0] }) : nil
         var suppliedIDs = Set<String>()
-        var imported = try clips.map { node in
+        var imported: [CutSequenceClip] = isMulticam ? [] : try recordingIndices.map { index in
+            let node = clips[index]
             let source = try linked(node)
             var clip = try CutSequenceClip(id: "", file: source.url.path, from: source.start,
                                            to: source.start.adding(node.time("duration")))
@@ -172,7 +179,114 @@ private final class FCPReader {
             imported[index].id = "clip-\(next)"
             next += 1
         }
-        return .sequence(imported)
+        if stillIndices.isEmpty {
+            if let group { return .multicam(group) }
+            return .sequence(imported)
+        }
+        guard let formatID = sequence.attr("format"), let format = resources[formatID],
+              let cadence = try? format.time("frameDuration"), cadence > .zero else {
+            throw invalidFCP("Still inserts need a sequence format with a positive frame duration.")
+        }
+        var assetKeys = [String: StillAsset]()
+        var assets = [StillAsset]()
+        var placements = Set<String>()
+        var policy: StillProgramColorPolicy?
+        var standalone: StillTimelineFormat?
+        var inserts = [Int: StillInsert]()
+        for index in stillIndices.sorted() {
+            let node = clips[index]
+            let ref = try node.required("ref")
+            let resource = resources[ref]!
+            let url = try assetURL(ref, asset: resource)
+            let metadata = try resource.elements(forName: "metadata").flatMap { $0.elements(forName: "md") }
+                .first(where: { $0.attr("key") == FCPStillMetadata.key })?.attr("value").map {
+                    try JSONDecoder().decode(FCPStillMetadata.self, from: Data($0.utf8))
+                }
+            try checkTiming(node)
+            try checkChildren(node, keeping: ["adjust-conform"])
+            let conform = node.elements(forName: "adjust-conform")
+            let fit: StillImageFraming
+            if conform.isEmpty || (conform.count == 1 && conform[0].attr("type") == "fit" && conform[0].elements.isEmpty) {
+                fit = .fit
+            } else if conform.count == 1 && conform[0].attr("type") == "fill" && conform[0].elements.isEmpty {
+                fit = .fill
+            } else {
+                try loss("Used centered Fit for still \(node.attr("name") ?? url.lastPathComponent) with unsupported spatial conform.")
+                fit = .fit
+            }
+            let assetID = metadata?.assetID ?? "still-asset-\(ref)"
+            if let previous = assetKeys[assetID] {
+                guard previous.file == url.path, metadata.map({ $0.fingerprint == previous.fingerprint }) ?? true else {
+                    throw invalidFCP("Still asset \(assetID) has conflicting original media references.")
+                }
+            }
+            if assetKeys[assetID] == nil {
+                let fingerprint: String
+                if let stored = metadata?.fingerprint {
+                    fingerprint = stored
+                } else if (try? SourceIdentity(url)) == nil {
+                    fingerprint = "unverified-fcpxml-\(ref)"
+                } else {
+                    fingerprint = try StillImage.fingerprint(url)
+                }
+                let asset = StillAsset(id: assetID, file: url.path, displayName: resource.attr("name") ?? url.lastPathComponent,
+                                       fingerprint: fingerprint)
+                assetKeys[assetID] = asset
+                assets.append(asset)
+            }
+            if let value = metadata?.colorPolicy {
+                guard policy == nil || policy == value else { throw invalidFCP("Conflicting still program color policies.") }
+                policy = value
+            }
+            if let value = metadata?.standalone {
+                guard standalone == nil || standalone == value else { throw invalidFCP("Conflicting standalone still formats.") }
+                standalone = value
+            }
+            let requestedID = metadata?.placementID ?? "still-\(index + 1)"
+            var id = requestedID
+            var suffix = 2
+            while !placements.insert(id).inserted {
+                id = "\(requestedID)-\(suffix)"
+                suffix += 1
+            }
+            inserts[index] = StillInsert(id: id, assetID: assetID, duration: try node.time("duration"),
+                                         cadence: cadence, framing: fit)
+        }
+        if var restored = group {
+            var iterator = (restored.assembly ?? [restored.range]).makeIterator()
+            restored.assemblyItems = clips.indices.map { index in
+                if let insert = inserts[index] { return .still(insert) }
+                return .group(iterator.next()!)
+            }
+            restored.stillAssets = assets
+            restored.programColorPolicy = policy
+            return .multicam(restored)
+        }
+        if imported.isEmpty {
+            guard let width = format.attr("width").flatMap(Int.init),
+                  let height = format.attr("height").flatMap(Int.init) else {
+                throw invalidFCP("A standalone still timeline needs a canvas size.")
+            }
+            standalone = StillTimelineFormat(width: width, height: height, cadence: cadence,
+                                             codec: standalone?.codec ?? .h264, container: standalone?.container ?? "mov")
+        } else if standalone != nil {
+            try loss("Removed the MPCut still-only export format because the timeline now contains recordings.")
+            standalone = nil
+        }
+        var iterator = imported.makeIterator()
+        let items: [StillSequenceItem] = clips.indices.map { index in
+            if let insert = inserts[index] { return .still(insert) }
+            return .source(iterator.next()!)
+        }
+        return .stillSequence(StillSequenceProject(items: items, stillAssets: assets, programColorPolicy: policy,
+                                                   stillFormat: standalone))
+    }
+
+    private func isStillVideo(_ node: XMLElement) throws -> Bool {
+        guard node.name == "video", let ref = node.attr("ref"), let asset = resources[ref], asset.name == "asset",
+              asset.attr("hasAudio") != "1", try asset.time("duration", default: .zero) == .zero else { return false }
+        let url = try assetURL(ref, asset: asset)
+        return StillImage.filenameExtensions.contains(url.pathExtension.lowercased())
     }
 
     func checkFormat(_ sequence: XMLElement, first: XMLElement) throws {
@@ -537,6 +651,15 @@ struct FCPClipMetadata: Codable {
     let audioTrack: Int?
     let originalFile: String?
     let replacementNames: [Int: String]
+}
+
+struct FCPStillMetadata: Codable {
+    static let key = "com.mpcut.still-insert.v1"
+    let placementID: String
+    let assetID: String
+    let fingerprint: String
+    let colorPolicy: StillProgramColorPolicy?
+    let standalone: StillTimelineFormat?
 }
 
 

@@ -5,7 +5,7 @@ import MPCutCore
 @MainActor
 final class EditorPreferences: ObservableObject {
     enum Change {
-        case localMCPEnabled, useAnalysisSidecars, defaultExportMode, snapTarget, largeThumbnails
+        case automaticallyRefreshMedia, localMCPEnabled, useAnalysisSidecars, defaultExportMode, snapTarget, largeThumbnails
         case minimumPause, leavePause, volume, isMuted, scrubSoundEnabled, jpegPreset, historyLimit
     }
 
@@ -31,13 +31,25 @@ final class EditorPreferences: ObservableObject {
     }
     @Published var localMCPStatus = "Off"
 
+    @Published var automaticallyRefreshMedia = false {
+        didSet { save(automaticallyRefreshMedia, replacing: oldValue, key: "automaticallyRefreshMedia", change: .automaticallyRefreshMedia) }
+    }
+
     @Published var useAnalysisSidecars = true {
         didSet { save(useAnalysisSidecars, replacing: oldValue, key: "useAnalysisSidecars", change: .useAnalysisSidecars) }
     }
-    @Published var defaultExportMode = ExportMode.smart {
+    /// The factory default of the movie export mode, from the export rules. The CLI uses the same one.
+    static let factoryExportMode = ExportRules.defaultMode(for: .movie)
+    @Published var defaultExportMode = EditorPreferences.factoryExportMode {
         didSet {
             save(defaultExportMode, replacing: oldValue, key: "defaultMovieExportMode",
                  stored: defaultExportMode.rawValue, change: .defaultExportMode)
+        }
+    }
+    /// Ask before an edit made by hand lowers the timeline tier. Nothing recalculates when it changes, so it is only stored.
+    @Published var warnBeforeLoweringExportTier = true {
+        didSet {
+            if warnBeforeLoweringExportTier != oldValue { defaults?.set(warnBeforeLoweringExportTier, forKey: "warnBeforeLoweringExportTier") }
         }
     }
     @Published var snapTarget = TimelineSnapTarget.off {
@@ -79,11 +91,13 @@ final class EditorPreferences: ObservableObject {
             if steps != Double(historyLimit) { defaults.set(historyLimit, forKey: "historyLimit") }
         }
         localMCPEnabled = Self.flag(defaults.object(forKey: "localMCPEnabled")) ?? false
+        automaticallyRefreshMedia = Self.flag(defaults.object(forKey: "automaticallyRefreshMedia")) ?? false
         useAnalysisSidecars = Self.flag(defaults.object(forKey: "useAnalysisSidecars")) ?? true
+        warnBeforeLoweringExportTier = Self.flag(defaults.object(forKey: "warnBeforeLoweringExportTier")) ?? true
         largeThumbnails = Self.flag(defaults.object(forKey: "largeTimelineThumbnails")) ?? false
         snapTarget = defaults.string(forKey: "timelineSnapTarget").flatMap(TimelineSnapTarget.init(rawValue:))
             ?? (Self.flag(defaults.object(forKey: "snapToKeyframes")) == true ? .keyframes : .off)
-        defaultExportMode = defaults.string(forKey: "defaultMovieExportMode").flatMap(ExportMode.init(rawValue:)) ?? .smart
+        defaultExportMode = defaults.string(forKey: "defaultMovieExportMode").flatMap(ExportMode.init(rawValue:)) ?? Self.factoryExportMode
         jpegPreset = defaults.string(forKey: "jpegFramePreset").flatMap(JPEGPreset.init(rawValue:)) ?? .review
         if let minimum = Self.number(defaults.object(forKey: "minimumPause")),
            minimum >= 1.0 / Double(AudioWaveform.rate) {

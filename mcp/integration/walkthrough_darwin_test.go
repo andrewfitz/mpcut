@@ -2,13 +2,14 @@ package integration
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func checkPackagedWalkthrough(t *testing.T, ctx context.Context, contents, project, media string, requireSocketOwner func(*testing.T)) {
+func checkPackagedWalkthrough(t *testing.T, ctx context.Context, contents, project, media, isolatedEndpoint string, requireSocketOwner func(*testing.T)) {
 	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
@@ -26,6 +27,7 @@ func checkPackagedWalkthrough(t *testing.T, ctx context.Context, contents, proje
 	} {
 		requireSocketOwner(t)
 		cmd := exec.CommandContext(ctx, python, append([]string{script, "--helper", helper}, step.args...)...)
+		cmd.Env = append(os.Environ(), isolatedEndpoint)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("bundled walkthrough %s: %v\n%s", step.args[0], err, output)

@@ -42,6 +42,16 @@ public struct SilenceAnalysisResult: Codable, Sendable {
     fileprivate var sourceClock: AudioAnalysisClock?
     fileprivate var hasSourceCalibration = true
 
+    /// Use after refresh has verified the result's audio stream and presentation clock.
+    package func forRefreshedMedia(_ media: MediaInfo) -> SilenceAnalysisResult {
+        let clock = AudioAnalysisClock(media: media, stream: stream)
+        guard sourceClock == clock else { return self }
+        var result = self
+        result.sourceIdentity = media.identity
+        result.sourceClock = clock
+        return result
+    }
+
     enum CodingKeys: String, CodingKey {
         case stream, requestedThresholdDB, minimum, automaticThresholdDB, pauses, runs
     }

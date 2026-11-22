@@ -15,45 +15,57 @@ struct EditorSettings: View {
                 Section {
                     Toggle("Enable local MCP control", isOn: $preferences.localMCPEnabled)
                         .accessibilityLabel("Enable local MCP control")
+                        .help("Allow local MCP control")
                     LabeledContent("Status", value: preferences.localMCPStatus)
                 } header: { Text("Automation") } footer: {
-                    Text("Allow local programs running as your user to inspect and edit projects and process media files.")
+                    Text("Programs running under your Mac account can read and edit projects and process media files.")
                 }
                 Section("Timeline") {
                     SnapTargetPicker(selection: $preferences.snapTarget)
+                    Toggle("Automatically refresh changed media", isOn: $preferences.automaticallyRefreshMedia)
+                        .help("Refresh changed media automatically")
                     Toggle("Large timeline thumbnails and waveforms", isOn: $preferences.largeThumbnails)
+                        .help("Enlarge timeline previews")
                 }
                 Section {
                     HistoryLimitField(limit: $preferences.historyLimit)
                 } header: {
                     Text("Project history")
                 } footer: {
-                    Text("Projects keep this many undo and redo steps in total. Lowering the limit trims open projects immediately. Set it to 0 to turn off history.")
+                    Text("Undo and redo share this limit. Lowering it immediately removes older history from open projects. Set it to 0 to turn off history.")
                 }
                 Section("Preview audio") {
                     Toggle("Play audio while scrubbing", isOn: $preferences.scrubSoundEnabled)
+                        .help("Hear audio while scrubbing")
                     Toggle("Mute preview", isOn: $preferences.isMuted)
+                        .help("Mute preview audio")
                     Slider(value: $preferences.volume, in: 0...1) { Text("Volume") }
+                        .help("Adjust preview volume")
                 }
                 Section("Export defaults") {
                     Picker("Movie", selection: $preferences.defaultExportMode) {
                         ForEach(ExportMode.allCases, id: \.self) { Text($0.displayName).tag($0) }
                     }
+                    .help("Set default movie mode")
                     Picker("JPEG frames", selection: $preferences.jpegPreset) {
                         Text("Small review images").tag(JPEGPreset.review)
                         Text("Full resolution, high quality").tag(JPEGPreset.full)
                     }
+                    .help("Set default JPEG quality")
+                    Toggle(TierPrompt.settingTitle, isOn: $preferences.warnBeforeLoweringExportTier)
+                        .help("Warn about export limits")
                 }
             }
-            .tabItem { Label("General", systemImage: "gearshape") }
+            .tabItem { Label("General", systemImage: "gearshape").help("Show general settings") }
 
             Form {
                 Section {
                     Toggle("Automatically save and load analysis beside each recording", isOn: $preferences.useAnalysisSidecars)
+                        .help("Reuse saved media analysis")
                 } header: {
                     Text("Analysis sidecars")
                 } footer: {
-                    Text("Completed scans are shared with the CLI. The app and the CLI can both reuse them.")
+                    Text("MPCut and the command-line tool can reuse saved scans.")
                 }
                 Section("Silence detection") {
                     PauseSetting(label: "Minimum pause", unit: "s", value: $preferences.minimumPause,
@@ -61,7 +73,7 @@ struct EditorSettings: View {
                     PauseSetting(label: "Leave per pause", unit: "s", value: $preferences.leavePause, minimum: 0, step: 0.1)
                 }
             }
-            .tabItem { Label("Analysis", systemImage: "waveform") }
+            .tabItem { Label("Analysis", systemImage: "waveform").help("Show analysis settings") }
         }
         .formStyle(.grouped)
         .frame(width: 480, height: 495)
@@ -81,6 +93,7 @@ struct HistoryLimitField: View {
                 .frame(width: 62)
                 .focused($editing)
                 .onSubmit(commit)
+                .help("Enter history limit")
             Stepper("Maximum history steps", value: Binding(
                 get: { enteredLimit ?? limit },
                 set: { value in
@@ -89,6 +102,7 @@ struct HistoryLimitField: View {
                 }
             ), in: EditorPreferences.historyStepRange)
             .labelsHidden()
+            .help("Adjust history limit")
         }
         .onChange(of: limit, initial: true) { _, value in entry = String(value) }
         .onChange(of: editing) { _, focused in if !focused { commit() } }

@@ -244,7 +244,18 @@ final class MCPFileJobs {
         let job = try job(id)
         var result: [String: Any] = ["job_id": id.uuidString, "tool": job.tool, "state": job.state]
         let recent = try tail(job.diagnostics)
-        if let percent = recent.split(whereSeparator: \.isNewline).reversed().compactMap({ line -> Int? in
+        let lines = recent.split(whereSeparator: \.isNewline).reversed()
+        if ["file_scenes", "file_refresh"].contains(job.tool),
+           let event = lines.lazy.compactMap({ line -> [String: Any]? in
+               let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
+               return object?["event"] as? String == "progress" ? object : nil
+           }).first {
+            result["progress_event"] = event
+            if let fraction = event["fraction"] as? Double, fraction.isFinite {
+                let percent = Int(100 * min(1, max(0, fraction)))
+                result["progress_percent"] = min(job.ended == nil ? 99 : 100, percent)
+            }
+        } else if let percent = lines.compactMap({ line -> Int? in
             guard line.hasPrefix("Export "), line.hasSuffix("%") else { return nil }
             return Int(line.dropFirst(7).dropLast())
         }).first {

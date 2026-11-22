@@ -3,6 +3,51 @@ import XCTest
 @testable import MPCutCore
 
 final class ProjectConverterTests: XCTestCase {
+    func testUnsupportedStillInterchangePreflightsEveryPlacementBeforeOpeningHost() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let time = RationalTime(numerator: 1)
+        let range = MulticamRange(from: .zero, to: time)
+        let clip = CutSequenceClip(id: "recording", file: "offline.mov", from: .zero, to: time)
+        let asset = StillAsset(id: "photo", file: "card.png", displayName: "Card", fingerprint: "offline")
+        let insert = StillInsert(id: "insert-id", assetID: asset.id, duration: time, cadence: .init(numerator: 1, denominator: 24))
+        let overlay = StillReplacement(id: "replace-id", assetID: asset.id,
+                                       coverage: .sequence([.init(clipID: clip.id, range: range)]))
+        let project = CutProject.stillSequence(.init(items: [.source(clip), .still(insert)],
+                                                     stillAssets: [asset], stillReplacements: [overlay]))
+        for ext in ["prproj", "drp", "drt"] {
+            let output = folder.appendingPathComponent("Edit." + ext)
+            XCTAssertThrowsError(try ProjectConverter.write(project, relativeTo: output, to: output)) {
+                let error = $0 as? CutError
+                XCTAssertEqual(error?.code, "conversion_loss")
+                XCTAssertTrue(error?.message.contains("Insert Still placement insert-id") == true)
+                XCTAssertTrue(error?.message.contains("Replace Picture placement replace-id") == true)
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        }
+        let approved = try ProjectConverter.prepareStills(project, for: "Adobe Premiere Pro", allowLoss: true)
+        XCTAssertEqual(approved.project, .sequence([clip]))
+        XCTAssertEqual(approved.warnings.count, 2)
+    }
+
+    func testApprovedMulticamStillOmissionPreservesEveryRetainedRange() throws {
+        let range = MulticamRange(from: .zero, to: .init(numerator: 1))
+        let asset = StillAsset(id: "asset", file: "card.png", displayName: "Card", fingerprint: "offline")
+        let insert = StillInsert(id: "title", assetID: asset.id, duration: .init(numerator: 1),
+                                 cadence: .init(numerator: 1, denominator: 24))
+        let group = MulticamProject(referenceAngle: "a", range: range, angles: [.init(id: "a", file: "camera.mov")],
+                                    audio: .none, switches: [.init(at: .zero, angle: "a")],
+                                    assemblyItems: [.group(range), .still(insert), .group(range)], stillAssets: [asset])
+        XCTAssertThrowsError(try ResolveExport.rejectUnsupportedStills(.multicam(group))) {
+            XCTAssertTrue(($0 as? CutError)?.message.contains("Insert Still placement title") == true)
+        }
+        let approved = try ProjectConverter.prepareStills(.multicam(group), for: "DaVinci Resolve", allowLoss: true)
+        guard case .multicam(let result) = approved.project else { return XCTFail("Expected multicam") }
+        XCTAssertEqual(result.assembly, [range, range])
+        XCTAssertEqual(approved.warnings.count, 1)
+    }
+
     func testCopyRebasesRepeatedMediaAndKeepsOccurrenceOrder() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: folder) }

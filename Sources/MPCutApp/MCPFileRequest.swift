@@ -18,9 +18,12 @@ struct MCPFileRequest {
             "waveform": ["file", "from", "to", "columns", "stream", "no_sidecar"],
             "frames": source.union(detector).union(["output", "preset", "at", "at_file", "select", "sample", "limit", "no_sidecar"]),
             "sidecar": detector.union(["file", "status", "only", "only_file", "no_sidecar"]),
-            "scenes": tracks.union(["file", "report", "input_file", "scenes_file", "export_to", "container", "group_by", "dry_run", "no_sidecar"]),
+            "scenes": tracks.union(["file", "project", "report", "input_file", "scenes_file", "export_to", "container",
+                                    "group_by", "dry_run", "no_sidecar", "from", "to", "clip_id", "camera_id",
+                                    "all_sources", "policy"]),
+            "refresh": ["project", "deep", "no_sidecar"],
             "silence": source.union(tracks).union(detector).union(["report", "input_file", "pauses_file", "leave", "waveform", "mode", "output", "dry_run", "no_sidecar"]),
-            "export": encoding.union(["output", "project", "project_data", "edit", "input_file", "clips_file", "order_file", "dry_run", "no_sidecar"]),
+            "export": encoding.union(["output", "project", "project_data", "edit", "input_file", "clips_file", "order_file", "dry_run", "no_sidecar", "require_camera_copy"]),
             "resolve": ["project", "project_data", "output", "edit", "clips_file", "input_file", "open", "no_sidecar"],
             "bulk": encoding.union(["file", "ranges", "ranges_file", "input_file", "output_directory", "container", "dry_run", "no_sidecar"]),
             "rearrange": tracks.union(["file", "ranges", "ranges_file", "output", "snap", "dry_run", "no_sidecar"]),
@@ -46,7 +49,7 @@ struct MCPFileRequest {
             ?? FileManager.default.homeDirectoryForCurrentUser
         arguments = [command == "version" ? "--version" : command, "--json"]
 
-        for name in ["dry_run", "no_sidecar", "open", "allow_loss", "flatten_multicam", "status"] where fields[name] != nil {
+        for name in ["dry_run", "no_sidecar", "open", "allow_loss", "flatten_multicam", "status", "all_sources", "deep", "require_camera_copy"] where fields[name] != nil {
             if try a.bool(name) { arguments.append(a.flag(name)) }
         }
         for name in ["stream", "columns", "waveform", "audio_stream", "limit"] where fields[name] != nil {
@@ -57,6 +60,47 @@ struct MCPFileRequest {
         }
         for name in ["from", "to", "select", "sample", "preset", "group_by", "audio", "mode", "video", "quality", "tracks", "snap"] {
             if let value = try a.string(name) { arguments += [a.flag(name), value] }
+        }
+        if command == "scenes" {
+            let rangePresent = fields["from"] != nil || fields["to"] != nil
+            let selectedScopes = ["clip_id", "camera_id"].filter { fields[$0] != nil }.count
+            let projectScopes = selectedScopes + (fields["all_sources"] as? Bool == true ? 1 : 0)
+            let policy = try a.string("policy")
+            guard projectScopes <= 1, projectScopes == 0 || fields["project"] != nil else {
+                throw a.invalid("Choose one saved-project scene scope.")
+            }
+            if rangePresent {
+                guard fields["file"] != nil, let from = try a.string("from"), let to = try a.string("to"),
+                      let start = try? RationalTime(parsing: from), let end = try? RationalTime(parsing: to),
+                      start >= .zero, end > start else {
+                    throw a.invalid("A file range requires a nonnegative from and a later to.")
+                }
+            }
+            let exportFields = ["report", "input_file", "scenes_file", "export_to", "dry_run", "container", "group_by", "tracks", "audio_stream"]
+            if fields["project"] != nil || rangePresent || policy != nil {
+                guard exportFields.allSatisfy({ fields[$0] == nil }) else {
+                    throw a.invalid("Project, range, and policy options are for scanning scenes.")
+                }
+            }
+            for name in ["clip_id", "camera_id"] {
+                if let value = try a.string(name) { arguments += [a.flag(name), value] }
+            }
+            if let policy {
+                guard ["reuse", "resume", "restart"].contains(policy) else { throw a.invalid("Unknown scene scan policy.") }
+                arguments += ["--policy", policy]
+                if policy == "restart" {
+                    guard let raw = try a.string("operationID"), let id = UUID(uuidString: raw) else {
+                        throw a.invalid("Supply an operationID UUID to restart the scan.")
+                    }
+                    arguments += ["--operation-id", id.uuidString]
+                }
+            }
+            if fields["export_to"] == nil && (fields["file"] != nil || fields["project"] != nil) {
+                arguments += ["--progress", "jsonl"]
+            }
+        } else if command == "refresh" {
+            try a.requireOne(["project"])
+            arguments += ["--progress", "jsonl"]
         }
         if let detail = try a.string("detail"), detail != "metadata" {
             guard ["keyframes", "frames", "audio_packets"].contains(detail) else { throw a.invalid("Unknown inspect detail.") }
@@ -92,6 +136,9 @@ struct MCPFileRequest {
                 throw a.invalid("A bulk input_file contains its own source, destination, ranges and container.")
             }
         case "export", "resolve":
+            if fields["require_camera_copy"] != nil, fields["project"] == nil && fields["project_data"] == nil {
+                throw a.invalid("Use require_camera_copy with a project input.")
+            }
             let needsOutput = ["project", "project_data", "clips_file"].contains { fields[$0] != nil }
             guard needsOutput == (fields["output"] != nil) else {
                 throw a.invalid(needsOutput ? "Supply output for the selected input." : "Supply the destination in the edit request.")

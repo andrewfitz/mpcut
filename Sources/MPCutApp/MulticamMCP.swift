@@ -43,6 +43,10 @@ extension MulticamEditorModel {
         guard let original = project else { throw args.invalid("Open a multicam project.") }
         if tool == "get_history" { return mcpHistory }
         if tool == "get_multicam" { return try multicamState(args, project: original) }
+        if (tool == "seek" || tool == "multicam_select"), arguments["occurrence"] != nil,
+           original.assemblyItems?.contains(where: { $0.still != nil }) == true, arguments["expectedRevision"] == nil {
+            throw MCPCommandError("invalid_arguments", "Supply the revision for this typed assembly occurrence.")
+        }
         guard !isBusy, window?.attachedSheet == nil, setup.isEmpty, notice == nil else {
             throw MCPCommandError("editor_busy", "Finish the current multicam operation or dialog.")
         }
@@ -53,7 +57,8 @@ extension MulticamEditorModel {
             let index = try occurrence(args)
             let requested = try args.time()
             let space = try args.string("space")
-            let start = assemblyStart(of: index)
+            guard let range = assemblyRange(at: index) else { throw args.invalid("An inserted still has no group time.") }
+            let start = assemblyStart(at: index)
             let group: RationalTime
             switch space {
             case "group": group = requested
@@ -61,10 +66,9 @@ extension MulticamEditorModel {
                 guard start < requested, requested < assemblyRangeEnds[index] else {
                     throw args.invalid("The time must lie inside the specified assembly occurrence.")
                 }
-                group = try ranges[index].from.adding(requested.subtracting(start))
+                group = try range.from.adding(requested.subtracting(start))
             default: throw args.invalid("Choose group or assembly time.")
             }
-            let range = ranges[index]
             guard let boundary = occurrenceSplitBoundary(index: index, group: group) else {
                 throw args.invalid("No split boundary is available inside this occurrence at that time.")
             }
@@ -74,6 +78,13 @@ extension MulticamEditorModel {
                       "left": index, "right": index + 1, "historyRetained": preferences.historyLimit > 0,
                       "groupTime": boundary.description, "occurrences": [index, index + 1]]
         case "set_camera_at":
+            let target = try args.time()
+            if arguments["occurrence"] != nil {
+                let index = try occurrence(args)
+                guard let range = assemblyRange(at: index), range.contains(target) else {
+                    throw args.invalid("Select a source-backed occurrence containing the requested group time.")
+                }
+            }
             let angle: String
             if args.values["number"] != nil {
                 let number = try args.integer("number")
@@ -84,7 +95,7 @@ extension MulticamEditorModel {
             } else {
                 angle = try args.string("angle")
             }
-            guard let actual = try take(angle, at: args.time()) else {
+            guard let actual = take(angle, at: target) else {
                 if notice != nil { throw nativeEditError }
                 throw args.invalid("Use an existing camera and an interior group time or the opening time.")
             }
@@ -97,9 +108,9 @@ extension MulticamEditorModel {
             case "group":
                 guard original.range.from <= target, target <= original.range.to else { throw args.invalid("Time outside group.") }
                 if let index {
-                    let range = ranges[index]
+                    guard let range = assemblyRange(at: index) else { throw args.invalid("An inserted still has no group time.") }
                     guard range.contains(target) else { throw args.invalid("Group time is outside the specified assembly occurrence.") }
-                    let output = try assemblyStart(of: index).adding(target.subtracting(range.from))
+                    let output = try assemblyStart(at: index).adding(target.subtracting(range.from))
                     seekAssembly(at: output, scrubbing: false)
                 } else {
                     setAssemblyPreview(false)
@@ -109,7 +120,7 @@ extension MulticamEditorModel {
                 guard target >= .zero, let end = assemblyRangeEnds.last, target <= end else { throw args.invalid("Time outside assembly.") }
                 if let index {
                     let occurrenceEnd = assemblyRangeEnds[index]
-                    guard target >= assemblyStart(of: index),
+                    guard target >= assemblyStart(at: index),
                           target < occurrenceEnd || (target == end && target == occurrenceEnd) else {
                         throw args.invalid("Assembly time is outside the specified occurrence.")
                     }
@@ -198,7 +209,13 @@ extension MulticamEditorModel {
                                     "rate": preview.playbackRate, "speed": preview.forwardSpeed.rawValue,
                                     "auditioning": preview.isAuditioning]
         if assemblyPreview { value["occurrence"] = occurrenceIndex(at: output) }
-        value["angle"] = project?.selection(at: group)?.angle
+        if assemblyPreview, let still = assemblyStill(at: occurrenceIndex(at: output)) {
+            value["groupTime"] = nil
+            value["placement"] = still.id
+            value["asset"] = still.assetID
+        } else {
+            value["angle"] = project?.selection(at: group)?.angle
+        }
         return value
     }
     private var nativeEditError: MCPCommandError {
@@ -209,11 +226,8 @@ extension MulticamEditorModel {
     }
     private func occurrence(_ args: MulticamArguments) throws -> Int {
         let index = try args.integer("occurrence")
-        guard ranges.indices.contains(index) else { throw args.invalid("Unknown assembly occurrence.") }
+        guard assemblyItems.indices.contains(index) else { throw args.invalid("Unknown assembly occurrence.") }
         return index
-    }
-    private func assemblyStart(of occurrence: Int) -> RationalTime {
-        occurrence == 0 ? .zero : assemblyRangeEnds[occurrence - 1]
     }
     private func audioSelection(_ args: MulticamArguments, project: MulticamProject) throws -> MulticamAudioSelection {
         let id = try args.string("source")
@@ -224,6 +238,27 @@ extension MulticamEditorModel {
         }
         return MulticamAudioSelection(source: id, stream: stream)
     }
+    func mcpAssemblyRows(in indices: Range<Int>) -> [[String: Any]] {
+        let items = assemblyItems
+        let ends = assemblyRangeEnds
+        return indices.map { index in
+            let start = index == 0 ? RationalTime.zero : ends[index - 1]
+            var row: [String: Any] = ["index": index, "assemblyFrom": start.description,
+                                      "assemblyTo": ends[index].description]
+            switch items[index] {
+            case .group(let range):
+                row["type"] = "group"
+                row["groupFrom"] = range.from.description
+                row["groupTo"] = range.to.description
+            case .still(let still):
+                row["type"] = "still"
+                row["placement"] = still.id
+                row["asset"] = still.assetID
+            }
+            return row
+        }
+    }
+
     private func multicamState(_ args: MulticamArguments, project: MulticamProject) throws -> [String: Any] {
         let offset = try args.values["offset"].map { _ in try args.integer("offset") } ?? 0
         let limit = try args.values["limit"].map { _ in try args.integer("limit") } ?? 50
@@ -257,11 +292,22 @@ extension MulticamEditorModel {
         case "switches":
             state["total"] = project.switches.count
             state["switches"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(Array(project.switches[page(project.switches.count)])))
+        case "assembly":
+            let total = assemblyItems.count
+            guard assemblyRangeEnds.count == total else { throw args.invalid("The assembly timeline is inconsistent.") }
+            state["total"] = total
+            state["occurrences"] = mcpAssemblyRows(in: page(total))
+        case "stills":
+            let stills = try CutProject.multicam(project).mcpStillList(location: projectURL, offset: offset, limit: limit)
+            state.merge(stills) { _, updated in updated }
         case "suggestions":
             state["total"] = suggestions.count
             state["anchor"] = suggestionAnchor?.description
             state["suggestions"] = suggestions[page(suggestions.count)].map(\.description)
-        default: throw args.invalid("Choose sources, switches or suggestions.")
+        default: throw args.invalid("Choose sources, switches, suggestions, assembly or stills.")
+        }
+        if let policy = project.programColorPolicy {
+            state["programColorPolicy"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(policy))
         }
         return state
     }
@@ -354,12 +400,14 @@ extension MulticamEditorModel {
             guard args.values["from"] != nil || args.values["to"] != nil else {
                 throw args.invalid("Supply a group in or out time to trim.")
             }
-            let from = args.values["from"] == nil ? ranges[index].from : try args.time("from")
-            let to = args.values["to"] == nil ? ranges[index].to : try args.time("to")
+            guard let range = assemblyRange(at: index) else { throw args.invalid("Use update_still to resize an inserted still.") }
+            let from = args.values["from"] == nil ? range.from : try args.time("from")
+            let to = args.values["to"] == nil ? range.to : try args.time("to")
             guard project.range.from <= from, from < to, to <= project.range.to else { throw args.invalid("Choose a nonempty group range.") }
             changeOccurrence(index, from: from, to: to)
         case "trim_edge", "preview_trim":
             let index = try occurrence(args)
+            guard assemblyRange(at: index) != nil else { throw args.invalid("An inserted still has no group edge.") }
             let target = try args.time()
             let edge: TimelineEdge
             switch try args.string("edge") {
@@ -377,11 +425,11 @@ extension MulticamEditorModel {
             return ["proposedSeconds": boundary.seconds, "boundary": boundary.description]
         case "move":
             let index = try occurrence(args), slot = try args.integer("before")
-            guard (0...ranges.count).contains(slot) else { throw args.invalid("Choose an insertion slot in the assembly.") }
+            guard (0...assemblyItems.count).contains(slot) else { throw args.invalid("Choose an insertion slot in the assembly.") }
             reorderAssemblyOccurrence(index, before: slot)
         case "remove":
             let index = try occurrence(args)
-            guard project.assembly != nil else { throw args.invalid("The implicit full group is not an explicit assembly range.") }
+            guard project.assembly != nil || project.assemblyItems != nil else { throw args.invalid("The implicit full group is not an explicit assembly range.") }
             removeOccurrence(index)
         case "split_selection":
             try requireMarkedRange(args)

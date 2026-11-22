@@ -6,6 +6,12 @@ public struct MulticamEdge: Codable, Equatable, Sendable {
     public let range: Int
     public let boundary: String
     public let at: RationalTime
+
+    package init(range: Int, boundary: String, at: RationalTime) {
+        self.range = range
+        self.boundary = boundary
+        self.at = at
+    }
 }
 
 public struct MulticamDiagnostic: Codable, Sendable {
@@ -255,7 +261,7 @@ public struct MulticamEngine: Sendable {
             }
             throw CutError(code: issue.code, message: issue.message,
                            segment: rangeNumber(context, boundary: issue.boundary, in: mapping) ?? issue.segment,
-                           boundary: issue.boundary, nearest: nearest, track: issue.track, multicam: context)
+                           boundary: issue.boundary, nearest: nearest, track: issue.track, multicam: context).because(issue.reason)
         }
     }
 
@@ -355,6 +361,7 @@ public struct MulticamEngine: Sendable {
                     : soundOnlyAlternatives(at: output, mapping: mapping, media: bySource, container: container)
                 throw CutError(code: issue.code, message: issue.message, segment: issue.segment,
                                boundary: issue.boundary, nearest: offered, track: issue.track, multicam: issue.multicam)
+                    .because(issue.reason)
             }
         }
         let soundEncode = convertAudio
@@ -584,5 +591,6 @@ public struct MulticamEngine: Sendable {
         return CutError(code: issue.code,
                         message: "Source \(span.source) \(description), group \(group.from)–\(group.to), source \(span.input.from)–\(span.input.to), output \(span.output.from)–\(span.output.to): \(issue.message)",
                         segment: index, boundary: issue.boundary, nearest: alternatives, track: stream, multicam: context)
+            .because(issue.reason)
     }
 }

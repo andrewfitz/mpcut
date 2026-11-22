@@ -52,12 +52,12 @@ public enum ExportRung: String, CaseIterable, Codable, Sendable {
     /// One description, used by the app, CLI text, CLI JSON, help and the written matrix.
     public var summary: String {
         switch self {
-        case .copyOtherContainer: return "Copy the same packets into another container that can carry these cuts."
-        case .copySampleAligned: return "Copy with each cut moved to the nearest audio sample, less than one sample away."
+        case .copyOtherContainer: return "Keep the original packets and use a container that supports these cuts."
+        case .copySampleAligned: return "Move each cut to the nearest audio sample, then copy the audio. Each cut moves by less than one sample."
         case .smartTrim: return "Copy complete sections and encode only the video at the cut edges."
-        case .convertSameFormat: return "Decode the kept ranges and encode them once in the source codec (MP3, AAC or FLAC) with the source parameters."
-        case .convertPCM: return "Decode the kept ranges to PCM in WAV. No further quality loss, and a much larger file."
-        case .convertAAC: return "Decode the kept ranges and encode AAC in M4A."
+        case .convertSameFormat: return "Re-encode the selected audio once using the original codec (MP3, AAC or FLAC) and settings."
+        case .convertPCM: return "Save the selected audio as a PCM WAV file. This preserves the decoded samples and uses more disk space."
+        case .convertAAC: return "Save the selected audio as AAC in an M4A file."
         case .reencode: return "Encode the whole timeline with the hardware video encoder."
         }
     }
@@ -134,18 +134,20 @@ public enum ExportEntryPoint: String, CaseIterable, Codable, Sendable {
     }
 
     /// The table's answer for a request made here: the matrix cell, or the refusal of a mode this entry point does not write.
-    public func answer(source: ExportSourceKind, tracks: ExportTracks, mode: ExportMode) -> ExportCell {
-        let cell = ExportRules.cell(source: source, tracks: tracks, mode: mode)
+    public func answer(source: ExportSourceKind, tracks: ExportTracks, mode: ExportMode,
+                       placements: ExportPlacementScope = .none) -> ExportCell {
+        let cell = ExportRules.cell(source: source, tracks: tracks, mode: mode, placements: placements)
         guard let refusal = refusal(of: mode) else { return cell }
         return ExportCell(source: source, tracks: cell.tracks, mode: mode, resolvedMode: cell.resolvedMode, refusal: refusal,
                           containers: nil, audioActions: [], defaultAudio: nil, rungs: [])
     }
 
     /// The modes a mode control lists here for a selection: those the table writes as themselves.
-    public func selectableModes(source: ExportSourceKind, tracks: ExportTracks) -> [ExportMode] {
+    public func selectableModes(source: ExportSourceKind, tracks: ExportTracks,
+                                placements: ExportPlacementScope = .none) -> [ExportMode] {
         modes.filter {
-            let cell = answer(source: source, tracks: tracks, mode: $0)
-            return cell.isAllowed && cell.resolvedMode == $0
+            let cell = answer(source: source, tracks: tracks, mode: $0, placements: placements)
+            return cell.resolvedMode == $0 && (cell.isAllowed || cell.refusal?.code == "still_requires_generation")
         }
     }
 
@@ -167,15 +169,15 @@ public enum ExportEntryPoint: String, CaseIterable, Codable, Sendable {
         case .replacement:
             return ["copyOnly: a replaced soundtrack is copied with both track types."]
         case .cliExport:
-            return ["namedOutput: `--audio auto` applies the first alternative that fits the extension of `--output`.",
-                    "defaultCopy: without `--mode`, export copies, or uses Smart Trim when `--order` is given. The app starts from Smart Trim. Existing scripts depend on this default, so it is kept until a change is approved."]
+            return ["namedOutput: `--audio auto` applies the first alternative that fits the extension of `--output`."]
         case .cliBulk:
             return ["namedOutput: `--audio auto` applies the first alternative that fits `container` when one is given."]
         case .cliRearrange:
             return ["noEncode: use export for --mode encode.", "nearestByDefault: video cuts snap to the nearest boundary."]
         case .cliSilence:
             return ["noEncode: retained ranges are written with Smart Trim or Lossless Copy.",
-                    "generatedClips: the failing clips are the retained ranges, so each alternative lists them in `clips`."]
+                    "generatedClips: the failing clips are the retained ranges, so each alternative lists them in `clips`.",
+                    "projectRanges: with `--project` the retained ranges resolve through `MulticamEngine.resolution` like `export --project`. They exist only in the report, so the alternatives listed are the ones this command can request for them: another container or the other mode, through its own `--output` and `--mode`."]
         case .cliScenes:
             return ["smartOnly: every scene is written with Smart Trim, or Lossless Copy for a single-type selection."]
         }
@@ -201,7 +203,12 @@ public struct ExportCell: Sendable {
     public var isAllowed: Bool { refusal == nil }
     /// The name shown for this mode with this selection.
     public var displayName: String { ExportRules.displayName(mode: resolvedMode, soundOnly: soundOnly) }
-    var soundOnly: Bool { source == .audio || (tracks == .audio && source != .multicam) }
+    var soundOnly: Bool { source == .audio || (tracks == .audio && (source != .multicam || resolvedMode == .encode)) }
+}
+
+/// The generated spans that are visible within an export selection.
+public enum ExportPlacementScope: Int, Sendable, Equatable {
+    case none, replacement, insertion
 }
 
 public enum ExportRules {
@@ -229,11 +236,11 @@ public enum ExportRules {
 
     public static func summary(audio: ReencodeAudio) -> String {
         switch audio {
-        case .auto: return "Copy when the copy is exact, otherwise the first alternative that works."
-        case .copyOriginal: return "Copy the source packets, or fail."
+        case .auto: return "Copy the original audio when possible. Otherwise, use the first supported alternative."
+        case .copyOriginal: return "Copy the original audio packets. Stop if they can’t be copied exactly."
         case .aac: return "Encode AAC."
         case .pcm: return "Write PCM."
-        case .removeAudio: return "Write no sound."
+        case .removeAudio: return "Omit the audio track."
         case .mp3: return "Encode MP3 with LAME."
         case .flac: return "Encode FLAC, which is lossless."
         }
@@ -255,6 +262,8 @@ public enum ExportRules {
         case "mkv": return "Matroska (.mkv)"
         case "webm": return "WebM (.webm)"
         case "wav": return "WAVE (.wav)"
+        case "mka": return "Matroska Audio (.mka)"
+        case "m4a": return "MPEG-4 Audio (.m4a)"
         default: return container.uppercased()
         }
     }
@@ -273,6 +282,17 @@ public enum ExportRules {
     public static let multicamContainers = multicamMovieContainers + ["mkv", "webm"]
     static let multicamContainerRefusal = CutError(code: "unsupported_container",
                                                    message: "Choose MOV, MP4, MKV or WebM for multicam picture and sound.")
+    /// What to do when a picture-only or sound-only multicam copy stops at a cut that no other container takes.
+    /// That row offers another container only, so this is said in the refusal and is not an alternative.
+    /// `together` is the mode that writes picture and sound together for the same program, when one plans.
+    static func multicamSingleTypeAdvice(tracks: ExportTracks, hasNearest: Bool, together: ExportMode?) -> String {
+        let kind = tracks == .video ? "picture-only" : "sound-only"
+        let steps = (hasNearest ? ["move the cut to one of the verified times"] : [])
+            + (together.map { ["export picture and sound together with \(displayName(mode: $0))"] } ?? [])
+        let advice = "A \(kind) multicam export is a \(displayName(mode: .copy)), which needs a verified time at every cut."
+        guard let first = steps.first else { return advice }
+        return advice + " " + first.prefix(1).uppercased() + first.dropFirst() + steps.dropFirst().map { ", or \($0)" }.joined() + "."
+    }
     /// The container a multicam program is written as. FFmpeg identifies M4V as raw video, so it is written as MP4.
     public static func multicamMuxContainer(_ container: String) -> String { container == "m4v" ? "mp4" : container }
     /// Containers of a multicam re-encode for each video codec.
@@ -334,6 +354,16 @@ public enum ExportRules {
     /// Containers a batch can ask a movie copy for before its cuts are verified. Each range is verified when it is planned,
     /// and no choice leaves the container to the copy planner.
     public static let movieCopyContainers = ["mp4", "mov", "mkv", "webm"]
+    /// Containers a replaced soundtrack can be written into, default first after the source's own. Each is still
+    /// verified against the tracks when the replacement is planned.
+    public static func replacementContainers(hasVideo: Bool) -> [String] {
+        hasVideo ? ["mov", "mp4", "mkv", "webm"] : ["mov", "mka", "m4a", "wav", "mp4", "mkv", "webm"]
+    }
+    /// The refusal of a container outside the list above.
+    public static func replacementContainerRefusal(hasVideo: Bool) -> CutError {
+        CutError(code: "unsupported_container",
+                 message: "Choose a supported replacement container: \(replacementContainers(hasVideo: hasVideo).joined(separator: ", ")).")
+    }
     /// The refusal of video settings, or of an action outside the list above, for a sound-only conversion.
     public static var soundSettingsRefusal: CutError {
         CutError(code: "invalid_arguments",
@@ -385,7 +415,8 @@ public enum ExportRules {
 
     // MARK: The matrix
 
-    public static func cell(source: ExportSourceKind, tracks requested: ExportTracks, mode: ExportMode) -> ExportCell {
+    public static func cell(source: ExportSourceKind, tracks requested: ExportTracks, mode: ExportMode,
+                            placements: ExportPlacementScope = .none) -> ExportCell {
         func make(_ tracks: ExportTracks, resolved: ExportMode, refusal: CutError? = nil, containers: [String]? = nil,
                   audio: [ReencodeAudio] = [], defaultAudio: ReencodeAudio? = nil, rungs: [ExportRung] = []) -> ExportCell {
             ExportCell(source: source, tracks: tracks, mode: mode, resolvedMode: resolved, refusal: refusal,
@@ -394,6 +425,35 @@ public enum ExportRules {
         }
         let soundRungs: [ExportRung] = [.copyOtherContainer, .copySampleAligned, .convertSameFormat, .convertPCM, .convertAAC]
         let conversionRungs: [ExportRung] = [.convertSameFormat, .convertPCM, .convertAAC]
+        if source != .audio, placements != .none {
+            if requested != .audio {
+                let rungs: [ExportRung] = [.smartTrim, .reencode]
+                switch mode {
+                case .copy:
+                    return make(requested, resolved: .copy, refusal: CutError(code: "still_requires_generation",
+                        message: "Visible stills need generated video samples. Choose Smart Trim or Re-encode.").because(.placementPicture),
+                        rungs: rungs)
+                case .smart:
+                    return make(requested, resolved: .smart, containers: stillMovieContainers,
+                                audio: requested == .video ? [] : stillMovieAudioActions,
+                                defaultAudio: requested == .video ? nil : .copyOriginal, rungs: rungs)
+                case .encode:
+                    let movie = cell(source: source, tracks: .all, mode: .encode)
+                    return make(requested, resolved: .encode,
+                                containers: stillContainers(mode: mode, tracks: requested, codec: defaultCodec, audio: .copyOriginal),
+                                audio: requested == .video ? [] : stillMovieAudioActions,
+                                defaultAudio: requested == .video ? nil : .copyOriginal, rungs: movie.rungs)
+                }
+            }
+            if placements == .insertion {
+                if mode == .encode {
+                    return make(.audio, resolved: .encode, audio: stillSoundConversions, defaultAudio: .pcm, rungs: conversionRungs)
+                }
+                return make(.audio, resolved: .copy, refusal: CutError(code: "still_requires_generation",
+                    message: "This selection includes inserted silence. Choose Convert Audio.").because(.placementSilence),
+                    rungs: conversionRungs)
+            }
+        }
         switch source {
         case .audio:
             // A recording without picture has one selection. Asking for all of it means its sound.
@@ -405,7 +465,7 @@ public enum ExportRules {
                 : make(.audio, resolved: .copy, rungs: soundRungs)
         case .movie:
             switch (requested, mode) {
-            case (.all, .smart): return make(.all, resolved: .smart, rungs: [.reencode])
+            case (.all, .smart): return make(.all, resolved: .smart, rungs: [.copyOtherContainer, .smartTrim, .reencode])
             case (.all, .copy): return make(.all, resolved: .copy, rungs: [.copyOtherContainer, .smartTrim, .reencode])
             case (.all, .encode):
                 // An audio treatment the container cannot carry offers the containers that can, then `auto`.
@@ -424,7 +484,7 @@ public enum ExportRules {
             case (.all, .encode):
                 return make(.all, resolved: .encode, containers: multicamReencodeContainers(.h264), audio: multicamAudioActions,
                             defaultAudio: .copyOriginal, rungs: [.convertPCM, .convertAAC, .reencode])
-            case (.all, .smart): return make(.all, resolved: .smart, containers: multicamContainers, rungs: [.copyOtherContainer, .reencode])
+            case (.all, .smart): return make(.all, resolved: .smart, containers: multicamContainers, rungs: [.copyOtherContainer, .smartTrim, .reencode])
             case (.all, .copy):
                 return make(.all, resolved: .copy, containers: multicamContainers, rungs: [.copyOtherContainer, .smartTrim, .reencode])
             // A single-type copy is verified by the copy planner, like a movie's.
@@ -464,12 +524,108 @@ public enum ExportRules {
         return flags
     }
 
+    // MARK: Timeline tier
+
+    /// One check of the timeline tier: a mode, the audio action of a sound-only conversion, and the rank it stands for.
+    public struct TierStep: Sendable {
+        public let rank: ExportRung.Rank
+        public let mode: ExportMode
+        public let audio: ReencodeAudio?
+        public var tier: FidelityTier { ExportRules.tier(of: rank) }
+    }
+
+    /// The tier of a rank: nothing encoded is True Lossless, cut edges only or no added loss is Lossless, the rest is Re-encode.
+    public static func tier(of rank: ExportRung.Rank) -> FidelityTier {
+        if rank.encodedScope == 0 { return .trueLossless }
+        return rank.encodedScope == 1 || rank.addedLoss == 0 ? .lossless : .reencode
+    }
+
+    /// The checks that decide a timeline's tier, best first. The tier is that of the first one that plans for the whole
+    /// timeline with every track and exact cuts.
+    public static func tierSteps(source: ExportSourceKind) -> [TierStep] {
+        let copy = TierStep(rank: ExportRung.copyOtherContainer.rank, mode: .copy, audio: nil)
+        switch source {
+        case .audio:
+            return [copy, TierStep(rank: ExportRung.convertPCM.rank, mode: .encode, audio: .pcm),
+                    TierStep(rank: ExportRung.convertAAC.rank, mode: .encode, audio: .aac)]
+        case .movie, .multicam:
+            return [copy, TierStep(rank: ExportRung.smartTrim.rank, mode: .smart, audio: nil),
+                    TierStep(rank: ExportRung.reencode.rank, mode: .encode, audio: .auto)]
+        }
+    }
+
+    public static func displayName(tier: FidelityTier) -> String {
+        switch tier {
+        case .trueLossless: return "True Lossless"
+        case .lossless: return "Lossless"
+        case .reencode: return "Re-encode"
+        }
+    }
+    /// The badge while the timeline is being checked, and when no mode writes it.
+    public static let tierCheckingName = "Checking…"
+    public static let tierUnavailableName = "Can’t Export"
+
+    public static func summary(tier: FidelityTier, source: ExportSourceKind = .movie) -> String {
+        switch tier {
+        case .trueLossless: return "MPCut copies the original media without re-encoding it."
+        case .lossless:
+            return source == .audio ? "Export as PCM to keep the audio samples unchanged."
+                : "Smart Trim re-encodes the video around cuts that need it and copies the rest."
+        case .reencode:
+            return source == .audio ? "This audio needs a lossy conversion to export." : "Exporting this timeline requires a full re-encode."
+        }
+    }
+
+    /// The best mode a tier allows for a selection, as the table writes it.
+    public static func bestMode(for tier: FidelityTier, source: ExportSourceKind, tracks: ExportTracks = .all) -> ExportMode {
+        let mode = tierSteps(source: source).first { $0.tier == tier }?.mode ?? .encode
+        let cell = cell(source: source, tracks: tracks, mode: mode)
+        return cell.isAllowed ? cell.resolvedMode : .copy
+    }
+
+    /// The tier a mode asks of the timeline.
+    public static func tier(of mode: ExportMode, source: ExportSourceKind) -> FidelityTier {
+        tierSteps(source: source).first { $0.mode == mode }?.tier ?? .reencode
+    }
+
+    /// The mode an export opens on: the preferred one, unless the timeline's tier is lower, then the tier's mode.
+    /// While the tier is unknown the preference stands.
+    /// A recording without picture always opens on Lossless Copy. When its exact copy is unavailable that mode lists
+    /// every working alternative of the ladder best first, so no conversion is opened ahead of a better one that works,
+    /// such as `copySampleAligned`. The first one listed is what `--audio auto` applies.
+    public static func openingMode(preferred: ExportMode, tier: FidelityTier?, source: ExportSourceKind) -> ExportMode {
+        guard source != .audio else { return defaultMode(for: .audio) }
+        guard let tier, tier < self.tier(of: preferred, source: source) else { return preferred }
+        return bestMode(for: tier, source: source)
+    }
+
+
+    /// The flags that would raise a timeline to `tier`, when its cuts are moved to verified times.
+    public static func raiseArguments(to tier: FidelityTier, source: ExportSourceKind) -> [String] {
+        ["--mode", bestMode(for: tier, source: source).rawValue, "--snap", SnapMode.nearest.rawValue]
+    }
+
+    /// Which commands report `tier`, for command help and the written rules.
+    public static var tierReportingHelp: String {
+        "tier is reported by inspect once it reads the cut index (--keyframes or --frames for a movie, always for a sound-only source and for --project, sequence or multicam), "
+            + "and by the dry runs and JSON reports of export, export --project, rearrange, bulk, scenes --export-to and silence --output. "
+            + "A bare inspect of a movie reads no cut index, so it stays a metadata read and omits tier."
+    }
+
+    /// One paragraph for command help.
+    public static var tierHelp: String {
+        let names = FidelityTier.allCases.map { "\($0.rawValue) (\(displayName(tier: $0)), --mode \(bestMode(for: $0, source: .movie).rawValue))" }
+        return "\(tierReportingHelp) The tier is the best mode that writes all the clips with every track and exact cuts. "
+            + "Tiers, best first: \(names.joined(separator: ", ")). tier.factors lists what lowers it, each with a stable id that failures also carry as error.reason, "
+            + "and tier.raise lists the arguments that would raise it. The tier never changes what a command writes."
+    }
+
     // MARK: Messages
 
     /// The one wording of an export failure for people: where it happened, why, and verified times.
     /// `issue.segment` is a position in `clips`. `numbered` is the number the caller knows that clip by, when it differs.
     public static func describe(_ issue: CutError, clips: [ClipRequest], numbered: Int? = nil) -> String {
-        var message = issue.message
+        var message = displayMessage(issue.message)
         if let index = issue.segment, clips.indices.contains(index - 1) {
             let clip = clips[index - 1]
             let boundary = issue.boundary == "from" ? clip.from : issue.boundary == "to" ? clip.to : nil
@@ -494,6 +650,35 @@ public enum ExportRules {
         value.formatted(.number.precision(.fractionLength(3...6)).locale(Locale(identifier: "en_US_POSIX"))) + " s"
     }
 
+    /// A failure or factor message as people read it. The engines name the time of a cut by the exact rational they
+    /// compared ("no verified video end boundary at 201/2"), and programs, sidecars and tests match those messages, so
+    /// the messages stay as they are. This shows the same times the way `describe` shows every other time: in seconds.
+    /// It rewrites the time that closes a sentence after "at", and the group, source and output ranges a multicam
+    /// failure opens with. Anything else, such as a path, a frame rate or a track number, is left alone.
+    public static func displayMessage(_ message: String) -> String {
+        let text = message as NSString
+        let whole = NSRange(location: 0, length: text.length)
+        func shown(_ range: NSRange, unit: Bool = true) -> String? {
+            guard let time = try? RationalTime(parsing: text.substring(with: range)) else { return nil }
+            return unit ? seconds(time.seconds) : String(seconds(time.seconds).dropLast(2))
+        }
+        var changes: [(range: NSRange, text: String)] = []
+        for match in displayCutTime.matches(in: message, range: whole) {
+            if let time = shown(match.range(at: 1)) { changes.append((match.range(at: 1), time)) }
+        }
+        for match in displaySpan.matches(in: message, range: whole) {
+            guard let from = shown(match.range(at: 1), unit: false), let to = shown(match.range(at: 2)) else { continue }
+            changes.append((NSUnionRange(match.range(at: 1), match.range(at: 2)), "\(from)–\(to)"))
+        }
+        let result = NSMutableString(string: message)
+        for change in changes.sorted(by: { $0.range.location > $1.range.location }) {
+            result.replaceCharacters(in: change.range, with: change.text)
+        }
+        return result as String
+    }
+    private static let displayCutTime = try! NSRegularExpression(pattern: #" at (\d+(?:/\d+)?)(?=\.(?:\s|$)|$)"#)
+    private static let displaySpan = try! NSRegularExpression(pattern: #"\b(?:group|source|output) (\d+(?:/\d+)?)–(\d+(?:/\d+)?)(?=[,:])"#)
+
     // MARK: Help and the written matrix
 
     /// Usage fragments for command help, so no command lists modes, tracks, codecs or actions by hand.
@@ -514,8 +699,7 @@ public enum ExportRules {
     /// How each command names its modes and what it does without one.
     public static func modeHelp(_ entry: ExportEntryPoint) -> String {
         let names = entry.modes.map { "\($0.rawValue) (\(displayName(mode: $0)))" }.joined(separator: ", ")
-        let start = entry == .cliExport ? "" : " The default is \(defaultMode(for: entry.source).rawValue) for picture with sound."
-        return "Modes: \(names).\(start) A single-type selection, or a source without picture, is written as \(displayName(mode: .copy))"
+        return "Modes: \(names). The default is \(defaultMode(for: entry.source).rawValue) for picture with sound, as in the app. A single-type selection, or a source without picture, is written as \(displayName(mode: .copy))"
             + (entry.modes.contains(.encode) && entry.source != .multicam ? ", or converted with --mode \(ExportMode.encode.rawValue)." : ".")
     }
     /// The multicam part of command help.
@@ -538,7 +722,8 @@ public enum ExportRules {
             + "Movie re-encode audio accepts \(list(movieAudioActions)). H.264/HEVC write \(reencodeContainers(.h264).joined(separator: ", ")) and ProRes \(reencodeContainers(.prores).joined(separator: ", ")). "
             + "Sound-only encode (a source without picture, or --tracks audio) accepts \(list(soundAudioActions)): \(conversions). "
             + "auto copies when the copy is exact and otherwise applies the first working alternative. "
-            + "An unavailable export lists error.alternatives in this order: \(ladder). Each has an id, label, lossless flag and the arguments that request it. Nothing switches unless auto was asked for."
+            + "An unavailable export lists error.alternatives in this order: \(ladder). Each has an id, label, lossless flag and the arguments that request it. Nothing switches unless auto was asked for. "
+            + tierHelp
     }
 
     public static func markdown() -> String {
@@ -575,7 +760,7 @@ public enum ExportRules {
             }
         }
         lines += ["", "A source without picture has one selection, so `all` means `audio`. Smart Trim applies to picture, so a single-type selection is written as Lossless Copy.", "",
-                  "The multicam rows are enforced: `MulticamEngine` reads its refusals, containers and audio actions from these rules, so no front end can write what a row refuses. The Export inspector, both Export Queues and `export --project` resolve through `MulticamEngine.resolution`, which reports the alternatives of the row. `silence --project --output` plans its retained ranges with the engine directly and reports verified times only, because no `export --project` request stands for ranges that exist only in its report. The engine still owns what depends on the recordings: the program clock, the switch and range-edge times in `nearest`, the mux of picture and sound, and sample-exact sound conversion. For a multicam program `convertPCM` and `convertAAC` re-encode with the program sound converted, in the requested container when it carries that sound.", "",
+                  "The multicam rows are enforced: `MulticamEngine` reads its refusals, containers and audio actions from these rules, so no front end can write what a row refuses. The Export inspector, both Export Queues, `export --project` and `silence --project --output` resolve through `MulticamEngine.resolution`, which reports the alternatives of the row. The retained ranges of `silence --project` exist only in its report, so it lists the alternatives it can request for them itself. The engine still owns what depends on the recordings: the program clock, the switch and range-edge times in `nearest`, the mux of picture and sound, and sample-exact sound conversion. For a multicam program `convertPCM` and `convertAAC` re-encode with the program sound converted, in the requested container when it carries that sound. A picture-only or sound-only program is a copy and its row offers another container only, so a cut that no container takes has no alternative: the refusal then says to move the cut to one of the times in `nearest`, and names the mode that writes picture and sound together when one plans.", "",
                   "## Containers by setting", "", "| Setting | Containers (default first) |", "| --- | --- |"]
         for codec in ReencodeCodec.allCases {
             lines.append("| Re-encode, `\(codec.rawValue)` | \(code(reencodeContainers(codec))) |")
@@ -589,6 +774,8 @@ public enum ExportRules {
         }
         lines.append("| Multicam picture only, listed by the app | \(code(multicamListedContainers(tracks: .video, mode: .copy))) |")
         lines.append("| Multicam sound only, listed by the app | \(code(multicamListedContainers(tracks: .audio, mode: .copy))) |")
+        lines.append("| Replace Source Audio, movie (after the source's own) | \(code(replacementContainers(hasVideo: true))) |")
+        lines.append("| Replace Source Audio, recording without picture (after the source's own) | \(code(replacementContainers(hasVideo: false))) |")
         for source in [ExportSourceKind.movie, .multicam] {
             for action in [ReencodeAudio.pcm, .aac] {
                 lines.append("| \(source.displayName) re-encode with `\(action.rawValue)` sound | \(code(reencodeContainers(for: action, source: source))) |")
@@ -604,7 +791,7 @@ public enum ExportRules {
         lines += ["| Tracks | `all` |", "| Snap | `exact` |", "| Video codec | `\(defaultCodec.rawValue)` |",
                   "| Quality | `\(defaultQuality(.h264).rawValue)`, ProRes `\(defaultQuality(.prores).rawValue)` |",
                   "| Audio action in encode | `auto` |", "",
-                  "The app's Settings can change the movie default mode. CLI commands use the default above, except `export`, whose exception is named under Entry points.", "",
+                  "Every CLI command and the app's factory settings use the default above. The app's Settings can change the movie default mode for the app.", "",
                   "## Alternatives when an export is unavailable", "",
                   "Alternatives are checked in rank order and every one that works is reported, least destructive first. The rank compares, in order: how much is encoded (nothing, cut edges, the sound, picture and sound), whether the source format changes, whether an encoding generation is added, and the time to write. An alternative is offered, never applied, unless the request asked for `--audio auto`.", "",
                   "| Rank | Id | Encoded | Format | Added loss | What it does |", "| --- | --- | --- | --- | --- | --- |"]
@@ -613,6 +800,27 @@ public enum ExportRules {
             let rank = rung.rank
             lines.append("| \(index + 1) | `\(rung.rawValue)` | \(scopes[rank.encodedScope]) | \(rank.formatChange == 0 ? "kept" : "changed") "
                 + "| \(rank.addedLoss == 0 ? "none" : "one generation") | \(rung.summary) |")
+        }
+        lines += mixedMarkdown()
+        lines += stillMarkdown()
+        lines += ["", "## Timeline tier", "",
+                  "The tier of a timeline is the best mode that plans for all of its clips with every track and exact cuts, over the containers the planner verifies. It is computed by running the planners in the order below, never by restating their rules, and it uses the same rank as the alternatives above. The app shows it as a badge and asks before an edit made by hand lowers it. For a multicam program the tier is found the same way from `MulticamEngine`, with picture and sound; the multicam editor shows the badge and does not ask, because its edits are applied at once and the program is planned off the main thread. In the CLI, \(tierReportingHelp) The tier never changes what a request writes.", "",
+                  "Adjacent clips that are contiguous in one source, a split that removes nothing, are planned as the single range they make, in every mode and container. Their seam is not a cut: it needs no verified boundary, nothing is encoded there, and the copy is the one the unsplit range gives. The seam becomes a cut when a piece is removed, moved or trimmed.", "",
+                  "| Tier | Id | Movie mode | Sound-only mode | What is encoded |", "| --- | --- | --- | --- | --- |"]
+        for tier in FidelityTier.allCases {
+            let sound = tierSteps(source: .audio).first { $0.tier == tier }
+            let soundMode = sound.map { "`\($0.mode.rawValue)`" + ($0.audio.map { " with `\($0.rawValue)`" } ?? "") } ?? "—"
+            lines.append("| \(displayName(tier: tier)) | `\(tier.rawValue)` | `\(bestMode(for: tier, source: .movie).rawValue)` | \(soundMode) "
+                + "| \(summary(tier: tier)) Sound only: \(summary(tier: tier, source: .audio)) |")
+        }
+        lines += ["", "The badge shows “\(tierCheckingName)” during indexing and “\(tierUnavailableName)” if none of the export modes work. "
+                  + "The export sheet starts with your preferred mode when the timeline supports it. Otherwise, it selects the best available mode. Audio-only exports always open on Lossless Copy. If an exact copy isn’t possible, the sheet lists the available alternatives in order of preference. `--audio auto` uses the first one. "
+                  + "Both checks try the preferred container first, then use the first compatible one. MPCut checks the hardware encoder when you export.", "",
+                  "## Tier factors", "",
+                  "Each factor explains why a higher-quality mode is unavailable. Errors include the factor ID in `reason`. An audio-only timeline can still qualify as Lossless when it can export as PCM without changing the decoded samples.", "",
+                  "| Id | Scope | Leaves at best | Exact alternative | Meaning |", "| --- | --- | --- | --- | --- |"]
+        for factor in TierFactorID.allCases {
+            lines.append("| `\(factor.rawValue)` | \(factor.scope) | \(factor.effect.summary) | \(factor.offersNearest ? "verified times in `nearest`" : "—") | \(factor.summary) |")
         }
         lines += ["", "## Entry points", "", "| Entry point | Source | Modes | Reports alternatives | Named restrictions |", "| --- | --- | --- | --- | --- |"]
         for entry in ExportEntryPoint.allCases {
@@ -628,10 +836,13 @@ public enum ExportRules {
     public static let refusals: [(String, String)] = [
         ("invalid_arguments", "The matrix refuses this combination of tracks, mode and settings."),
         ("unsafe_boundary", "A cut cannot be copied exactly. `nearest` lists verified times when there are any."),
+        ("still_requires_generation", "Visible still picture or inserted silence requires generated samples."),
+        ("camera_copy_required", "The requested settings encode retained camera picture. Review any verified placement adjustments in `stillBoundaryAdjustments`."),
         ("unsupported_container", "The container cannot carry the selected tracks or this conversion. The message names the valid extensions."),
         ("unsupported_tracks", "The source has tracks or timing that this mode cannot write."),
         ("unsupported_audio", "The audio action does not apply to this source, selection or container."),
         ("audio_copy_unavailable", "`--audio copy` was requested and the sound cannot be copied exactly."),
+        ("incompatible_clip", "The clips differ, so their packets cannot be joined. Re-encode writes a mixed timeline; see Mixed timelines for what no mode joins."),
         ("encoder_unavailable", "The FFmpeg helper lacks the encoder, or the hardware encoder did not start."),
         ("no_video", "A picture was requested from a source without one."),
         ("no_audio", "Sound was requested from a source without a matching track."),
@@ -649,7 +860,7 @@ public struct ExportRequest: Sendable {
     public var tracks: ExportTracks
     public var audioStream: Int?
     public var audioTrackOrdinal: Int?
-    /// Nil chooses the first container the rules allow.
+    /// Nil uses the destination extension when present, otherwise the first container the rules allow.
     public var container: String?
     public var audio: ReencodeAudio
     public var codec: ReencodeCodec
@@ -673,6 +884,13 @@ public struct ExportRequest: Sendable {
         self.quality = quality
         self.snap = snap
         self.movieSettings = movieSettings
+    }
+
+    fileprivate func namingContainer(from output: URL?) -> Self {
+        var request = self
+        let pathExtension = output?.pathExtension.lowercased() ?? ""
+        request.container = container?.lowercased() ?? (pathExtension.isEmpty ? nil : pathExtension)
+        return request
     }
 }
 
@@ -776,6 +994,12 @@ public struct ExportPlanner: Sendable {
     /// A batch shares one boundary cache between the requests it resolves from the same recordings.
     func resolve(_ request: ExportRequest, output: URL? = nil, media: [URL: MediaInfo] = [:],
                  boundaries: inout CutEngine.BoundaryCache) -> ExportResolution {
+        let request = request.namingContainer(from: output)
+        if let container = request.container, let pathExtension = output?.pathExtension.lowercased(),
+           !pathExtension.isEmpty, container != pathExtension {
+            return .unavailable(CutError(code: "unsupported_container", message: "The container must match the destination extension."),
+                                offers: [])
+        }
         var indexed = media
         do {
             let source = try self.source(of: request, media: &indexed)
@@ -815,6 +1039,7 @@ public struct ExportPlanner: Sendable {
                         let refusal = CutError(code: "unsupported_container",
                                                message: "Exact audio copy is unavailable. \(issue.message) No alternative writes .\(container). Use \(valid.joined(separator: ", ")).",
                                                segment: issue.segment, boundary: issue.boundary, nearest: issue.nearest, track: issue.track)
+                            .because(issue.reason)
                         return .unavailable(refusal, offers: offers)
                     }
                 }
@@ -881,11 +1106,72 @@ public struct ExportPlanner: Sendable {
         }
     }
 
+    // MARK: The timeline tier's question
+
+    /// Whether one mode plans for these clips: the request's cell and refusals, then the planner of that mode, sharing
+    /// `boundaries`. No ladder, and no helper process: a movie re-encode is checked up to the hardware encoder.
+    func verdict(_ request: ExportRequest, media: [URL: MediaInfo],
+                 boundaries: inout CutEngine.BoundaryCache) throws -> (container: String, warnings: [String], edit: ResolvedEdit?) {
+        var indexed = media
+        let source = try self.source(of: request, media: &indexed)
+        let cell = ExportRules.cell(source: source.kind, tracks: request.tracks, mode: request.mode)
+        if let refusal = cell.refusal { throw refusal }
+        return try AnalysisSidecar.$readsEnabled.withValue(useSidecar && AnalysisSidecar.readsEnabled) {
+            switch cell.resolvedMode {
+            case .encode where cell.soundOnly:
+                let plan = try self.plan(request, cell: cell, output: nil, media: indexed, boundaries: &boundaries)
+                return (plan.edit.container, plan.warnings, nil)
+            case .encode:
+                let container = request.container ?? ExportRules.defaultReencodeContainer(request.codec)
+                if source.media.streams.contains(where: { $0.kind == "audio" }),
+                   let refusal = ExportRules.reencodeRefusal(audio: request.audio, container: container, source: source.kind) {
+                    throw refusal
+                }
+                let settings = ReencodeSettings(codec: request.codec, quality: request.quality, audio: request.audio)
+                return (container, try ReencodeEngine(cancelled: cancelled)
+                    .staticWarnings(request.clips, media: indexed, container: container, settings: settings), nil)
+            case .copy, .smart:
+                let plan = try self.plan(request, cell: cell, output: nil, media: indexed, boundaries: &boundaries)
+                return (plan.edit.container, plan.warnings, plan.edit)
+            }
+        }
+    }
+
+    /// The one container choice rule of the timeline tier and of the export sheet's opening state: the preferred
+    /// container when the request plans in it, otherwise the first container the planner verifies.
+    /// A re-encode names its container by its settings, so the rule applies to packet copies and Smart Trim.
+    func verdict(_ request: ExportRequest, preferring preferred: String?, media: [URL: MediaInfo],
+                 boundaries: inout CutEngine.BoundaryCache) throws -> (container: String, warnings: [String], edit: ResolvedEdit?) {
+        guard let preferred, request.container == nil, request.mode != .encode else {
+            return try verdict(request, media: media, boundaries: &boundaries)
+        }
+        var named = request
+        named.container = preferred
+        do {
+            return try verdict(named, media: media, boundaries: &boundaries)
+        } catch let issue as CutError where issue.code == "cancelled" || issue.code == "source_changed" {
+            throw issue
+        } catch {
+            return try verdict(request, media: media, boundaries: &boundaries)
+        }
+    }
+
+    /// The container an export of `request` opens on, by the rule above. Nil when the request plans in no container,
+    /// or is a re-encode.
+    public func openingContainer(for request: ExportRequest, preferred: String?, media: [URL: MediaInfo] = [:]) -> String? {
+        guard request.mode != .encode else { return nil }
+        var open = request
+        open.container = nil
+        var boundaries = CutEngine.BoundaryCache()
+        return try? verdict(open, preferring: preferred, media: media, boundaries: &boundaries).container
+    }
+
     // MARK: The ladder
 
     /// Every alternative of the cell that works for this request, in rank order.
     public func offers(after request: ExportRequest, source: MediaInfo, kind: ExportSourceKind, output: URL? = nil,
                        media: [URL: MediaInfo]) -> [ExportOffer] {
+        let request = request.namingContainer(from: output)
         let cell = ExportRules.cell(source: kind, tracks: request.tracks, mode: request.mode)
         guard cell.isAllowed else { return [] }
         let sound = source.streams.filter { $0.kind == "audio" }
@@ -902,6 +1188,7 @@ public struct ExportPlanner: Sendable {
             next.snap = .exact
             switch rung {
             case .copyOtherContainer:
+                next.mode = .copy
                 let engine = CutEngine(cancelled: cancelled, useSidecar: useSidecar, tracks: cell.tracks,
                                        audioStream: request.audioStream, audioTrackOrdinal: request.audioTrackOrdinal)
                 for container in engine.suggestedContainers(for: source, clips: request.clips) where container != request.container {
@@ -921,7 +1208,16 @@ public struct ExportPlanner: Sendable {
                 candidates.append((rung, next))
             case .smartTrim:
                 next.mode = .smart
-                candidates.append((rung, next))
+                if request.mode == .copy {
+                    candidates.append((rung, next))
+                }
+                if request.container != nil {
+                    let engine = CutEngine(cancelled: cancelled, smartTrim: true, useSidecar: useSidecar, tracks: cell.tracks)
+                    for container in engine.suggestedContainers(for: source, clips: request.clips) where container != request.container {
+                        next.container = container
+                        candidates.append((rung, next))
+                    }
+                }
             case .convertSameFormat, .convertPCM, .convertAAC:
                 guard let action = rung == .convertSameFormat ? native : rung == .convertPCM ? .pcm : .aac else { continue }
                 // The same-format rung already covers AAC for an AAC source.
@@ -956,6 +1252,9 @@ public struct ExportPlanner: Sendable {
         var offers: [ExportOffer] = []
         for (rung, candidate) in candidates {
             if cancelled?() == true { return offers }
+            if rung == .smartTrim, candidate.container != request.container,
+               offers.contains(where: { ($0.alternative.rung == .smartTrim && $0.request.container == request.container)
+                   || ($0.alternative.mode == .copy && $0.alternative.container == candidate.container) }) { continue }
             let target = ExportRules.cell(source: kind, tracks: candidate.tracks, mode: candidate.mode)
             // The destination is named for the original request. Each alternative is planned on its own.
             guard target.isAllowed, let plan = try? self.plan(candidate, cell: target, output: nil, media: media) else { continue }
@@ -971,9 +1270,11 @@ public struct ExportPlanner: Sendable {
             // A re-encode offered for a re-encode names its container and audio action.
             let variant = rung == .reencode && request.mode == .encode
             let named = variant && candidate.audio == request.audio
+            let smartOtherContainer = rung == .smartTrim && candidate.container != request.container
+            let label = rung.label(container: container, audio: variant ? candidate.audio : action?.action, lossless: lossless)
             let alternative = ExportAlternative(
-                id: rung == .copyOtherContainer || named ? "\(rung.rawValue):\(container)" : rung.rawValue, rung: rung,
-                label: rung.label(container: container, audio: variant ? candidate.audio : action?.action, lossless: lossless),
+                id: rung == .copyOtherContainer || named || smartOtherContainer ? "\(rung.rawValue):\(container)" : rung.rawValue, rung: rung,
+                label: smartOtherContainer ? "\(label) in \(ExportRules.containerDisplayName(container))" : label,
                 mode: plan.mode, tracks: candidate.tracks, container: container, audio: variant ? candidate.audio : action?.action,
                 codec: action?.codec, bitRate: action?.bitRate, quality: action?.quality, lossless: lossless,
                 warnings: warnings, arguments: ExportRules.arguments(for: candidate, audioStream: stream),

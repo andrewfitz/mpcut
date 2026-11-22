@@ -26,15 +26,18 @@ private func outputEnum<T: RawRepresentable>(_ args: [String: Any], _ key: Strin
 }
 
 private func exportOptions(_ args: [String: Any], container: String, source: ExportSourceKind,
-                           defaultMode: ExportMode) throws -> ExportSheetOptions {
+                           defaultMode: ExportMode, placements: ExportPlacementScope = .none) throws -> ExportSheetOptions {
     guard !container.isEmpty, container.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) }) else {
         throw MCPCommandError("invalid_arguments", "Supply a container filename extension.")
     }
     var options = ExportSheetOptions()
     let tracks = try outputEnum(args, "tracks", source == .audio ? ExportTracks.audio : .all)
-    let mode = try outputEnum(args, "mode", source != .audio && tracks == .all ? defaultMode : .copy)
-    let cell = ExportRules.cell(source: source, tracks: tracks, mode: mode)
-    if let refusal = cell.refusal { throw refusal }
+    let ordinaryMode: ExportMode = source != .audio && tracks == .all ? defaultMode : .copy
+    let mode = try outputEnum(args, "mode", ExportRules.defaultStillMode(tracks: tracks, placements: placements, otherwise: ordinaryMode))
+    let cell = ExportRules.cell(source: source, tracks: tracks, mode: mode, placements: placements)
+    if let refusal = cell.refusal, refusal.code != "still_generation_required" { throw refusal }
+    options.placements = placements
+    options.requireCameraCopy = args["requireCameraCopy"] as? Bool ?? false
     options.tracks = cell.tracks
     options.mode = cell.resolvedMode
     options.codec = try outputEnum(args, "codec", .h264)
@@ -57,11 +60,16 @@ private func exportOptions(_ args: [String: Any], container: String, source: Exp
             throw MCPCommandError("invalid_arguments", "Choose a supported audio conversion action without video codec or quality settings.")
         }
     } else if options.mode == .encode {
-        guard cell.audioActions.contains(options.audio), ExportRules.allows(audio: options.audio, inMovieContainer: container) else {
+        guard (cell.tracks == .video && options.audio == .auto || cell.audioActions.contains(options.audio)),
+              ExportRules.allows(audio: options.audio, inMovieContainer: container) else {
             throw CutError(code: "unsupported_audio", message: "The requested audio action cannot be used for a movie in .\(container).")
         }
-    } else if args["codec"] != nil || args["quality"] != nil || ![.auto, .copyOriginal].contains(options.audio) {
-        throw MCPCommandError("invalid_arguments", "Video codec, quality and audio conversion options apply to encode mode.")
+    } else {
+        let audio: [ReencodeAudio] = placements != .none && options.mode == .smart && options.tracks == .all
+            ? [.auto, .copyOriginal, .aac, .pcm, .removeAudio] : [.auto, .copyOriginal]
+        guard args["codec"] == nil, args["quality"] == nil, audio.contains(options.audio) else {
+            throw MCPCommandError("invalid_arguments", "Choose settings supported for the selected mode and tracks.")
+        }
     }
     return options
 }
@@ -115,6 +123,12 @@ extension ProjectSessions {
         let work: MCPLiveOutputJobs.Work
         switch tool {
         case "apply_export_review":
+            if let adjustment = arguments["stillAdjustment"] {
+                return try await mcpApplyStillExportReview(adjustment, args: arguments, session: session, output: output, validateEdit: validateEdit)
+            }
+            if let project = session.mcpStillProject, project.mcpHasStills {
+                throw MCPCommandError("invalid_target", "Supply a verified stillAdjustment from the camera-copy preflight.")
+            }
             guard !session.isMulticam else { throw MCPCommandError("invalid_target", "Use the multicam switch editor for suggested group boundaries.") }
             let input = try editor.mcpExportInput(selection: false)
             let copyOptions = try exportOptions([:], container: output.pathExtension.lowercased(),
@@ -183,9 +197,15 @@ extension ProjectSessions {
     private func mcpRender(session: ProjectSession, output: URL, args: [String: Any]) throws -> MCPLiveOutputJobs.Work {
         let scope = args["scope"] as? String ?? "timeline"
         let dryRun = args["dryRun"] as? Bool ?? true
+        if let snapshot = try mcpRenderStillSnapshot(session: session, scope: scope) {
+            return try mcpRenderStills(session: session, snapshot: snapshot, output: output, args: args, dryRun: dryRun)
+        }
         let source: ExportSourceKind = session.isMulticam ? .multicam : (session.editor.isAudioOnly ? .audio : .movie)
         let options = try exportOptions(args, container: output.pathExtension.lowercased(), source: source,
                                         defaultMode: preferences.defaultExportMode)
+        guard !options.requireCameraCopy || options.tracks == .audio || options.effectiveMode == .copy else {
+            throw MCPCommandError("invalid_arguments", "Select Lossless Copy to preserve camera samples.")
+        }
         let useReviewedCuts = args["useReviewedCuts"] as? Bool ?? false
         guard !useReviewedCuts || (!session.isMulticam && options.mode == .copy && options.tracks == .all) else {
             throw MCPCommandError("invalid_arguments", "Reviewed export cuts apply to ordinary full-track copy exports.")
@@ -209,11 +229,11 @@ extension ProjectSessions {
                 try CutEngine().checkDestination(output)
                 let plan: MulticamExportPlan
                 do {
-                    plan = try engine.resolve(project, relativeTo: location, output: output, mode: options.effectiveMode,
-                                              tracks: options.tracks, assembly: ranges, settings: options.settings, indexedSources: indexed)
+                    plan = try engine.resolution(project, relativeTo: location, output: output, mode: options.effectiveMode,
+                                                 tracks: options.tracks, assembly: ranges, settings: options.settings, indexedSources: indexed).get()
                 } catch let issue as CutError where dryRun {
                     try Task.checkCancellation()
-                    return Self.outputRefusal(issue)
+                    return try Self.outputRefusal(issue)
                 }
                 if !dryRun {
                     try engine.write(plan, to: output) { progress.update($0) }
@@ -238,11 +258,9 @@ extension ProjectSessions {
             case .unavailable(let message, let review):
                 var issue = resolved.failure ?? CutError(code: "unavailable", message: message)
                 let alternatives = resolved.offers.map(\.alternative)
-                if !dryRun {
-                    issue.alternatives = alternatives.isEmpty ? nil : alternatives
-                    throw issue
-                }
-                var result = Self.outputRefusal(issue)
+                issue.alternatives = alternatives.isEmpty ? nil : alternatives
+                if !dryRun { throw issue }
+                var result = try Self.outputRefusal(issue)
                 result["reason"] = Self.outputDetail(message)
                 if let review {
                     result["review"] = Self.outputDetail(review.detail)
@@ -253,11 +271,16 @@ extension ProjectSessions {
                         return item
                     })
                 }
-                if let first = alternatives.first {
-                    result["fallback"] = ["title": first.label, "mode": first.mode.rawValue, "container": first.container]
-                    result["alternatives"] = try Self.outputJSON(alternatives)
-                }
                 return result
+            case .stillReady(let plan):
+                if !dryRun {
+                    try StillExportPlanner(cancelled: outputCancelled).write(plan, to: output) { fraction in
+                        progress.update(fraction)
+                        return !Task.isCancelled
+                    }
+                    progress.published(output)
+                }
+                return ["eligible": true, "dryRun": dryRun, "plan": try Self.outputJSON(plan.report)]
             case .ready(let plan):
                 if !dryRun {
                     try plan.writeOutput(to: output, cancelled: outputCancelled) { progress.update($0) }
@@ -278,8 +301,150 @@ extension ProjectSessions {
         }
     }
 
-    nonisolated private static func outputRefusal(_ issue: CutError) -> [String: Any] {
-        ["eligible": false, "dryRun": true, "reason": outputDetail(issue.message), "issue": MCPLiveOutputJobs.errorFields(issue)]
+    private func mcpRenderStillSnapshot(session: ProjectSession, scope: String) throws -> CutProject? {
+        guard let project = session.mcpStillProject, project.mcpHasStills else { return nil }
+        if case .multicam(var value) = project {
+            if scope == "group" { value.assemblyItems = nil }
+            if scope == "selection" {
+                let model = session.multicam
+                if let selection = model.assemblySelection {
+                    value = try value.assemblySelection(.init(from: selection.from, to: selection.to))
+                } else {
+                    let ranges = model.selectedExportRanges
+                    guard !ranges.isEmpty else { throw MCPCommandError("no_selection", "Select a multicam range first.") }
+                    value.assembly = ranges
+                }
+            }
+            return .multicam(value)
+        }
+        guard scope != "group" else { throw MCPCommandError("invalid_target", "Group time requires a multicam project.") }
+        guard scope == "selection" else { return project }
+        guard session.editor.canActOnRange else { throw MCPCommandError("no_selection", "Select a timeline range first.") }
+        return try session.editor.stillProjectForSelection()
+    }
+
+    private func mcpRenderStills(session: ProjectSession, snapshot: CutProject, output: URL,
+                                 args: [String: Any], dryRun: Bool) throws -> MCPLiveOutputJobs.Work {
+        guard args["useReviewedCuts"] as? Bool != true else {
+            throw MCPCommandError("invalid_target", "Use still placement edits to change a still boundary.")
+        }
+        let tracks = try outputEnum(args, "tracks", ExportTracks.all)
+        let placements = try snapshot.exportPlacementScope()
+        let ordinaryMode: ExportMode = tracks == .all ? preferences.defaultExportMode : .copy
+        let mode = try outputEnum(args, "mode", ExportRules.defaultStillMode(tracks: tracks, placements: placements, otherwise: ordinaryMode))
+        let codec = try outputEnum(args, "codec", ReencodeCodec.h264)
+        let quality = try outputEnum(args, "quality", codec == .prores ? ReencodeQuality.prores422 : .balanced)
+        let audio = try outputEnum(args, "audio", ReencodeAudio.auto)
+        if args["codec"] != nil || args["quality"] != nil {
+            guard mode == .encode, tracks != .audio else {
+                throw MCPCommandError("invalid_arguments", "Video codec and quality apply to picture encode mode.")
+            }
+        }
+        let settings = ReencodeSettings(codec: codec, quality: quality, audio: audio)
+        let requireCameraCopy = args["requireCameraCopy"] as? Bool ?? false
+        if case .multicam(let project) = snapshot,
+           let issue = session.multicam.refreshExportIssue(in: try project.plan(), tracks: tracks, mode: mode, settings: settings) {
+            throw MCPCommandError("source_needs_review", issue)
+        }
+        let location = session.mcpStillLocation
+        let sidecar = session.isMulticam ? session.multicam.useAnalysisSidecars : session.editor.useAnalysisSidecars
+        let mediaFiles: [String]
+        switch snapshot {
+        case .sequence(let clips):
+            if let issue = session.editor.refreshedSourceIssue(for: clips) {
+                throw MCPCommandError("source_needs_review", issue)
+            }
+            mediaFiles = clips.map(\.file)
+        case .stillSequence(let sequence):
+            let clips = sequence.items.compactMap(\.source)
+            if let issue = session.editor.refreshedSourceIssue(for: clips) {
+                throw MCPCommandError("source_needs_review", issue)
+            }
+            mediaFiles = clips.map(\.file)
+        case .multicam(let project): mediaFiles = project.sources.map(\.file)
+        }
+        let document = location ?? URL(fileURLWithPath: "/Untitled.cut")
+        let referencedMedia = Set(mediaFiles.map { CutProject.mediaURL($0, relativeTo: document).path })
+        let indexed = session.isMulticam ? Array(session.multicam.media.values) : Array(session.editor.analysisSourceMedia.values)
+        let pinnedMedia = indexed.filter { referencedMedia.contains($0.url.path) }
+        let audioStream: Int?
+        if let ordinal = args["audioTrackOrdinal"] as? Int {
+            let tracksByOrdinal = session.editor.audioTracks
+            guard !session.isMulticam, tracks == .audio, tracksByOrdinal.indices.contains(ordinal) else {
+                throw MCPCommandError("invalid_arguments", "Choose an available ordinary audio track ordinal with audio-only output.")
+            }
+            audioStream = tracksByOrdinal[ordinal].index
+        } else {
+            audioStream = nil
+        }
+        return { progress in
+            let planner = StillExportPlanner(useSidecar: sidecar, cancelled: outputCancelled)
+            let plan: StillExportPlan
+            do {
+                for media in pinnedMedia where !media.identity.isCurrentSnapshot(at: media.url) {
+                    throw CutError(code: "source_changed", message: "\(media.url.lastPathComponent) changed after the render was requested.")
+                }
+                plan = try planner.resolve(snapshot, relativeTo: location, tracks: tracks, audioStream: audioStream,
+                                           mode: mode, requireCameraCopy: requireCameraCopy, output: output, settings: settings)
+            } catch let issue as CutError where dryRun {
+                try Task.checkCancellation()
+                return try Self.outputRefusal(issue)
+            }
+            if !dryRun {
+                try planner.write(plan, to: output) { fraction in
+                    progress.update(fraction)
+                    return !Task.isCancelled
+                }
+                progress.published(output)
+            }
+            return ["eligible": true, "dryRun": dryRun, "plan": try Self.outputJSON(plan.report)]
+        }
+    }
+
+    private func mcpApplyStillExportReview(_ value: Any, args: [String: Any], session: ProjectSession, output: URL,
+                                           validateEdit: @escaping @MainActor () throws -> Void) async throws -> [String: Any] {
+        guard session.mcpCanEditStills, let project = session.mcpStillProject, project.mcpHasStills else {
+            throw MCPCommandError("invalid_target", "An editable still placement is required.")
+        }
+        let adjustment = try JSONDecoder().decode(StillBoundaryAdjustment.self, from: JSONSerialization.data(withJSONObject: value))
+        let mode = try outputEnum(args, "mode", ExportMode.smart)
+        let tracks = try outputEnum(args, "tracks", ExportTracks.all)
+        let audio = try outputEnum(args, "audio", ReencodeAudio.auto)
+        guard tracks != .audio else { throw MCPCommandError("invalid_arguments", "Select picture to review a camera boundary.") }
+        let settings = ReencodeSettings(audio: audio)
+        let location = session.mcpStillLocation
+        let sidecar = session.isMulticam ? session.multicam.useAnalysisSidecars : session.editor.useAnalysisSidecars
+        let candidate = try project.applyingStillBoundary(adjustment)
+        let report = try await prepareOutput {
+            let planner = StillExportPlanner(useSidecar: sidecar, cancelled: outputCancelled)
+            do {
+                _ = try planner.resolve(project, relativeTo: location, tracks: tracks, mode: mode, requireCameraCopy: true,
+                                        output: output, settings: settings)
+                throw MCPCommandError("no_review", "The current timeline can already preserve camera samples.")
+            } catch let issue as CutError {
+                guard issue.stillBoundaryAdjustments?.contains(adjustment) == true else { throw issue }
+            }
+            return try planner.resolve(candidate, relativeTo: location, tracks: tracks, mode: mode, requireCameraCopy: true,
+                                       output: output, settings: settings).report
+        }
+        try validateEdit()
+        let action = "Apply Reviewed Still Boundary"
+        try session.mcpCommitStill(candidate, action: action)
+        return ["action": action, "revision": session.mcpRevision, "placement": adjustment.placementID,
+                "review": try Self.outputJSON(adjustment), "plan": try Self.outputJSON(report),
+                "historyRetained": preferences.historyLimit > 0]
+    }
+
+    nonisolated private static func outputRefusal(_ issue: CutError) throws -> [String: Any] {
+        var detail = issue
+        detail.alternatives = nil
+        var result: [String: Any] = ["eligible": false, "dryRun": true, "reason": outputDetail(issue.message),
+                                     "issue": MCPLiveOutputJobs.errorFields(detail)]
+        if let alternatives = issue.alternatives, let first = alternatives.first {
+            result["fallback"] = ["title": first.label, "mode": first.mode.rawValue, "container": first.container]
+            result["alternatives"] = try outputJSON(alternatives)
+        }
+        return result
     }
 
     nonisolated private static func outputDetail(_ value: String) -> String {
@@ -313,9 +478,13 @@ private extension ProjectSessions {
             indexed = session.multicam.media
             sequence = []; ordinary = []
         } else {
-            let input = try session.editor.mcpExportInput(selection: false)
-            snapshot = .sequence(session.editor.sequenceClips)
-            sequence = input.clips; ordinary = Array(input.media.values); indexed = [:]
+            snapshot = session.editor.stillProject
+            if snapshot.mcpHasStills {
+                sequence = []; ordinary = []; indexed = [:]
+            } else {
+                let input = try session.editor.mcpExportInput(selection: false)
+                sequence = input.clips; ordinary = Array(input.media.values); indexed = [:]
+            }
         }
         let location = (session.isMulticam ? session.multicam.projectURL : session.editor.projectURL) ?? output
         let allowLoss = args["allowLoss"] as? Bool ?? false
@@ -323,11 +492,12 @@ private extension ProjectSessions {
         let open = args["openInResolve"] as? Bool ?? false
         return { progress in
             if resolve {
+                try ResolveExport.rejectUnsupportedStills(snapshot)
                 switch snapshot {
                 case .multicam(let project):
                     try ResolveExport.write(project, relativeTo: location, to: output, useSidecar: AnalysisSidecar.readsEnabled,
                                             matching: indexed, auxiliaryOutput: progress.published, cancelled: outputCancelled)
-                case .sequence:
+                case .sequence, .stillSequence:
                     try ResolveExport.write(sequence, to: output, useSidecar: AnalysisSidecar.readsEnabled,
                                             matching: ordinary, auxiliaryOutput: progress.published, cancelled: outputCancelled)
                 }
@@ -349,37 +519,73 @@ private extension ProjectSessions {
         let ranges = session.editor.queuedRanges
         let groups = session.multicam.queuedRanges
         let dryRun = args["dryRun"] as? Bool ?? true
+        if let issue = multi ? session.multicam.queuedMediaRefreshIssue() : session.editor.queuedMediaRefreshIssue() {
+            throw MCPCommandError(issue.code, issue.message)
+        }
         guard !(multi ? groups.isEmpty : ranges.isEmpty) else { throw MCPCommandError("empty_queue", "Queue at least one range first.") }
-        let hasVideo = ranges.contains { $0.media.values.contains(where: \.hasVideo) }
+        let hasVideo = ranges.contains { $0.stillProject != nil || $0.media.values.contains(where: \.hasVideo) }
         let source: ExportSourceKind = multi ? .multicam : (hasVideo ? .movie : .audio)
-        let options = try exportOptions(args, container: container, source: source, defaultMode: preferences.defaultExportMode)
+        var placements = ranges.map(\.placements).max(by: { $0.rawValue < $1.rawValue }) ?? .none
+        for entry in groups {
+            var project = entry.project
+            if !entry.usesAssembly { project.assemblyItems = [.group(entry.range)] }
+            let scope = try CutProject.multicam(project).exportPlacementScope()
+            if scope.rawValue > placements.rawValue { placements = scope }
+        }
+        let options = try exportOptions(args, container: container, source: source,
+                                        defaultMode: preferences.defaultExportMode, placements: placements)
+        let mode = try (args["mode"] as? String).map { _ in try outputEnum(args, "mode", ExportMode.copy) }
+        let sidecars = multi ? session.multicam.useAnalysisSidecars : session.editor.useAnalysisSidecars
+        let defaultOrdinaryMode: ExportMode = source != .audio && options.tracks == .all ? preferences.defaultExportMode : .copy
+        let hasStills = placements != .none
         guard !multi || options.audioTrackOrdinal == nil else { throw MCPCommandError("invalid_arguments", "Multicam uses routed program audio.") }
+
         return { progress in
             let outputs: [URL]
             let write: (Int, @escaping @Sendable (Double) -> Void) throws -> Void
-            if multi {
-                let engine = MulticamEngine(cancelled: outputCancelled)
-                let batch = try MulticamBulkExport(ranges: groups, directory: output, container: container, mode: options.effectiveMode,
-                                                   tracks: options.tracks, settings: options.settings, engine: engine)
-                outputs = batch.items.map(\.output)
-                write = { try batch.write(batch.items[$0], progress: $1) }
-            } else {
-                var indexed: [URL: MediaInfo] = [:]
-                for range in ranges {
-                    try Task.checkCancellation()
-                    for (url, media) in range.media {
-                        if let previous = indexed[url], previous.identity != media.identity {
-                            throw CutError(code: "source_changed", message: "Queued ranges refer to different versions of \(url.lastPathComponent).")
+            var plans: [[String: Any]] = []
+            do {
+                if multi {
+                    let engine = MulticamEngine(cancelled: outputCancelled)
+                    let batch = try MulticamBulkExport(ranges: groups, directory: output, container: container,
+                                                       mode: mode ?? (!hasStills ? options.effectiveMode : nil),
+                                                       tracks: options.tracks, settings: options.batchSettings, engine: engine,
+                                                       requireCameraCopy: options.requireCameraCopy, cancelled: outputCancelled)
+                    outputs = batch.items.map(\.output)
+                    plans = try batch.items.compactMap { item in
+                        guard let report = item.stillReport else { return nil }
+                        return ["destination": item.output.path, "plan": try Self.outputJSON(report)]
+                    }
+                    write = { try batch.write(batch.items[$0], progress: $1) }
+                } else {
+                    var identities: [URL: SourceIdentity] = [:]
+                    for range in ranges {
+                        try Task.checkCancellation()
+                        for (url, media) in range.media {
+                            if let previous = identities[url], previous != media.identity {
+                                throw CutError(code: "source_changed", message: "Queued ranges refer to different versions of \(url.lastPathComponent).")
+                            }
+                            identities[url] = media.identity
                         }
-                        indexed[url] = media
+                    }
+                    let batch = try SequenceQueuePlan(ranges, directory: output, options: options, useSidecar: sidecars,
+                                                      ordinaryModeWhenUnspecified: mode == nil ? defaultOrdinaryMode : nil,
+                                                      cancelled: outputCancelled)
+                    outputs = batch.items.map(\.output)
+                    plans = try batch.items.compactMap { item in
+                        guard case .still(let plan) = item.payload else { return nil }
+                        return ["destination": item.output.path, "plan": try Self.outputJSON(plan.report)]
+                    }
+                    write = { index, update in
+                        try batch.write(batch.items[index]) {
+                            update($0)
+                            return !Task.isCancelled
+                        }
                     }
                 }
-                let settings = options.convertsAudio ? ReencodeSettings(audio: options.audioFormat) : options.settings
-                let batch = try BulkExport(groups: ranges.map(\.clips), directory: output, mode: options.effectiveMode,
-                                           tracks: options.tracks, audioTrackOrdinal: options.audioTrackOrdinal,
-                                           container: container, settings: settings, media: indexed, cancelled: outputCancelled)
-                outputs = batch.items.map(\.output)
-                write = { try batch.write(batch.items[$0], progress: $1) }
+            } catch let issue as CutError where dryRun && hasStills {
+                try Task.checkCancellation()
+                return try Self.outputRefusal(issue)
             }
             for path in outputs { try CutProject.validateMediaDestination(path, absoluteSources: protected) }
             if !dryRun {
@@ -389,7 +595,9 @@ private extension ProjectSessions {
                     progress.published(path)
                 }
             }
-            return ["dryRun": dryRun, "destinations": outputs.map(\.path)]
+            var result: [String: Any] = ["dryRun": dryRun, "destinations": outputs.map(\.path)]
+            if !plans.isEmpty { result["stillPlans"] = plans }
+            return result
         }
     }
 
@@ -407,6 +615,9 @@ private extension ProjectSessions {
         let limit = args["limit"] as? Int
         if let limit, limit < 1 || !["scenes", "nonSilent"].contains(mode) {
             throw MCPCommandError("invalid_arguments", "Supply a positive limit with scene or non-silent sampling.")
+        }
+        if let work = try mcpProgramFrameExport(session: session, output: output, args: args, mode: mode, times: times, preset: preset) {
+            return work
         }
         if session.isMulticam, let project = session.multicam.project {
             let model = session.multicam, indexed = model.media
@@ -426,6 +637,10 @@ private extension ProjectSessions {
                     }
                     targets = [group]
                 }
+                let cameras = targets.compactMap { project.selection(at: $0)?.angle }
+                if let issue = cameras.lazy.compactMap({ model.refreshPictureIssue(sourceID: $0) }).first {
+                    throw MCPCommandError("source_needs_review", issue)
+                }
                 let url = model.projectURL
                 return { progress in
                     let manifest = try JPEGExport.writeMulticam(project, document: url, at: targets, to: output, preset: preset,
@@ -438,6 +653,9 @@ private extension ProjectSessions {
             }
             guard let mapping = model.mapping else { throw MCPCommandError("no_picture", "No active program preview.") }
             let active = try MulticamStillPosition.at(model.preview.currentTime(), in: mapping)
+            if let issue = model.refreshPictureIssue(sourceID: active.angle) {
+                throw MCPCommandError("source_needs_review", issue)
+            }
             guard let source = indexed[active.angle], source.hasFullEditIndex else {
                 throw MCPCommandError("unavailable", "Wait for the active camera to finish indexing.")
             }
@@ -495,14 +713,6 @@ private extension ProjectSessions {
             try Self.writeFrameSet(source.media, selection: selection, sample: sample, preset: preset, limit: limit,
                                    useSidecar: sidecar, to: output, progress: progress)
         }
-    }
-
-    nonisolated static func writeStill(_ media: MediaInfo, time: RationalTime, exclusiveEnd: Bool = false,
-                                       to output: URL, progress: MCPLiveOutputProgress) throws -> [String: Any] {
-        let frame = try JPEGExport.stillFrameTime(in: media, at: time, exclusiveEnd: exclusiveEnd)
-        try JPEGExport.writeStill(media, at: time, to: output, replacing: nil, exclusiveEnd: exclusiveEnd, cancelled: outputCancelled)
-        progress.published(output)
-        return ["sourceTime": frame.description, "frames": 1]
     }
 
     nonisolated static func writeFrameSet(_ media: MediaInfo, selection: JPEGSelection, sample: JPEGSample, preset: JPEGPreset,

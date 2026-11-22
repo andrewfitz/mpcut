@@ -55,7 +55,8 @@ class ExportModes(unittest.TestCase):
         index = query("help")
         self.assertEqual(index["version"], query("--version")["version"])
         self.assertEqual(set(index["commands"]), {"help", "version", "inspect", "export", "bulk", "rearrange",
-                                                 "sidecar", "frames", "waveform", "silence", "scenes", "multicam", "resolve", "convert"})
+                                                 "sidecar", "refresh", "frames", "waveform", "silence", "scenes",
+                                                 "multicam", "still", "resolve", "convert"})
         for name, expected in index["commands"].items():
             verb = "--version" if name == "version" else name
             self.assertEqual(query("help", name), expected)
@@ -105,14 +106,23 @@ class ExportModes(unittest.TestCase):
         self.assertEqual(result["segments"], plan["segments"])
         self.assertTrue(self.output.is_file())
 
-    def test_copy_remains_the_default(self):
+    def test_default_mode_is_the_apps_and_copy_is_named(self):
+        # Without --mode the CLI uses the app's default, Smart Trim, with or without --order.
+        index = json.loads(subprocess.check_output([CLI, "help", "--json"]))
+        self.assertEqual(index["defaultExportMode"], "smart")
+        self.assertEqual(index["defaultExportModes"], {"movie": "smart", "audio": "copy", "multicam": "smart"})
         default = self.export()
-        self.assertEqual(default, self.export("--mode", "copy"))
-        self.assertEqual(default["mode"], "copy")
-        self.assertEqual(ratio(default["encodedDuration"]), 0)
-        self.assertEqual(ratio(default["copiedDuration"]), ratio(default["duration"]))
-        self.assertEqual(default["segments"][0]["trackActions"][0]["action"], "copy")
-        self.export(start="0.28", exit_code=1)
+        self.assertEqual(default, self.export("--mode", "smart"))
+        self.assertEqual(default["mode"], "smart")
+        # A cut inside a picture group is written by the default and refused by a named copy.
+        self.assertEqual(self.export(start="7/25")["mode"], "smart")
+        self.assertEqual(self.export("--mode", "copy", start="7/25", exit_code=1)["error"]["code"], "unsafe_boundary")
+        copy = self.export("--mode", "copy")
+        self.assertEqual(copy["mode"], "copy")
+        self.assertEqual(ratio(copy["encodedDuration"]), 0)
+        self.assertEqual(ratio(copy["copiedDuration"]), ratio(copy["duration"]))
+        self.assertEqual(copy["segments"][0]["trackActions"][0]["action"], "copy")
+        self.export("--mode", "copy", start="0.28", exit_code=1)
 
     def test_order_flags_and_json_validate_before_writing(self):
         request = {"output": str(self.output), "file": str(self.fixture),
@@ -202,7 +212,7 @@ class ExportModes(unittest.TestCase):
         for field, edge in [("from", "start"), ("to", "end")]:
             with self.subTest(field=field):
                 report = self.export(request={
-                    "output": str(self.output), "clips": [{"file": str(self.fixture), field: "7/25"}],
+                    "output": str(self.output), "clips": [{"file": str(self.fixture), field: "7/25"}], "mode": "copy",
                 }, exit_code=1)
                 self.assertEqual(report["error"]["boundary"], field)
                 self.assertEqual(report["error"]["message"], f"There is no verified video {edge} boundary at 7/25.")

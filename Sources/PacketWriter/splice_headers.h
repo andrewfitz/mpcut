@@ -9,6 +9,7 @@
 int mpcut_splice_encoded(AVPacket *packet, const AVCodecParameters *source, bool first);
 int mpcut_splice_check_copy(const AVPacket *packet, const AVCodecParameters *source,
                             const uint8_t *extra, int extra_size);
+int mpcut_splice_check_still_hdr(const AVPacket *packet, const uint8_t *extra, int extra_size);
 int mpcut_splice_restore(AVPacket *packet, const AVCodecParameters *codec,
                          const uint8_t *extra, int extra_size);
 

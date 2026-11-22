@@ -87,8 +87,23 @@ class MulticamCLITests(unittest.TestCase):
         self.write(lambda document: document["switches"][1].update(at="1x"))
         for args, request in self.entry_points():
             with self.subTest(args=args[:3], stdin=request is not None):
-                error = self.failure(*args, request=request, status=1, code="invalid_multicam_project")
+                # A malformed time is a request to correct: exit 2 and `invalid_time`, as for a time on the command line.
+                error = self.failure(*args, request=request, status=2, code="invalid_time")
                 self.assertIn("‘1x’ in switches[1].at", error["message"])
+        silence = ["silence", "--project", self.project, "--json"]
+        resolve = ["resolve", "--project", self.project, "--output", "timeline.fcpxml", "--json"]
+        for args in (silence, [*silence, "--output", "program.mov", "--dry-run"], resolve):
+            with self.subTest(args=args[:3]):
+                error = self.failure(*args, status=2, code="invalid_time")
+                self.assertIn("‘1x’ in switches[1].at", error["message"])
+        sequence = self.fixtures / "sequence.cut"
+        sequence.write_text(json.dumps({"format": "mpcut", "schemaVersion": 1, "kind": "sequence", "clips": [
+            {"id": "a", "file": "wide.mov", "from": "0", "to": "1x"}]}))
+        self.addCleanup(sequence.unlink)
+        self.before = self.listing()
+        error = self.failure("inspect", "--project", sequence, "--json", status=2, code="invalid_time")
+        self.assertIn("‘1x’ in clips[0].to", error["message"])
+        self.write(lambda document: document["switches"][1].update(at="1x"))
         self.write(lambda document: document["angles"][0].update(extra=1))
         error = self.failure("inspect", "--project", self.project, "--json", status=1, code="invalid_multicam_project")
         self.assertIn("angles[0]", error["message"])
@@ -102,7 +117,7 @@ class MulticamCLITests(unittest.TestCase):
             "assembly empty": lambda d: d.update(assembly=[{"from": "3", "to": "3"}]),
             "repeated id": lambda d: d["audioSources"][0].update(id="wide"),
             "blank id": lambda d: d["angles"][1].update(id=" "),
-            "future version": lambda d: d.update(schemaVersion=2, extra=True),
+            "future version": lambda d: d.update(schemaVersion=3),
             "wrong kind": lambda d: d.update(kind="edit"),
             "unknown field": lambda d: d.update(extra=True),
             "video stream as sound": lambda d: d.update(audio={"mode": "fixed", "source": "wide", "stream": 0}),
@@ -207,8 +222,7 @@ class MulticamCLITests(unittest.TestCase):
         for args in (["inspect", "--project", recording, "--json"],
                      ["export", "--project", recording, "--output", "program.mov", "--json"],
                      ["frames", "--project", recording, "--at", "1", "--output", "review", "--json"]):
-            code = "invalid_multicam_project" if args[0] == "frames" else "invalid_cut_project"
-            error = self.failure(*args, status=1, code=code)
+            error = self.failure(*args, status=1, code="invalid_cut_project")
             self.assertIn("64 MB", error["message"])
         self.failure("inspect", "--project", "/dev/null", "--json", status=1, code="cut_project_read_failed")
         self.failure("inspect", "--project", self.fixtures, "--json", status=1, code="cut_project_read_failed")
@@ -274,7 +288,8 @@ class MulticamCLITests(unittest.TestCase):
         # Every documented flag is parsed somewhere, and every parsed flag is documented.
         sources = Path(__file__).resolve().parents[2] / "Sources/MPCutCLI"
         parsed = set()
-        for file in ("Arguments.swift", "Frames.swift", "Silence.swift", "Sidecar.swift", "Waveform.swift"):
+        for file in ("Arguments.swift", "Frames.swift", "MediaAnalysis.swift", "Silence.swift",
+                     "Sidecar.swift", "StillCreate.swift", "Stills.swift", "Waveform.swift"):
             parsed |= set(re.findall(r'"(--[a-z][a-z-]*)"', (sources / file).read_text()))
         documented = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", json.dumps(overview, ensure_ascii=False)))
         self.assertEqual(documented - parsed, set())

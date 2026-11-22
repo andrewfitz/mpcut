@@ -21,14 +21,15 @@ extension MulticamEditorModel {
         preview.pause()
         let prompt = NSAlert()
         prompt.messageText = "Rename \(scene.defaultName)"
-        prompt.informativeText = "The name applies to every matching scene in this camera. Leave it blank to restore the default."
+        prompt.informativeText = "All matching scenes from this camera will use the new name. Clear the field to restore the default."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 270, height: 24))
+        field.toolTip = "Enter view name"
         field.placeholderString = scene.defaultName
         field.stringValue = scene.name ?? ""
         field.setAccessibilityLabel("View name")
         prompt.accessoryView = field
-        prompt.addButton(withTitle: "Save")
-        prompt.addButton(withTitle: "Cancel")
+        prompt.addButton(withTitle: "Save").toolTip = "Save view name"
+        prompt.addButton(withTitle: "Cancel").toolTip = "Cancel rename"
         prompt.window.initialFirstResponder = field
         prompt.beginSheetModal(for: window) { [weak self] result in
             guard result == .alertFirstButtonReturn else { return }
@@ -47,6 +48,29 @@ extension MulticamEditorModel {
         markOut = nil
         assemblySelection = nil
         return true
+    }
+
+    var selectedSceneCamera: String? {
+        guard let marker = selectedSwitch else { return nil }
+        return project?.switches.first(where: { $0.at == marker })?.angle
+    }
+
+    func confirmSceneRestart(camera: String? = nil, paused: Bool, repeatPrevious: Bool = false) {
+        guard !isBusy, let window else { return }
+        let prompt = NSAlert()
+        prompt.messageText = paused ? "Restart scene analysis?" : "Scan for scenes again?"
+        prompt.informativeText = "MPCut will start a new analysis for this footage."
+        prompt.addButton(withTitle: paused ? "Restart" : "Scan Again").toolTip = "Restart scene scan"
+        prompt.addButton(withTitle: "Cancel").toolTip = "Keep existing scene analysis"
+        prompt.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self, !self.isBusy else { return }
+            let policy = SceneScanPolicy.restart(operationID: UUID().uuidString)
+            if repeatPrevious {
+                self.analysis.repeatSceneScan(policy: policy)
+            } else {
+                self.analysis.scanScenes(camera: camera, policy: policy)
+            }
+        }
     }
 
     func canScanAnalysis(_ target: TimelineSnapTarget) -> Bool { !isBusy && analysis.canScan(target) }
@@ -79,9 +103,7 @@ extension MulticamEditorModel {
     func activeAnalysisOccurrence(containing time: RationalTime, at output: RationalTime? = nil) -> MulticamRange? {
         guard assemblyPreview else { return nil }
         let index = occurrenceIndex(at: output ?? preview.currentTime())
-        let ranges = ranges
-        guard ranges.indices.contains(index) else { return nil }
-        let range = ranges[index]
+        guard let range = assemblyRange(at: index) else { return nil }
         return range.contains(time) ? range : nil
     }
 

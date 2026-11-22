@@ -12,11 +12,20 @@ final class SidecarAnalysisTests: XCTestCase {
         let source = directory.appendingPathComponent("scan.mov")
         try FileManager.default.copyItem(at: original, to: source)
         let media = try CutEngine(useSidecar: false).inspect(source, keyframes: true)
-        var enabled = true
-        let report = try SceneAnalysis.scan(media, allowAutomaticSave: { enabled }, onScene: { _, _ in enabled = false })
-        XCTAssertFalse(enabled)
-        XCTAssertFalse(report.scenes.isEmpty)
-        XCTAssertEqual(try AnalysisSidecar(source: source).status(), "missing")
+        let sidecar = try AnalysisSidecar(source: source)
+        let session = SceneScanSession()
+        // Allow the initial lease, then disable persistence before the first analysis write.
+        // Marker delivery can be coalesced until after a short scan has completed.
+        let outcome = try SceneAnalysis.run(media, session: session, allowAutomaticSave: {
+            !FileManager.default.fileExists(atPath: sidecar.url.path)
+        })
+        XCTAssertEqual(outcome.state, .completed)
+        XCTAssertFalse(try XCTUnwrap(outcome.report).scenes.isEmpty)
+        XCTAssertEqual(sidecar.status(), "current")
+        XCTAssertNil(outcome.progress.durable)
+        XCTAssertNil(sidecar.sceneReport(for: media))
+        XCTAssertNil(SceneAnalysis.lookup(media, session: SceneScanSession()))
+        XCTAssertEqual(SceneAnalysis.lookup(media, useSidecar: false, session: session)?.state, .upToDate)
     }
 
     func testLegacyRoundedPeaksAreRecomputedWhileSignedEnvelopeIsReused() throws {

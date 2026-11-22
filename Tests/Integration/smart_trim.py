@@ -103,8 +103,8 @@ class SmartTrimTests(unittest.TestCase):
 
     def export(self, output, ranges, *, smart=True, dry=False, ok=True):
         args = [CLI, "export", "--json", "--output", output]
-        if smart:
-            args.append("--smart-trim")
+        # Smart Trim is the default, so the tests of Lossless Copy name it.
+        args += ["--smart-trim"] if smart else ["--mode", "copy"]
         if dry:
             args.append("--dry-run")
         for source, start, end in ranges:

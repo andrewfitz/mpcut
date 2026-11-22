@@ -18,7 +18,8 @@ struct ReverseAudioTimeline {
 
     init(ranges: [PreviewRange], offsets: [Double], composition: AVAsset?) {
         let starts = offsets.map(Self.frame)
-        regions = ranges.enumerated().map { index, range in
+        regions = ranges.enumerated().compactMap { index, range in
+            guard !range.isSilentInsert else { return nil }
             let start = starts[index]
             let end = index + 1 < starts.count
                 ? starts[index + 1] : Self.frame(offsets[index] + (range.end - range.start))

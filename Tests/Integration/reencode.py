@@ -79,6 +79,56 @@ class ReencodeTests(unittest.TestCase):
         self.assertEqual(output.exists(), ok and not dry)
         return report
 
+    def test_reencode_converts_different_soundtracks_by_audio_order(self):
+        original = self.root / "original.mov"
+        working = self.root / "working.mov"
+        for path, frequencies, mapping, codec in [
+            (original, (330, 440), ("0:v", "1:a", "2:a"), "aac"),
+            (working, (660, 880), ("1:a", "0:v", "2:a"), "pcm_f32le"),
+        ]:
+            ffmpeg("-i", self.video, "-f", "lavfi", "-i", f"sine=d=1:r=48000:f={frequencies[0]}",
+                   "-f", "lavfi", "-i", f"sine=d=1:r=48000:f={frequencies[1]}",
+                   "-map", mapping[0], "-map", mapping[1], "-map", mapping[2],
+                   "-c:v", "copy", "-c:a:0", codec, "-c:a:1", "pcm_s16le",
+                   "-disposition:a:0", "default", "-disposition:a:1", "0", path)
+        self.assertEqual([stream(file, "a:0")["index"] for file in (original, working)], [1, 0])
+        clips = [(original, 0, 1), (working, 0, 1)]
+        denied = self.export(self.root / "copy.mov", clips, audio="copy", dry=True, ok=False)
+        self.assertEqual(denied["error"]["code"], "incompatible_clip")
+        for action in ("auto", "aac", "pcm", "remove"):
+            with self.subTest(action=action):
+                output = self.root / f"{action}.mov"
+                # Put PCM first for Auto so it must still decline an exact PCM copy
+                # when the corresponding track in the next clip is AAC.
+                ordered = clips[::-1] if action == "auto" else clips
+                self.export(output, ordered, audio=action)
+                streams = probe(output, "-show_streams")["streams"]
+                if action == "remove":
+                    self.assertEqual([item["codec_type"] for item in streams], ["video"])
+                    continue
+                self.assertEqual([item["codec_type"] for item in streams], ["video", "audio", "audio"])
+                if action == "auto":
+                    self.assertEqual([item["codec_name"] for item in streams[1:]], ["aac", "pcm_s16le"])
+                for index in range(2):
+                    samples = pcm(output, 48_000, index)
+                    self.assertGreaterEqual(len(samples), 96_000)
+                    for position, (file, _, _) in enumerate(ordered):
+                        start = position * 48_000
+                        expected = pcm(file, 48_000, index)[:48_000]
+                        actual = samples[start:start + 48_000]
+                        self.assertGreater(correlation(actual, expected), 0.99)
+        mismatched = self.root / "different-clock.mov"
+        ffmpeg("-i", working, "-map", "0", "-c", "copy", "-c:a:0", "pcm_f32le", "-ar:a:0", "44100", mismatched)
+        # Another sample rate makes the timeline mixed: its sound is converted to one format, and an exact copy is refused.
+        report = self.export(self.root / "mixed-clock.mov", [(original, 0, 1), (mismatched, 0, 1)],
+                             audio="pcm", dry=True)
+        self.assertIn("audio sample rate", report["warnings"][0])
+        self.assertIn("Audio track 1 is resampled to 48 kHz", "\n".join(report["warnings"]))
+        report = self.export(self.root / "invalid.mov", [(original, 0, 1), (mismatched, 0, 1)],
+                             audio="copy", dry=True, ok=False)
+        self.assertEqual(report["error"]["code"], "incompatible_clip")
+        self.assertIn("sample rate", report["error"]["message"])
+
     def test_selected_codecs_encode_every_frame_in_requested_order(self):
         src_packets = packets(self.video)
         self.assertNotEqual([int(p["pts"]) for p in src_packets],

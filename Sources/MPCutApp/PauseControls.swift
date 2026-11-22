@@ -9,14 +9,25 @@ struct PauseControls: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionHeading("Detection")
-            if editor.audioTracks.count > 1 {
+            if editor.playheadAudioTracks.count > 1 {
                 InspectorRow("Analyze track", labelWidth: 96) {
-                    Picker("Analyze track", selection: Binding(get: { editor.analysisTrack }, set: editor.chooseAnalysisTrack)) {
-                        ForEach(Array(editor.audioTracks.enumerated()), id: \.offset) { index, stream in
-                            Text("Track \(index + 1) · \(stream.codec) · \(stream.language)").tag(index)
+                    Picker("Analyze track", selection: Binding<Int?>(
+                        get: { editor.audioMonitoringTrack },
+                        set: { track in
+                            if let track { editor.chooseAnalysisTrack(track) }
+                            else { editor.monitorSourceAudio() }
+                        }
+                    )) {
+                        Text("Follow Source Audio").tag(nil as Int?)
+                        ForEach(Array(editor.playheadAudioTracks.enumerated()), id: \.offset) { index, stream in
+                            Text("Track \(index + 1) · \(stream.audioFormatLabel)").tag(Optional(index))
                         }
                     }
+                    .help("Choose track to analyze")
                 }
+            }
+            if let note = editor.audioTrackFallbackNote {
+                Text(note).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             if let source = editor.pauseSourceLabel {
                 Text(source).font(.callout).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
@@ -28,7 +39,7 @@ struct PauseControls: View {
                     set: { automatic in editor.manualThresholdDB = automatic ? nil : editor.effectiveThresholdDB }
                 ))
                 .disabled(editor.effectiveThresholdDB == nil)
-                .help("Estimate the silence threshold for this recording and audio track.")
+                .help("Estimate silence threshold")
                 if editor.manualThresholdDB == nil {
                     Spacer()
                     if let level = editor.effectiveThresholdDB {
@@ -48,7 +59,7 @@ struct PauseControls: View {
             PauseSetting(label: "Leave per pause", unit: "s", value: $editor.leavePause, minimum: 0, step: 0.1)
             Button("Use Marked Room Tone") { editor.useRoomTone() }
                 .disabled(!editor.canUseRoomTone)
-                .help("Use the marked audio to set a manual threshold for each recording in the selection.")
+                .help("Measure marked room tone")
             Divider().padding(.vertical, 2)
             SectionHeading("Pauses")
             if let progress = editor.silenceProgress {
@@ -56,9 +67,11 @@ struct PauseControls: View {
                     Text("Finding silence… \(progressPercent(progress))").font(.callout).monospacedDigit()
                 }
                 Button("Cancel Scan", action: editor.cancelSilenceScan)
+                    .help("Cancel silence scan")
             } else if let issue = editor.silenceIssue {
                 IssueLabel(issue)
                 Button("Retry Silence Scan", action: editor.scanForSilence).disabled(!editor.canScanSilence)
+                    .help("Retry silence scan")
             } else {
                 HStack(alignment: .firstTextBaseline) {
                     if editor.pauseAnalysisReady {
@@ -69,14 +82,15 @@ struct PauseControls: View {
                     Button(editor.pauseAnalysisReady ? "Rescan" : "Scan for Silence", action: editor.scanForSilence)
                         .disabled(!editor.canScanSilence)
                         .accessibilityLabel(editor.pauseAnalysisReady ? "Rescan Silence" : "Scan for Silence")
+                        .help("Find silent sections")
                 }
             }
             HStack(spacing: 8) {
                 ControlGroup {
                     Button("Previous", systemImage: "chevron.left") { editor.stepPause(-1) }
-                        .help("Previous Silence (⌃⌥←)")
+                        .help("Previous pause (⌃⌥←)")
                     Button("Next", systemImage: "chevron.right") { editor.stepPause(1) }
-                        .help("Next Silence (⌃⌥→)")
+                        .help("Next pause (⌃⌥→)")
                 }
                 .fixedSize()
                 Button("Preview Cut") {
@@ -84,21 +98,24 @@ struct PauseControls: View {
                     dismiss()
                 }
                     .disabled(!editor.canPreviewCurrentCut)
+                    .help("Preview shortened pause")
                 Spacer(minLength: 0)
                 Button(editor.currentPause?.isProtected == true ? "Shorten This Pause" : "Keep This Pause",
                        action: editor.protectCurrentPause)
                     .disabled(editor.currentPause == nil)
+                    .help(editor.currentPause?.isProtected == true ? "Shorten selected pause" : "Protect selected pause")
             }.disabled(!editor.pauseAnalysisReady || editor.pausePlan.isEmpty)
             Toggle("Skip pauses during playback", isOn: $editor.skipPauses)
                 .disabled(!editor.pauseAnalysisReady || editor.pausePlan.isEmpty)
+                .help("Skip pauses in preview")
             Divider().padding(.vertical, 2)
             HStack {
                 Button("Queue Takes") { editor.applyPauses(queueTakes: true); dismiss() }
-                    .help("Add the audible ranges between pauses to the export queue.")
+                    .help("Queue audible takes")
                 Spacer()
-                Button("Shorten Pauses") { editor.applyPauses(queueTakes: false); dismiss() }
+                Button("Shorten Pauses") { editor.byHand { _ = editor.applyPauses(queueTakes: false) }; dismiss() }
                     .buttonStyle(.borderedProminent)
-                    .help("Trim each pause on the timeline down to the length left per pause.")
+                    .help("Shorten timeline pauses")
             }.disabled(!editor.pauseAnalysisReady || editor.shortenedPauseCount == 0)
         }
         .padding(16)
@@ -137,9 +154,11 @@ struct PauseSetting: View {
                 .multilineTextAlignment(.trailing)
                 .frame(width: 62)
                 .accessibilityLabel("\(label) in \(unit)")
+                .help("Enter \(label.lowercased())")
             Text(unit).foregroundStyle(.secondary).frame(width: 34, alignment: .leading)
             Stepper(label, onIncrement: { setValue(value + step) }, onDecrement: { setValue(value - step) })
                 .labelsHidden()
+                .help("Adjust \(label.lowercased())")
         }
     }
 
@@ -158,7 +177,7 @@ struct CutPreviewSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        EditorSheet(title: "Preview Cut", message: "Audition the join as it will play once this pause is shortened.") {
+        EditorSheet(title: "Preview Cut", message: "Listen to the cut with the shorter pause.") {
             Group {
                 if let ranges = editor.cutPreview?.ranges, !ranges.isEmpty, ranges.allSatisfy(\.isAudioOnly) {
                     CutWaveformPreview(editor: editor, ranges: ranges, playhead: preview.time)
@@ -173,11 +192,13 @@ struct CutPreviewSheet: View {
         } actions: {
             CutPreviewPlayButton(isPlaying: preview.isPlaying, toggle: preview.togglePlayback)
             Button("Keep This Pause") { editor.advanceCutPreview(keepingCurrent: true) }
-                .help("Leave this pause at its full length and move to the next cut.")
+                .help("Keep pause and advance")
             Button("Next Cut") { editor.advanceCutPreview(keepingCurrent: false) }
                 .disabled(editor.shortenedPauseCount < 2)
+                .help("Preview next cut")
             Spacer()
             Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+                .help("Close cut preview")
         }
         .task(id: editor.cutPreview?.position) {
             guard let cut = editor.cutPreview else { return }
@@ -204,5 +225,6 @@ struct CutPreviewPlayButton: View {
                 .frame(minWidth: 58)
         }
         .accessibilityLabel(isPlaying ? "Pause" : "Play Preview")
+        .help(isPlaying ? "Pause cut preview" : "Play cut preview")
     }
 }

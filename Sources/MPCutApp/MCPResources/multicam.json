@@ -26,6 +26,11 @@
           "minimum": 1,
           "description": "One-based displayed camera number from the current revision."
         },
+        "occurrence": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional source-backed assembly occurrence from the current revision."
+        },
         "time": {
           "type": "string",
           "description": "Exact rational seconds on the multicam group clock."
@@ -343,6 +348,11 @@
           "type": "string",
           "description": "Live project handle returned by list_projects."
         },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Required when selecting an occurrence from an assembly with still inserts."
+        },
         "action": {
           "type": "string",
           "enum": [
@@ -461,7 +471,7 @@
   },
   {
     "name": "get_multicam",
-    "description": "Inspect the live group, program audio and reference camera. Page sources with offsets, index issues and stream IDs, switches with overrides, or suggested switch boundaries.",
+    "description": "Inspect the live group, program audio and reference camera. Page sources with offsets, index issues and stream IDs, switches with overrides, suggested switch boundaries, assembly occurrences, or still placements.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -473,7 +483,9 @@
           "enum": [
             "sources",
             "switches",
-            "suggestions"
+            "suggestions",
+            "assembly",
+            "stills"
           ]
         },
         "offset": {

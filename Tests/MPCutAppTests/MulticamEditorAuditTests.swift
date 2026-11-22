@@ -588,6 +588,149 @@ final class MulticamEditorAuditTests: XCTestCase {
         XCTAssertEqual(model.project?.switches.map(\.at), [.zero])
     }
 
+    /// The multicam editor shows the tier of the saved program, found by MulticamEngine, and follows every edit.
+    @MainActor
+    func testTierBadgeFollowsTheProgram() async throws {
+        let url = try fixture("SmartTrim-GOP", "mp4")
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(url)
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.useAnalysisSidecars = false
+        XCTAssertNil(model.tierState, "No project, no badge.")
+        model.confirmSetup(drafts: [.init(source: .init(id: "wide", file: url.path), media: media)], opening: "wide", audio: .none)
+        func settle() async throws {
+            try await waitForIdle(model)
+            let deadline = ContinuousClock.now + .seconds(10)
+            while !model.tierIsCurrent, .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertTrue(model.tierIsCurrent)
+        }
+        try await settle()
+        XCTAssertEqual(model.settledTier, .trueLossless)
+        XCTAssertEqual(model.tierState?.name, ExportRules.displayName(tier: .trueLossless))
+
+        // A range that starts inside a picture group: Smart Trim encodes that edge.
+        let inside = RationalTime(numerator: 7, denominator: 25)
+        XCTAssertTrue(model.edit { $0.assembly = [.init(from: .zero, to: media.duration), .init(from: inside, to: media.duration)] })
+        XCTAssertNil(model.settledTier, "A program that changed is checked again before its tier is relied on.")
+        try await settle()
+        XCTAssertEqual(model.settledTier, .lossless)
+        let factor = try XCTUnwrap(model.tierState?.factors.first)
+        XCTAssertEqual(factor.id, .cutVideoStart)
+        XCTAssertEqual(factor.segment, 2)
+        XCTAssertEqual(factor.forces, .lossless)
+        // What a remote client reads, in the shape of the editor's report and of `inspect --project`.
+        let remote = try XCTUnwrap(model.tierReport)
+        XCTAssertEqual(remote["id"] as? String, FidelityTier.lossless.rawValue)
+        XCTAssertEqual(remote["mode"] as? String, ExportMode.smart.rawValue)
+        XCTAssertEqual(remote["current"] as? Bool, true)
+        let listed = try XCTUnwrap((remote["factors"] as? [[String: Any]])?.first)
+        XCTAssertEqual(listed["id"] as? String, TierFactorID.cutVideoStart.rawValue)
+        XCTAssertEqual(listed["segment"] as? Int, 2)
+        XCTAssertEqual(listed["forces"] as? String, FidelityTier.lossless.rawValue)
+        XCTAssertFalse((listed["nearest"] as? [String] ?? []).isEmpty)
+        XCTAssertTrue(MulticamTierBadge.summary(try XCTUnwrap(model.tierState)).contains(ExportRules.displayName(mode: .smart)))
+        model.selectAssemblyOccurrence(0)
+        model.goToTierFactor(factor)
+        XCTAssertEqual(model.selectedOccurrence, 1)
+        // The badge is what the engine answers for the same program, and the tier's mode plans.
+        let project = try XCTUnwrap(model.project)
+        XCTAssertEqual(MulticamEngine().tier(project, indexedSources: model.media).tier, .lossless)
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mov")
+        if case .unavailable(let issue, _) = MulticamEngine().resolution(project, output: output, mode: .smart, indexedSources: model.media) {
+            XCTFail("The tier's mode does not plan: \(issue.message)")
+        }
+        if case .ready = MulticamEngine().resolution(project, output: output, mode: .copy, indexedSources: model.media) {
+            XCTFail("Lossless Copy plans for a program whose tier is Lossless.")
+        }
+
+        // Undo restores the program and its tier. No edit of the multicam editor asks.
+        model.undo()
+        try await settle()
+        XCTAssertEqual(model.settledTier, .trueLossless)
+        // A cut that is on no picture stops every mode.
+        XCTAssertTrue(model.edit { $0.assembly = [.init(from: RationalTime(numerator: 1, denominator: 3), to: media.duration)] })
+        try await settle()
+        XCTAssertNil(model.settledTier)
+        XCTAssertEqual(model.tierState?.name, ExportRules.tierUnavailableName)
+        XCTAssertEqual(model.tierState?.factors.first?.id, .cutOffFrame)
+    }
+
+    /// An unsafe edge of an assembly range offers the engine's verified times, and applying one sets that range's
+    /// edge, undoably. The times never move a switch.
+    @MainActor
+    func testUnsafeRangeEdgeOffersVerifiedTimesAndApplyingOneMovesThatEdge() async throws {
+        let url = try fixture("SmartTrim-GOP", "mp4")
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(url)
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.useAnalysisSidecars = false
+        model.confirmSetup(drafts: [.init(source: .init(id: "wide", file: url.path), media: media)], opening: "wide", audio: .none)
+        try await waitForIdle(model)
+        let inside = RationalTime(numerator: 7, denominator: 25), end = media.duration
+        let first = MulticamRange(from: .zero, to: end)
+        XCTAssertTrue(model.edit { $0.assembly = [first, .init(from: inside, to: end)] })
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mp4")
+        model.export(output: output, mode: .copy, tracks: .video, dryRun: true, wholeGroup: false)
+        try await waitForIdle(model)
+        let suggestion = try XCTUnwrap(model.currentEdgeSuggestion, model.notice?.message ?? "The export did not fail.")
+        XCTAssertEqual(suggestion.edge, MulticamEdge(range: 2, boundary: "from", at: inside))
+        XCTAssertFalse(suggestion.times.isEmpty)
+        XCTAssertTrue(model.suggestions.isEmpty, "The times of a range edge are never offered for a switch.")
+        XCTAssertEqual(model.project?.switches.map(\.at), [.zero])
+
+        // A time the engine did not verify is refused.
+        XCTAssertFalse(model.applyEdgeSuggestion(RationalTime(numerator: 8, denominator: 25)))
+        let time = try XCTUnwrap(suggestion.times.first)
+        XCTAssertTrue(model.applyEdgeSuggestion(time))
+        XCTAssertEqual(model.project?.assembly, [first, .init(from: time, to: end)])
+        XCTAssertNil(model.currentEdgeSuggestion)
+        XCTAssertEqual(model.project?.switches.map(\.at), [.zero])
+        model.undo()
+        XCTAssertEqual(model.project?.assembly, [first, .init(from: inside, to: end)])
+        model.redo()
+        XCTAssertEqual(model.project?.assembly, [first, .init(from: time, to: end)])
+        // The moved edge copies: the same export is now planned.
+        model.export(output: output, mode: .copy, tracks: .video, dryRun: true, wholeGroup: false)
+        try await waitForIdle(model)
+        XCTAssertNil(model.currentEdgeSuggestion)
+        XCTAssertNotNil(model.report)
+
+        // Exporting other ranges than the saved assembly numbers them differently, so nothing is offered.
+        model.export(output: output, mode: .copy, tracks: .video, dryRun: true, wholeGroup: false,
+                     selection: [.init(from: inside, to: end)])
+        try await waitForIdle(model)
+        XCTAssertNil(model.currentEdgeSuggestion)
+
+        // A project without an assembly has one range covering the group. Applying saves the adjusted range.
+        XCTAssertTrue(model.edit { $0.assembly = nil })
+        let whole = try XCTUnwrap(model.project?.range)
+        let earlier = media.frames[media.frames.count / 2].time
+        model.edgeSuggestion = MulticamEdgeSuggestion(edge: MulticamEdge(range: 1, boundary: "to", at: whole.to), times: [earlier])
+        XCTAssertTrue(model.applyEdgeSuggestion(earlier))
+        XCTAssertEqual(model.project?.assembly, [.init(from: whole.from, to: earlier)])
+        // A suggestion for an edge that has since moved is not offered.
+        model.edgeSuggestion = MulticamEdgeSuggestion(edge: MulticamEdge(range: 1, boundary: "to", at: whole.to), times: [earlier])
+        XCTAssertNil(model.currentEdgeSuggestion)
+        XCTAssertFalse(model.applyEdgeSuggestion(earlier))
+
+        // The Export Queue: the edge belongs to the queued entry's own range.
+        XCTAssertTrue(model.enqueueRanges([first, .init(from: inside, to: end)]))
+        var choices = MulticamExportChoices(entry: .multicamQueue)
+        choices.tracks = .video
+        choices.mode = .copy
+        choices.settle()
+        let checked = await model.checkQueuedRanges(choices)
+        let issue = try XCTUnwrap(checked)
+        XCTAssertEqual(issue.segment, 2)
+        XCTAssertEqual(issue.multicam?.edge, MulticamEdge(range: 1, boundary: "from", at: inside))
+        let queued = try XCTUnwrap(issue.nearest?.first)
+        XCTAssertFalse(model.applyQueuedEdgeSuggestion(RationalTime(numerator: 8, denominator: 25), for: issue))
+        XCTAssertTrue(model.applyQueuedEdgeSuggestion(queued, for: issue))
+        XCTAssertEqual(model.queuedRanges.map(\.range), [first, .init(from: queued, to: end)])
+        let again = await model.checkQueuedRanges(choices)
+        XCTAssertNil(again, again?.message ?? "")
+    }
+
     @MainActor
     func testClosedModelIsReleased() async throws {
         weak var released: MulticamEditorModel?

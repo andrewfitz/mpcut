@@ -106,11 +106,8 @@ final class SidecarConcurrentReadTests: XCTestCase {
         let copy = try scratchDirectory().appendingPathComponent("Scene-Cadence-Change.mov")
         try FileManager.default.copyItem(at: fixture, to: copy)
         let source = try CutEngine().inspect(copy)
-        let report = try SceneAnalysis.scan(source, useSidecar: false)
         let sidecar = AnalysisSidecar(media: source)
-        let markers = try XCTUnwrap(AnalysisSidecar.sceneSections(for: report)[AnalysisSidecar.sceneSectionKey])
-        try sidecar.save(["scenes.v1": markers, "viewNames.v1": JSONEncoder().encode([1: "Wide"])])
-        _ = try SceneAnalysis.scan(source, useSidecar: true)
+        _ = try SceneAnalysis.run(source, session: SceneScanSession())
         XCTAssertNotNil(sidecar.sceneReport(for: source))
 
         let group = DispatchGroup()

@@ -12,7 +12,12 @@ struct BulkQueueView: View {
         self.editor = editor
         var value = ExportSheetOptions()
         value.copyContainer = ""
-        value.mode = editor.defaultExportMode
+        if editor.queuedRanges.contains(where: { $0.placements != .none }) {
+            value.mode = .smart
+            value.audio = .copyOriginal
+        } else {
+            value.mode = editor.defaultExportMode
+        }
         _options = State(initialValue: value)
     }
 
@@ -20,18 +25,28 @@ struct BulkQueueView: View {
     /// The modes, containers, audio actions and names on offer, from the export rules.
     private var choices: ExportQueueChoices {
         let selected = options.audioTrackOrdinal.flatMap { audioStreams.indices.contains($0) ? audioStreams[$0] : nil }
-        return ExportQueueChoices(media: media, audioCodec: (selected ?? audioStreams.first)?.codec)
+        return ExportQueueChoices(media: media, audioCodec: (selected ?? audioStreams.first)?.codec, placements: placements)
+    }
+    private var placements: ExportPlacementScope {
+        editor.queuedRanges.map(\.placements).max(by: { $0.rawValue < $1.rawValue }) ?? .none
     }
     private var hasVideo: Bool { choices.hasVideo }
     private var hasAudio: Bool { choices.hasAudio }
     private var tracks: ExportTracks { choices.tracks(options.tracks) }
     private var audioStreams: [StreamInfo] {
-        guard let first = editor.queuedRanges.first, let clip = first.clips.first else { return [] }
-        return first.media[clip.file]?.streams.filter { $0.kind == "audio" } ?? []
+        guard let first = editor.queuedRanges.first else { return [] }
+        if let clip = first.clips.first {
+            return first.media[clip.file]?.streams.filter { $0.kind == "audio" } ?? []
+        }
+        if let reference = first.stillProject?.stillAudioReference {
+            return first.media[URL(fileURLWithPath: reference.file).standardizedFileURL]?.streams.filter { $0.kind == "audio" } ?? []
+        }
+        return []
     }
     private var exportOptions: ExportSheetOptions {
         var result = options
         result.tracks = tracks
+        result.placements = placements
         return result
     }
 
@@ -86,9 +101,11 @@ struct BulkQueueView: View {
                             Toggle("Video", isOn: Binding(get: { hasVideo && tracks != .audio },
                                                           set: { chooseTracks($0 ? .all : .audio) }))
                                 .disabled(!hasVideo || !hasAudio || tracks == .video)
+                                .help("Include video")
                             Toggle("Audio", isOn: Binding(get: { hasAudio && tracks != .video },
                                                           set: { chooseTracks($0 ? .all : .video) }))
                                 .disabled(!hasAudio || !hasVideo || tracks == .audio)
+                                .help("Include audio")
                         }
                         .toggleStyle(.checkbox)
                     }
@@ -97,6 +114,7 @@ struct BulkQueueView: View {
                             Text("All audio tracks").tag(nil as Int?)
                             ForEach(audioStreams.indices, id: \.self) { Text(audioStreams[$0].exportLabel).tag(Optional($0)) }
                         }
+                        .help("Choose audio tracks")
                     }
                     // Exactly the modes the export rules write as themselves for this selection.
                     let modes = choices.modes(tracks: tracks)
@@ -104,40 +122,60 @@ struct BulkQueueView: View {
                         ForEach(modes, id: \.self) { Text(choices.title($0, tracks: tracks)) }
                     }
                     .disabled(modes.count < 2)
+                    .help("Choose export mode")
+                    if placements != .none && tracks != .audio {
+                        Toggle("Preserve camera picture", isOn: $options.requireCameraCopy)
+                            .help("Copy camera footage")
+                    }
                     if exportOptions.convertsAudio {
                         Picker("Audio", selection: Binding(get: { options.audioFormat },
                                                            set: { options.convertAudio(to: $0, preferred: options.conversionContainer) })) {
                             ForEach(choices.conversions, id: \.self) { Text($0.displayName) }
                         }
+                        .help("Choose audio format")
                         Picker("Container", selection: $options.conversionContainer) {
                             ForEach(ExportRules.conversionContainers(options.audioFormat), id: \.self) { Text(containerDisplayName($0)) }
                         }
+                        .help("Choose file format")
                     } else if exportOptions.effectiveMode == .encode {
                         Picker("Video", selection: $options.codec) {
                             ForEach(ReencodeCodec.allCases, id: \.self) { Text($0.displayName) }
                         }
+                        .help("Choose video codec")
                         let proRes = options.codec == .prores
                         Picker("Container", selection: proRes ? $options.proResContainer : $options.encodeContainer) {
-                            ForEach(ExportRules.reencodeContainers(options.codec), id: \.self) { Text(containerDisplayName($0)) }
+                            ForEach(placements == .none ? ExportRules.reencodeContainers(options.codec) :
+                                ExportRules.stillContainers(mode: .encode, tracks: tracks, codec: options.codec, audio: options.audio), id: \.self) { Text(containerDisplayName($0)) }
                         }
+                        .help("Choose file format")
                         Picker("Quality", selection: proRes ? $options.proResQuality : $options.standardQuality) {
                             ForEach(ExportRules.qualities(options.codec), id: \.self) { Text($0.displayName) }
                         }
-                        if hasAudio {
+                        .help("Set video quality")
+                        if hasAudio && tracks != .video {
                             // Every audio action of the cell. One the container cannot carry is refused with its alternatives.
                             Picker("Audio", selection: $options.audio) {
-                                ForEach(choices.movieAudio, id: \.self) { Text($0.displayName) }
+                                ForEach(choices.movieAudio(mode: .encode), id: \.self) { Text($0.displayName) }
                             }
+                            .help("Choose audio encoding")
                         }
                     } else {
                         Picker("Container", selection: $options.copyContainer) {
                             Text("Source compatible").tag("")
-                            let listed = tracks != .audio ? ExportRules.movieCopyContainers : []
+                            let listed = tracks == .audio ? [] :
+                                placements == .none ? ExportRules.movieCopyContainers : ExportRules.stillMovieContainers
                             ForEach(listed, id: \.self) { Text(containerDisplayName($0)) }
                             // A container chosen by applying an alternative stays selectable.
                             if !options.copyContainer.isEmpty, !listed.contains(options.copyContainer) {
                                 Text(containerDisplayName(options.copyContainer)).tag(options.copyContainer)
                             }
+                        }
+                        .help("Choose file format")
+                        if placements != .none && tracks == .all && hasAudio && exportOptions.effectiveMode == .smart {
+                            Picker("Audio", selection: $options.audio) {
+                                ForEach(choices.movieAudio(mode: .smart), id: \.self) { Text($0.displayName) }
+                            }
+                            .help("Choose audio encoding")
                         }
                     }
                 }
@@ -153,8 +191,10 @@ struct BulkQueueView: View {
         } actions: {
             Spacer()
             Button("Close") { editor.isBulkQueuePresented = false }.keyboardShortcut(.cancelAction)
+                .help("Close export queue")
             Button(editor.queuedRanges.count == 1 ? "Export File…" : "Export \(editor.queuedRanges.count) Files…", action: export)
                 .keyboardShortcut(.defaultAction).disabled(editor.queuedRanges.isEmpty || isChecking)
+                .help("Export queued ranges")
         }
         .onChange(of: options) { _, _ in issue = nil }
         .onChange(of: editor.queuedRanges.map(\.id)) { _, _ in
@@ -225,7 +265,7 @@ struct ExportQueueRangeRow: View {
             }
             .buttonStyle(.borderless)
             .accessibilityLabel("Remove range \(index + 1)")
-            .help("Remove this range from the queue")
+            .help("Remove queued range")
         }
         .padding(.vertical, 2)
     }
@@ -237,10 +277,12 @@ struct ExportOrganizationFields: View {
     let container: String
 
     var body: some View {
-        DisclosureGroup("Folders and filenames") {
+        DisclosureGroup {
             Form {
                 TextField("Subfolder", text: $organization.subfolder, prompt: Text("Selected folder"))
+                    .help("Set output subfolder")
                 TextField("Base name", text: $organization.baseName, prompt: Text(stem))
+                    .help("Set base filename")
                 if let error = validationError {
                     IssueLabel(error)
                 } else {
@@ -249,6 +291,8 @@ struct ExportOrganizationFields: View {
                         .font(.caption)
                 }
             }
+        } label: {
+            Text("Folders and filenames").help("Show naming options")
         }
     }
 

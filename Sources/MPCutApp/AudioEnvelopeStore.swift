@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import MPCutCore
 
@@ -58,7 +59,7 @@ final class DisplayEnvelope: Sendable {
     }
 }
 
-enum WaveformSurface: Hashable { case viewer, timeline(UUID), cutPreview(Int) }
+enum WaveformSurface: Hashable { case viewer, timeline(UUID), multicam(RationalTime), cutPreview(Int) }
 
 /// Least recently used order. Evicting a window that is still drawn would decode it again on every redraw.
 struct RecentKeys<Key: Hashable> {
@@ -78,8 +79,10 @@ struct RecentKeys<Key: Hashable> {
     mutating func removeAll(where shouldRemove: (Key) -> Bool) { keys.removeAll(where: shouldRemove) }
 }
 
+typealias AudioEnvelopeStore = WaveformEnvelopeStore<UUID>
+
 @MainActor
-final class AudioEnvelopeStore {
+final class WaveformEnvelopeStore<Source: Hashable & Sendable>: ObservableObject {
     private struct Input {
         let media: MediaInfo
         let stream: Int
@@ -100,31 +103,76 @@ final class AudioEnvelopeStore {
             from <= start && to >= end && bin <= resolution * 1.15
         }
     }
-    private struct Job {
+    @MainActor private final class Job {
         let request: Request
-        let token: EditCancellation
+        let token = EditCancellation()
+        var consumers: Set<Key>
+        var sparse: SparseWaveform?
+
+        init(_ request: Request, for key: Key) {
+            self.request = request
+            consumers = [key]
+        }
     }
     private struct Key: Hashable {
-        let id: UUID
+        let id: Source
         let surface: WaveformSurface
     }
 
-    private var inputs: [UUID: Input] = [:]
-    private var overviewJobs: [UUID: EditCancellation] = [:]
-    private var overviews: [UUID: [Int: Overview]] = [:]
+    private var inputs: [Source: Input] = [:]
+    private var visibleOnly = Set<Source>()
+
+    func isVisibleOnly(_ id: Source) -> Bool { visibleOnly.contains(id) }
+
+    func refresh(_ id: Source, media: MediaInfo?, preserving streams: Set<Int>, visibleOnly: Bool) {
+        if visibleOnly { self.visibleOnly.insert(id) }
+        overviewJobs.removeValue(forKey: id)?.cancel()
+        for key in Array(jobs.keys) where key.id == id { releaseJob(for: key) }
+        if let before = inputs[id], let media, streams.contains(before.stream) {
+            inputs[id] = Input(media: media, stream: before.stream, readSidecars: before.readSidecars)
+        } else {
+            inputs[id] = nil
+            for key in Set(windows.keys).union(failed.keys) where key.id == id {
+                windows[key] = nil
+                failed[key] = nil
+            }
+            recentWindows.removeAll { $0.id == id }
+        }
+        overviews[id] = media.map { media in
+            (overviews[id] ?? [:]).filter { streams.contains($0.key) }.map { stream, item in
+                (stream, Overview(key: AudioAnalysisCacheKey(media: media, stream: stream), envelope: item.envelope))
+            }.reduce(into: [:]) { $0[$1.0] = $1.1 }
+        }
+        windowRevision += 1
+    }
+    private var overviewJobs: [Source: EditCancellation] = [:]
+    private var overviews: [Source: [Int: Overview]] = [:]
     private var windows: [Key: DisplayEnvelope] = [:]
-    // Pause cuts can put far more than a screenful of short clips in view.
+    // Keep the onscreen working set and a bounded history for scrolling back.
+    private var visibleSurfaces = Set<WaveformSurface>()
     private var recentWindows = RecentKeys<Key>(limit: 256)
     private var jobs: [Key: Job] = [:]
     private var failed: [Key: Request] = [:]
     var changed: (() -> Void)?
+    @Published private(set) var windowRevision = 0
 
-    func update(sources: [UUID: MediaInfo], track: Int, readSidecars: Bool, excludedSources: Set<URL> = []) {
-        var current = [UUID: Input]()
-        for (id, media) in sources where !media.hasVideo {
-            let streams = media.streams.filter { $0.kind == "audio" }
-            guard streams.indices.contains(track) else { continue }
-            current[id] = Input(media: media, stream: streams[track].index, readSidecars: readSidecars && !AnalysisSidecar.isExcluded(media.url, in: excludedSources))
+    func update(sources: [Source: MediaInfo], track: Int, sourceTracks: [Source: Int] = [:], readSidecars: Bool, excludedSources: Set<URL> = []) {
+        var selected: [Source: Int] = [:]
+        for (id, media) in sources {
+            let tracks = media.streams.filter { $0.kind == "audio" }
+            let ordinal = sourceTracks[id] ?? track
+            if tracks.indices.contains(ordinal) { selected[id] = tracks[ordinal].index }
+        }
+        update(sources: sources, streams: selected, readSidecars: readSidecars,
+               excludedSources: excludedSources, preloadAudioOverviews: true)
+    }
+
+    func update(sources: [Source: MediaInfo], streams: [Source: Int], readSidecars: Bool,
+                excludedSources: Set<URL>, preloadAudioOverviews: Bool) {
+        var current = [Source: Input]()
+        for (id, stream) in streams {
+            guard let media = sources[id] else { continue }
+            current[id] = Input(media: media, stream: stream, readSidecars: readSidecars && !AnalysisSidecar.isExcluded(media.url, in: excludedSources))
         }
         for id in Set(inputs.keys).union(current.keys).union(overviews.keys) {
             let before = inputs[id], after = current[id]
@@ -138,13 +186,13 @@ final class AudioEnvelopeStore {
             if before?.key == after?.key && before?.readSidecars == after?.readSidecars { continue }
             overviewJobs.removeValue(forKey: id)?.cancel()
             for key in Set(jobs.keys).union(windows.keys).union(failed.keys) where key.id == id {
-                jobs.removeValue(forKey: key)?.token.cancel()
+                releaseJob(for: key)
                 windows[key] = nil
                 failed[key] = nil
             }
             recentWindows.removeAll { $0.id == id }
             inputs[id] = after
-            if let after, !after.media.audio.isEmpty, overviews[id]?[after.stream] == nil { loadOverview(id, input: after) }
+            if preloadAudioOverviews, !visibleOnly.contains(id), let after, !after.media.hasVideo, !after.media.audio.isEmpty, overviews[id]?[after.stream] == nil { loadOverview(id, input: after) }
         }
     }
 
@@ -152,7 +200,7 @@ final class AudioEnvelopeStore {
         Int(max(1, min(Double(AudioEnvelope.maxColumns), ceil(media.duration.seconds * 1_000))))
     }
 
-    private func loadOverview(_ id: UUID, input: Input) {
+    private func loadOverview(_ id: Source, input: Input) {
         let token = EditCancellation()
         overviewJobs[id] = token
         EditorAnalysisQueues.waveformDetail.addOperation { [weak self] in
@@ -172,14 +220,50 @@ final class AudioEnvelopeStore {
         }
     }
 
-    func completed(for id: UUID, media: MediaInfo) -> [Int: AudioEnvelope] {
+    func completed(for id: Source, media: MediaInfo) -> [Int: AudioEnvelope] {
         (overviews[id] ?? [:]).filter { stream, entry in
             entry.key == AudioAnalysisCacheKey(media: media, stream: stream)
         }.mapValues { $0.envelope.samples }
     }
 
+    /// Request detail when a 20 ms peak spans more than one backing pixel.
+    static func needsTimelineDetail(secondsPerPixel: Double) -> Bool {
+        secondsPerPixel > 0 && secondsPerPixel < 1 / Double(AudioWaveform.rate)
+    }
+
+    func setVisibleTimelineSurfaces(_ visible: Set<WaveformSurface>) {
+        if visible != visibleSurfaces {
+            let hidden = visibleSurfaces.subtracting(visible)
+            visibleSurfaces = visible
+            recentWindows.removeAll { visible.contains($0.surface) }
+            if !hidden.isEmpty {
+                for key in Set(windows.keys).union(failed.keys) where hidden.contains(key.surface) {
+                    touchWindow(key)
+                }
+            }
+        }
+        for key in jobs.keys where !visible.contains(key.surface) {
+            switch key.surface {
+            case .timeline, .multicam:
+                releaseJob(for: key)
+            case .viewer, .cutPreview: break
+            }
+        }
+    }
+
+    private func releaseJob(for key: Key) {
+        guard let job = jobs.removeValue(forKey: key) else { return }
+        job.consumers.remove(key)
+        if job.consumers.isEmpty { job.token.cancel() }
+    }
+
+    func sparseWaveform(for id: Source, surface: WaveformSurface) -> SparseWaveform? {
+        jobs[Key(id: id, surface: surface)]?.sparse
+    }
+
     /// Keep a margin around each request so small scrolls reuse the same result.
-    func envelope(for id: UUID, surface: WaveformSurface, from: Double, to: Double, pixels: Int) -> DisplayEnvelope? {
+    func envelope(for id: Source, surface: WaveformSurface, from: Double, to: Double, pixels: Int,
+                  showSparseWhileLoading: Bool = false) -> DisplayEnvelope? {
         guard let input = inputs[id], pixels > 0, to.isFinite, from.isFinite else { return nil }
         let start = max(0, from), end = min(input.media.duration.seconds, to)
         guard start < end else { return nil }
@@ -188,24 +272,50 @@ final class AudioEnvelopeStore {
                       (end - start) / Double(min(8_192, pixels)))
         let key = Key(id: id, surface: surface)
         let window = windows[key]
-        if window != nil { _ = recentWindows.use(key) }
+        if window != nil { touchWindow(key) }
         let covers = window.map { $0.samples.from <= start && $0.samples.to >= end } ?? false
-        if let window, covers, window.secondsPerBin <= bin * 1.15 { return window }
-        if let overview, overview.secondsPerBin <= bin * 1.15 { return overview }
+        if let window, covers, window.secondsPerBin <= bin * 1.15 {
+            releaseJob(for: key)
+            return window
+        }
+        if let overview, overview.secondsPerBin <= bin * 1.15 {
+            releaseJob(for: key)
+            return overview
+        }
         let overviewBin = input.media.duration.seconds / Double(Self.overviewColumns(input.media))
         let waitingForOverview = overviewJobs[id] != nil && overviewBin <= bin * 1.15
         guard !input.media.audio.isEmpty, !waitingForOverview, jobs[key]?.request.covers(start, end, bin) != true,
               failed[key]?.covers(start, end, bin) != true else { return covers ? window : overview }
+        // Splits, repeated clips, and the viewer can share the same source window.
+        // Check other consumers only on a miss in this surface's own cache.
+        releaseJob(for: key)
+        if let shared = windows.first(where: { other, value in
+            other.id == id && value.samples.from <= start && value.samples.to >= end && value.secondsPerBin <= bin * 1.15
+        }) {
+            remember(shared.value, for: key)
+            return shared.value
+        }
+        if let shared = jobs.first(where: { $0.key.id == id && $0.value.request.covers(start, end, bin) })?.value {
+            shared.consumers.insert(key)
+            jobs[key] = shared
+            return covers ? window : overview
+        }
         let span = end - start
         // A 10 ms view needs a few hundred milliseconds of lookahead to follow playback.
-        let padded = min(16_384 * bin, max(0.35, span * 2))
+        let padded: Double
+        switch surface {
+        case .timeline, .multicam:
+            padded = min(16_384 * bin, span + min(span, 2))
+        case .viewer, .cutPreview:
+            padded = min(16_384 * bin, max(0.35, span * 2))
+        }
         let margin = max(0, (padded - span) / 2)
         let lower = max(0, start - margin), upper = min(input.media.duration.seconds, end + margin)
         let columns = max(1, min(16_384, Int(ceil((upper - lower) / bin))))
-        let token = EditCancellation()
         let request = Request(from: lower, to: upper, bin: (upper - lower) / Double(columns))
-        jobs[key]?.token.cancel()
-        jobs[key] = Job(request: request, token: token)
+        let job = Job(request, for: key)
+        let token = job.token
+        jobs[key] = job
         let operation = BlockOperation { [weak self] in
             guard !token.isCancelled else { return }
             let data = try? AudioAnalysis.envelope(input.media, stream: input.stream, from: lower, to: upper,
@@ -213,19 +323,55 @@ final class AudioEnvelopeStore {
             guard !token.isCancelled else { return }
             let result = data.map(DisplayEnvelope.init)
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.jobs[key]?.token === token else { return }
-                self.jobs[key] = nil
-                self.windows[key] = result
-                if let oldest = self.recentWindows.use(key) {
-                    self.windows[oldest] = nil
-                    self.failed[oldest] = nil
+                guard let self, !token.isCancelled else { return }
+                token.cancel() // Stop spot sampling as soon as exact measurements are ready.
+                for consumer in job.consumers {
+                    self.jobs[consumer] = nil
+                    self.remember(result, for: consumer)
+                    self.failed[consumer] = result == nil ? request : nil
                 }
-                self.failed[key] = result == nil ? request : nil
+                self.windowRevision &+= 1
                 self.changed?()
             }
         }
         operation.queuePriority = .high
-        EditorAnalysisQueues.waveformDetail.addOperation(operation)
+        switch surface {
+        case .timeline, .multicam:
+            // Brief zoom/scroll gestures often replace this request before a decoder needs to open.
+            // Short windows decode quickly. Sample only when a refreshed wide view has no usable waveform.
+            let wantsSparse = showSparseWhileLoading && visibleOnly.contains(id) && !covers && overview == nil && span >= 60
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(45)) {
+                guard !token.isCancelled else { return }
+                if wantsSparse, let ordinal = input.media.streams.filter({ $0.kind == "audio" }).firstIndex(where: { $0.index == input.stream }) {
+                    EditorAnalysisQueues.openingAudio.addOperation { [weak self] in
+                        SparseWaveform.sample(media: input.media, ordinal: ordinal, range: lower..<upper, token: token) { sparse in
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self, !token.isCancelled else { return }
+                                job.sparse = sparse
+                                self.windowRevision &+= 1
+                                self.changed?()
+                            }
+                        }
+                    }
+                }
+                EditorAnalysisQueues.waveformDetail.addOperation(operation)
+            }
+        case .viewer, .cutPreview:
+            EditorAnalysisQueues.waveformDetail.addOperation(operation)
+        }
         return covers ? window : overview
+    }
+
+    private func remember(_ window: DisplayEnvelope?, for key: Key) {
+        windows[key] = window
+        touchWindow(key)
+    }
+
+    private func touchWindow(_ key: Key) {
+        guard !visibleSurfaces.contains(key.surface) else { return }
+        if let oldest = recentWindows.use(key) {
+            windows[oldest] = nil
+            failed[oldest] = nil
+        }
     }
 }

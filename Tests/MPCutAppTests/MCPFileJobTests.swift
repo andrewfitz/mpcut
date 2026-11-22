@@ -48,6 +48,30 @@ final class MCPFileJobTests: XCTestCase {
         XCTAssertThrowsError(try schema.validate(tool: "file_resolve", arguments: ["operationID": id, "project": "/tmp/Edit.cut"]))
     }
 
+    func testSceneAndRefreshRequestsForwardNativeScopeAndPolicy() throws {
+        let schemas = try MCPSchemas.loaded.get()
+        let id = UUID()
+        let file = "/tmp/Interview.mov"
+        let project = "/tmp/Assembly.cut"
+        let clip = UUID().uuidString
+        func request(_ tool: String, _ args: [String: Any]) throws -> [String] {
+            var input = args
+            input["operationID"] = id.uuidString.lowercased()
+            return try MCPFileRequest(tool: tool, fields: schemas.validate(tool: tool, arguments: input)).arguments
+        }
+        XCTAssertEqual(try request("file_scenes", ["file": file, "from": "1/3", "to": "2/3", "policy": "restart"]),
+                       ["scenes", "--json", "--from", "1/3", "--to", "2/3", "--policy", "restart", "--operation-id",
+                        id.uuidString, "--progress", "jsonl", "--", file])
+        XCTAssertEqual(try request("file_scenes", ["project": project, "clip_id": clip, "policy": "resume"]),
+                       ["scenes", "--json", "--clip-id", clip, "--policy", "resume", "--progress", "jsonl", "--project", project])
+        XCTAssertEqual(try request("file_refresh", ["project": project, "deep": true, "no_sidecar": true]),
+                       ["refresh", "--json", "--no-sidecar", "--deep", "--progress", "jsonl", "--project", project])
+        XCTAssertThrowsError(try request("file_scenes", ["file": file, "from": "1"]))
+        XCTAssertThrowsError(try request("file_scenes", ["project": project, "clip_id": clip, "all_sources": true]))
+        XCTAssertThrowsError(try request("file_scenes", ["file": file, "project": project]))
+        XCTAssertThrowsError(try request("file_refresh", ["file": file]))
+    }
+
     @MainActor
     func testFileJobReplayResultAndCleanup() async throws {
         let cli = productsDirectory.appendingPathComponent("mpcut")
@@ -84,6 +108,28 @@ final class MCPFileJobTests: XCTestCase {
         XCTAssertEqual(status["state"] as? String, "failed")
         let report = try XCTUnwrap(status["result"] as? [String: Any])
         XCTAssertNotNil((report["error"] as? [String: Any])?["code"])
+    }
+
+    @MainActor
+    func testSceneFileJobReportsCoverageSeparatelyFromSceneJSON() async throws {
+        let cli = productsDirectory.appendingPathComponent("mpcut")
+        let jobs = MCPFileJobs(executable: cli)
+        defer { jobs.disable() }
+        let file = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
+        let id = UUID()
+        _ = try jobs.start(tool: "file_scenes", arguments: [
+            "file": file.path, "operationID": id.uuidString, "no_sidecar": true, "from": "0", "to": "1"
+        ])
+        let completed = try await wait(jobs, id: id)
+        XCTAssertEqual(completed["state"] as? String, "succeeded", String(describing: completed))
+        let report = try XCTUnwrap(completed["result"] as? [String: Any])
+        XCTAssertNotNil(report["scenes"])
+        let event = try XCTUnwrap(completed["progress_event"] as? [String: Any])
+        XCTAssertEqual(event["file"] as? String, file.path)
+        let progress = try XCTUnwrap(event["progress"] as? [String: Any])
+        XCTAssertNotNil(progress["requested"])
+        XCTAssertNotNil(progress["confirmed"])
+        XCTAssertNil(progress["durable"])
     }
 
     @MainActor
@@ -186,6 +232,25 @@ final class MCPFileJobTests: XCTestCase {
         _ = try await run("file_rearrange", ["file": source.path, "output": movie.path, "ranges": ranges,
                                              "no_sidecar": true], expected: "failed")
         XCTAssertEqual(try Data(contentsOf: movie), original)
+
+        let camera = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4", subdirectory: "Fixtures"))
+        let unsupported = folder.appendingPathComponent("Remux.webm")
+        let refused = try await run("file_export", ["mode": "copy", "dry_run": true, "no_sidecar": true,
+                                                    "edit": ["output": unsupported.path, "clips": [["file": camera.path]]]],
+                                    expected: "failed")
+        let issue = try XCTUnwrap(refused["error"] as? [String: Any])
+        XCTAssertEqual(issue["code"] as? String, "unsupported_container")
+        let alternatives = try XCTUnwrap(issue["alternatives"] as? [[String: Any]])
+        let offer = try XCTUnwrap(alternatives.first { $0["id"] as? String == "copyOtherContainer:mov" })
+        XCTAssertEqual(offer["lossless"] as? Bool, true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: unsupported.path))
+
+        let remux = folder.appendingPathComponent("Remux.mov")
+        let copied = try await run("file_export", ["mode": XCTUnwrap(offer["mode"] as? String), "no_sidecar": true,
+                                                   "edit": ["output": remux.path, "clips": [["file": camera.path]]]])
+        XCTAssertEqual(copied["mode"] as? String, "copy")
+        XCTAssertEqual((copied["encodedDuration"] as? [String: Int])?["numerator"], 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: remux.path))
 
         let xml = folder.appendingPathComponent("Resolve.fcpxml")
         let resolve = try await run("file_resolve", ["edit": ["output": xml.path,

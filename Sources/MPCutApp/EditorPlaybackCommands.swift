@@ -58,24 +58,36 @@ struct EditorTransportCommands<Player: EditorPlayback>: View {
     var body: some View {
         Button(preview.isPlaying ? "Pause" : "Play", action: preview.togglePlayback)
             .disabled(!canPlay)
+            .help(preview.isPlaying ? "Pause playback" : "Start playback")
         Button("Shuttle Reverse (J)") { preview.shuttle(-1) }
             .disabled(!canPlay)
+            .help("Play backward")
         Button("Stop Shuttle (K)", action: preview.pause)
             .disabled(!canNavigate || !preview.isPlaying)
+            .help("Stop shuttle")
         Button("Shuttle Forward (L)") { preview.shuttle(1) }
             .disabled(!canPlay)
+            .help("Play forward")
         Button("Slower Playback ([)") { preview.changeSpeed(-1) }
             .disabled(!canPlay || preview.adjacentSpeed(-1) == nil)
+            .help("Slow down playback")
         Button("Faster Playback (])") { preview.changeSpeed(1) }
             .disabled(!canPlay || preview.adjacentSpeed(1) == nil)
+            .help("Speed up playback")
         Button("Normal Playback Speed (\\)") { preview.selectPlaybackSpeed(.normal) }
             .disabled(!canPlay)
+            .help("Reset playback speed")
         Divider()
         Button("Go to Time…", action: enterTime).disabled(!canNavigate)
+            .help("Enter playhead time")
         Button("Go to Start") { seekBoundary(false) }.keyboardShortcut(.home, modifiers: []).disabled(!canNavigate)
+            .help("Jump to start")
         Button("Go to End") { seekBoundary(true) }.keyboardShortcut(.end, modifiers: []).disabled(!canNavigate)
+            .help("Jump to end")
         Button(audioOnly ? "Previous Audio Boundary" : "Previous Frame") { step(-1) }.disabled(!canStep)
+            .help(audioOnly ? "Previous audio boundary" : "Previous frame")
         Button(audioOnly ? "Next Audio Boundary" : "Next Frame") { step(1) }.disabled(!canStep)
+            .help(audioOnly ? "Next audio boundary" : "Next frame")
     }
 }
 
@@ -84,11 +96,15 @@ struct EditorAudioCommands<Player: EditorPlayback>: View {
 
     var body: some View {
         Toggle("Mute Preview Audio", isOn: $preview.isMuted)
+            .help("Mute preview audio")
         Button("Increase Preview Volume") { changeVolume(by: 0.1) }
             .disabled(preview.volume >= 1 && !preview.isMuted)
+            .help("Raise preview volume")
         Button("Decrease Preview Volume") { changeVolume(by: -0.1) }
             .disabled(preview.volume <= 0)
+            .help("Lower preview volume")
         Toggle("Play Audio While Scrubbing", isOn: $preview.scrubSoundEnabled)
+            .help("Hear audio while scrubbing")
     }
 
     private func changeVolume(by delta: Float) {
@@ -114,6 +130,7 @@ struct EditorBoundaryCommands: View {
     @ViewBuilder
     private func boundary(_ direction: Int, label: String, key: KeyEquivalent) -> some View {
         let button = Button(label) { step(direction) }
+            .help(label)
         if let modifiers { button.keyboardShortcut(key, modifiers: modifiers) }
         else { button }
     }

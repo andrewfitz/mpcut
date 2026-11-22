@@ -281,7 +281,7 @@
   },
   {
     "name": "file_scenes",
-    "description": "Detect scene cuts or export grouped scenes/views from a file or saved report. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "description": "Detect scenes in a file, file range or saved project, or export grouped scenes or views from a saved report. Poll file_job_status for progress and the CLI result. Supply the same operationID when retrying.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -348,6 +348,42 @@
           "type": "string",
           "pattern": "^/",
           "description": "Absolute path to a native CLI input/list file."
+        },
+        "project": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "to": {
+          "type": "string",
+          "description": "Exclusive source timestamp for a file range. Supply from as well."
+        },
+        "clip_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Stable sequence occurrence ID in the saved project."
+        },
+        "camera_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable camera ID in the saved multicam project."
+        },
+        "all_sources": {
+          "type": "boolean",
+          "description": "Scan all referenced video sources in the saved project. This is the default project scope."
+        },
+        "policy": {
+          "type": "string",
+          "enum": [
+            "reuse",
+            "resume",
+            "restart"
+          ],
+          "description": "Reuse returns current results or resumes unfinished analysis. Resume prefers a saved replacement attempt. Restart begins a replacement identified by operationID."
+        },
+        "from": {
+          "type": "string",
+          "description": "Inclusive source timestamp for a file range. Supply to as well."
         }
       },
       "additionalProperties": false,
@@ -370,6 +406,11 @@
             {
               "required": [
                 "input_file"
+              ]
+            },
+            {
+              "required": [
+                "project"
               ]
             }
           ]
@@ -396,6 +437,43 @@
           }
         }
       ]
+    }
+  },
+  {
+    "name": "file_refresh",
+    "description": "Check recordings referenced by a saved project and refresh eligible analysis sidecars. The project file stays untouched.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "project": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "deep": {
+          "type": "boolean",
+          "description": "Verify stream content even when the file stamp is unchanged."
+        },
+        "no_sidecar": {
+          "type": "boolean",
+          "description": "Check recordings without reading or writing analysis sidecars."
+        }
+      },
+      "required": [
+        "operationID",
+        "project"
+      ],
+      "additionalProperties": false
     }
   },
   {
@@ -538,7 +616,8 @@
           "description": "Absolute path to the source file."
         },
         "status": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Inspect persisted sections, scene attempts and stale reasons without writing."
         },
         "only": {
           "type": "array",
@@ -582,7 +661,7 @@
   },
   {
     "name": "file_export",
-    "description": "Render an ordered edit, replace a soundtrack, or export a saved project. For a project provide output; for an edit supply edit.output. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "description": "Render an ordered edit, replace a soundtrack, or export a saved project. Use mode copy to remux compatible streams. For a project provide output. For an edit supply edit.output. Poll file_job_status for the native CLI result. Reuse the operationID for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -740,6 +819,10 @@
             "clips",
             "output"
           ]
+        },
+        "require_camera_copy": {
+          "type": "boolean",
+          "description": "Require zero encoded camera duration when rendering a saved or inline project."
         },
         "output": {
           "type": "string",
@@ -1584,7 +1667,7 @@
   },
   {
     "name": "file_job_status",
-    "description": "Get state, native progress when available and the terminal JSON result. For large results, read result_bytes using file_job_result.",
+    "description": "Get state, native progress and the terminal JSON result. Scene scans and refreshes include the latest available progress event. For large results, read result_bytes using file_job_result.",
     "inputSchema": {
       "type": "object",
       "properties": {

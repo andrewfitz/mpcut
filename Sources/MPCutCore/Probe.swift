@@ -56,6 +56,20 @@ public struct StreamInfo: Encodable, Sendable {
     }
 }
 
+extension StreamInfo {
+    /// The channel layout that two tracks are compared by. A container may state the same sound as "2 channels" or
+    /// as "stereo": a layout that names no speakers stands for the standard layout of its channel count, and a
+    /// layout that names them stands for itself, so "5.1" and "5.1(side)" stay different.
+    /// `channelLayout` keeps what the file states, which sidecars store and reports print.
+    public var canonicalChannelLayout: String { Self.canonicalChannelLayout(channelLayout, channels: channels) }
+
+    static func canonicalChannelLayout(_ layout: String, channels: Int) -> String {
+        var text = [CChar](repeating: 0, count: 128)
+        guard mp_canonical_channel_layout(layout, Int32(channels), &text, text.count) != 0 else { return layout }
+        return String(cString: text)
+    }
+}
+
 public struct FrameInfo: Encodable, Sendable {
     public let dts: RationalTime?
     public let time: RationalTime
@@ -101,6 +115,10 @@ public struct AudioIndex: Encodable, Sendable {
     var mp3Anchors: [MP3Anchor] = []
     var opusWindow: OpusTrimWindow? = nil
 
+    package var hasDeclaredPCMStart: Bool {
+        stream.isPCM && stream.hasDeclaredStart && stream.start == start
+    }
+
     enum CodingKeys: String, CodingKey {
         case start, end, hasPriming
     }
@@ -135,6 +153,7 @@ public struct MediaInfo: Encodable, Sendable {
     private let videoIndex: Int
     private let metadataOnly: Bool
     let hasProvisionalClock: Bool
+    let refreshEvidence: MediaRefreshEvidence?
     package let multicamClockOffset: RationalTime
 
     public var hasVideo: Bool { videoIndex >= 0 }
@@ -166,7 +185,20 @@ public struct MediaInfo: Encodable, Sendable {
                   frames: [], audio: tracks, copyIssue: copyIssue, sourceStartSafe: sourceStartSafe,
                   identity: identity, videoIndex: videoIndex, timelineIssue: timelineIssue,
                   reportedContainers: reportedContainers, metadataOnly: metadataOnly, hasProvisionalClock: hasProvisionalClock,
-                  multicamClockOffset: multicamClockOffset, audioIssues: audioIssues)
+                  multicamClockOffset: multicamClockOffset, audioIssues: audioIssues, refreshEvidence: refreshEvidence)
+    }
+
+    package func forRefreshAlias(_ url: URL) -> MediaInfo {
+        withRefreshEvidence(refreshEvidence, at: url)
+    }
+
+    func withRefreshEvidence(_ evidence: MediaRefreshEvidence?, at url: URL? = nil,
+                             identity refreshedIdentity: SourceIdentity? = nil) -> MediaInfo {
+        MediaInfo(url: url ?? self.url, format: format, duration: duration, origin: origin, streams: streams,
+                  frames: frames, audio: audio, copyIssue: copyIssue, sourceStartSafe: sourceStartSafe,
+                  identity: refreshedIdentity ?? identity, videoIndex: videoIndex, timelineIssue: timelineIssue,
+                  reportedContainers: reportedContainers, metadataOnly: metadataOnly, hasProvisionalClock: hasProvisionalClock,
+                  multicamClockOffset: multicamClockOffset, audioIssues: audioIssues, refreshEvidence: evidence)
     }
 
     public var videoStream: StreamInfo? { hasVideo ? streams[videoIndex] : nil }
@@ -184,7 +216,8 @@ public struct MediaInfo: Encodable, Sendable {
          frames: [FrameInfo], audio: [AudioIndex], copyIssue: String?, sourceStartSafe: Bool,
          identity: SourceIdentity, videoIndex: Int, timelineIssue: String? = nil,
          reportedContainers: Set<String>? = nil, metadataOnly: Bool = false, hasProvisionalClock: Bool = false,
-         multicamClockOffset: RationalTime = .zero, audioIssues: [Int: String] = [:]) {
+         multicamClockOffset: RationalTime = .zero, audioIssues: [Int: String] = [:],
+         refreshEvidence: MediaRefreshEvidence? = nil) {
         self.url = url
         self.audioIssues = audioIssues
         self.format = format
@@ -199,6 +232,7 @@ public struct MediaInfo: Encodable, Sendable {
         self.reportedContainers = reportedContainers
         self.metadataOnly = metadataOnly
         self.hasProvisionalClock = hasProvisionalClock
+        self.refreshEvidence = refreshEvidence
         self.multicamClockOffset = multicamClockOffset
         self.identity = identity
         self.videoIndex = videoIndex
@@ -216,7 +250,7 @@ public struct MediaInfo: Encodable, Sendable {
                          frames: frames, audio: audio, copyIssue: copyIssue, sourceStartSafe: sourceStartSafe,
                          identity: identity, videoIndex: videoIndex, timelineIssue: timelineIssue,
                          reportedContainers: reportedContainers, metadataOnly: metadataOnly, hasProvisionalClock: hasProvisionalClock,
-                         audioIssues: audioIssues)
+                         audioIssues: audioIssues, refreshEvidence: refreshEvidence)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -230,6 +264,48 @@ package struct SourceIdentity: Codable, Hashable, Sendable {
     let size: Int64
     let modifiedSeconds: Int
     let modifiedNanoseconds: Int
+
+    // Keep the filesystem change time only for live jobs. Tags and permissions can
+    // change it, so it must never invalidate an analysis stored across sessions.
+    package struct ChangeTime: Hashable, Sendable {
+        let seconds: Int
+        let nanoseconds: Int
+    }
+    package private(set) var changeTime: ChangeTime?
+
+    private enum CodingKeys: String, CodingKey {
+        case device, inode, size, modifiedSeconds, modifiedNanoseconds
+    }
+
+    package static func == (lhs: SourceIdentity, rhs: SourceIdentity) -> Bool {
+        lhs.device == rhs.device && lhs.matches(saved: rhs)
+    }
+
+    package func hash(into hasher: inout Hasher) {
+        hasher.combine(device)
+        hasher.combine(inode)
+        hasher.combine(size)
+        hasher.combine(modifiedSeconds)
+        hasher.combine(modifiedNanoseconds)
+    }
+
+    /// A source pinned to a running or queued operation may have been rewritten
+    /// in place with its original modification time restored.
+    package func isCurrentSnapshot(at url: URL) -> Bool {
+        (try? SourceIdentity(url)).map(matchesSnapshot) == true
+    }
+
+    package func matchesSnapshot(_ other: SourceIdentity) -> Bool {
+        self == other && (changeTime == nil || other.changeTime == nil || changeTime == other.changeTime)
+    }
+
+    func forPreviewHandoff() -> SourceIdentity {
+        // Permission and other metadata changes can advance ctime between a
+        // provisional preview read and the full inspection without changing media.
+        var identity = self
+        identity.changeTime = nil
+        return identity
+    }
 
     package init(_ url: URL) throws {
         var info = stat()
@@ -245,8 +321,7 @@ package struct SourceIdentity: Codable, Hashable, Sendable {
         size = info.st_size
         modifiedSeconds = info.st_mtimespec.tv_sec
         modifiedNanoseconds = info.st_mtimespec.tv_nsec
-        // ctime also changes for metadata such as tags, permissions and
-        // file-provider state. Those updates leave the media bytes intact.
+        changeTime = ChangeTime(seconds: info.st_ctimespec.tv_sec, nanoseconds: info.st_ctimespec.tv_nsec)
     }
 
     /// Compares against an identity saved by an earlier session. A volume's
@@ -259,11 +334,11 @@ package struct SourceIdentity: Codable, Hashable, Sendable {
 
 enum Probe {
     static func read(_ url: URL, keyframes: Bool = true, conversion: Bool = false, previewOnly: Bool = false,
-                     audioAnalysis: Bool = false,
+                     audioAnalysis: Bool = false, forcePayload: Bool = false,
                      expectedIdentity: SourceIdentity? = nil,
                      progress: ((Double) -> Void)? = nil, cancelled: (() -> Bool)? = nil) throws -> MediaInfo {
         let before = try SourceIdentity(url)
-        if let expectedIdentity, expectedIdentity != before {
+        if let expectedIdentity, !expectedIdentity.matchesSnapshot(before) {
             throw CutError(code: "source_changed", message: "The source changed while opening the clip.")
         }
         var error = [CChar](repeating: 0, count: 256)
@@ -279,7 +354,8 @@ enum Probe {
         let control = ProbeCancellation(cancelled ?? { false }, progress: progress)
         let pointer = withExtendedLifetime(control) {
             url.withUnsafeFileSystemRepresentation { path in
-                mp_probe_read(path, conversion ? 1 : 0, previewOnly ? 1 : 0, audioAnalysis ? 1 : 0, callback, report,
+                mp_probe_read(path, conversion ? 1 : 0, previewOnly ? 1 : 0, audioAnalysis ? 1 : 0,
+                              forcePayload ? 1 : 0, callback, report,
                               Unmanaged.passUnretained(control).toOpaque(),
                               &error, error.count)
             }
@@ -292,7 +368,7 @@ enum Probe {
         progress?(packetScanShare)
         let media = try makeMedia(pointer.pointee, url: url, identity: before,
                                   keyframes: keyframes, previewOnly: previewOnly, progress: progress, cancelled: cancelled)
-        guard try SourceIdentity(url) == before else {
+        guard before.isCurrentSnapshot(at: url) else {
             throw CutError(code: "source_changed", message: "The source changed during inspection.")
         }
         progress?(1)
@@ -503,11 +579,18 @@ private extension Probe {
         if copyIssue == nil, native.has_unsupported_auxiliary != 0 {
             copyIssue = MediaInfo.auxiliaryTrackIssue
         }
+        let refreshEvidence = previewOnly ? nil : MediaRefreshEvidence(
+            identity: identity, format: format, origin: origin, duration: duration,
+            videoIndex: videoIndex, streams: streams, audio: audio,
+            indexIssues: [copyIssue ?? "", timelineIssue, String(native.source_start_safe)] +
+                audioIssues.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" },
+            native: storage
+        )
         return MediaInfo(url: url, format: format, duration: duration,
                          origin: origin, streams: streams, frames: frames, audio: audio, copyIssue: copyIssue,
                          sourceStartSafe: native.source_start_safe != 0, identity: identity, videoIndex: videoIndex,
                          timelineIssue: timelineIssue.isEmpty ? nil : timelineIssue, metadataOnly: previewOnly,
-                         hasProvisionalClock: previewOnly, audioIssues: audioIssues)
+                         hasProvisionalClock: previewOnly, audioIssues: audioIssues, refreshEvidence: refreshEvidence)
     }
 
     static func makeAACEdits(_ source: OpaquePointer?, trackID: Int32, stream: StreamInfo) throws -> [AACPresentationEdit]? {

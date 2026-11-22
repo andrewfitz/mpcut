@@ -12,7 +12,7 @@ private struct CopiedAACEdits: Sendable {
     let shift: RationalTime
 }
 
-/// A whole-recording stream substitution. Times are in the original picture's presentation clock.
+/// A whole-recording stream substitution. Times are in the source presentation clock.
 public struct AudioReplacementPlan: Encodable, Sendable {
     public let source: URL
     public let replacement: URL
@@ -44,6 +44,14 @@ public struct AudioReplacementPlan: Encodable, Sendable {
         case source, replacement, targetStream, replacementStream, replacementCodec, container, duration
     }
 
+    fileprivate var muxer: String {
+        switch container {
+        case "m4a": return "ipod"
+        case "mka": return "matroska"
+        default: return muxerName(container)
+        }
+    }
+
     fileprivate var arguments: [String] {
         var values = ["-xerror", "-copyts", "-copy_unknown", "-i", source.path,
                       "-itsoffset", "\(offsetMicroseconds)us", "-i", replacement.path]
@@ -68,7 +76,7 @@ public struct AudioReplacementPlan: Encodable, Sendable {
             values += ["-map_metadata:s:\(index)", "0:s:\(stream.index)",
                        "-disposition:\(index)", String(stream.disposition)]
         }
-        if ["mov", "mp4"].contains(container) {
+        if ["mov", "mp4", "m4a"].contains(container) {
             values += ["-movie_timescale", "1000000"]
         }
         return values
@@ -112,9 +120,6 @@ public struct AudioReplacementEngine: Sendable {
         if let sourceIdentity { try inspector.verifyIdentity(source, identity: sourceIdentity) }
         if let replacementIdentity { try inspector.verifyIdentity(replacement, identity: replacementIdentity) }
         let movie = try inspector.inspect(source, keyframes: false, expectedIdentity: sourceIdentity)
-        guard movie.hasVideo else {
-            throw CutError(code: "no_video", message: "Choose a recording with a video track for audio replacement.")
-        }
         let incoming = try inspector.inspect(replacement, keyframes: false, expectedIdentity: replacementIdentity)
         let target = try audio(in: movie, index: targetStream)
         let track = try audio(in: incoming, index: replacementStream)
@@ -177,10 +182,10 @@ public struct AudioReplacementEngine: Sendable {
         }
         var audioBounds = try Dictionary(uniqueKeysWithValues: movie.audio.map { ($0.stream.index, try audibleBounds(of: $0, in: movie)) })
         audioBounds[target.stream.index] = targetBounds
-        let formats = ["mov", "mp4", "mkv", "webm"]
+        let formats = ExportRules.replacementContainers(hasVideo: movie.hasVideo)
         let explicit = container?.lowercased() ?? output.flatMap { $0.pathExtension.isEmpty ? nil : $0.pathExtension.lowercased() }
         if let explicit, !formats.contains(explicit) {
-            throw CutError(code: "unsupported_container", message: "Audio replacement supports MOV, MP4, MKV and WebM.")
+            throw ExportRules.replacementContainerRefusal(hasVideo: movie.hasVideo)
         }
         let candidates = explicit.map { [$0] } ?? ([source.pathExtension.lowercased()] + formats)
         let process = ReencodeEngine(cancelled: cancelled)
@@ -189,12 +194,25 @@ public struct AudioReplacementEngine: Sendable {
         var failure: CutError?
         for format in candidates where formats.contains(format) && tried.insert(format).inserted {
             if let output { try process.checkDestination(output, container: format) }
-            if !editLists.isEmpty && !["mov", "mp4"].contains(format) {
-                failure = CutError(code: "unsupported_container", message: "Choose MOV or MP4 to preserve the audio presentation edit list.")
+            if !editLists.isEmpty && !["mov", "mp4", "m4a"].contains(format) {
+                failure = CutError(code: "unsupported_container",
+                                   message: "Choose \(movie.hasVideo ? "MOV or MP4" : "MOV, MP4 or M4A") to preserve the audio presentation edit list.")
+                continue
+            }
+            // Matroska's PCM tracks store the channel count without a speaker mask.
+            // The muxer accepts these streams but the output loses any named surround layout.
+            if ["mka", "mkv"].contains(format), let namedPCM = streams.first(where: { stream in
+                let format = stream.index == target.stream.index ? track.stream : stream
+                return format.kind == "audio" && format.codec.hasPrefix("pcm_") && format.channels > 2
+                    && !format.channelLayout.isEmpty && format.channelLayout != "\(format.channels) channels"
+            }) {
+                failure = CutError(code: "unsupported_container",
+                                   message: "Matroska cannot preserve the speaker layout of PCM track \(namedPCM.index). Choose MOV.",
+                                   track: namedPCM.index)
                 continue
             }
             var priming: Int64?
-            if ["mov", "mp4"].contains(format), track.stream.codec == "aac", start > .zero,
+            if ["mov", "mp4", "m4a"].contains(format), track.stream.codec == "aac", start > .zero,
                let first = track.packets.first {
                 let skipped = try incomingBounds.lowerBound.subtracting(first.time).roundedToSamples(track.stream.sampleRate)
                 if skipped > 0 { priming = skipped }
@@ -207,9 +225,8 @@ public struct AudioReplacementEngine: Sendable {
                                             replacementFormat: track.stream, editLists: editLists, priming: priming, targetStart: start, targetEnd: end,
                                             offsetMicroseconds: try offset.roundedToSamples(1_000_000), helper: helper)
             // Exercise the actual muxer's header, including every untouched stream, even on a dry run.
-            let muxer = format == "mkv" ? "matroska" : format
             do {
-                try process.runHelper(helper, arguments: plan.arguments + ["-t", "0", "-f", muxer, "-y", "/dev/null"],
+                try process.runHelper(helper, arguments: plan.arguments + ["-t", "0", "-f", plan.muxer, "-y", "/dev/null"],
                                       in: FileManager.default.temporaryDirectory)
                 try verify(plan, with: process)
                 return plan
@@ -263,8 +280,13 @@ public struct AudioReplacementEngine: Sendable {
         _ = try exportWorkingCopy(plan, to: output, progress: progress)
     }
 
+    /// `beforePublishing` receives the finished, verified copy while it is still in its private staging folder.
+    /// Throwing from it leaves nothing at `output`. The plan does not decide how the muxer packs the copied tracks
+    /// (PCM chunking, container time base, rewritten AAC edit lists), so what the copy can be cut into is known
+    /// only from these bytes.
     package func exportWorkingCopy(_ plan: AudioReplacementPlan, to output: URL,
-                                   progress: ((Double) -> Bool)? = nil) throws -> SourceIdentity {
+                                   progress: ((Double) -> Bool)? = nil,
+                                   beforePublishing: ((URL) throws -> Void)? = nil) throws -> SourceIdentity {
         let process = ReencodeEngine(cancelled: cancelled)
         try verify(plan, with: process)
         try process.checkDestination(output, container: plan.container)
@@ -276,7 +298,7 @@ public struct AudioReplacementEngine: Sendable {
         let cancellation = ReplacementCancellation()
         let runner = ReencodeEngine(cancelled: { cancelled?() == true || cancellation.isCancelled })
         do {
-            try runner.runHelper(plan.helper, arguments: plan.arguments + ["-n", partial.path], in: folder,
+            try runner.runHelper(plan.helper, arguments: plan.arguments + ["-f", plan.muxer, "-n", partial.path], in: folder,
                                  duration: plan.duration) { fraction in
                 if progress?(fraction) == false { cancellation.cancel() }
             }
@@ -307,11 +329,22 @@ public struct AudioReplacementEngine: Sendable {
         try verifyOutput(partial, plan: plan, cancelled: { cancelled?() == true || cancellation.isCancelled })
         let identity = try SourceIdentity(partial)
         try verify(plan, with: runner)
+        try beforePublishing?(partial)
+        try verify(plan, with: runner)
+        guard identity.isCurrentSnapshot(at: partial) else {
+            throw CutError(code: "write_failed", message: "The working copy changed before it could be saved.")
+        }
         let failure = publishExclusively(from: partial, to: destination)
         guard failure == 0 else {
             throw CutError(code: failure == EEXIST ? "output_exists" : "write_failed", message: String(cString: strerror(failure)))
         }
-        return identity
+        // An exclusive rename can update ctime. Pin the published location for
+        // the next indexing job after verifying it still names our staged inode.
+        let published = try SourceIdentity(destination)
+        guard published == identity else {
+            throw CutError(code: "source_changed", message: "The working copy changed after it was saved.")
+        }
+        return published
     }
 
     private func verifyOutput(_ file: URL, plan: AudioReplacementPlan, cancelled: @escaping @Sendable () -> Bool) throws {
@@ -336,6 +369,8 @@ public struct AudioReplacementEngine: Sendable {
             }
             if written.kind == "audio" {
                 guard written.sampleRate == expected.sampleRate, written.channels == expected.channels,
+                      (written.channelLayout == expected.channelLayout ||
+                       (expected.channels <= 2 && (try? audioLayout(written)) == (try? audioLayout(expected)))),
                       let bounds = plan.audioBounds[original.index],
                       let actual = output.audio.first(where: { $0.stream.index == written.index }) else { throw changed }
                 let tolerance = Self.tolerance(original, written)

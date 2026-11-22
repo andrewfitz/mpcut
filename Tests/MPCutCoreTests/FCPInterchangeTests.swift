@@ -3,6 +3,75 @@ import XCTest
 @testable import MPCutCore
 
 final class FCPInterchangeTests: XCTestCase {
+    func testInlineStillRoundTripsWithOriginalImageAndExactTimelineGeometry() throws {
+        let tests = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().standardizedFileURL
+        let camera = tests.appendingPathComponent("MPCutAppTests/Fixtures/Shuttle-Chirp.mov")
+        let photo = tests.appendingPathComponent("Integration/fixtures/stills/patch.jpeg")
+        let rate = try XCTUnwrap(CutEngine(useSidecar: false).inspectSummary(camera).videoStream?.frameRate)
+        let cadence = RationalTime(numerator: rate.denominator, denominator: rate.numerator)
+        let duration = try cadence.multiplied(by: .init(numerator: 12))
+        let image = StillAsset(id: "card-source", file: photo.path, displayName: "Card",
+                               fingerprint: try StillImage.fingerprint(photo))
+        let first = StillInsert(id: "head", assetID: image.id, duration: duration, cadence: cadence)
+        let second = StillInsert(id: "tail", assetID: image.id, duration: duration, cadence: cadence, framing: .fill)
+        let clip = CutSequenceClip(id: "keep", file: camera.path, from: .zero, to: duration)
+        let project = CutProject.stillSequence(.init(items: [.still(first), .source(clip), .still(second)], stillAssets: [image]))
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let input = folder.appendingPathComponent("Source.cut")
+        for ext in ["fcpxml", "fcpxmld"] {
+            let output = folder.appendingPathComponent("Edit." + ext)
+            XCTAssertEqual(try ProjectConverter.write(project, relativeTo: input, to: output), [])
+            let (reopened, warnings) = try FCPInterchange.read(output)
+            XCTAssertEqual(reopened, project)
+            XCTAssertEqual(warnings, [])
+            let xml = ext == "fcpxml" ? output : output.appendingPathComponent("Info.fcpxml")
+            let document = try FCPInterchange.loadDocument(xml)
+            let storyline = try XCTUnwrap(document.nodes(forXPath: "//sequence/spine").first as? XMLElement)
+            let nodes = storyline.children?.compactMap { $0 as? XMLElement } ?? []
+            XCTAssertEqual(nodes.map(\.name), ["video", "asset-clip", "video"])
+            XCTAssertEqual(nodes.map { $0.attribute(forName: "offset")?.stringValue },
+                           ["0s", "\(duration)s", "\(try duration.adding(duration))s"])
+            XCTAssertEqual(nodes.map { $0.attribute(forName: "duration")?.stringValue }, Array(repeating: "\(duration)s", count: 3))
+        }
+        let canvas = StillTimelineFormat(width: 1920, height: 1080, cadence: cadence, codec: .prores, container: "mov")
+        let standalone = CutProject.stillSequence(.init(items: [.still(first)], stillAssets: [image], stillFormat: canvas))
+        let output = folder.appendingPathComponent("Standalone.fcpxml")
+        XCTAssertEqual(try FCPInterchange.write(standalone, relativeTo: input, to: output), [])
+        XCTAssertEqual(try FCPInterchange.read(output).0, standalone)
+    }
+
+    func testMulticamStillKeepsRepeatedAssemblyRangesAndTheGapInProgramSound() throws {
+        let tests = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().standardizedFileURL
+        let camera = tests.appendingPathComponent("MPCutAppTests/Fixtures/Shuttle-Chirp.mov")
+        let photo = tests.appendingPathComponent("Integration/fixtures/stills/patch.jpeg")
+        let rate = try XCTUnwrap(CutEngine(useSidecar: false).inspectSummary(camera).videoStream?.frameRate)
+        let cadence = RationalTime(numerator: rate.denominator, denominator: rate.numerator)
+        let range = MulticamRange(from: .zero, to: .init(numerator: 1))
+        let image = StillAsset(id: "card-source", file: photo.path, displayName: "Card",
+                               fingerprint: try StillImage.fingerprint(photo))
+        let card = StillInsert(id: "between", assetID: image.id, duration: range.to, cadence: cadence)
+        let group = MulticamProject(referenceAngle: "a", range: range,
+                                    angles: [.init(id: "a", file: camera.path, name: "Wide", audioStream: 1)],
+                                    audio: .follow, switches: [.init(at: .zero, angle: "a")],
+                                    assemblyItems: [.group(range), .still(card), .group(range)], stillAssets: [image])
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let output = folder.appendingPathComponent("Angles.fcpxml")
+        let input = folder.appendingPathComponent("Source.cut")
+        XCTAssertEqual(try ProjectConverter.write(.multicam(group), relativeTo: input, to: output), [])
+        let (project, warnings) = try FCPInterchange.read(output)
+        guard case .multicam(let reopened) = project else { return XCTFail("Expected multicam") }
+        XCTAssertEqual(warnings, [])
+        XCTAssertEqual(reopened.assemblyItems, group.assemblyItems)
+        XCTAssertEqual(reopened.stillAssets, [image])
+        let plan = try reopened.plan()
+        XCTAssertEqual(plan.duration, .init(numerator: 3))
+        XCTAssertEqual(plan.audio.map(\.output), [range, .init(from: .init(numerator: 2), to: .init(numerator: 3))])
+    }
+
     private func read(_ story: String, allowLoss: Bool = false) throws -> (CutProject, [String]) {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID()).fcpxml")
         defer { try? FileManager.default.removeItem(at: file) }

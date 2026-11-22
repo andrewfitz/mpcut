@@ -19,8 +19,12 @@ struct SidecarInventory: Encodable {
     let envelopeStreams: [Int]?
     let thumbnailCount: Int
     let silence: [Silence]
+    let sceneAttempts: [AnalysisSidecar.PersistedSceneAttempt]?
+    let sceneStaleReason: String?
 
-    init(sections: [String]) {
+    init(sections: [String], sceneAttempts: [AnalysisSidecar.PersistedSceneAttempt]?, sceneStaleReason: String?) {
+        self.sceneAttempts = sceneAttempts
+        self.sceneStaleReason = sceneStaleReason
         hasIndex = AnalysisSidecar.indexKeys.isSubset(of: Set(sections))
         hasScenes = sections.contains(AnalysisSidecar.sceneSectionKey)
         waveformStreams = sections.compactMap(AnalysisSidecar.savedWaveformStream(forKey:)).sorted()
@@ -46,14 +50,28 @@ struct SidecarResult: Encodable {
     let sections: [String]
     let saved: [String]?
     let inventory: SidecarInventory
+    let generations: [AnalysisSidecar.PersistedGeneration]?
+    let staleReason: String?
 
-    init(file: String, sidecar: String, status: String, sections: [String], saved: [String]?) {
+    init(file: String, sidecar: String, status: String, sections: [String], saved: [String]?,
+         generations: [AnalysisSidecar.PersistedGeneration]? = nil,
+         sceneAttempts: [AnalysisSidecar.PersistedSceneAttempt]? = nil) {
         self.file = file
         self.sidecar = sidecar
         self.status = status
         self.sections = sections
         self.saved = saved
-        inventory = SidecarInventory(sections: sections)
+        self.generations = generations
+        switch status {
+        case "stale": staleReason = "Source identity differs from the saved analysis."
+        case "offline": staleReason = "The source recording is unavailable."
+        default: staleReason = nil
+        }
+        let generationChange = generations?.first.flatMap { latest in
+            sceneAttempts?.contains(where: { !$0.current && $0.generation < latest.id }) == true ? latest.reason : nil
+        }
+        let sceneStaleReason = staleReason ?? generationChange
+        inventory = SidecarInventory(sections: sections, sceneAttempts: sceneAttempts, sceneStaleReason: sceneStaleReason)
     }
 }
 
@@ -138,11 +156,32 @@ struct SidecarOptions {
     }
 
     func run(source: URL, cancelled: @escaping @Sendable () -> Bool) async throws -> SidecarResult {
-        let store = try AnalysisSidecar(source: source)
         if statusOnly {
-            return SidecarResult(file: source.path, sidecar: store.url.path,
-                                 status: store.status(), sections: store.keys().sorted(), saved: nil)
+            do {
+                var store = try AnalysisSidecar(source: source)
+                var status = store.status()
+                // A scene scan can store an alias's result beside the recording it resolves to.
+                if status == "missing" {
+                    let resolved = source.resolvingSymlinksInPath()
+                    if resolved != source, let alternate = try? AnalysisSidecar(source: resolved) {
+                        let alternateStatus = alternate.status()
+                        if alternateStatus != "missing" {
+                            store = alternate
+                            status = alternateStatus
+                        }
+                    }
+                }
+                return SidecarResult(file: source.path, sidecar: store.url.path,
+                                     status: status, sections: store.keys().sorted(), saved: nil,
+                                     generations: store.persistedGenerations(), sceneAttempts: store.persistedSceneAttempts())
+            } catch let issue as CutError where issue.code == "invalid_input" {
+                let offline = AnalysisSidecar.offlineInventory(source: source)
+                return SidecarResult(file: source.path, sidecar: AnalysisSidecar.url(for: source).path,
+                                     status: offline.status, sections: [], saved: nil,
+                                     generations: offline.generations, sceneAttempts: offline.attempts)
+            }
         }
+        let store = try AnalysisSidecar(source: source)
         let sections: [String: Data]
         if contents == [.scenes] {
             sections = try AnalysisSidecar.sceneSections(for: SceneAnalysis.scan(source, cancelled: cancelled))

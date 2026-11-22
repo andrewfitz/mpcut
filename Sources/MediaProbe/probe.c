@@ -3,6 +3,7 @@
 #include "../CFFmpeg/layer3_frame.h"
 #include "../CFFmpeg/copy_probe.h"
 #include "mov_index.h"
+#include "probe_evidence.h"
 #include "video_clock.h"
 #include "wave_pcm.h"
 #include "../CFFmpeg/opus_packet.h"
@@ -28,6 +29,31 @@ static void issue(MPProbeResult *result, const char *message)
 {
     if (!result->issue[0])
         snprintf(result->issue, sizeof(result->issue), "%s", message);
+}
+
+int mp_canonical_channel_layout(const char *layout, int channels, char *canonical, size_t capacity)
+{
+    AVChannelLayout parsed = {0};
+    int count = 0, used = 0;
+    if (!layout || !canonical || !capacity)
+        return 0;
+    // "N channels" is how a layout without speaker positions describes itself.
+    if (sscanf(layout, "%d channels%n", &count, &used) == 1 && used && !layout[used] && count > 0) {
+        av_channel_layout_default(&parsed, count);
+    } else {
+        if (!layout[0] || av_channel_layout_from_string(&parsed, layout) < 0)
+            return 0;
+        if (parsed.order == AV_CHANNEL_ORDER_UNSPEC) {
+            count = parsed.nb_channels;
+            av_channel_layout_uninit(&parsed);
+            av_channel_layout_default(&parsed, count);
+        }
+    }
+    // A description that disagrees with the track's channel count is left as it is.
+    int written = channels > 0 && parsed.nb_channels != channels ? -1
+        : av_channel_layout_describe(&parsed, canonical, capacity);
+    av_channel_layout_uninit(&parsed);
+    return written > 0 && (size_t)written <= capacity;
 }
 
 void mp_probe_free(MPProbeResult *result)
@@ -218,61 +244,6 @@ static int describe_stream(AVFormatContext *file, AVStream *input, MPProbeStream
     return status;
 }
 
-/* MOV H.26x samples are length-prefixed. Transport streams use Annex B. */
-static bool h26x_start(const AVPacket *packet, const AVCodecParameters *params, bool source_start, int *multilayer)
-{
-    bool hevc = params->codec_id == AV_CODEC_ID_HEVC;
-    int length_size = 0;
-    if (!hevc && params->extradata_size >= 5 && params->extradata[0] == 1)
-        length_size = (params->extradata[4] & 3) + 1;
-    if (hevc && params->extradata_size >= 22 && params->extradata[0] == 1)
-        length_size = (params->extradata[21] & 3) + 1;
-    const uint8_t *bytes = packet->data;
-    int size = packet->size;
-    bool random_access = false;
-    for (int i = 0; i < size;) {
-        int unit_end = size;
-        if (length_size) {
-            if (size - i < length_size)
-                return false;
-            uint32_t length = 0;
-            for (int end = i + length_size; i < end; i++)
-                length = (length << 8) | bytes[i];
-            if (!length || length > (uint32_t)(size - i))
-                return false;
-            unit_end = i + (int)length;
-        } else {
-            while (i <= size - 3 && (bytes[i] || bytes[i + 1] || bytes[i + 2] != 1))
-                i++;
-            if (i > size - 4)
-                break;
-            i += 3;
-            for (int next = i; next <= size - 3; next++) {
-                if (!bytes[next] && !bytes[next + 1] && bytes[next + 2] == 1) {
-                    unit_end = next;
-                    break;
-                }
-            }
-        }
-        if (unit_end - i < (hevc ? 2 : 1))
-            return false;
-        int type = hevc ? (bytes[i] >> 1) & 63 : bytes[i] & 31;
-        if (hevc && mp_hevc_multilayer_unit(bytes + i, unit_end - i))
-            *multilayer = 1;
-        if (hevc && type <= 31) {
-            if (type < 16 || type > (source_start ? 21 : 20))
-                return false;
-            random_access = true;
-        } else if (!hevc && type >= 1 && type <= 5) {
-            if (type != 5)
-                return false;
-            random_access = true;
-        }
-        i = unit_end;
-    }
-    return random_access;
-}
-
 static bool vp9_start(const uint8_t *bytes, size_t size)
 {
     if (size < 4)
@@ -338,7 +309,7 @@ static bool independent(const AVPacket *packet, const AVCodecParameters *params,
         return false;
     switch (params->codec_id) {
     case AV_CODEC_ID_H264: case AV_CODEC_ID_HEVC:
-        return h26x_start(packet, params, source_start, multilayer);
+        return mp_h26x_random_access(packet, params, source_start, multilayer);
     case AV_CODEC_ID_VP8:
         return vp8_start(packet->data, packet->size);
     case AV_CODEC_ID_VP9:
@@ -1045,13 +1016,14 @@ static int indexed_wave_audio(AVFormatContext *file, MPProbeResult *result)
     return status < 0 ? status : 1;
 }
 
-MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only, int audio_analysis,
+MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only, int audio_analysis, int force_payload,
                             MPProbeCancelled cancelled, MPProbeProgress progress, void *context,
                             char *error, size_t error_capacity)
 {
     AVFormatContext *file = avformat_alloc_context();
     AVPacket *packet = NULL;
     MPProbeResult *result = NULL;
+    MPProbeEvidence *evidence = NULL;
     MPMOVIndex mov_index = {.fd = -1};
     int status = AVERROR(ENOMEM);
     if (!file)
@@ -1164,10 +1136,17 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
     bool needs_video_header = video_params->format < 0 &&
                               (prores_video || mp_has_header_probe(video_params->codec_id));
     bool inspect_scan = video_params->codec_id == AV_CODEC_ID_H264 || video_params->codec_id == AV_CODEC_ID_HEVC;
-    status = result->video_index >= 0 ? indexed_prores(&mov_index, file, result, cancelled, progress, context) :
+    status = force_payload ? 0 : result->video_index >= 0 ? indexed_prores(&mov_index, file, result, cancelled, progress, context) :
              audio_analysis ? indexed_wave_audio(file, result) : 0;
     if (status < 0)
         goto fail;
+    if (status == 0) {
+        evidence = mp_probe_evidence_open(path, file);
+        if (!evidence) {
+            status = AVERROR(ENOMEM);
+            goto fail;
+        }
+    }
     int64_t file_size = progress && file->pb && status == 0 ? avio_size(file->pb) : 0;
     unsigned packet_number = 0;
     double packet_bytes = 0;
@@ -1201,9 +1180,10 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
             }
             inspect_scan = false;
         }
-        if (packet->stream_index < result->stream_count)
+        if (packet->stream_index < result->stream_count) {
+            mp_probe_evidence_packet(evidence, file->streams[packet->stream_index], packet);
             status = record_packet(result, file->streams[packet->stream_index]->codecpar, packet, &first_description);
-        else
+        } else
             issue(result, "The source introduces a track after its stream headers.");
         av_packet_unref(packet);
         if (status < 0)
@@ -1211,6 +1191,8 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
     }
     if (status != AVERROR_EOF && status != 1)
         goto fail;
+    if (evidence)
+        mp_probe_evidence_finish(evidence, result);
     if (needs_video_header)
         issue(result, "The video codec headers do not identify the pixel format.");
     if (result->video_index >= 0) {
@@ -1222,6 +1204,7 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
         result->source_start_safe = 1;
     }
     av_packet_free(&packet);
+    mp_probe_evidence_free(evidence);
     avformat_close_input(&file);
     if (mov_index.fd >= 0)
         close(mov_index.fd);
@@ -1231,6 +1214,7 @@ fail:
     if (error && error_capacity)
         av_strerror(status, error, error_capacity);
     av_packet_free(&packet);
+    mp_probe_evidence_free(evidence);
     avformat_close_input(&file);
     if (mov_index.fd >= 0)
         close(mov_index.fd);

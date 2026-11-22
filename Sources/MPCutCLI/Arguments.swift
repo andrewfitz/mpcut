@@ -58,11 +58,12 @@ struct InputEdit: Decodable {
     var output: String
     var clips: [InputClip]
     var file: String?
+    var project: String?
     var order: [Int]?
     var options = ExportOptions()
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case output, clips, file, order, mode, video, quality, audio, snap, tracks, audioStream, replaceAudio, replaceTrack, replacementStream
+        case output, clips, file, project, order, mode, video, quality, audio, snap, tracks, audioStream, replaceAudio, replaceTrack, replacementStream, requireCameraCopy
     }
 
     init(output: String, clips: [InputClip]) {
@@ -73,7 +74,16 @@ struct InputEdit: Decodable {
     init(from decoder: Decoder) throws {
         let fields = try decoder.requestFields(CodingKeys.self, in: "Export request")
         output = try fields.decode(String.self, forKey: .output)
-        clips = try fields.decode([InputClip].self, forKey: .clips)
+        project = try fields.decodeIfPresent(String.self, forKey: .project)
+        if project == nil {
+            clips = try fields.decode([InputClip].self, forKey: .clips)
+        } else {
+            guard !fields.contains(.clips), !fields.contains(.file), !fields.contains(.order) else {
+                throw CLIError("invalid_json", "A saved project export accepts project in place of clips, file and order.")
+            }
+            clips = []
+        }
+        options.requireCameraCopy = try fields.decodeIfPresent(Bool.self, forKey: .requireCameraCopy)
         file = try fields.decodeIfPresent(String.self, forKey: .file)
         order = try fields.decodeIfPresent([Int].self, forKey: .order)
         for key in [CodingKeys.mode, .video, .quality, .audio, .snap, .tracks] {
@@ -115,6 +125,7 @@ struct ExportOptions {
     var replacementStream: Int?
     var subfolder: String?
     var baseName: String?
+    var requireCameraCopy: Bool?
 
     var organization: ExportOrganization { .init(subfolder: subfolder ?? "", baseName: baseName ?? "") }
 
@@ -173,7 +184,8 @@ struct ExportOptions {
             replaceTrack: resolve("replace-track", replaceTrack, request.replaceTrack, jsonKey: "replaceTrack"),
             replacementStream: resolve("replacement-stream", replacementStream, request.replacementStream, jsonKey: "replacementStream"),
             subfolder: resolve("subfolder", subfolder, request.subfolder),
-            baseName: resolve("base-name", baseName, request.baseName, jsonKey: "baseName")
+            baseName: resolve("base-name", baseName, request.baseName, jsonKey: "baseName"),
+            requireCameraCopy: resolve("require-camera-copy", requireCameraCopy, request.requireCameraCopy, jsonKey: "requireCameraCopy")
         )
     }
 }
@@ -207,8 +219,12 @@ enum CLICommand {
     case version
     case waveform(WaveformOptions)
     case frames(FrameExportOptions)
+    case still(StillOptions)
+    case stillCreate(StillCreateOptions)
     case silence(SilenceOptions)
-    case scenes(file: String?, export: SceneExportOptions?)
+    case scenes(SceneScanOptions)
+    case sceneExport(file: String?, options: SceneExportOptions)
+    case refresh(RefreshOptions)
     case inspect(file: String, keyframes: Bool, allFrames: Bool, audioPackets: Bool, packetStream: Int?, from: RationalTime?, to: RationalTime?, tracks: ExportTracks, audioStream: Int?)
     case convert(input: String, output: String, allowLoss: Bool, flattenMulticam: Bool)
     case resolve(project: String, output: String, open: Bool)
@@ -344,10 +360,25 @@ struct Arguments {
             return Arguments(command: .sidecar(try SidecarOptions(options)), json: json)
         case "--version" where options.isEmpty || options == ["--json"]:
             return Arguments(command: .version, json: json)
+        case "still":
+            let stillOptions = options.filter { $0 != "--json" }
+            if stillOptions.first == "create", !stillOptions.contains("--help"), !stillOptions.contains("-h") {
+                return Arguments(command: .stillCreate(try StillCreateOptions(Array(stillOptions.dropFirst()))), json: json)
+            }
+            if helpOptions == ["create", "--help"] || helpOptions == ["create", "-h"] {
+                return Arguments(command: .help(try CommandHelp.topic(verb)), json: json)
+            }
+            if helpOptions.count == 2, ["--help", "-h"].contains(helpOptions[1]),
+               StillOptions.Operation(rawValue: helpOptions[0]) != nil {
+                return Arguments(command: .help(try CommandHelp.topic(verb)), json: json)
+            }
+            return Arguments(command: .still(try StillOptions(options)), json: json)
         case "silence":
             return Arguments(command: .silence(try SilenceOptions(options)), json: json)
         case "scenes":
             return Arguments(command: try scenes(options), json: json)
+        case "refresh":
+            return Arguments(command: .refresh(try RefreshOptions(options)), json: json)
         case "waveform":
             return Arguments(command: .waveform(try WaveformOptions(options)), json: json)
         case "frames":
@@ -472,7 +503,7 @@ struct Arguments {
         var list: String?
         var dryRun = false
         var seen: Set<String> = []
-        var settings = ExportOptions(mode: .smart)
+        var settings = ExportOptions(mode: ExportRules.defaultMode(for: ExportEntryPoint.cliRearrange.source))
         var iterator = options.makeIterator()
         while let argument = iterator.next() {
             if !positionalOnly {
@@ -531,6 +562,12 @@ struct Arguments {
     }
 
     private static func scenes(_ options: [String]) throws -> CLICommand {
+        let flags = options.prefix(while: { $0 != "--" })
+        let exportFlags = ["--stdin", "--dry-run", "--export-to", "--scenes-file", "--group-by",
+                           "--subfolder", "--base-name", "--container", "--tracks", "--audio-stream"]
+        if flags.allSatisfy({ !exportFlags.contains($0) }) {
+            return .scenes(try SceneScanOptions(options))
+        }
         var file: String?
         var values: [String: String] = [:]
         var stdin = false
@@ -566,10 +603,7 @@ struct Arguments {
             throw CLIError("invalid_arguments", "Supply either one input file or --stdin with a scene report.")
         }
         guard let directory = values["--export-to"] else {
-            guard !stdin, !dryRun, values.isEmpty else {
-                throw CLIError("invalid_arguments", "--stdin, --dry-run, --group-by, --container, --tracks and --audio-stream require --export-to.")
-            }
-            return .scenes(file: file, export: nil)
+            throw CLIError("invalid_arguments", "Scene export options require --export-to.")
         }
         guard let grouping = SceneGrouping(rawValue: values["--group-by"] ?? "scene") else {
             throw CLIError("invalid_arguments", "--group-by requires scene or view.")
@@ -579,7 +613,7 @@ struct Arguments {
         if let stream = values["--audio-stream"] { try settings.set("audio-stream", to: stream) }
         try settings.checkTrackSelection()
         let organization = ExportOrganization(subfolder: values["--subfolder"] ?? "", baseName: values["--base-name"] ?? "")
-        return .scenes(file: file, export: SceneExportOptions(organization: organization, list: values["--scenes-file"],
+        return .sceneExport(file: file, options: SceneExportOptions(organization: organization, list: values["--scenes-file"],
                                                             directory: directory, grouping: grouping,
                                                             container: values["--container"], dryRun: dryRun, tracks: settings.tracks ?? .all, audioStream: settings.audioStream))
     }
@@ -708,6 +742,11 @@ struct Arguments {
                 stdin = true
             case "--dry-run":
                 dryRun = true
+            case "--require-camera-copy" where !forResolve && !forBulk:
+                guard exportOptions.requireCameraCopy == nil else {
+                    throw CLIError("invalid_arguments", "Duplicate --require-camera-copy.")
+                }
+                exportOptions.requireCameraCopy = true
             case "--smart-trim":
                 guard !smartTrim else {
                     throw CLIError("invalid_arguments", "--smart-trim may be specified only once.")

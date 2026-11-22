@@ -21,6 +21,7 @@ struct MulticamPauseControls: View {
                 get: { model.analysis.pauseThreshold != nil },
                 set: { model.configureSilenceAnalysis(minimum: model.analysis.pauseMinimum, threshold: $0 ? -45 : nil) }
             ))
+                .help("Use one manual threshold")
             if let threshold = model.analysis.pauseThreshold {
                 PauseSetting(label: "Quiet below", unit: "dBFS", value: Binding(
                     get: { model.analysis.pauseThreshold ?? threshold },
@@ -36,7 +37,7 @@ struct MulticamPauseControls: View {
             ), minimum: 0, step: 0.1)
             Button("Use Marked Room Tone") { model.useRoomTone() }
                 .disabled(!model.canUseRoomTone)
-                .help("Measure room tone in the marked range on each microphone routed there.")
+                .help("Measure marked room tone")
             Divider().padding(.vertical, 2)
             SectionHeading("Pauses")
             if let progress = model.analysis.silenceProgress {
@@ -44,6 +45,7 @@ struct MulticamPauseControls: View {
                     Text("Scanning program audio… \(progressPercent(progress))").font(.callout).monospacedDigit()
                 }
                 Button("Cancel Scan") { model.cancelAnalysis(.silence) }
+                    .help("Cancel silence scan")
             } else {
                 let issue = model.analysis.silenceIssue
                 if let issue { IssueLabel(issue) }
@@ -55,20 +57,22 @@ struct MulticamPauseControls: View {
                         .compactMap({ model.sourceIssues[$0] ?? model.sourceIndexIssues[$0] }).first {
                         IssueLabel(issue)
                     } else {
-                        Text("Waiting for the routed audio index.").font(.callout).foregroundStyle(.secondary)
+                        Text("Indexing the selected audio tracks…").font(.callout).foregroundStyle(.secondary)
                     }
                 } else if issue == nil, model.analysis.hasMissingSilenceTrack {
                     IssueLabel("A selected microphone stream is unavailable. Check Sources or Switch.")
                 } else if issue == nil, model.analysis.silenceTrackCount == 0 {
-                    Text("No routed audio is available to scan. Choose a microphone in Sources or Switch.")
+                    Text("Choose a microphone in Sources or Switch to scan for pauses.")
                         .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
                 if model.canScanAnalysis(.silence) {
                     Button(issue == nil ? "Scan for Silence" : "Retry Silence Scan") {
                         model.scanAnalysis(.silence)
                     }
+                    .help(issue == nil ? "Find silent sections" : "Retry silence scan")
                 } else if model.canApplyPauses {
                     Button("Rescan Silence") { model.analysis.rescanSilence() }
+                        .help("Run a fresh silence scan")
                 }
             }
             MulticamPauseNavigation(model: model, preview: model.preview, pauses: pauses) { pause in
@@ -81,18 +85,19 @@ struct MulticamPauseControls: View {
             Toggle("Skip pauses during playback", isOn: $edits.skip)
                 .disabled(!edits.skip && !(model.assemblyPreview ? pauses : model.multicamPausePlan(forPlayback: true))
                     .contains { $0.removal != nil })
+                    .help("Skip pauses in preview")
             Divider().padding(.vertical, 2)
             HStack {
                 Button("Queue Takes") {
                     if model.applyMulticamPauses(queueTakes: true, plan: pauses) { dismiss() }
                 }
-                    .help("Add the audible ranges between pauses to the export queue.")
+                .help("Queue audible takes")
                 Spacer()
                 Button("Shorten Pauses") {
                     if model.applyMulticamPauses(queueTakes: false, plan: pauses) { dismiss() }
                 }
                     .buttonStyle(.borderedProminent)
-                    .help("Trim each pause in the assembly down to the length left per pause.")
+                    .help("Shorten assembly pauses")
             }.disabled(cuts.isEmpty)
         }
         .padding(16)
@@ -138,14 +143,15 @@ private struct MulticamPauseNavigation: View {
         HStack(spacing: 8) {
             ControlGroup {
                 Button("Previous", systemImage: "chevron.left") { step(-1, occurrence: index, group: group) }
-                    .help("Go to the previous pause in the assembly.")
+                    .help("Jump to previous pause")
                 Button("Next", systemImage: "chevron.right") { step(1, occurrence: index, group: group) }
-                    .help("Go to the next pause in the assembly.")
+                    .help("Jump to next pause")
             }
             .fixedSize()
             Button("Preview Cut") {
                 if let current { openReview(current) }
             }.disabled(current?.removal == nil)
+                .help("Preview shortened pause")
             Spacer(minLength: 0)
             keepButton(current)
         }.disabled(pauses.isEmpty)
@@ -156,6 +162,7 @@ private struct MulticamPauseNavigation: View {
             guard let current else { return }
             model.setPauseProtection(!current.isProtected, for: current)
         }.disabled(current == nil)
+            .help(current?.isProtected == true ? "Shorten selected pause" : "Protect selected pause")
     }
 
     private func step(_ direction: Int, occurrence: Int, group: RationalTime) {
@@ -203,7 +210,7 @@ private struct MulticamCutReview: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        EditorSheet(title: "Preview Cut", message: "Audition the join as it will play once this pause is shortened.") {
+        EditorSheet(title: "Preview Cut", message: "Listen to the cut with the shorter pause.") {
             MulticamPreviewView(preview: preview).frame(width: 480, height: 270).background(.black)
                 .modifier(InsetPanel())
             if let message = preview.issue { IssueLabel(message) }
@@ -213,9 +220,10 @@ private struct MulticamCutReview: View {
                 model.pauseEdits.protected.insert(review.pause)
                 dismiss()
             }
-            .help("Leave this pause at its full length.")
+            .help("Keep pause at full length")
             Spacer()
             Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+                .help("Close pause preview")
         }
         .onAppear {
             preview.volume = model.preview.volume

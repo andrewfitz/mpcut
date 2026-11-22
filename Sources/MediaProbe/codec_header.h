@@ -7,6 +7,8 @@
 bool mp_has_header_probe(enum AVCodecID codec);
 bool mp_read_video_header(AVCodecParameters *params, const AVPacket *packet, bool *may_interlace,
                           int *multilayer);
+bool mp_h26x_random_access(const AVPacket *packet, const AVCodecParameters *params,
+                            bool source_start, int *multilayer);
 
 static inline bool mp_hevc_multilayer_unit(const uint8_t *unit, size_t size)
 {

@@ -28,10 +28,10 @@ final class TimelineDisplayTests: XCTestCase {
 
     func testSharedFilmstripLayoutDividesCoverageEvenly() {
         let strip = TimelineFilmstrip(width: 400, targetWidth: 92)
-        XCTAssertEqual(strip.count, 4)
-        XCTAssertEqual(strip.tileWidth, 100)
-        XCTAssertEqual(strip.visibleTiles(origin: 31, visible: 131..<231), 1..<2)
-        XCTAssertEqual(strip.visibleTiles(origin: 31, visible: 429..<500), 3..<4)
+        XCTAssertEqual(strip.count, 5)
+        XCTAssertEqual(strip.tileWidth, 80)
+        XCTAssertEqual(strip.visibleTiles(origin: 31, visible: 111..<191), 1..<2)
+        XCTAssertEqual(strip.visibleTiles(origin: 31, visible: 429..<500), 4..<5)
         XCTAssertTrue(strip.visibleTiles(origin: 31, visible: 500..<600).isEmpty)
     }
 
@@ -332,6 +332,36 @@ final class TimelineDisplayTests: XCTestCase {
         let frame = 1001.0 / 30_000
         XCTAssertEqual(SequenceTimeline.parseTime("00:00.033", initialTime: frame), frame)
         XCTAssertEqual(SequenceTimeline.parseTime("00:00.034", initialTime: frame), 0.034)
+    }
+
+    @MainActor
+    func testClipContextMenuTargetsTheClickedOccurrenceAndAudioTrack() throws {
+        _ = NSApplication.shared
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 500, height: 120))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = 500
+        let clips = [clip(size: .zero), clip(size: .zero)]
+        var state = timeline(clips)
+        var monitored: (track: Int, clip: UUID)?
+        var replaced: UUID?
+        state.audioTrackLabels = { id in
+            XCTAssertEqual(id, clips[1].sourceID)
+            return ["Track 1 · stereo", "Track 2 · 5.1"]
+        }
+        state.onMonitorAudio = { monitored = ($0, $1) }
+        state.onReplaceAudio = { replaced = $0 }
+        surface.timeline = state
+        let point = surface.convert(NSPoint(x: 375, y: 48), to: nil)
+        let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [],
+                                                     timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                                     eventNumber: 1, clickCount: 1, pressure: 1))
+        let menu = try XCTUnwrap(surface.menu(for: event))
+        menu.performActionForItem(at: 1)
+        XCTAssertEqual(monitored?.track, 1)
+        XCTAssertEqual(monitored?.clip, clips[1].id)
+        menu.performActionForItem(at: menu.indexOfItem(withTitle: "Replace Source Audio…"))
+        XCTAssertEqual(replaced, clips[1].id)
     }
 
     @MainActor
@@ -682,6 +712,46 @@ final class TimelineDisplayTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(scrubs.last), 0.225, accuracy: 1e-8)
     }
 
+    /// A project dropped on the timeline opens as it does on the viewer, also while the editor is busy and the
+    /// timeline takes no media. Media in the same drop is imported only when the timeline can take it.
+    @MainActor
+    func testProjectDropIsRoutedBeforeTheTimelineRefusesMedia() {
+        let clips = [clip(size: CGSize(width: 1920, height: 1080))]
+        let project = URL(fileURLWithPath: "/tmp/program.cut"), movie = URL(fileURLWithPath: "/tmp/take.mov")
+        XCTAssertTrue(ProjectSessions.isDroppedProject(project))
+        XCTAssertFalse(ProjectSessions.isDroppedProject(movie))
+        for busy in [true, false] {
+            let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 632, height: 150))
+            surface.viewportWidth = surface.frame.width
+            var opened: [URL] = [], imported: [[URL]] = []
+            var state = SequenceTimeline(clips: clips, playhead: 0, selection: nil,
+                                         thumbnailHeight: TimelineClip.minimumThumbnailHeight,
+                                         onSelect: { _ in }, onSeek: { _ in }, onTrim: { _, _, _, _ in nil },
+                                         onMove: { _, _ in }, onDrop: { urls, _ in imported.append(urls) })
+            state.allowsClipEdits = !busy
+            // What ProjectSessions.openDroppedProjects does: open the projects, return the media.
+            state.onDropProjects = { urls in
+                opened += urls.filter(ProjectSessions.isDroppedProject)
+                return urls.filter { !ProjectSessions.isDroppedProject($0) }
+            }
+            surface.timeline = state
+            let point = NSPoint(x: 350, y: 50)
+            XCTAssertTrue(surface.dropFiles([project], at: point), "busy \(busy)")
+            XCTAssertEqual(opened, [project])
+            XCTAssertEqual(imported, [], "A project alone imports nothing.")
+            XCTAssertTrue(surface.dropFiles([project, movie], at: point), "The project of a mixed drop is routed.")
+            XCTAssertEqual(opened, [project, project])
+            XCTAssertEqual(imported, busy ? [] : [[movie]], "Media needs a timeline that takes edits.")
+            XCTAssertEqual(surface.dropFiles([movie], at: point), !busy, "Media alone is refused while busy.")
+            XCTAssertEqual(opened.count, 2, "Media is never sent to the project router.")
+            // A timeline that takes no file drops at all, such as the multicam assembly, routes nothing.
+            state.allowsFileDrops = false
+            surface.timeline = state
+            XCTAssertFalse(surface.dropFiles([project], at: point))
+            XCTAssertEqual(opened.count, 2)
+        }
+    }
+
     @MainActor
     func testCSVFileDropTargetsClipInsteadOfInsertionSlot() {
         let clips = (0..<2).map { _ in clip(size: CGSize(width: 1920, height: 1080)) }
@@ -771,18 +841,75 @@ final class TimelineDisplayTests: XCTestCase {
     }
 
     @MainActor
-    func testFilmstripWaitsForTheIndexedClock() async throws {
+    func testBenchmarkOpeningTimelineDuringIndexing() async throws {
+        guard let path = ProcessInfo.processInfo.environment["MPCUT_OPENING_BENCHMARK_MEDIA"] else {
+            throw XCTSkip("Set MPCUT_OPENING_BENCHMARK_MEDIA to a long local video with audio")
+        }
+        let model = EditorModel()
+        model.useAnalysisSidecars = false
+        defer { model.endSession() }
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 1200, height: 260))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = surface.bounds.width
+        let bitmap = try XCTUnwrap(surface.bitmapImageRepForCachingDisplay(in: surface.bounds))
+        let start = ContinuousClock.now
+        model.importFiles([URL(fileURLWithPath: path)])
+        while model.timelineClips.isEmpty && model.isImporting && start.duration(to: .now) < .seconds(10) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        let headerTime = start.duration(to: .now)
+        let clip = try XCTUnwrap(model.timelineClips.first)
+        XCTAssertFalse(clip.isIndexed)
+        var view = timeline([clip])
+        view.showsWaveform = true
+        let tiles = TimelineFilmstrip(width: surface.bounds.width - 32, targetWidth: TimelineClip.tileWidth).count
+        let groups = min(tiles, TimelineFilmstrip.openingFrameLimit)
+        var pictureTimes: [Duration] = []
+        view.thumbnail = { id, time, size in
+            let image = await model.thumbnail(for: id, at: time, size: size)
+            if image != nil { pictureTimes.append(start.duration(to: .now)) }
+            return image
+        }
+        surface.timeline = view
+        surface.cacheDisplay(in: surface.bounds, to: bitmap)
+        var audioTime: Duration?
+        func audioSpansTimeline() -> Bool {
+            guard let peaks = model.audioStore.openingWaveform?.waveform.peaks else { return false }
+            return peaks.prefix(6).contains { $0 != nil } && peaks.suffix(6).contains { $0 != nil }
+        }
+        while model.isImporting && start.duration(to: .now) < .seconds(5) {
+            if model.audioStore.openingWaveform != nil, audioTime == nil { audioTime = start.duration(to: .now) }
+            if pictureTimes.count == groups, audioSpansTimeline() { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        view.openingWaveform = model.audioStore.openingWaveform
+        surface.timeline = view
+        surface.cacheDisplay(in: surface.bounds, to: bitmap)
+        let filledTime = start.duration(to: .now)
+        let firstAudioTime = try XCTUnwrap(audioTime)
+        print("Opening timeline: header \(headerTime), sampled audio \(firstAudioTime), rendered \(filledTime), picture times \(pictureTimes)")
+        XCTAssertEqual(pictureTimes.count, groups)
+        XCTAssertTrue(audioSpansTimeline())
+        XCTAssertTrue(model.isImporting)
+    }
+
+    @MainActor
+    func testFilmstripShowsSparsePreviewThenReloadsTheIndexedClock() async throws {
         _ = NSApplication.shared
         var clip = clip(size: CGSize(width: 90, height: 160))
         clip.isIndexed = false
-        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 1100, height: 342))
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 2500, height: 342))
         surface.viewportWidth = surface.bounds.width
         let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
         window.contentView = surface
         let context = try XCTUnwrap(CGContext(data: nil, width: 90, height: 160, bitsPerComponent: 8,
                                               bytesPerRow: 360, space: CGColorSpaceCreateDeviceRGB(),
                                               bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(origin: .zero, size: clip.displaySize))
         let picture = try XCTUnwrap(context.makeImage())
+        var resumeSecond: CheckedContinuation<Void, Never>?
         var requests: [(Double, CGSize)] = []
         func state() -> SequenceTimeline {
             var view = timeline([clip])
@@ -790,6 +917,9 @@ final class TimelineDisplayTests: XCTestCase {
             view.thumbnailHeight = clip.thumbnailHeight(large: true)
             view.thumbnail = { _, time, size in
                 requests.append((time, size))
+                if !clip.isIndexed && requests.count == 2 {
+                    await withCheckedContinuation { resumeSecond = $0 }
+                }
                 return picture
             }
             return view
@@ -797,32 +927,47 @@ final class TimelineDisplayTests: XCTestCase {
         surface.timeline = state()
         let bitmap = try XCTUnwrap(surface.bitmapImageRepForCachingDisplay(in: surface.bounds))
         surface.cacheDisplay(in: surface.bounds, to: bitmap)
-        await Task.yield()
-        XCTAssertTrue(requests.isEmpty)
+        for _ in 0..<300 where resumeSecond == nil { try await Task.sleep(for: .milliseconds(10)) }
+        surface.cacheDisplay(in: surface.bounds, to: bitmap)
+        resumeSecond?.resume()
+        XCTAssertNotNil(resumeSecond)
+        for fraction in [0.1, 0.5, 0.9] {
+            let x = Int(Double(bitmap.pixelsWide) * fraction)
+            let color = try XCTUnwrap(bitmap.colorAt(x: x, y: bitmap.pixelsHigh / 2)?.usingColorSpace(.deviceRGB))
+            XCTAssertGreaterThan(color.redComponent - max(color.greenComponent, color.blueComponent), 0.35)
+        }
+        for _ in 0..<300 where requests.count < 10 { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(requests.count, 10)
+        XCTAssertEqual(Set(requests.map { $0.0 }).count, 10)
+        XCTAssertEqual(requests.first?.0, 0)
+        if requests.count >= 3 {
+            XCTAssertEqual(requests[1].0, clip.duration / 2, accuracy: clip.duration * 0.15)
+            XCTAssertGreaterThan(requests[2].0, clip.duration * 0.8)
+        }
+        requests.removeAll()
         clip.isIndexed = true
         surface.timeline = state()
         surface.cacheDisplay(in: surface.bounds, to: bitmap)
-        for _ in 0..<300 where requests.count < 4 { try await Task.sleep(for: .milliseconds(10)) }
-        XCTAssertEqual(requests.count, 4)
+        for _ in 0..<300 where requests.count < 11 { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(requests.count, 11)
         XCTAssertEqual(requests.first?.0, 0)
         XCTAssertEqual(requests.first?.1.width, TimelineClip.largeTileWidth * window.backingScaleFactor)
 
     }
 
     @MainActor
-    func testFinalFilmstripThumbnailMatchesTheFirstInAnUnevenClipWidth() async throws {
+    func testFilmstripPicturesMeetAcrossAnUnevenClipWidth() async throws {
         _ = NSApplication.shared
-        let portrait = clip(size: CGSize(width: 90, height: 160))
-        // The old fixed-width grid left only 32 points for the final picture.
-        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 432, height: 251))
+        let portrait = clip(size: CGSize(width: 60, height: 160))
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 435, height: 251))
         surface.viewportWidth = surface.bounds.width
         let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
         window.contentView = surface
-        let context = try XCTUnwrap(CGContext(data: nil, width: 90, height: 160, bitsPerComponent: 8,
-                                               bytesPerRow: 360, space: CGColorSpaceCreateDeviceRGB(),
+        let context = try XCTUnwrap(CGContext(data: nil, width: 60, height: 160, bitsPerComponent: 8,
+                                               bytesPerRow: 240, space: CGColorSpaceCreateDeviceRGB(),
                                                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
         context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
-        context.fill(CGRect(x: 0, y: 0, width: 90, height: 160))
+        context.fill(CGRect(origin: .zero, size: portrait.displaySize))
         let picture = try XCTUnwrap(context.makeImage())
         var state = timeline([portrait])
         var requests = 0
@@ -833,8 +978,8 @@ final class TimelineDisplayTests: XCTestCase {
         surface.timeline = state
         let bitmap = try XCTUnwrap(surface.bitmapImageRepForCachingDisplay(in: surface.bounds))
         surface.cacheDisplay(in: surface.bounds, to: bitmap)
-        for _ in 0..<300 where requests < 4 { try await Task.sleep(for: .milliseconds(10)) }
-        XCTAssertGreaterThanOrEqual(requests, 4, "Expected four filmstrip tile requests within 3 s")
+        for _ in 0..<300 where requests < 5 { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(requests, 5)
         surface.cacheDisplay(in: surface.bounds, to: bitmap)
 
         func redHeight(at point: CGFloat) -> Int {
@@ -846,6 +991,54 @@ final class TimelineDisplayTests: XCTestCase {
         let last = redHeight(at: 400)
         XCTAssertGreaterThan(first, 100)
         XCTAssertEqual(Double(last), Double(first), accuracy: 2)
+        // Sample every backing pixel across the strip, including the joins.
+        let pixelsPerPoint = CGFloat(bitmap.pixelsWide) / surface.bounds.width
+        let middle = bitmap.pixelsHigh / 2
+        let interior = try XCTUnwrap(bitmap.colorAt(x: Int(66 * pixelsPerPoint), y: middle))
+        for x in Int(20 * pixelsPerPoint)..<Int(412 * pixelsPerPoint) {
+            XCTAssertEqual(bitmap.colorAt(x: x, y: middle), interior, "Filmstrip gap at pixel \(x)")
+        }
+    }
+
+    @MainActor
+    func testLargeThumbnailKeepsItsHeightInANarrowReorderedClip() async throws {
+        let size = CGSize(width: 160, height: 90)
+        let wide = clip(size: size)
+        let narrow = TimelineClip(id: UUID(), sourceID: UUID(), name: "Short", sourceStart: 0, sourceEnd: 0.5,
+                                  sourceDuration: 0.5, keyframes: [0], thumbnailSyncTimes: [0], frames: [],
+                                  displaySize: size)
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 452, height: 220))
+        surface.viewportWidth = surface.frame.width
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        let context = try XCTUnwrap(CGContext(data: nil, width: 160, height: 90, bitsPerComponent: 8,
+                                              bytesPerRow: 640, space: CGColorSpaceCreateDeviceRGB(),
+                                              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(origin: .zero, size: size))
+        let image = try XCTUnwrap(context.makeImage())
+        var loaded = Set<UUID>()
+        let bitmap = try XCTUnwrap(surface.bitmapImageRepForCachingDisplay(in: surface.bounds))
+        for clips in [[wide, narrow], [narrow, wide]] {
+            var state = timeline(clips)
+            state.largeThumbnails = .constant(true)
+            state.thumbnailHeight = narrow.thumbnailHeight(large: true)
+            state.thumbnail = { id, _, _ in
+                loaded.insert(id)
+                return image
+            }
+            surface.timeline = state
+            surface.cacheDisplay(in: surface.bounds, to: bitmap)
+            for _ in 0..<300 where loaded.count < 2 { try await Task.sleep(for: .milliseconds(10)) }
+            surface.cacheDisplay(in: surface.bounds, to: bitmap)
+
+            let center: CGFloat = clips.first?.id == narrow.id ? 26 : 426
+            let x = Int(center * CGFloat(bitmap.pixelsWide) / surface.bounds.width)
+            let redPixels = (0..<bitmap.pixelsHigh).compactMap { bitmap.colorAt(x: x, y: $0)?.usingColorSpace(.deviceRGB) }
+                .filter { $0.redComponent - max($0.greenComponent, $0.blueComponent) > 0.35 }.count
+            let height = CGFloat(redPixels) * surface.bounds.height / CGFloat(bitmap.pixelsHigh)
+            XCTAssertEqual(height, state.thumbnailHeight, accuracy: 2)
+        }
     }
 
     @MainActor

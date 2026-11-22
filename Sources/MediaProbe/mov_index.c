@@ -1,6 +1,8 @@
 #include "mov_index.h"
+#include "probe_evidence.h"
 
 #include <libavutil/intreadwrite.h>
+#include <libavutil/mem.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -252,4 +254,107 @@ bool mp_mov_open_index(const char *path, const AVFormatContext *file, MPMOVIndex
 fallback:
     close(fd);
     return false;
+}
+
+/* The demuxed packet clock alone cannot identify repeated or empty edits.
+ * Include their independent presentation mapping before hashing packets. */
+
+static bool hash_track_edits(int fd, Atom track, const AVStream *stream,
+                             int movie_scale, CC_SHA256_CTX *hash)
+{
+    Atom edits, list, media, header;
+    uint8_t bytes[28];
+    if (!find_atom(fd, track, TAG('e', 'd', 't', 's'), &edits))
+        return false;
+    if (!edits.payload || (stream->time_base.num == 1 && stream->start_time == 0 &&
+                          stream->duration > 0 && full_track_edit(fd, track, stream, movie_scale))) {
+        mp_probe_hash_value(hash, 0);
+        return true;
+    }
+    if (!find_atom(fd, edits, TAG('e', 'l', 's', 't'), &list) || list.end - list.payload < 8 ||
+        !mp_mov_read_at(fd, list.payload, bytes, 8) || (AV_RB32(bytes) & 0xfeffffff))
+        return false;
+    int row_size = bytes[0] ? 20 : 12;
+    uint32_t count = AV_RB32(bytes + 4);
+    if (!find_atom(fd, track, TAG('m', 'd', 'i', 'a'), &media) || !media.payload ||
+        !find_atom(fd, media, TAG('m', 'd', 'h', 'd'), &header) || header.end - header.payload < 24 ||
+        !mp_mov_read_at(fd, header.payload, bytes, 24) || bytes[0] > 1)
+        return false;
+    uint32_t media_scale = AV_RB32(bytes + (bytes[0] ? 20 : 12));
+    if (!media_scale || media_scale > INT32_MAX || count != (list.end - list.payload - 8) / row_size ||
+        (list.end - list.payload - 8) % row_size)
+        return false;
+    mp_probe_hash_value(hash, count);
+    for (uint32_t i = 0; i < count; i++) {
+        if (!mp_mov_read_at(fd, list.payload + 8 + (int64_t)i * row_size, bytes, row_size))
+            return false;
+        uint64_t duration = row_size == 20 ? AV_RB64(bytes) : AV_RB32(bytes);
+        int64_t start = row_size == 20 ? (int64_t)AV_RB64(bytes + 8) : (int32_t)AV_RB32(bytes + 4);
+        if (duration > INT64_MAX || start < -1)
+            return false;
+        mp_probe_hash_time(hash, duration, (AVRational){1, movie_scale});
+        mp_probe_hash_value(hash, start == -1);
+        if (start >= 0)
+            mp_probe_hash_time(hash, start, (AVRational){1, media_scale});
+        mp_probe_hash_value(hash, AV_RB32(bytes + row_size - 4));
+    }
+    return true;
+}
+
+void mp_mov_hash_edits(const char *path, const AVFormatContext *file, CC_SHA256_CTX **timing)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat info;
+    Atom movie = {0}, header;
+    uint8_t bytes[24];
+    bool *seen = av_calloc(file->nb_streams, sizeof(*seen));
+    if (fd < 0 || !seen || fstat(fd, &info))
+        goto fail;
+    for (int64_t offset = 0; offset < info.st_size;) {
+        Atom atom;
+        if (!next_atom(fd, &offset, info.st_size, &atom, movie.payload))
+            goto fail;
+        if (atom.type == TAG('m', 'o', 'o', 'v')) {
+            if (movie.payload)
+                goto fail;
+            movie = atom;
+        }
+    }
+    if (!movie.payload || !find_atom(fd, movie, TAG('m', 'v', 'h', 'd'), &header) ||
+        header.end - header.payload < 24 || !mp_mov_read_at(fd, header.payload, bytes, 24) || bytes[0] > 1)
+        goto fail;
+    uint32_t scale = AV_RB32(bytes + (bytes[0] ? 20 : 12));
+    if (!scale || scale > INT32_MAX)
+        goto fail;
+    for (int64_t offset = movie.payload; offset < movie.end;) {
+        Atom track, tkhd;
+        if (!next_atom(fd, &offset, movie.end, &track, false))
+            goto fail;
+        if (track.type != TAG('t', 'r', 'a', 'k'))
+            continue;
+        if (!find_atom(fd, track, TAG('t', 'k', 'h', 'd'), &tkhd) ||
+            tkhd.end - tkhd.payload < 24 || !mp_mov_read_at(fd, tkhd.payload, bytes, 24) || bytes[0] > 1)
+            goto fail;
+        uint32_t id = AV_RB32(bytes + (bytes[0] ? 20 : 12));
+        for (unsigned i = 0; i < file->nb_streams; i++) {
+            const AVStream *stream = file->streams[i];
+            if ((uint32_t)stream->id != id)
+                continue;
+            if (timing[i] && (seen[i] || !hash_track_edits(fd, track, stream, scale, timing[i])))
+                timing[i] = NULL;
+            seen[i] = true;
+        }
+    }
+    for (unsigned i = 0; i < file->nb_streams; i++)
+        if (!seen[i])
+            timing[i] = NULL;
+    close(fd);
+    av_free(seen);
+    return;
+fail:
+    for (unsigned i = 0; i < file->nb_streams; i++)
+        timing[i] = NULL;
+    if (fd >= 0)
+        close(fd);
+    av_free(seen);
 }

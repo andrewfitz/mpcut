@@ -84,6 +84,7 @@ struct MulticamPreviewAudioSpan: Equatable, Sendable {
     let origin: RationalTime
     let input: Range<RationalTime>
     let output: Range<RationalTime>
+    let channels: Int
     let presentationTrackID: CMPersistentTrackID?
 
     init?(span: MulticamSpan, media: [String: MediaInfo]) {
@@ -104,6 +105,7 @@ struct MulticamPreviewAudioSpan: Equatable, Sendable {
         self.ordinal = ordinal
         input = start..<end
         output = outputStart..<outputEnd
+        channels = track.stream.channels
         presentationTrackID = source.requiresPresentationAudioAnalysis(stream: stream) ? track.stream.trackID : nil
     }
 
@@ -165,6 +167,19 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
     private var parked: [NativeEntry] = []
     private var previous: MulticamPicturePosition?
     private var frame: PreviewFrame?
+
+    func invalidate(_ urls: Set<URL>) {
+        requests.queue.async {
+            self.parked.removeAll { urls.contains($0.source.url) }
+            if let source = self.source, urls.contains(source.url) {
+                self.source = nil
+                self.native = nil
+                self.reader = FFPreviewReader(videoOnly: true)
+                self.previous = nil
+                self.frame = nil
+            }
+        }
+    }
 
     func retainSources(_ sources: Set<MulticamPictureSource>) {
         requests.queue.async {
@@ -248,17 +263,17 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
 /// Serial audio reader. A mapped span is opened only at a seek or a real sound edit.
 final class MulticamPreviewAudioDecoder: @unchecked Sendable {
     fileprivate let requests = MulticamDecodeQueue("audio")
-    private var fallback = FFPreviewReader(audioOnly: true)
+    private var fallback = FFPreviewReader(audioOnly: true, preservesSurround: true)
     private var identity: SourceIdentity?
     private var native: AVAssetReader?
-    private var nativeOutput: AVAssetReaderAudioMixOutput?
+    private var nativeOutput: AVAssetReaderOutput?
 
     func read(span: MulticamPreviewAudioSpan, from start: RationalTime, open: Bool,
               cancelled: @escaping () -> Bool) throws -> FFPreviewBatch {
         if open {
             if identity != span.identity {
                 identity = span.identity
-                fallback = FFPreviewReader(audioOnly: true)
+                fallback = FFPreviewReader(audioOnly: true, preservesSurround: true)
             }
             native?.cancelReading()
             native = nil
@@ -309,11 +324,18 @@ final class MulticamPreviewAudioDecoder: @unchecked Sendable {
             throw MulticamDecodeError.audio(span.url)
         }
         let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderAudioMixOutput(audioTracks: [track], audioSettings: [
-            AVFormatIDKey: kAudioFormatLinearPCM, AVNumberOfChannelsKey: 2,
+        var settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
             AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true,
             AVLinearPCMIsNonInterleaved: false, AVLinearPCMIsBigEndianKey: false
-        ])
+        ]
+        let output: AVAssetReaderOutput
+        if span.channels > 2 {
+            output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+        } else {
+            settings[AVNumberOfChannelsKey] = 2
+            output = AVAssetReaderAudioMixOutput(audioTracks: [track], audioSettings: settings)
+        }
         let origin = previewTime(span.origin)
         reader.timeRange = CMTimeRange(start: previewTime(start) + origin,
                                        end: previewTime(span.input.upperBound) + origin)
@@ -381,6 +403,10 @@ final class MulticamPreview: ObservableObject {
     private var reverseStarted: ContinuousClock.Instant = .now
     private var audio: [MulticamPreviewAudioSpan] = []
     private var plan: MulticamPlan?
+    private var programStills: ProgramPreviewStills?
+    private var programTransfer: String?
+    private let stillPreview = ProgramStillPreview()
+    private var showingProgramStill = false
     private var media: [String: MediaInfo] = [:]
     private var ticker: PreviewDisplayTicker?
     private var frame: PreviewFrame?
@@ -457,6 +483,10 @@ final class MulticamPreview: ObservableObject {
     func reset() {
         pause()
         plan = nil
+        programStills = nil
+        programTransfer = nil
+        stillPreview.cancel()
+        showingProgramStill = false
         media.removeAll()
         audio.removeAll()
         time = .zero
@@ -471,7 +501,21 @@ final class MulticamPreview: ObservableObject {
         audioDecoder = MulticamPreviewAudioDecoder()
     }
 
-    func configure(plan: MulticamPlan, media: [String: MediaInfo]) {
+    func invalidateMedia(_ urls: Set<URL>) {
+        pause()
+        _ = pictureDecoder.requests.invalidate()
+        pictureDecoder.invalidate(urls)
+        prefetchedPicture = nil
+        requestPicture(nil, interrupt: true)
+        resetAudio(at: time)
+        audioDecoder = MulticamPreviewAudioDecoder()
+    }
+
+    func configure(plan: MulticamPlan, media: [String: MediaInfo], project: CutProject? = nil, document: URL? = nil) {
+        let reference = plan.picture.lazy.compactMap { media[$0.source] }.first { $0.hasVideo }
+            ?? media.sorted { $0.key < $1.key }.lazy.map(\.value).first { $0.hasVideo }
+        programStills = ProgramPreviewStills(project: project, reference: reference, document: document)
+        programTransfer = project?.programColorPolicy?.transfer ?? programStills?.canvas.transfer
         let mappedAudio = plan.audio.compactMap { MulticamPreviewAudioSpan(span: $0, media: media) }
         let position = currentTime()
         if self.plan?.picture != plan.picture {
@@ -629,6 +673,7 @@ final class MulticamPreview: ObservableObject {
 
     func audition(url: URL, sourceTime: RationalTime, media: MediaInfo) {
         guard !isPlaying else { return }
+        stopProgramStill()
         isAuditioning = true
         let target = MulticamPicturePosition.at(sourceTime, source: url.path, media: media, spanIndex: -1)
         requestPicture(target, interrupt: true)
@@ -642,7 +687,11 @@ final class MulticamPreview: ObservableObject {
 
     func attach(_ surface: PreviewSurface) {
         surfaces.add(surface)
+        surface.otherMonitorStatus = { [weak self] in
+            self?.surfaces.allObjects.first(where: \.isVideoMonitor)?.presentationDescription
+        }
         if let frame { surface.display(frame) }
+        else if let pictureIssue { surface.unavailable(pictureIssue) }
     }
 
     fileprivate func detach(_ surface: PreviewSurface) {
@@ -651,6 +700,33 @@ final class MulticamPreview: ObservableObject {
 
     private func render(at time: RationalTime, interrupt: Bool) {
         guard !isAuditioning else { return }
+        if let programStills, let still = programStills.picture(at: time) {
+            if !showingProgramStill {
+                showingProgramStill = true
+                _ = pictureDecoder.requests.invalidate()
+                decodingPicture = nil
+                desiredPicture = nil
+                prefetchedPicture = nil
+                failedPicture = nil
+            }
+            stillPreview.show(still, canvas: programStills.canvas, onPending: {
+                clearPicture()
+                setPictureIssue(nil)
+            }) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let frame):
+                    self.frame = frame
+                    self.surfaces.allObjects.forEach { $0.display(frame) }
+                    self.setPictureIssue(nil)
+                case .failure(let error):
+                    self.clearPicture()
+                    self.setPictureIssue(error.localizedDescription)
+                }
+            }
+            return
+        }
+        stopProgramStill()
         requestPicture(plan.flatMap { MulticamPicturePosition.at(time, in: $0, media: media) }, interrupt: interrupt)
         guard playbackRate > 0, !interrupt, let plan, let picture, picture == desiredPicture,
               decodingPicture == nil, prefetchedPicture == nil,
@@ -661,8 +737,22 @@ final class MulticamPreview: ObservableObject {
         decodePicture(next.picture, prefetch: true)
     }
 
+    private func stopProgramStill() {
+        guard showingProgramStill else { return }
+        showingProgramStill = false
+        stillPreview.cancel()
+        clearPicture()
+        setPictureIssue(nil)
+    }
+
     private func setPictureIssue(_ message: String?) {
-        if pictureIssue != message { pictureIssue = message }
+        if pictureIssue != message {
+            pictureIssue = message
+            if frame == nil {
+                if let message { surfaces.allObjects.forEach { $0.unavailable(message) } }
+                else { surfaces.allObjects.forEach { $0.clear() } }
+            }
+        }
         if issue != (pictureIssue ?? audioIssue) { issue = pictureIssue ?? audioIssue }
     }
 
@@ -701,7 +791,9 @@ final class MulticamPreview: ObservableObject {
         decodePicture(target, prefetch: false)
     }
 
-    private func show(_ frame: PreviewFrame, at position: MulticamPicturePosition) {
+    private func show(_ decoded: PreviewFrame, at position: MulticamPicturePosition) {
+        let transfer = media[position.source]?.videoStream?.colorTransfer
+        let frame = decoded.tagged(transfer: isAuditioning ? transfer : programTransfer ?? transfer)
         self.frame = frame
         surfaces.allObjects.forEach { $0.display(frame) }
         picture = position
@@ -841,9 +933,11 @@ final class MulticamPreview: ObservableObject {
 
 struct MulticamPreviewView: NSViewRepresentable {
     let preview: MulticamPreview
+    var isVideoMonitor = false
 
     func makeNSView(context: Context) -> PreviewSurface {
         let surface = PreviewSurface(frame: .zero)
+        surface.setMonitor(isVideoMonitor)
         surface.windowChanged = { [weak preview] surface in
             if surface.window == nil { preview?.detach(surface) }
             else { preview?.attach(surface) }

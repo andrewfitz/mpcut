@@ -5,6 +5,90 @@ import XCTest
 @testable import MPCutApp
 
 final class AudioWaveformDisplayTests: XCTestCase {
+    @MainActor
+    func testOpeningAudioIsSampledFromTheSelectedTrackAndDiscardedOnClose() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
+        let header = try CutEngine(useSidecar: false).inspectForPreview(url)
+        let source = UUID(), store = WaveformStore()
+        for ordinal in [0, 1] {
+            store.update(sources: [:], track: ordinal, useSidecar: false, opening: (source, header, ordinal))
+            XCTAssertNil(store.openingWaveform)
+            let deadline = ContinuousClock.now + .seconds(3)
+            while store.openingWaveform?.waveform.peaks.last.flatMap({ $0 }) == nil && .now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let preview = try XCTUnwrap(store.openingWaveform)
+            XCTAssertEqual(preview.source, source)
+            XCTAssertEqual(preview.waveform.range, 0..<header.duration.seconds)
+            XCTAssertEqual(preview.waveform.peaks.count, 24)
+            XCTAssertGreaterThan(preview.waveform.peaks.compactMap { $0 }.max() ?? 0, 0)
+            XCTAssertNil(store.waves[source])
+            XCTAssertFalse(store.finished.contains(source))
+            XCTAssertTrue(store.completedWaveforms(for: source, media: header).isEmpty)
+        }
+        store.clear()
+        XCTAssertNil(store.openingWaveform)
+    }
+
+    @MainActor
+    func testVideoTimelineLoadsDetailOnlyAtFineZoomAndReusesTheWindow() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspect(url, keyframes: true)
+        let id = UUID(), store = AudioEnvelopeStore()
+        store.update(sources: [id: media], track: 0, readSidecars: false)
+        let clip = TimelineClip(id: UUID(), sourceID: id, name: "Video", sourceStart: 0, sourceEnd: media.duration.seconds,
+                                sourceDuration: media.duration.seconds, keyframes: [], thumbnailSyncTimes: [], frames: [])
+        let surface = TimelineSurface(frame: CGRect(x: 0, y: 0, width: 64, height: 160))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = surface.bounds.width
+        surface.timeline = SequenceTimeline(clips: [clip], playhead: 0, selection: nil, showsWaveform: true,
+            envelopeStore: store, onSelect: { _ in }, onSeek: { _ in }, onTrim: { _, _, _, _ in nil },
+            onMove: { _, _ in }, onDrop: { _, _ in })
+        let bitmap = try XCTUnwrap(surface.bitmapImageRepForCachingDisplay(in: surface.bounds))
+        func draw() { surface.cacheDisplay(in: surface.bounds, to: bitmap) }
+        draw()
+        surface.zoom = 64
+        draw()
+        surface.zoom = 1
+        draw()
+        try await Task.sleep(for: .milliseconds(120))
+        XCTAssertEqual(store.windowRevision, 0)
+        XCTAssertTrue(store.completed(for: id, media: media).isEmpty)
+
+        surface.zoom = 64
+        draw()
+        let deadline = ContinuousClock.now + .seconds(5)
+        while store.windowRevision == 0 && .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(store.windowRevision, 1)
+        draw()
+        XCTAssertGreaterThan(tealPixels(nearCenterOf: bitmap), 1)
+        let detail = try XCTUnwrap(store.envelope(for: id, surface: .timeline(clip.id), from: 0.02, to: 0.04, pixels: 8))
+        XCTAssertLessThan(detail.samples.to, media.duration.seconds / 4)
+        XCTAssertTrue(detail === store.envelope(for: id, surface: .timeline(UUID()), from: 0.03, to: 0.05, pixels: 8))
+        XCTAssertEqual(store.windowRevision, 1)
+    }
+
+    @MainActor
+    func testDuplicateVisibleRequestsShareWorkWhenTheFirstClipScrollsAway() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspect(url, keyframes: true)
+        let id = UUID(), store = AudioEnvelopeStore()
+        let first = WaveformSurface.timeline(UUID()), second = WaveformSurface.timeline(UUID())
+        store.update(sources: [id: media], track: 0, readSidecars: false)
+        XCTAssertNil(store.envelope(for: id, surface: first, from: 0.9, to: 1.1, pixels: 320))
+        XCTAssertNil(store.envelope(for: id, surface: second, from: 0.95, to: 1.05, pixels: 160))
+        store.setVisibleTimelineSurfaces([second])
+        let deadline = ContinuousClock.now + .seconds(5)
+        while store.windowRevision == 0 && .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        let shared = try XCTUnwrap(store.envelope(for: id, surface: second, from: 0.95, to: 1.05, pixels: 160))
+        XCTAssertTrue(shared === store.envelope(for: id, surface: first, from: 0.9, to: 1.1, pixels: 320))
+        XCTAssertEqual(store.windowRevision, 1)
+        store.update(sources: [id: media], track: 1, readSidecars: false)
+        XCTAssertNil(store.envelope(for: id, surface: second, from: 0.95, to: 1.05, pixels: 160))
+        store.setVisibleTimelineSurfaces([])
+    }
+
     func testEnvelopeLevelOfDetailPreservesSignedExtrema() throws {
         let lows = (0..<681).map { Float(($0 * 19) % 71 - 59) / 100 }
         let highs = (0..<681).map { Float(($0 * 11) % 37 + 30) / 100 }

@@ -5,6 +5,61 @@
 #include <libavutil/pixdesc.h>
 #include <stdio.h>
 
+/* MOV H.26x samples are length-prefixed. Transport streams use Annex B. */
+bool mp_h26x_random_access(const AVPacket *packet, const AVCodecParameters *params, bool source_start, int *multilayer)
+{
+    bool hevc = params->codec_id == AV_CODEC_ID_HEVC;
+    int length_size = 0;
+    if (!hevc && params->extradata_size >= 5 && params->extradata[0] == 1)
+        length_size = (params->extradata[4] & 3) + 1;
+    if (hevc && params->extradata_size >= 22 && params->extradata[0] == 1)
+        length_size = (params->extradata[21] & 3) + 1;
+    const uint8_t *bytes = packet->data;
+    int size = packet->size;
+    bool random_access = false;
+    for (int i = 0; i < size;) {
+        int unit_end = size;
+        if (length_size) {
+            if (size - i < length_size)
+                return false;
+            uint32_t length = 0;
+            for (int end = i + length_size; i < end; i++)
+                length = (length << 8) | bytes[i];
+            if (!length || length > (uint32_t)(size - i))
+                return false;
+            unit_end = i + (int)length;
+        } else {
+            while (i <= size - 3 && (bytes[i] || bytes[i + 1] || bytes[i + 2] != 1))
+                i++;
+            if (i > size - 4)
+                break;
+            i += 3;
+            for (int next = i; next <= size - 3; next++) {
+                if (!bytes[next] && !bytes[next + 1] && bytes[next + 2] == 1) {
+                    unit_end = next;
+                    break;
+                }
+            }
+        }
+        if (unit_end - i < (hevc ? 2 : 1))
+            return false;
+        int type = hevc ? (bytes[i] >> 1) & 63 : bytes[i] & 31;
+        if (hevc && mp_hevc_multilayer_unit(bytes + i, unit_end - i))
+            *multilayer = 1;
+        if (hevc && type <= 31) {
+            if (type < 16 || type > (source_start ? 21 : 20))
+                return false;
+            random_access = true;
+        } else if (!hevc && type >= 1 && type <= 5) {
+            if (type != 5)
+                return false;
+            random_access = true;
+        }
+        i = unit_end;
+    }
+    return random_access;
+}
+
 typedef struct {
     const uint8_t *data;
     size_t size, position;

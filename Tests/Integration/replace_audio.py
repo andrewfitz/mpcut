@@ -62,6 +62,49 @@ class Replacement(unittest.TestCase):
         self.assertEqual(run(["ffmpeg", "-v", "error", "-i", self.processed, "-map", "0:0", "-c", "copy", "-f", "s24le", "-"]),
                          run(["ffmpeg", "-v", "error", "-i", self.output, "-map", "0:2", "-c", "copy", "-f", "s24le", "-"]))
 
+    def test_audio_only_replacement_preserves_six_channel_order_and_other_track(self):
+        self.movie = self.folder / "two-tracks.mov"
+        ffmpeg("-i", self.extracted, "-i", self.processed, "-map", "0:a", "-map", "1:a",
+               "-c", "copy", self.movie)
+        surround = self.folder / "surround.wav"
+        tones = "|".join(f"0.1*sin(2*PI*{hz}*t)" for hz in (220, 330, 440, 110, 550, 660))
+        ffmpeg("-f", "lavfi", "-i", f"aevalsrc={tones}:c=5.1:s=48000:d=2", "-c:a", "pcm_s24le", surround)
+        self.replace(replacement=surround, target=1)
+        streams = probe(self.output, "-show_streams")["streams"]
+        self.assertEqual([s["channels"] for s in streams], [1, 6])
+        self.assertEqual(streams[1]["channel_layout"], "5.1")
+        self.assertEqual(self.pcm(self.output, "0:1"), self.pcm(surround, "0:0"))
+        self.assertEqual(self.pcm(self.output, "0:0"), self.pcm(self.movie, "0:0"))
+
+    def test_matroska_cannot_copy_named_pcm_surround_layout(self):
+        self.movie = self.extracted
+        surround = self.folder / "surround.wav"
+        ffmpeg("-f", "lavfi", "-i", "anullsrc=r=48000:cl=5.1(side):d=2", "-c:a", "pcm_s24le", surround)
+        for extension in ("mka", "mkv"):
+            output = self.folder / f"replaced.{extension}"
+            for extra in (("--dry-run",), ()):
+                with self.subTest(extension=extension, extra=extra):
+                    report = self.replace(replacement=surround, destination=output, target=0, extra=extra, missing=True)
+                    self.assertEqual(report["error"]["code"], "unsupported_container")
+                    self.assertIn("speaker layout", report["error"]["message"])
+                    self.assertFalse(output.exists())
+        self.replace(replacement=surround, target=0)
+        self.assertEqual(probe(self.output, "-show_streams")["streams"][0]["channel_layout"], "5.1(side)")
+        self.assertEqual(self.pcm(self.output, "0:a"), self.pcm(surround, "0:a"))
+
+    def test_audio_only_replacement_can_write_m4a_wav_and_mka(self):
+        self.movie = self.extracted
+        incoming = self.folder / "processed.m4a"
+        ffmpeg("-i", self.processed, "-c:a", "aac", incoming)
+        for extension, replacement in (("wav", self.processed), ("mka", self.processed), ("m4a", incoming)):
+            with self.subTest(extension=extension):
+                output = self.folder / f"replaced.{extension}"
+                report = self.replace(replacement=replacement, destination=output, target=0, extra=("--dry-run",))
+                self.assertEqual(report["container"], extension)
+                self.assertFalse(output.exists())
+                self.replace(replacement=replacement, destination=output, target=0)
+                self.assertEqual(self.pcm(output, "0:a"), self.pcm(replacement, "0:a"))
+
     def test_compressed_replacement_from_a_chosen_external_stream(self):
         alternate = self.folder / "alternate.mov"
         ffmpeg("-i", self.processed, "-f", "lavfi", "-i", "sine=d=2:f=850:r=48000",
@@ -222,6 +265,30 @@ class Replacement(unittest.TestCase):
         report = self.replace(replacement=self.folder / "missing.wav", extra=("--to", "1"), missing=True)
         self.assertEqual(report["error"]["code"], "output_exists", report)
         self.assertEqual(self.output.read_bytes(), b"existing output")
+
+    def test_ranged_replacement_failure_names_the_original_source(self):
+        arguments = [CLI, "export", "--mode", "copy", "--clip", self.movie, "--to", "0.125",
+                     "--replace-audio", self.processed, "--replace-track", "2", "--output", self.output]
+        result = subprocess.run(arguments, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"Clip 1 · {self.movie.name}", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_ranged_replacement_dry_run_lists_replayable_original_clip(self):
+        self.movie = self.folder / "long-gop.mov"
+        donor = self.folder / "donor.wav"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=d=3:s=160x96:r=25",
+               "-f", "lavfi", "-i", "sine=d=3:f=440:r=48000", "-c:v", "libx264", "-g", "25",
+               "-c:a", "pcm_s16le", self.movie)
+        ffmpeg("-f", "lavfi", "-i", "sine=d=3:f=660:r=48000", "-c:a", "pcm_s16le", donor)
+        span = ("--from", "0.8", "--to", "2.12")
+        report = self.replace(replacement=donor, target=1, extra=(*span, "--snap", "nearest", "--dry-run"))
+        raises = report["tier"]["raise"]
+        self.assertEqual([offer["tier"] for offer in raises], ["trueLossless"])
+        self.assertEqual(raises[0]["clips"], [{"file": str(self.movie), "from": "1", "to": "2"}])
+        self.replace(replacement=donor, target=1, extra=("--from", "1", "--to", "2"))
+        self.assertEqual([p["data_hash"] for p in packets(self.output, "v:0")],
+                         [p["data_hash"] for p in packets(self.movie, "v:0")[25:50]])
 
     def test_ranged_replacement_resolves_the_final_container_after_staging(self):
         self.movie = self.folder / "intra.mov"

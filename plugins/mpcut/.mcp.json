@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mpcut": {
+      "command": "/Applications/MPCut.app/Contents/Helpers/mpcut-mcp",
+      "args": []
+    }
+  }
+}

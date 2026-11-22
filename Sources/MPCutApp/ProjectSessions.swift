@@ -68,7 +68,7 @@ final class ProjectSession: ObservableObject {
 
     /// A discard decision applies to the document the user actually saw.
     enum DocumentState: Equatable {
-        case sequence(URL?, [CutSequenceClip], [UUID], Int)
+        case sequence(URL?, CutProject, [UUID], Int)
         case multicam(URL?, MulticamProject?, [MulticamSource], Int, Int)
     }
 
@@ -77,7 +77,7 @@ final class ProjectSession: ObservableObject {
             return .multicam(multicam.projectURL ?? multicam.draft.url, multicam.project ?? multicam.pendingSetupProject,
                              multicam.setup.map(\.source), multicam.historyRevision, multicam.historyCursor)
         }
-        return .sequence(editor.projectURL ?? editor.draft.url, editor.sequenceClips, editor.historyEntryIDs,
+        return .sequence(editor.projectURL ?? editor.draft.url, editor.stillProject, editor.historyEntryIDs,
                          editor.historyCursor)
     }
 
@@ -181,8 +181,8 @@ private struct ProjectMonitor: View {
 
     var body: some View {
         Group {
-            if isMulticam { MulticamPreviewView(preview: multicam) }
-            else { PreviewView(preview: ordinary) }
+            if isMulticam { MulticamPreviewView(preview: multicam, isVideoMonitor: true) }
+            else { PreviewView(preview: ordinary, isVideoMonitor: true) }
         }
         .onReceive(mode) { isMulticam = $0 }
     }
@@ -528,6 +528,9 @@ final class ProjectSessions: ObservableObject {
         return media
     }
 
+    /// True when a dropped file is a project, which `openDroppedProjects` opens instead of importing.
+    static func isDroppedProject(_ url: URL) -> Bool { url.isFileURL && isProject(resolveAlias(url)) }
+
     private static func isProject(_ resolved: URL) -> Bool {
         isCutDocument(resolved) || isCutDocument(resolved.resolvingSymlinksInPath())
     }
@@ -543,9 +546,16 @@ final class ProjectSessions: ObservableObject {
             } else { media.append(resolved) }
         }
         if !media.isEmpty {
-            let target = source.flatMap { $0.canReceiveMedia ? $0 : nil } ?? newWindow(openWindow)
-            target.editor.openFiles(media)
-            target.window?.makeKeyAndOrderFront(nil)
+            if let source, source.isMulticam, source.multicam.project != nil,
+               !source.multicam.isBusy, source.window?.attachedSheet == nil,
+               media.allSatisfy(StillImage.isImageInput) {
+                source.multicam.insertMulticamStills(media)
+                source.window?.makeKeyAndOrderFront(nil)
+            } else {
+                let target = source.flatMap { $0.canReceiveMedia ? $0 : nil } ?? newWindow(openWindow)
+                target.editor.openFiles(media)
+                target.window?.makeKeyAndOrderFront(nil)
+            }
         }
         for file in projects { openProject(file, in: source) }
     }
@@ -598,6 +608,16 @@ final class ProjectSessions: ObservableObject {
             target.isMulticam = false
             try target.editor.openProject(clips, at: url, history: history, reservation: reservation,
                                           archiveMedia: document.media, allowCommit: commitCheck?(target))
+            target.window?.makeKeyAndOrderFront(nil)
+        case .stillSequence(let sequence):
+            target.isMulticam = false
+            let clips = sequence.items.compactMap { item -> CutSequenceClip? in
+                guard case .source(let clip) = item else { return nil }
+                return clip
+            }
+            try target.editor.openProject(clips, at: url, history: history, reservation: reservation,
+                                          archiveMedia: document.media, allowCommit: commitCheck?(target),
+                                          stillProject: document.project)
             target.window?.makeKeyAndOrderFront(nil)
         case .multicam(let project):
             target.isMulticam = true
@@ -835,9 +855,11 @@ final class EditorApplication: NSObject, NSApplicationDelegate {
         let decision = sessions.prepareToQuit(stopExports: {
             let alert = NSAlert()
             alert.messageText = "Stop ongoing work and quit?"
-            alert.informativeText = "Quitting waits for exports, project conversions, and active MCP jobs to finish cancelling."
-            alert.addButton(withTitle: "Continue Working")
-            alert.addButton(withTitle: "Stop and Quit").hasDestructiveAction = true
+            alert.informativeText = "MPCut will cancel active exports, conversions, and MCP jobs before it quits."
+            alert.addButton(withTitle: "Continue Working").toolTip = "Keep MPCut open"
+            let quit = alert.addButton(withTitle: "Stop and Quit")
+            quit.hasDestructiveAction = true
+            quit.toolTip = "Stop work and quit"
             return alert.runModal() != .alertFirstButtonReturn
         }, reply: { [weak self] allowed in
             self?.isQuitting = false

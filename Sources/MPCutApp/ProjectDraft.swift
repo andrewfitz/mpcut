@@ -309,21 +309,22 @@ extension ProjectSessions {
             let alert = NSAlert()
             if files.isEmpty {
                 alert.messageText = "No untitled projects to recover"
-                alert.informativeText = "Untitled projects from interrupted editing sessions appear here."
+                alert.informativeText = "If MPCut closes unexpectedly, you can recover untitled projects here."
                 ProjectPanels.present(alert, in: window)
                 return
             }
             alert.messageText = "Recover an untitled project"
             alert.informativeText = "Choose a draft by its last edit time."
             let choices = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 340, height: 28))
+            choices.toolTip = "Choose project draft"
             for file in files {
                 let date = try file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
                 let label = date?.formatted(date: .abbreviated, time: .standard) ?? "Unknown edit time"
                 choices.addItem(withTitle: "\(label) (\(file.deletingLastPathComponent().lastPathComponent.prefix(8)))")
             }
             alert.accessoryView = choices
-            alert.addButton(withTitle: "Recover")
-            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Recover").toolTip = "Recover selected draft"
+            alert.addButton(withTitle: "Cancel").toolTip = "Cancel draft recovery"
             let respond: (NSApplication.ModalResponse) -> Void = { [weak self] result in
                 guard result == .alertFirstButtonReturn, files.indices.contains(choices.indexOfSelectedItem) else { return }
                 let file = files[choices.indexOfSelectedItem]
