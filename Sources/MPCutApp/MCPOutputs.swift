@@ -362,7 +362,7 @@ private extension ProjectSessions {
                 let batch = try MulticamBulkExport(ranges: groups, directory: output, container: container, mode: options.effectiveMode,
                                                    tracks: options.tracks, settings: options.settings, engine: engine)
                 outputs = batch.items.map(\.output)
-                write = { try engine.write(batch.items[$0].plan, to: batch.items[$0].output, progress: $1) }
+                write = { try batch.write(batch.items[$0], progress: $1) }
             } else {
                 var indexed: [URL: MediaInfo] = [:]
                 for range in ranges {

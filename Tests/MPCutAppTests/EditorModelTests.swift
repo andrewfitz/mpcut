@@ -553,12 +553,14 @@ final class EditorModelTests: XCTestCase {
         model.showBulkQueue()
         var options = ExportSheetOptions()
         options.copyContainer = "mov"
+        options.organization = .init(subfolder: "Review", baseName: "Select")
         model.exportQueuedRanges(to: directory, options: options)
         try await waitForEdit(model)
         XCTAssertNil(model.alert)
-        XCTAssertEqual(model.lastExportedURL, directory)
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted(),
-                       ["ProRes-2997-001.mov", "ProRes-2997-002.mov"])
+        let folder = directory.appendingPathComponent("Review", isDirectory: true)
+        XCTAssertEqual(model.lastExportedURL, folder)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(),
+                       ["Select-001.mov", "Select-002.mov"])
         model.removeQueuedRange(first.id)
         XCTAssertEqual(model.queuedRanges.first?.start, .zero)
         XCTAssertEqual(model.queuedRanges.first?.end, frame)

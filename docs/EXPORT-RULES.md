@@ -33,7 +33,7 @@ Containers marked *verified* are those the copy planner accepts for the source a
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | movie | all | smart | Smart Trim | *verified* | — | — | `reencode` |
 | movie | all | copy | Lossless Copy | *verified* | — | — | `copyOtherContainer`, `smartTrim`, `reencode` |
-| movie | all | encode | Re-encode | `mp4`, `mov`, `mkv` | `auto`, `copy`, `aac`, `pcm`, `remove` | `auto` | — |
+| movie | all | encode | Re-encode | `mp4`, `mov`, `mkv` | `auto`, `copy`, `aac`, `pcm`, `remove` | `auto` | `reencode` |
 | movie | video | smart | Lossless Copy | *verified* | — | — | `copyOtherContainer` |
 | movie | video | copy | Lossless Copy | *verified* | — | — | `copyOtherContainer` |
 | movie | video | encode | refused: `invalid_arguments` “A video-only selection uses Lossless Copy.” | — | — | — | — |
@@ -49,19 +49,19 @@ Containers marked *verified* are those the copy planner accepts for the source a
 | audio | audio | smart | Lossless Copy | *verified* | — | — | `copyOtherContainer`, `copySampleAligned`, `convertSameFormat`, `convertPCM`, `convertAAC` |
 | audio | audio | copy | Lossless Copy | *verified* | — | — | `copyOtherContainer`, `copySampleAligned`, `convertSameFormat`, `convertPCM`, `convertAAC` |
 | audio | audio | encode | Convert Audio | by audio action | `auto`, `copy`, `pcm`, `flac`, `aac`, `mp3` | `auto` | `convertSameFormat`, `convertPCM`, `convertAAC` |
-| multicam | all | smart | Smart Trim | `mov`, `mp4`, `m4v`, `mkv`, `webm` | — | — | — |
-| multicam | all | copy | Lossless Copy | `mov`, `mp4`, `m4v`, `mkv`, `webm` | — | — | — |
-| multicam | all | encode | Re-encode | `mov`, `mp4`, `m4v`, `mkv`, `webm` | `auto`, `copy`, `aac`, `pcm`, `remove` | `auto` | — |
+| multicam | all | smart | Smart Trim | `mov`, `mp4`, `m4v`, `mkv`, `webm` | — | — | `copyOtherContainer`, `reencode` |
+| multicam | all | copy | Lossless Copy | `mov`, `mp4`, `m4v`, `mkv`, `webm` | — | — | `copyOtherContainer`, `smartTrim`, `reencode` |
+| multicam | all | encode | Re-encode | `mov`, `mp4`, `m4v`, `mkv` | `copy`, `aac`, `pcm`, `remove` | `copy` | `convertPCM`, `convertAAC`, `reencode` |
 | multicam | video | smart | refused: `invalid_arguments` “Multicam single-type track selection uses copy. Omit --mode or choose --mode copy.” | — | — | — | — |
-| multicam | video | copy | Lossless Copy | `mov`, `mp4`, `m4v`, `mkv`, `webm` | — | — | — |
+| multicam | video | copy | Lossless Copy | *verified* | — | — | `copyOtherContainer` |
 | multicam | video | encode | refused: `invalid_arguments` “Multicam single-type track selection uses copy. Omit --mode or choose --mode copy.” | — | — | — | — |
 | multicam | audio | smart | refused: `invalid_arguments` “Multicam single-type track selection uses copy. Omit --mode or choose --mode copy.” | — | — | — | — |
-| multicam | audio | copy | Lossless Copy | `mov`, `mp4`, `m4v`, `mkv`, `webm` | — | — | — |
+| multicam | audio | copy | Lossless Copy | *verified* | — | — | `copyOtherContainer` |
 | multicam | audio | encode | refused: `invalid_arguments` “Multicam single-type track selection uses copy. Omit --mode or choose --mode copy.” | — | — | — | — |
 
 A source without picture has one selection, so `all` means `audio`. Smart Trim applies to picture, so a single-type selection is written as Lossless Copy.
 
-The multicam rows describe `MulticamEngine`, which plans programs itself and is not yet resolved through `ExportPlanner`. A sound-only multicam copy can also be written to `wav`.
+The multicam rows are enforced: `MulticamEngine` reads its refusals, containers and audio actions from these rules, so no front end can write what a row refuses. The Export inspector, both Export Queues and `export --project` resolve through `MulticamEngine.resolution`, which reports the alternatives of the row. `silence --project --output` plans its retained ranges with the engine directly and reports verified times only, because no `export --project` request stands for ranges that exist only in its report. The engine still owns what depends on the recordings: the program clock, the switch and range-edge times in `nearest`, the mux of picture and sound, and sample-exact sound conversion. For a multicam program `convertPCM` and `convertAAC` re-encode with the program sound converted, in the requested container when it carries that sound.
 
 ## Containers by setting
 
@@ -74,9 +74,22 @@ The multicam rows describe `MulticamEngine`, which plans programs itself and is 
 | Convert Audio, `aac` | `m4a`, `mp4`, `mov` |
 | Convert Audio, `mp3` | `mp3` |
 | Convert Audio, `flac` | `flac` |
-| Multicam program | `mov`, `mp4`, `m4v`, `mkv`, `webm` |
+| Multicam program, picture and sound | `mov`, `mp4`, `m4v`, `mkv`, `webm` |
+| Multicam re-encode, `h264` | `mov`, `mp4`, `m4v`, `mkv` |
+| Multicam re-encode, `hevc` | `mov`, `mp4`, `m4v`, `mkv` |
+| Multicam re-encode, `prores` | `mov`, `mkv` |
+| Multicam picture only, listed by the app | `mov`, `mp4`, `m4v`, `mkv`, `webm` |
+| Multicam sound only, listed by the app | `mov`, `mp4`, `m4v`, `mkv`, `wav` |
+| Movie re-encode with `pcm` sound | `mov`, `mkv` |
+| Movie re-encode with `aac` sound | `mp4`, `mov`, `mkv` |
+| Multicam program re-encode with `pcm` sound | `mov`, `mkv` |
+| Multicam program re-encode with `aac` sound | `mov`, `mp4`, `m4v` |
 
-PCM cannot be written into MP4 by a movie re-encode.
+An audio action its container cannot carry is refused with `unsupported_audio` and offers the containers that carry it, then `auto` for a movie. No front end substitutes another action. A multicam `m4v` is written as MP4. Multicam AAC needs a movie edit list for gapless timing, so it is not written into Matroska.
+
+PCM bit depth is chosen by the engine that writes it: a sound-only conversion keeps the source depth (16, 24 or 32-bit, or 32-bit float), while a movie or multicam re-encode writes 32-bit, or 32-bit float for a float source, so that no source depth is reduced.
+
+When `auto` cannot copy the sound of a movie re-encode exactly it converts: AAC, or PCM for ProRes outside MP4. A multicam re-encode never converts the routed program sound unasked: `auto` is accepted and means `copy`, and when that copy is not exact the export is unavailable and offers `convertPCM` and `convertAAC`.
 
 ## Defaults
 
@@ -111,17 +124,17 @@ Alternatives are checked in rank order and every one that works is reported, lea
 
 | Entry point | Source | Modes | Reports alternatives | Named restrictions |
 | --- | --- | --- | --- | --- |
-| App: Export sheet | movie | `smart`, `copy`, `encode` | yes | noAutoAudioConversion: Convert Audio names a format, so the sheet always shows what it will write. The offer button is what `--audio auto` applies. |
-| App: Export Queue | movie | `smart`, `copy`, `encode` | no | copyOnlySound: sound-only queues use Lossless Copy. Convert the ranges with the Export sheet or `bulk --mode encode`.<br>noAlternatives: a failed range reports its error without the ladder. |
-| App: multicam Export inspector | multicam | `smart`, `copy`, `encode` | no | multicamConversion: Re-encode converts program sound to AAC or PCM only.<br>singleTypeCopy: picture-only and sound-only selections use Lossless Copy.<br>noAlternatives: an unavailable export reports verified switch times instead of the ladder. |
-| App: multicam Export Queue | multicam | `smart`, `copy`, `encode` | no | multicamConversion: Re-encode converts program sound to AAC or PCM only.<br>singleTypeCopy: picture-only and sound-only selections use Lossless Copy.<br>noAlternatives: an unavailable export reports verified switch times instead of the ladder. |
+| App: Export sheet | movie | `smart`, `copy`, `encode` | yes | noAutoAudioConversion: Convert Audio names a format, so the sheet always shows what it will write. The first offer is what `--audio auto` applies. |
+| App: Export Queue | movie | `smart`, `copy`, `encode` | yes | sharedSettings: one setting applies to every range, so an alternative that moves cuts (`copySampleAligned`) is not offered.<br>sourceCompatible: Lossless Copy and Smart Trim can leave the container to the copy planner. |
+| App: multicam Export inspector | multicam | `smart`, `copy`, `encode` | yes | listedContainers: a picture-only or sound-only copy lists the containers under Containers by setting. The CLI accepts every extension the copy planner verifies.<br>switchTimes: an unsafe switch or range edge also reports verified times. |
+| App: multicam Export Queue | multicam | `smart`, `copy`, `encode` | yes | listedContainers: a picture-only or sound-only copy lists the containers under Containers by setting. The CLI accepts every extension the copy planner verifies.<br>switchTimes: an unsafe switch or range edge also reports verified times. |
 | App and CLI: Replace Source Audio | movie | `copy` | no | copyOnly: a replaced soundtrack is copied with both track types. |
 | CLI: export | movie | `smart`, `copy`, `encode` | yes | namedOutput: `--audio auto` applies the first alternative that fits the extension of `--output`.<br>defaultCopy: without `--mode`, export copies, or uses Smart Trim when `--order` is given. The app starts from Smart Trim. Existing scripts depend on this default, so it is kept until a change is approved. |
 | CLI: bulk | movie | `smart`, `copy`, `encode` | yes | namedOutput: `--audio auto` applies the first alternative that fits `container` when one is given. |
 | CLI: rearrange | movie | `smart` | yes | noEncode: use export for --mode encode.<br>nearestByDefault: video cuts snap to the nearest boundary. |
-| CLI: silence --output | movie | `smart`, `copy` | no | noEncode: retained ranges are written with Smart Trim or Lossless Copy.<br>noAlternatives: an unavailable export reports its error without the ladder. |
-| CLI: scenes --export-to | movie | `smart` | no | smartOnly: every scene is written with Smart Trim.<br>noAlternatives: an unavailable export reports its error without the ladder. |
-| CLI: export --project (multicam) | multicam | `smart`, `copy`, `encode` | no | multicamConversion: Re-encode converts program sound to AAC or PCM only.<br>singleTypeCopy: picture-only and sound-only selections use Lossless Copy.<br>noAlternatives: an unavailable export reports verified switch times instead of the ladder. |
+| CLI: silence --output | movie | `smart`, `copy` | yes | noEncode: retained ranges are written with Smart Trim or Lossless Copy.<br>generatedClips: the failing clips are the retained ranges, so each alternative lists them in `clips`. |
+| CLI: scenes --export-to | movie | `smart` | yes | smartOnly: every scene is written with Smart Trim, or Lossless Copy for a single-type selection. |
+| CLI: export --project (multicam) | multicam | `smart`, `copy`, `encode` | yes | namedOutput: the extension of `--output` is the container.<br>autoCopies: `--audio auto`, the flag's default, means `copy`. An inexact copy is refused and offers the conversions.<br>switchTimes: an unsafe switch or range edge also reports verified times in `nearest`. |
 
 ## Refusals
 

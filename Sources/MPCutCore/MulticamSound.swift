@@ -6,10 +6,12 @@ extension MulticamEngine {
         let engine = CutEngine(cancelled: cancelled, tracks: .audio)
         var identities: [URL: SourceIdentity] = [:]
         var reference: MediaInfo?
+        var prepared: [String: [Int: MediaInfo]] = [:]
         var segments: [ResolvedSegment] = []
         var silentAAC: [Int: Int] = [:]
         var audibleAAC = Set<Int>()
         let spans = mapping.audio
+        segments.reserveCapacity(spans.count)
         for (index, span) in spans.enumerated() {
             try engine.checkCancellation()
             let segment = index + 1
@@ -20,27 +22,39 @@ extension MulticamEngine {
                     throw CutError(code: "missing_audio", message: "No source or absolute stream index was supplied.")
                 }
                 let selector = CutEngine(cancelled: cancelled, tracks: .audio, audioStream: stream)
-                let selected = try selector.selectedMedia(source)
-                guard let track = selected.audio.first, track.stream.sampleRate > 0,
-                      track.stream.isPCM || !track.packets.isEmpty || !track.presentationEdits.isEmpty else {
-                    throw CutError(code: "audio_unavailable", message: "The selected soundtrack has no usable presentation clock.")
+                let selected: MediaInfo
+                let isPrepared: Bool
+                if let known = prepared[span.source]?[stream] {
+                    selected = known
+                    isPrepared = true
+                } else {
+                    selected = try selector.selectedMedia(source)
+                    guard let track = selected.audio.first, track.stream.sampleRate > 0,
+                          track.stream.isPCM || !track.packets.isEmpty || !track.presentationEdits.isEmpty else {
+                        throw CutError(code: "audio_unavailable", message: "The selected soundtrack has no usable presentation clock.")
+                    }
+                    // An indexed issue names one track. Only another track's issue is irrelevant here.
+                    if let issue = selected.copyIssue, !issue.hasPrefix("The video "), !issue.hasPrefix("A ProRes "),
+                       !issue.hasPrefix("RAW video"), issue != "Multiple video tracks are unsupported.",
+                       !(issue.hasPrefix("Audio track ") || issue.hasPrefix("AAC track "))
+                        || issue.hasPrefix("Audio track \(stream) ") || issue.hasPrefix("AAC track \(stream) ") {
+                        throw CutError(code: "unsupported_tracks", message: issue)
+                    }
+                    if let issue = selector.muxIssue(selected, container: container) {
+                        throw CutError(code: "unsupported_container", message: issue)
+                    }
+                    isPrepared = false
                 }
-                // An indexed issue names one track. Only another track's issue is irrelevant here.
-                if let issue = selected.copyIssue, !issue.hasPrefix("The video "), !issue.hasPrefix("A ProRes "),
-                   !issue.hasPrefix("RAW video"), issue != "Multiple video tracks are unsupported.",
-                   !(issue.hasPrefix("Audio track ") || issue.hasPrefix("AAC track "))
-                    || issue.hasPrefix("Audio track \(stream) ") || issue.hasPrefix("AAC track \(stream) ") {
-                    throw CutError(code: "unsupported_tracks", message: issue)
-                }
-                if let issue = selector.muxIssue(selected, container: container) {
-                    throw CutError(code: "unsupported_container", message: issue)
-                }
+                let track = selected.audio[0]
                 if container == "flac", !(first && last && span.input.from == .zero && span.input.to == track.end) {
                     throw CutError(code: "unsupported_container",
                                    message: "FLAC frames carry their original sample numbers. Choose MKA for an edited soundtrack.")
                 }
-                if let reference { try engine.checkCompatibility(selected, with: reference) }
-                else { reference = selected }
+                if !isPrepared {
+                    if let reference { try engine.checkCompatibility(selected, with: reference) }
+                    else { reference = selected }
+                    prepared[span.source, default: [:]][stream] = selected
+                }
 
                 let from = span.input.from
                 let to = span.input.to

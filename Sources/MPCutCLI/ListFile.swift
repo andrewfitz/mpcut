@@ -256,16 +256,15 @@ enum ListFile {
         }
         guard url.pathExtension.lowercased() == "json" else { throw invalid("Choose a .csv or .json range list.") }
         let data = try jsonData(url, cancelled: cancelled)
-        // Canonicalize validated timestamps before handing them to the shared edit-list validator.
-        func time(_ value: Scalar) throws -> String { try RationalTime(parsing: value.value).description }
-        let lines: [String]
         if !rangesOnly, let points = try? json(Scalar.self, data: data) {
-            lines = try points.map(time)
-        } else {
-            lines = try json(RangeRow.self, data: data).map { try time($0.from) + "," + time($0.to) }
+            let times = try points.map { try RationalTime(parsing: $0.value) }
+            try validateJSON(data)
+            return try ClipEditCSV.ranges(points: times, clip: clip, cancelled: cancelled)
+        }
+        let intervals = try json(RangeRow.self, data: data).map {
+            try AudioSpan(from: RationalTime(parsing: $0.from.value), to: RationalTime(parsing: $0.to.value))
         }
         try validateJSON(data)
-        return try ClipEditCSV.ranges(in: lines.joined(separator: "\n"), clip: clip, rangesOnly: rangesOnly,
-                                     cancelled: cancelled)
+        return try ClipEditCSV.ranges(intervals: intervals, clip: clip, cancelled: cancelled)
     }
 }

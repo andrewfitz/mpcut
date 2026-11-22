@@ -92,13 +92,11 @@ public struct ReencodeEngine: Sendable {
         try checkCancellation()
         guard !clips.isEmpty else { throw CutError(code: "empty_edit", message: "Add at least one clip before exporting.") }
         let container = container.lowercased()
-        guard ["mp4", "mov", "mkv"].contains(container), container != "mp4" || settings.codec != .prores else {
-            throw CutError(code: "unsupported_container", message: "Choose MP4, MOV, or MKV for Re-encode. ProRes requires MOV or MKV.")
-        }
+        // The container and audio action lists belong to the export rules.
+        guard ExportRules.reencodeContainers(settings.codec).contains(container) else { throw ExportRules.reencodeContainerRefusal }
         if let output { try checkDestination(output, container: container) }
-        guard ReencodeAudio.movieCases.contains(settings.audio) else {
-            throw CutError(code: "unsupported_audio",
-                           message: "\(settings.audio.rawValue.uppercased()) conversion applies to audio-only exports. Choose auto, copy, aac, pcm or remove for a movie.")
+        guard ExportRules.movieAudioActions.contains(settings.audio) else {
+            throw ExportRules.audioActionRefusal(settings.audio, source: .movie)
         }
 
         let engine = CutEngine(cancelled: cancelled)
@@ -362,12 +360,10 @@ public struct ReencodeEngine: Sendable {
                                    segment: issue.segment, boundary: issue.boundary, nearest: issue.nearest, track: issue.track)
                 }
                 copyFailure = issue
-                effective = settings.codec == .prores && container != "mp4" ? .pcm : .aac
+                effective = ExportRules.automaticAudio(codec: settings.codec, container: container, source: .movie).first ?? .aac
             }
         }
-        if effective == .pcm, container == "mp4" {
-            throw CutError(code: "unsupported_audio", message: "Choose MOV or MKV for PCM audio.")
-        }
+        if let refusal = ExportRules.reencodeRefusal(audio: effective, container: container, source: .movie) { throw refusal }
         return (try reference.audio.map { audio in
             if exactPCM.contains(audio.stream.index) { return exactPCMAction(audio.stream.index) }
             if effective != .removeAudio {

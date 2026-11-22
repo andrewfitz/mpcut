@@ -852,12 +852,26 @@ static int indexed_prores(const MPMOVIndex *index, AVFormatContext *file, MPProb
                               (int64_t)params->ch_layout.nb_channels;
         if (audio && (block_align <= 0 || (params->block_align && params->block_align != block_align)))
             goto fallback;
+        MPProbeStream *indexed = &result->streams[i];
+        if (video && count > (index->payload_end - index->payload_start) / 26)
+            goto fallback;
+        if (video || audio) {
+            size_t capacity = video ? count : 1;
+            indexed->packets = av_malloc_array(capacity, sizeof(*indexed->packets));
+            if (!indexed->packets) {
+                status = AVERROR(ENOMEM);
+                goto done;
+            }
+            indexed->capacity = capacity;
+        }
+        int last_audio_size = 0;
         for (int j = 0; j < count; j++) {
-            if (cancelled && cancelled(context)) {
+            bool report = (j % 128) == 0;
+            if ((video || report) && cancelled && cancelled(context)) {
                 status = AVERROR_EXIT;
                 goto done;
             }
-            if (progress && entries > 0 && (j % 128) == 0)
+            if (report && progress && entries > 0)
                 progress(context, (double)(completed + j) / entries);
             const AVIndexEntry *entry = avformat_index_get_entry(stream, j);
             if (!entry || entry->timestamp != expected || entry->pos < end ||
@@ -881,26 +895,39 @@ static int indexed_prores(const MPMOVIndex *index, AVFormatContext *file, MPProb
             if (duration <= 0 || duration > stream->duration - expected)
                 goto fallback;
             expected += duration;
-            if (!video && !audio)
+            if (!video) {
+                if (audio)
+                    last_audio_size = entry->size;
                 continue;
+            }
 
             uint8_t header[26];
-            if (video && !mp_mov_read_at(index->fd, entry->pos, header, sizeof(header)))
+            if (!mp_mov_read_at(index->fd, entry->pos, header, sizeof(header)))
                 goto fallback;
             AVPacket packet = {
                 .stream_index = i, .pts = entry->timestamp, .dts = entry->timestamp,
                 .duration = duration, .flags = AV_PKT_FLAG_KEY,
-                .data = video ? header : NULL, .size = video ? sizeof(header) : 0,
+                .data = header, .size = sizeof(header),
             };
             status = record_packet(result, params, &packet, NULL);
             if (status < 0)
                 goto done;
-            MPProbeStream *indexed = &result->streams[i];
             indexed->packets[indexed->count - 1].byte_count = entry->size;
         }
         completed += count;
         if (expected != stream->duration)
             goto fallback;
+        if (audio) {
+            // The validated PCM rows are contiguous and have no padding.
+            // Store the same coalesced row as the ordinary packet scan.
+            AVPacket packet = {
+                .stream_index = i, .duration = expected, .size = last_audio_size,
+                .flags = AV_PKT_FLAG_KEY,
+            };
+            status = record_packet(result, params, &packet, NULL);
+            if (status < 0)
+                goto done;
+        }
     }
     status = 1;
     goto done;

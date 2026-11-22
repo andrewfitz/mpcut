@@ -78,7 +78,11 @@ extension CutEngine {
     }
 
     public func suggestedContainers(for media: MediaInfo, clips: [ClipRequest]) -> [String] {
-        var candidates = suggestedContainers(for: media)
+        editContainers(suggestedContainers(for: media), for: media, clips: clips)
+    }
+
+    func editContainers(_ supported: [String], for media: MediaInfo, clips: [ClipRequest]) -> [String] {
+        var candidates = supported
         if !isCompleteSource(clips, media: media) {
             candidates.removeAll { $0 == "flac" }
             if let selected = try? selectedMedia(media), !selected.hasVideo,

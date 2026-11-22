@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import MPCutCore
 import SwiftUI
 import UniformTypeIdentifiers
@@ -601,13 +602,19 @@ private struct MulticamSceneStatus: View {
 }
 
 private struct MulticamProgramViewer: View {
-    @ObservedObject var preview: MulticamPreview
+    let preview: MulticamPreview
+    @State private var issue: String?
+    @State private var audioWarning: String?
 
     var body: some View {
-        EditorPreview(accessibilityTitle: "Multicam program preview", issue: preview.issue ?? preview.pictureIssue,
-                      audioWarning: preview.audioIssue) {
+        EditorPreview(accessibilityTitle: "Multicam program preview", issue: issue, audioWarning: audioWarning) {
             MulticamPreviewView(preview: preview)
         }
+        // The preview surface receives frames directly. SwiftUI only displays the warnings.
+        .onReceive(preview.$issue.combineLatest(preview.$pictureIssue).map { $0 ?? $1 }.removeDuplicates()) {
+            issue = $0
+        }
+        .onReceive(preview.$audioIssue.removeDuplicates()) { audioWarning = $0 }
     }
 }
 
@@ -622,14 +629,15 @@ private struct MulticamPreviewSoundControls: View {
 
 private struct MulticamTimelineHost: View {
     @ObservedObject var model: MulticamEditorModel
-    @ObservedObject var preview: MulticamPreview
+    let preview: MulticamPreview
     let project: MulticamProject
     let inspectingAssembly: Bool
     let showSwitchInspector: () -> Void
 
     var body: some View {
-        var timeline = MulticamTimeline(project: project, media: model.media, playhead: model.groupTime(at: preview.time),
-                         exclusiveEnd: preview.time == preview.duration, seek: model.seekTimeline, take: model.take,
+        var timeline = MulticamTimeline(project: project, media: model.media, playhead: .zero,
+                         clock: MulticamTimelineClock(preview: preview, groupTime: model.groupTime(at:)),
+                         seek: model.seekTimeline, take: model.take,
                          moveSwitch: { model.moveSwitch($0, to: $1, snap: true) },
                          deleteSwitch: model.deleteSwitch,
                          selectSwitch: { model.selectMarker($0); showSwitchInspector() },
@@ -937,21 +945,23 @@ private struct MulticamSetupWindowBinding: NSViewRepresentable {
 private struct MulticamExportControls: View {
     @ObservedObject var model: MulticamEditorModel
     let project: MulticamProject
-    @State private var mode: ExportMode
-    @State private var tracks: ExportTracks = .all
-    @State private var container = "mov"
+    /// The settings on offer. Their lists, defaults and names come from the export rules.
+    @State private var choices: MulticamExportChoices
+    private var tracks: ExportTracks { choices.tracks }
+    private var container: String { choices.container }
     private var wholeGroup: Bool { model.exportProgram == .group }
     private var selectionRanges: [MulticamRange]? {
         model.exportProgram == .selection ? model.selectedExportRanges : nil
     }
-    @State private var codec: ReencodeCodec = .h264
-    @State private var audio: ReencodeAudio = .copyOriginal
     @State private var checkedConversion: Conversion?
 
     init(model: MulticamEditorModel, project: MulticamProject) {
         self.model = model
         self.project = project
-        _mode = State(initialValue: model.preferences.defaultExportMode == .copy ? .copy : .smart)
+        // Re-encode has its own section below, so the Mode control starts from a copying mode.
+        let preferred = model.preferences.defaultExportMode
+        _choices = State(initialValue: MulticamExportChoices(entry: .multicamSheet,
+                                                            preferred: preferred == .encode ? ExportRules.defaultMode(for: .multicam) : preferred))
     }
 
     private struct Conversion: Equatable {
@@ -964,8 +974,10 @@ private struct MulticamExportControls: View {
 
     private var conversion: Conversion {
         Conversion(project: project, container: container, wholeGroup: wholeGroup, selection: selectionRanges,
-                   settings: ReencodeSettings(codec: codec, audio: audio))
+                   settings: ReencodeSettings(codec: choices.codec, audio: choices.audio))
     }
+    /// The copying modes of the Mode control. Re-encode is requested from its own section.
+    private var copyModes: [ExportMode] { choices.modes.filter { $0 != .encode } }
 
     var body: some View {
         SectionHeading("Export")
@@ -977,25 +989,23 @@ private struct MulticamExportControls: View {
             }
         }
         InspectorRow("Tracks") {
-            Picker("Tracks", selection: $tracks) {
-                Text(project.audio == .none && project.switches.allSatisfy { $0.audio == nil }
-                     ? "Project tracks (picture only)" : "Project tracks").tag(ExportTracks.all)
-                Text("Picture only (Lossless Copy)").tag(ExportTracks.video)
-                Text("Sound only (Lossless Copy)").tag(ExportTracks.audio)
+            Picker("Tracks", selection: $choices.tracks) {
+                let silent = project.audio == .none && project.switches.allSatisfy { $0.audio == nil }
+                ForEach(ExportTracks.allCases, id: \.self) {
+                    Text(MulticamExportChoices.title(of: $0, silentProject: silent)).tag($0)
+                }
             }
         }
-        if tracks == .all {
+        if copyModes.count > 1 {
             InspectorRow("Mode") {
-                Picker("Mode", selection: $mode) {
-                    Text("Smart Trim").tag(ExportMode.smart)
-                    Text("Lossless Copy").tag(ExportMode.copy)
+                Picker("Mode", selection: $choices.mode) {
+                    ForEach(copyModes, id: \.self) { Text(choices.title(of: $0)).tag($0) }
                 }
             }
         }
         InspectorRow("Container") {
-            Picker("Container", selection: $container) {
-                ForEach(["mov", "mp4", "m4v", "mkv"], id: \.self) { Text(containerDisplayName($0)).tag($0) }
-                if tracks == .audio { Text(containerDisplayName("wav")).tag("wav") }
+            Picker("Container", selection: $choices.container) {
+                ForEach(choices.containers(mode: tracks == .all ? nil : .copy), id: \.self) { Text(containerDisplayName($0)).tag($0) }
             }
         }
         let sourceIssue = model.exportSourceIssue(tracks: tracks, wholeGroup: wholeGroup, selection: selectionRanges)
@@ -1010,19 +1020,30 @@ private struct MulticamExportControls: View {
                 .buttonStyle(.borderedProminent)
         }
         .disabled(sourceIssue != nil)
-        .onChange(of: tracks) { _, tracks in if tracks != .audio && container == "wav" { container = "mov" } }
+        .onChange(of: choices) { _, _ in
+            choices.settle()
+            model.exportAlternatives = []
+        }
+        // An unavailable export offers what the export rules report for it, least destructive first.
+        if !model.exportAlternatives.isEmpty {
+            ExportOffersView(message: "This export is unavailable. These alternatives work.", alternatives: model.exportAlternatives) {
+                choices.apply($0)
+                // Re-encode is requested from its own section, so the Mode control keeps a copying mode.
+                if $0.mode == .encode { choices.mode = ExportRules.defaultMode(for: .multicam) }
+            }
+        }
 
-        if tracks == .all {
+        if choices.modes.contains(.encode) {
             Divider().padding(.vertical, 2)
-            SectionHeading("Re-encode")
+            SectionHeading(choices.title(of: .encode))
             InspectorRow("Video") {
-                Picker("Video", selection: $codec) {
+                Picker("Video", selection: $choices.codec) {
                     ForEach(ReencodeCodec.allCases, id: \.self) { Text($0.displayName).tag($0) }
                 }
             }
             InspectorRow("Audio") {
-                Picker("Audio", selection: $audio) {
-                    ForEach([ReencodeAudio.copyOriginal, .aac, .pcm, .removeAudio], id: \.self) {
+                Picker("Audio", selection: $choices.audio) {
+                    ForEach(choices.audioActions, id: \.self) {
                         Text($0.displayName).tag($0)
                     }
                 }
@@ -1031,7 +1052,7 @@ private struct MulticamExportControls: View {
                 model.exportSourceIssue(tracks: .all, wholeGroup: wholeGroup, mode: .encode, settings: conversion.settings, selection: selectionRanges)
             }
             HStack {
-                Button("Check Re-encode") { checkConversion() }
+                Button("Check \(choices.title(of: .encode))") { checkConversion() }
                     .help("A re-encode must pass this check before it can be exported.")
                 Spacer()
                 Button("Export Re-encoded…") {
@@ -1040,7 +1061,7 @@ private struct MulticamExportControls: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(checkedConversion != conversion)
                 .help(checkedConversion == conversion ? "Export with these re-encode settings"
-                                                      : "Choose Check Re-encode first.")
+                                                      : "Choose Check \(choices.title(of: .encode)) first.")
             }
             .disabled(conversionIssue != nil)
         }
@@ -1051,7 +1072,7 @@ private struct MulticamExportControls: View {
             .disabled(!model.canReplaceSourceAudio)
     }
 
-    private var effectiveMode: ExportMode { tracks == .all ? mode : .copy }
+    private var effectiveMode: ExportMode { choices.effectiveMode }
 
     private var checkDestination: URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("multicam-check-\(UUID()).\(container)")

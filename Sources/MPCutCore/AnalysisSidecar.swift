@@ -178,7 +178,8 @@ public struct AnalysisSidecar: Sendable {
         guard Self.readsEnabled, Self.validKey(key), !cancelled() else { return nil }
         do {
             guard let db = try openReadSnapshot() else { return nil }
-            let section = try verifiedSection(key, in: db, maxBytes: maxBytes, cancelled: cancelled)
+            guard let saved = try currentStamp(db) else { return nil }
+            let section = try verifiedSection(key, in: db, stamp: saved, maxBytes: maxBytes, cancelled: cancelled)
             try checkSource()
             return cancelled() ? nil : section
         } catch { return nil }
@@ -189,11 +190,12 @@ public struct AnalysisSidecar: Sendable {
     func withReadSnapshot<Value>(cancelled: () -> Bool,
                                  _ load: ((_ key: String) -> Data?) throws -> Value?) throws -> Value? {
         guard Self.readsEnabled, !cancelled(),
-              let db = try? openReadSnapshot() else { return nil }
+              let db = try? openReadSnapshot(),
+              let saved = try? currentStamp(db) else { return nil }
         let value = try withoutActuallyEscaping(cancelled) { check in
             try load { key in
                 guard Self.validKey(key), !check() else { return nil }
-                return try? verifiedSection(key, in: db, maxBytes: nil, cancelled: check)
+                return try? verifiedSection(key, in: db, stamp: saved, maxBytes: nil, cancelled: check)
             }
         }
         guard !cancelled(), (try? SourceIdentity(source)) == identity else { return nil }
@@ -209,9 +211,8 @@ public struct AnalysisSidecar: Sendable {
         return db
     }
 
-    private func verifiedSection(_ key: String, in db: SidecarDatabase, maxBytes: Int?,
+    private func verifiedSection(_ key: String, in db: SidecarDatabase, stamp saved: String, maxBytes: Int?,
                                  cancelled: () -> Bool) throws -> Data? {
-        guard let saved = try currentStamp(db) else { return nil }
         return try db.statement("SELECT digest, rowid FROM sections WHERE name = ?", [key]) { query in
             let step = sqlite3_step(query)
             if step == SQLITE_DONE { return nil }
@@ -356,7 +357,7 @@ public struct AnalysisSidecar: Sendable {
             var merged = sections
             for (key, update) in updating {
                 try checkSidecarCancellation(cancelled)
-                let current = try verifiedSection(key, in: db, maxBytes: nil, cancelled: cancelled)
+                let current = try verifiedSection(key, in: db, stamp: saved, maxBytes: nil, cancelled: cancelled)
                 let updated = try update(current)
                 if !retainingLatest.isEmpty || current != updated { merged[key] = updated }
             }

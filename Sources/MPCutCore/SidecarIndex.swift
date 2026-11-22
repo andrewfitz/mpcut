@@ -208,12 +208,18 @@ private struct IndexReader {
     }
 
     mutating func unsigned() throws -> UInt64 {
-        var n: UInt64 = 0
-        for shift in stride(from: 0, through: 63, by: 7) {
-            let b = try byte()
-            guard shift != 63 || b <= 1 else { throw IndexCodingError.invalid }
-            n |= UInt64(b & 0x7f) << shift
-            if b < 128 { return n }
+        let first = try byte()
+        if first < 128 { return UInt64(first) }
+
+        var n = UInt64(first & 0x7f)
+        var shift = 7
+        while position < bytes.count, shift <= 63 {
+            let next = bytes[position]
+            position += 1
+            guard shift != 63 || next <= 1 else { throw IndexCodingError.invalid }
+            n |= UInt64(next & 0x7f) << shift
+            if next < 128 { return n }
+            shift += 7
         }
         throw IndexCodingError.invalid
     }

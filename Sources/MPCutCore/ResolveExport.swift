@@ -411,26 +411,27 @@ public final class ResolveExport {
             let streams = info.streams.filter { $0.kind == "audio" }
             var fields = ["offset": at.fcpxTime, "start": start.fcpxTime, "duration": length.fcpxTime,
                           "name": try displayName(info.url.lastPathComponent)]
+            let node: XMLElement
             if streams.count <= 1 || !isolateSequenceAudio {
                 fields["start"] = try sourceTime(info, start).fcpxTime
                 fields["ref"] = try asset(info)
-                spine.child("asset-clip", fields)
+                node = spine.child("asset-clip", fields)
             } else {
-                let parent = spine.child("clip", fields)
+                node = spine.child("clip", fields)
                 if info.hasVideo {
-                    parent.child("video", ["ref": try asset(info), "offset": start.fcpxTime, "start": try sourceTime(info, start).fcpxTime,
+                    node.child("video", ["ref": try asset(info), "offset": start.fcpxTime, "start": try sourceTime(info, start).fcpxTime,
                                            "duration": length.fcpxTime])
                 }
                 for (index, stream) in streams.enumerated() {
                     let sound = try soundFile(info, stream: stream)
                     let from = max(start, stream.start), to = try min(start.adding(length), stream.start.adding(sound.duration))
                     guard from < to else { continue }
-                    parent.child("audio", ["ref": try asset(sound), "lane": String(index - streams.count),
+                    node.child("audio", ["ref": try asset(sound), "lane": String(index - streams.count),
                         "offset": from.fcpxTime, "start": try from.subtracting(stream.start).fcpxTime,
                         "duration": try to.subtracting(from).fcpxTime])
                 }
             }
-            if !clipMetadata.isEmpty, let node = spine.children?.last as? XMLElement {
+            if !clipMetadata.isEmpty {
                 let value = String(decoding: try JSONEncoder().encode(clipMetadata[ordinal]), as: UTF8.self)
                     .replacingOccurrences(of: "\u{FFFE}", with: "\\uFFFE")
                     .replacingOccurrences(of: "\u{FFFF}", with: "\\uFFFF")

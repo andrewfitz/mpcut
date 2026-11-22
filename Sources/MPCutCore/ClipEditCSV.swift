@@ -48,18 +48,46 @@ public enum ClipEditCSV {
         if cancelled() { throw CutError(code: "cancelled", message: "CSV import was cancelled.") }
     }
 
-    public static func ranges(in text: String, clip: AudioSpan, rangesOnly: Bool = false,
-                              cancelled: () -> Bool = { false }) throws -> [AudioSpan] {
-        func lineError(_ line: Int, _ message: String) -> CutError {
-            CutError(code: "invalid_csv", message: "CSV line \(line): \(message)")
-        }
-        let duration = try clip.to.subtracting(clip.from)
-        guard duration > .zero else { throw lineError(1, "The target clip must have positive duration.") }
-        var width: Int?
+    private static func lineError(_ line: Int, _ message: String) -> CutError {
+        CutError(code: "invalid_csv", message: "CSV line \(line): \(message)")
+    }
+
+    private struct Timeline {
+        let clip: AudioSpan
+        let duration: RationalTime
         var ranges: [AudioSpan] = []
-        var previous = clip.from
+        var previous: RationalTime
         var total = RationalTime.zero
-        func append(_ from: RationalTime, _ to: RationalTime, line: Int) throws {
+        var lastPointLine = 0
+
+        init(clip: AudioSpan) throws {
+            self.clip = clip
+            duration = try clip.to.subtracting(clip.from)
+            guard duration > .zero else { throw lineError(1, "The target clip must have positive duration.") }
+            previous = clip.from
+        }
+
+        func absoluteTime(_ offset: RationalTime?, field: @autoclosure () -> String, line: Int) throws -> RationalTime {
+            guard let offset, offset >= .zero, offset <= duration else {
+                throw lineError(line, "Expected a timestamp between 0 and \(duration) seconds, got ‘\(field())’.")
+            }
+            guard let absolute = try? clip.from.adding(offset) else {
+                throw lineError(line, "The timestamp exceeds the supported precision on this clip.")
+            }
+            return absolute
+        }
+
+        mutating func appendPoint(_ point: RationalTime, line: Int) throws {
+            guard point > previous, point < clip.to else {
+                throw lineError(line, "Cut points must increase and fall inside the clip.")
+            }
+            try append(previous, point, line: line)
+            previous = point
+            lastPointLine = line
+        }
+
+        mutating func append(_ from: RationalTime, _ to: RationalTime, line: Int) throws {
+            guard from < to else { throw lineError(line, "The end must follow the start.") }
             guard ranges.count < maximumPieces else {
                 throw lineError(line, "A CSV edit can produce at most 100,000 pieces.")
             }
@@ -70,9 +98,46 @@ public enum ClipEditCSV {
             }
             ranges.append(AudioSpan(from: from, to: to))
         }
+
+        mutating func finish() throws -> [AudioSpan] {
+            guard !ranges.isEmpty else { throw CutError(code: "invalid_csv", message: "The CSV contains no edit rows.") }
+            if lastPointLine != 0 { try append(previous, clip.to, line: lastPointLine) }
+            return ranges
+        }
+    }
+
+    /// List files with structured timestamps share the CSV timeline rules without parsing the timestamps again.
+    package static func ranges(points: [RationalTime], clip: AudioSpan, cancelled: () -> Bool) throws -> [AudioSpan] {
+        var timeline = try Timeline(clip: clip)
+        timeline.ranges.reserveCapacity(min(points.count + 1, maximumPieces))
+        for (offset, point) in points.enumerated() {
+            try checkCancellation(cancelled)
+            let line = offset + 1
+            let absolute = try timeline.absoluteTime(point, field: point.description, line: line)
+            try timeline.appendPoint(absolute, line: line)
+        }
+        return try timeline.finish()
+    }
+
+    package static func ranges(intervals: [AudioSpan], clip: AudioSpan, cancelled: () -> Bool) throws -> [AudioSpan] {
+        var timeline = try Timeline(clip: clip)
+        timeline.ranges.reserveCapacity(intervals.count)
+        for (offset, interval) in intervals.enumerated() {
+            try checkCancellation(cancelled)
+            let line = offset + 1
+            let from = try timeline.absoluteTime(interval.from, field: interval.from.description, line: line)
+            let to = try timeline.absoluteTime(interval.to, field: interval.to.description, line: line)
+            try timeline.append(from, to, line: line)
+        }
+        return try timeline.finish()
+    }
+
+    public static func ranges(in text: String, clip: AudioSpan, rangesOnly: Bool = false,
+                              cancelled: () -> Bool = { false }) throws -> [AudioSpan] {
+        var timeline = try Timeline(clip: clip)
+        var width: Int?
         var content = text.drop(while: { $0 == "\u{feff}" })
         var number = 0
-        var lastPointLine = 0
         while !content.isEmpty {
             try checkCancellation(cancelled)
             number += 1
@@ -99,28 +164,14 @@ public enum ClipEditCSV {
                 throw lineError(number, "Use one timestamp per row or two columns (from,to) throughout.")
             }
             let times = try cells.map { field in
-                guard let offset = try? RationalTime(parsing: field), offset >= .zero, offset <= duration else {
-                    throw lineError(number, "Expected a timestamp between 0 and \(duration) seconds, got ‘\(field)’.")
-                }
-                guard let absolute = try? clip.from.adding(offset) else {
-                    throw lineError(number, "The timestamp exceeds the supported precision on this clip.")
-                }
-                return absolute
+                try timeline.absoluteTime(try? RationalTime(parsing: field), field: field, line: number)
             }
             if times.count == 1 {
-                guard times[0] > previous, times[0] < clip.to else {
-                    throw lineError(number, "Cut points must increase and fall inside the clip.")
-                }
-                try append(previous, times[0], line: number)
-                previous = times[0]
-                lastPointLine = number
+                try timeline.appendPoint(times[0], line: number)
             } else {
-                guard times[0] < times[1] else { throw lineError(number, "The end must follow the start.") }
-                try append(times[0], times[1], line: number)
+                try timeline.append(times[0], times[1], line: number)
             }
         }
-        guard !ranges.isEmpty else { throw CutError(code: "invalid_csv", message: "The CSV contains no edit rows.") }
-        if width == 1 { try append(previous, clip.to, line: lastPointLine) }
-        return ranges
+        return try timeline.finish()
     }
 }

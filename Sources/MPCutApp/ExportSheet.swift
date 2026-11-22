@@ -2,7 +2,8 @@ import AppKit
 import Darwin
 import MPCutCore
 
-struct ExportSheetOptions: Sendable {
+struct ExportSheetOptions: Sendable, Equatable {
+    var organization = ExportOrganization()
     var mode: ExportMode = .smart
     var tracks: ExportTracks = .all
     var audioTrackOrdinal: Int?
@@ -68,8 +69,18 @@ struct ExportSheetOptions: Sendable {
         conversionContainer = preferred.flatMap { choices.contains($0) ? $0 : nil } ?? choices.first ?? conversionContainer
     }
     var quality: ReencodeQuality { codec == .prores ? proResQuality : standardQuality }
-    var effectiveAudio: ReencodeAudio { ExportRules.allows(audio: audio, inMovieContainer: container) ? audio : .auto }
+    /// The audio action that is requested. A container that cannot carry it is refused by the export rules with
+    /// the alternatives that work. Nothing is substituted here.
+    var effectiveAudio: ReencodeAudio { audio }
     var settings: ReencodeSettings { .init(codec: codec, quality: quality, audio: effectiveAudio) }
+    /// The settings of a batch, which names a conversion format through its audio action.
+    var batchSettings: ReencodeSettings { convertsAudio ? ReencodeSettings(audio: audioFormat) : settings }
+
+    /// The selection that an alternative reported by a batch stands for.
+    func applying(_ alternative: ExportAlternative) -> ExportSheetOptions {
+        applying(ExportRequest(clips: [], mode: alternative.mode, tracks: alternative.tracks, audio: alternative.audio ?? .auto),
+                 container: alternative.container)
+    }
 }
 
 struct ExportContainerChoices: Sendable {
@@ -294,30 +305,20 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private var sourceKind: ExportSourceKind { sourceHasVideo ? .movie : .audio }
     private func cell(_ mode: ExportMode) -> ExportCell { ExportRules.cell(source: sourceKind, tracks: options.tracks, mode: mode) }
     /// The modes the matrix writes as themselves for the selected tracks.
-    private var modes: [ExportMode] {
-        [ExportMode.smart, .copy, .encode].filter { cell($0).isAllowed && cell($0).resolvedMode == $0 }
-    }
+    private var modes: [ExportMode] { ExportEntryPoint.sheet.selectableModes(source: sourceKind, tracks: options.tracks) }
     private func title(of mode: ExportMode) -> String { cell(mode).displayName }
-    private let codecs: [ReencodeCodec] = [.h264, .hevc, .prores]
+    private let codecs = ReencodeCodec.allCases
     /// The source's own format first, then the named conversions of the matrix.
     private var conversionFormats: [ReencodeAudio] {
         let selected = options.audioTrackOrdinal.flatMap { audioStreams.indices.contains($0) ? audioStreams[$0] : nil }
             ?? audioStreams.first
-        let native = selected.flatMap { ExportRules.sameFormat(for: $0.codec) }
-        let named = cell(.encode).audioActions.filter { !ExportRules.conversionContainers($0).isEmpty }
-        return ([native].compactMap { $0 } + named).reduce(into: []) { list, format in
-            if !list.contains(format) { list.append(format) }
-        }
+        return ExportRules.namedConversions(sourceCodec: selected?.codec)
     }
+    /// Every audio action of the cell. One the container cannot carry is refused with its alternatives.
     private var audioChoices: [ReencodeAudio] {
-        if options.convertsAudio { return conversionFormats }
-        return ExportRules.movieAudioActions.filter {
-            $0 != .removeAudio && ExportRules.allows(audio: $0, inMovieContainer: options.container)
-        }
+        options.convertsAudio ? conversionFormats : cell(.encode).audioActions
     }
-    private var qualities: [ReencodeQuality] {
-        options.codec == .prores ? [.proresLT, .prores422, .proresHQ] : [.smallerFile, .balanced, .highQuality]
-    }
+    private var qualities: [ReencodeQuality] { ExportRules.qualities(options.codec) }
     private var containers: [String] {
         if options.convertsAudio { return ExportRules.conversionContainers(options.audioFormat) }
         return options.effectiveMode == .encode ? ExportRules.reencodeContainers(options.codec) : copyContainers.choices(for: options)
@@ -336,7 +337,15 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private let statusIcon = NSImageView()
     private let summary = NSTextField(wrappingLabelWithString: "")
     private let reviewButton = NSButton(title: "Review Cuts…", target: nil, action: nil)
-    private let encodeButton = NSButton(title: "Choose Re-encode", target: nil, action: nil)
+    private let encodeButton = NSButton(title: "", target: nil, action: nil)
+    /// The alternatives after the first, in the order the export rules report them.
+    private let morePicker = NSPopUpButton(frame: .zero, pullsDown: true)
+    private let offerRow = NSStackView()
+    /// The titles on offer: the button, then the pull-down beside it. This is the CLI's `alternatives` array.
+    var offeredTitles: [String] {
+        guard !offerRow.isHidden else { return [] }
+        return [encodeButton.title] + (morePicker.isHidden ? [] : Array(morePicker.itemTitles.dropFirst()))
+    }
     private let applyButton = NSButton(title: "Apply to Timeline", target: nil, action: nil)
     private let reviewScroll = NSScrollView()
     private let reviewText = NSTextView(frame: NSRect(x: 0, y: 0, width: 470, height: 124))
@@ -376,6 +385,13 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         configure(reviewButton, action: #selector(showReview))
         configure(encodeButton, action: #selector(applyFallback))
         configure(applyButton, action: #selector(applyReview))
+        morePicker.target = self
+        morePicker.action = #selector(applyListedAlternative)
+        morePicker.bezelStyle = .rounded
+        morePicker.setAccessibilityLabel("More export alternatives")
+        offerRow.spacing = 8
+        offerRow.alignment = .centerY
+        [encodeButton, morePicker].forEach(offerRow.addArrangedSubview)
 
         settings.orientation = .vertical
         settings.alignment = .leading
@@ -414,7 +430,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         accessory.spacing = 8
         accessory.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 12, right: 16)
         [paired(videoCheck, audioCheck), trackRow, paired(row("Mode", modePicker), row("Container", containerPicker)), settings, result,
-         reviewButton, encodeButton, reviewScroll, applyButton].forEach(accessory.addArrangedSubview)
+         reviewButton, offerRow, reviewScroll, applyButton].forEach(accessory.addArrangedSubview)
         summary.widthAnchor.constraint(equalToConstant: 446).isActive = true
         updatePickers()
         checkAvailability()
@@ -545,6 +561,13 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         apply(fallback)
     }
 
+    @objc private func applyListedAlternative() {
+        // Item 0 of a pull-down is its title. The rest follow the first alternative, which is the button.
+        let index = morePicker.indexOfSelectedItem
+        guard index > 0, alternatives.indices.contains(index) else { return }
+        apply(alternatives[index])
+    }
+
     /// Applies one of `alternatives`: the same request the CLI makes with that alternative's arguments.
     func apply(_ fallback: ExportFallback) {
         let previousContainer = options.container
@@ -650,12 +673,20 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         statusIcon.setAccessibilityLabel(description)
         if case .unavailable(_, let proposed) = availability {
             reviewButton.isHidden = proposed == nil || review != nil
-            encodeButton.isHidden = fallback == nil
+            offerRow.isHidden = fallback == nil
             if let fallback { encodeButton.title = fallback.title }
+            // The whole ordered list is on offer: the first as the button, the rest in the pull-down.
+            let titles = ["More Alternatives"] + alternatives.dropFirst().map(\.title)
+            if morePicker.itemTitles != titles {
+                morePicker.removeAllItems()
+                morePicker.addItems(withTitles: titles)
+            }
+            morePicker.isHidden = alternatives.count < 2
         } else {
             reviewButton.isHidden = true
-            encodeButton.isHidden = true
+            offerRow.isHidden = true
         }
+        encodeButton.isHidden = offerRow.isHidden
         reviewScroll.isHidden = review == nil
         applyButton.isHidden = review == nil || !allowsApplyingReviewToTimeline
         accessory.layoutSubtreeIfNeeded()

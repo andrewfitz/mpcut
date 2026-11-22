@@ -1144,7 +1144,8 @@ final class EditorModel: ObservableObject {
                                     let settings = preference.indexSettings(for: canonical)
                                     do {
                                         let key = SourceIndexLoader.Key(url: canonical, sidecars: settings.enabled,
-                                                                        preview: preview, identity: identity)
+                                                                        preview: preview, identity: identity,
+                                                                        preferCompleted: preview)
                                         let index = try await SourceIndexLoader.shared.read(key, token: token,
                                             preference: settings.change, progress: report)
                                         return index.ordinary
@@ -1155,8 +1156,9 @@ final class EditorModel: ObservableObject {
                                 throw CancellationError()
                             }
 
-                            let header = try? await read(true)
-                            if publishPartial, projectClips == nil, existing.isEmpty, additions.isEmpty, let preview = header, preview.timelineIssue == nil {
+                            let canPublishPreview = publishPartial && projectClips == nil && existing.isEmpty && additions.isEmpty
+                            let header = canPublishPreview ? try? await read(true) : nil
+                            if let preview = header, !preview.hasFullEditIndex, preview.timelineIssue == nil {
                                 let clip = EditorSegment(source: IndexedSource(media: preview))
                                 provisional = clip
                                 let prepared = PreparedEdit(segments: [clip], previous: prior, engine: engine)
@@ -1166,7 +1168,12 @@ final class EditorModel: ObservableObject {
                                                action: "Add Clip", recordHistory: false)
                                 }
                             }
-                            let media = try await read(false, identity: header?.identity)
+                            let media: MediaInfo
+                            if let header, header.hasFullEditIndex {
+                                media = header
+                            } else {
+                                media = try await read(false, identity: header?.identity)
+                            }
                             try Self.checkEditable(media)
                             if let reference {
                                 guard reference.hasVideo == media.hasVideo else {
@@ -2095,9 +2102,11 @@ final class EditorModel: ObservableObject {
                 if commit { alert = EditorNotice(title: "Can’t Trim Clip", message: copyMessage(fixedTrimIssue, in: segments)) }
                 return nil
             }
-            let options = trimCandidates(at: index, edge: edge, boundaries: boundaries)
-            let result = verified ?? Self.searchCopyTrim(segments: segments, index: index, edge: edge, target: sourceTime,
-                                             options: options, container: preferredCopyContainer, cached: trimChecks)
+            let result = verified ?? Self.searchCopyTrim(
+                segments: segments, index: index, edge: edge, target: sourceTime,
+                options: trimCandidates(at: index, edge: edge, boundaries: boundaries),
+                container: preferredCopyContainer, cached: trimChecks
+            )
             trimChecks.merge(result.newChecks) { _, new in new }
             fixedTrimIssue = result.fixedIssue
             let tried = result.firstIssue, chosen = result.cut
@@ -2600,10 +2609,11 @@ final class EditorModel: ObservableObject {
         runExport { token, progress in
             var media: [URL: MediaInfo] = [:]
             for range in ranges { media.merge(range.media) { first, _ in first } }
-            let batch = try BulkExport(groups: ranges.map(\.clips), directory: directory, mode: options.effectiveMode,
+            try options.organization.validateSubfolder(in: directory, protectedMedia: protected)
+            let batch = try BulkExport(groups: ranges.map(\.clips), directory: directory, organization: options.organization, mode: options.effectiveMode,
                                        tracks: options.tracks, audioTrackOrdinal: options.audioTrackOrdinal,
                                        container: options.container.isEmpty ? nil : options.container,
-                                       settings: options.settings, media: media, cancelled: { token.isCancelled })
+                                       settings: options.batchSettings, media: media, cancelled: { token.isCancelled })
             for item in batch.items {
                 try CutProject.validateMediaDestination(item.output, absoluteSources: protected)
             }
@@ -2616,7 +2626,8 @@ final class EditorModel: ObservableObject {
                 }
             }
             let count = ranges.count == 1 ? "1 file" : "\(ranges.count) files"
-            return (directory, "Exported \(count) to \(directory.lastPathComponent)")
+            let folder = batch.items.first?.output.deletingLastPathComponent() ?? directory
+            return (folder, "Exported \(count) to \(folder.lastPathComponent)")
         }
     }
 
@@ -3003,9 +3014,14 @@ final class EditorModel: ObservableObject {
             var options = exportOptions
             options.mode = mode ?? defaultExportMode
             options.tracks = source.hasVideo ? .all : .audio
-            // Every export starts from Lossless Copy for sound. Conversion is offered when copy cannot be exact.
+            // An export starts from Lossless Copy for sound, where conversion is offered when copy cannot be exact,
+            // unless Convert Audio was asked for by name.
             options.audioMode = .copy
             options.audioTrackOrdinal = nil
+            if !source.hasVideo, mode == .encode,
+               let format = ExportRules.namedConversions(sourceCodec: source.streams.first { $0.kind == "audio" }?.codec).first {
+                options.convertAudio(to: format)
+            }
             let available = choices.choices(for: options)
             if let preferred, options.tracks == .all, available.contains(preferred) {
                 options.copyContainer = preferred

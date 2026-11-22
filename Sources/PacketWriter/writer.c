@@ -149,6 +149,18 @@ static MPCutTime time_make(Wide n, Wide d) {
     if (d <= 0) {
         return (MPCutTime){0, 0};
     }
+    /* Reduce ordinary packet clocks without calling the wide-division
+     * runtime. The wide path still handles intermediate products above 64 bits. */
+    if (n >= INT64_MIN && n <= INT64_MAX && d <= INT64_MAX) {
+        uint64_t a = (uint64_t)(n < 0 ? -n : n);
+        uint64_t b = (uint64_t)d;
+        while (b) {
+            uint64_t remainder = a % b;
+            a = b;
+            b = remainder;
+        }
+        return (MPCutTime){(int64_t)n / (int64_t)a, (int64_t)d / (int64_t)a};
+    }
     Wide divisor = gcd(n, d);
     n /= divisor;
     d /= divisor;
@@ -159,6 +171,9 @@ static MPCutTime time_make(Wide n, Wide d) {
 }
 
 static MPCutTime time_add(MPCutTime a, MPCutTime b, int sign) {
+    if (a.denominator > 0 && a.denominator == b.denominator) {
+        return time_make((Wide)a.numerator + sign * (Wide)b.numerator, a.denominator);
+    }
     return time_make((Wide)a.numerator * b.denominator + sign * (Wide)b.numerator * a.denominator,
                      (Wide)a.denominator * b.denominator);
 }
@@ -183,7 +198,10 @@ static int64_t time_round(MPCutTime time, AVRational base) {
     }
     Wide n = (Wide)time.numerator * base.den;
     Wide d = (Wide)time.denominator * base.num;
-    Wide number = (n < 0 ? n - d / 2 : n + d / 2) / d;
+    Wide rounded = n < 0 ? n - d / 2 : n + d / 2;
+    if (rounded >= INT64_MIN && rounded <= INT64_MAX && d <= INT64_MAX)
+        return (int64_t)rounded / (int64_t)d;
+    Wide number = rounded / d;
     return number <= INT64_MIN || number > INT64_MAX ? AV_NOPTS_VALUE : (int64_t)number;
 }
 
@@ -912,8 +930,13 @@ static int remux_packet(Writer *writer, const AVStream *input_track, const Range
     }
 
     MPCutTime dts = time_ticks(packet->dts, input_track->time_base);
-    int64_t mapped_pts = time_round(time_add(pts, range->shift, 1), track->time_base);
-    int64_t mapped_dts = time_round(time_add(dts, range->shift, 1), track->time_base);
+    if (range->shift.numerator) {
+        pts = time_add(pts, range->shift, 1);
+        dts = time_add(dts, range->shift, 1);
+        packet_end = time_add(packet_end, range->shift, 1);
+    }
+    int64_t mapped_pts = time_round(pts, track->time_base);
+    int64_t mapped_dts = time_round(dts, track->time_base);
     if (video && writer->video_dts) {
         if (writer->video_dts_used >= writer->video_dts_count)
             return fail(writer, "More video samples than indexed in the Smart Trim edit");
@@ -921,7 +944,7 @@ static int remux_packet(Writer *writer, const AVStream *input_track, const Range
         if (mapped_dts == AV_NOPTS_VALUE || mapped_dts > mapped_pts)
             return fail(writer, "Cannot represent a Smart Trim decode slot on the output clock");
     }
-    int64_t mapped_end = time_round(time_add(packet_end, range->shift, 1), track->time_base);
+    int64_t mapped_end = time_round(packet_end, track->time_base);
     if (mapped_pts == AV_NOPTS_VALUE || (packet->dts != AV_NOPTS_VALUE && mapped_dts == AV_NOPTS_VALUE)
         || (packet->duration > 0 && (mapped_end == AV_NOPTS_VALUE || mapped_end <= mapped_pts
                                     || (Wide)mapped_end - mapped_pts > INT64_MAX))) {
@@ -1541,7 +1564,8 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
     unsigned remaining = writer->selected_count;
     int mov_video_timing = av_match_name("mov", input->iformat->name)
         && (is_mov(writer->output->oformat) || is_matroska(writer->output->oformat));
-    MPCutTime progress_shift = time_add(range->output_start, range->source_start, -1);
+    double progress_shift = time_seconds(range->output_start) - time_seconds(range->source_start);
+    double progress_end = time_seconds(range->output_end);
     memset(writer->range_tracks, 0, input->nb_streams);
     if (writer->aac_source) {
         result = write_aac_source(writer, input, range, &remaining);
@@ -1609,14 +1633,11 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
         packet->stream_index = writer->stream_map[input_index];
         int64_t source_pts = packet->pts;
         double fraction = writer->fraction;
-        if ((video || writer->tracks == MPCUT_TRACKS_AUDIO) && source_pts != AV_NOPTS_VALUE) {
-            MPCutTime pts = time_ticks(source_pts, input_track->time_base);
-            MPCutTime mapped = time_add(pts, progress_shift, 1);
-            if (mapped.denominator) {
-                double seconds = time_seconds(mapped);
-                double end = time_seconds(range->output_end);
-                fraction = (seconds < end ? seconds : end) / total_duration;
-            }
+        if (writer->progress && (video || writer->tracks == MPCUT_TRACKS_AUDIO) && source_pts != AV_NOPTS_VALUE) {
+            // Only the progress estimate uses floating point. Muxed timestamps
+            // and cut boundaries are still calculated on their rational clocks.
+            double seconds = (double)source_pts * av_q2d(input_track->time_base) + progress_shift;
+            fraction = (seconds < progress_end ? seconds : progress_end) / total_duration;
         }
 
         result = progress_at(writer, fraction);

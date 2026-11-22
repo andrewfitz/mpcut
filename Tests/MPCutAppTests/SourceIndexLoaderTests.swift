@@ -56,9 +56,11 @@ final class SourceIndexLoaderTests: XCTestCase {
         let first = try await read(key)
         let second = try await read(key)
         let admission = try await read(.init(url: file, sidecars: false, preview: true))
+        let warmPreview = try await read(.init(url: file, sidecars: false, preview: true, preferCompleted: true))
         let sidecar = try await read(.init(url: file, sidecars: true, preview: false, identity: identity))
         XCTAssertTrue(first === second)
         XCTAssertFalse(admission.ordinary.hasFullEditIndex)
+        XCTAssertTrue(warmPreview === first)
         XCTAssertFalse(first === sidecar)
 
         let newFile = directory.appendingPathComponent("new-camera.mov")

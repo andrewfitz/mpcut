@@ -35,15 +35,7 @@ struct ConvertedSoundSpan {
 extension MulticamEngine {
     func resolveConvertedSound(_ mapping: MulticamPlan, sources: [String: MediaInfo],
                                container: String, action: ReencodeAudio) throws -> MulticamAudioConversionPlan {
-        switch action {
-        case .aac where !["mov", "mp4"].contains(container):
-            throw CutError(code: "unsupported_audio",
-                           message: "Choose MOV or MP4 for converted multicam AAC with gapless timing.")
-        case .pcm where !["mov", "mkv"].contains(container):
-            throw CutError(code: "unsupported_audio", message: "Choose MOV or MKV for PCM audio.")
-        default:
-            break
-        }
+        if let refusal = ExportRules.reencodeRefusal(audio: action, container: container, source: .multicam) { throw refusal }
         let lane = mapping.audio.map {
             ConvertedSoundSpan(media: sources[$0.source], stream: $0.stream, input: $0.input, output: $0.output)
         }
@@ -202,20 +194,21 @@ extension MulticamEngine {
         let runner = ReencodeEngine(cancelled: cancelled)
         let directory = output.deletingLastPathComponent()
         let raw = directory.appendingPathComponent("program-audio.raw")
-        guard FileManager.default.createFile(atPath: raw.path, contents: nil) else {
-            throw CutError(code: "audio_conversion_failed", message: "Could not create the program audio staging file.")
-        }
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forWritingTo: raw)
-        } catch {
-            try? FileManager.default.removeItem(at: raw)
-            throw CutError(code: "audio_conversion_failed",
-                           message: "Could not open the program audio staging file. \(error.localizedDescription)")
-        }
+        var handle: FileHandle?
         defer {
-            try? handle.close()
+            try? handle?.close()
             try? FileManager.default.removeItem(at: raw)
+        }
+        if plan.inputs.count > 1 {
+            guard FileManager.default.createFile(atPath: raw.path, contents: nil) else {
+                throw CutError(code: "audio_conversion_failed", message: "Could not create the program audio staging file.")
+            }
+            do {
+                handle = try FileHandle(forWritingTo: raw)
+            } catch {
+                throw CutError(code: "audio_conversion_failed",
+                               message: "Could not open the program audio staging file. \(error.localizedDescription)")
+            }
         }
         let rawFormat = plan.floatingPoint ? "f32le" : "s32le"
         let stagedFormat = ["-f", rawFormat, "-ar", "\(plan.sampleRate)", "-ch_layout", plan.layout]
@@ -230,7 +223,10 @@ extension MulticamEngine {
                 + "aresample=\(rate):async=1:first_pts=0:min_hard_comp=0,"
         }
 
-        func part(_ index: Int) -> URL { directory.appendingPathComponent("audio-\(index).raw") }
+        // A single validated span already is the complete program sample stream.
+        func part(_ index: Int) -> URL {
+            plan.inputs.count == 1 ? raw : directory.appendingPathComponent("audio-\(index).raw")
+        }
 
         func outputArguments(prefix: String, for index: Int) -> [String] {
             let count = plan.inputs[index].count
@@ -281,7 +277,7 @@ extension MulticamEngine {
             let part = part(index)
             let caf = directory.appendingPathComponent("audio-\(index).caf")
             defer {
-                try? FileManager.default.removeItem(at: part)
+                if part != raw { try? FileManager.default.removeItem(at: part) }
                 try? FileManager.default.removeItem(at: caf)
             }
             let track = input.audio.stream
@@ -326,11 +322,13 @@ extension MulticamEngine {
                 guard !expected.overflow, (attributes[.size] as? NSNumber)?.int64Value == expected.partialValue else {
                     throw CutError(code: "audio_conversion_failed", message: "The converted span did not contain the planned number of samples.")
                 }
-                let reader = try FileHandle(forReadingFrom: part)
-                defer { try? reader.close() }
-                while let block = try reader.read(upToCount: 1 << 20), !block.isEmpty {
-                    try runner.checkCancellation()
-                    try handle.write(contentsOf: block)
+                if let handle {
+                    let reader = try FileHandle(forReadingFrom: part)
+                    defer { try? reader.close() }
+                    while let block = try reader.read(upToCount: 1 << 20), !block.isEmpty {
+                        try runner.checkCancellation()
+                        try handle.write(contentsOf: block)
+                    }
                 }
             } catch let error as CutError where error.code != "cancelled" {
                 throw CutError(code: "audio_conversion_failed", message: error.message, segment: index + 1, track: track.index)
@@ -341,7 +339,7 @@ extension MulticamEngine {
             }
             progress?(0.8 * (segment.outputStart + segment.duration).seconds / plan.edit.duration.seconds)
         }
-        try handle.close()
+        try handle?.close()
 
         let container = plan.edit.container
         var arguments = ["-xerror"] + stagedFormat + ["-i", raw.path, "-map", "0:a:0"]

@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import MPCutCore
 import SwiftUI
 
@@ -8,6 +9,7 @@ struct MulticamTimeline: View {
     let media: [String: MediaInfo]
     let playhead: RationalTime
     var exclusiveEnd = false
+    var clock: MulticamTimelineClock? = nil
     let seek: (RationalTime) -> Void
     let take: (String) -> Void
     let moveSwitch: (RationalTime, RationalTime) -> Void
@@ -40,6 +42,7 @@ struct MulticamTimeline: View {
     @State private var verticalViewport: Range<CGFloat>?
     @State private var selection: RationalTime?
     @State private var pendingReveal: Double?
+    @State private var activeInterval: MulticamInterval?
     @GestureState private var drag: MarkerDrag?
 
     private struct MarkerDrag {
@@ -72,7 +75,13 @@ struct MulticamTimeline: View {
 
     private var audioHeight: CGFloat { largeThumbnails.wrappedValue ? 64 : Self.audioHeight }
 
+    private var currentPlayhead: RationalTime {
+        guard let clock else { return playhead }
+        return clock.groupTime(clock.preview.time)
+    }
+
     var body: some View {
+        let intervals = analysis?.groupIntervals ?? (try? project.groupIntervals()) ?? []
         let heights = cameraHeights
         let contentHeight = Self.rulerHeight + Self.markerHeight + heights.reduce(0, +) + audioHeight
         let scrollBarHeight = NSScroller.preferredScrollerStyle == .legacy
@@ -83,17 +92,19 @@ struct MulticamTimeline: View {
 
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                TimelineTimeControl(playhead: playhead.seconds, duration: project.range.to.seconds,
-                                    durationLabel: "Group duration", request: timeEntryRequest) { time in
-                    let target = time == playhead.seconds ? playhead : groupTime(at: time)
-                    if let target {
-                        if let jump {
-                            jump(target)
-                        } else {
-                            seek(target)
-                            scrubEnded()
+                MulticamPlayheadReader(clock: clock, fallback: playhead) { head in
+                    TimelineTimeControl(playhead: head.seconds, duration: project.range.to.seconds,
+                                        durationLabel: "Group duration", request: timeEntryRequest) { time in
+                        let target = time == head.seconds ? head : groupTime(at: time)
+                        if let target {
+                            if let jump {
+                                jump(target)
+                            } else {
+                                seek(target)
+                                scrubEnded()
+                            }
+                            reveal(target.seconds)
                         }
-                        reveal(target.seconds)
                     }
                 }
                 .layoutPriority(1)
@@ -138,7 +149,8 @@ struct MulticamTimeline: View {
                                 let scale = (width - 2 * Self.margin) / extent
                                 let visible = visiblePixels(viewport: viewport, width: width)
                                 ScrollView(.horizontal) {
-                                    lanes(width: width, scale: scale, visible: visible, heights: heights, panelHeight: panel.size.height)
+                                    lanes(width: width, scale: scale, visible: visible, heights: heights,
+                                          panelHeight: panel.size.height, viewport: viewport, intervals: intervals)
                                         .background {
                                             MulticamScrollViewLocator(position: scroll, zoom: zoom, revealTime: { time in
                                                 guard (0...extent).contains(time) else { return false }
@@ -154,16 +166,11 @@ struct MulticamTimeline: View {
                                     let previousWidth = documentWidth(viewport, zoom: previous)
                                     let previousScale = (previousWidth - 2 * Self.margin) / extent
                                     let origin = scroll.origin ?? scrollOrigin
-                                    let head = x(playhead.seconds, scale: previousScale)
+                                    let head = x(currentPlayhead.seconds, scale: previousScale)
                                     let anchor = timelineZoomAnchor(playheadX: head, visible: origin..<(origin + viewport))
                                     let offset = anchor - origin
                                     let target = x(seconds(at: anchor, scale: previousScale), scale: scale) - offset
                                     scroll.move(to: next == 0 ? 0 : target, viewport: viewport, width: width)
-                                }
-                                .onChange(of: playhead) { previous, current in
-                                    guard zoom.wrappedValue > 0, !scrubbing, drag == nil, let origin = scroll.origin,
-                                          (origin...(origin + viewport)).contains(x(previous.seconds, scale: scale)) else { return }
-                                    scroll.reveal(x(current.seconds, scale: scale), viewport: viewport, width: width)
                                 }
                             }
                             .frame(height: viewportHeight)
@@ -184,6 +191,9 @@ struct MulticamTimeline: View {
             .frame(minHeight: 0, idealHeight: idealHeight, maxHeight: .infinity)
             .clipped()
             .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 5))
+        }
+        .onReceive(activeIntervals(in: intervals)) { current in
+            if activeInterval != current { activeInterval = current }
         }
         .onChange(of: selectedSwitch, initial: true) { _, time in
             selection = time
@@ -282,11 +292,25 @@ struct MulticamTimeline: View {
             .overlay(alignment: .bottom) { Divider() }
     }
 
+    private func activeIntervals(in intervals: [MulticamInterval]) -> AnyPublisher<MulticamInterval?, Never> {
+        guard let clock else { return Empty().eraseToAnyPublisher() }
+        return clock.preview.$time.combineLatest(clock.preview.$duration)
+            .map { time, duration in
+                Self.interval(at: clock.groupTime(time), exclusiveEnd: time == duration, in: intervals)
+            }
+            .removeDuplicates()
+            .eraseToAnyPublisher()
+    }
+
+    private static func interval(at time: RationalTime, exclusiveEnd: Bool,
+                                 in intervals: [MulticamInterval]) -> MulticamInterval? {
+        let index = intervals.lowerBound { exclusiveEnd ? $0.group.to >= time : $0.group.to > time }
+        return intervals.indices.contains(index) ? intervals[index] : nil
+    }
+
     private func lanes(width: CGFloat, scale: CGFloat, visible: Range<CGFloat>, heights: [CGFloat],
-                       panelHeight: CGFloat) -> some View {
-        let intervals = analysis?.groupIntervals ?? (try? project.groupIntervals()) ?? []
-        let active = intervals.lowerBound { exclusiveEnd ? $0.group.to >= playhead : $0.group.to > playhead }
-        let current = active < intervals.count ? intervals[active] : nil
+                       panelHeight: CGFloat, viewport: CGFloat, intervals: [MulticamInterval]) -> some View {
+        let current = clock == nil ? Self.interval(at: playhead, exclusiveEnd: exclusiveEnd, in: intervals) : activeInterval
         let first = intervals.lowerBound { x($0.group.to.seconds, scale: scale) > visible.lowerBound }
         let end = intervals.lowerBound { x($0.group.from.seconds, scale: scale) >= visible.upperBound }
         let visibleIntervals = intervals[first..<end]
@@ -296,15 +320,18 @@ struct MulticamTimeline: View {
                 .overlay(alignment: .bottom) { Divider() }
                 .contentShape(Rectangle())
                 .gesture(scrubGesture(scale: scale))
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Group time ruler")
-                .accessibilityValue(timelineTime(playhead.seconds, milliseconds: true))
-                .accessibilityAdjustableAction { direction in
-                    let step = timelineRulerStep(scale: scale) / 5
-                    switch direction {
-                    case .increment: seekAccessibly(playhead.seconds + step)
-                    case .decrement: seekAccessibly(playhead.seconds - step)
-                    @unknown default: break
+                .accessibilityRepresentation {
+                    MulticamPlayheadReader(clock: clock, fallback: playhead) { head in
+                        Text("Group time ruler")
+                            .accessibilityValue(timelineTime(head.seconds, milliseconds: true))
+                            .accessibilityAdjustableAction { direction in
+                                let step = timelineRulerStep(scale: scale) / 5
+                                switch direction {
+                                case .increment: seekAccessibly(head.seconds + step)
+                                case .decrement: seekAccessibly(head.seconds - step)
+                                @unknown default: break
+                                }
+                            }
                     }
                 }
             markers(width: width, scale: scale, visible: visible)
@@ -354,17 +381,26 @@ struct MulticamTimeline: View {
                 if selectRange == nil, let markOut {
                     mark(at: x(markOut.seconds, scale: scale), isIn: false, height: geometry.size.height)
                 }
-                let position = x(playhead.seconds, scale: scale)
-                let red = Color(nsColor: .systemRed)
-                Rectangle()
-                    .fill(red)
-                    .frame(width: 1, height: max(0, geometry.size.height - Self.rulerTickTop))
-                    .offset(x: position - 0.5, y: Self.rulerTickTop)
-                TimelinePlayheadMarker()
-                    .fill(red)
-                    .frame(width: 16, height: 18)
-                    .scaleEffect(x: 1, y: 0.72, anchor: .top)
-                    .offset(x: position - 8)
+                MulticamPlayheadReader(clock: clock, fallback: playhead) { head in
+                    let position = x(head.seconds, scale: scale)
+                    let red = Color(nsColor: .systemRed)
+                    ZStack(alignment: .topLeading) {
+                        Rectangle()
+                            .fill(red)
+                            .frame(width: 1, height: max(0, geometry.size.height - Self.rulerTickTop))
+                            .offset(x: position - 0.5, y: Self.rulerTickTop)
+                        TimelinePlayheadMarker()
+                            .fill(red)
+                            .frame(width: 16, height: 18)
+                            .scaleEffect(x: 1, y: 0.72, anchor: .top)
+                            .offset(x: position - 8)
+                    }
+                    .onChange(of: head) { previous, current in
+                        guard zoom.wrappedValue > 0, !scrubbing, drag == nil, let origin = scroll.origin,
+                              (origin...(origin + viewport)).contains(x(previous.seconds, scale: scale)) else { return }
+                        scroll.reveal(x(current.seconds, scale: scale), viewport: viewport, width: width)
+                    }
+                }
             }
             .allowsHitTesting(false)
             .accessibilityHidden(true)
@@ -822,6 +858,31 @@ struct MulticamTimeline: View {
         let rect = CGRect(x: range.lowerBound + 3, y: y - 8, width: min(size.width + 6, available), height: 16)
         context.fill(Path(roundedRect: rect, cornerRadius: 3), with: .color(background))
         context.draw(resolved, in: rect.insetBy(dx: 3, dy: 1))
+    }
+}
+
+@MainActor
+struct MulticamTimelineClock {
+    let preview: MulticamPreview
+    let groupTime: (RationalTime) -> RationalTime
+}
+
+@MainActor
+private struct MulticamPlayheadReader<Content: View>: View {
+    let clock: MulticamTimelineClock?
+    let fallback: RationalTime
+    @ViewBuilder let content: (RationalTime) -> Content
+    @State private var outputTime: RationalTime?
+
+    var body: some View {
+        if let clock {
+            content(clock.groupTime(outputTime ?? clock.preview.time))
+                .onReceive(clock.preview.$time) { time in
+                    if outputTime != time { outputTime = time }
+                }
+        } else {
+            content(fallback)
+        }
     }
 }
 

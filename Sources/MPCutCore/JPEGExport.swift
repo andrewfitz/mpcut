@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import ImageIO
 import MediaProbe
+import Metal
 
 public enum JPEGPreset: String, CaseIterable, Sendable, Encodable { case review, full }
 public enum JPEGSample: String, CaseIterable, Sendable, Encodable { case first, midpoint }
@@ -475,7 +476,6 @@ public enum JPEGExport {
         var ordered = Array<JPEGFrame?>(repeating: nil, count: requests.count)
         var completed = 0
         if !requests.isEmpty {
-            let access = frames.indices.filter { frames[$0].canStart && frames[$0].dts != nil }
             let renderer = try JPEGRenderer(media: media, control: control)
             let inverse = RationalTime(numerator: media.video.timeBase.denominator, denominator: media.video.timeBase.numerator)
             func ticks(_ time: RationalTime) throws -> Int64 {
@@ -505,11 +505,17 @@ public enum JPEGExport {
                     let frame = requests[first].frame
                     let pts = try ticks(frames[frame].time)
                     var seekDTS = Int64.min
-                    let key = access.lowerBound { $0 > frame } - 1
-                    if key >= 0, access[key] > (previous ?? 0),
-                       frames[access[key]].time.seconds - (previous.map { frames[$0].time.seconds } ?? 0) > 2,
-                       let dts = frames[access[key]].dts {
-                        seekDTS = try ticks(dts)
+                    // Requests advance in frame order. Only the gap since the previous
+                    // picture can contain a useful seek point, even on a long recording.
+                    let previousTime = previous.map { frames[$0].time.seconds } ?? 0
+                    if frames[frame].time.seconds - previousTime > 2 {
+                        for key in stride(from: frame, to: previous ?? 0, by: -1) {
+                            guard frames[key].time.seconds - previousTime > 2 else { break }
+                            if frames[key].canStart, let dts = frames[key].dts {
+                                seekDTS = try ticks(dts)
+                                break
+                            }
+                        }
                     }
                     let picture = try autoreleasepool { try renderer.picture(at: pts, seekDTS: seekDTS, preset: preset) }
                     previous = frame
@@ -611,8 +617,14 @@ private final class JPEGRenderer {
     static var failure: CutError { CutError(code: "frame_export_failed", message: "Could not render the selected picture as JPEG.") }
     let reader: OpaquePointer
     let control: JPEGControl
-    let context = CIContext(options: [.cacheIntermediates: false])
-    let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    // A CIContext supports concurrent renders and owns expensive Metal resources.
+    // Share it across angles, exported stills and live frame-review requests.
+    private static let context: CIContext = {
+        let options: [CIContextOption: Any] = [.cacheIntermediates: false, .name: "MPCut JPEG Export"]
+        guard let device = MTLCreateSystemDefaultDevice() else { return CIContext(options: options) }
+        return CIContext(mtlDevice: device, options: options)
+    }()
+    private static let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
     init(media: MediaInfo, control: JPEGControl) throws {
         self.control = control
@@ -655,7 +667,7 @@ private final class JPEGRenderer {
 
     func encode(_ image: CIImage, preset: JPEGPreset) throws -> Data {
         let quality = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
-        guard let data = context.jpegRepresentation(of: image, colorSpace: colorSpace,
+        guard let data = Self.context.jpegRepresentation(of: image, colorSpace: Self.colorSpace,
                                                    options: [quality: preset == .review ? 0.62 : 0.95]) else { throw Self.failure }
         return data
     }

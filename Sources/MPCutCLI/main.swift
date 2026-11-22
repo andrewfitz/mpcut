@@ -61,9 +61,11 @@ private struct CLIHelp: Encodable {
     let snapOptions = SnapMode.allCases.map(\.rawValue)
     let defaultExportMode = ExportMode.copy.rawValue
     let defaultOrderedExportMode = ExportMode.smart.rawValue
-    let defaultMulticamExportMode = ExportMode.smart.rawValue
+    let defaultMulticamExportMode = ExportRules.defaultMode(for: .multicam).rawValue
     let clipOrderIndexBase = 1
-    let defaultBulkMode = ExportMode.smart.rawValue
+    let defaultBulkMode = ExportRules.defaultMode(for: .movie).rawValue
+    /// The modes each command writes, from the export rules.
+    let entryPointModes = Dictionary(uniqueKeysWithValues: ExportEntryPoint.allCases.map { ($0.rawValue, $0.modes.map(\.rawValue)) })
     let sceneExportGroups = SceneGrouping.allCases.map(\.rawValue)
 }
 
@@ -392,15 +394,18 @@ private struct MulticamExportResponse: Encodable {
     let sources: [String: String]
     let preflight: MulticamExportPlan
     var extraRangeInputs: [Int: Int] = [:]
+    /// The alternative that `--audio auto` applied.
+    var applied: ExportAlternative?
 
     private enum CodingKeys: String, CodingKey {
         case ok, dryRun, output, order, sources, plan, mode, tracks, container, duration, warnings
-        case picture, audio, audioAction, copiedVideoDuration, encodedVideoDuration
+        case picture, audio, audioAction, copiedVideoDuration, encodedVideoDuration, applied
     }
 
     func encode(to encoder: Encoder) throws {
         var fields = encoder.container(keyedBy: CodingKeys.self)
         try fields.encode(ok, forKey: .ok)
+        try fields.encodeIfPresent(applied?.id, forKey: .applied)
         try fields.encode(dryRun, forKey: .dryRun)
         try fields.encode(output, forKey: .output)
         try fields.encodeIfPresent(order, forKey: .order)
@@ -775,6 +780,12 @@ private func validate(_ options: ExportOptions, mode: ExportMode) throws {
     }
 }
 
+/// What a failed export says to people, set where the clips are known.
+private final class FailureContext: @unchecked Sendable {
+    static let shared = FailureContext()
+    var text: String?
+}
+
 private struct BulkResponse: Encodable {
     let ok: Bool
     let dryRun: Bool
@@ -808,9 +819,11 @@ private func runBatch(_ batch: BulkExport, dryRun: Bool, interruption: Interrupt
             guard interruption.isActive else {
                 throw CutError(code: "cancelled", message: "Operation cancelled.")
             }
-            let result = try item.audio.map { try ExportResult(dryRun: dryRun, output: item.output.path, audio: $0) }
+            // Each range reports the plan the export rules resolved for it.
+            var result = try item.audio.map { try ExportResult(dryRun: dryRun, output: item.output.path, audio: $0) }
                 ?? ExportResult(dryRun: dryRun, output: item.output.path, edit: item.edit,
-                                mode: batch.mode, conversion: item.conversion)
+                                mode: item.plan.mode, conversion: item.conversion)
+            result.applied = item.applied
             if !dryRun {
                 try batch.write(item) { _ = progress.report((Double(index) + $0) / Double(batch.items.count)) }
             }
@@ -851,7 +864,7 @@ private func runScenes(file: String?, requestFile: String?, options: SceneExport
         if let list = options.list { request.scenes = try ListFile.scenes(list) }
     }
     let jobs = try request.jobs(for: media, grouping: options.grouping)
-    let batch = try BulkExport(groups: jobs.map(\.clips), directory: directory, outputSuffixes: jobs.map(\.outputSuffix),
+    let batch = try BulkExport(groups: jobs.map(\.clips), directory: directory, outputSuffixes: jobs.map(\.outputSuffix), organization: options.organization,
                                tracks: options.tracks, audioStream: options.audioStream, container: options.container, media: [media.url: media], cancelled: { !interruption.isActive })
     let result = runBatch(batch, dryRun: options.dryRun, interruption: interruption)
     let outputs = zip(jobs, result.outputs).map { job, export in
@@ -897,7 +910,10 @@ private func runSilence(_ options: SilenceOptions, requestFile: String?, json: B
     let original = try engine.inspect(source, keyframes: true)
     let media = tracks == .audio ? try original.extendingToAudioEnd(stream: audioStream) : original
     let reuseAnalysis = original.duration == media.duration
-    if tracks == .video && !media.hasVideo { throw CutError(code: "no_video", message: "Video output requires a video stream.") }
+    // The matrix refuses a picture selection from a source without one, in its own words.
+    if let refusal = ExportEntryPoint.cliSilence.answer(source: media.hasVideo ? .movie : .audio, tracks: tracks, mode: requestedMode).refusal {
+        throw refusal
+    }
     if let audioStream, !media.streams.contains(where: { $0.kind == "audio" && $0.index == audioStream }) {
         throw CutError(code: "no_audio", message: "The source has no matching output audio stream.")
     }
@@ -990,15 +1006,26 @@ private func runSilence(_ options: SilenceOptions, requestFile: String?, json: B
         throw CutError(code: "empty_edit", message: "The selected pauses cover the entire source. Increase --leave to retain footage.")
     }
     let clips = retained.map { ClipRequest(file: source, from: $0.from, to: $0.to) }
-    let edit = try engine.resolve(clips, output: output, media: [media.url: media])
-    var result = try ExportResult(dryRun: options.dryRun, output: output.path, edit: edit, mode: mode, conversion: nil)
+    // The retained ranges resolve through the shared rules, as export does.
+    let planner = ExportPlanner(cancelled: { !interruption.isActive })
+    let request = ExportRequest(clips: clips, mode: requestedMode, tracks: tracks, audioStream: audioStream,
+                                container: ext?.isEmpty == false ? ext : nil)
+    let plan: ExportPlan
+    switch planner.resolve(request, output: output, media: [media.url: media]) {
+    case .ready(let ready, _, _): plan = ready
+    case .unavailable(var issue, let offers):
+        // The failing clips are the retained ranges, so each alternative carries the clips to export.
+        if !offers.isEmpty { issue.alternatives = offers.map { $0.alternative.listing($0.request.clips) } }
+        throw issue
+    }
+    var result = try ExportResult(dryRun: options.dryRun, output: output.path, edit: plan.edit, mode: plan.mode, conversion: nil)
     result.silence = SilenceExportSummary(thresholdMode: thresholdMode, thresholdDB: threshold,
                                           detectedPauses: pauses.count, shortenedPauses: cuts.count,
                                           skippedPauses: pauses.count - cuts.count, removedDuration: removedDuration,
                                           waveformPeakDBFS: columns)
     if !options.dryRun {
         let progress = ExportProgress(interruption: interruption)
-        try engine.export(edit, to: output) { progress.report($0) }
+        try planner.write(plan, to: output) { progress.report($0) }
     }
     try writeJSON(result, pretty: !json, checkCancellation: options.dryRun)
 }
@@ -1012,7 +1039,7 @@ private func runProjectSilence(_ options: SilenceOptions, path: String, json: Bo
         if let output { try checkProjectOutput(output, media: loaded.media, location: location) }
         let cancelled: @Sendable () -> Bool = { !interruption.isActive }
         let engine = MulticamEngine(cancelled: cancelled)
-        let container = try output.map { try engine.checkCombinedDestination($0) } ?? "mov"
+        let container = try output.map { try engine.checkCombinedDestination($0) } ?? ExportRules.multicamContainers[0]
         var report = try ProjectSilenceReport(project, at: location, options: options,
                                               container: container, cancelled: cancelled)
         report.project = loaded.path
@@ -1020,6 +1047,8 @@ private func runProjectSilence(_ options: SilenceOptions, path: String, json: Bo
             guard !report.clips.isEmpty else {
                 throw CutError(code: "empty_edit", message: "The selected pauses cover the entire assembly. Increase --leave to retain footage.")
             }
+            // The retained ranges exist only in this report, so no `export --project` alternative stands for them.
+            // The engine plans them and reports verified times.
             let preflight = try engine.resolve(project, relativeTo: location, output: output, mode: report.mode,
                                                assembly: report.clips.map { MulticamSilencePlanner.range($0.group) },
                                                indexedSources: report.indexedSources)
@@ -1123,12 +1152,14 @@ private func runMulticamExport(project loaded: LoadedProject<MulticamProject>? =
     guard options.replaceAudio == nil, options.replaceTrack == nil, options.replacementStream == nil else {
         throw CLIError("invalid_arguments", "Set an external recorder in audioSources and select it in the project audio policy.")
     }
-    if tracks != .all, let requested = options.mode, requested != .copy {
-        throw CLIError("invalid_arguments", "Multicam single-type track selection uses copy. Omit --mode or choose --mode copy.")
-    }
-    let mode = ExportRules.cell(source: .multicam, tracks: tracks, mode: options.mode ?? ExportRules.defaultMode(for: .multicam)).resolvedMode
-    try validate(options, mode: options.mode ?? mode)
-    let settings = ReencodeSettings(codec: options.video ?? .h264, quality: options.quality, audio: options.audio ?? .auto)
+    // The matrix decides the default and the modes of each selection.
+    let mode = options.mode ?? ExportRules.defaultMode(for: .multicam, tracks: tracks)
+    let cell = ExportEntryPoint.cliProject.answer(source: .multicam, tracks: tracks, mode: mode)
+    if let refusal = cell.refusal { throw CLIError(refusal.code, refusal.message) }
+    try validate(options, mode: mode)
+    let settings = ReencodeSettings(codec: options.video ?? ExportRules.defaultCodec, quality: options.quality,
+                                    audio: options.audio ?? cell.defaultAudio ?? .auto)
+    var applied: ExportAlternative?
     let mixed = try input.map { try MixedProjectInput($0, order: order, output: output, interruption: interruption) }
     let exclusions = loaded?.excludedSidecarSources ?? AnalysisSidecar.excludedSources.union(mixed?.excludedSidecarSources ?? [])
     try AnalysisSidecar.$excludedSources.withValue(exclusions) {
@@ -1141,7 +1172,10 @@ private func runMulticamExport(project loaded: LoadedProject<MulticamProject>? =
             sources = Dictionary(uniqueKeysWithValues: (project.angles + project.audioSources).map {
                 ($0.id, project.sourceURL(for: $0, relativeTo: location))
             })
-            plan = try engine.resolve(project, relativeTo: location, output: output, mode: mode, tracks: tracks, settings: settings)
+            // The plan, or the failure with the alternatives that work, as every export reports them.
+            let resolution = engine.resolution(project, relativeTo: location, output: output, mode: mode, tracks: tracks, settings: settings)
+            plan = try resolution.get()
+            applied = resolution.applied
         } else if let mixed {
             var assembly = MulticamAssembly()
             var files: [URL: MediaInfo] = [:]
@@ -1207,10 +1241,12 @@ private func runMulticamExport(project loaded: LoadedProject<MulticamProject>? =
             sources = assembly.sources
             let request = assembly
             do {
-                plan = try engine.resolve(request.mapping, sources: sources, output: output, mode: mode,
-                                          tracks: tracks, settings: settings, requireAudio: request.requiresAudio) { clip, boundary, time in
+                let resolution = engine.resolution(request.mapping, sources: sources, output: output, mode: mode,
+                                                   tracks: tracks, settings: settings, requireAudio: request.requiresAudio) { clip, boundary, time in
                     try request.moving(clip: clip, boundary: boundary, to: time).mapping
                 }
+                plan = try resolution.get()
+                applied = resolution.applied
             } catch let issue as CutError {
                 guard let id = issue.segment, let original = extraRangeInputs[id] else { throw issue }
                 throw issue.reportingInputClip(original)
@@ -1225,10 +1261,12 @@ private func runMulticamExport(project loaded: LoadedProject<MulticamProject>? =
         }
         if json || dryRun {
             try writeJSON(MulticamExportResponse(dryRun: dryRun, output: output.path, order: order,
-                                                sources: sources.mapValues(\.path), preflight: plan, extraRangeInputs: extraRangeInputs),
+                                                sources: sources.mapValues(\.path), preflight: plan, extraRangeInputs: extraRangeInputs,
+                                                applied: applied),
                           pretty: !json, checkCancellation: dryRun)
         } else {
             try interruption.beginResponse(checkCancellation: false)
+            if let applied { errorOutput("mpcut: \(applied.label)") }
             for warning in plan.warnings { errorOutput("mpcut: \(warning)") }
             try writeOutput("Exported \(output.path)")
         }
@@ -1428,19 +1466,25 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
             input = try readInput(interruption, path: arguments.requestFile)
         }
         let options = try flags.merging(input.options)
-        let mode = options.mode ?? .smart
+        let mode = options.mode ?? ExportRules.defaultMode(for: ExportEntryPoint.cliBulk.source)
         try validate(options, mode: mode)
         let file = try fileURL(input.file, label: "Source")
         let directory = try fileURL(input.outputDirectory, label: "Output directory", directory: true)
-        let groups = try input.ranges.enumerated().map { index, range in
-            [try ClipRequest(file: file, from: timestamp(range.from, segment: index + 1, boundary: "from"),
-                             to: timestamp(range.to, segment: index + 1, boundary: "to"))]
+        let groups: [[ClipRequest]]
+        switch input.ranges {
+        case .parsed(let spans):
+            groups = spans.map { [ClipRequest(file: file, from: $0.from, to: $0.to)] }
+        case .request(let ranges):
+            groups = try ranges.enumerated().map { index, range in
+                [try ClipRequest(file: file, from: timestamp(range.from, segment: index + 1, boundary: "from"),
+                                 to: timestamp(range.to, segment: index + 1, boundary: "to"))]
+            }
         }
         let settings = ReencodeSettings(codec: options.video ?? .h264, quality: options.quality, audio: options.audio ?? .auto)
-        let batch = try BulkExport(groups: groups, directory: directory, mode: mode, tracks: options.tracks ?? .all, audioStream: options.audioStream, container: input.container,
+        let batch = try BulkExport(groups: groups, directory: directory, organization: options.organization, mode: mode, tracks: options.tracks ?? .all, audioStream: options.audioStream, container: input.container,
                                    snap: options.snap ?? .exact, settings: settings, media: cachedMedia, cancelled: { !interruption.isActive })
         if batch.items.contains(where: { $0.audio != nil }), options.video != nil || options.quality != nil {
-            throw CLIError("invalid_arguments", "Audio conversion accepts --audio auto, copy, aac, pcm, mp3 or flac. Video settings apply to movies.")
+            throw CLIError(ExportRules.soundSettingsRefusal.code, ExportRules.soundSettingsRefusal.message)
         }
         let result = runBatch(batch, dryRun: dryRun, interruption: interruption)
         try writeJSON(BulkResponse(ok: result.failure == nil, dryRun: dryRun, outputs: result.outputs,
@@ -1690,6 +1734,8 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
                                    boundary: error.boundary, nearest: error.nearest, track: error.track)
             }
             if !offers.isEmpty { failure.alternatives = offers.map(\.alternative) }
+            // People are told which clip and where, in the wording of the app's export sheet.
+            FailureContext.shared.text = ExportRules.describe(error, clips: clips, numbered: failure.segment)
             throw failure
         }
         result.sourceFiles = sourceFiles
@@ -1729,9 +1775,9 @@ do {
         try await run(arguments, interruption: interruption)
     }
 } catch let error as CutError {
-    // People read the same labels the app shows on its offer button, with the flags that request each one.
-    let offers = (error.alternatives ?? []).map { "\n  \($0.label): \($0.arguments.joined(separator: " ")), output .\($0.container)" }
-    reportFailure(error, message: error.message + (offers.isEmpty ? "" : "\nAlternatives, least destructive first:" + offers.joined()), json: json)
+    // People read the wording and the labels the app shows, with the flags that request each alternative. JSON keeps the raw message.
+    let text = FailureContext.shared.text ?? ExportRules.describe(error, clips: [])
+    reportFailure(error, message: text + ExportRules.describe(alternatives: error.alternatives ?? []), json: json)
     exit(exitStatus(error.code, operation: true))
 } catch let error as CLIError {
     reportFailure(error, message: error.message, json: json)

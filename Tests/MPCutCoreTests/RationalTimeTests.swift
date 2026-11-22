@@ -50,6 +50,10 @@ final class RationalTimeTests: XCTestCase {
         let second = RationalTime(numerator: 1, denominator: 9_000_000_000_000_000_000)
         XCTAssertEqual(try first.adding(second), RationalTime(numerator: 1, denominator: 3_600_000_000_000_000_000))
         XCTAssertEqual(try RationalTime(numerator: .min).subtracting(RationalTime(numerator: .min)), .zero)
+        let halfMax = RationalTime(numerator: .max, denominator: 2)
+        XCTAssertEqual(try halfMax.adding(halfMax), RationalTime(numerator: .max))
+        XCTAssertEqual(try halfMax.adding(.zero), halfMax)
+        XCTAssertEqual(try RationalTime.zero.multiplied(by: halfMax), .zero)
         XCTAssertThrowsError(try first.subtracting(second)) { error in
             XCTAssertEqual((error as? CutError)?.code, "time_overflow")
         }

@@ -88,7 +88,7 @@ final class HardwareFrames: @unchecked Sendable {
     private var cursor: AVSampleCursor?
     private var frames: [PreviewFrame] = []
     private let frameLock = NSLock()
-    private var request: CMTime = .invalid
+    private var requestedPicture: CMTime = .invalid
     private var decodeError: OSStatus = noErr
 
     init(url: URL) throws {
@@ -125,21 +125,42 @@ final class HardwareFrames: @unchecked Sendable {
         if let session { VTDecompressionSessionInvalidate(session) }
     }
 
-    /// Later pictures of the group can be predicted from the rejected one. Dropping the session
-    /// makes the next request decode again from its own keyframe.
-    private func decodeFailure(_ status: OSStatus) -> PreviewFailure {
-        if let session { VTDecompressionSessionInvalidate(session) }
-        session = nil
-        return PreviewFailure("Hardware video decoding failed for \(asset.url.lastPathComponent) (\(status)).")
+    // Keep one small decoder ready for a return to the previous camera. A
+    // large format or an unusually deep reorder queue retains metadata only.
+    func park(keepingSession: Bool) {
+        if keepingSession, let sessionFormat {
+            let dimensions = CMVideoFormatDescriptionGetDimensions(sessionFormat)
+            let keepsFewPictures = frameLock.withLock {
+                decodeError == noErr && frames.count <= 4
+                    && frames.allSatisfy { CVPixelBufferGetDataSize($0.buffer) <= 8 * 1024 * 1024 }
+            }
+            if Int64(dimensions.width) * Int64(dimensions.height) <= 1920 * 1080, keepsFewPictures { return }
+        }
+        releaseSession()
     }
 
-    private func reset(at start: AVSampleCursor) throws {
+    private func releaseSession() {
         if let session { VTDecompressionSessionInvalidate(session) }
         session = nil
+        sessionFormat = nil
+        cursor = nil
         frameLock.withLock {
             frames.removeAll()
             decodeError = noErr
+            requestedPicture = .invalid
         }
+    }
+
+    /// Later pictures of the group can be predicted from the rejected one. Dropping the session
+    /// makes the next request decode again from its own keyframe.
+    private func decodeFailure(_ status: OSStatus) -> PreviewFailure {
+        releaseSession()
+        return PreviewFailure("Hardware video decoding failed for \(asset.url.lastPathComponent) (\(status)).")
+    }
+
+    private func reset(at start: AVSampleCursor, requesting picture: CMTime) throws {
+        releaseSession()
+        frameLock.withLock { requestedPicture = picture }
         cursor = start
 
         let specification = [
@@ -156,7 +177,10 @@ final class HardwareFrames: @unchecked Sendable {
                     decoder.decodeError = status
                 } else if let pixelBuffer {
                     let time = CMTimeMapTimeFromRangeToRange(pts, fromRange: decoder.mapping.source, toRange: decoder.mapping.target)
-                    decoder.frames.append(PreviewFrame(buffer: pixelBuffer, time: time, transform: decoder.transform))
+                    // Keep later pictures that arrive first in decode order.
+                    if time >= decoder.requestedPicture {
+                        decoder.frames.append(PreviewFrame(buffer: pixelBuffer, time: time, transform: decoder.transform))
+                    }
                 }
             },
             decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque()
@@ -200,7 +224,10 @@ final class HardwareFrames: @unchecked Sendable {
         }
         guard !isAfterRangeEnd() else { return nil }
         let desiredTime = CMTimeMapTimeFromRangeToRange(desired.presentationTimeStamp, fromRange: mapping.source, toRange: mapping.target)
-        if let cached = frameLock.withLock({ decodeError == noErr ? frames.first { $0.time == desiredTime } : nil }) {
+        let (request, cached) = frameLock.withLock {
+            (requestedPicture, decodeError == noErr ? frames.first { $0.time == desiredTime } : nil)
+        }
+        if let cached {
             return cached
         }
         if session == nil || !request.isValid || desiredTime < request || (desiredTime - request).seconds > 0.5 {
@@ -211,13 +238,15 @@ final class HardwareFrames: @unchecked Sendable {
             }
             if session == nil || !request.isValid || desiredTime < request ||
                 cursor.map({ sync.decodeTimeStamp > $0.decodeTimeStamp }) ?? true {
-                try reset(at: sync)
+                try reset(at: sync, requesting: desiredTime)
             }
         }
-        request = desiredTime
+        frameLock.withLock {
+            requestedPicture = desiredTime
+            frames.removeAll { $0.time < desiredTime }
+        }
         while !cancelled() {
             frameLock.lock()
-            frames.removeAll { $0.time < desiredTime }
             let matching = frames.first { $0.time == desiredTime }
             let error = decodeError
             frameLock.unlock()
@@ -232,7 +261,7 @@ final class HardwareFrames: @unchecked Sendable {
                     throw PreviewFailure("The video changes format between random-access pictures.")
                 }
                 if let delayed = frameLock.withLock({ frames.first { $0.time == desiredTime } }) { return delayed }
-                try reset(at: cursor)
+                try reset(at: cursor, requesting: desiredTime)
             }
             guard let session else { return nil }
             let sample = try generator.makeSampleBuffer(for: AVSampleBufferRequest(start: cursor))

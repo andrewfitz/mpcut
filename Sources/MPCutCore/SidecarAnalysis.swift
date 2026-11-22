@@ -286,19 +286,40 @@ extension AnalysisSidecar {
     /// as a decode, without loading the source index, audio, or unrelated tracks.
     public func sceneReport(cancelled: () -> Bool = { Task.isCancelled }) -> SceneReport? {
         try? withReadSnapshot(cancelled: cancelled) { read in
-            guard let data = read(Self.sceneSectionKey),
-                  let cached = try? JSONDecoder().decode(CachedScenes.self, from: data)
-            else { return nil }
-            let names = viewNames(matching: cached, read: read)
-            return try cached.report(source: source, identity: identity, names: names, cancelled: cancelled)
+            try decodeSceneReport(read: read, cancelled: cancelled)
         }
     }
 
+    private func decodeSceneReport(read: (String) -> Data?, cancelled: () -> Bool) throws -> SceneReport? {
+        guard let data = read(Self.sceneSectionKey),
+              let cached = try? JSONDecoder().decode(CachedScenes.self, from: data)
+        else { return nil }
+        let names = viewNames(matching: cached, read: read)
+        return try cached.report(source: source, identity: identity, names: names, cancelled: cancelled)
+    }
+
     public func sceneReport(for media: MediaInfo, cancelled: () -> Bool = { Task.isCancelled }) -> SceneReport? {
-        guard media.hasVideo, identity == media.identity, let report = sceneReport(cancelled: cancelled),
-              report.timeBase == media.video.timeBase, report.duration == media.duration,
+        guard media.hasVideo, identity == media.identity else { return nil }
+        return matchingSceneReport(sceneReport(cancelled: cancelled), media: media)
+    }
+
+    private func matchingSceneReport(_ report: SceneReport?, media: MediaInfo) -> SceneReport? {
+        guard let report, report.timeBase == media.video.timeBase, report.duration == media.duration,
               report.origin == media.origin else { return nil }
         return report
+    }
+
+    package func editorMetadata(for media: MediaInfo, cancelled: () -> Bool) -> (SceneReport?, [Int: Double])? {
+        guard identity == media.identity else { return nil }
+        return try? withReadSnapshot(cancelled: cancelled) { read in
+            let report = media.hasVideo
+                ? matchingSceneReport(try? decodeSceneReport(read: read, cancelled: cancelled), media: media)
+                : nil
+            let thresholds = read("thresholdOverrides.v1").flatMap {
+                try? JSONDecoder().decode([Int: Double].self, from: $0)
+            } ?? [:]
+            return (report, thresholds)
+        }
     }
 
     private func audioRecord<Value: Codable>(_ type: Value.Type, key: String, media: MediaInfo,

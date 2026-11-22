@@ -146,9 +146,15 @@ static bool full_track_edit(int fd, Atom track, const AVStream *stream, uint32_t
         return false;
     uint64_t duration = size == 28 ? AV_RB64(bytes + 8) : AV_RB32(bytes + 8);
     uint64_t start = size == 28 ? AV_RB64(bytes + 16) : AV_RB32(bytes + 12);
-    // Only full, forward, zero-based tracks are eligible.
-    return duration <= INT64_MAX && start == 0 && AV_RB32(bytes + size - 4) == 0x10000 &&
-           av_rescale(duration, stream->time_base.den, movie_scale) == stream->duration;
+    // Only full, forward, zero-based tracks are eligible. Some recorders
+    // round the edit end up to the next movie tick. The sample table and
+    // demuxer's index must still cover exactly the full media duration.
+    if (duration > INT64_MAX || start != 0 || AV_RB32(bytes + size - 4) != 0x10000)
+        return false;
+    int64_t media_duration = av_rescale(duration, stream->time_base.den, movie_scale);
+    int64_t rounded_edit_duration = av_rescale_rnd(stream->duration, movie_scale, stream->time_base.den, AV_ROUND_UP);
+    return media_duration == stream->duration ||
+           (media_duration > stream->duration && duration == (uint64_t)rounded_edit_duration);
 }
 
 static bool read_movie(int fd, Atom movie, const AVFormatContext *file)

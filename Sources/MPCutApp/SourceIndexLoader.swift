@@ -9,6 +9,7 @@ final class SourceIndexLoader {
         let sidecars: Bool
         let preview: Bool
         var identity: SourceIdentity? = nil
+        var preferCompleted = false
     }
 
     final class Index: Sendable {
@@ -278,7 +279,8 @@ final class SourceIndexLoader {
                 let result = Result {
                     let engine = CutEngine(cancelled: { token.isCancelled }, useSidecar: key.sidecars)
                     let identity = try freshIdentity()
-                    if !key.preview, let cached = completed.index(for: key, identity: identity) {
+                    if !key.preview || key.preferCompleted,
+                       let cached = completed.index(for: key, identity: identity) {
                         return cached
                     }
                     let ordinary: MediaInfo

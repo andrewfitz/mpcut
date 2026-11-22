@@ -1,15 +1,26 @@
 # Using MPCut 1.2.0
 
-Use **Help → MPCut User Guide** or **Help → Release Notes** to open the bundled documents offline. **MPCut → About MPCut** also opens both documents and lets you check the running version, view credits, or copy the full path of the installed CLI.
+Open this guide from **Help → MPCut User Guide** (⌘?). The Help menu also includes **MPCut Agent Guide** for automation and **Release Notes** for changes in this version. **MPCut → About MPCut** also opens the user guide and release notes and lets you check the running version, view credits, or copy the full path of the installed CLI.
 
 Jump to [working with several windows](#work-with-several-editor-windows), [multicam editing](#edit-a-multicam-project), [shortening pauses](#find-and-shorten-pauses), [audio editing and track export](#edit-audio-and-export-tracks), [CLI automation](#use-the-cli-from-an-agent), [settings](#set-editing-and-export-defaults), or [reviewing footage with JPEGs](#review-a-recording-with-jpegs).
 
 ## Make your first cut
 
-1. Open MPCut and choose **Add Clips**. Select a movie or audio recording. To join multiple clips, select compatible recordings of the same kind.
-2. Drag the clips into playback order. Press Space to preview the join.
-3. To shorten a clip, drag its leading or trailing edge. To remove a section in the middle, seek to its start and click **Mark In** (I). A bracket appears at the playhead and the timeline shows its **In** time. Seek to the end and click **Mark Out** (O). Press **Delete** to remove the shaded range, **Esc** to clear the marks, or **⌘Z** to undo an edit.
-4. Choose **Export** to write all retained footage in timeline order. To save one or more marked sections as separate files, add them to the **Export Queue**. Choose **File → Save Project** to keep the ordered edit in a `.cut` document. Export queues are session-based.
+Remove the middle of a recording and export the two ends as one movie. The example uses a six-second clip and removes seconds 2 through 4. You can follow along with your own recording and choose different times.
+
+1. Choose **File → Add Clips…** (⌘O), select a movie, then click **Add**. Wait for indexing to finish so the timeline is ready to edit.
+2. Click the ruler where the unwanted section begins and click **Mark In** (I). Move to the end of the section and click **Mark Out** (O). For an exact time, choose **Playback → Go to Time…**, type the time in seconds, and press Return. Check the **In**, **Out**, and **Duration** readouts before deleting. Press Esc to clear the marks and try again.
+
+   ![At 2 seconds the In bracket starts a shaded selection. The Out bracket at 4 seconds closes the two-second range.](images/first-cut-marks.jpg)
+
+3. Press **Delete**. The two retained pieces now meet at the cut. In the example, the timeline runs four seconds. Click the ruler just before the join and press **Space** to preview it. Press **⌘Z** if you want to change the cut.
+
+   ![After deletion the timeline shows two adjacent pieces of Practice.mov and a total duration of four seconds.](images/first-cut-result.jpg)
+
+4. Choose **File → Save Project** (⌘S) to keep the editable timeline as a `.cut` file. Keep the source recording available when you reopen it.
+5. Choose **File → Export Media…** (⌘E) to create the movie. For the ProRes example, choose **Lossless Copy** and **MOV**. For other recordings, review the [export modes](#choose-an-export-mode). Choose a new filename and click **Export**. After the export finishes, **File → Show Last Export in Finder** reveals the result.
+
+To join recordings, add compatible clips and drag them into playback order. Drag a clip edge to shorten it. To write several marked sections as individual files, use the session’s [export queue](#export-several-ranges-from-the-timeline).
 
 ## Apply CSV cut points to a clip
 
@@ -88,6 +99,8 @@ Use **File → Import External Project…** to convert an editor project into a 
 
 Add clips with **⌘O** or drop them at the desired position in the timeline. Click the time ruler to seek. Drag a clip to move it or drag an edge to trim. The filmstrip grows taller for portrait video and fits each entire frame, including footage stored sideways with a rotation tag. Splitting divides the filmstrip into adjacent pieces. Faded footage is excluded from playback and export. Drag the same handle back across the faded frames to restore them, or press Esc during a drag to cancel it. The ruler and duration measure the kept footage. The time beside a moving handle shows its position in the source. By default, handles land on individual video frames. The left handle previews the first retained frame. The right handle previews the last retained frame and shows the exclusive end time. Choose a target from **Snap To** beside the zoom slider. **Keyframes** places cuts on verified copy boundaries. **Scenes** uses detected scene changes. **Silence** uses the beginning and end of detected pauses on the selected audio track, aligned to the nearest video frame. Start a scene scan with **Playback → Scan for Scenes**. Choosing **Silence** starts a missing silence scan. The playhead snaps within eight screen points of a matching boundary at the current zoom. **Off** restores ordinary frame editing. The choice applies to subsequent edits.
 
+For a menu-driven trim, select a clip, position the playhead inside it, and choose **Sequence → Trim Selected Clip → Trim Start to Playhead** or **Trim End to Playhead**. The same submenu can **Restore Original Start** or **Restore Original End**. To reorder the selected clip by one position, choose **Sequence → Move Selected Clip Earlier** or **Move Selected Clip Later**.
+
 If the file declares its duration, you can start watching or scrubbing while MPCut indexes the video and audio. The filmstrip and waveform load once the exact index is available. Frame stepping, trimming, and export become available when indexing finishes. Use **Cancel** in the status bar to cancel the import.
 
 Drag the playhead on the time ruler to hear short sections of sound as you move. Drag left to hear the samples in reverse. Releasing the mouse stops the sound at the selected position. Open **Preview Audio** (the speaker in the toolbar) to mute playback, set the monitoring volume, or turn off just **Play audio while scrubbing**. Export audio is controlled separately in the export sheet.
@@ -137,7 +150,7 @@ Press **J** to play backward, **K** to pause, and **L** to play forward. Repeati
 
 New projects and saved projects can open before all sources finish indexing. Watch, scrub and switch available cameras while the status bar shows how many sources are indexing. Camera filmstrips can start filling from source headers as indexing runs. The finished indexes refine frame times and gaps and enable exact frame stepping and export. If MPCut cannot read a source, use **Sources → Relink…** to locate its recording.
 
-A multicam project puts simultaneous recordings on one group ruler. Each recording starts at group time zero until you change its offset. A positive offset puts source time zero later on the ruler. Camera switches are hard cuts and stay in force until the next switch. At the exact switch time, the incoming camera is active. Trimming or reordering the assembly changes which parts of the group play and in what order. Reusing a group interval also reuses the switches within it.
+A multicam project puts simultaneous recordings on one group ruler. Each recording starts at group time zero until you change its offset. A positive offset puts source time zero later on the ruler. If a camera continues past the current group end, choose **Sources → Extend to Last Camera** to include its remaining footage. Camera switches are hard cuts and stay in force until the next switch. At the exact switch time, the incoming camera is active. Trimming or reordering the assembly changes which parts of the group play and in what order. Reusing a group interval also reuses the switches within it.
 
 Choose **Fixed master** for a continuous soundtrack from one camera or a separate recorder. Picture-only switches leave that track continuous. An assembly jump creates an audio cut because the source time jumps. Choose **Audio follows camera** to take the track assigned to each active camera. A switch can override the project audio policy for its interval. Choose **Video only** as the soundtrack policy for a silent project. Track selection uses the absolute stream indices shown by inspection.
 
@@ -332,7 +345,7 @@ For whole-source replacement, a dry run checks the plan and muxer. MPCut verifie
 
 ## Choose an export mode
 
-Press **⌘E** to choose a mode, container and filename in one save sheet. For movies, the initial default is **Smart Trim**. You can change the movie default in Settings. Audio-only exports start with **Lossless Copy** and can switch to **Convert Audio**. The sheet checks the current timeline as you change settings. When the selected mode cannot write the timeline, a button under the message names the least destructive export that can, and nothing changes until you click it.
+Press **⌘E** to choose a mode, container and filename in one save sheet. To open the sheet with a particular mode already selected, choose it under **File → Export Media As**. For movies, the initial default is **Smart Trim**. You can change the movie default in Settings. Audio-only exports start with **Lossless Copy** and can switch to **Convert Audio**. The sheet checks the current timeline as you change settings. When the selected mode cannot write the timeline, a button under the message names the least destructive export that can, and nothing changes until you click it.
 
 | Mode | When to use it |
 | --- | --- |
@@ -365,6 +378,8 @@ Start with the installed executable. In a shell, set `mpcut=/Applications/MPCut.
 | Inspect sound | `waveform`, `silence`, `silence --project PROJECT` | Signed envelope or detected pauses, removal and retained ranges. Silence can also export the joined result |
 | Review picture | `scenes`, `frames` | Scene/view report or grouped exports, or JPEGs and a timestamped manifest |
 | Save or inspect reusable analysis | `sidecar`, `sidecar --status` | Adjacent analysis database on save, plus its status and inventory on either invocation |
+| Convert an editable project | `convert INPUT --output NEW_PROJECT` | A project in the format selected by its extension. [Supported editors and requirements](../README.md#convert-projects) |
+| Send a timeline to Resolve | `resolve --project PROJECT --output FILE.fcpxml` | An editable timeline. Add `--open` to import it into the current Resolve project. [Resolve setup and import](../README.md#export-a-project-to-davinci-resolve) |
 | Produce media | `export`, `rearrange`, `bulk` | One edited/replaced/remuxed/converted recording, one ordered set of selects, or one numbered file per range |
 
 From the root of a built source checkout, this shell example uses `jq` to turn the installed help’s export template into a request. The template’s empty clip object uses the whole top-level input file. Change `clips` to choose ranges. Use a fresh work directory so dry-run and export see the same destination.
@@ -594,6 +609,14 @@ cp Tests/MPCutAppTests/Fixtures/ProRes-2997.mov "$source_clip"
 In JSON inspection results, `media.frames[].canStart` identifies verified start points. A keyframe marker alone can still depend on earlier pictures. Export results include the effective `segments`, `duration`, and `container`. Times are returned as integer numerator/denominator pairs. The dry run checks audio and destination constraints as well as video boundaries.
 
 ### Export several timestamp ranges with one command
+
+For a review delivery, choose an existing destination and give the batch its own subfolder and base filename.
+
+```sh
+mpcut bulk interview.mov --ranges selects.csv --output . --subfolder "Review 2" --base-name Interview --dry-run
+```
+
+The first output might be `Review 2/Interview-001.mov`. Remove `--dry-run` to create the folder and write the clips. Both options are independent. Omit the subfolder to write directly into the destination, or omit the base name to keep the default name. Bulk JSON requests accept the same settings as `subfolder` and `baseName`. Scene exports accept both flags and retain their scene or view suffixes. In either desktop Export Queue, expand **Folders and filenames** to set these values and preview the first filename.
 
 `mpcut bulk` accepts one source file, an existing destination folder, and an ordered list of ranges. Each range uses an inclusive start and an exclusive end. Use clock times, decimal or rational seconds, or the timestamp objects returned by `inspect --frames`.
 

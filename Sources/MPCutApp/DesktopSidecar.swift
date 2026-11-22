@@ -9,8 +9,8 @@ struct SavedEditorAnalysis: Sendable {
 
     init?(media: MediaInfo, cancelled: () -> Bool) {
         let sidecar = AnalysisSidecar(media: media)
-        report = sidecar.sceneReport(for: media, cancelled: cancelled)
-        if cancelled() { return nil }
+        guard let (report, thresholds) = sidecar.editorMetadata(for: media, cancelled: cancelled) else { return nil }
+        self.report = report
         if let report {
             markers = report.scenes.map { TimelineScene(start: $0.startSeconds, view: $0.view) }
             names = Dictionary(uniqueKeysWithValues: report.views.compactMap { view in
@@ -20,9 +20,6 @@ struct SavedEditorAnalysis: Sendable {
             markers = []
             names = [:]
         }
-        let thresholds = sidecar.read("thresholdOverrides.v1", cancelled: cancelled).flatMap {
-            try? JSONDecoder().decode([Int: Double].self, from: $0)
-        } ?? [:]
         let audio = media.streams.filter { $0.kind == "audio" }
         thresholdsByTrack = Dictionary(uniqueKeysWithValues: audio.enumerated().compactMap { offset, stream in
             guard let value = thresholds[stream.index], (-120...0).contains(value) else { return nil }

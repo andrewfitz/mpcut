@@ -41,9 +41,11 @@ final class MulticamQueueAndAudioTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: batch.items[0].output.path))
         XCTAssertEqual(try Data(contentsOf: batch.items[1].output), sentinel)
         try FileManager.default.removeItem(at: batch.items[1].output)
-        model.exportQueuedRanges(to: directory, container: "mov", mode: .copy, tracks: .video)
+        model.exportQueuedRanges(to: directory, container: "mov", mode: .copy, tracks: .video,
+                                 organization: .init(subfolder: "Review", baseName: "Concert"))
         try await waitForOperation(model)
-        XCTAssertTrue(batch.items.allSatisfy { FileManager.default.fileExists(atPath: $0.output.path) })
+        let files = try FileManager.default.contentsOfDirectory(atPath: directory.appendingPathComponent("Review").path)
+        XCTAssertEqual(files.sorted(), ["Concert-001.mov", "Concert-002.mov"])
         XCTAssertEqual(model.queuedRanges.count, 2)
         model.removeQueuedRange(model.queuedRanges[0].id)
         XCTAssertEqual(model.queuedRanges.count, 1)
@@ -70,11 +72,20 @@ final class MulticamQueueAndAudioTests: XCTestCase {
         let end = RationalTime(numerator: 1001, denominator: 30000)
         XCTAssertTrue(model.enqueueRanges([.init(from: .zero, to: end)]))
 
+        let organization = ExportOrganization(subfolder: "Review")
         func preflight() throws -> MulticamBulkExport {
             try MulticamBulkExport(ranges: model.queuedRanges, directory: directory, container: "mov",
-                                   mode: .copy, tracks: .video, settings: .init(), engine: MulticamEngine())
+                                   mode: .copy, tracks: .video, settings: .init(), organization: organization, engine: MulticamEngine())
         }
         XCTAssertEqual(try preflight().items.first?.plan.duration, end)
+        let folder = directory.appendingPathComponent("Review", isDirectory: true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+        XCTAssertThrowsError(try organization.validateSubfolder(in: directory, protectedMedia: [folder.path: "offline"]))
+        if try directory.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames == false {
+            let offline = directory.appendingPathComponent("review/multicam-001.mov")
+            let output = try XCTUnwrap(preflight().items.first?.output)
+            XCTAssertThrowsError(try CutProject.validateMediaDestination(output, absoluteSources: [offline.path: "offline"]))
+        }
         let replacement = directory.appendingPathComponent("replacement.mov")
         try FileManager.default.copyItem(at: original, to: replacement)
         _ = try FileManager.default.replaceItemAt(camera, withItemAt: replacement)
@@ -82,6 +93,7 @@ final class MulticamQueueAndAudioTests: XCTestCase {
         XCTAssertThrowsError(try preflight()) { error in
             XCTAssertEqual((error as? CutError)?.code, "source_changed")
         }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
     }
 
     @MainActor

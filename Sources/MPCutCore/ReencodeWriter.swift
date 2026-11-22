@@ -234,7 +234,10 @@ extension ReencodeEngine {
         args += plan.encoding.arguments
         if plan.settings.codec == .hevc, container != "mkv" { args += ["-tag:v", "hvc1"] }
         if container != "mkv" {
-            args += ["-movflags", "+faststart", "-video_track_timescale", "\(plan.timeScale)",
+            // Only the published movie needs its metadata at the front. The
+            // concat demuxer reads local batch files and can seek to the trailer.
+            if !intermediate { args += ["-movflags", "+faststart"] }
+            args += ["-video_track_timescale", "\(plan.timeScale)",
                      "-movie_timescale", "\(plan.movieTimeScale)"]
         }
         let reference = firstInput.media

@@ -115,6 +115,7 @@ actor ScrubAudioReader {
                 AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true,
                 AVLinearPCMIsNonInterleaved: false, AVLinearPCMIsBigEndianKey: false
             ])
+            output.alwaysCopiesSampleData = false
             guard reader.canAdd(output) else { return nil }
             reader.add(output)
             reader.timeRange = CMTimeRange(start: origin + CMTime(seconds: window.lowerBound, preferredTimescale: 1_000_000_000),

@@ -11,6 +11,12 @@ public struct RationalTime: Hashable, Comparable, Codable, Sendable, CustomStrin
         self.denominator = denominator / divisor
     }
 
+    // Arithmetic and parsing can prove coprimality before constructing the result.
+    private init(reducedNumerator: Int64, denominator: Int64) {
+        self.numerator = reducedNumerator
+        self.denominator = denominator
+    }
+
     public static let zero = Self(numerator: 0)
     public var seconds: Double { Double(numerator) / Double(denominator) }
     public var description: String {
@@ -18,7 +24,7 @@ public struct RationalTime: Hashable, Comparable, Codable, Sendable, CustomStrin
     }
 
     public init(parsing input: String) throws {
-        let invalid = CutError(code: "invalid_time", message: "Invalid timestamp ‘\(input)’")
+        var invalid: CutError { CutError(code: "invalid_time", message: "Invalid timestamp ‘\(input)’") }
         let negative = input.first == "-"
         let unsigned = negative || input.first == "+" ? input.dropFirst() : input[...]
         guard !unsigned.isEmpty else { throw invalid }
@@ -127,10 +133,17 @@ public struct RationalTime: Hashable, Comparable, Codable, Sendable, CustomStrin
         let (top, numeratorOverflow) = (numerator / crossLeft).multipliedReportingOverflow(by: other.numerator / crossRight)
         let (bottom, denominatorOverflow) = (denominator / crossRight).multipliedReportingOverflow(by: other.denominator / crossLeft)
         guard !numeratorOverflow, !denominatorOverflow else { throw Self.overflow }
-        return Self(numerator: top, denominator: bottom)
+        return Self(reducedNumerator: top, denominator: bottom)
     }
 
     private func combining(_ other: Self, subtract: Bool) throws -> Self {
+        if other.numerator == 0 { return self }
+        if denominator == other.denominator {
+            let (top, overflow) = subtract ? numerator.subtractingReportingOverflow(other.numerator)
+                                           : numerator.addingReportingOverflow(other.numerator)
+            if !overflow { return Self(numerator: top, denominator: denominator) }
+            // A wide sum can still fit after reducing the shared denominator.
+        }
         let common = Self.gcd(UInt64(denominator), UInt64(other.denominator))
         let leftScale = other.denominator / Int64(common)
         let rightScale = denominator / Int64(common)
@@ -150,7 +163,7 @@ public struct RationalTime: Hashable, Comparable, Codable, Sendable, CustomStrin
         guard !overflow, let top = Self.quotient(magnitude, dividingBy: divisor, negative: sum.high < 0) else {
             throw Self.overflow
         }
-        return Self(numerator: top, denominator: bottom)
+        return Self(reducedNumerator: top, denominator: bottom)
     }
 
     func isCloserToEarlier(_ earlier: Self, than later: Self) -> Bool {
@@ -188,14 +201,16 @@ public struct RationalTime: Hashable, Comparable, Codable, Sendable, CustomStrin
         let divisor = gcd(remainder(top, dividingBy: denominator), denominator)
         guard let numerator = quotient(top, dividingBy: divisor, negative: negative),
               let bottom = Int64(exactly: denominator / divisor) else { return nil }
-        return Self(numerator: numerator, denominator: bottom)
+        return Self(reducedNumerator: numerator, denominator: bottom)
     }
 
     private static func remainder(_ value: WideMagnitude, dividingBy divisor: UInt64) -> UInt64 {
-        divisor.dividingFullWidth((value.high % divisor, value.low)).remainder
+        if value.high == 0 { return value.low % divisor }
+        return divisor.dividingFullWidth((value.high % divisor, value.low)).remainder
     }
 
     private static func quotient(_ value: WideMagnitude, dividingBy divisor: UInt64, negative: Bool) -> Int64? {
+        if value.high == 0 { return signed(value.low / divisor, negative: negative) }
         guard value.high < divisor else { return nil }
         return signed(divisor.dividingFullWidth(value).quotient, negative: negative)
     }

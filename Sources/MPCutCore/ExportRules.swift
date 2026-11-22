@@ -63,17 +63,23 @@ public enum ExportRung: String, CaseIterable, Codable, Sendable {
     }
 
     /// The label of one offer. `container` and `audio` describe the offered export.
-    public func label(container: String, audio: ReencodeAudio?, lossless: Bool) -> String {
+    /// A multicam program and a movie re-encode keep their picture, so their sound offers name the re-encode.
+    public func label(container: String, audio: ReencodeAudio?, lossless: Bool, source: ExportSourceKind = .audio) -> String {
+        let reencode = ExportRules.displayName(mode: .encode)
         switch self {
         case .copyOtherContainer: return "Copy to \(ExportRules.containerDisplayName(container)) (lossless)"
         case .copySampleAligned: return "Copy with cuts on the nearest audio sample (lossless)"
-        case .smartTrim: return "Use Smart Trim (encodes only the cut edges)"
+        case .smartTrim: return "Use \(ExportRules.displayName(mode: .smart)) (encodes only the cut edges)"
         case .convertSameFormat:
             let name = audio.map(ExportRules.displayName(audio:)) ?? "the source format"
             return "Convert to \(name) (same format\(lossless ? ", lossless" : ""))"
-        case .convertPCM: return "Convert to WAV (no further quality loss)"
-        case .convertAAC: return "Convert to AAC (.m4a, smaller)"
-        case .reencode: return "Choose Re-encode"
+        case .convertPCM:
+            return source == .multicam ? "\(reencode) with PCM sound (no further quality loss)" : "Convert to WAV (no further quality loss)"
+        case .convertAAC:
+            return source == .multicam ? "\(reencode) with AAC sound" : "Convert to AAC (.m4a, smaller)"
+        case .reencode:
+            guard let audio else { return "Choose \(reencode)" }
+            return "\(reencode) to \(ExportRules.containerDisplayName(container)) with \(ExportRules.displayName(audio: audio)) audio"
         }
     }
 }
@@ -116,11 +122,30 @@ public enum ExportEntryPoint: String, CaseIterable, Codable, Sendable {
         }
     }
 
-    /// True when an unavailable export reports the ordered alternatives of the ladder.
-    public var offersAlternatives: Bool {
-        switch self {
-        case .sheet, .cliExport, .cliRearrange, .cliBulk: return true
-        default: return false
+    /// Every entry point reports the ordered alternatives of the ladder, except a replaced soundtrack, which has one way to be written.
+    public var offersAlternatives: Bool { self != .replacement }
+
+    /// The refusal of a mode this entry point does not write. Nil when it does.
+    public func refusal(of mode: ExportMode) -> CutError? {
+        guard !modes.contains(mode) else { return nil }
+        let names = modes.map { ExportRules.displayName(mode: $0) }.joined(separator: " or ")
+        return CutError(code: "invalid_arguments",
+                        message: "\(displayName) writes \(names). Use export for \(ExportRules.displayName(mode: mode)).")
+    }
+
+    /// The table's answer for a request made here: the matrix cell, or the refusal of a mode this entry point does not write.
+    public func answer(source: ExportSourceKind, tracks: ExportTracks, mode: ExportMode) -> ExportCell {
+        let cell = ExportRules.cell(source: source, tracks: tracks, mode: mode)
+        guard let refusal = refusal(of: mode) else { return cell }
+        return ExportCell(source: source, tracks: cell.tracks, mode: mode, resolvedMode: cell.resolvedMode, refusal: refusal,
+                          containers: nil, audioActions: [], defaultAudio: nil, rungs: [])
+    }
+
+    /// The modes a mode control lists here for a selection: those the table writes as themselves.
+    public func selectableModes(source: ExportSourceKind, tracks: ExportTracks) -> [ExportMode] {
+        modes.filter {
+            let cell = answer(source: source, tracks: tracks, mode: $0)
+            return cell.isAllowed && cell.resolvedMode == $0
         }
     }
 
@@ -128,14 +153,17 @@ public enum ExportEntryPoint: String, CaseIterable, Codable, Sendable {
     public var restrictions: [String] {
         switch self {
         case .sheet:
-            return ["noAutoAudioConversion: Convert Audio names a format, so the sheet always shows what it will write. The offer button is what `--audio auto` applies."]
+            return ["noAutoAudioConversion: Convert Audio names a format, so the sheet always shows what it will write. The first offer is what `--audio auto` applies."]
         case .queue:
-            return ["copyOnlySound: sound-only queues use Lossless Copy. Convert the ranges with the Export sheet or `bulk --mode encode`.",
-                    "noAlternatives: a failed range reports its error without the ladder."]
-        case .multicamSheet, .multicamQueue, .cliProject:
-            return ["multicamConversion: Re-encode converts program sound to AAC or PCM only.",
-                    "singleTypeCopy: picture-only and sound-only selections use Lossless Copy.",
-                    "noAlternatives: an unavailable export reports verified switch times instead of the ladder."]
+            return ["sharedSettings: one setting applies to every range, so an alternative that moves cuts (`copySampleAligned`) is not offered.",
+                    "sourceCompatible: Lossless Copy and Smart Trim can leave the container to the copy planner."]
+        case .multicamSheet, .multicamQueue:
+            return ["listedContainers: a picture-only or sound-only copy lists the containers under Containers by setting. The CLI accepts every extension the copy planner verifies.",
+                    "switchTimes: an unsafe switch or range edge also reports verified times."]
+        case .cliProject:
+            return ["namedOutput: the extension of `--output` is the container.",
+                    "autoCopies: `--audio auto`, the flag's default, means `copy`. An inexact copy is refused and offers the conversions.",
+                    "switchTimes: an unsafe switch or range edge also reports verified times in `nearest`."]
         case .replacement:
             return ["copyOnly: a replaced soundtrack is copied with both track types."]
         case .cliExport:
@@ -147,10 +175,9 @@ public enum ExportEntryPoint: String, CaseIterable, Codable, Sendable {
             return ["noEncode: use export for --mode encode.", "nearestByDefault: video cuts snap to the nearest boundary."]
         case .cliSilence:
             return ["noEncode: retained ranges are written with Smart Trim or Lossless Copy.",
-                    "noAlternatives: an unavailable export reports its error without the ladder."]
+                    "generatedClips: the failing clips are the retained ranges, so each alternative lists them in `clips`."]
         case .cliScenes:
-            return ["smartOnly: every scene is written with Smart Trim.",
-                    "noAlternatives: an unavailable export reports its error without the ladder."]
+            return ["smartOnly: every scene is written with Smart Trim, or Lossless Copy for a single-type selection."]
         }
     }
 }
@@ -238,11 +265,80 @@ public enum ExportRules {
     public static func reencodeContainers(_ codec: ReencodeCodec) -> [String] {
         codec == .prores ? ["mov", "mkv"] : ["mp4", "mov", "mkv"]
     }
-    public static let multicamContainers = ["mov", "mp4", "m4v", "mkv", "webm"]
-    /// Audio treatments of a movie or multicam re-encode.
+    static let reencodeContainerRefusal = CutError(code: "unsupported_container",
+                                                   message: "Choose MP4, MOV, or MKV for Re-encode. ProRes requires MOV or MKV.")
+    /// Containers whose movie clock and edit lists carry a multicam program.
+    public static let multicamMovieContainers = ["mov", "mp4", "m4v"]
+    /// Containers of a multicam program with picture and sound. Matroska ones are muxed by the FFmpeg helper.
+    public static let multicamContainers = multicamMovieContainers + ["mkv", "webm"]
+    static let multicamContainerRefusal = CutError(code: "unsupported_container",
+                                                   message: "Choose MOV, MP4, MKV or WebM for multicam picture and sound.")
+    /// The container a multicam program is written as. FFmpeg identifies M4V as raw video, so it is written as MP4.
+    public static func multicamMuxContainer(_ container: String) -> String { container == "m4v" ? "mp4" : container }
+    /// Containers of a multicam re-encode for each video codec.
+    public static func multicamReencodeContainers(_ codec: ReencodeCodec) -> [String] {
+        multicamContainers.filter { reencodeContainers(codec).contains(multicamMuxContainer($0)) }
+    }
+    /// Containers a front end lists for a multicam program. A single-type copy is verified by the copy planner,
+    /// so the CLI accepts other extensions too.
+    public static func multicamListedContainers(tracks: ExportTracks, mode: ExportMode, codec: ReencodeCodec = defaultCodec) -> [String] {
+        if tracks == .audio { return multicamMovieContainers + ["mkv", "wav"] }
+        return tracks == .all && mode == .encode ? multicamReencodeContainers(codec) : multicamContainers
+    }
+    /// Containers that carry an audio treatment of a movie or multicam re-encode. Copy, auto and remove fit every one.
+    public static func reencodeContainers(for audio: ReencodeAudio, source: ExportSourceKind, codec: ReencodeCodec = defaultCodec) -> [String] {
+        let all = source == .multicam ? multicamReencodeContainers(codec) : reencodeContainers(codec)
+        return all.filter { reencodeRefusal(audio: audio, container: $0, source: source) == nil }
+    }
+    /// The refusal of an audio treatment in a re-encode container. Nil when the container carries it.
+    public static func reencodeRefusal(audio: ReencodeAudio, container: String, source: ExportSourceKind) -> CutError? {
+        let written = multicamMuxContainer(container)
+        switch audio {
+        case .pcm where !["mov", "mkv"].contains(written):
+            return CutError(code: "unsupported_audio", message: "Choose MOV or MKV for PCM audio.")
+        case .aac where source == .multicam && !["mov", "mp4"].contains(written):
+            // The program sound keeps gapless timing through a movie edit list, which Matroska lacks.
+            return CutError(code: "unsupported_audio", message: "Choose MOV or MP4 for converted multicam AAC with gapless timing.")
+        default:
+            return nil
+        }
+    }
+    /// What `auto` converts to when the sound of a re-encode cannot be copied exactly, in order of preference.
+    public static func automaticAudio(codec: ReencodeCodec, container: String, source: ExportSourceKind) -> [ReencodeAudio] {
+        let preferred: [ReencodeAudio] = codec == .prores && multicamMuxContainer(container) != "mp4" ? [.pcm, .aac] : [.aac, .pcm]
+        return preferred.filter { reencodeRefusal(audio: $0, container: container, source: source) == nil }
+    }
+    static func audioActionRefusal(_ audio: ReencodeAudio, source: ExportSourceKind) -> CutError {
+        let choices = movieAudioActions.map(\.rawValue)
+        let list = choices.dropLast().joined(separator: ", ") + " or " + (choices.last ?? "")
+        return CutError(code: "unsupported_audio", message: source == .multicam
+            ? "Multicam conversion writes AAC or PCM sound. Choose \(list)."
+            : "\(audio.rawValue.uppercased()) conversion applies to audio-only exports. Choose \(list) for a movie.")
+    }
+    /// Audio treatments of a movie re-encode.
     public static let movieAudioActions: [ReencodeAudio] = [.auto, .copyOriginal, .aac, .pcm, .removeAudio]
+    /// Audio treatments of a multicam re-encode. The routed program sound is never converted unasked, so there is no
+    /// automatic treatment: `auto` is accepted and means `copy`, and an inexact copy offers the conversions.
+    public static let multicamAudioActions: [ReencodeAudio] = movieAudioActions.filter { $0 != .auto }
+    /// The treatment a multicam re-encode applies for a requested one.
+    public static func multicamAudio(_ requested: ReencodeAudio) -> ReencodeAudio { requested == .auto ? .copyOriginal : requested }
     /// Audio treatments of a sound-only conversion.
     public static let soundAudioActions: [ReencodeAudio] = [.auto, .copyOriginal, .pcm, .flac, .aac, .mp3]
+    /// The formats a Convert Audio control names: the source's own first, then every conversion with a container.
+    public static func namedConversions(sourceCodec: String?) -> [ReencodeAudio] {
+        let named = soundAudioActions.filter { !conversionContainers($0).isEmpty }
+        return ([sourceCodec.flatMap(sameFormat(for:))].compactMap { $0 } + named).reduce(into: []) { list, format in
+            if !list.contains(format) { list.append(format) }
+        }
+    }
+    /// Containers a batch can ask a movie copy for before its cuts are verified. Each range is verified when it is planned,
+    /// and no choice leaves the container to the copy planner.
+    public static let movieCopyContainers = ["mp4", "mov", "mkv", "webm"]
+    /// The refusal of video settings, or of an action outside the list above, for a sound-only conversion.
+    public static var soundSettingsRefusal: CutError {
+        CutError(code: "invalid_arguments",
+                 message: "Audio conversion accepts --audio \(soundAudioActions.map(\.rawValue).joined(separator: ", ")). Video settings apply to movies.")
+    }
     /// Containers of each sound-only conversion. The first is its default.
     public static func conversionContainers(_ action: ReencodeAudio) -> [String] {
         switch action {
@@ -264,7 +360,7 @@ public enum ExportRules {
     }
     /// Movie re-encode cannot write PCM into MP4.
     public static func allows(audio: ReencodeAudio, inMovieContainer container: String) -> Bool {
-        !(audio == .pcm && container == "mp4")
+        reencodeRefusal(audio: audio, container: container, source: .movie) == nil
     }
 
     // MARK: Defaults
@@ -273,8 +369,18 @@ public enum ExportRules {
     public static func defaultMode(for source: ExportSourceKind) -> ExportMode {
         source == .audio ? .copy : .smart
     }
+    /// The default mode for a selection: the default above, written as the table writes it. A multicam single-type selection copies.
+    public static func defaultMode(for source: ExportSourceKind, tracks: ExportTracks, preferred: ExportMode? = nil) -> ExportMode {
+        let mode = preferred ?? defaultMode(for: source)
+        let cell = cell(source: source, tracks: tracks, mode: mode)
+        return cell.isAllowed || source != .multicam ? cell.resolvedMode : .copy
+    }
     public static let defaultCodec = ReencodeCodec.h264
     public static func defaultQuality(_ codec: ReencodeCodec) -> ReencodeQuality { codec == .prores ? .prores422 : .balanced }
+    /// The quality presets of each video codec.
+    public static func qualities(_ codec: ReencodeCodec) -> [ReencodeQuality] {
+        codec == .prores ? [.proresLT, .prores422, .proresHQ] : [.smallerFile, .balanced, .highQuality]
+    }
     public static func defaultReencodeContainer(_ codec: ReencodeCodec) -> String { reencodeContainers(codec)[0] }
 
     // MARK: The matrix
@@ -302,7 +408,9 @@ public enum ExportRules {
             case (.all, .smart): return make(.all, resolved: .smart, rungs: [.reencode])
             case (.all, .copy): return make(.all, resolved: .copy, rungs: [.copyOtherContainer, .smartTrim, .reencode])
             case (.all, .encode):
-                return make(.all, resolved: .encode, containers: reencodeContainers(.h264), audio: movieAudioActions, defaultAudio: .auto)
+                // An audio treatment the container cannot carry offers the containers that can, then `auto`.
+                return make(.all, resolved: .encode, containers: reencodeContainers(.h264), audio: movieAudioActions, defaultAudio: .auto,
+                            rungs: [.reencode])
             case (.video, .encode):
                 return make(.video, resolved: .copy, refusal: CutError(code: "invalid_arguments",
                                                                        message: "A video-only selection uses Lossless Copy."))
@@ -314,9 +422,13 @@ public enum ExportRules {
         case .multicam:
             switch (requested, mode) {
             case (.all, .encode):
-                return make(.all, resolved: .encode, containers: multicamContainers, audio: movieAudioActions, defaultAudio: .auto)
-            case (.all, _): return make(.all, resolved: mode, containers: multicamContainers)
-            case (_, .copy): return make(requested, resolved: .copy, containers: multicamContainers)
+                return make(.all, resolved: .encode, containers: multicamReencodeContainers(.h264), audio: multicamAudioActions,
+                            defaultAudio: .copyOriginal, rungs: [.convertPCM, .convertAAC, .reencode])
+            case (.all, .smart): return make(.all, resolved: .smart, containers: multicamContainers, rungs: [.copyOtherContainer, .reencode])
+            case (.all, .copy):
+                return make(.all, resolved: .copy, containers: multicamContainers, rungs: [.copyOtherContainer, .smartTrim, .reencode])
+            // A single-type copy is verified by the copy planner, like a movie's.
+            case (_, .copy): return make(requested, resolved: .copy, rungs: [.copyOtherContainer])
             default:
                 return make(requested, resolved: .copy, refusal: CutError(
                     code: "invalid_arguments",
@@ -355,13 +467,14 @@ public enum ExportRules {
     // MARK: Messages
 
     /// The one wording of an export failure for people: where it happened, why, and verified times.
-    public static func describe(_ issue: CutError, clips: [ClipRequest]) -> String {
+    /// `issue.segment` is a position in `clips`. `numbered` is the number the caller knows that clip by, when it differs.
+    public static func describe(_ issue: CutError, clips: [ClipRequest], numbered: Int? = nil) -> String {
         var message = issue.message
         if let index = issue.segment, clips.indices.contains(index - 1) {
             let clip = clips[index - 1]
             let boundary = issue.boundary == "from" ? clip.from : issue.boundary == "to" ? clip.to : nil
             let location = boundary.map { " at \(seconds($0.seconds))" } ?? ""
-            message = "Clip \(index) · \(clip.file.lastPathComponent)\(location)\n\(message)"
+            message = "Clip \(numbered ?? index) · \(clip.file.lastPathComponent)\(location)\n\(message)"
         }
         if let times = issue.nearest, !times.isEmpty {
             message += "\nVerified alternatives: " + times.map { seconds($0.seconds) }.joined(separator: ", ")
@@ -369,11 +482,50 @@ public enum ExportRules {
         return message
     }
 
+    /// The ordered alternatives for people: the label every front end shows, and how to request each one.
+    public static func describe(alternatives: [ExportAlternative]) -> String {
+        guard !alternatives.isEmpty else { return "" }
+        return "\nAlternatives, least destructive first:" + alternatives.map {
+            "\n  \($0.label): \($0.arguments.joined(separator: " ")), output .\($0.container)"
+        }.joined()
+    }
+
     public static func seconds(_ value: Double) -> String {
         value.formatted(.number.precision(.fractionLength(3...6)).locale(Locale(identifier: "en_US_POSIX"))) + " s"
     }
 
     // MARK: Help and the written matrix
+
+    /// Usage fragments for command help, so no command lists modes, tracks, codecs or actions by hand.
+    public static func modeUsage(_ entry: ExportEntryPoint) -> String {
+        "[--mode " + entry.modes.map(\.rawValue).joined(separator: "|") + "]"
+    }
+    public static var tracksUsage: String { "[--tracks " + ExportTracks.allCases.map(\.rawValue).joined(separator: "|") + "]" }
+    public static var snapUsage: String { "[--snap " + SnapMode.allCases.map(\.rawValue).joined(separator: "|") + "]" }
+    public static var encodeUsage: String { "[--video CODEC] [--quality PRESET] [--audio ACTION]" }
+    /// The default and the presets of each encode setting.
+    public static var encodeSettingsHelp: String {
+        let presets = ReencodeCodec.allCases.map { codec in
+            "\(codec.rawValue) uses " + qualities(codec).map { $0.rawValue + ($0 == defaultQuality(codec) ? " (default)" : "") }.joined(separator: ", ")
+        }.joined(separator: ". ")
+        return "Encoding settings require --mode \(ExportMode.encode.rawValue). CODEC is \(ReencodeCodec.allCases.map(\.rawValue).joined(separator: ", ")) and defaults to \(defaultCodec.rawValue). "
+            + "For PRESET, \(presets). ACTION is one of \(ReencodeAudio.allCases.map(\.rawValue).joined(separator: ", ")) and defaults to \(ReencodeAudio.auto.rawValue). Encode requires exact boundaries."
+    }
+    /// How each command names its modes and what it does without one.
+    public static func modeHelp(_ entry: ExportEntryPoint) -> String {
+        let names = entry.modes.map { "\($0.rawValue) (\(displayName(mode: $0)))" }.joined(separator: ", ")
+        let start = entry == .cliExport ? "" : " The default is \(defaultMode(for: entry.source).rawValue) for picture with sound."
+        return "Modes: \(names).\(start) A single-type selection, or a source without picture, is written as \(displayName(mode: .copy))"
+            + (entry.modes.contains(.encode) && entry.source != .multicam ? ", or converted with --mode \(ExportMode.encode.rawValue)." : ".")
+    }
+    /// The multicam part of command help.
+    public static var multicamHelpSummary: String {
+        func list(_ values: [String]) -> String { values.joined(separator: ", ") }
+        return "A multicam program with picture and sound writes \(list(multicamContainers)). Its re-encode accepts audio \(list(multicamAudioActions.map(\.rawValue))), where auto means copy, and writes "
+            + ReencodeCodec.allCases.map { "\($0.rawValue): \(list(multicamReencodeContainers($0)))" }.joined(separator: "; ")
+            + ". pcm sound needs \(list(reencodeContainers(for: .pcm, source: .multicam))) and aac sound \(list(reencodeContainers(for: .aac, source: .multicam))). "
+            + "A picture-only or sound-only selection is copied. An unavailable export lists error.alternatives like any other export."
+    }
 
     /// One paragraph for command help, derived from the matrix.
     public static var helpSummary: String {
@@ -423,7 +575,7 @@ public enum ExportRules {
             }
         }
         lines += ["", "A source without picture has one selection, so `all` means `audio`. Smart Trim applies to picture, so a single-type selection is written as Lossless Copy.", "",
-                  "The multicam rows describe `MulticamEngine`, which plans programs itself and is not yet resolved through `ExportPlanner`. A sound-only multicam copy can also be written to `wav`.", "",
+                  "The multicam rows are enforced: `MulticamEngine` reads its refusals, containers and audio actions from these rules, so no front end can write what a row refuses. The Export inspector, both Export Queues and `export --project` resolve through `MulticamEngine.resolution`, which reports the alternatives of the row. `silence --project --output` plans its retained ranges with the engine directly and reports verified times only, because no `export --project` request stands for ranges that exist only in its report. The engine still owns what depends on the recordings: the program clock, the switch and range-edge times in `nearest`, the mux of picture and sound, and sample-exact sound conversion. For a multicam program `convertPCM` and `convertAAC` re-encode with the program sound converted, in the requested container when it carries that sound.", "",
                   "## Containers by setting", "", "| Setting | Containers (default first) |", "| --- | --- |"]
         for codec in ReencodeCodec.allCases {
             lines.append("| Re-encode, `\(codec.rawValue)` | \(code(reencodeContainers(codec))) |")
@@ -431,8 +583,20 @@ public enum ExportRules {
         for action in [ReencodeAudio.pcm, .aac, .mp3, .flac] {
             lines.append("| Convert Audio, `\(action.rawValue)` | \(code(conversionContainers(action))) |")
         }
-        lines.append("| Multicam program | \(code(multicamContainers)) |")
-        lines += ["", "PCM cannot be written into MP4 by a movie re-encode.", "",
+        lines.append("| Multicam program, picture and sound | \(code(multicamContainers)) |")
+        for codec in ReencodeCodec.allCases {
+            lines.append("| Multicam re-encode, `\(codec.rawValue)` | \(code(multicamReencodeContainers(codec))) |")
+        }
+        lines.append("| Multicam picture only, listed by the app | \(code(multicamListedContainers(tracks: .video, mode: .copy))) |")
+        lines.append("| Multicam sound only, listed by the app | \(code(multicamListedContainers(tracks: .audio, mode: .copy))) |")
+        for source in [ExportSourceKind.movie, .multicam] {
+            for action in [ReencodeAudio.pcm, .aac] {
+                lines.append("| \(source.displayName) re-encode with `\(action.rawValue)` sound | \(code(reencodeContainers(for: action, source: source))) |")
+            }
+        }
+        lines += ["", "An audio action its container cannot carry is refused with `unsupported_audio` and offers the containers that carry it, then `auto` for a movie. No front end substitutes another action. A multicam `m4v` is written as MP4. Multicam AAC needs a movie edit list for gapless timing, so it is not written into Matroska.", "",
+                  "PCM bit depth is chosen by the engine that writes it: a sound-only conversion keeps the source depth (16, 24 or 32-bit, or 32-bit float), while a movie or multicam re-encode writes 32-bit, or 32-bit float for a float source, so that no source depth is reduced.", "",
+                  "When `auto` cannot copy the sound of a movie re-encode exactly it converts: AAC, or PCM for ProRes outside MP4. A multicam re-encode never converts the routed program sound unasked: `auto` is accepted and means `copy`, and when that copy is not exact the export is unavailable and offers `convertPCM` and `convertAAC`.", "",
                   "## Defaults", "", "| Setting | Default |", "| --- | --- |"]
         for source in ExportSourceKind.allCases {
             lines.append("| Mode, \(source.displayName.lowercased()) | `\(defaultMode(for: source).rawValue)` |")
@@ -566,6 +730,18 @@ public struct ExportAlternative: Codable, Equatable, Sendable {
     }
 }
 
+extension ExportAlternative {
+    /// The alternative with its clips listed, for a command whose clips are not the ones `mpcut export` would be given:
+    /// the ranges of a batch, retained ranges or scenes.
+    public func listing(_ requested: [ClipRequest]) -> ExportAlternative {
+        ExportAlternative(id: id, rung: rung, label: label, mode: mode, tracks: tracks, container: container, audio: audio,
+                          codec: codec, bitRate: bitRate, quality: quality, lossless: lossless, warnings: warnings,
+                          arguments: arguments, clips: requested.map {
+                              .init(file: $0.file.path, from: ($0.from ?? .zero).description, to: $0.to?.description ?? "")
+                          })
+    }
+}
+
 public struct ExportOffer: Sendable {
     public let alternative: ExportAlternative
     public let request: ExportRequest
@@ -593,14 +769,20 @@ public struct ExportPlanner: Sendable {
                                              "empty_edit", "invalid_range", "invalid_time", "no_video", "no_audio", "probe_failed"]
 
     public func resolve(_ request: ExportRequest, output: URL? = nil, media: [URL: MediaInfo] = [:]) -> ExportResolution {
+        var boundaries = CutEngine.BoundaryCache()
+        return resolve(request, output: output, media: media, boundaries: &boundaries)
+    }
+
+    /// A batch shares one boundary cache between the requests it resolves from the same recordings.
+    func resolve(_ request: ExportRequest, output: URL? = nil, media: [URL: MediaInfo] = [:],
+                 boundaries: inout CutEngine.BoundaryCache) -> ExportResolution {
         var indexed = media
         do {
             let source = try self.source(of: request, media: &indexed)
             let cell = ExportRules.cell(source: source.kind, tracks: request.tracks, mode: request.mode)
             if let refusal = cell.refusal { throw refusal }
             if cell.soundOnly, cell.resolvedMode == .encode, request.movieSettings || !cell.audioActions.contains(request.audio) {
-                throw CutError(code: "invalid_arguments",
-                               message: "Audio conversion accepts --audio \(cell.audioActions.map(\.rawValue).joined(separator: ", ")). Video settings apply to movies.")
+                throw ExportRules.soundSettingsRefusal
             }
             if cell.soundOnly, cell.resolvedMode == .encode, let output, output.pathExtension.isEmpty {
                 throw CutError(code: "unsupported_container",
@@ -611,8 +793,15 @@ public struct ExportPlanner: Sendable {
             var attempt = request
             if automatic { attempt.mode = .copy }
             do {
+                // A re-encode container that cannot carry the audio action is refused here, for every front end.
+                // A source without sound has no audio action to refuse.
+                if cell.resolvedMode == .encode, !cell.soundOnly, source.media.streams.contains(where: { $0.kind == "audio" }),
+                   let refusal = ExportRules.reencodeRefusal(audio: request.audio, container: request.container
+                                                               ?? ExportRules.defaultReencodeContainer(request.codec), source: source.kind) {
+                    throw refusal
+                }
                 return .ready(try plan(attempt, cell: automatic ? ExportRules.cell(source: source.kind, tracks: request.tracks, mode: .copy) : cell,
-                                       output: output, media: indexed), request: attempt, applied: nil)
+                                       output: output, media: indexed, boundaries: &boundaries), request: attempt, applied: nil)
             } catch let issue as CutError {
                 guard !Self.terminal.contains(issue.code) else { return .unavailable(issue, offers: []) }
                 let offers = self.offers(after: attempt, source: source.media, kind: source.kind, output: output, media: indexed)
@@ -663,6 +852,12 @@ public struct ExportPlanner: Sendable {
     }
 
     private func plan(_ request: ExportRequest, cell: ExportCell, output: URL?, media: [URL: MediaInfo]) throws -> ExportPlan {
+        var boundaries = CutEngine.BoundaryCache()
+        return try plan(request, cell: cell, output: output, media: media, boundaries: &boundaries)
+    }
+
+    private func plan(_ request: ExportRequest, cell: ExportCell, output: URL?, media: [URL: MediaInfo],
+                      boundaries: inout CutEngine.BoundaryCache) throws -> ExportPlan {
         try AnalysisSidecar.$readsEnabled.withValue(useSidecar && AnalysisSidecar.readsEnabled) {
             switch cell.resolvedMode {
             case .encode where cell.soundOnly:
@@ -680,7 +875,7 @@ public struct ExportPlanner: Sendable {
                                        tracks: request.tracks, audioStream: request.audioStream,
                                        audioTrackOrdinal: request.audioTrackOrdinal)
                 let edit = try engine.resolve(request.clips, output: output, snap: request.snap, media: media,
-                                              container: request.container)
+                                              container: request.container, boundaries: &boundaries)
                 return .packets(edit, mode: cell.resolvedMode, tracks: request.tracks)
             }
         }
@@ -737,6 +932,18 @@ public struct ExportPlanner: Sendable {
                 next.container = rung == .convertSameFormat && containers.contains(own) ? own : containers[0]
                 if request.mode == .encode, request.audio == action { continue }
                 candidates.append((rung, next))
+            case .reencode where request.mode == .encode:
+                // Keep the audio action in the containers that carry it, then offer `auto` where the request was made.
+                let here = request.container ?? ExportRules.defaultReencodeContainer(request.codec)
+                for container in ExportRules.reencodeContainers(for: request.audio, source: kind, codec: request.codec) where container != here {
+                    next.container = container
+                    candidates.append((rung, next))
+                }
+                if request.audio != .auto, ExportRules.reencodeContainers(request.codec).contains(here) {
+                    next.container = here
+                    next.audio = .auto
+                    candidates.append((rung, next))
+                }
             case .reencode:
                 next.mode = .encode
                 next.audio = .auto
@@ -761,10 +968,13 @@ public struct ExportPlanner: Sendable {
             }
             let changed = zip(candidate.clips, request.clips).contains { $0.from != $1.from || $0.to != $1.to }
             let warnings = plan.warnings + (rung == .copySampleAligned ? ["Cuts were placed on the nearest audio sample."] : [])
+            // A re-encode offered for a re-encode names its container and audio action.
+            let variant = rung == .reencode && request.mode == .encode
+            let named = variant && candidate.audio == request.audio
             let alternative = ExportAlternative(
-                id: rung == .copyOtherContainer ? "\(rung.rawValue):\(container)" : rung.rawValue, rung: rung,
-                label: rung.label(container: container, audio: action?.action, lossless: lossless),
-                mode: plan.mode, tracks: candidate.tracks, container: container, audio: action?.action,
+                id: rung == .copyOtherContainer || named ? "\(rung.rawValue):\(container)" : rung.rawValue, rung: rung,
+                label: rung.label(container: container, audio: variant ? candidate.audio : action?.action, lossless: lossless),
+                mode: plan.mode, tracks: candidate.tracks, container: container, audio: variant ? candidate.audio : action?.action,
                 codec: action?.codec, bitRate: action?.bitRate, quality: action?.quality, lossless: lossless,
                 warnings: warnings, arguments: ExportRules.arguments(for: candidate, audioStream: stream),
                 clips: changed ? candidate.clips.map {

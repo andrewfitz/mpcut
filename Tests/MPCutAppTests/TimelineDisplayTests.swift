@@ -47,23 +47,39 @@ final class TimelineDisplayTests: XCTestCase {
 
     @MainActor
     private final class MulticamTimelineState: ObservableObject {
+        static let project = MulticamProject(
+            referenceAngle: "one", range: .init(from: .zero, to: .init(numerator: 10)),
+            angles: [.init(id: "one", file: "camera.mov")], audio: .none,
+            switches: [.init(at: .zero, angle: "one"), .init(at: .init(numerator: 8), angle: "one")]
+        )
         @Published var zoom = 0.0
-        @Published var playhead = RationalTime(numerator: 5, denominator: 1)
+        @Published private(set) var playhead = RationalTime(numerator: 5)
         var selectedSwitch: RationalTime?
         let thumbnails = MulticamThumbnailService()
+        private(set) var clock: MulticamTimelineClock?
+
+        func usePreviewClock() throws {
+            let preview = MulticamPreview()
+            preview.configure(plan: try Self.project.plan(), media: [:])
+            preview.seek(to: playhead)
+            clock = MulticamTimelineClock(preview: preview, groupTime: { $0 })
+        }
+
+        func seek(to time: RationalTime) {
+            if let clock {
+                clock.preview.seek(to: time)
+            } else {
+                playhead = time
+            }
+        }
     }
 
     private struct MulticamTimelineFixture: View {
         @ObservedObject var state: MulticamTimelineState
 
         var body: some View {
-            let end = RationalTime(numerator: 10, denominator: 1)
-            let project = MulticamProject(referenceAngle: "one", range: .init(from: .zero, to: end),
-                                          angles: [.init(id: "one", file: "camera.mov")],
-                                          audio: .none, switches: [.init(at: .zero, angle: "one"),
-                                                                  .init(at: .init(numerator: 8), angle: "one")])
-            MulticamTimeline(project: project, media: [:], playhead: state.playhead,
-                             seek: { _ in }, take: { _ in }, moveSwitch: { _, _ in },
+            MulticamTimeline(project: MulticamTimelineState.project, media: [:], playhead: state.playhead,
+                             clock: state.clock, seek: { _ in }, take: { _ in }, moveSwitch: { _, _ in },
                              deleteSwitch: { _ in }, selectSwitch: { _ in },
                              thumbnailService: state.thumbnails, selectedSwitch: state.selectedSwitch, zoom: $state.zoom)
         }
@@ -97,8 +113,19 @@ final class TimelineDisplayTests: XCTestCase {
 
     @MainActor
     func testMulticamZoomAnchorsAndFollowsThePlayheadUntilManualScroll() async throws {
+        try await verifyMulticamPlayheadFollowing(usesPreviewClock: false)
+    }
+
+    @MainActor
+    func testMulticamZoomFollowsPreviewClockWithoutParentUpdates() async throws {
+        try await verifyMulticamPlayheadFollowing(usesPreviewClock: true)
+    }
+
+    @MainActor
+    private func verifyMulticamPlayheadFollowing(usesPreviewClock: Bool) async throws {
         _ = NSApplication.shared
         let state = MulticamTimelineState()
+        if usesPreviewClock { try state.usePreviewClock() }
         let suite = "MulticamTimelineTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -126,7 +153,7 @@ final class TimelineDisplayTests: XCTestCase {
         for _ in 0..<30 where scroll.contentView.bounds.minX == 0 { try await Task.sleep(for: .milliseconds(10)) }
         let zoomedOrigin = scroll.contentView.bounds.minX
         XCTAssertEqual(zoomedOrigin, viewport * 1.5, accuracy: 3)
-        state.playhead = RationalTime(numerator: 8, denominator: 1)
+        state.seek(to: .init(numerator: 8))
         for _ in 0..<30 where scroll.contentView.bounds.minX == zoomedOrigin {
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -135,7 +162,7 @@ final class TimelineDisplayTests: XCTestCase {
         scroll.contentView.scroll(to: .zero)
         scroll.reflectScrolledClipView(scroll.contentView)
         try await Task.sleep(for: .milliseconds(30))
-        state.playhead = RationalTime(numerator: 9, denominator: 1)
+        state.seek(to: .init(numerator: 9))
         try await Task.sleep(for: .milliseconds(30))
         XCTAssertEqual(scroll.contentView.bounds.minX, 0)
 
@@ -333,6 +360,53 @@ final class TimelineDisplayTests: XCTestCase {
         XCTAssertEqual(points.count, 2)
         if points.count == 2 { XCTAssertGreaterThan(points[0], points[1]) }
         XCTAssertEqual(stops, 1)
+    }
+
+    @MainActor
+    func testReorderDragRepaintsOnlyTheOverlayWhenTheInsertionSlotChanges() throws {
+        _ = NSApplication.shared
+        let frame = NSRect(x: 0, y: 0, width: 632, height: 150)
+        let window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        let surface = TimelineSurface(frame: frame)
+        window.contentView = surface
+        surface.viewportWidth = surface.bounds.width
+
+        let clips = (0..<3).map { _ in clip(size: .zero) }
+        var moved: (UUID, Int)?
+        surface.timeline = SequenceTimeline(clips: clips, playhead: 0, selection: nil,
+                                            onSelect: { _ in }, onSeek: { _ in }, onTrim: { _, _, _, _ in nil },
+                                            onMove: { moved = ($0, $1) }, onDrop: { _, _ in })
+        surface.displayIfNeeded()
+        let overlay = try XCTUnwrap(surface.subviews.first as? TimelineRangeOverlay)
+        let drawOverlay = overlay.drawRange
+        var overlayPaints = 0
+        overlay.drawRange = { dirty in
+            overlayPaints += 1
+            drawOverlay?(dirty)
+        }
+
+        func event(_ type: NSEvent.EventType, at x: CGFloat) throws -> NSEvent {
+            let point = surface.convert(NSPoint(x: x, y: 50), to: nil)
+            return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                                                     timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                                     eventNumber: 1, clickCount: 1, pressure: 1))
+        }
+
+        surface.mouseDown(with: try event(.leftMouseDown, at: 60))
+        surface.needsDisplay = false
+        for (x, expectedPaints) in [(250.0, 1), (260.0, 1), (450.0, 2)] {
+            surface.mouseDragged(with: try event(.leftMouseDragged, at: x))
+            XCTAssertFalse(surface.needsDisplay, "Dragging at \(x) should leave the timeline document clean")
+            XCTAssertFalse(overlay.isHidden)
+            overlay.layer?.displayIfNeeded()
+            XCTAssertEqual(overlayPaints, expectedPaints)
+            surface.needsDisplay = false
+        }
+        XCTAssertNil(moved)
+        surface.mouseUp(with: try event(.leftMouseUp, at: 450))
+        XCTAssertTrue(overlay.isHidden)
+        XCTAssertEqual(moved?.0, clips[0].id)
+        XCTAssertEqual(moved?.1, 2)
     }
 
     @MainActor

@@ -16,6 +16,9 @@ final class PremiereTimelineTests: XCTestCase {
         let xml = stage.appendingPathComponent("sequence.xml")
         XCTAssertEqual(try PremiereTimeline.write(project, relativeTo: stage.appendingPathComponent("test.cut"),
                                                   to: xml, name: "Sequence", allowLoss: false), [])
+        let document = try XMLDocument(contentsOf: xml, options: [])
+        let links = try document.nodes(forXPath: "/xmeml/sequence/media/video/track/clipitem[2]/link/clipindex")
+        XCTAssertEqual(links.compactMap(\.stringValue), ["2", "2", "2"])
         XCTAssertEqual(try PremiereTimeline.read(xml, allowLoss: false).0, project)
     }
 

@@ -8,6 +8,8 @@ extension ReencodeEngine {
         let process = Process()
         process.executableURL = executable
         process.currentDirectoryURL = directory
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         var options = ["-nostdin", "-hide_banner", "-nostats", "-loglevel", "error"]
         if duration != nil, progress != nil { options += ["-progress", "pipe:1"] }
         process.arguments = options + arguments
@@ -43,6 +45,12 @@ extension ReencodeEngine {
                 try checkCancellation()
                 if let deadline, ContinuousClock.now >= deadline {
                     throw CutError(code: "encoder_unavailable", message: "The hardware encoder did not respond to its startup check. Try again.")
+                }
+                if descriptors.allSatisfy({ $0.fd < 0 }) {
+                    // The child can close both pipes just before exiting. Wait
+                    // for termination without making it pay another poll interval.
+                    if exited.wait(timeout: .now() + .milliseconds(75)) == .success { break }
+                    continue
                 }
                 let ready = poll(&descriptors, 2, 75)
                 if ready == 0 || (ready < 0 && errno == EINTR) { continue }

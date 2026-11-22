@@ -6,13 +6,12 @@ import Foundation
 struct MulticamMux {
     var cancelled: (@Sendable () -> Bool)?
 
-    static let movieContainers: Set<String> = ["mov", "mp4", "m4v"]
+    /// The container lists belong to the export rules.
+    static var movieContainers: [String] { ExportRules.multicamMovieContainers }
 
     func check(container: String) throws {
         if Self.movieContainers.contains(container) { return }
-        guard ["mkv", "webm"].contains(container) else {
-            throw CutError(code: "unsupported_container", message: "Choose MOV, MP4, MKV or WebM for multicam picture and sound.")
-        }
+        guard ExportRules.multicamContainers.contains(container) else { throw ExportRules.multicamContainerRefusal }
         _ = try ReencodeEngine.findHelper(override: nil)
     }
 

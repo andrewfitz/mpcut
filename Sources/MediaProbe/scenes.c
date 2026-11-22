@@ -1,4 +1,5 @@
 #include "MediaProbe.h"
+#include "scene_distance.h"
 #include "scene_reader.h"
 #include "video_clock.h"
 #include <CoreVideo/CoreVideo.h>
@@ -36,8 +37,7 @@ static double distance(const ScenePicture *a, const ScenePicture *b)
 {
     unsigned sum = 0;
     for (int c = 0; c < CHANNELS; c++)
-        for (int i = 0; i < W * H; i++)
-            sum += abs(a->planes[c][i] - b->planes[c][i]);
+        sum += mp_scene_byte_distance(a->planes[c], b->planes[c], W * H);
     return (double)sum / (W * H);
 }
 

@@ -96,6 +96,8 @@ final class MulticamEditorModel: ObservableObject {
     private(set) var assemblyRangeEnds: [RationalTime] = []
     var rangeSelectionEdits: MulticamRangeSelectionEdits?
     @Published var exportProgram = MulticamExportProgram.assembly
+    /// The alternatives the export rules reported for the last unavailable export, least destructive first.
+    @Published var exportAlternatives: [ExportAlternative] = []
     @Published var markIn: RationalTime? {
         didSet {
             if markIn != oldValue { rangeSelectionEdits = nil }
@@ -1792,6 +1794,7 @@ final class MulticamEditorModel: ObservableObject {
         report = nil
         suggestions = []
         suggestionAnchor = nil
+        exportAlternatives = []
         let ranges = selection ?? (wholeGroup ? [project.range] : nil)
         let indexedSources = media.filter { $0.value.hasFullEditIndex }
         if let issue = exportSourceIssue(tracks: tracks, wholeGroup: wholeGroup, mode: mode, settings: settings, selection: selection) {
@@ -1808,8 +1811,9 @@ final class MulticamEditorModel: ObservableObject {
             try CutProject.validateMediaDestination(output, absoluteSources: protected)
             return try AnalysisSidecar.$readsEnabled.withValue(useSidecar) {
                 let engine = MulticamEngine(cancelled: { token.isCancelled })
-                let plan = try engine.resolve(project, output: output, mode: mode, tracks: tracks, assembly: ranges,
-                                              settings: settings, indexedSources: indexedSources)
+                // The plan, or the failure with the alternatives of the export rules, as every export reports them.
+                let plan = try engine.resolution(project, output: output, mode: mode, tracks: tracks, assembly: ranges,
+                                                 settings: settings, indexedSources: indexedSources).get()
                 if dryRun {
                     let encoder = JSONEncoder()
                     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
@@ -1913,7 +1917,11 @@ final class MulticamEditorModel: ObservableObject {
                         self.suggestionAnchor = at
                         self.suggestions = nearest
                     }
-                    let message = self.project?.sources.reduce(error.localizedDescription) { message, source in
+                    // One wording for an export failure, and the alternatives that work, on every front end.
+                    let issue = error as? CutError
+                    self.exportAlternatives = issue?.alternatives ?? []
+                    let described = issue.map { $0.alternatives == nil ? $0.localizedDescription : ExportRules.describe($0, clips: []) }
+                    let message = self.project?.sources.reduce(described ?? error.localizedDescription) { message, source in
                         message.replacingOccurrences(of: "Source \(source.id) ", with: "Source \(source.displayName) ")
                             .replacingOccurrences(of: "Angle \(source.id) ", with: "Angle \(source.displayName) ")
                     }

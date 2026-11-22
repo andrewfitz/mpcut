@@ -83,6 +83,7 @@ private final class FCPReader {
     var warnings = [String]()
     private var warned = Set<String>()
     var resources = [String: XMLElement]()
+    private var assetURLs = [String: URL]()
     let engine = CutEngine(useSidecar: false)
     var media = [URL: MediaInfo]()
 
@@ -332,6 +333,20 @@ private final class FCPReader {
         }
         let ref = try source.required("ref")
         guard let asset = resources[ref], asset.name == "asset" else { throw invalidFCP("Missing original asset \(ref).") }
+        let url = try assetURL(ref, asset: asset)
+        if node.name == "video" && asset.attr("hasAudio") == "1" || source.name == "audio" && asset.attr("hasVideo") == "1" {
+            try loss("Restored the omitted components of \(node.name ?? "clip") from its linked asset.")
+        }
+        let local = try start.subtracting(asset.time("start", default: .zero))
+        guard local >= .zero else { throw invalidFCP("Clip begins before the original asset \(ref).") }
+        if asset.attr("duration") != nil, try local.adding(node.time("duration")) > asset.time("duration") {
+            throw invalidFCP("Clip exceeds the duration of original asset \(ref).")
+        }
+        return Linked(asset: asset, url: url, start: local)
+    }
+
+    private func assetURL(_ ref: String, asset: XMLElement) throws -> URL {
+        if let url = assetURLs[ref] { return url }
         let original = asset.elements(forName: "media-rep").first { ($0.attr("kind") ?? "original-media") == "original-media" }
         guard let path = original?.attr("src") ?? asset.attr("src"),
               let refURL = URLComponents(string: path),
@@ -341,16 +356,9 @@ private final class FCPReader {
               let decodedPath = refURL.percentEncodedPath.removingPercentEncoding,
               ProjectFile.validMediaPath(decodedPath), refURL.scheme == nil || decodedPath.hasPrefix("/")
         else { throw invalidFCP("Asset \(ref) needs a local original-media URL.") }
-        let url = try CutProject.checkedMediaURL(decodedPath, relativeTo: location)
-        if node.name == "video" && asset.attr("hasAudio") == "1" || source.name == "audio" && asset.attr("hasVideo") == "1" {
-            try loss("Restored the omitted components of \(node.name ?? "clip") from its linked asset.")
-        }
-        let local = try start.subtracting(asset.time("start", default: .zero))
-        guard local >= .zero else { throw invalidFCP("Clip begins before the original asset \(ref).") }
-        if asset.attr("duration") != nil, try local.adding(node.time("duration")) > asset.time("duration") {
-            throw invalidFCP("Clip exceeds the duration of original asset \(ref).")
-        }
-        return Linked(asset: asset, url: url.standardizedFileURL, start: local)
+        let url = try CutProject.checkedMediaURL(decodedPath, relativeTo: location).standardizedFileURL
+        assetURLs[ref] = url
+        return url
     }
 
     struct Edit {

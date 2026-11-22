@@ -28,6 +28,9 @@ struct MPPreviewDecoder {
     VTDecompressionSessionRef verified_session;
     AVPacket *packet;
     AVFrame *frame;
+    CMVideoFormatDescriptionRef video_description;
+    CMAudioFormatDescriptionRef audio_description;
+    int description_rate;
     SwrContext *resampler;
     AVChannelLayout audio_layout;
     int audio_rate;
@@ -295,6 +298,10 @@ void mp_preview_close(MPPreviewDecoder *preview)
     avcodec_free_context(&preview->audio.codec);
     av_frame_free(&preview->frame);
     av_packet_free(&preview->packet);
+    if (preview->video_description)
+        CFRelease(preview->video_description);
+    if (preview->audio_description)
+        CFRelease(preview->audio_description);
     swr_free(&preview->resampler);
     av_channel_layout_uninit(&preview->audio_layout);
     if (preview->format && !preview->format->iformat)
@@ -507,19 +514,23 @@ static CMSampleBufferRef video_sample(MPPreviewDecoder *preview)
 {
     AVFrame *frame = preview->frame;
     CVPixelBufferRef image = (CVPixelBufferRef)frame->data[3];
-    CMVideoFormatDescriptionRef description = NULL;
     CMSampleBufferRef sample = NULL;
     CMTime pts = sample_time(preview, &preview->video);
     if (!image || !CMTIME_IS_VALID(pts))
         return NULL;
     av_vt_pixbuf_set_attachments(preview->video.codec, image, frame);
-    if (CMVideoFormatDescriptionCreateForImageBuffer(NULL, image, &description) != noErr)
-        return NULL;
+    if (!preview->video_description || !CMVideoFormatDescriptionMatchesImageBuffer(preview->video_description, image)) {
+        CMVideoFormatDescriptionRef description = NULL;
+        if (CMVideoFormatDescriptionCreateForImageBuffer(NULL, image, &description) != noErr)
+            return NULL;
+        if (preview->video_description)
+            CFRelease(preview->video_description);
+        preview->video_description = description;
+    }
     AVRational base = preview->video.codec->pkt_timebase;
     CMTime duration = frame->duration > 0 ? timestamp_time(frame->duration, base) : kCMTimeInvalid;
     CMSampleTimingInfo timing = {duration, pts, kCMTimeInvalid};
-    CMSampleBufferCreateReadyWithImageBuffer(NULL, image, description, &timing, &sample);
-    CFRelease(description);
+    CMSampleBufferCreateReadyWithImageBuffer(NULL, image, preview->video_description, &timing, &sample);
     return sample;
 }
 
@@ -559,9 +570,28 @@ static CMSampleBufferRef audio_sample(MPPreviewDecoder *preview)
         return NULL;
 
     const size_t stride = 2 * sizeof(float);
+    // Output channel count and packing are fixed. Only the rate can change.
+    if (!preview->audio_description || preview->description_rate != frame->sample_rate) {
+        AudioStreamBasicDescription format = {
+            .mSampleRate = frame->sample_rate,
+            .mFormatID = kAudioFormatLinearPCM,
+            .mFormatFlags = kAudioFormatFlagsNativeFloatPacked,
+            .mBytesPerPacket = stride,
+            .mFramesPerPacket = 1,
+            .mBytesPerFrame = stride,
+            .mChannelsPerFrame = 2,
+            .mBitsPerChannel = 8 * sizeof(float),
+        };
+        CMAudioFormatDescriptionRef description = NULL;
+        if (CMAudioFormatDescriptionCreate(NULL, &format, 0, NULL, 0, NULL, NULL, &description) != noErr)
+            return NULL;
+        if (preview->audio_description)
+            CFRelease(preview->audio_description);
+        preview->audio_description = description;
+        preview->description_rate = frame->sample_rate;
+    }
     size_t bytes = (size_t)frame->nb_samples * stride;
     CMBlockBufferRef data = NULL;
-    CMAudioFormatDescriptionRef description = NULL;
     CMSampleBufferRef sample = NULL;
     if (CMBlockBufferCreateWithMemoryBlock(NULL, NULL, bytes, NULL, NULL, 0, bytes,
                                            kCMBlockBufferAssureMemoryNowFlag, &data) != noErr)
@@ -574,22 +604,9 @@ static CMSampleBufferRef audio_sample(MPPreviewDecoder *preview)
                               (const uint8_t **)frame->extended_data, frame->nb_samples);
     if (samples <= 0)
         goto finish;
-    AudioStreamBasicDescription format = {
-        .mSampleRate = frame->sample_rate,
-        .mFormatID = kAudioFormatLinearPCM,
-        .mFormatFlags = kAudioFormatFlagsNativeFloatPacked,
-        .mBytesPerPacket = stride,
-        .mFramesPerPacket = 1,
-        .mBytesPerFrame = stride,
-        .mChannelsPerFrame = 2,
-        .mBitsPerChannel = 8 * sizeof(float),
-    };
-    if (CMAudioFormatDescriptionCreate(NULL, &format, 0, NULL, 0, NULL, NULL, &description) == noErr)
-        CMAudioSampleBufferCreateReadyWithPacketDescriptions(NULL, data, description, samples,
-                                                            pts, NULL, &sample);
+    CMAudioSampleBufferCreateReadyWithPacketDescriptions(NULL, data, preview->audio_description, samples,
+                                                        pts, NULL, &sample);
 finish:
-    if (description)
-        CFRelease(description);
     CFRelease(data);
     return sample;
 }

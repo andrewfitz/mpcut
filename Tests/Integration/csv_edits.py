@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check CSV edits through the built CLI using frame and sample comparisons."""
 import argparse
+import errno
 import json
 from pathlib import Path
 import subprocess
@@ -51,6 +52,65 @@ class CSVEdits(unittest.TestCase):
         playlist.write_text('[0.25,"1/2"]')
         self.assertEqual(len(self.command("bulk", self.movie, "--ranges", playlist, "--tracks", "video",
                                           "--output", bulk, "--dry-run")["outputs"]), 3)
+
+    def test_batch_organization(self):
+        self.csv.write_text("from,to\n0,0.25\n0.5,1")
+        args = ["bulk", self.movie, "--ranges", self.csv, "--output", self.folder,
+                "--container", "mov", "--tracks", "video", "--base-name", "Interview"]
+        folder = self.folder / "Review 2"
+        expected = [folder.resolve() / "Interview-001.mov", folder.resolve() / "Interview-002.mov"]
+        plan = self.command(*args, "--subfolder", folder.name, "--dry-run")
+        self.assertEqual([Path(row["output"]).resolve() for row in plan["outputs"]], expected)
+        self.assertFalse(folder.exists())
+        request = self.folder / "batch.json"
+        request.write_text(json.dumps({"file": self.movie.name, "outputDirectory": str(self.folder),
+                                       "subfolder": folder.name, "baseName": "Interview", "container": "mov",
+                                       "tracks": "video", "ranges": [{"from": "0", "to": "0.25"}]}))
+        row = self.command("bulk", "--input", request, "--dry-run")["outputs"][0]
+        self.assertEqual(Path(row["output"]).resolve(), expected[0])
+        self.command("bulk", "--input", request, "--base-name", "Different", "--dry-run", ok=False)
+        scenes = self.folder / "scenes.csv"
+        scenes.write_text("start,end,view\n0,0.25,1")
+        scene = self.command("scenes", self.movie, "--scenes-file", scenes, "--export-to", self.folder,
+                             "--tracks", "video", "--container", "mov", "--subfolder", folder.name,
+                             "--base-name", "Interview", "--dry-run")["outputs"][0]
+        scene_path = Path(scene["export"]["output"])
+        self.assertEqual(scene_path.parent.resolve(), folder.resolve())
+        self.assertEqual(scene_path.name, f"Interview-scene-001-{scene['viewLabel']}.mov")
+        self.assertFalse(folder.exists())
+        for invalid in ["../escape", "a/b", "."]:
+            self.command(*args, "--subfolder", invalid, "--dry-run", ok=False)
+        folder.symlink_to(self.folder, target_is_directory=True)
+        self.command(*args, "--subfolder", folder.name, "--dry-run", ok=False)
+        folder.unlink()
+        self.command(*args, "--subfolder", folder.name)
+        self.assertTrue(all(path.is_file() for path in expected))
+        expected[0].unlink()
+        self.command(*args, "--subfolder", folder.name, ok=False)
+        self.assertFalse(expected[0].exists())
+
+    def test_unicode_batch_filename(self):
+        self.csv.write_text("from,to\n0,0.25")
+        stem = "映" * 90
+        parent_file = self.folder / (stem + "-001.mov")
+        try:
+            parent_file.touch()
+        except OSError as error:
+            if error.errno == errno.ENAMETOOLONG:
+                self.skipTest("Destination filesystem limits UTF-8 filename bytes")
+            raise
+        args = ["bulk", self.movie, "--ranges", self.csv, "--output", self.folder,
+                "--tracks", "video", "--container", "mov"]
+        child = self.folder / "Review"
+        self.command(*args, "--subfolder", child.name, "--base-name", "a" * 256, "--dry-run", ok=False)
+        self.command(*args, "--subfolder", child.name, "--base-name", stem, "--dry-run")
+        self.assertFalse(child.exists())
+        self.command(*args, "--subfolder", child.name, "--base-name", stem)
+        self.assertTrue((child / parent_file.name).is_file())
+        self.assertEqual(parent_file.stat().st_size, 0)
+        parent_file.unlink()
+        self.command(*args, "--base-name", stem)
+        self.assertGreater(parent_file.stat().st_size, 0)
 
     def test_clip_and_order_files(self):
         source = self.movie.rename(self.folder / 'talk, "one".mov')

@@ -213,8 +213,10 @@ private struct ExportCommands: View {
                 .keyboardShortcut("e", modifiers: [.command])
                 .disabled(!editor.canEdit)
             Menu("Export Media As") {
-                ForEach(editor.isAudioOnly ? [.copy] : [ExportMode.smart, .copy, .encode], id: \.self) { mode in
-                    Button("\(mode.displayName)…") { editor.chooseExport(mode: mode) }
+                // The modes and their names for this source come from the export rules, as the sheet's Mode control does.
+                let source: ExportSourceKind = editor.isAudioOnly ? .audio : .movie
+                ForEach(ExportEntryPoint.sheet.selectableModes(source: source, tracks: .all), id: \.self) { mode in
+                    Button("\(ExportRules.cell(source: source, tracks: .all, mode: mode).displayName)…") { editor.chooseExport(mode: mode) }
                 }
             }
             .disabled(!editor.canEdit)

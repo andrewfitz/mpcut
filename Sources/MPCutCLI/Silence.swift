@@ -68,7 +68,10 @@ struct SilenceOptions {
                 guard let choice = ExportTracks(rawValue: raw) else { throw invalid("Choose all, audio, or video.") }
                 tracks = choice
             case "--mode":
-                guard let choice = ExportMode(rawValue: try value()), choice != .encode else { throw invalid("Choose smart or copy.") }
+                let modes = ExportEntryPoint.cliSilence.modes
+                guard let choice = ExportMode(rawValue: try value()), modes.contains(choice) else {
+                    throw invalid("Choose \(modes.map(\.rawValue).joined(separator: " or ")).")
+                }
                 mode = choice
             default: throw invalid("Unknown silence option '\(flag)'.")
             }

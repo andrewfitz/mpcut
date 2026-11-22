@@ -228,9 +228,16 @@ public enum CutProject: Equatable, Codable, Sendable {
         }
         try validate()
         let directory = ProjectFile.directory(of: projectURL)
-        return try clips.map {
-            ClipRequest(file: try ProjectFile.checkedSourceURL(file: $0.file, in: directory),
-                        from: $0.from, to: $0.to)
+        var sources: [String: URL] = [:]
+        return try clips.map { clip in
+            let file: URL
+            if let cached = sources[clip.file] {
+                file = cached
+            } else {
+                file = try ProjectFile.checkedSourceURL(file: clip.file, in: directory)
+                sources[clip.file] = file
+            }
+            return ClipRequest(file: file, from: clip.from, to: clip.to)
         }
     }
 }
@@ -390,8 +397,12 @@ enum ProjectFile {
                                     sources: [(String, String)], prefix: String, includesContents: Bool = false) throws {
         let destination = canonicalFileURL(output)
         let destinationIdentity = fileIdentity(destination)
-        let caseInsensitive = (try? destination.deletingLastPathComponent()
-            .resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames == false
+        var volumeDirectory = destination.deletingLastPathComponent()
+        while !volumeDirectory.path.isEmpty, volumeDirectory.path != "/",
+              !FileManager.default.fileExists(atPath: volumeDirectory.path) {
+            volumeDirectory.deleteLastPathComponent()
+        }
+        let caseInsensitive = (try? volumeDirectory.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames == false
         var checked = Set<String>()
         for (id, file) in sources where checked.insert(file).inserted {
             let location = sourceURL(file: file, in: sourceDirectory)

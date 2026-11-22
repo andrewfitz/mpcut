@@ -131,7 +131,8 @@ enum PremiereTimeline {
         format.add("fielddominance", "none")
         let v1 = picture.add("track")
         let sound = tracks.add("audio")
-        var audioTracks: [XMLElement] = []
+        var videoClipCount = 0
+        var audioTracks: [(node: XMLElement, clipCount: Int)] = []
         var end: Int64 = 0
         var next = 1
         var fileIDs: [URL: String] = [:]
@@ -200,6 +201,7 @@ enum PremiereTimeline {
             }
             var linked: [(XMLElement, String, Int, Int)] = []
             if edit.video && info.hasVideo {
+                videoClipCount += 1
                 if let group = nativeGroup {
                     let input = v1.add("clipitem")
                     let angleID = next
@@ -214,7 +216,7 @@ enum PremiereTimeline {
                     try addNativeAngles(to: input, group: group, selected: edit.angle, occurrence: angleID,
                                         name: name, fps: fps, location: location, media: media)
                 } else {
-                    linked.append((try item(on: v1), "video", 1, v1.childCount))
+                    linked.append((try item(on: v1), "video", 1, videoClipCount))
                 }
             }
             if edit.audio {
@@ -224,9 +226,10 @@ enum PremiereTimeline {
                         channel += 1
                         guard edit.audioOrdinal == nil || edit.audioOrdinal == ordinal else { continue }
                         guard destination < 32 else { throw issue("Premiere exchange supports up to 32 audio channels per clip.") }
-                        if destination == audioTracks.count { audioTracks.append(sound.add("track")) }
+                        if destination == audioTracks.count { audioTracks.append((sound.add("track"), 0)) }
+                        audioTracks[destination].clipCount += 1
                         let track = audioTracks[destination]
-                        linked.append((try item(on: track, sourceChannel: channel), "audio", destination + 1, track.childCount))
+                        linked.append((try item(on: track.node, sourceChannel: channel), "audio", destination + 1, track.clipCount))
                         destination += 1
                     }
                 }
@@ -316,6 +319,11 @@ extension PremiereTimeline {
         let sourceIn: RationalTime
         let sourceOut: RationalTime
         let channel: Int
+    }
+
+    private enum AudioBoundary {
+        case begin(track: Int, item: Item)
+        case end(track: Int)
     }
 
     static func read(_ xml: URL, allowLoss: Bool) throws -> (CutProject, [String]) {
@@ -490,20 +498,30 @@ extension PremiereTimeline {
             if video { angles.append(source) } else { microphones.append(source) }
             return id
         }
-        let times = Set((base + audio).flatMap { [$0.start, $0.end] }).sorted()
+        var boundaries: [RationalTime: [AudioBoundary]] = [:]
+        for (track, items) in sounds.enumerated() {
+            for item in items {
+                // Ordered clips put an ending before a new beginning at the same time on a track.
+                boundaries[item.start, default: []].append(.begin(track: track, item: item))
+                boundaries[item.end, default: []].append(.end(track: track))
+            }
+        }
+        let times = Set(base.lazy.map(\.start)).union(boundaries.keys).sorted()
         var pictureIndex = 0
-        var audioIndices = Array(repeating: 0, count: sounds.count)
+        var activeTracks: [Int: Item] = [:]
         for start in times where start < last {
             while base[pictureIndex].end <= start { pictureIndex += 1 }
             let picture = base[pictureIndex]
             let camera = try id(picture, video: true)
-            var active: [Item] = []
-            for (trackIndex, track) in sounds.enumerated() {
-                var index = audioIndices[trackIndex]
-                while index < track.count, track[index].end <= start { index += 1 }
-                audioIndices[trackIndex] = index
-                if index < track.count, track[index].start <= start { active.append(track[index]) }
+            if let events = boundaries[start] {
+                for event in events {
+                    switch event {
+                    case let .begin(track, item): activeTracks[track] = item
+                    case let .end(track): activeTracks.removeValue(forKey: track)
+                    }
+                }
             }
+            let active = activeTracks.keys.sorted().map { activeTracks[$0]! }
             var selection: MulticamAudioSelection?
             if let first = active.first {
                 let sourceOffset = try first.sourceIn.subtracting(first.start)

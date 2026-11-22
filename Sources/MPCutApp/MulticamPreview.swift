@@ -147,26 +147,63 @@ private final class MulticamDecodeQueue: @unchecked Sendable {
     func isCurrent(_ request: Int) -> Bool { lock.withLock { generation == request } }
 }
 
+private struct MulticamPictureSource: Hashable, Sendable {
+    let url: URL
+    let identity: SourceIdentity
+}
+
 private final class MulticamPictureDecoder: @unchecked Sendable {
+    private struct NativeEntry {
+        let source: MulticamPictureSource
+        let decoder: HardwareFrames
+    }
+
     let requests = MulticamDecodeQueue("picture")
     private var reader = FFPreviewReader(videoOnly: true)
-    private var nativeURL: URL?
-    private var identity: SourceIdentity?
+    private var source: MulticamPictureSource?
     private var native: HardwareFrames?
+    private var parked: [NativeEntry] = []
     private var previous: MulticamPicturePosition?
     private var frame: PreviewFrame?
+
+    func retainSources(_ sources: Set<MulticamPictureSource>) {
+        requests.queue.async {
+            self.parked.removeAll { !sources.contains($0.source) }
+            if let source = self.source, !sources.contains(source) {
+                self.source = nil
+                self.native = nil
+                self.reader = FFPreviewReader(videoOnly: true)
+                self.previous = nil
+                self.frame = nil
+            }
+        }
+    }
+
+    private func switchSource(to target: MulticamPictureSource) {
+        let prior = source.flatMap { source in native.map { NativeEntry(source: source, decoder: $0) } }
+        parked.removeAll { $0.source.url == target.url && $0.source != target }
+        let reuse = parked.firstIndex(where: { $0.source == target }).map { parked.remove(at: $0).decoder }
+        // Keep the most recent camera's session if it fits. Other entries
+        // retain the AVFoundation asset and track metadata only.
+        parked.last?.decoder.park(keepingSession: false)
+        if let prior, prior.source.url != target.url {
+            prior.decoder.park(keepingSession: true)
+            parked.append(prior)
+            if parked.count > 3 { parked.removeFirst() }
+        }
+        native = reuse ?? (try? HardwareFrames(url: target.url))
+        source = target
+        reader = FFPreviewReader(videoOnly: true)
+        previous = nil
+        frame = nil
+    }
 
     func decode(_ target: MulticamPicturePosition, request: Int) throws -> PreviewFrame? {
         func cancelled() -> Bool { !requests.isCurrent(request) }
         if target == previous, let frame { return frame }
-        if nativeURL != target.url || identity != target.identity {
-            nativeURL = target.url
-            if identity != target.identity {
-                identity = target.identity
-                reader = FFPreviewReader(videoOnly: true)
-                previous = nil
-            }
-            native = try? HardwareFrames(url: target.url)
+        let key = MulticamPictureSource(url: target.url, identity: target.identity)
+        if source != key {
+            switchSource(to: key)
         }
         if let native {
             // HardwareFrames measures from the first presentation edit.
@@ -443,6 +480,12 @@ final class MulticamPreview: ObservableObject {
                 _ = pictureDecoder.requests.invalidate()
                 decodingPicture = nil
             }
+        }
+        if media.count != self.media.count || !media.allSatisfy({ id, source in
+            self.media[id]?.url == source.url && self.media[id]?.identity == source.identity
+        }) {
+            let sources = Set(media.values.map { MulticamPictureSource(url: $0.url, identity: $0.identity) })
+            pictureDecoder.retainSources(sources)
         }
         self.plan = plan
         self.media = media

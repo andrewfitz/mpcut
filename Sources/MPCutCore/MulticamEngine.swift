@@ -92,6 +92,14 @@ public struct MulticamEngine: Sendable {
         self.cancelled = cancelled
     }
 
+    private var plannedSubfolder: URL?
+
+    package func planning(in subfolder: URL?) -> Self {
+        var planner = self
+        planner.plannedSubfolder = subfolder
+        return planner
+    }
+
     package func checkCombinedDestination(_ output: URL) throws -> String {
         let engine = CutEngine(cancelled: cancelled)
         try engine.checkCancellation()
@@ -106,8 +114,7 @@ public struct MulticamEngine: Sendable {
         guard !ext.isEmpty, ext.utf8.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) }) else {
             throw CutError(code: "unsupported_container", message: "Choose a destination with a media container extension.")
         }
-        // FFmpeg identifies M4V as raw video. Multicam uses an MP4 movie.
-        return ext == "m4v" ? "mp4" : ext
+        return ExportRules.multicamMuxContainer(ext)
     }
 
     public func inspect(_ project: MulticamProject, relativeTo location: URL? = nil) throws -> MulticamInspection {
@@ -176,6 +183,14 @@ public struct MulticamEngine: Sendable {
                          mode: ExportMode = .smart, tracks: ExportTracks = .all,
                          assembly: [MulticamRange]? = nil, settings: ReencodeSettings = .init(),
                          indexedSources: [String: MediaInfo]) throws -> MulticamExportPlan {
+        var media = indexedSources
+        return try resolve(project, relativeTo: location, output: output, mode: mode, tracks: tracks,
+                           assembly: assembly, settings: settings, media: &media)
+    }
+
+    func resolve(_ project: MulticamProject, relativeTo location: URL?, output: URL,
+                 mode: ExportMode, tracks: ExportTracks, assembly: [MulticamRange]?,
+                 settings: ReencodeSettings, media: inout [String: MediaInfo]) throws -> MulticamExportPlan {
         let mapping = try project.plan(ranges: assembly)
         let sources = Dictionary(uniqueKeysWithValues: (project.angles + project.audioSources).map {
             ($0.id, sourceURL($0, project: project, location: location))
@@ -183,14 +198,14 @@ public struct MulticamEngine: Sendable {
         let ranges = assembly ?? project.assembly ?? [project.range]
         return try resolve(mapping, sources: sources, output: output, mode: mode, tracks: tracks,
                            settings: settings, requireAudio: project.audio != .none || !mapping.audio.isEmpty,
-                           indexedSources: indexedSources) { number, boundary, time in
+                           media: &media, adjusting: { number, boundary, time in
             var moved = ranges
             guard moved.indices.contains(number - 1) else {
                 throw CutError(code: "invalid_range", message: "The project has no assembly range \(number).")
             }
             if boundary == "from" { moved[number - 1].from = time } else { moved[number - 1].to = time }
             return try project.plan(ranges: moved)
-        }
+        }, offerBoundaries: true)
     }
 
     /// `adjusting` replans the request with one range edge moved. With it, an unsafe range
@@ -200,38 +215,38 @@ public struct MulticamEngine: Sendable {
                         settings: ReencodeSettings = .init(),
                         requireAudio: Bool = true,
                         adjusting: MulticamEdgePlanner? = nil) throws -> MulticamExportPlan {
-        try resolve(mapping, sources: sources, output: output, mode: mode, tracks: tracks,
-                    settings: settings, requireAudio: requireAudio, indexedSources: [:], adjusting: adjusting)
+        var media: [String: MediaInfo] = [:]
+        return try resolve(mapping, sources: sources, output: output, mode: mode, tracks: tracks,
+                           settings: settings, requireAudio: requireAudio, media: &media,
+                           adjusting: adjusting, offerBoundaries: true)
     }
 
     /// Reports each located fault against its one-based assembly range, which for an edit
     /// request is the caller's clip number, and offers alternatives for an unsafe range edge.
-    private func resolve(_ mapping: MulticamPlan, sources: [String: URL], output: URL,
-                         mode: ExportMode, tracks: ExportTracks, settings: ReencodeSettings,
-                         requireAudio: Bool, indexedSources: [String: MediaInfo],
-                         adjusting: MulticamEdgePlanner?) throws -> MulticamExportPlan {
-        var media: [String: MediaInfo] = [:]
+    func resolve(_ mapping: MulticamPlan, sources: [String: URL], output: URL,
+                 mode: ExportMode, tracks: ExportTracks, settings: ReencodeSettings,
+                 requireAudio: Bool, media: inout [String: MediaInfo],
+                 adjusting: MulticamEdgePlanner?, offerBoundaries: Bool) throws -> MulticamExportPlan {
         do {
             return try resolveLanes(mapping, sources: sources, output: output, mode: mode, tracks: tracks,
                                     settings: settings, requireAudio: requireAudio,
-                                    indexedSources: indexedSources, media: &media)
+                                    media: &media, offerBoundaries: offerBoundaries)
         } catch let issue as CutError {
             guard let context = issue.multicam else { throw issue }
             var nearest = issue.nearest
-            if let edge = context.edge, let adjusting,
+            if offerBoundaries, let edge = context.edge, let adjusting,
                issue.code == "unsafe_boundary" || issue.code == "invalid_frame_boundary" {
-                let indexed = media
-                nearest = try edgeAlternatives(edge, mapping: mapping, media: indexed, mode: mode,
+                var candidateMedia = media
+                nearest = try edgeAlternatives(edge, mapping: mapping, media: media, mode: mode,
                                                container: destinationContainer(output),
                                                picture: tracks != .audio,
                                                sound: tracks != .video && !mapping.audio.isEmpty
                                                    && !(mode == .encode && [.aac, .pcm, .removeAudio].contains(settings.audio)),
                                                adjusting: adjusting) { candidate in
-                    var unused: [String: MediaInfo] = [:]
                     do {
                         _ = try resolveLanes(candidate, sources: sources, output: output, mode: mode, tracks: tracks,
                                              settings: settings, requireAudio: requireAudio,
-                                             indexedSources: indexed, media: &unused)
+                                             media: &candidateMedia, offerBoundaries: false)
                         return nil
                     } catch let failure as CutError {
                         return failure
@@ -255,16 +270,16 @@ public struct MulticamEngine: Sendable {
     /// Faults thrown here carry `segment` as a one-based index into the picture or sound lane.
     private func resolveLanes(_ mapping: MulticamPlan, sources: [String: URL], output: URL,
                               mode: ExportMode, tracks: ExportTracks, settings: ReencodeSettings,
-                              requireAudio: Bool, indexedSources: [String: MediaInfo],
-                              media indexedMedia: inout [String: MediaInfo]) throws -> MulticamExportPlan {
+                              requireAudio: Bool, media indexedMedia: inout [String: MediaInfo],
+                              offerBoundaries: Bool) throws -> MulticamExportPlan {
         let engine = CutEngine(cancelled: cancelled)
         try engine.checkCancellation()
-        try engine.checkDestination(output)
+        try engine.checkDestination(output, plannedSubfolder: plannedSubfolder)
         let destinationContainer = output.pathExtension.lowercased()
         let container = try self.destinationContainer(output)
-        guard mode == .copy || tracks == .all else {
-            throw CutError(code: "invalid_arguments", message: "Explicit track selection requires Lossless Copy.")
-        }
+        // The matrix decides which modes a selection can be written with, here for every front end.
+        let cell = ExportRules.cell(source: .multicam, tracks: tracks, mode: mode)
+        if let refusal = cell.refusal { throw refusal }
         let wantPicture = tracks != .audio
         let wantAudio = tracks != .video && (mode != .encode || settings.audio != .removeAudio)
         if wantAudio && (requireAudio || !mapping.audio.isEmpty || tracks == .audio),
@@ -296,7 +311,7 @@ public struct MulticamEngine: Sendable {
         let selected = (wantPicture ? mapping.picture : []) + (useAudio ? mapping.audio : [])
         for span in selected where bySource[span.source] == nil {
             let file = sources[span.source]
-            let previous = indexedSources[span.source].flatMap { $0.url == file?.standardizedFileURL ? $0 : nil }
+            let previous = indexedMedia[span.source].flatMap { $0.url == file?.standardizedFileURL ? $0 : nil }
             if let previous, previous.hasFullEditIndex, let file, !file.path.split(separator: "/").contains("..") {
                 try engine.checkCancellation()
                 try engine.verifyIdentity(file, identity: previous.identity)
@@ -309,7 +324,7 @@ public struct MulticamEngine: Sendable {
             }
         }
 
-        indexedMedia = bySource
+        indexedMedia.merge(bySource) { _, current in current }
         // Inspection places each recording on the group clock. Do the same here, so an
         // offset beyond the rational range is one fault in both commands.
         var checkedOffsets: [String: Set<RationalTime>] = [:]
@@ -320,16 +335,15 @@ public struct MulticamEngine: Sendable {
             _ = try groupCoverage(of: bySource[span.source]!, source: span.source, offset: offset)
         }
 
-        guard mode != .encode || ReencodeAudio.movieCases.contains(settings.audio) else {
-            throw CutError(code: "unsupported_audio",
-                           message: "Multicam conversion writes AAC or PCM sound. Choose auto, copy, aac, pcm or remove.")
+        guard mode != .encode || cell.audioActions.contains(ExportRules.multicamAudio(settings.audio)) else {
+            throw ExportRules.audioActionRefusal(settings.audio, source: .multicam)
         }
         let convertAudio = useAudio && mode == .encode && [.aac, .pcm].contains(settings.audio)
         var sound: ResolvedEdit?
         if useAudio && !convertAudio {
             do {
                 sound = try resolveSound(mapping, sources: bySource, container: container)
-            } catch let issue as CutError where issue.code == "unsafe_boundary" {
+            } catch let issue as CutError where offerBoundaries && issue.code == "unsafe_boundary" {
                 guard let segment = issue.segment, mapping.audio.indices.contains(segment - 1),
                       let boundary = issue.boundary else { throw issue }
                 let audio = mapping.audio[segment - 1]
@@ -351,11 +365,12 @@ public struct MulticamEngine: Sendable {
             let pictureEngine = CutEngine(multicamSmartPicture: mode == .smart, cancelled: cancelled)
             var media: [URL: MediaInfo] = [:]
             var requests: [ClipRequest] = []
+            requests.reserveCapacity(mapping.picture.count)
             for (index, span) in mapping.picture.enumerated() {
                 let source = bySource[span.source]!
                 let info: MediaInfo
                 do {
-                    info = try isolatedPicture(source, using: pictureEngine)
+                    info = try media[source.url] ?? isolatedPicture(source, using: pictureEngine)
                     try checkPictureCoverage(info, span: span, mapping: mapping, container: container)
                 } catch let issue as CutError {
                     throw try contextual(issue, span: span, mapping: mapping, index: index + 1,
@@ -379,7 +394,7 @@ public struct MulticamEngine: Sendable {
                 guard let segment = issue.segment, mapping.picture.indices.contains(segment - 1) else { throw issue }
                 let span = mapping.picture[segment - 1]
                 var offered: [RationalTime] = []
-                if issue.code == "unsafe_boundary" || issue.code == "invalid_frame_boundary",
+                if offerBoundaries, issue.code == "unsafe_boundary" || issue.code == "invalid_frame_boundary",
                    let boundary = issue.boundary {
                     offered = try pictureAlternatives(at: boundary == "from" ? span.output.from : span.output.to,
                                                      mapping: mapping, media: bySource, mode: mode, container: container,
@@ -497,7 +512,7 @@ public struct MulticamEngine: Sendable {
         }
     }
 
-    private func sourceURL(_ source: MulticamSource, project: MulticamProject, location: URL?) -> URL {
+    func sourceURL(_ source: MulticamSource, project: MulticamProject, location: URL?) -> URL {
         if let location { return project.sourceURL(for: source, relativeTo: location) }
         let workingDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         return project.sourceURL(for: source, in: workingDirectory)

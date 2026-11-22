@@ -191,13 +191,15 @@ public struct AudioWaveform: Sendable {
             for value in page.samples {
                 if value >= 0 {
                     if coveredStart == nil { coveredStart = i }
+                    if value <= threshold {
+                        if quietStart == nil { quietStart = i }
+                    } else if quietStart != nil {
+                        appendRun(quietStart, to: &quiet)
+                        quietStart = nil
+                    }
                 } else {
                     appendRun(coveredStart, to: &covered)
                     coveredStart = nil
-                }
-                if value >= 0 && value <= threshold {
-                    if quietStart == nil { quietStart = i }
-                } else {
                     appendRun(quietStart, to: &quiet)
                     quietStart = nil
                 }
@@ -315,6 +317,11 @@ private final class PeakCollector {
         }
         let offset = bin - waveform.count
         if offset < pending.count { pending[offset] = max(pending[offset], peak); return }
+        if offset == pending.count && offset < AudioWaveform.pageSize {
+            if pending.isEmpty { pending.reserveCapacity(AudioWaveform.pageSize) }
+            pending.append(peak)
+            return
+        }
         while bin >= waveform.count + AudioWaveform.pageSize {
             if cancelled() { failed = true; return }
             pending += repeatElement(-1, count: AudioWaveform.pageSize - pending.count)
@@ -324,7 +331,9 @@ private final class PeakCollector {
                 lastUpdate = .now
             }
         }
-        pending += repeatElement(-1, count: bin - waveform.count - pending.count)
+        if pending.isEmpty { pending.reserveCapacity(AudioWaveform.pageSize) }
+        let missing = bin - waveform.count - pending.count
+        if missing > 0 { pending += repeatElement(-1, count: missing) }
         pending.append(peak)
     }
 

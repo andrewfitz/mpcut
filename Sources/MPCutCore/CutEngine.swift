@@ -351,7 +351,7 @@ public struct CutEngine: Sendable {
                                    message: "This source uses multiple video sample descriptions and requires MOV or MP4 output.",
                                    segment: firstOccurrence[info.url])
                 }
-                if let issue = muxIssue(info, container: explicit) {
+                if let issue = cachedMuxIssue(info, container: explicit, cache: &boundaries) {
                     throw CutError(code: "unsupported_container", message: issue,
                                    segment: firstOccurrence[info.url])
                 }
@@ -361,11 +361,20 @@ public struct CutEngine: Sendable {
         }
 
         var defaultFailure: CutError?
-        for candidate in suggestedContainers(for: indexed[sequence[0].url] ?? sequence[0], clips: clips) {
+        let original = indexed[sequence[0].url] ?? sequence[0]
+        let key = muxKey(original)
+        let supported: [String]
+        if let cached = boundaries.suggestedContainers[original.url]?[key] {
+            supported = cached
+        } else {
+            supported = suggestedContainers(for: original)
+            boundaries.suggestedContainers[original.url, default: [:]][key] = supported
+        }
+        for candidate in editContainers(supported, for: original, clips: clips) {
             try checkCancellation()
             if !uniqueMedia.dropFirst().allSatisfy({
                 ($0.videoStream?.multipleDescriptions != true || ["mov", "mp4", "m4v"].contains(candidate))
-                    && muxIssue($0, container: candidate) == nil
+                    && cachedMuxIssue($0, container: candidate, cache: &boundaries) == nil
             }) {
                 continue
             }
@@ -882,7 +891,7 @@ public struct CutEngine: Sendable {
         CutError(code: "output_exists", message: "A file already exists at the destination.")
     }
 
-    package func checkDestination(_ url: URL) throws {
+    package func checkDestination(_ url: URL, plannedSubfolder: URL? = nil) throws {
         guard url.isFileURL, !url.hasDirectoryPath else {
             throw CutError(code: "invalid_output", message: "Choose a local destination file.")
         }
@@ -890,10 +899,20 @@ public struct CutEngine: Sendable {
         var status = stat()
         if lstat(destination.path, &status) == 0 { throw destinationExists }
         let failure = errno
-        guard failure == ENOENT,
-              stat(destination.deletingLastPathComponent().path, &status) == 0,
+        var parent = destination.deletingLastPathComponent()
+        if failure == ENOENT, parent == plannedSubfolder?.standardizedFileURL,
+           lstat(parent.path, &status) != 0, errno == ENOENT {
+            // The child will be created at write time. Ask the same filesystem about this
+            // filename in its existing parent. A file of that name there is unrelated.
+            parent = parent.deletingLastPathComponent()
+            let probe = parent.appendingPathComponent(destination.lastPathComponent, isDirectory: false)
+            guard lstat(probe.path, &status) == 0 || errno == ENOENT else {
+                throw CutError(code: "invalid_output", message: "The export filename is unavailable.")
+            }
+        }
+        guard failure == ENOENT, stat(parent.path, &status) == 0,
               (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR),
-              access(destination.deletingLastPathComponent().path, W_OK | X_OK) == 0 else {
+              access(parent.path, W_OK | X_OK) == 0 else {
             throw CutError(code: "invalid_output", message: "The destination folder is unavailable.")
         }
     }
@@ -932,10 +951,23 @@ extension Array {
 extension CutEngine {
     struct BoundaryCache {
         fileprivate var sources: [URL: [BoundaryKey: Boundaries]] = [:]
+        // Mux eligibility depends on the source and selected tracks. Range-specific
+        // checks still run for every edit, and every use verifies the source identity.
+        fileprivate var suggestedContainers: [URL: [MuxKey: [String]]] = [:]
+        fileprivate var muxIssues: [URL: [MuxKey: [String: String?]]] = [:]
 
         mutating func discard(_ url: URL) {
             sources.removeValue(forKey: url)
+            suggestedContainers.removeValue(forKey: url)
+            muxIssues.removeValue(forKey: url)
         }
+    }
+
+    fileprivate struct MuxKey: Hashable {
+        let identity: SourceIdentity
+        let tracks: ExportTracks
+        let audioStream: Int?
+        let audioTrackOrdinal: Int?
     }
 
     fileprivate struct BoundaryKey: Hashable {
@@ -952,6 +984,18 @@ extension CutEngine {
 }
 
 private extension CutEngine {
+    func muxKey(_ media: MediaInfo) -> MuxKey {
+        MuxKey(identity: media.identity, tracks: tracks, audioStream: audioStream, audioTrackOrdinal: audioTrackOrdinal)
+    }
+
+    func cachedMuxIssue(_ media: MediaInfo, container: String, cache: inout BoundaryCache) -> String? {
+        let key = muxKey(media)
+        if let checked = cache.muxIssues[media.url]?[key]?[container] { return checked }
+        let issue = muxIssue(media, container: container)
+        cache.muxIssues[media.url, default: [:]][key, default: [:]].updateValue(issue, forKey: container)
+        return issue
+    }
+
     func cachedBoundaries(in media: MediaInfo, start: Bool, first: Bool, last: Bool,
                           container: String, cache: inout BoundaryCache) throws -> Boundaries {
         let key = BoundaryKey(container: container, start: start, first: first, last: last)

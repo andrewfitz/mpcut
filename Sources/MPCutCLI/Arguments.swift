@@ -113,6 +113,10 @@ struct ExportOptions {
     var replaceAudio: String?
     var replaceTrack: Int?
     var replacementStream: Int?
+    var subfolder: String?
+    var baseName: String?
+
+    var organization: ExportOrganization { .init(subfolder: subfolder ?? "", baseName: baseName ?? "") }
 
     mutating func set(_ key: String, to value: String, code: String = "invalid_arguments") throws {
         func checked<T: RawRepresentable & CaseIterable>(_ type: T.Type) throws -> T where T.RawValue == String {
@@ -167,7 +171,9 @@ struct ExportOptions {
             audioStream: resolve("audio-stream", audioStream, request.audioStream, jsonKey: "audioStream"),
             replaceAudio: resolve("replace-audio", replaceAudio, request.replaceAudio, jsonKey: "replaceAudio"),
             replaceTrack: resolve("replace-track", replaceTrack, request.replaceTrack, jsonKey: "replaceTrack"),
-            replacementStream: resolve("replacement-stream", replacementStream, request.replacementStream, jsonKey: "replacementStream")
+            replacementStream: resolve("replacement-stream", replacementStream, request.replacementStream, jsonKey: "replacementStream"),
+            subfolder: resolve("subfolder", subfolder, request.subfolder),
+            baseName: resolve("base-name", baseName, request.baseName, jsonKey: "baseName")
         )
     }
 }
@@ -217,6 +223,7 @@ enum SceneGrouping: String, CaseIterable {
 }
 
 struct SceneExportOptions {
+    var organization = ExportOrganization()
     var list: String? = nil
     let directory: String
     let grouping: SceneGrouping
@@ -349,7 +356,7 @@ struct Arguments {
             return Arguments(command: try inspect(options), json: json)
         case "bulk":
             if !options.prefix(while: { $0 != "--" }).contains("--stdin") { return Arguments(command: try bulkList(options), json: json) }
-            guard case let .export(nil, dryRun, flags, order, nil) = try export(options, json: json) else {
+            guard case let .export(nil, dryRun, flags, order, nil) = try export(options, json: json, forBulk: true) else {
                 throw CLIError("invalid_arguments", "Bulk requires --json --stdin.")
             }
             guard flags.replaceAudio == nil, flags.replaceTrack == nil, flags.replacementStream == nil else {
@@ -439,7 +446,7 @@ struct Arguments {
                 directory = try value()
             case "--container" where container == nil: container = try value()
             case "--json", "--dry-run", "--audio-only", "--video-only", "--smart-trim": flags.append(option)
-            case "--mode", "--tracks", "--audio-stream", "--snap", "--audio", "--video", "--quality":
+            case "--mode", "--tracks", "--audio-stream", "--snap", "--audio", "--video", "--quality", "--subfolder", "--base-name":
                 flags += [option, try value()]
             case "--":
                 let remaining = Array(iterator)
@@ -452,7 +459,7 @@ struct Arguments {
             }
         }
         guard let source, let ranges, let directory,
-              case let .export(nil, dryRun, settings, nil, nil) = try export(flags, json: true) else {
+              case let .export(nil, dryRun, settings, nil, nil) = try export(flags, json: true, forBulk: true) else {
             throw CLIError("invalid_arguments", "Use bulk SOURCE --ranges LIST --output DIRECTORY, or supply a complete bulk request.")
         }
         return .bulk(dryRun: dryRun, options: settings, list: BulkList(source: source, ranges: ranges, directory: directory, container: container))
@@ -537,7 +544,7 @@ struct Arguments {
                 case "--json": continue
                 case "--stdin": stdin = true; continue
                 case "--dry-run": dryRun = true; continue
-                case "--export-to", "--scenes-file", "--group-by", "--container", "--tracks", "--audio-stream":
+                case "--export-to", "--scenes-file", "--group-by", "--subfolder", "--base-name", "--container", "--tracks", "--audio-stream":
                     guard values[option] == nil else {
                         throw CLIError("invalid_arguments", "\(option) may be specified only once.")
                     }
@@ -571,7 +578,9 @@ struct Arguments {
         if let tracks = values["--tracks"] { try settings.set("tracks", to: tracks) }
         if let stream = values["--audio-stream"] { try settings.set("audio-stream", to: stream) }
         try settings.checkTrackSelection()
-        return .scenes(file: file, export: SceneExportOptions(list: values["--scenes-file"], directory: directory, grouping: grouping,
+        let organization = ExportOrganization(subfolder: values["--subfolder"] ?? "", baseName: values["--base-name"] ?? "")
+        return .scenes(file: file, export: SceneExportOptions(organization: organization, list: values["--scenes-file"],
+                                                            directory: directory, grouping: grouping,
                                                             container: values["--container"], dryRun: dryRun, tracks: settings.tracks ?? .all, audioStream: settings.audioStream))
     }
 
@@ -668,7 +677,7 @@ struct Arguments {
         return .inspect(file: file, keyframes: keyframes, allFrames: allFrames, audioPackets: audioPackets, packetStream: packetStream, from: from, to: to, tracks: settings.tracks ?? .all, audioStream: settings.audioStream)
     }
 
-    private static func export(_ options: [String], json: Bool, forResolve: Bool = false) throws -> CLICommand {
+    private static func export(_ options: [String], json: Bool, forResolve: Bool = false, forBulk: Bool = false) throws -> CLICommand {
         var arguments = options.makeIterator()
         var openResolve = false
         var output: String?
@@ -714,6 +723,16 @@ struct Arguments {
                     throw CLIError("invalid_arguments", "\(argument) may be specified only once.")
                 }
                 try exportOptions.set(String(argument.dropFirst(2)), to: value(for: argument))
+            case "--subfolder", "--base-name":
+                guard forBulk, suppliedSettings.insert(argument).inserted else {
+                    throw CLIError("invalid_arguments", "Use \(argument) once on a batch export.")
+                }
+                let name = try value(for: argument)
+                if argument == "--subfolder" {
+                    exportOptions.subfolder = name
+                } else {
+                    exportOptions.baseName = name
+                }
             case "--order", "--order-file":
                 guard order == nil else {
                     throw CLIError("invalid_arguments", "--order may be specified only once.")
@@ -806,10 +825,6 @@ struct BulkInput: Decodable {
         let from: String
         let to: String
         private enum Fields: String, CodingKey, CaseIterable { case from, to }
-        init(_ range: AudioSpan) {
-            from = range.from.description
-            to = range.to.description
-        }
         init(from decoder: Decoder) throws {
             let fields = try decoder.requestFields(Fields.self, in: "Range")
             guard let start = try fields.inputTime(.from, in: "Range"), let end = try fields.inputTime(.to, in: "Range") else {
@@ -820,25 +835,32 @@ struct BulkInput: Decodable {
         }
     }
 
+    enum Ranges {
+        case request([RangeInput])
+        case parsed([AudioSpan])
+    }
+
     let file: String
     let outputDirectory: String
     let container: String?
-    let ranges: [RangeInput]
+    let ranges: Ranges
     var options = ExportOptions()
     init(list: BulkList, spans: [AudioSpan]) {
         file = list.source
         outputDirectory = list.directory
         container = list.container
-        ranges = spans.map(RangeInput.init)
+        ranges = .parsed(spans)
     }
     private enum Fields: String, CodingKey, CaseIterable {
-        case file, outputDirectory, ranges, container, mode, snap, video, quality, audio, tracks, audioStream
+        case file, outputDirectory, ranges, subfolder, baseName, container, mode, snap, video, quality, audio, tracks, audioStream
     }
     init(from decoder: Decoder) throws {
         let fields = try decoder.requestFields(Fields.self, in: "Bulk request")
         file = try fields.decode(String.self, forKey: .file)
         outputDirectory = try fields.decode(String.self, forKey: .outputDirectory)
-        ranges = try fields.decode([RangeInput].self, forKey: .ranges)
+        ranges = .request(try fields.decode([RangeInput].self, forKey: .ranges))
+        options.subfolder = try fields.decodeIfPresent(String.self, forKey: .subfolder)
+        options.baseName = try fields.decodeIfPresent(String.self, forKey: .baseName)
         container = try fields.decodeIfPresent(String.self, forKey: .container)
         options.audioStream = try fields.decodeIfPresent(Int.self, forKey: .audioStream)
         for key in [Fields.mode, .snap, .video, .quality, .audio, .tracks] {
