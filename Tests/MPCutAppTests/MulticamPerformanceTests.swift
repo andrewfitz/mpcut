@@ -147,7 +147,7 @@ final class MulticamPerformanceTests: XCTestCase {
                                       angles: [.init(id: "wide", file: source.path)], audio: .none,
                                       switches: [.init(at: .zero, angle: "wide")])
         let urls = try (0..<count).map { index in
-            let url = directory.appendingPathComponent("edit-\(index).multicam.json")
+            let url = directory.appendingPathComponent("edit-\(index).cut")
             try project.save(to: url)
             return url
         }

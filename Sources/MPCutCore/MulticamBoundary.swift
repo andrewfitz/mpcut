@@ -28,6 +28,37 @@ public enum MulticamBoundary {
             self.offset = offset
         }
 
+        /// A continuous join can be legal between normal cut points, since no
+        /// cut occurs on this lane. The additional time is on the source clock.
+        func including(_ time: RationalTime?) -> Self {
+            guard let time else { return self }
+            let index = times.lowerBound { $0 >= time }
+            if index < times.count, times[index] == time { return self }
+            var values = times
+            values.insert(time, at: index)
+            return Self(times: values, offset: offset)
+        }
+
+        /// Expand a range once to inspect all routing decisions that moving its edge
+        /// could expose. A project's group can end before its recording does.
+        func expandedPlan(from edge: RationalTime, toward limit: RationalTime, original: MulticamPlan,
+                          moving: (RationalTime) throws -> MulticamPlan?) throws -> MulticamPlan {
+            guard edge != limit else { return original }
+            if let plan = try moving(limit) { return plan }
+            let earlier = limit < edge
+            let low = try min(edge, limit).subtracting(offset)
+            let high = try max(edge, limit).subtracting(offset)
+            var lower = times.lowerBound { $0 > low }, upper = times.lowerBound { $0 >= high }
+            var best = original
+            while lower < upper {
+                let middle = lower + (upper - lower) / 2
+                let plan = try moving(times[middle].adding(offset))
+                if let plan { best = plan }
+                if (plan != nil) == earlier { upper = middle } else { lower = middle + 1 }
+            }
+            return best
+        }
+
         /// The first and last instants of this grid on the group clock.
         func extent() throws -> ClosedRange<RationalTime>? {
             guard let first = times.first, let last = times.last, first <= last else { return nil }
@@ -40,6 +71,16 @@ public enum MulticamBoundary {
                                   within bounds: ClosedRange<RationalTime>,
                                   cancelled: () -> Bool = { false },
                                   accepting: (RationalTime) throws -> Bool = { _ in true }) throws -> [RationalTime] {
+        try search(near: requested, among: grids, within: bounds, cancelled: cancelled) {
+            try accepting($0) ? .accept : .skip
+        }
+    }
+
+    enum Decision { case accept, skip, stopDirection }
+
+    static func search(near requested: RationalTime, among grids: [Grid],
+                       within bounds: ClosedRange<RationalTime>, cancelled: () -> Bool,
+                       evaluate: (RationalTime) throws -> Decision) throws -> [RationalTime] {
         guard !grids.isEmpty, grids.allSatisfy({ !$0.times.isEmpty }) else { return [] }
         func nearest(later: Bool) throws -> RationalTime? {
             var indices = try grids.map { grid in
@@ -77,7 +118,13 @@ public enum MulticamBoundary {
                     }
                 }
                 if aligned {
-                    if bounds.contains(time), try accepting(time) { return time }
+                    if bounds.contains(time) {
+                        switch try evaluate(time) {
+                        case .accept: return time
+                        case .stopDirection: return nil
+                        case .skip: break
+                        }
+                    }
                     for index in indices.indices { indices[index] += later ? 1 : -1 }
                 }
             }

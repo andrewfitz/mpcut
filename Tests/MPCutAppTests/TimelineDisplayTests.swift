@@ -5,6 +5,21 @@ import XCTest
 @testable import MPCutApp
 
 final class TimelineDisplayTests: XCTestCase {
+    func testWheelZoomAndPanRespectDeviceAndModifiers() {
+        func action(_ x: CGFloat, _ y: CGFloat, precise: Bool = false, inverted: Bool = false,
+                    modifiers: NSEvent.ModifierFlags = []) -> TimelineWheelAction? {
+            TimelineWheelAction(horizontal: x, vertical: y, precise: precise, inverted: inverted, modifiers: modifiers)
+        }
+        XCTAssertEqual(action(0, 2), .zoom(0.5))
+        XCTAssertEqual(action(0, -2, inverted: true), .zoom(0.5))
+        XCTAssertEqual(action(0, -4, precise: true, modifiers: .option), .zoom(-0.05))
+        XCTAssertEqual(action(0, -2, modifiers: .command), .pan(32))
+        XCTAssertEqual(action(0, 2, inverted: true, modifiers: .command), .pan(-32))
+        XCTAssertEqual(action(18, -2, precise: true, modifiers: .command), .pan(-18))
+        XCTAssertNil(action(18, -2, precise: true))
+        XCTAssertNil(action(0, 2, modifiers: .control))
+    }
+
     private func clip(size: CGSize) -> TimelineClip {
         TimelineClip(id: UUID(), sourceID: UUID(), name: "Clip", sourceStart: 0, sourceEnd: 10,
                      sourceDuration: 10, keyframes: [0], thumbnailSyncTimes: [0], frames: [],
@@ -198,7 +213,7 @@ final class TimelineDisplayTests: XCTestCase {
             model.reset()
             try? FileManager.default.removeItem(at: directory)
         }
-        let url = directory.appendingPathComponent("layout.multicam.json")
+        let url = directory.appendingPathComponent("layout.cut")
         try project.save(to: url)
         model.openProject(url)
         for _ in 0..<100 where model.project == nil { try await Task.sleep(for: .milliseconds(10)) }
@@ -321,6 +336,188 @@ final class TimelineDisplayTests: XCTestCase {
     }
 
     @MainActor
+    func testRangeToolCommitsSnappedOrderedBoundsAndClickCollapsesSelection() throws {
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 1032, height: 119))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = surface.bounds.width
+        var state = timeline([clip(size: .zero)], at: 5)
+        var ranges: [ClosedRange<Double>] = []
+        var seeks: [Double] = []
+        state.pointerTarget = { raw, _ in raw.rounded() }
+        state.onRangeSelect = { ranges.append($0...$1) }
+        state.onPointerSeek = { seeks.append($0) }
+        state.onScrub = { _ in XCTFail("A range drag must not scrub") }
+        surface.timeline = state
+        func event(_ type: NSEvent.EventType, _ x: CGFloat, _ y: CGFloat) throws -> NSEvent {
+            let point = surface.convert(NSPoint(x: x, y: y), to: nil)
+            return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                                                     timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                                     eventNumber: 1, clickCount: 1, pressure: 1))
+        }
+        // Start on the playhead, drag backward, then release beyond the left edge.
+        surface.mouseDown(with: try event(.leftMouseDown, 523, 22))
+        surface.mouseDragged(with: try event(.leftMouseDragged, 190, 45))
+        XCTAssertTrue(ranges.isEmpty)
+        let overlay = try XCTUnwrap(surface.subviews.first as? TimelineRangeOverlay)
+        let bitmap = try XCTUnwrap(overlay.bitmapImageRepForCachingDisplay(in: overlay.bounds))
+        overlay.cacheDisplay(in: overlay.bounds, to: bitmap)
+        let pixelScale = CGFloat(bitmap.pixelsWide) / overlay.bounds.width
+        let inside = try XCTUnwrap(bitmap.colorAt(x: Int(300 * pixelScale), y: Int(45 * pixelScale)))
+        let outside = try XCTUnwrap(bitmap.colorAt(x: Int(800 * pixelScale), y: Int(45 * pixelScale)))
+        XCTAssertGreaterThan(inside.alphaComponent, outside.alphaComponent)
+        overlay.layer?.displayIfNeeded()
+        surface.displayIfNeeded()
+        let drawRange = overlay.drawRange
+        var layerPaints = 0
+        overlay.drawRange = { visible in
+            layerPaints += 1
+            drawRange?(visible)
+        }
+        surface.needsDisplay = false
+        surface.mouseDragged(with: try event(.leftMouseDragged, 280, 45))
+        XCTAssertFalse(surface.needsDisplay)
+        overlay.layer?.displayIfNeeded()
+        XCTAssertEqual(layerPaints, 1)
+        surface.mouseUp(with: try event(.leftMouseUp, -40, 45))
+        XCTAssertEqual(ranges, [0...5])
+        XCTAssertTrue(seeks.isEmpty)
+
+        surface.mouseDown(with: try event(.leftMouseDown, 238, 55))
+        surface.mouseUp(with: try event(.leftMouseUp, 239, 55))
+        XCTAssertEqual(ranges, [0...5, 2...2])
+        XCTAssertEqual(seeks, [2])
+
+        surface.mouseDown(with: try event(.leftMouseDown, 238, 55))
+        surface.mouseDragged(with: try event(.leftMouseDragged, 1300, 55))
+        XCTAssertTrue(surface.performKeyEquivalent(with: try escapeKey(window: window)))
+        surface.mouseUp(with: try event(.leftMouseUp, 1300, 55))
+        XCTAssertEqual(ranges, [0...5, 2...2])
+    }
+
+    @MainActor
+    func testRangeOverlayShadesKeptClipsAroundTrimmedSourceHandles() throws {
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 1032, height: 119))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = surface.bounds.width
+        let clips = (0..<2).map { _ in
+            TimelineClip(id: UUID(), sourceID: UUID(), name: "Trimmed", sourceStart: 2, sourceEnd: 8,
+                         sourceDuration: 10, keyframes: [], thumbnailSyncTimes: [], frames: [])
+        }
+        var state = timeline(clips)
+        state.markIn = 1
+        state.markOut = 11
+        surface.timeline = state
+        let overlay = try XCTUnwrap(surface.subviews.first)
+        let bitmap = try XCTUnwrap(overlay.bitmapImageRepForCachingDisplay(in: overlay.bounds))
+        overlay.cacheDisplay(in: overlay.bounds, to: bitmap)
+        let pixelScale = CGFloat(bitmap.pixelsWide) / overlay.bounds.width
+        func alpha(at x: CGFloat) throws -> CGFloat {
+            try XCTUnwrap(bitmap.colorAt(x: Int(x * pixelScale), y: Int(45 * pixelScale))).alphaComponent
+        }
+        let gap = try alpha(at: 500)
+        XCTAssertGreaterThan(try alpha(at: 240), gap)
+        XCTAssertGreaterThan(try alpha(at: 700), gap)
+    }
+
+    @MainActor
+    func testGroupRangeDragContinuesScrollingAndEscapeCancels() async throws {
+        let frame = NSRect(x: 0, y: 0, width: 400, height: 120)
+        let scroller = NSScrollView(frame: frame)
+        let surface = MulticamGroupRangeSurface.Surface(frame: NSRect(x: 0, y: 0, width: 2000, height: 120))
+        let window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = scroller
+        scroller.documentView = surface
+        var ranges: [ClosedRange<RationalTime>] = []
+        surface.configuration = MulticamGroupRangeSurface(markIn: nil, markOut: nil, markTop: 28,
+                                                           timeAt: { RationalTime(numerator: Int64($0)) },
+                                                           positionAt: { CGFloat($0.seconds) },
+                                                           commit: { ranges.append($0...$1) })
+        func mouse(_ type: NSEvent.EventType, _ x: CGFloat) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.mouseEvent(with: type, location: NSPoint(x: x, y: 60), modifierFlags: [],
+                                             timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                             eventNumber: 1, clickCount: 1, pressure: 1))
+        }
+
+        surface.mouseDown(with: try mouse(.leftMouseDown, 120))
+        surface.mouseDragged(with: try mouse(.leftMouseDragged, 395))
+        let deadline = ContinuousClock.now + .seconds(1)
+        while scroller.contentView.bounds.minX < 24, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let origin = scroller.contentView.bounds.minX
+        XCTAssertGreaterThanOrEqual(origin, 24)
+        XCTAssertTrue(ranges.isEmpty)
+        surface.mouseUp(with: try mouse(.leftMouseUp, 395))
+        XCTAssertEqual(ranges, [RationalTime(numerator: 120)...RationalTime(numerator: Int64(origin + 395))])
+
+        surface.mouseDown(with: try mouse(.leftMouseDown, 210))
+        surface.mouseDragged(with: try mouse(.leftMouseDragged, 150))
+        XCTAssertTrue(surface.performKeyEquivalent(with: try escapeKey(window: window)))
+        surface.mouseUp(with: try mouse(.leftMouseUp, 135))
+        XCTAssertEqual(ranges.count, 1)
+    }
+
+    @MainActor
+    private func escapeKey(window: NSWindow) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                     timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                     characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
+                                     isARepeat: false, keyCode: 53))
+    }
+
+    @MainActor
+    func testBenchmarkRangeDragAcrossFiftyThousandClips() throws {
+        guard ProcessInfo.processInfo.environment["MPCUT_RANGE_DRAG_BENCHMARK"] == "1" else {
+            throw XCTSkip("Set MPCUT_RANGE_DRAG_BENCHMARK=1 to time range drag")
+        }
+        let clipCount = 50_000
+        let eventCount = 2_000
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 1032, height: 119))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = surface.bounds.width
+        var state = timeline((0..<clipCount).map { _ in clip(size: .zero) })
+        var range: ClosedRange<Double>?
+        state.pointerTarget = { raw, _ in raw.rounded() }
+        state.onRangeSelect = { range = $0...$1 }
+        surface.timeline = state
+        func event(_ type: NSEvent.EventType, _ x: CGFloat) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.mouseEvent(with: type, location: NSPoint(x: x, y: 60), modifierFlags: [],
+                                             timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                             eventNumber: 1, clickCount: 1, pressure: 1))
+        }
+        let events = try (0..<eventCount).map { index in
+            try event(.leftMouseDragged, 16 + 1000 * CGFloat((index * 7919) % 1999) / 1998)
+        }
+        surface.mouseDown(with: try event(.leftMouseDown, 16))
+        let start = ContinuousClock.now
+        for event in events { surface.mouseDragged(with: event) }
+        let elapsed = start.duration(to: .now)
+        surface.mouseUp(with: try event(.leftMouseUp, 1016))
+        XCTAssertEqual(range, 0...500_000)
+        print("Range drag, \(clipCount) sequence clips and \(eventCount) mouse updates: \(elapsed)")
+
+        // At this zoom the viewport contains ten clips. The isolated layer can be painted
+        // into a reusable bitmap without drawing the ruler, thumbnails, or waveform.
+        surface.zoom = 5_000
+        surface.mouseDown(with: try event(.leftMouseDown, 16))
+        surface.mouseDragged(with: events[1])
+        let overlay = try XCTUnwrap(surface.subviews.first)
+        let bitmap = try XCTUnwrap(overlay.bitmapImageRepForCachingDisplay(in: overlay.bounds))
+        let paintStart = ContinuousClock.now
+        for event in events {
+            surface.mouseDragged(with: event)
+            overlay.cacheDisplay(in: overlay.bounds, to: bitmap)
+        }
+        let paintElapsed = paintStart.duration(to: .now)
+        surface.mouseUp(with: try event(.leftMouseUp, 1016))
+        XCTAssertEqual(range, 0...100)
+        print("Range drag and overlay rasterization, ten visible clips out of \(clipCount), \(eventCount) updates: \(paintElapsed)")
+    }
+
+    @MainActor
     func testOffCenterPlayheadGrabPreservesTimeAndDragOffset() throws {
         let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 1032, height: 119))
         let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
@@ -409,6 +606,24 @@ final class TimelineDisplayTests: XCTestCase {
         surface.mouseUp(with: try mouse(.leftMouseUp, at: 241))
         XCTAssertEqual(try XCTUnwrap(seeks.first), 0.102, accuracy: 1e-8)
         XCTAssertEqual(try XCTUnwrap(scrubs.last), 0.225, accuracy: 1e-8)
+    }
+
+    @MainActor
+    func testCSVFileDropTargetsClipInsteadOfInsertionSlot() {
+        let clips = (0..<2).map { _ in clip(size: CGSize(width: 1920, height: 1080)) }
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 632, height: 150))
+        surface.viewportWidth = surface.frame.width
+        var state = timeline(clips)
+        var targets: [UUID] = []
+        state.onClipCSV = { _, id in targets.append(id) }
+        surface.timeline = state
+        let csv = URL(fileURLWithPath: "/tmp/selects.CSV")
+        for x: CGFloat in [250, 350, 580] {
+            XCTAssertTrue(surface.dropFiles([csv], at: NSPoint(x: x, y: 50)))
+        }
+        XCTAssertFalse(surface.dropFiles([csv], at: .zero))
+        XCTAssertFalse(surface.dropFiles([csv, csv], at: NSPoint(x: 350, y: 50)))
+        XCTAssertEqual(targets, [clips[0].id, clips[1].id, clips[1].id])
     }
 
     @MainActor

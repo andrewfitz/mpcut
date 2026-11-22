@@ -46,8 +46,7 @@ export MPCUT_BUNDLED_FFMPEG=1
 swift_args=(--package-path "$root" --scratch-path "$root/.build/packaged" --configuration release)
 swift_args+=(-Xcc "-I$ffmpeg/install/include" -Xlinker "-L$ffmpeg/install/lib" -Xlinker -lavformat)
 swift_args+=(-Xlinker -rpath -Xlinker '@loader_path/../Frameworks')
-xcrun swift build "${swift_args[@]}" --product MPCutDesktop
-xcrun swift build "${swift_args[@]}" --product mpcut
+xcrun swift build "${swift_args[@]}"
 bin_dir=$(xcrun swift build "${swift_args[@]}" --show-bin-path)
 
 staging=$(mktemp -d "$output_dir/.MPCut-stage.XXXXXX")
@@ -64,9 +63,16 @@ trap cleanup EXIT
 mkdir -p "$contents"/{Frameworks,Helpers,MacOS,Resources/FFmpeg}
 install -m 755 "$bin_dir/MPCutDesktop" "$contents/MacOS/MPCut"
 install -m 755 "$bin_dir/mpcut" "$contents/Helpers/mpcut"
+version=$(DYLD_LIBRARY_PATH="$ffmpeg/install/lib" "$bin_dir/mpcut" --version)
+if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Expected a three-part MPCut release version, got $version." >&2
+    exit 1
+fi
+"$root/scripts/build-mcp-helper.sh" "$contents" "$version"
 install -m 755 "$ffmpeg/install/bin/ffmpeg" "$contents/Helpers/ffmpeg"
 install -m 644 "$root/packaging/Info.plist" "$contents/Info.plist"
 install -m 644 "$root/packaging/Credits.html" "$contents/Resources/Credits.html"
+(cd "$root/packaging/premiere" && /usr/bin/zip -q -X "$contents/Resources/MPCut Premiere.ccx" manifest.json index.html index.js)
 manual="$contents/Resources/Documentation"
 mkdir -p "$manual/packaging"
 # Finder metadata on screenshots is invalid inside a signed application bundle.
@@ -99,6 +105,9 @@ install -m 644 "$ffmpeg/install"/{COPYING.LGPLv2.1,LICENSE.md} "$notices/"
 mkdir "$notices/SVT-AV1"
 install -m 644 "$ffmpeg/install/SVT-AV1"/{LICENSE.md,LICENSE-BSD2.md,PATENTS.md,fastfeat-LICENSE,safestringlib-LICENSE} \
     "$ffmpeg/$svt_name.tar.bz2" "$notices/SVT-AV1/"
+lame_name=$(cat "$ffmpeg/install/lame-source-name")
+mkdir "$notices/LAME"
+install -m 644 "$ffmpeg/install/LAME"/{COPYING,LICENSE} "$ffmpeg/$lame_name.tar.gz" "$notices/LAME/"
 
 for binary in "$contents"/Frameworks/*.dylib "$contents"/Helpers/* "$contents/MacOS/MPCut"; do
     if [[ $(xcrun lipo -archs "$binary") != arm64 ]]; then
@@ -138,11 +147,7 @@ for binary in "$contents"/Frameworks/*.dylib "$contents"/Helpers/* "$contents/Ma
     done <<< "$dependencies"
     codesign --force --sign - --timestamp=none "$binary"
 done
-version=$("$contents/Helpers/mpcut" --version)
-if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "Expected a three-part MPCut release version, got $version." >&2
-    exit 1
-fi
+
 plutil -insert CFBundleShortVersionString -string "$version" "$contents/Info.plist"
 plutil -insert CFBundleVersion -string "$version" "$contents/Info.plist"
 codesign --force --sign - --timestamp=none "$app"
@@ -150,6 +155,8 @@ codesign --verify --deep --strict "$app"
 plutil -lint "$contents/Info.plist"
 env -i PATH=/usr/bin:/bin "$contents/Helpers/mpcut" --help >/dev/null
 env -i PATH=/usr/bin:/bin "$contents/Helpers/ffmpeg" -version >/dev/null
+python3 "$root/scripts/mcp-reference.py" --check
+python3 "$root/Tests/Integration/mcp_bundle.py" "$app"
 
 if [[ -e "$final" || -L "$final" ]]; then
     mv "$final" "$previous"

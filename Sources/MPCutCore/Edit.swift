@@ -10,6 +10,8 @@ public struct CutError: Error, LocalizedError, Codable, Sendable {
     public let track: Int?
     public let multicam: MulticamDiagnostic?
     public var multicamAt: RationalTime? { multicam?.at }
+    /// The exports that work instead, least destructive first. Set by the front end from `ExportPlanner`.
+    public var alternatives: [ExportAlternative]? = nil
 
     public init(code: String, message: String, segment: Int? = nil, boundary: String? = nil,
                 nearest: [RationalTime]? = nil, track: Int? = nil, multicam: MulticamDiagnostic? = nil) {
@@ -66,6 +68,7 @@ public struct ResolvedTrack: Codable, Sendable {
     public let sourceEnd: RationalTime
     public let outputStart: RationalTime
     public let outputEnd: RationalTime
+    var mp3Anchor: MP3Anchor? = nil
     var opusPreSkip: Int32? = nil
 
     enum CodingKeys: String, CodingKey {

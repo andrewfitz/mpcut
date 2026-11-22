@@ -60,7 +60,7 @@ def benchmark(cli, file, directory, runs):
                                           "--to", str(middle + min(middle, Fraction(1, 10)))]
     return {
         "source": file.name, "sourceBytes": source.stat().st_size,
-        "sidecarBytes": source.with_name(source.name + ".mpcut").stat().st_size,
+        "sidecarBytes": source.with_name(source.name + ".cutdb").stat().st_size,
         "buildSeconds": round(build, 4), "measuredRuns": runs,
         "reports": {name: compare(cli, source, arguments, runs) for name, arguments in operations.items()},
     }

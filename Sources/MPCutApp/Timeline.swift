@@ -97,6 +97,8 @@ struct TimelineScene: Equatable {
     let view: Int
 }
 
+typealias TimelineHandleValidation = (UUID, TimelineEdge, Double, Bool, @escaping (Double?) -> Void) -> Void
+
 @MainActor
 struct SequenceTimeline: View {
     let clips: [TimelineClip]
@@ -130,17 +132,21 @@ struct SequenceTimeline: View {
     let onTrim: (UUID, TimelineEdge, Double, Bool) -> Double?
     let onMove: (UUID, Int) -> Void
     let onDrop: ([URL], Int) -> Void
+    var onClipCSV: ((URL, UUID) -> Void)? = nil
     var pointerTarget: ((Double, Double) -> Double)? = nil
     var onPointerSeek: ((Double) -> Void)? = nil
     var onScrub: ((Double) -> Void)? = nil
     var onEndScrub: () -> Void = {}
     var onCancelTrim: () -> Void = {}
+    var validateHandle: TimelineHandleValidation? = nil
     var thumbnail: ((UUID, Double, CGSize) async -> CGImage?)? = nil
+
+    var onRangeSelect: ((Double, Double) -> Void)? = nil
 
     @State private var revealTime: Double?
     @State private var revealRequest = 0
 
-    fileprivate var duration: Double { sequenceDuration ?? clips.reduce(0) { $0 + $1.duration } }
+    var duration: Double { sequenceDuration ?? clips.reduce(0) { $0 + $1.duration } }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -268,6 +274,7 @@ final class TimelineScrollView: NSScrollView {
         super.reflectScrolledClipView(clipView)
         updatePlayhead()
         surface.window?.invalidateCursorRects(for: surface)
+        surface.updateRangeOverlay()
         surface.needsDisplay = true
     }
 
@@ -280,6 +287,7 @@ final class TimelineScrollView: NSScrollView {
             height: max(100, contentView.bounds.height)
         )
         if surface.frame.size != newSize { surface.setFrameSize(newSize) }
+        surface.updateRangeOverlay()
         updatePlayhead()
     }
 
@@ -292,12 +300,13 @@ final class TimelineScrollView: NSScrollView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        // A standalone timeline can use a conventional wheel to scroll horizontally at higher zoom.
-        let isInsideVerticalScroll = superview?.enclosingScrollView?.hasVerticalScroller == true
-        if !isInsideVerticalScroll, !event.hasPreciseScrollingDeltas, event.scrollingDeltaX == 0,
-           surface.bounds.width > contentView.bounds.width {
-            scrollHorizontally(to: contentView.bounds.minX - event.scrollingDeltaY * 12)
-        } else {
+        switch TimelineWheelAction(event) {
+        case .zoom(let amount):
+            guard let zoom = surface.timeline?.zoom else { return }
+            zoom.wrappedValue = TimelineViewControls.adjustedZoom(zoom.wrappedValue, by: amount)
+        case .pan(let delta):
+            scrollHorizontally(to: contentView.bounds.minX + delta)
+        case nil:
             super.scrollWheel(with: event)
         }
     }
@@ -320,6 +329,40 @@ private func drawTimelinePlayhead(x: CGFloat, top: CGFloat, bottom: CGFloat, col
     NSRect(x: x - 0.5, y: top + 3, width: 1, height: bottom - top - 3).fill()
     let marker = TimelinePlayheadMarker().path(in: CGRect(x: x - 8, y: top, width: 16, height: 18))
     NSBezierPath(cgPath: marker.cgPath).fill()
+}
+
+// Keep the marks in a layer sized to the viewport. Pointer movement only
+// invalidates this layer, even when the scroll document spans millions of points.
+final class TimelineRangeOverlay: NSView {
+    var drawRange: ((NSRect) -> Void)?
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        setAccessibilityElement(false)
+        isHidden = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(viewport: NSRect, showMarks: Bool) {
+        let viewport = viewport.isEmpty ? .zero : viewport
+        if frame != viewport { frame = viewport }
+        let hidden = viewport.isEmpty || !showMarks
+        if isHidden != hidden { isHidden = hidden }
+        if !hidden { layer?.setNeedsDisplay() }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let offset = frame.origin
+        context.saveGState()
+        context.translateBy(x: -offset.x, y: -offset.y)
+        drawRange?(dirtyRect.offsetBy(dx: offset.x, dy: offset.y))
+        context.restoreGState()
+    }
 }
 
 final class TimelineSurface: NSView {
@@ -349,6 +392,13 @@ final class TimelineSurface: NSView {
         }
     }
 
+    private struct KeptRun {
+        let sequenceStart: Double
+        var sequenceEnd: Double
+        let stripStart: Double
+        var stripEnd: Double
+    }
+
     private struct PositionedClip {
         let clip: TimelineClip
         let stripStart: Double
@@ -366,6 +416,7 @@ final class TimelineSurface: NSView {
     }
 
     private enum Interaction {
+        case range(anchor: Double, downX: CGFloat)
         case seek(grabOffset: CGFloat)
         case clip(UUID, NSPoint)
         case reorder(UUID)
@@ -421,6 +472,10 @@ final class TimelineSurface: NSView {
                     reveal(time: current)
                 }
             }
+            if (oldValue?.onRangeSelect == nil) != (timeline?.onRangeSelect == nil) {
+                if case .range = interaction { clearInteraction() }
+                window?.invalidateCursorRects(for: self)
+            }
             if oldValue?.allowsClipEdits != timeline?.allowsClipEdits {
                 window?.invalidateCursorRects(for: self)
                 needsDisplay = true
@@ -428,9 +483,11 @@ final class TimelineSurface: NSView {
             if previousDuration != sequenceDuration || oldValue?.playhead != timeline?.playhead {
                 accessibleRuler.updateValue(timeline?.playhead ?? 0, duration: sequenceDuration)
             }
+            if oldValue?.markIn != timeline?.markIn || oldValue?.markOut != timeline?.markOut {
+                updateRangeOverlay()
+            }
             if !sharedClips || oldValue?.sceneRevision != timeline?.sceneRevision ||
                 oldValue?.showsWaveform != timeline?.showsWaveform || oldValue?.selection != timeline?.selection ||
-                oldValue?.markIn != timeline?.markIn || oldValue?.markOut != timeline?.markOut ||
                 oldValue?.thumbnailHeight != timeline?.thumbnailHeight ||
                 (oldValue?.thumbnail == nil) != (timeline?.thumbnail == nil) {
                 needsDisplay = true
@@ -457,9 +514,14 @@ final class TimelineSurface: NSView {
     var zoom = 1.0
     var viewportWidth: CGFloat = 1
     private var interaction: Interaction?
+    private var previewRange: ClosedRange<Double>?
+    private let rangeOverlay = TimelineRangeOverlay()
+    private var keptRuns: [KeptRun] = []
     private var trimPosition: TrimPosition?
     private var lastTrimTarget: Double?
     private var lastSeekTarget: Double?
+    private var csvDrag = false
+    private var csvTarget: Int?
     private var insertionIndex: Int?
     private var dragLocation: NSPoint?
     private var isExternalDrag = false
@@ -512,6 +574,8 @@ final class TimelineSurface: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
         setAccessibilityLabel("Sequence timeline")
+        rangeOverlay.drawRange = { [weak self] visible in self?.drawRange(visible) }
+        addSubview(rangeOverlay)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -623,6 +687,10 @@ final class TimelineSurface: NSView {
                 guard timeline.playhead > position.sequenceStart, timeline.playhead < position.sequenceEnd else { return false }
                 sourceTime = position.sourceStart + (timeline.playhead - position.sequenceStart)
             }
+            if let validate = timeline.validateHandle {
+                validate(id, edge, sourceTime, true) { _ in }
+                return true
+            }
             return timeline.onTrim(id, edge, sourceTime, true) != nil
         }
     }
@@ -642,6 +710,7 @@ final class TimelineSurface: NSView {
         var nextSequenceTime = 0.0
         var trimDelta = 0.0
         trimClipIndex = nil
+        keptRuns.removeAll(keepingCapacity: true)
         positions = (timeline?.clips ?? []).enumerated().map { index, clip in
             let sequenceStart = clip.sequenceRange.map { $0.lowerBound + trimDelta } ?? nextSequenceTime
             var sourceStart = clip.sourceStart
@@ -657,9 +726,18 @@ final class TimelineSurface: NSView {
                                           sourceStart: sourceStart, sourceEnd: sourceEnd)
             stripStart = position.stripEnd
             nextSequenceTime = position.sequenceEnd
+            if let last = keptRuns.last, last.stripEnd == position.keptStart,
+               last.sequenceEnd == position.sequenceStart {
+                keptRuns[keptRuns.count - 1].sequenceEnd = position.sequenceEnd
+                keptRuns[keptRuns.count - 1].stripEnd = position.keptEnd
+            } else {
+                keptRuns.append(KeptRun(sequenceStart: position.sequenceStart, sequenceEnd: position.sequenceEnd,
+                                        stripStart: position.keptStart, stripEnd: position.keptEnd))
+            }
             return position
         }
         sequenceDuration = nextSequenceTime
+        updateRangeOverlay()
     }
 
     fileprivate func stripX(at time: Double) -> CGFloat { margin + time * scale }
@@ -683,7 +761,7 @@ final class TimelineSurface: NSView {
         return clip.sequenceStart + (time - clip.keptStart)
     }
 
-    fileprivate func reveal(time: Double) {
+    func reveal(time: Double) {
         guard let scrollView = enclosingScrollView as? TimelineScrollView else { return }
         let visible = visibleRect
         let point = x(at: time)
@@ -733,21 +811,9 @@ final class TimelineSurface: NSView {
                 }
                 drawClip(position, selected: position.clip.id == timeline.selection,
                          visible: visible, keys: &keys)
-                if let markIn = timeline.markIn, let markOut = timeline.markOut {
-                    let lower = max(position.sequenceStart, min(markIn, markOut))
-                    let upper = min(position.sequenceEnd, max(markIn, markOut))
-                    if upper > lower {
-                        fill(NSRect(x: stripX(at: position.keptStart + lower - position.sequenceStart),
-                                    y: 24, width: (upper - lower) * scale, height: laneTop + laneHeight - 22),
-                             .controlAccentColor.withAlphaComponent(0.19))
-                    }
-                }
             }
             thumbnailRequests = keys.filter { thumbnails[$0] == nil && !unavailableThumbnails.contains($0) }
             loadThumbnails()
-
-            if let time = timeline.markIn { drawMark(time, isIn: true) }
-            if let time = timeline.markOut { drawMark(time, isIn: false) }
 
             if let trimPosition, let trimClipIndex {
                 let position = positions[trimClipIndex]
@@ -759,6 +825,13 @@ final class TimelineSurface: NSView {
             }
         }
 
+        if let csvTarget, positions.indices.contains(csvTarget) {
+            let rect = clipRect(positions[csvTarget]).insetBy(dx: 1, dy: 1)
+            NSColor.controlAccentColor.setStroke()
+            let outline = NSBezierPath(rect: rect)
+            outline.lineWidth = 2
+            outline.stroke()
+        }
         if let insertionIndex {
             let time = positions.indices.contains(insertionIndex)
                 ? positions[insertionIndex].stripStart : positions.last?.stripEnd ?? 0
@@ -1020,9 +1093,42 @@ final class TimelineSurface: NSView {
         }
     }
 
-    private func drawMark(_ time: Double, isIn: Bool) {
+    fileprivate func updateRangeOverlay() {
+        let hasMarks = previewRange != nil || timeline?.markIn != nil || timeline?.markOut != nil
+        rangeOverlay.update(viewport: visibleRect.intersection(bounds), showMarks: !positions.isEmpty && hasMarks)
+    }
+
+    private func drawRange(_ visible: NSRect) {
+        let markIn = previewRange?.lowerBound ?? timeline?.markIn
+        let markOut = previewRange?.upperBound ?? timeline?.markOut
+        if let markIn, let markOut {
+            let start = min(markIn, markOut)
+            let end = max(markIn, markOut)
+            let visibleStart = stripTime(at: visible.minX)
+            let visibleEnd = stripTime(at: visible.maxX)
+            let first = keptRuns.lowerBound { $0.stripEnd > visibleStart && $0.sequenceEnd > start }
+            let shade = NSBezierPath()
+            for index in first..<keptRuns.count {
+                let run = keptRuns[index]
+                if run.stripStart >= visibleEnd || run.sequenceStart >= end { break }
+                let lower = max(run.sequenceStart, start)
+                let upper = min(run.sequenceEnd, end)
+                if upper > lower {
+                    let left = stripX(at: run.stripStart + (lower - run.sequenceStart))
+                    let right = stripX(at: run.stripEnd + (upper - run.sequenceEnd))
+                    shade.appendRect(NSRect(x: left, y: 24, width: right - left, height: laneTop + laneHeight - 22)
+                        .intersection(visible))
+                }
+            }
+            NSColor.controlAccentColor.withAlphaComponent(0.19).setFill()
+            shade.fill()
+        }
+        if let markIn { drawMark(markIn, isIn: true, otherMark: markOut) }
+        if let markOut { drawMark(markOut, isIn: false, otherMark: markIn) }
+    }
+
+    private func drawMark(_ time: Double, isIn: Bool, otherMark: Double?) {
         // Put the bracket on its own side of the playhead so it is visible immediately.
-        let otherMark = isIn ? timeline?.markOut : timeline?.markIn
         let edge = x(at: time, preceding: otherMark.map { time > $0 } ?? !isIn)
         for rect in timelineMarkRects(at: edge, isIn: isIn, bottom: laneTop + laneHeight + 2) {
             fill(rect, .controlAccentColor)
@@ -1051,7 +1157,12 @@ final class TimelineSurface: NSView {
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        guard isEditingEnabled, timeline?.allowsClipEdits == true,
+        guard isEditingEnabled else { return }
+        if timeline?.onRangeSelect != nil, !positions.isEmpty {
+            addCursorRect(visibleRect, cursor: .iBeam)
+            return
+        }
+        guard timeline?.allowsClipEdits == true,
               let selected = positions.first(where: { $0.clip.id == timeline?.selection }) else { return }
         let rect = clipRect(selected)
         for edge in [TimelineEdge.start, .end] {
@@ -1063,9 +1174,13 @@ final class TimelineSurface: NSView {
 
     override func mouseDown(with event: NSEvent) {
         guard isEditingEnabled, let timeline, !positions.isEmpty else { return }
-        clearInteraction()
+        if interaction != nil || isExternalDrag { clearInteraction() }
         window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
+        if timeline.onRangeSelect != nil {
+            interaction = .range(anchor: rangeTime(at: point.x), downX: point.x)
+            return
+        }
         let inWaveform = waveformHeight > 0 && (waveformTop..<(waveformTop + waveformHeight)).contains(point.y)
         let onPlayhead = abs(point.x - x(at: timeline.playhead)) <= 10 && (14...36).contains(point.y)
         if onPlayhead {
@@ -1139,6 +1254,14 @@ final class TimelineSurface: NSView {
         guard let timeline, let interaction else { return }
         let point = convert(location, from: nil)
         switch interaction {
+        case let .range(anchor, downX):
+            guard previewRange != nil || abs(point.x - downX) > 3 else { return }
+            let endpoint = rangeTime(at: point.x)
+            let range = min(anchor, endpoint)...max(anchor, endpoint)
+            guard range != previewRange else { return }
+            previewRange = range
+            updateRangeOverlay()
+            return
         case let .seek(grabOffset):
             seek(to: point.x - grabOffset, scrubbing: true)
             if enclosingScrollView is TimelineScrollView { return }
@@ -1153,14 +1276,25 @@ final class TimelineSurface: NSView {
             let sourceTime = min(clip.sourceDuration, max(0, initialTime + Double((point.x - downX) / initialScale)))
             guard sourceTime != lastTrimTarget else { return }
             lastTrimTarget = sourceTime
-            let effective = timeline.onTrim(id, edge, sourceTime, false)
-            if effective != trimPosition?.time {
-                trimPosition = effective.map { TrimPosition(id: id, edge: edge, time: $0) }
-                if effective == nil { timeline.onCancelTrim() }
-                rebuildPositions()
-                (enclosingScrollView as? TimelineScrollView)?.resizeDocument()
+            if let validate = timeline.validateHandle {
+                validate(id, edge, sourceTime, false) { [weak self] effective in
+                    guard let self, case .trim(id, edge, _, _, _) = self.interaction,
+                          self.lastTrimTarget == sourceTime else { return }
+                    self.showHandle(id, edge: edge, at: effective)
+                }
+            } else {
+                showHandle(id, edge: edge, at: timeline.onTrim(id, edge, sourceTime, false))
             }
         }
+        needsDisplay = true
+    }
+
+    private func showHandle(_ id: UUID, edge: TimelineEdge, at time: Double?) {
+        guard time != trimPosition?.time else { return }
+        trimPosition = time.map { TrimPosition(id: id, edge: edge, time: $0) }
+        if time == nil { timeline?.onCancelTrim() }
+        rebuildPositions()
+        (enclosingScrollView as? TimelineScrollView)?.resizeDocument()
         needsDisplay = true
     }
 
@@ -1169,13 +1303,14 @@ final class TimelineSurface: NSView {
         let point = convert(event.locationInWindow, from: nil)
         if isEditingEnabled, dragLocation != nil {
             switch interaction {
-            case .seek, .reorder, .trim:
+            case .range, .seek, .reorder, .trim:
                 updateInternalDrag(at: event.locationInWindow)
             case .clip:
                 break
             }
         }
         let wasTrimming = trimPosition != nil
+        let selectedRange = previewRange
         let trimTarget = lastTrimTarget
         clearInteraction()
         guard isEditingEnabled else {
@@ -1183,6 +1318,13 @@ final class TimelineSurface: NSView {
             return
         }
         switch interaction {
+        case let .range(anchor, _):
+            if let selectedRange, selectedRange.lowerBound < selectedRange.upperBound {
+                timeline.onRangeSelect?(selectedRange.lowerBound, selectedRange.upperBound)
+            } else {
+                timeline.onRangeSelect?(anchor, anchor)
+                (timeline.onPointerSeek ?? timeline.onSeek)(anchor)
+            }
         case .seek:
             break
         case .clip:
@@ -1191,7 +1333,11 @@ final class TimelineSurface: NSView {
             timeline.onMove(id, insertionSlot(at: point.x))
         case let .trim(id, edge, _, _, _):
             if let trimTarget {
-                if timeline.onTrim(id, edge, trimTarget, true) == nil { timeline.onCancelTrim() }
+                if let validate = timeline.validateHandle {
+                    validate(id, edge, trimTarget, true) { if $0 == nil { timeline.onCancelTrim() } }
+                } else if timeline.onTrim(id, edge, trimTarget, true) == nil {
+                    timeline.onCancelTrim()
+                }
             } else {
                 seek(to: point.x)
             }
@@ -1212,25 +1358,40 @@ final class TimelineSurface: NSView {
     }
 
     private func clearInteraction() {
+        let wasSelectingRange: Bool
+        if case .range = interaction { wasSelectingRange = true }
+        else { wasSelectingRange = false }
         if case .seek = interaction { timeline?.onEndScrub() }
         interaction = nil
+        previewRange = nil
         lastTrimTarget = nil
         lastSeekTarget = nil
         let wasTrimming = trimPosition != nil
         trimPosition = nil
+        csvTarget = nil
+        csvDrag = false
         insertionIndex = nil
         endEdgeScroll()
         if wasTrimming {
             rebuildPositions()
             (enclosingScrollView as? TimelineScrollView)?.resizeDocument()
         }
-        needsDisplay = true
+        if wasSelectingRange { updateRangeOverlay() }
+        else { needsDisplay = true }
+    }
+
+    private func pointerTime(at x: CGFloat) -> Double {
+        let raw = sequenceTime(at: x)
+        return timeline?.pointerTarget?(raw, 8 / scale) ?? raw
+    }
+
+    private func rangeTime(at x: CGFloat) -> Double {
+        min(sequenceDuration, max(0, pointerTime(at: x)))
     }
 
     private func seek(to x: CGFloat, scrubbing: Bool = false) {
         guard let timeline else { return }
-        let raw = sequenceTime(at: x)
-        let target = timeline.pointerTarget?(raw, 8 / scale) ?? raw
+        let target = pointerTime(at: x)
         guard target != lastSeekTarget else { return }
         lastSeekTarget = target
         if scrubbing, let onScrub = timeline.onScrub { onScrub(target) }
@@ -1263,6 +1424,24 @@ final class TimelineSurface: NSView {
         endExternalDrop()
     }
 
+    private func droppedFiles(_ sender: NSDraggingInfo) -> [URL] {
+        sender.draggingPasteboard.pasteboardItems?.compactMap { item in
+            item.string(forType: .fileURL).flatMap(URL.init(string:)).flatMap { $0.isFileURL ? $0 : nil }
+        } ?? []
+    }
+
+    private func csvClip(at point: NSPoint) -> Int? {
+        let index = firstClipIndex { stripX(at: $0.stripEnd) > point.x }
+        guard positions.indices.contains(index), clipRect(positions[index]).contains(point) else { return nil }
+        return index
+    }
+
+    private func updateDropMarker(at point: NSPoint) {
+        csvTarget = csvDrag ? csvClip(at: point) : nil
+        insertionIndex = csvDrag ? nil : insertionSlot(at: point.x)
+        needsDisplay = true
+    }
+
     private func updateDrop(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard isEditingEnabled, timeline?.allowsClipEdits == true, timeline?.allowsFileDrops == true,
               interaction == nil, sender.draggingSourceOperationMask.contains(.copy),
@@ -1272,28 +1451,44 @@ final class TimelineSurface: NSView {
             return []
         }
         let point = convert(sender.draggingLocation, from: nil)
+        let urls = droppedFiles(sender)
+        let containsCSV = urls.contains { $0.pathExtension.lowercased() == "csv" }
+        guard !urls.isEmpty, !containsCSV || (urls.count == 1 && timeline?.onClipCSV != nil) else {
+            endExternalDrop()
+            return []
+        }
         startEdgeScroll(at: sender.draggingLocation, external: true)
-        insertionIndex = insertionSlot(at: point.x)
-        needsDisplay = true
-        return .copy
+        csvDrag = containsCSV
+        updateDropMarker(at: point)
+        return csvDrag && csvTarget == nil ? [] : .copy
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let urls = sender.draggingPasteboard.pasteboardItems?.compactMap { item in
-            item.string(forType: .fileURL).flatMap(URL.init(string:)).flatMap { $0.isFileURL ? $0 : nil }
-        } ?? []
-        let index = insertionSlot(at: convert(sender.draggingLocation, from: nil).x)
+        let urls = droppedFiles(sender)
+        let point = convert(sender.draggingLocation, from: nil)
         let isCopy = sender.draggingSourceOperationMask.contains(.copy)
         endExternalDrop()
-        guard isEditingEnabled, interaction == nil, isCopy, !urls.isEmpty,
+        guard isCopy else { return false }
+        return dropFiles(urls, at: point)
+    }
+
+    func dropFiles(_ urls: [URL], at point: NSPoint) -> Bool {
+        guard isEditingEnabled, interaction == nil, !urls.isEmpty,
               let timeline, timeline.allowsClipEdits, timeline.allowsFileDrops else { return false }
-        timeline.onDrop(urls, index)
+        if let csv = urls.first(where: { $0.pathExtension.lowercased() == "csv" }) {
+            guard urls.count == 1, let onClipCSV = timeline.onClipCSV, let index = csvClip(at: point) else { return false }
+            onClipCSV(csv, positions[index].clip.id)
+            return true
+        }
+        timeline.onDrop(urls, insertionSlot(at: point.x))
         return true
     }
 
     private func endExternalDrop() {
         guard isExternalDrag else { return }
         endEdgeScroll()
+        csvTarget = nil
+        csvDrag = false
         insertionIndex = nil
         needsDisplay = true
     }
@@ -1331,8 +1526,7 @@ final class TimelineSurface: NSView {
         scrollView.scrollHorizontally(to: visible.minX + delta)
         guard visible.minX != scrollView.contentView.bounds.minX else { return }
         if isExternalDrag {
-            insertionIndex = insertionSlot(at: convert(dragLocation, from: nil).x)
-            needsDisplay = true
+            updateDropMarker(at: convert(dragLocation, from: nil))
         } else {
             updateInternalDrag(at: dragLocation)
         }

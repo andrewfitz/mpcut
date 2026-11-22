@@ -232,15 +232,22 @@ public enum JPEGExport {
             _ = try MulticamProject.load(from: projectURL)
             throw error
         }
-        let project = try MulticamProject.load(from: projectURL)
-        return try writeMulticam(project, document: projectURL, at: times, to: directory, preset: preset,
-                                 useSidecar: useSidecar, documentIdentity: identity, cancelled: cancelled)
+        let media = try CutProjectMedia.load(from: projectURL, multicam: true)
+        guard case .multicam(let project) = media.project else {
+            throw CutError(code: "invalid_multicam_project", message: "Expected a multicam project")
+        }
+        let exclusions = AnalysisSidecar.excludedSources.union(media.sidecarExclusions(relativeTo: projectURL))
+        return try AnalysisSidecar.$excludedSources.withValue(exclusions) {
+            try writeMulticam(project, document: projectURL, at: times, to: directory, preset: preset,
+                              useSidecar: useSidecar, documentIdentity: identity, projectMedia: media, cancelled: cancelled)
+        }
     }
 
     /// The editor renders its current decisions, including changes that have not been saved yet.
     package static func writeMulticam(_ project: MulticamProject, document: URL?, at times: [RationalTime],
                                       to directory: URL, preset: JPEGPreset, useSidecar: Bool,
                                       indexedSources: [String: MediaInfo] = [:], documentIdentity: SourceIdentity? = nil,
+                                      projectMedia: CutProjectMedia? = nil,
                                       cancelled: @escaping @Sendable () -> Bool) throws -> MulticamJPEGManifest {
         let control = JPEGControl(cancelled)
         try control.check()
@@ -249,6 +256,8 @@ public enum JPEGExport {
             throw CutError(code: "invalid_range", message: "Frame time \(time) is outside the group range.")
         }
         let engine = CutEngine(cancelled: cancelled, useSidecar: useSidecar)
+        let sourceDirectory = document.map(ProjectFile.directory(of:)) ??
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         var identities: [URL: SourceIdentity] = [:]
         if let document, let documentIdentity { identities[document] = documentIdentity }
         return try writeDirectory(to: directory, control: control, validate: {
@@ -257,11 +266,16 @@ public enum JPEGExport {
                 try engine.verifyIdentity(url, identity: identity)
             }
         }) { staging, destination in
+            if let projectMedia {
+                try projectMedia.validateDestination(destination, sourceDirectory: sourceDirectory, includesContents: true)
+            } else {
+                try CutProject.multicam(project).validateDestination(destination, sourceDirectory: sourceDirectory, includesContents: true)
+            }
             var angles: [MulticamJPEGAngle] = []
             var byAngle: [[MulticamJPEGFrame]] = []
             for (angleIndex, angle) in project.angles.enumerated() {
                 try control.check()
-                let url = document.map { project.sourceURL(for: angle, relativeTo: $0) } ?? URL(fileURLWithPath: angle.file)
+                let url = project.sourceURL(for: angle, in: sourceDirectory)
                 let sourceTimes = try times.map { time in
                     try control.check()
                     return try time.subtracting(angle.offset)
@@ -644,5 +658,29 @@ private final class JPEGRenderer {
         guard let data = context.jpegRepresentation(of: image, colorSpace: colorSpace,
                                                    options: [quality: preset == .review ? 0.62 : 0.95]) else { throw Self.failure }
         return data
+    }
+}
+
+extension JPEGExport {
+    /// Renders one bounded review image using the same decoder, transforms and frame rules as JPEG export.
+    package static func reviewFrame(_ media: MediaInfo, at time: RationalTime, exclusiveEnd: Bool,
+                                    cancelled: @escaping @Sendable () -> Bool) throws -> (Data, JPEGFrame) {
+        let control = JPEGControl(cancelled)
+        try control.check()
+        try checkSource(media)
+        let target = try stillFrameTime(in: media, at: time, exclusiveEnd: exclusiveEnd)
+        let selected = try plan(media, .times([target]), useSidecar: false, cancelled: cancelled)
+        var bytes: Data?
+        let frames = try render(media, ranges: selected.ranges, sample: .first, preset: .review, control: control,
+                                fileName: { _ in "review.jpg" }, progress: { _, _ in }) { data, _ in
+            guard data.count <= 1_048_576 else {
+                throw CutError(code: "image_too_large", message: "The review JPEG exceeds 1 MiB.")
+            }
+            bytes = data
+        }
+        try control.check()
+        try checkSource(media)
+        guard let bytes, let frame = frames.first else { throw CutError(code: "no_frame", message: "No review frame was available.") }
+        return (bytes, frame)
     }
 }

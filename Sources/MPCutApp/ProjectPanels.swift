@@ -1,7 +1,20 @@
 import AppKit
+import UniformTypeIdentifiers
+
+extension UTType {
+    static let mpcutProject = UTType(exportedAs: "com.mpcut.project", conformingTo: .json)
+}
 
 @MainActor
 enum ProjectPanels {
+    static func cutSavePanel(name: String) -> NSSavePanel {
+        let panel = NSSavePanel()
+        panel.title = "Save MPCut Project"
+        panel.allowedContentTypes = [.mpcutProject]
+        panel.nameFieldStringValue = name
+        return panel
+    }
+
     static func present(_ panel: NSSavePanel, in window: NSWindow?, fromSheet: Bool = false,
                         completion: @escaping (Bool) -> Void) {
         guard let window else {

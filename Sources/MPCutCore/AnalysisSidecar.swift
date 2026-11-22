@@ -7,12 +7,29 @@ import SQLite3
 /// assigns a version to its section keys so unrelated analyses can evolve independently.
 public struct AnalysisSidecar: Sendable {
     @TaskLocal public static var readsEnabled = true
+    @TaskLocal public static var excludedSources: Set<URL> = []
+
+    /// The same recording can reach a worker through a symlink or a differently cased path.
+    static func canonicalSource(_ source: URL) -> URL {
+        let physical = source.standardizedFileURL.resolvingSymlinksInPath()
+        if let name = try? physical.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath {
+            return URL(fileURLWithPath: name)
+        }
+        return physical
+    }
+
+    public static func isExcluded(_ source: URL, in exclusions: Set<URL>) -> Bool {
+        !exclusions.isEmpty && (exclusions.contains(source.standardizedFileURL) || exclusions.contains(canonicalSource(source)))
+    }
+
+    var isExcluded: Bool { Self.isExcluded(source, in: Self.excludedSources) }
+
 
     @TaskLocal public static var automaticWritesEnabled = true
 
     public func saveAutomatically(_ sections: @autoclosure () throws -> [String: Data],
                                   retainingLatest: [String: Int] = [:], cancelled: () -> Bool = { false }) {
-        guard Self.readsEnabled, Self.automaticWritesEnabled, !cancelled() else { return }
+        guard Self.readsEnabled, Self.automaticWritesEnabled, !isExcluded, !cancelled() else { return }
         // Analysis remains usable when the source folder is read-only.
         try? save(sections(), retainingLatest: retainingLatest, cancelled: cancelled)
     }
@@ -21,7 +38,7 @@ public struct AnalysisSidecar: Sendable {
     let identity: SourceIdentity
     public var url: URL { Self.url(for: source) }
 
-    public static func url(for source: URL) -> URL { source.appendingPathExtension("mpcut") }
+    public static func url(for source: URL) -> URL { source.appendingPathExtension("cutdb") }
 
     public init(source: URL) throws {
         guard source.isFileURL else { throw CutError(code: "invalid_input", message: "Choose a local media file.") }
@@ -61,11 +78,16 @@ public struct AnalysisSidecar: Sendable {
     }
 
     private func validate(_ db: SidecarDatabase) throws {
-        // MPCut never uses a write-ahead log. Reject one before the first query,
-        // which would create log files beside someone else's database.
-        guard !db.usesWriteAheadLog else {
-            throw CutError(code: "unsupported_sidecar", message: "This file is not a supported MPCut analysis sidecar.")
+        // The first SQLite query can replay a journal or open a write-ahead log.
+        // Check the database header on SQLite's own descriptor first.
+        let unsupported = CutError(code: "unsupported_sidecar", message: "This file is not a supported MPCut analysis sidecar.")
+        guard let header = db.headerVersions() else {
+            var info = stat()
+            if lstat(url.path, &info) == 0 && info.st_size == 0 { throw unsupported }
+            throw sidecarError("The sidecar has no readable SQLite header.")
         }
+        guard !header.usesWriteAheadLog, header.applicationID == Self.applicationID,
+              header.userVersion == Self.version else { throw unsupported }
         let kind = try db.integer("PRAGMA application_id")
         guard kind == Self.applicationID, try db.integer("PRAGMA user_version") == Self.version else {
             throw CutError(code: "unsupported_sidecar", message: "This file is not a supported MPCut analysis sidecar.")
@@ -79,6 +101,16 @@ public struct AnalysisSidecar: Sendable {
             }
             return String(cString: value)
         }
+    }
+
+    /// SQLite may roll back or remove a neighboring journal on its first query.
+    /// A new or replacement database must never inherit a previous journal.
+    private func requireClearJournalPath() throws {
+        var info = stat()
+        if lstat(url.path + "-journal", &info) == 0 {
+            throw sidecarError("The sidecar journal path is occupied. The existing files were preserved.")
+        }
+        guard errno == ENOENT else { throw sidecarError(String(cString: strerror(errno))) }
     }
 
     /// The saved stamp when it describes this source. A volume's device number
@@ -110,6 +142,7 @@ public struct AnalysisSidecar: Sendable {
 
     /// Inspects the container and media identity without loading any analysis payload.
     public func status() -> String {
+        guard !isExcluded else { return "excluded" }
         do {
             guard try exists() else { return "missing" }
             let db = try SidecarDatabase(url, writing: false)
@@ -168,7 +201,7 @@ public struct AnalysisSidecar: Sendable {
     }
 
     private func openReadSnapshot() throws -> SidecarDatabase? {
-        guard try exists() else { return nil }
+        guard !isExcluded, try exists() else { return nil }
         try checkSource()
         let db = try SidecarDatabase(url, writing: false)
         try db.execute("BEGIN")
@@ -224,6 +257,9 @@ public struct AnalysisSidecar: Sendable {
     public func save(_ sections: [String: Data], updating: [String: (Data?) throws -> Data] = [:],
                      retainingLatest: [String: Int] = [:],
                      cancelled: () -> Bool = { false }) throws {
+        guard !isExcluded else {
+            throw sidecarError("A recording in this project uses the cache path for \(source.lastPathComponent).")
+        }
         try checkSource()
         try checkSidecarCancellation(cancelled)
         guard !sections.isEmpty || !updating.isEmpty else { return }
@@ -260,6 +296,7 @@ public struct AnalysisSidecar: Sendable {
     /// creating another file beside the recording. Healthy writers use SQLite.
     private func publish(_ staging: URL, cancelled: () -> Bool) throws -> Bool {
         if try !exists() {
+            try requireClearJournalPath()
             if renamex_np(staging.path, url.path, UInt32(RENAME_EXCL)) == 0 { return true }
             let failure = errno
             guard failure == EEXIST || failure == ENOTSUP || failure == EINVAL else {
@@ -281,11 +318,11 @@ public struct AnalysisSidecar: Sendable {
         if try exists() {
             guard damaged(cancelled: cancelled) else { return false }
             try checkSidecarCancellation(cancelled)
-            // The old journal must never be replayed into the replacement.
-            unlink(url.path + "-journal")
+            try requireClearJournalPath()
             guard rename(staging.path, url.path) == 0 else { throw sidecarError(String(cString: strerror(errno))) }
             return true
         }
+        try requireClearJournalPath()
         let failure = publishExclusively(from: staging, to: url)
         if failure == 0 { return true }
         guard failure == EEXIST else { throw sidecarError(String(cString: strerror(failure))) }
@@ -383,6 +420,7 @@ private final class SidecarDatabase {
         }
         defer { free(parent) }
         let path = String(cString: parent) + "/" + url.lastPathComponent
+        try Self.checkJournal(at: path + "-journal", writing: writing)
         let status = sqlite3_open_v2(path, &connection, flags, nil)
         guard status == SQLITE_OK, let connection else {
             let message = connection.map { String(cString: sqlite3_errmsg($0)) } ?? "Cannot open file."
@@ -392,6 +430,42 @@ private final class SidecarDatabase {
         handle = connection
         sqlite3_busy_timeout(handle, writing ? 5_000 : 100)
         try execute("PRAGMA trusted_schema = OFF")
+    }
+
+    /// DELETE-mode writers initially leave the magic and record count zeroed
+    /// until the journal has been synced. Other header fields are already valid.
+    private static func checkJournal(at path: String, writing: Bool) throws {
+        var info = stat()
+        if lstat(path, &info) != 0 {
+            guard errno == ENOENT else { throw sidecarError(String(cString: strerror(errno))) }
+            return
+        }
+        let occupied = sidecarError("The sidecar journal path is occupied by an unrecognized file.")
+        guard info.st_mode & S_IFMT == S_IFREG, info.st_nlink == 1 else { throw occupied }
+        let fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW)
+        if fd < 0 {
+            if errno == ENOENT { return }
+            throw sidecarError(String(cString: strerror(errno)))
+        }
+        defer { close(fd) }
+        var header = [UInt8](repeating: 0, count: 28)
+        // A concurrent writer can be between creating and populating the journal.
+        let deadline = ContinuousClock.now + .milliseconds(writing ? 100 : 25)
+        while true {
+            let count = pread(fd, &header, header.count, 0)
+            if count == header.count {
+                let magic: [UInt8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]
+                let sector = header[20..<24].reduce(0) { $0 << 8 | Int($1) }
+                let page = header[24..<28].reduce(0) { $0 << 8 | Int($1) }
+                guard header.starts(with: magic) || header.prefix(12).allSatisfy({ $0 == 0 }),
+                      (32...65536).contains(sector), sector.nonzeroBitCount == 1,
+                      (512...65536).contains(page), page.nonzeroBitCount == 1 else { throw occupied }
+                return
+            }
+            if fstat(fd, &info) == 0 && info.st_nlink == 0 { return }
+            guard count == 0, .now < deadline else { throw occupied }
+            usleep(1_000)
+        }
     }
 
     // Closing the connection rolls back a transaction interrupted before COMMIT.
@@ -413,15 +487,12 @@ private final class SidecarDatabase {
         return header
     }
 
-    /// The header's write and read format versions are 2 for a write-ahead log.
-    var usesWriteAheadLog: Bool { header().map { $0[18] == 2 || $0[19] == 2 } ?? false }
-
-    func headerVersions() -> (applicationID: Int32, userVersion: Int32)? {
+    func headerVersions() -> (applicationID: Int32, userVersion: Int32, usesWriteAheadLog: Bool)? {
         guard let header = header() else { return nil }
         func field(at offset: Int) -> Int32 {
             header[offset..<(offset + 4)].reduce(Int32(0)) { $0 << 8 | Int32($1) }
         }
-        return (field(at: 68), field(at: 60))
+        return (field(at: 68), field(at: 60), header[18] == 2 || header[19] == 2)
     }
 
     func execute(_ sql: String) throws {

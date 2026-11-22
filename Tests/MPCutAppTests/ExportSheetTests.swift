@@ -210,10 +210,11 @@ final class ExportSheetTests: XCTestCase {
         let atStart = try XCTUnwrap(model.jpegSourceAtPlayhead)
         XCTAssertEqual(atStart.media.url.standardizedFileURL.path, output.standardizedFileURL.path)
         let frame = directory.appendingPathComponent("still.jpg")
-        try JPEGExport.writeStill(atStart.media, at: atStart.frame, to: frame)
+        let picture = try XCTUnwrap(atStart.frame)
+        try JPEGExport.writeStill(atStart.media, at: picture, to: frame)
         XCTAssertNotNil(NSImage(contentsOf: frame))
         let reference = directory.appendingPathComponent("reference")
-        let expected = try JPEGExport.write(atStart.media, to: reference, selection: .times([atStart.frame]), preset: .full)
+        let expected = try JPEGExport.write(atStart.media, to: reference, selection: .times([picture]), preset: .full)
         let named = try XCTUnwrap(expected.frames.first?.file)
         XCTAssertEqual(try Data(contentsOf: frame), try Data(contentsOf: reference.appendingPathComponent(named)))
         model.undo()
@@ -285,6 +286,34 @@ final class ExportSheetTests: XCTestCase {
         guard case .ready(.packets(_, .smart, .all)) = ExportAvailability.check(.init(), clips: clips, media: [:], useSidecar: false) else {
             return XCTFail("The export check did not bypass the saved index.")
         }
+    }
+
+    @MainActor
+    func testSelectionExportReviewCannotApplyPartialCutsToTimeline() async throws {
+        let file = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
+                                                   subdirectory: "Fixtures"))
+        let media = try CutEngine().inspect(file, keyframes: true)
+        let clips = [ClipRequest(file: file, from: RationalTime(numerator: 7, denominator: 25), to: media.duration)]
+        var options = ExportSheetOptions()
+        options.mode = .copy
+        options.copyContainer = "mp4"
+        let panel = NSSavePanel()
+        let choices = ExportContainerChoices(source: media, clips: clips, preferred: "mp4", cancelled: { false })
+        let control = ExportFormatControl(panel: panel, options: options, copyContainers: choices,
+                                         clips: clips, media: [file: media], allowsApplyingReviewToTimeline: false,
+                                         changed: { _, _ in }, directoryChanged: { _ in })
+        defer { control.stopChecking() }
+        func views(_ root: NSView) -> [NSView] { [root] + root.subviews.flatMap(views) }
+        let buttons = views(try XCTUnwrap(panel.accessoryView)).compactMap { $0 as? NSButton }
+        let review = try XCTUnwrap(buttons.first { $0.title == "Review Cuts…" })
+        let apply = try XCTUnwrap(buttons.first { $0.title == "Apply to Timeline" })
+        let deadline = ContinuousClock.now + .seconds(5)
+        while review.isHidden, .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(review.isHidden)
+        review.performClick(nil)
+        XCTAssertTrue(apply.isHidden)
+        apply.performClick(nil)
+        XCTAssertNil(control.appliedReview)
     }
 
     @MainActor

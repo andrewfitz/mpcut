@@ -104,18 +104,23 @@ final class MulticamAnalysisStore: ObservableObject {
     private var groupPauses: [AudioSpan] = []
     private var angleOffsets: [String: RationalTime] = [:]
     private var jobs: [Job: EditCancellation] = [:]
+    private var sceneFractions: [Job: Double] = [:]
+    var mcpReceipts: [TimelineSnapTarget: MCPAnalysisReceipt] = [:]
     private var issues: [Job: String] = [:]
     private var waves: [MulticamAudioSelection: AudioWaveform] = [:]
     private var finishedWaves = Set<MulticamAudioSelection>()
     private var silences: [MulticamAudioSelection: SilenceAnalysisResult] = [:]
     private var pendingSilenceRescans = Set<MulticamAudioSelection>()
     private var roomThresholds: [SourceTrack: Double] = [:]
-    private var sceneReports: [String: SceneReport] = [:]
+    private(set) var sceneReports: [String: SceneReport] = [:]
     private var checkedSavedScenes = Set<String>()
     private var metadata: [String: EditorMetadataEdits] = [:]
-    private var metadataWrite: Task<Void, Never>?
+    private(set) var metadataWrite: Task<Void, Never>?
+    private var metadataWriteID: UUID?
     private var scenes: [String: [RationalTime]] = [:]
     private var useSidecars = true
+    private var excludedSources = Set<URL>()
+    private let sidecarPreference = SidecarPreference()
     private var requested = Set<TimelineSnapTarget>()
     var changed: (() -> Void)?
     private(set) var snapTarget: TimelineSnapTarget = .off
@@ -146,18 +151,19 @@ final class MulticamAnalysisStore: ObservableObject {
         return nil
     }
 
-    func programMicrophone(at time: RationalTime, project: MulticamProject) -> String {
+    func programMicrophone(at time: RationalTime, project: MulticamProject, exclusiveEnd: Bool = false) -> String {
         guard let groupPlan else { return "Unavailable" }
         guard let interval = groupPlan.intervals.last else { return "Unavailable" }
-        let index = groupPlan.intervals.lowerBound { $0.group.to > time }
+        let atEnd = exclusiveEnd || time == interval.group.to
+        let index = groupPlan.intervals.lowerBound { atEnd ? $0.group.to >= time : $0.group.to > time }
         let onAir = groupPlan.intervals.indices.contains(index) ? groupPlan.intervals[index] : interval
         guard let selection = onAir.audio else { return "None routed here" }
         let name = project.sources.first { $0.id == selection.source }?.displayName ?? selection.source
         let track = "\(name) · stream \(selection.stream)"
-        let atEnd = time == interval.group.to
         let coverage = activeRoutes.lowerBound { atEnd ? $0.group.to >= time : $0.group.to > time }
         guard activeRoutes.indices.contains(coverage),
-              activeRoutes[coverage].selection == selection, activeRoutes[coverage].group.from <= time else {
+              activeRoutes[coverage].selection == selection,
+              atEnd ? activeRoutes[coverage].group.from < time : activeRoutes[coverage].group.from <= time else {
             return "\(track) · no audio here"
         }
         if let result = silences[selection] {
@@ -183,6 +189,14 @@ final class MulticamAnalysisStore: ObservableObject {
         return completed / Double(routes.count)
     }
 
+    var sceneProgress: Double? {
+        guard isScanning(.scenes) else { return nil }
+        let candidates = candidates(for: .scenes)
+        guard !candidates.isEmpty else { return nil }
+        let progress = candidates.reduce(0.0) { $0 + (complete($1) ? 1 : sceneFractions[$1] ?? 0) }
+        return progress / Double(candidates.count)
+    }
+
     var status: String? {
         if jobs.keys.contains(where: { $0.target == .scenes }) { return "Scanning multicam scenes…" }
         if silenceProgress != nil { return "Scanning multicam audio for silence…" }
@@ -198,13 +212,38 @@ final class MulticamAnalysisStore: ObservableObject {
     }
 
     private func publish() {
+        for (target, receipt) in mcpReceipts where !isScanning(target) {
+            let error = target == .silence ? silenceIssue ?? waveformIssue : issues.first { $0.key.target == target }?.value
+            let candidates = candidates(for: target)
+            let completed = candidates.filter(complete)
+            let sources = Set(completed.map(\.source)).sorted()
+            if let error {
+                receipt.finish("failed", detail: ["error": error, "sources": sources])
+                mcpReceipts[target] = nil
+            } else if !completed.isEmpty, completed.count == candidates.count {
+                var detail: [String: Any] = ["sources": sources]
+                if target == .silence {
+                    let unindexed = unindexedSilenceSources.sorted()
+                    if !unindexed.isEmpty { detail["unindexedSources"] = unindexed }
+                    if hasMissingSilenceTrack { detail["missingSelectedTrack"] = true }
+                }
+                receipt.finish("succeeded", detail: detail)
+                mcpReceipts[target] = nil
+            } else {
+                receipt.finish("failed", detail: ["error": "No current analysis report was produced."])
+                mcpReceipts[target] = nil
+            }
+        }
         objectWillChange.send()
         changed?()
     }
 
     func reset() {
+        for receipt in mcpReceipts.values { receipt.finish("cancelled") }
+        mcpReceipts.removeAll()
         for work in jobs.values { work.cancel() }
         jobs = [:]
+        sceneFractions = [:]
         issues = [:]
         sources = [:]
         sourceVersions = [:]
@@ -232,16 +271,23 @@ final class MulticamAnalysisStore: ObservableObject {
         pauseThreshold = nil
     }
 
-    func update(project: MulticamProject, media: [String: MediaInfo], ordinary: [String: MediaInfo], useSidecars: Bool) {
+    func update(project: MulticamProject, media: [String: MediaInfo], ordinary: [String: MediaInfo], useSidecars: Bool,
+                excludedSources: Set<URL> = []) {
         let next = ordinary.mapValues(SourceVersion.init)
         let offsets = media.mapValues(\.multicamClockOffset)
         let changedSources = next != sourceVersions || offsets != presentationOffsets
-        if self.useSidecars != useSidecars {
+        let nextPlan = try? project.plan(ranges: [project.range])
+        if changedSources, mcpReceipts[.scenes] != nil { cancel(.scenes) }
+        if (changedSources || groupPlan != nextPlan), mcpReceipts[.silence] != nil { cancel(.silence) }
+        if self.useSidecars != useSidecars || self.excludedSources != excludedSources {
             for id in Array(jobs.keys) { cancelJob(id) }
             issues = [:]
             checkedSavedScenes = []
         }
         self.useSidecars = useSidecars
+        self.excludedSources = excludedSources
+        sidecarPreference.enabled = useSidecars
+        sidecarPreference.setExclusions(excludedSources)
         for id in Set(sourceVersions.keys).union(next.keys)
             where sourceVersions[id] != next[id] || presentationOffsets[id] != offsets[id] {
             for task in Array(jobs.keys) where task.source == id { cancelJob(task) }
@@ -260,7 +306,6 @@ final class MulticamAnalysisStore: ObservableObject {
         sourceVersions = next
         sources = ordinary
         presentationOffsets = offsets
-        let nextPlan = try? project.plan(ranges: [project.range])
         let nextAngles = Dictionary(uniqueKeysWithValues: project.angles.map { ($0.id, $0.offset) })
         if groupPlan != nextPlan || changedSources || angleOffsets != nextAngles {
             let oldMinimum = inputPauseMinimum
@@ -304,6 +349,11 @@ final class MulticamAnalysisStore: ObservableObject {
         waves[MulticamAudioSelection(source: sourceID, stream: stream)]
     }
 
+    func completedWaveform(sourceID: String, stream: Int) -> AudioWaveform? {
+        let route = MulticamAudioSelection(source: sourceID, stream: stream)
+        return finishedWaves.contains(route) ? waves[route] : nil
+    }
+
     func sourceScenes(_ id: String) -> [RationalTime] { scenes[id] ?? [] }
 
     struct ScenePosition {
@@ -317,14 +367,19 @@ final class MulticamAnalysisStore: ObservableObject {
     }
 
     func currentScene(at groupTime: RationalTime, project: MulticamProject) -> ScenePosition? {
-        guard let selection = project.selection(at: groupTime), let offset = angleOffsets[selection.angle],
-              let report = sceneReports[selection.angle], let markers = scenes[selection.angle],
+        guard let angle = project.selection(at: groupTime)?.angle else { return nil }
+        return currentScene(at: groupTime, angle: angle, exclusiveEnd: false)
+    }
+
+    func currentScene(at groupTime: RationalTime, angle: String, exclusiveEnd: Bool) -> ScenePosition? {
+        guard let offset = angleOffsets[angle],
+              let report = sceneReports[angle], let markers = scenes[angle],
               let local = try? groupTime.subtracting(offset) else { return nil }
-        let index = markers.lowerBound { $0 > local } - 1
+        let index = markers.lowerBound { exclusiveEnd ? $0 >= local : $0 > local } - 1
         guard report.scenes.indices.contains(index), index < markers.count,
-              let end = try? report.scenes[index].end.adding(presentationOffsets[selection.angle] ?? .zero),
-              local < end else { return nil }
-        return ScenePosition(source: selection.angle, report: report, index: index)
+              let end = try? report.scenes[index].end.adding(presentationOffsets[angle] ?? .zero),
+              exclusiveEnd ? local <= end : local < end else { return nil }
+        return ScenePosition(source: angle, report: report, index: index)
     }
 
     func rename(_ scene: ScenePosition, to text: String) {
@@ -338,8 +393,10 @@ final class MulticamAnalysisStore: ObservableObject {
         publish()
     }
 
-    func soundtrack(project: MulticamProject, media: [String: MediaInfo]) -> [MulticamAnalysisAudioSpan] {
-        activeRoutes.compactMap { route in
+    func soundtrack(in visible: MulticamRange) -> [MulticamAnalysisAudioSpan] {
+        let first = activeRoutes.lowerBound { $0.group.to > visible.from }
+        let end = activeRoutes.lowerBound { $0.group.from >= visible.to }
+        return activeRoutes[first..<end].compactMap { route in
             waves[route.selection].map { MulticamAnalysisAudioSpan(group: route.group, input: route.input, waveform: $0) }
         }
     }
@@ -396,6 +453,7 @@ final class MulticamAnalysisStore: ObservableObject {
     }
 
     func cancel(_ target: TimelineSnapTarget) {
+        mcpReceipts.removeValue(forKey: target)?.finish("cancelled")
         requested.remove(target)
         if target == .silence { pendingSilenceRescans.removeAll() }
         for job in Array(jobs.keys) where job.target == target { cancelJob(job) }
@@ -414,6 +472,7 @@ final class MulticamAnalysisStore: ObservableObject {
         let oldMinimum = inputPauseMinimum
         pauseMinimum = minimum
         if oldMinimum != inputPauseMinimum || pauseThreshold != threshold {
+            if mcpReceipts[.silence] != nil { cancel(.silence) }
             if activeSilenceTracks.contains(where: { silences[$0] != nil }) { requested.insert(.silence) }
             invalidateSilenceResults()
         }
@@ -429,27 +488,37 @@ final class MulticamAnalysisStore: ObservableObject {
         silences = [:]
     }
 
-    private func roomToneRoutes(in scope: MulticamRange) -> [MulticamSilenceRoute] {
-        activeRoutes.filter { $0.group.from < scope.to && scope.from < $0.group.to }
+    private func roomTonePeaks(in ranges: [MulticamRange]) -> [SourceTrack: (source: String, peak: Float)]? {
+        var peaks: [SourceTrack: (source: String, peak: Float)] = [:]
+        for range in ranges {
+            guard range.from < range.to else { continue }
+            let firstInterval = groupIntervals.lowerBound { $0.group.to > range.from }
+            let lastInterval = groupIntervals.lowerBound { $0.group.from >= range.to }
+            guard groupIntervals[firstInterval..<lastInterval].compactMap(\.audio).allSatisfy({ route in
+                sources[route.source]?.audio.contains { $0.stream.index == route.stream } == true
+            }) else { return nil }
+            let first = activeRoutes.lowerBound { $0.group.to > range.from }
+            let end = activeRoutes.lowerBound { $0.group.from >= range.to }
+            for route in activeRoutes[first..<end] {
+                guard finishedWaves.contains(route.selection), let track = sourceTrack(for: route.selection),
+                      let from = try? max(range.from, route.group.from).subtracting(route.offset),
+                      let to = try? min(range.to, route.group.to).subtracting(route.offset),
+                      let peak = waves[route.selection]?.peak(from: from.seconds, to: to.seconds) else { return nil }
+                if peak >= (peaks[track]?.peak ?? 0) { peaks[track] = (route.selection.source, peak) }
+            }
+        }
+        return peaks.isEmpty ? nil : peaks
     }
 
-    func canUseRoomTone(in scope: MulticamRange) -> Bool {
-        let routes = roomToneRoutes(in: scope)
-        return !routes.isEmpty && routes.allSatisfy { finishedWaves.contains($0.selection) }
-    }
+    func canUseRoomTone(in ranges: [MulticamRange]) -> Bool { roomTonePeaks(in: ranges) != nil }
 
     @discardableResult
-    func useRoomTone(in scope: MulticamRange) -> Bool {
-        guard canUseRoomTone(in: scope) else { return false }
-        let routes = roomToneRoutes(in: scope)
-        var peaks: [SourceTrack: (source: String, peak: Float)] = [:]
-        for route in routes {
-            guard let track = sourceTrack(for: route.selection),
-                  let from = try? max(scope.from, route.group.from).subtracting(route.offset),
-                  let to = try? min(scope.to, route.group.to).subtracting(route.offset),
-                  let peak = waves[route.selection]?.peak(from: from.seconds, to: to.seconds) else { return false }
-            if peak >= (peaks[track]?.peak ?? 0) { peaks[track] = (route.selection.source, peak) }
-        }
+    func useRoomTone(in scope: MulticamRange) -> Bool { useRoomTone(in: [scope]) }
+
+    @discardableResult
+    func useRoomTone(in ranges: [MulticamRange]) -> Bool {
+        guard let peaks = roomTonePeaks(in: ranges) else { return false }
+        if mcpReceipts[.silence] != nil { cancel(.silence) }
         for (track, measurement) in peaks {
             let threshold = AudioAnalysis.roomToneThresholdDB(forPeak: measurement.peak)
             roomThresholds[track] = threshold
@@ -493,7 +562,7 @@ final class MulticamAnalysisStore: ObservableObject {
             }
         }
         if useSidecars, !requested.contains(.scenes) {
-            for (id, media) in sources where media.hasVideo {
+            for (id, media) in sources where media.hasVideo && sidecarPreference.permits(media.url) {
                 let job = Job.savedScenes(id)
                 if jobs[job] == nil, issues[job] == nil, !complete(job) { start(job, media: media) }
             }
@@ -502,6 +571,7 @@ final class MulticamAnalysisStore: ObservableObject {
 
     private func cancelJob(_ job: Job) {
         jobs.removeValue(forKey: job)?.cancel()
+        sceneFractions[job] = nil
         if case .waveform(let route) = job, !finishedWaves.contains(route) { waves[route] = nil }
     }
 
@@ -511,33 +581,40 @@ final class MulticamAnalysisStore: ObservableObject {
         case scenes(SceneReport?)
     }
 
-    /// Returns once every accepted name and threshold edit has reached its sidecar or failed.
-    func finishMetadataWrites() async { await metadataWrite?.value }
-
     private func persistMetadata(_ id: String, edits: EditorMetadataEdits) {
         metadata[id, default: EditorMetadataEdits()].update(edits, saved: false)
-        guard useSidecars, let media = sources[id], let version = sourceVersions[id] else { return }
+        guard useSidecars, let media = sources[id], sidecarPreference.permits(media.url),
+              let version = sourceVersions[id] else { return }
         let previous = metadataWrite
         let snapshot = MulticamAnalysisSnapshot(scenes: sceneReports[id], edits: edits)
-        let write = Task.detached(priority: .utility) {
+        let write = Task.detached(priority: .utility) { [sidecarPreference] in
             await previous?.value
             do {
-                try AnalysisSidecar(media: media).save([:], updating: snapshot.metadataUpdates)
+                try AnalysisSidecar(media: media).save([:], updating: snapshot.metadataUpdates,
+                                                     cancelled: { !sidecarPreference.permits(media.url) })
                 return true
             } catch {
                 return false
             }
         }
+        let writeID = UUID()
+        metadataWriteID = writeID
         metadataWrite = Task { [weak self] in
-            guard await write.value, let self, self.sourceVersions[id] == version else { return }
-            self.metadata[id]?.discardSaved(edits)
+            let saved = await write.value
+            guard let self else { return }
+            if saved, self.sourceVersions[id] == version { self.metadata[id]?.discardSaved(edits) }
+            if self.metadataWriteID == writeID {
+                self.metadataWrite = nil
+                self.metadataWriteID = nil
+            }
         }
     }
 
     private func start(_ job: Job, media: MediaInfo) {
         let token = EditCancellation()
         jobs[job] = token
-        let useSidecars = useSidecars
+        let endWork = mcpReceipts[job.target]?.cleanup.begin()
+        let useSidecars = useSidecars && sidecarPreference.permits(media.url)
         let minimum = inputPauseMinimum
         let threshold = pauseThreshold
         let cached: AudioWaveform?
@@ -557,6 +634,9 @@ final class MulticamAnalysisStore: ObservableObject {
             rescan = false
         }
         EditorAnalysisQueues.scans.addOperation { [weak self] in
+            defer {
+                if let endWork { DispatchQueue.main.async { endWork() } }
+            }
             guard !token.isCancelled else { return }
             func level(for route: MulticamAudioSelection) -> Double? {
                 if let value = threshold ?? roomThreshold { return value }
@@ -596,7 +676,14 @@ final class MulticamAnalysisStore: ObservableObject {
                     }
                     return .silence(detection)
                 case .scenes:
-                    return .scenes(try SceneAnalysis.scan(media, useSidecar: useSidecars, cancelled: { token.isCancelled }))
+                    return .scenes(try SceneAnalysis.scan(media, useSidecar: useSidecars, cancelled: { token.isCancelled },
+                        progress: { fraction in
+                            guard token.shouldReport(fraction) else { return }
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self, self.jobs[job] === token else { return }
+                                self.sceneFractions[job] = fraction
+                            }
+                        }))
                 case .savedScenes:
                     return .scenes(AnalysisSidecar(media: media).sceneReport(for: media, cancelled: { token.isCancelled }))
                 }
@@ -604,6 +691,7 @@ final class MulticamAnalysisStore: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.jobs[job] === token else { return }
                 self.jobs[job] = nil
+                self.sceneFractions[job] = nil
                 switch (job, result) {
                 case (.waveform(let route), .success(.waveform(let waveform, let savedSilence))):
                     self.waves[route] = waveform

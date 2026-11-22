@@ -1,0 +1,564 @@
+[
+  {
+    "name": "get_preferences",
+    "description": "Read shared MPCut settings and inspect the local-control toggle.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "set_preference",
+    "description": "Change a native preference. Lowering historyLimit immediately trims retained history in open projects. Local MCP access is controlled in Settings.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique operation ID for identical retries."
+        },
+        "key": {
+          "type": "string",
+          "enum": [
+            "historyLimit",
+            "useAnalysisSidecars",
+            "defaultExportMode",
+            "snapTarget",
+            "largeThumbnails",
+            "minimumPause",
+            "leavePause",
+            "volume",
+            "isMuted",
+            "scrubSoundEnabled",
+            "jpegPreset"
+          ]
+        },
+        "value": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "description": "historyLimit 0–500, volume 0–1, pause durations in seconds. Enum values match get_preferences."
+        }
+      },
+      "required": [
+        "operationID",
+        "key",
+        "value"
+      ],
+      "allOf": [
+        {
+          "if": { "properties": { "key": { "const": "historyLimit" } } },
+          "then": { "properties": { "value": { "type": "integer", "minimum": 0, "maximum": 500 } } }
+        },
+        {
+          "if": { "properties": { "key": { "const": "volume" } } },
+          "then": { "properties": { "value": { "type": "number", "minimum": 0, "maximum": 1 } } }
+        },
+        {
+          "if": { "properties": { "key": { "const": "minimumPause" } } },
+          "then": { "properties": { "value": { "type": "number", "minimum": 0.02 } } }
+        },
+        {
+          "if": { "properties": { "key": { "const": "leavePause" } } },
+          "then": { "properties": { "value": { "type": "number", "minimum": 0 } } }
+        },
+        {
+          "if": { "properties": { "key": { "enum": ["useAnalysisSidecars", "largeThumbnails", "isMuted", "scrubSoundEnabled"] } } },
+          "then": { "properties": { "value": { "type": "boolean" } } }
+        },
+        {
+          "if": { "properties": { "key": { "const": "defaultExportMode" } } },
+          "then": { "properties": { "value": { "enum": ["copy", "smart", "encode"] } } }
+        },
+        {
+          "if": { "properties": { "key": { "const": "snapTarget" } } },
+          "then": { "properties": { "value": { "enum": ["off", "keyframes", "scenes", "silence"] } } }
+        },
+        {
+          "if": { "properties": { "key": { "const": "jpegPreset" } } },
+          "then": { "properties": { "value": { "enum": ["review", "full"] } } }
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "list_drafts",
+    "description": "List unlocked untitled project recovery files and last-modified times.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "new_project",
+    "description": "Create a new ordinary sequence or multicam project window. Supply local recording paths for initial import. Multicam requires a camera and opens the setup sheet.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique operation ID for identical retries."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "sequence",
+            "multicam"
+          ]
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^/",
+            "description": "Absolute local filesystem path."
+          },
+          "minItems": 1,
+          "maxItems": 512
+        }
+      },
+      "required": [
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "open_project",
+    "description": "Open a saved MPCut project and wait for native document loading. An already-open document is activated.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique operation ID for identical retries."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/",
+          "description": "Absolute local filesystem path."
+        }
+      },
+      "required": [
+        "operationID",
+        "path"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "recover_project",
+    "description": "Recover an unlocked draft from a path returned by list_drafts.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique operation ID for identical retries."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/",
+          "description": "Absolute local filesystem path."
+        }
+      },
+      "required": [
+        "operationID",
+        "path"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "add_media",
+    "description": "Add local recordings using the native editor. In a sequence, append or insert at index; in a multicam editor this opens source setup. Read editor state after partial import.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live handle returned by list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique operation ID for identical retries."
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^/",
+            "description": "Absolute local filesystem path."
+          },
+          "minItems": 1,
+          "maxItems": 512
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "paths"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "save_project",
+    "description": "Save the live project with native history. Supply a new .cut path for Save As. Writing over another existing destination requires replaceExisting.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live handle returned by list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique operation ID for identical retries."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/",
+          "description": "Absolute local filesystem path."
+        },
+        "replaceExisting": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "close_project",
+    "description": "Close this window. Specify what to do with unsaved edits; save requires a .cut path if the document is untitled.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live handle returned by list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique operation ID for identical retries."
+        },
+        "changes": {
+          "type": "string",
+          "enum": [
+            "save",
+            "discard",
+            "cancel"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/",
+          "description": "Absolute local filesystem path."
+        },
+        "replaceExisting": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "focus_project",
+    "description": "Bring the specified project window to the front.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live handle returned by list_projects."
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "set_video_monitor",
+    "description": "Show or close the target window’s native video monitor.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live handle returned by list_projects."
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project",
+        "visible"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "show_history",
+    "description": "Show the native history sheet for the target project.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live handle returned by list_projects."
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_multicam_setup",
+    "description": "Inspect the pending setup after a multicam import. Returns source IDs, picture/stream availability, and whether the project already exists.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live handle returned by list_projects."
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "multicam_setup",
+    "description": "Confirm or dismiss native multicam source setup. For creation you can choose opening camera and program audio. Options use the source IDs from get_multicam_setup.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live handle returned by list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique operation ID for identical retries."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "confirm",
+            "dismiss"
+          ]
+        },
+        "sourceOrder": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "names": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "audioStreams": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "opening": {
+          "type": "string",
+          "minLength": 1
+        },
+        "audio": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "follow",
+                "none",
+                "fixed"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "minLength": 1
+            },
+            "stream": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "action"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_native_operations",
+    "description": "Inspect current native UI import/export/multicam workers for a specified project, including conversion started in that window. Omit project to inspect app-wide conversion. Scene/silence scans use analysis_state.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Target live window. Omit for app-wide project conversion."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cancel_native_operation",
+    "description": "Cancel the exact native worker returned by get_native_operations. Supply its same project handle for window-owned work. An ended worker cannot cancel its successor.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Target live window. Omit for app-wide project conversion."
+        },
+        "nativeOperation": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "nativeOperation",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "dismiss_notice",
+    "description": "Dismiss a native informational or error notice after inspecting it. Use its exact message so a newer notice remains visible.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "project": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "message",
+        "project"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

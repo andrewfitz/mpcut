@@ -28,13 +28,17 @@
 | Preserve source presentation metadata | Preflight checks stream layout, codec and container compatibility. Supported workflows preserve rotation, pixel aspect ratio, variable frame timing, linked audio timing, alpha, and camera timecode. |
 | Automate a repeatable edit | Discover every command with `help --json`, retrieve a single command’s inputs and outputs, reuse saved scene/silence reports, and dry-run edit JSON before exporting. Existing media destinations are protected. |
 
-Use **File → New Project Window** (⌘N) to work on independent timelines and multicam projects side by side. Ordinary timelines and export queues are session-based. Multicam projects save the edit for reopening in the app or exporting from the CLI. Sidecars store source analysis for each recording. Save a CLI edit request if you need to replay an ordinary ordered assembly. [Multicam editing](docs/USAGE.md#edit-a-multicam-project) · [Usage and workflow examples](docs/USAGE.md)
+Use **File → New Project Window** (⌘N) to work on independent timelines and multicam projects side by side. Save an ordinary timeline or a multicam edit as a `.cut` project. A sequence stores each clip occurrence and its source in/out points in playback order. A multicam project also stores camera alignment, switches, soundtrack choices and the assembly. Each recording can have its own `.cutdb` analysis cache. [Multicam editing](docs/USAGE.md#edit-a-multicam-project) · [Usage and workflow examples](docs/USAGE.md)
 
 ## Install
 
 MPCut requires **macOS 14 or later on Apple Silicon**. Download the arm64 ZIP, expand it, and move **MPCut.app** into Applications. To verify the download, put `SHA256SUMS.txt` next to the ZIP and run `shasum -a 256 -c SHA256SUMS.txt`. The published app is ad-hoc signed, so macOS may ask for approval on the first launch. [Release and downloads](https://github.com/andrewfitz/mpcut/releases/latest) · [Apple’s guide to opening downloaded apps](https://support.apple.com/en-us/102445)
 
 The **Help** menu opens the bundled **MPCut User Guide** (⌘?) and **Release Notes** offline. **MPCut → About MPCut** also shows the installed version, documentation, credits, and a **Copy CLI Path** button.
+
+## Control open projects from an agent
+
+Open **Settings → General → Automation** and enable local MCP control. Configure your agent’s stdio server to launch `/Applications/MPCut.app/Contents/Helpers/mpcut-mcp` or the helper from the app bundle you have open. Ask the agent to list open projects, inspect the timeline and split a specific clip. Edits use the GUI’s native history, including its retention limit. Turn off the setting to end access. **Help → MPCut Agent Guide** opens the instructions offline. [Setup and use cases](docs/MCP-AGENT-GUIDE.md) · [Tool reference](docs/MCP-REFERENCE.md)
 
 ## Edit on the timeline
 
@@ -59,9 +63,44 @@ Repeated **J** or **L** presses step through 2×, 4×, and 8× shuttle speeds. R
 
 Choose **Add as Multicam…** beside **Add Clips** on the startup screen or in the **File** menu. Select the recordings, choose the opening angle and soundtrack, and adjust source offsets on the shared **Group** timeline. Choose a fixed master microphone, follow the active camera, or export without sound. Playback and scrubbing can start while exact source indexes load. Click a numbered camera button next to the mark controls or press **1–9** to switch at the playhead. Drag the switch marker or edit its picture and microphone in the inspector.
 
-Mark and add group ranges to the **Assembly**. Drag the edges in its timeline lane to trim a range, drag its body to reorder it, or use the scissors button (⌘B) to split it at the playhead in **Group** or **Assembly** preview. Drag the timeline divider up to see more camera lanes. Use **Save Project** (⌘S) to save the edit as JSON and **Open Multicam Project…** to resume it. The **Export** inspector lets you check the current assembly or the whole group before export. [Desktop multicam editing](docs/USAGE.md#edit-a-multicam-project)
+Mark and add group ranges to the **Assembly**. Drag the edges in its timeline lane to trim a range, drag its body to reorder it, or use the scissors button (⌘B) to split it at the playhead in **Group** or **Assembly** preview. Drag the timeline divider up to see more camera lanes. Use **Save Project** (⌘S) to save the edit as a `.cut` project and **Open MPCut Project…** to resume it. The **Export** inspector lets you check the current assembly or the whole group before export. [Desktop multicam editing](docs/USAGE.md#edit-a-multicam-project)
 
-Use **Scan for Silence** to find pauses in the program soundtrack. The CLI can also report pauses or render the retained ranges from a saved project with `mpcut silence --project edit.multicam.json --json`. [Routed project audio examples](docs/USAGE.md#scan-and-shorten-routed-project-audio-from-the-cli)
+Use **Scan for Silence** to find pauses in the program soundtrack. The CLI can also report pauses or render the retained ranges from a saved project with `mpcut silence --project edit.cut --json`. [Routed project audio examples](docs/USAGE.md#scan-and-shorten-routed-project-audio-from-the-cli)
+
+## Convert projects
+
+Use **File → Import External Project…** or **File → Export Project**, or use `mpcut convert` with a new output path. Both entry points use the same converters. The output extension identifies the file to create.
+
+```sh
+mpcut convert Interview.cut --to resolve --output Interview.drp
+mpcut convert Interview.drp --to mpcut --output Reopened.cut --allow-loss --json
+mpcut convert Interview.cut --to premiere --output Interview.prproj
+mpcut convert Interview.fcpxmld --to mpcut --output Imported.cut
+mpcut convert Interview.cut --to fcp --output Interview.fcpxml
+```
+
+| Extension | What opens it | Conversion requirements |
+| --- | --- | --- |
+| `.cut` | MPCut | Versioned JSON containing an ordered sequence or multicam project. [Schema](docs/schema/cut-v1.schema.json). Media files are referenced by path. |
+| `.drp`, `.drt` | DaVinci Resolve | Resolve writes and reads its native project or timeline through its local scripting API. |
+| `.prproj` | Adobe Premiere Pro | Adobe Premiere Pro and the MPCut Premiere bridge handle the native project. [Install the panel](docs/PREMIERE.md#install-the-panel). |
+| `.fcpxml`, `.fcpxmld` | Final Cut Pro and compatible editors | MPCut reads and writes timeline interchange XML directly. |
+| `.fcpbundle` | Final Cut Pro | Native library conversion requires Final Cut Pro and an interactive host step. |
+
+Conversion handles one edit at a time. Resolve can retain editable multicam angles. Premiere can retain switchable angles for two to four aligned cameras at a common frame rate that cover the full group. To bring that edit back through Premiere’s sequence XML, flatten a copy in Premiere or choose `--flatten-multicam --allow-loss` when exporting from MPCut. The flattened sequence retains the assembled picture cuts and selected microphone tracks. Reading a Resolve archive requires loss approval because its timeline exchange can omit host-specific effects, grades and project settings. Final Cut library import asks you to export the chosen project as XML in Final Cut. Review reported limitations before retrying a conversion with `--allow-loss`. Keep referenced recordings and generated audio files alongside your projects. For an editable XML handoff to an existing Resolve project, see the workflow below.
+
+## Export a project to DaVinci Resolve
+
+Choose **File → Send Timeline to DaVinci Resolve via FCPXML…** in either editor. Choose a new `.fcpxml` file and leave **Open timeline in the current Resolve project** checked to import it immediately. Direct import requires an open Resolve project and local external scripting enabled. For manual import, use **File → Import → Timeline** in Resolve.
+
+```sh
+mpcut resolve --project interview.cut --output interview.fcpxml --open
+mpcut resolve --stdin --open < ordered-edit.json
+```
+
+The multicam timeline retains synchronized cameras, angle switches, microphone choices and the saved assembly order. Ordinary timelines retain source trims, repeated clips and replacement working copies. Resolve uses the reference camera’s frame rate, the first video clip’s rate for ordinary edits, or 24 fps for audio-only edits. Cumulative cut positions round to that frame grid.
+
+Keep the source recordings and any companion **Audio** or **Sources** directories. MPCut writes separate PCM files for independently routed streams in a multistream recording. The CLI also keeps working movies when an edit request supplies replacement audio. Double-click a multicam segment on Resolve’s Edit page to see the synchronized angles. [Close angle](docs/images/resolve-multicam-close.jpg) · [Wide angle](docs/images/resolve-multicam-wide.jpg) · [Replacement tracks](docs/images/resolve-replaced-tracks.jpg)
 
 ## Edit audio or export individual tracks
 
@@ -83,7 +122,7 @@ Some scene cuts land on existing keyframes. In the multicam fixture, 11 of 12 de
 
 ## Save analysis and review frames
 
-The app and CLI automatically save and reuse matching analysis in a versioned SQLite sidecar such as `interview.mov.mpcut`. **File → Save Analysis Sidecars** also saves completed desktop analysis such as view names and available thumbnails. To inspect the cache inventory without updating it, run `mpcut sidecar --status --json interview.mov`. In **MPCut → Settings…** (⌘,), use **Analysis** for automatic sidecars and pause defaults, and **General** for timeline size, snapping, monitoring, and movie and JPEG export defaults. Pass `--no-sidecar` to bypass automatic sidecar reads and writes for a CLI invocation. [Save and reuse analysis](docs/USAGE.md#save-and-reuse-analysis)
+The app and CLI automatically save and reuse matching analysis in a versioned SQLite sidecar such as `interview.mov.cutdb`. **File → Save Analysis Sidecars** also saves completed desktop analysis such as view names and available thumbnails. To inspect the cache inventory without updating it, run `mpcut sidecar --status --json interview.mov`. In **MPCut → Settings…** (⌘,), use **Analysis** for automatic sidecars and pause defaults, and **General** for timeline size, snapping, monitoring, and movie and JPEG export defaults. Pass `--no-sidecar` to bypass automatic sidecar reads and writes for a CLI invocation. [Save and reuse analysis](docs/USAGE.md#save-and-reuse-analysis)
 
 **File → Export JPEG Frames…** exports the picture at the playhead or batches from scenes and non-silent ranges. Each folder includes a `manifest.json` with exact source times and frame-aligned edit bounds. With `mpcut frames --project`, an agent can compare every camera at the same group time before choosing a switch. [Review JPEGs](docs/USAGE.md#review-a-recording-with-jpegs) · [Compare camera angles](docs/USAGE.md#compare-all-angles-at-the-same-time)
 
@@ -126,17 +165,17 @@ The installed CLI carries its own reference and offline user guide (`mpcut help 
 
 Use the inspection report’s top-level `file` as the source path for an edit. Use `--frames` for exact presentation timestamps and `--keyframes` for keyframe markers and verified start points. Times accept `MM:SS`, `HH:MM:SS`, decimal seconds, or exact fractions. JSON requests also accept the rational time objects returned by inspection. Each start is inclusive and each end is exclusive. Add `--dry-run --json` to validate cuts and inspect `copiedDuration` and `encodedDuration` before writing.
 
-### Render a multicam JSON project in one command
+### Render a multicam project in one command
 
 Pass a project saved by MPCut or written by an agent directly to the CLI.
 
 ```sh
-"$mpcut" export --project edits/interview.multicam.json --output interview.mov --json
+"$mpcut" export --project edits/interview.cut --output interview.mov --json
 ```
 
 Relative media paths inside the JSON resolve from the project’s directory. For example, `media/wide.mov` in this project resolves to `edits/media/wide.mov`. Relative `--project` and `--output` arguments resolve from the shell’s working directory. The command renders the saved assembly, or the entire group if the project omits `assembly`. It defaults to Smart Trim at the project’s exact times. Explicit video-only or audio-only exports use Lossless Copy.
 
-To create a project, extract `projectTemplate` from `mpcut help multicam --json`, save it as JSON, and edit the filenames, offsets, soundtrack, and switches. Append `--dry-run` to the export command for an optional preflight that returns the resolved picture and audio ranges and actions without writing the movie. Use `mpcut inspect --project edits/interview.multicam.json --json` to check source coverage and group intervals. [Project schema and ordered range examples](docs/USAGE.md#inspect-and-export-a-project-from-the-cli)
+To create a project, extract `projectTemplate` from `mpcut help multicam --json`, save it as a `.cut` file, and edit the filenames, offsets, soundtrack, and switches. Append `--dry-run` to the export command for an optional preflight that returns the resolved picture and audio ranges and actions without writing the movie. Use `mpcut inspect --project edits/interview.cut --json` to check source coverage and group intervals. [Project schema and ordered range examples](docs/USAGE.md#inspect-and-export-a-project-from-the-cli)
 
 ### Rearrange ranges into one movie
 
@@ -232,7 +271,7 @@ The 1,200 copied pictures matched the source byte-for-byte. MPCut targets the so
 
 ## Build from source
 
-On an Apple Silicon Mac with the Xcode command-line tools, CMake, and pkg-config installed, run these commands from the repository root. The first build downloads and verifies the pinned FFmpeg and SVT-AV1 sources. The resulting bundle includes the native app, CLI, FFmpeg executable and required media libraries.
+On an Apple Silicon Mac with the Xcode command-line tools, CMake, pkg-config and Python 3 installed, run these commands from the repository root. The first build downloads and verifies the pinned FFmpeg, SVT-AV1 and LAME sources. The resulting bundle includes the native app, CLI, MCP helper, FFmpeg executable and required media libraries. The Go module pins the helper’s SDK and toolchain. If the pinned Go version is unavailable, the build downloads and verifies the pinned Apple Silicon toolchain into the checkout’s build cache.
 
 ```sh
 ./scripts/build-app.sh

@@ -112,7 +112,9 @@ class TrackEditing(unittest.TestCase):
         self.assertEqual(rejected["error"]["code"], "unsupported_tracks")
         self.assertIn("non-increasing presentation timestamps", rejected["error"]["message"])
         selected = self.cli(*flags, "--audio-stream", "0", "--output", self.root / "First.mka", ok=False)
-        self.assertEqual(selected["error"], rejected["error"])
+        # The refusal is the same. Each request lists its own working alternatives beside it.
+        self.assertEqual({key: value for key, value in selected["error"].items() if key != "alternatives"},
+                         {key: value for key, value in rejected["error"].items() if key != "alternatives"})
         expected = ffmpeg("-i", source, "-map", "0:1", "-c", "copy", "-f", "s16le", "-")
         for label in ("Fresh", "Cached"):
             with self.subTest(index=label):
@@ -325,7 +327,9 @@ class TrackEditing(unittest.TestCase):
         output = self.root/"Bad.wav"
         for code, args in [
             ("no_video", ["--tracks","video","--clip",self.sound]),
-            ("invalid_arguments", ["--tracks","audio","--mode","encode","--clip",self.sound]),
+            # An audio selection converts in encode mode. Video settings and a video selection do not apply.
+            ("invalid_arguments", ["--tracks","audio","--mode","encode","--video","h264","--clip",self.sound]),
+            ("invalid_arguments", ["--tracks","video","--mode","encode","--clip",self.movie]),
             ("no_audio", ["--tracks","audio","--audio-stream","999","--clip",self.movie]),
             ("unsupported_container", ["--replace-audio",self.processed,"--clip",self.movie,"--from","1"]),
             ("invalid_arguments", ["--replace-track","1","--clip",self.movie]),

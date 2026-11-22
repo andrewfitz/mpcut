@@ -17,6 +17,7 @@ struct SilenceOptions {
     var columns: Int?
     var mode: ExportMode?
     var tracks: ExportTracks?
+    var pausesFile: String?
     var stdin = false
     var dryRun = false
 
@@ -45,6 +46,7 @@ struct SilenceOptions {
             switch flag {
             case "--": positional = true
             case "--json": break
+            case "--pauses-file": pausesFile = try value()
             case "--stdin": stdin = true
             case "--dry-run": dryRun = true
             case "--project": project = try value()
@@ -80,6 +82,7 @@ struct SilenceOptions {
         guard minimum > 0, (leave ?? 0) >= 0 else {
             throw invalid("Use a positive minimum pause and nonnegative leave time.")
         }
+        if pausesFile != nil && project != nil { throw invalid("--pauses-file uses one recording or its saved silence report.") }
         if stdin && !seen.isDisjoint(with: ["--threshold-db", "--min-pause", "--stream", "--waveform"]) {
             throw invalid("Detection settings and waveform columns require a new scan.")
         }

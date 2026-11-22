@@ -1,4 +1,5 @@
 #include "FFPreviewDecoder.h"
+#include "LinkedAudioMix.h"
 
 #include <AudioToolbox/AudioToolbox.h>
 #include <libavcodec/videotoolbox.h>
@@ -17,6 +18,9 @@ typedef struct {
 
 struct MPPreviewDecoder {
     AVFormatContext *format;
+    LinkedAudioMix *mix;
+    CMSampleBufferRef mixed_audio, mixed_picture;
+    bool mix_video_end, mix_audio_end, linked_lane;
     PreviewStream video;
     PreviewStream audio;
     PreviewStream *receiving;
@@ -33,6 +37,7 @@ struct MPPreviewDecoder {
     int video_failures;
     bool met_damage;
     bool late_damage;
+    bool recovering;
     bool audio_enabled;
     bool audio_only;
     bool eof;
@@ -183,7 +188,30 @@ MPPreviewDecoder *mp_preview_open(const char *path, enum MPPreviewTracks tracks,
     int first_audio = find_stream(preview->format, AVMEDIA_TYPE_AUDIO, 0);
     int audio = audio_ordinal >= 0 ? find_stream(preview->format, AVMEDIA_TYPE_AUDIO, audio_ordinal) :
         picture < 0 ? first_audio : av_find_best_stream(preview->format, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-    if (preview->audio_enabled && !open_stream(preview, &preview->audio, audio, AVMEDIA_TYPE_AUDIO)) {
+    int lane_count = 0;
+    if (picture >= 0 && audio_ordinal < 0 && preview->audio_enabled) {
+        for (unsigned i = 0; i < preview->format->nb_streams; i++)
+            if (preview->format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                lane_count++;
+    }
+    // An explicit ordinal and a standalone audio file each monitor one track.
+    if (lane_count > 1) {
+        preview->mix = linked_mix_create(lane_count);
+        if (!preview->mix)
+            goto failure;
+        int ordinal = 0;
+        for (unsigned i = 0; i < preview->format->nb_streams; i++) {
+            AVStream *lane = preview->format->streams[i];
+            if (lane->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
+                continue;
+            MPPreviewDecoder *child = mp_preview_open(path, MPPreviewSoundOnly, ordinal, origin, cancelled, context, error);
+            if (child)
+                child->linked_lane = true;
+            linked_mix_set_lane(preview->mix, ordinal++, child, lane->time_base);
+            if (preview_cancelled(preview))
+                goto failure;
+        }
+    } else if (preview->audio_enabled && !open_stream(preview, &preview->audio, audio, AVMEDIA_TYPE_AUDIO)) {
         preview->audio_unavailable = preview->audio.index >= 0;
         if (preview->audio_only && preview->audio_unavailable) {
             *error = "This audio stream has no compatible decoder.";
@@ -255,6 +283,11 @@ void mp_preview_close(MPPreviewDecoder *preview)
     if (!preview)
         return;
     preview->cancelled = NULL;
+    linked_mix_close(preview->mix);
+    if (preview->mixed_audio)
+        CFRelease(preview->mixed_audio);
+    if (preview->mixed_picture)
+        CFRelease(preview->mixed_picture);
     if (preview->verified_session)
         CFRelease(preview->verified_session);
     clear_hardware(&preview->hardware);
@@ -273,6 +306,8 @@ void mp_preview_close(MPPreviewDecoder *preview)
 
 void mp_preview_enable_audio(MPPreviewDecoder *preview, bool enabled)
 {
+    if (preview->mix)
+        preview->audio_enabled = enabled;
     if (preview->audio.index >= 0) {
         preview->format->streams[preview->audio.index]->discard = enabled ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
         preview->audio_enabled = enabled;
@@ -281,12 +316,14 @@ void mp_preview_enable_audio(MPPreviewDecoder *preview, bool enabled)
 
 bool mp_preview_has_audio(const MPPreviewDecoder *preview)
 {
+    if (preview->mix)
+        return preview->audio_enabled && linked_mix_has_audio(preview->mix);
     return preview->audio_enabled && preview->audio.codec && !preview->audio_unavailable;
 }
 
 bool mp_preview_has_unavailable_audio(const MPPreviewDecoder *preview)
 {
-    return preview->audio_unavailable;
+    return preview->mix ? linked_mix_unavailable(preview->mix) : preview->audio_unavailable;
 }
 
 CGAffineTransform mp_preview_transform(const MPPreviewDecoder *preview)
@@ -352,6 +389,18 @@ static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_ti
     int64_t target = llround(seconds * AV_TIME_BASE);
     if (preview->origin > 0 && target > INT64_MAX - preview->origin)
         return false;
+    if (preview->mix) {
+        if (preview->mixed_audio)
+            CFRelease(preview->mixed_audio);
+        if (preview->mixed_picture)
+            CFRelease(preview->mixed_picture);
+        preview->mixed_audio = preview->mixed_picture = NULL;
+        preview->mix_audio_end = preview->mix_video_end = false;
+        if (preview->audio_enabled && !linked_mix_seek(preview->mix, seconds))
+            return false;
+        if (preview->audio_only)
+            return true;
+    }
     int result;
     if (preview->audio_only) {
         if (!preview->audio.codec)
@@ -383,7 +432,7 @@ static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_ti
         CMTime origin = preview->timeline_origin;
         if (from_timeline_origin && CMTIME_IS_NUMERIC(origin) && origin.timescale > 0)
             start = av_rescale_q_rnd(origin.value, (AVRational){1, origin.timescale}, video->time_base,
-                                     (origin.value < 0 ? AV_ROUND_UP : AV_ROUND_DOWN) | AV_ROUND_PASS_MINMAX);
+                                     AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
         if (ticks >= 0x1p63L || (start > 0 && (int64_t)ticks > INT64_MAX - start))
             return false;
         result = av_seek_frame(preview->format, preview->video.index, start + (int64_t)ticks, AVSEEK_FLAG_BACKWARD);
@@ -406,6 +455,7 @@ static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_ti
     preview->video_failures = 0;
     preview->met_damage = false;
     preview->late_damage = false;
+    preview->recovering = false;
     av_packet_unref(preview->packet);
     av_frame_unref(preview->frame);
     return true;
@@ -490,6 +540,9 @@ static bool configure_resampler(MPPreviewDecoder *preview)
     AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
     if (swr_alloc_set_opts2(&preview->resampler, &stereo, AV_SAMPLE_FMT_FLT, frame->sample_rate,
                            &frame->ch_layout, frame->format, frame->sample_rate, 0, NULL) < 0 ||
+        // AVAssetReaderAudioMixOutput duplicates a linked mono track into both channels at unity.
+        (preview->linked_lane && frame->ch_layout.nb_channels == 1 &&
+         swr_set_matrix(preview->resampler, (double[]){1.0, 1.0}, 1) < 0) ||
         swr_init(preview->resampler) < 0) {
         swr_free(&preview->resampler);
         return false;
@@ -550,6 +603,7 @@ static bool edge_metadata_supported(const AVFrame *frame)
         case AV_FRAME_DATA_A53_CC:
         case AV_FRAME_DATA_MASTERING_DISPLAY_METADATA:
         case AV_FRAME_DATA_CONTENT_LIGHT_LEVEL:
+        case AV_FRAME_DATA_AMBIENT_VIEWING_ENVIRONMENT:
         case AV_FRAME_DATA_DYNAMIC_HDR_PLUS:
         case AV_FRAME_DATA_DYNAMIC_HDR_VIVID:
         case AV_FRAME_DATA_DOVI_RPU_BUFFER:
@@ -587,27 +641,41 @@ bool mp_preview_edge_intact_before_damage(const MPPreviewDecoder *preview)
 
 // libavcodec reports a packet it cannot parse as invalid data. VideoToolbox reports a picture
 // it cannot decode as an unknown or external error. Later pictures can be predicted from the
-// rejected one, so none is returned until a keyframe restarts decoding. A preview drops the
-// decoder's state and resumes at the next keyframe. A Smart Trim edge must not lose a picture:
-// it stops reading and drains the pictures that were decoded before the damage. A session
-// that keeps failing is a decoder fault rather than damage.
+// rejected one, so no further packet is sent. The decoder is drained of the pictures that
+// came from earlier packets. A preview then resumes at the next keyframe. A Smart Trim edge
+// must not lose a picture, so it ends with an error. A session that keeps failing is a
+// decoder fault rather than damage.
 static bool is_picture_damage(int result)
 {
     return result == AVERROR_INVALIDDATA || result == AVERROR_UNKNOWN || result == AVERROR_EXTERNAL;
 }
 
-static bool damaged_video_picture(MPPreviewDecoder *preview, int result)
+static void resume_at_keyframe(MPPreviewDecoder *preview)
+{
+    avcodec_flush_buffers(preview->video.codec);
+    preview->recovering = false;
+    preview->awaiting_keyframe = true;
+}
+
+static bool damaged_video_picture(MPPreviewDecoder *preview, int result, bool sending)
 {
     if (preview->encoding_edge || !is_picture_damage(result) || ++preview->video_failures > 32)
         return false;
-    if (getenv("MPCUT_DAMAGE_TRACE")) fprintf(stderr, "preview damage %d\n", result);
     preview->met_damage = true;
-    avcodec_flush_buffers(preview->video.codec);
-    preview->awaiting_keyframe = true;
+    if (preview->recovering) {
+        // The rejected picture can surface while the earlier pictures drain.
+        preview->receiving = &preview->video;
+    } else if (sending && avcodec_send_packet(preview->video.codec, NULL) >= 0) {
+        preview->recovering = true;
+        preview->receiving = &preview->video;
+    } else {
+        // A failure first reported with a picture can follow packets that were already sent.
+        resume_at_keyframe(preview);
+    }
     return true;
 }
 
-int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const char **error)
+static int next_stream_sample(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const char **error)
 {
     *sample = NULL;
     *error = NULL;
@@ -654,15 +722,23 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
                 continue;
             }
             preview->receiving = NULL;
-            if (result == AVERROR_EOF)
+            if (result == AVERROR_EOF && stream == &preview->video && preview->recovering)
+                resume_at_keyframe(preview);
+            else if (result == AVERROR_EOF)
                 stream->drained = true;
             else if (result != AVERROR(EAGAIN)) {
                 if (stream == &preview->video) {
-                    if (getenv("MPCUT_DAMAGE_TRACE")) fprintf(stderr, "receive failure %d\n", result);
-                    if (damaged_video_picture(preview, result))
+                    if (damaged_video_picture(preview, result, false))
                         continue;
-                    // A failure reported here can follow packets that were already sent, so
-                    // an edge has no later picture that is known to be intact.
+                    // While an edge drains after a rejected packet, the rejected picture can
+                    // surface here ahead of intact pictures that were decoded before it.
+                    if (preview->encoding_edge && preview->eof && preview->met_damage && !preview->late_damage &&
+                        is_picture_damage(result) && ++preview->video_failures <= 32) {
+                        preview->receiving = stream;
+                        continue;
+                    }
+                    // A failure reported first here can follow packets that were already sent,
+                    // so an edge has no later picture that is known to be intact.
                     if (is_picture_damage(result)) {
                         preview->late_damage = preview->late_damage || !preview->met_damage;
                         preview->met_damage = true;
@@ -731,8 +807,7 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
             continue;
         if (result < 0) {
             if (stream == &preview->video) {
-                if (getenv("MPCUT_DAMAGE_TRACE")) fprintf(stderr, "send failure %d\n", result);
-                if (damaged_video_picture(preview, result))
+                if (damaged_video_picture(preview, result, true))
                     continue;
                 if (preview->encoding_edge && is_picture_damage(result)) {
                     // Nothing after the rejected packet is sent. The pictures still held by
@@ -751,4 +826,39 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
         }
     }
     return MPPreviewAgain;
+}
+
+int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const char **error)
+{
+    if (!preview->mix || !preview->audio_enabled)
+        return next_stream_sample(preview, sample, error);
+    *sample = NULL;
+    *error = NULL;
+    if (!preview->mixed_audio && !preview->mix_audio_end) {
+        int result = linked_mix_next(preview->mix, &preview->mixed_audio);
+        if (result == MPPreviewError)
+            *error = "Could not create the linked preview audio mix.";
+        if (result == MPPreviewAgain || result == MPPreviewError)
+            return result;
+        preview->mix_audio_end = result == MPPreviewEnd;
+    }
+    if (!preview->audio_only && !preview->mixed_picture && !preview->mix_video_end) {
+        int result = next_stream_sample(preview, &preview->mixed_picture, error);
+        if (result == MPPreviewAgain || result == MPPreviewError)
+            return result;
+        preview->mix_video_end = result == MPPreviewEnd;
+    }
+    if (preview->mixed_audio && (!preview->mixed_picture ||
+        CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(preview->mixed_audio),
+                      CMSampleBufferGetPresentationTimeStamp(preview->mixed_picture)) <= 0)) {
+        *sample = preview->mixed_audio;
+        preview->mixed_audio = NULL;
+        return MPPreviewAudio;
+    }
+    if (preview->mixed_picture) {
+        *sample = preview->mixed_picture;
+        preview->mixed_picture = NULL;
+        return MPPreviewVideo;
+    }
+    return MPPreviewEnd;
 }

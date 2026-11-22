@@ -3,6 +3,22 @@ import Foundation
 import XCTest
 
 final class SidecarAnalysisTests: XCTestCase {
+    func testDisablingAutomaticSceneSaveDuringDetectionKeepsCompletedReport() throws {
+        let original = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov",
+                                                       subdirectory: "Fixtures"))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("scan.mov")
+        try FileManager.default.copyItem(at: original, to: source)
+        let media = try CutEngine(useSidecar: false).inspect(source, keyframes: true)
+        var enabled = true
+        let report = try SceneAnalysis.scan(media, allowAutomaticSave: { enabled }, onScene: { _, _ in enabled = false })
+        XCTAssertFalse(enabled)
+        XCTAssertFalse(report.scenes.isEmpty)
+        XCTAssertEqual(try AnalysisSidecar(source: source).status(), "missing")
+    }
+
     func testLegacyRoundedPeaksAreRecomputedWhileSignedEnvelopeIsReused() throws {
         let fixture = try XCTUnwrap(Bundle.module.url(forResource: "Standalone-Multitrack", withExtension: "mka",
                                                       subdirectory: "Fixtures"))

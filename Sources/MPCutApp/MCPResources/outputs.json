@@ -1,0 +1,575 @@
+[
+  {
+    "name": "get_export_queue",
+    "description": "Read the native export queue. Each entry includes its identifier and exact marked range.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "add_export_range",
+    "description": "Add the current marked range to the native queue, preserving the captured edit and media.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique operation identifier; repeat the exact request after a lost reply."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "remove_export_range",
+    "description": "Remove one entry from this project’s native export queue.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique operation identifier; repeat the exact request after a lost reply."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "render_project",
+    "description": "Check or render an unsaved timeline snapshot using the native export planner. Read the job with live_job_status. A completed preflight can report eligible false with a structured issue. Ordinary copy preflight can offer verified boundaries and export alternatives.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique operation identifier; repeat the exact request after a lost reply."
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local output path. Existing media destinations are protected."
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "timeline",
+            "selection",
+            "group"
+          ]
+        },
+        "tracks": {
+          "type": "string",
+          "enum": [
+            "all",
+            "video",
+            "audio"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "description": "Defaults to the native movie preference for full-track movies and copy for a single track type or audio-only sources.",
+          "enum": [
+            "smart",
+            "copy",
+            "encode"
+          ]
+        },
+        "codec": {
+          "type": "string",
+          "enum": [
+            "h264",
+            "hevc",
+            "prores"
+          ]
+        },
+        "quality": {
+          "type": "string",
+          "description": "Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. Requires movie encode mode.",
+          "enum": [
+            "smaller",
+            "balanced",
+            "high",
+            "422-lt",
+            "422",
+            "422-hq"
+          ]
+        },
+        "audio": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "copy",
+            "aac",
+            "pcm",
+            "remove",
+            "mp3",
+            "flac"
+          ]
+        },
+        "audioTrackOrdinal": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based track within the ordinary source audio tracks."
+        },
+        "dryRun": {
+          "type": "boolean",
+          "description": "Defaults to true. Pass false to write output."
+        },
+        "useReviewedCuts": {
+          "type": "boolean",
+          "description": "Use the native verified copy-boundary proposal for this ordinary export only. The timeline and its history stay intact."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "output"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "apply_export_review",
+    "description": "Recompute the native ordinary timeline lossless-copy boundary proposal for this output extension and apply it as one undoable edit. Use render_project with dryRun first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique operation identifier; repeat the exact request after a lost reply."
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local output path. Existing media destinations are protected."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "output"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "export_queue",
+    "description": "Check or export queued snapshots to an existing directory. Poll live_job_status for completed outputs, including files already written if a later range fails or is cancelled.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique operation identifier; repeat the exact request after a lost reply."
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local output path. Existing media destinations are protected."
+        },
+        "container": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tracks": {
+          "type": "string",
+          "enum": [
+            "all",
+            "video",
+            "audio"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "smart",
+            "copy",
+            "encode"
+          ]
+        },
+        "codec": {
+          "type": "string",
+          "enum": [
+            "h264",
+            "hevc",
+            "prores"
+          ]
+        },
+        "quality": {
+          "type": "string",
+          "enum": [
+            "smaller",
+            "balanced",
+            "high",
+            "422-lt",
+            "422",
+            "422-hq"
+          ]
+        },
+        "audio": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "copy",
+            "aac",
+            "pcm",
+            "remove",
+            "mp3",
+            "flac"
+          ]
+        },
+        "audioTrackOrdinal": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based track within the ordinary source audio tracks."
+        },
+        "dryRun": {
+          "type": "boolean",
+          "description": "Defaults to true. Pass false to write output."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "output"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "export_review_frames",
+    "description": "Export a full-resolution still at the playhead, or a manifest and JPEGs to a new directory. Explicit times use source time on the active ordinary clip and group time on multicam. Playhead, explicit times and switches on multicam sample all angles. Poll live_job_status for the count of written frames and unavailable angle samples.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique operation identifier; repeat the exact request after a lost reply."
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local output path. Existing media destinations are protected."
+        },
+        "selection": {
+          "type": "string",
+          "enum": [
+            "playhead",
+            "still",
+            "times",
+            "switches",
+            "scenes",
+            "nonSilent"
+          ]
+        },
+        "times": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "maxItems": 4096
+        },
+        "preset": {
+          "type": "string",
+          "enum": [
+            "review",
+            "full"
+          ]
+        },
+        "sample": {
+          "type": "string",
+          "enum": [
+            "first",
+            "midpoint"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Optional maximum frame count for scene or non-silent sampling.",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "output"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "convert_live_project",
+    "description": "Export the current unsaved edit as a new .cut, .drp, .drt, .prproj, .fcpxml, .fcpxmld or .fcpbundle. Host applications may be required. Poll live_job_status for warnings and actual output paths.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique operation identifier; repeat the exact request after a lost reply."
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local output path. Existing media destinations are protected."
+        },
+        "allowLoss": {
+          "type": "boolean"
+        },
+        "flattenMulticam": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "output"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "send_live_to_resolve",
+    "description": "Write the live edit as Resolve-compatible FCPXML and optionally import the new timeline into the current Resolve project. The job records the XML and any linked audio directory separately from host import success.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique operation identifier; repeat the exact request after a lost reply."
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local output path. Existing media destinations are protected."
+        },
+        "openInResolve": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "output"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "replace_live_audio",
+    "description": "Replace the ordinary clip source soundtrack using a new working copy and native history. Supply clip, replacement and output. For multicam choose an existing source/stream or an external replacement recording to set the program soundtrack.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique operation identifier; repeat the exact request after a lost reply."
+        },
+        "clip": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "replacement": {
+          "type": "string",
+          "minLength": 1
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute local output path. Existing media destinations are protected."
+        },
+        "targetStream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "replacementStream": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "live_job_status",
+    "description": "Read progress, terminal outcome and published paths for an export job in this project.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        },
+        "job": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "project",
+        "job"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cancel_live_job",
+    "description": "Request cancellation of this project’s specific output job; inspect its terminal result to see which outputs were published.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live project handle from list_projects."
+        },
+        "job": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "project",
+        "job"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

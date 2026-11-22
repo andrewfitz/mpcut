@@ -259,7 +259,7 @@ class Replacement(unittest.TestCase):
 
     def test_mismatch_invalid_stream_and_existing_destination(self):
         original = self.movie.read_bytes()
-        expected = set(self.folder.iterdir()) | {Path(str(path) + ".mpcut") for path in (self.movie, self.processed)}
+        expected = set(self.folder.iterdir()) | {Path(str(path) + ".cutdb") for path in (self.movie, self.processed)}
         for error, kwargs in [
             ("duration_mismatch", {"target": 1}),
             ("no_audio", {"target": 0}),

@@ -25,7 +25,7 @@ class Sidecar(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.source = Path(temp.name) / "Interview.mov"
         shutil.copyfile(FIXTURES / "Pause-Quiet.mov", self.source)
-        self.sidecar = self.source.with_suffix(".mov.mpcut")
+        self.sidecar = self.source.with_suffix(".mov.cutdb")
 
     def cli(self, *args, success=True, cwd=None):
         run = subprocess.run([CLI, *args], cwd=cwd, capture_output=True, text=True, timeout=30)
@@ -289,7 +289,7 @@ class Sidecar(unittest.TestCase):
         self.source.rename(named_like_flag)
         result = self.cli("sidecar", "--only", "scenes", "--json", "--", named_like_flag.name,
                           cwd=named_like_flag.parent)
-        self.assertEqual(Path(result["sidecar"]).name, "--no-sidecar.mpcut")
+        self.assertEqual(Path(result["sidecar"]).name, "--no-sidecar.cutdb")
         status = self.cli("sidecar", "--status", "--json", "--", named_like_flag.name, cwd=named_like_flag.parent)
         self.assertEqual(status["inventory"]["hasScenes"], True)
 

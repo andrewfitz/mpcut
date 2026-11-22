@@ -16,7 +16,7 @@ extension MulticamEditorModel {
         guard canReplaceSourceAudio,
               let indexed = media[selection.source], indexed.hasFullEditIndex,
               indexed.audio.contains(where: { $0.stream.index == selection.stream }) else { return false }
-        let replaced = edit { $0.replaceProgramAudio(with: selection) }
+        let replaced = edit("Replace Program Audio") { $0.replaceProgramAudio(with: selection) }
         if replaced { status = "Updated the multicam soundtrack." }
         return replaced
     }
@@ -45,7 +45,7 @@ extension MulticamEditorModel {
                                  onIndexed: @escaping (SourceDraft) -> Void) {
         guard canReplaceSourceAudio, url.isFileURL else { return }
         let url = url.standardizedFileURL
-        run("Indexing external soundtrack…") { token, useSidecar in
+        run("Indexing external soundtrack…", additionalSources: [url]) { token, useSidecar in
             let engine = CutEngine(cancelled: { token.isCancelled }, useSidecar: useSidecar)
             let ordinary = try engine.inspect(url, keyframes: true)
             let info = try engine.multicamClock(ordinary)
@@ -71,7 +71,7 @@ extension MulticamEditorModel {
         guard canReplaceSourceAudio, selection.source == external.id,
               external.media.audio.contains(where: { $0.stream.index == selection.stream }) else { return false }
         cacheIndexedSource(external.media, ordinary: external.ordinaryMedia)
-        let replaced = edit { project in
+        let replaced = edit("Replace Program Audio") { project in
             if !project.sources.contains(where: { $0.id == external.id }) {
                 var source = external.source
                 source.audioStream = selection.stream

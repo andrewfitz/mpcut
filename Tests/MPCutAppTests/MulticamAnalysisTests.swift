@@ -26,7 +26,7 @@ final class MulticamAnalysisTests: XCTestCase {
         analysis.scan(.silence)
         try await waitUntil { analysis.hasSilenceResults(project: project, media: media) }
         XCTAssertTrue(analysis.programMicrophone(at: half, project: project).contains("dBFS threshold"))
-        let first = try XCTUnwrap(analysis.soundtrack(project: project, media: media).first)
+        let first = try XCTUnwrap(analysis.soundtrack(in: project.range).first)
         XCTAssertEqual(first.group, .init(from: half, to: switchTime))
         XCTAssertEqual(first.input, .init(from: .zero, to: .init(numerator: 3, denominator: 2)))
         let pause = try XCTUnwrap(analysis.routedPauses(project: project, media: media).first)

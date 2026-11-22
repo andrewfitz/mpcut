@@ -161,7 +161,8 @@ public enum SceneAnalysis {
                         progress: nil, onScene: nil, onReset: nil, cache: cache)
     }
 
-    public static func scan(_ media: MediaInfo, useSidecar: Bool = true, cancelled: @escaping () -> Bool = { Task.isCancelled },
+    public static func scan(_ media: MediaInfo, useSidecar: Bool = true, allowAutomaticSave: @escaping () -> Bool = { true },
+                            cancelled: @escaping () -> Bool = { Task.isCancelled },
                             progress: ((Double) -> Void)? = nil,
                             onScene: ((RationalTime, Int) -> Void)? = nil,
                             onReset: (() -> Void)? = nil) throws -> SceneReport {
@@ -173,7 +174,7 @@ public enum SceneAnalysis {
                 throw CutError(code: "source_changed", message: "The source changed since inspection.")
             }
             let exact = try Probe.read(media.url, keyframes: false, expectedIdentity: media.identity, cancelled: cancelled)
-            return try scan(exact, useSidecar: useSidecar, cancelled: cancelled, progress: progress, onScene: onScene, onReset: onReset)
+            return try scan(exact, useSidecar: useSidecar, allowAutomaticSave: allowAutomaticSave, cancelled: cancelled, progress: progress, onScene: onScene, onReset: onReset)
         }
         let cache = useSidecar && AnalysisSidecar.readsEnabled ? AnalysisSidecar(media: media) : nil
         if let report = cache?.sceneReport(for: media, cancelled: cancelled) {
@@ -191,13 +192,13 @@ public enum SceneAnalysis {
             return report
         }
         return try scan(media, verifyClock: false, cancelled: cancelled, progress: progress,
-                        onScene: onScene, onReset: onReset, cache: cache)
+                        onScene: onScene, onReset: onReset, cache: cache, allowAutomaticSave: allowAutomaticSave)
     }
 
     private static func scan(_ media: MediaInfo, verifyClock: Bool, cancelled: @escaping () -> Bool,
                              progress: ((Double) -> Void)?,
                              onScene: ((RationalTime, Int) -> Void)?,
-                             onReset: (() -> Void)?, cache: AnalysisSidecar?) throws -> SceneReport {
+                             onReset: (() -> Void)?, cache: AnalysisSidecar?, allowAutomaticSave: () -> Bool = { true }) throws -> SceneReport {
         guard media.hasVideo else { throw CutError(code: "no_video", message: "Scene detection requires a video track.") }
         func checkSource() throws {
             guard (try? SourceIdentity(media.url)) == media.identity else {
@@ -277,7 +278,9 @@ public enum SceneAnalysis {
         let restored = cache.restoringViewNames(to: report, cancelled: cancelled)
         if cancelled() { throw CutError(code: "cancelled", message: "Scene analysis was cancelled.") }
         try checkSource()
-        cache.saveAutomatically(try AnalysisSidecar.sceneSections(for: restored), cancelled: cancelled)
+        if allowAutomaticSave() {
+            cache.saveAutomatically(try AnalysisSidecar.sceneSections(for: restored), cancelled: { cancelled() || !allowAutomaticSave() })
+        }
         if cancelled() { throw CutError(code: "cancelled", message: "Scene analysis was cancelled.") }
         try checkSource()
         progress?(1)

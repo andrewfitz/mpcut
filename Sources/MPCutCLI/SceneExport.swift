@@ -8,6 +8,13 @@ struct SceneExportInput: Decodable {
         let start: RationalTime
         let end: RationalTime
 
+        init(number: Int?, view: Int, start: RationalTime, end: RationalTime) {
+            self.number = number
+            self.view = view
+            self.start = start
+            self.end = end
+        }
+
         init(_ scene: DetectedScene) {
             number = scene.number
             view = scene.view
@@ -20,7 +27,15 @@ struct SceneExportInput: Decodable {
     let file: String
     let sourceStamp: SceneSourceStamp?
     let duration: RationalTime?
-    let scenes: [Scene]
+    var scenes: [Scene]
+
+    init(file: String, scenes: [Scene]) {
+        self.file = file
+        self.scenes = scenes
+        ok = true
+        sourceStamp = nil
+        duration = nil
+    }
 
     init(_ report: SceneReport) {
         ok = report.ok

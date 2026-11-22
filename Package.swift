@@ -34,7 +34,7 @@ let package = Package(
         ),
         .target(name: "MPCutCore", dependencies: ["PacketWriter", "MediaProbe"]),
         .executableTarget(name: "MPCutCLI", dependencies: ["MPCutCore"]),
-        .executableTarget(name: "MPCutApp", dependencies: ["MPCutCore", "FFPreview"]),
+        .executableTarget(name: "MPCutApp", dependencies: ["MPCutCore", "FFPreview"], resources: [.copy("MCPResources")]),
         .testTarget(name: "MPCutCoreTests", dependencies: ["MPCutCore"]),
         .testTarget(name: "MPCutAppTests", dependencies: ["MPCutApp"], resources: [.copy("Fixtures")])
     ]

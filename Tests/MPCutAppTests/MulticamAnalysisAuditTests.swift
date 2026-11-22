@@ -26,14 +26,20 @@ final class MulticamAnalysisAuditTests: XCTestCase {
         let project = MulticamProject(referenceAngle: "camera", range: .init(from: .zero, to: source.duration),
                                       angles: [.init(id: "camera", file: url.path)],
                                       audio: .none, switches: [.init(at: .zero, angle: "camera")])
-        let analysis = MulticamAnalysisStore()
-        defer { analysis.reset() }
+        let sessions = ProjectSessions(preferences: EditorPreferences(), openWindow: { _ in })
+        XCTAssertTrue(sessions.reopen())
+        let session = try XCTUnwrap(sessions.sessions.values.first)
+        session.isMulticam = true
+        let analysis = session.multicam.analysis
         analysis.update(project: project, media: ["camera": source], ordinary: ["camera": source], useSidecars: true)
         analysis.scan(.scenes)
         try await waitUntil { !analysis.sourceScenes("camera").isEmpty && !analysis.isScanning(.scenes) }
         let scene = try XCTUnwrap(analysis.currentScene(at: .zero, project: project))
         XCTAssertEqual(scene.view, first)
         XCTAssertEqual(scene.name, "Room")
+        let next = try XCTUnwrap(report.scenes.dropFirst().first)
+        XCTAssertEqual(analysis.currentScene(at: next.start, angle: "camera", exclusiveEnd: true)?.index, 0)
+        XCTAssertEqual(analysis.currentScene(at: next.start, angle: "camera", exclusiveEnd: false)?.index, 1)
         analysis.rename(scene, to: "Desk")
 
         func saved() -> [Int: String] {
@@ -41,7 +47,12 @@ final class MulticamAnalysisAuditTests: XCTestCase {
             return Dictionary(uniqueKeysWithValues: views.compactMap { view in view.name.map { (view.view, $0) } })
         }
         // Read only after the write. A reader in this process can make a concurrent sidecar write fail.
-        await analysis.finishMetadataWrites()
+        sessions.windowClosed(session)
+        var quitAllowed = false
+        XCTAssertEqual(sessions.prepareToQuit(stopExports: { true }, reply: { quitAllowed = $0 }), .later)
+        try await waitUntil { quitAllowed }
+        XCTAssertEqual(sessions.prepareToQuit(stopExports: { true }, reply: { _ in }), .now)
+
         XCTAssertEqual(saved(), [first: "Desk", other: "Stage"])
     }
 

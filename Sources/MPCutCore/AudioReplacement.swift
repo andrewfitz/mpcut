@@ -6,6 +6,7 @@ import PacketWriter
 private struct CopiedAACEdits: Sendable {
     let source: URL
     let sourceTrackID: Int32
+    let sampleRate: Int32
     let sourceStream: Int
     let destinationStream: Int
     let shift: RationalTime
@@ -97,6 +98,13 @@ public struct AudioReplacementEngine: Sendable {
                     sourceIdentity: source.identity, replacementIdentity: replacement.identity)
     }
 
+    package func resolve(source: MediaInfo, replacement: URL, output: URL,
+                         targetStream: Int?, replacementStream: Int?) throws -> AudioReplacementPlan {
+        try resolve(source: source.url, replacement: replacement, output: output, container: nil,
+                    targetStream: targetStream, replacementStream: replacementStream,
+                    sourceIdentity: source.identity, replacementIdentity: nil)
+    }
+
     private func resolve(source: URL, replacement: URL, output: URL?, container: String?,
                          targetStream: Int?, replacementStream: Int?, sourceIdentity: SourceIdentity?,
                          replacementIdentity: SourceIdentity?) throws -> AudioReplacementPlan {
@@ -159,11 +167,12 @@ public struct AudioReplacementEngine: Sendable {
         var editLists = movie.audio.compactMap { audio -> CopiedAACEdits? in
             guard audio.stream.index != target.stream.index, !audio.presentationEdits.isEmpty,
                   let outputIndex = outputIndexes[audio.stream.index] else { return nil }
-            return CopiedAACEdits(source: movie.url, sourceTrackID: audio.stream.trackID, sourceStream: audio.stream.index,
+            return CopiedAACEdits(source: movie.url, sourceTrackID: audio.stream.trackID, sampleRate: Int32(audio.stream.sampleRate),
+                                  sourceStream: audio.stream.index,
                                   destinationStream: outputIndex, shift: .zero)
         }
         if !track.presentationEdits.isEmpty {
-            editLists.append(CopiedAACEdits(source: incoming.url, sourceTrackID: track.stream.trackID,
+            editLists.append(CopiedAACEdits(source: incoming.url, sourceTrackID: track.stream.trackID, sampleRate: Int32(track.stream.sampleRate),
                                             sourceStream: track.stream.index, destinationStream: targetOutputStream, shift: offset))
         }
         var audioBounds = try Dictionary(uniqueKeysWithValues: movie.audio.map { ($0.stream.index, try audibleBounds(of: $0, in: movie)) })
@@ -290,7 +299,7 @@ public struct AudioReplacementEngine: Sendable {
             var message = [CChar](repeating: 0, count: 512)
             let size = message.count
             let shift = MPCutTime(numerator: item.shift.numerator, denominator: item.shift.denominator)
-            guard mpcut_restore_copied_aac(item.source.path, item.sourceTrackID, partial.path,
+            guard mpcut_restore_copied_aac(item.source.path, item.sourceTrackID, item.sampleRate, partial.path,
                                            UInt32(item.destinationStream), shift, 1_000_000, &message, size) == 0 else {
                 throw CutError(code: "write_failed", message: String(cString: message))
             }

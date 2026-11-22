@@ -13,6 +13,9 @@ digest=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 svt_name=SVT-AV1-v4.3.0
 svt_archive="$build_dir/$svt_name.tar.bz2"
 svt_digest=9223ce06e6172ad41357ed23b3b00f036e03794b86b0e20ea9ccb3f648b8955d
+lame_name=lame-3.100
+lame_archive="$build_dir/$lame_name.tar.gz"
+lame_digest=ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e
 prefix="$build_dir/install"
 
 mkdir -p "$build_dir"
@@ -58,6 +61,7 @@ fetch_source() (
 )
 fetch_source "$archive" "$digest" "https://ffmpeg.org/releases/$source_name.tar.xz"
 fetch_source "$svt_archive" "$svt_digest" "https://gitlab.com/AOMediaCodec/SVT-AV1/-/archive/v4.3.0/$svt_name.tar.bz2"
+fetch_source "$lame_archive" "$lame_digest" "https://downloads.sourceforge.net/project/lame/lame/3.100/$lame_name.tar.gz"
 
 # Only a successful install marks the recipe and its outputs valid.
 hardware_patch="$root/packaging/ffmpeg-require-hardware.patch"
@@ -85,6 +89,9 @@ recipe=$(
 if [[ -f "$build_dir/.recipe" && $(cat "$build_dir/.recipe") == "$recipe" &&
       -f "$prefix/ffmpeg-source-name" && -f "$prefix/svt-source-name" &&
       -f "$prefix/SVT-AV1/LICENSE.md" && -f "$prefix/SVT-AV1/PATENTS.md" &&
+      -f "$prefix/SVT-AV1/LICENSE-BSD2.md" && -f "$prefix/SVT-AV1/fastfeat-LICENSE" &&
+      -f "$prefix/SVT-AV1/safestringlib-LICENSE" && -f "$prefix/include/libswscale/swscale.h" &&
+      -f "$prefix/lame-source-name" && -f "$prefix/LAME/COPYING" && -f "$prefix/LAME/LICENSE" &&
       -f "$prefix/COPYING.LGPLv2.1" && -f "$prefix/LICENSE.md" &&
       -f "$prefix/include/libavformat/avformat.h" &&
       -f "$prefix/include/libavcodec/avcodec.h" &&
@@ -116,6 +123,21 @@ cmake -S "$stage/$svt_name" -B "$stage/svt-build" \
     -DBUILD_SHARED_LIBS=OFF -DBUILD_APPS=OFF -DBUILD_TESTING=OFF -DEXCLUDE_HASH=ON
 cmake --build "$stage/svt-build" --parallel "$jobs"
 cmake --install "$stage/svt-build"
+# LAME supplies the MP3 encoder as a static library inside libavcodec. Build it in
+# its own tree and copy the two products, so no absolute path reaches libtool.
+tar -xf "$lame_archive" -C "$stage"
+(
+    cd "$stage/$lame_name"
+    ./configure --host=aarch64-apple-darwin --build=aarch64-apple-darwin CC="$compiler" \
+        CFLAGS="-O3 -arch arm64 -isysroot $SDKROOT -mmacosx-version-min=14.0" \
+        --disable-shared --enable-static --with-pic \
+        --disable-frontend --disable-decoder --disable-gtktest --disable-dependency-tracking
+    make -j "$jobs" -C mpglib
+    make -j "$jobs" -C libmp3lame
+)
+mkdir -p "$stage/lame/include/lame" "$stage/lame/lib"
+install -m 644 "$stage/$lame_name/include/lame.h" "$stage/lame/include/lame/"
+install -m 644 "$stage/$lame_name/libmp3lame/.libs/libmp3lame.a" "$stage/lame/lib/"
 mkdir "$stage/objects"
 
 cd "$stage/objects"
@@ -123,6 +145,7 @@ cd "$stage/objects"
 # rejects out-of-tree builds under paths containing spaces.
 ln -s "../$source_name" src
 ln -s ../svt svt
+ln -s ../lame lame
 # FFmpeg expands pkg-config flags as shell words. Keep dependency paths
 # relative so that configure and make also work in a checkout with spaces.
 sed -i '' 's|^prefix=.*|prefix=./svt|' svt/lib/pkgconfig/SvtAv1Enc.pc
@@ -132,15 +155,16 @@ src/configure \
     --prefix="$prefix" \
     --arch=aarch64 --cc="$compiler" \
     --sysroot="$SDKROOT" \
-    --extra-cflags=-mmacosx-version-min=14.0 --extra-ldflags=-mmacosx-version-min=14.0 \
+    --extra-cflags="-mmacosx-version-min=14.0 -I./lame/include" \
+    --extra-ldflags="-mmacosx-version-min=14.0 -L./lame/lib" \
     --extra-ldexeflags="-Wl,-rpath,@loader_path/../lib -Wl,-rpath,@loader_path/../Frameworks" \
     --install-name-dir=@rpath \
     --enable-shared --disable-static \
     --disable-autodetect --disable-ffplay --disable-ffprobe --disable-doc --disable-debug \
     --disable-indevs --disable-outdevs --enable-indev=lavfi \
     --disable-network --disable-encoders --enable-zlib --enable-bzlib \
-    --enable-videotoolbox --enable-libsvtav1 --pkg-config-flags=--static \
-    --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox,libsvtav1,aac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,wrapped_avframe,rawvideo
+    --enable-videotoolbox --enable-libsvtav1 --enable-libmp3lame --pkg-config-flags=--static \
+    --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox,libsvtav1,aac,libmp3lame,flac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,wrapped_avframe,rawvideo
 make -j "$jobs" DESTDIR="$stage" install
 cd "$build_dir"
 install -m 644 "$stage/$source_name"/{COPYING.LGPLv2.1,LICENSE.md} "$stage$prefix/"
@@ -148,6 +172,9 @@ mkdir -p "$stage$prefix/SVT-AV1"
 install -m 644 "$stage/$svt_name"/{LICENSE.md,LICENSE-BSD2.md,PATENTS.md} "$stage$prefix/SVT-AV1/"
 install -m 644 "$stage/$svt_name/third_party/fastfeat/LICENSE" "$stage$prefix/SVT-AV1/fastfeat-LICENSE"
 install -m 644 "$stage/$svt_name/third_party/safestringlib/LICENSE" "$stage$prefix/SVT-AV1/safestringlib-LICENSE"
+mkdir -p "$stage$prefix/LAME"
+install -m 644 "$stage/$lame_name"/{COPYING,LICENSE} "$stage$prefix/LAME/"
+printf '%s\n' "$lame_name" > "$stage$prefix/lame-source-name"
 printf '%s\n' "$svt_name" > "$stage$prefix/svt-source-name"
 printf '%s\n' "$source_name" > "$stage$prefix/ffmpeg-source-name"
 printf '%s\n' "$recipe" > "$stage/recipe"

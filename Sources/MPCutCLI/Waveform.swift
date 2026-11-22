@@ -62,10 +62,11 @@ struct WaveformOptions {
     }
 
     func run(_ source: URL, cancelled: @escaping @Sendable () -> Bool) throws -> Report {
-        let media = try CutEngine(cancelled: cancelled).inspectForAudioAnalysis(source)
-        guard let track = media.streams.first(where: { $0.kind == "audio" && (stream == nil || $0.index == stream) }) else {
+        let original = try CutEngine(cancelled: cancelled).inspectForAudioAnalysis(source)
+        guard let track = original.streams.first(where: { $0.kind == "audio" && (stream == nil || $0.index == stream) }) else {
             throw CutError(code: "no_audio", message: "Choose an available audio stream.")
         }
+        let media = try original.extendingToAudioEnd(stream: track.index)
         let wave = try AudioAnalysis.envelope(media, stream: track.index, from: from?.seconds ?? 0,
                                               to: to?.seconds ?? media.duration.seconds, columns: columns, cancelled: cancelled)
         return Report(file: media.url.path, stream: track.index, sampleRate: track.sampleRate, columns: columns, envelope: wave)

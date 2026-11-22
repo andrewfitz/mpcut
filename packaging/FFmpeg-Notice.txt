@@ -1,4 +1,4 @@
-MPCut includes an FFmpeg executable and libraries from the FFmpeg and SVT-AV1 projects.
+MPCut includes an FFmpeg executable and libraries from the FFmpeg, SVT-AV1 and LAME projects.
 
 The bundled FFmpeg 9.0.2 executable and libraries are distributed under the GNU Lesser
 General Public License, version 2.1 or later. See COPYING.LGPLv2.1 and
@@ -8,18 +8,26 @@ The FFmpeg codec library incorporates the SVT-AV1 4.3.0 encoder from the
 Alliance for Open Media. Its upstream license, patent terms and additional
 notices are in SVT-AV1/. The project site is https://gitlab.com/AOMediaCodec/SVT-AV1.
 
-This directory includes both upstream source archives, the patch to require
+The FFmpeg codec library also incorporates the LAME 3.100 MP3 encoder, built
+without its decoder or command-line frontend. LAME is distributed under the
+GNU Library General Public License, version 2 or later. See LAME/COPYING and
+LAME/LICENSE. The project site is https://lame.sourceforge.io/ and the source
+archive is https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz.
+
+This directory includes the three upstream source archives, the patch to require
 hardware decoding in VideoToolbox, and the build recipe. FFmpeg's shared
 libraries are installed in Contents/Frameworks. The three video encoders
 enabled for Smart Trim are h264_videotoolbox, hevc_videotoolbox and libsvtav1.
 Re-encode uses the FFmpeg executable in Contents/Helpers/ffmpeg with the
 h264_videotoolbox, hevc_videotoolbox and prores_videotoolbox video encoders
-and native AAC and PCM audio encoders.
+and native AAC and PCM audio encoders. Audio conversion also uses the
+libmp3lame MP3 encoder and the native FLAC encoder.
 
 To rebuild the executable and libraries on Apple Silicon with Xcode, CMake and pkg-config, create a build
 directory with scripts/, packaging/, and .build/mpcut-ffmpeg/ subdirectories.
 Copy build-ffmpeg.sh into scripts/, changes.diff into packaging/ as
-ffmpeg-require-hardware.patch, and both source archives into .build/mpcut-ffmpeg/.
+ffmpeg-require-hardware.patch, and the source archives (the LAME archive is in
+LAME/ and the SVT-AV1 archive in SVT-AV1/) into .build/mpcut-ffmpeg/.
 Run `bash scripts/build-ffmpeg.sh` from the build directory. The resulting
 libraries are in .build/mpcut-ffmpeg/install/lib/ and the executable is in
 .build/mpcut-ffmpeg/install/bin/ffmpeg.

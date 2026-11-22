@@ -53,15 +53,28 @@
         </dict>
         <dict>
             <key>CFBundleTypeName</key>
-            <string>MPCut Multicam Project</string>
+            <string>MPCut Project</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
             <key>LSHandlerRank</key>
-            <string>Alternate</string>
+            <string>Owner</string>
             <key>LSItemContentTypes</key>
             <array>
-                <string>public.json</string>
+                <string>com.mpcut.project</string>
             </array>
+        </dict>
+    </array>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.mpcut.project</string>
+            <key>UTTypeDescription</key>
+            <string>MPCut Project</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.json</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>cut</string></array></dict>
         </dict>
     </array>
 </dict>

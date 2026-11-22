@@ -5,6 +5,7 @@ from array import array
 from fractions import Fraction
 import json
 import os
+import resource
 from math import sqrt
 from pathlib import Path
 import shutil
@@ -130,6 +131,57 @@ class ReencodeTests(unittest.TestCase):
             for frame in frames:
                 expected.extend(source[frame * frame_samples:(frame + 1) * frame_samples])
             self.assertEqual(pcm(output, rate, index), expected)
+
+    def test_long_reordered_edits_with_a_descriptor_limit(self):
+        frames = [(i * 17) % 65 for i in range(72)]
+        sources = []
+        for i in range(len(frames)):
+            path = self.root / f"source-{i}.mov"
+            os.link(self.stereo, path)
+            sources.append(path)
+        for label, files in [("shared", [self.stereo] * len(frames)), ("distinct", sources)]:
+            with self.subTest(inputs=label):
+                output = self.root / f"{label}.mov"
+                args = [CLI, "--no-sidecar", "export", "--mode", "encode", "--audio", "copy",
+                        "--output", output, "--json"]
+                for source, frame in zip(files, frames):
+                    args += ["--clip", source, "--from", str(Fraction(frame, FPS)),
+                             "--to", str(Fraction(frame + 1, FPS))]
+                run(args, preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64)),
+                    allow_diagnostics=True)
+                self.assertEqual(picture_ids(output), bytes(frames))
+                self.assertEqual([pts for pts, _ in timestamped_hashes(output)],
+                                 [Fraction(i, FPS) for i in range(len(frames))])
+                for index, rate in enumerate([44100, 48000]):
+                    source = pcm(self.stereo, rate, index)
+                    stride = rate // FPS * (2 - index)
+                    expected = array("f")
+                    for frame in frames:
+                        expected.extend(source[frame * stride:(frame + 1) * stride])
+                    self.assertEqual(pcm(output, rate, index), expected)
+                self.assertFalse(any(self.root.glob(".mpcut-*")))
+
+        cancelled = self.root / "cancel-batch.mov"
+        args[args.index("--output") + 1] = cancelled
+        with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            try:
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    if any(self.root.glob(".mpcut-*/part-0.mov")):
+                        process.send_signal(signal.SIGINT)
+                        break
+                    self.assertIsNone(process.poll())
+                    time.sleep(0.005)
+                else:
+                    self.fail("No encoded batch appeared")
+                stdout, stderr = process.communicate(timeout=30)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+        self.assertEqual(process.returncode, 130, stdout + stderr)
+        self.assertFalse(cancelled.exists())
+        self.assertFalse(any(self.root.glob(".mpcut-*")))
 
     def test_aac_and_pcm_keep_trimmed_audio_in_sync_and_preserve_linked_tracks(self):
         ranges = [(63, 77), (15, 31), (63, 77)]

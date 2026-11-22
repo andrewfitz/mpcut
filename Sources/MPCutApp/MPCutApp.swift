@@ -47,24 +47,37 @@ private struct ProjectCommands: Commands {
                     .keyboardShortcut("o")
                 Button("Add as Multicam…") { sessions.chooseMulticamSources(using: openWindow) }
             }
-            Button("Open Multicam Project…") { sessions.chooseProject(using: openWindow) }
+            Button("Open MPCut Project…") { sessions.chooseProject(using: openWindow) }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
+            Button("Recover Untitled Project…") { sessions.recoverUntitledProject(using: openWindow) }
         }
         CommandGroup(after: .importExport) {
+            Button(sessions.isConvertingProject ? "Converting Project…" : "Import External Project…") { sessions.chooseExternalImport(in: session, using: openWindow) }
+                .disabled(sessions.isConvertingProject)
+            if sessions.isConvertingProject {
+                Button(sessions.isCancellingProject ? "Cancelling Project Conversion…" : "Cancel Project Conversion",
+                       action: sessions.cancelProjectConversion)
+                    .disabled(sessions.isCancellingProject)
+            }
             if let session {
-                ExportCommands(editor: session.editor, multicam: session.multicam, isMulticam: isMulticam)
+                ExportCommands(editor: session.editor, multicam: session.multicam, isMulticam: isMulticam,
+                               isConverting: sessions.isConvertingProject, export: { sessions.chooseExternalExport($0, in: session) })
             }
         }
         CommandGroup(replacing: .undoRedo) {
             if let session {
-                UndoCommands(editor: session.editor, multicam: session.multicam, text: textFocus, isMulticam: isMulticam)
+                UndoCommands(editor: session.editor, multicam: session.multicam, text: textFocus,
+                             isMulticam: isMulticam, showHistory: { session.isHistoryPresented = true })
             } else {
-                Button("Undo") { activeTextUndoManager()?.undo() }
+                Button(textFocus.undoTitle) { textFocus.performUndo() }
                     .keyboardShortcut("z")
-                    .disabled(!textFocus.isEditing)
-                Button("Redo") { activeTextUndoManager()?.redo() }
+                    .disabled(!textFocus.canUndo)
+                Button(textFocus.redoTitle) { textFocus.performRedo() }
                     .keyboardShortcut("z", modifiers: [.command, .shift])
-                    .disabled(!textFocus.isEditing)
+                    .disabled(!textFocus.canRedo)
+                Button("Project History…") {}
+                    .keyboardShortcut("y", modifiers: [.command, .shift])
+                    .disabled(true)
             }
         }
         CommandMenu("Sequence") {
@@ -107,18 +120,21 @@ private struct ProjectFileItems: View {
         .keyboardShortcut(session.isMulticam ? KeyboardShortcut("o") : nil)
         .disabled(session.isMulticam ? !multicam.canChooseSources : editor.isBusy)
         Divider()
+        Button("Save Project") {
+            if session.isMulticam { multicam.requestSaveProject() } else { editor.requestSaveProject() }
+        }
+        .keyboardShortcut("s")
+        .disabled(session.isMulticam ? multicam.project == nil || multicam.isBusy : editor.isBusy)
+        Button("Save Project As…") {
+            if session.isMulticam { multicam.requestSaveProject(asNew: true) } else { editor.requestSaveProject(asNew: true) }
+        }
+        .keyboardShortcut("s", modifiers: [.command, .shift])
+        .disabled(session.isMulticam ? multicam.project == nil || multicam.isBusy : editor.isBusy)
         if session.isMulticam {
-            Button("Save Project") { multicam.requestSaveProject() }
-                .keyboardShortcut("s")
-                .disabled(multicam.project == nil || multicam.isBusy)
-            Button("Save Project As…") { multicam.requestSaveProject(asNew: true) }
-                .keyboardShortcut("s", modifiers: [.command, .shift])
-                .disabled(multicam.project == nil || multicam.isBusy)
             Button("Save Analysis Sidecars", action: multicam.saveAnalysisSidecars)
                 .disabled(!multicam.canSaveSidecars)
         } else {
             Button("Save Analysis Sidecars", action: editor.saveAnalysisSidecars)
-                .keyboardShortcut("s")
                 .help("Save the frame index and completed analysis beside each source file.")
                 .disabled(!editor.canSaveAnalysisSidecars)
         }
@@ -137,12 +153,17 @@ private struct TimelineCommands: View {
         }
         let zoom = isMulticam ? $multicam.timelineZoom : $editor.timelineZoom
         let isEmpty = isMulticam ? multicam.project == nil : editor.isEmpty
-        Button("Zoom In on Timeline") { zoom.wrappedValue = min(SequenceTimeline.maximumZoom, zoom.wrappedValue + 1) }
+        Button("Zoom In on Timeline") { zoom.wrappedValue = TimelineViewControls.adjustedZoom(zoom.wrappedValue, by: 1) }
+            .keyboardShortcut("=")
             .disabled(isEmpty || zoom.wrappedValue >= SequenceTimeline.maximumZoom)
-        Button("Zoom Out on Timeline") { zoom.wrappedValue = max(0, zoom.wrappedValue - 1) }
+        Button("Zoom Out on Timeline") { zoom.wrappedValue = TimelineViewControls.adjustedZoom(zoom.wrappedValue, by: -1) }
+            .keyboardShortcut("-")
             .disabled(isEmpty || zoom.wrappedValue <= 0)
-        Button("Fit Timeline") { zoom.wrappedValue = 0 }
-            .disabled(isEmpty || zoom.wrappedValue == 0)
+        Button(zoom.wrappedValue > 0 ? "Fit Timeline" : "Restore Timeline Zoom") {
+            zoom.wrappedValue = zoom.wrappedValue > 0 ? 0 : (isMulticam ? multicam.previousTimelineZoom : editor.previousTimelineZoom)
+        }
+        .keyboardShortcut("z", modifiers: .shift)
+        .disabled(isEmpty)
     }
 }
 
@@ -151,9 +172,28 @@ private struct ExportCommands: View {
     @ObservedObject var multicam: MulticamEditorModel
     let isMulticam: Bool
 
+    let isConverting: Bool
+    let export: (ExternalProjectFormat) -> Void
+
     var body: some View {
+        Menu("Export Project") {
+            ForEach(ExternalProjectFormat.allCases, id: \.rawValue) { format in
+                Button(format.title + " (." + format.rawValue + ")…") { export(format) }
+            }
+        }
+        .disabled(isConverting || (isMulticam ? multicam.project == nil || multicam.isBusy : !editor.canEdit))
+        Button("Send Timeline to DaVinci Resolve via FCPXML…") {
+            if isMulticam { multicam.chooseResolveExport() }
+            else { editor.chooseResolveExport() }
+        }
+        .disabled(isMulticam ? multicam.project == nil || multicam.isBusy : !editor.canEdit)
+        Button("Export Selection…") {
+            if isMulticam { multicam.chooseSelectionExport() } else { editor.chooseSelectionExport() }
+        }
+        .keyboardShortcut("e", modifiers: [.command, .option])
+        .disabled(isMulticam ? !multicam.canActOnRange : !editor.canActOnRange)
         if isMulticam {
-            Button("Export Multicam…") { multicam.exportRequested.toggle() }
+            Button("Export Multicam…", action: multicam.chooseProgramExport)
                 .keyboardShortcut("e")
                 .disabled(multicam.project == nil || multicam.isBusy)
             Button("Replace Source Audio…", action: multicam.chooseReplacementAudio)
@@ -184,7 +224,7 @@ private struct ExportCommands: View {
                 .keyboardShortcut("e", modifiers: [.command, .shift])
                 .disabled(!editor.canShowBulkQueue)
             Button("Export Current Frame…", action: editor.chooseStillFrame)
-                .disabled(!editor.canEdit || editor.jpegSourceAtPlayhead == nil)
+                .disabled(!editor.canEdit || editor.jpegSourceAtPlayhead?.frame == nil)
             Button("Export JPEG Frames…", action: editor.chooseJPEGExport)
                 .disabled(!editor.canEdit || editor.audioPreviewClip != nil)
             Button("Show Last Export in Finder", action: editor.showExportInFinder)
@@ -204,6 +244,14 @@ private struct SequenceCommands: View {
     let isMulticam: Bool
 
     var body: some View {
+        let tool = isMulticam ? $multicam.rangeTool : $editor.rangeTool
+        Picker("Timeline Tool", selection: tool) {
+            Text("Pointer (A)").tag(false)
+            Text("Range Selection (R)").tag(true)
+        }
+        .pickerStyle(.inline)
+        .disabled(isMulticam ? multicam.project == nil || multicam.isBusy : !editor.canEdit)
+        Divider()
         if isMulticam {
             Button("Mark In") { multicam.markIn = multicam.markAnalysisTime() }
                 .keyboardShortcut("i", modifiers: [])
@@ -216,7 +264,7 @@ private struct SequenceCommands: View {
                 multicam.markOut = nil
             }
                 .keyboardShortcut(.escape, modifiers: [])
-                .disabled(multicam.markIn == nil && multicam.markOut == nil)
+                .disabled(multicam.markIn == nil && multicam.markOut == nil && multicam.assemblySelection == nil)
             Button("Add Marked Range to Assembly", action: multicam.addMarkedRange)
                 .keyboardShortcut("a", modifiers: [.command, .option])
                 .disabled(!multicam.canAddMarkedRange)
@@ -250,13 +298,17 @@ private struct SequenceCommands: View {
                 .keyboardShortcut("a", modifiers: [.command, .shift])
                 .disabled(!editor.canAddMarkedRange)
             Divider()
-            Button("Split at Playhead", action: editor.split)
-                .keyboardShortcut("b", modifiers: [.command])
-                .disabled(!editor.canEdit)
+            Button(editor.rangeTool ? "Split at Selection Edges" : "Split at Playhead") {
+                if editor.rangeTool { editor.splitSelectedRange() } else { editor.split() }
+            }
+            .keyboardShortcut("b")
+            .disabled(editor.rangeTool ? !editor.canSplitSelectedRange : !editor.canEdit)
             Button(editor.deleteTitle, action: editor.deleteSelection)
                 .keyboardShortcut(.delete, modifiers: [])
                 .disabled(!editor.canDelete)
             Divider()
+            Button("Apply CSV to Selected Clip…", action: editor.chooseClipCSV)
+                .disabled(!editor.canEdit || editor.selectedID == nil)
             Menu("Trim Selected Clip") {
                 Button("Trim Start to Playhead") { editor.trimSelected(.start) }
                     .disabled(!editor.canTrimSelected(.start, restore: false))
@@ -291,9 +343,11 @@ private struct MulticamRangeCommands: View {
             Button("Trim End to Playhead") { model.trimOccurrence(.end) }
         }
         .disabled(!model.canTrimOccurrence)
-        Button("Split Assembly Range at Playhead", action: model.splitOccurrence)
-            .keyboardShortcut("b")
-            .disabled(!model.canCutOccurrence)
+        Button(model.rangeTool ? "Split at Selection Edges" : "Split Assembly Range at Playhead") {
+            if model.rangeTool { model.splitSelectedRange() } else { model.splitOccurrence() }
+        }
+        .keyboardShortcut("b")
+        .disabled(model.rangeTool ? !model.canSplitSelectedRange : !model.canCutOccurrence)
     }
 }
 
@@ -332,51 +386,76 @@ private struct UndoCommands: View {
     @ObservedObject var multicam: MulticamEditorModel
     @ObservedObject var text: TextFocus
     let isMulticam: Bool
+    let showHistory: () -> Void
 
     var body: some View {
-        Button(text.isEditing || isMulticam ? "Undo" : editor.undoTitle) {
-            if let text = activeTextUndoManager() { if text.canUndo { text.undo() } }
-            else if isMulticam { multicam.undo() }
-            else { editor.undo() }
+        Button(text.isEditing ? text.undoTitle : (isMulticam ? multicam.undoTitle : editor.undoTitle)) {
+            text.performUndo { if isMulticam { multicam.undo() } else { editor.undo() } }
         }
         .keyboardShortcut("z")
-        .disabled(!text.isEditing && !(isMulticam ? !multicam.isBusy && !multicam.undoStack.isEmpty : editor.canUndo))
-        Button(text.isEditing || isMulticam ? "Redo" : editor.redoTitle) {
-            if let text = activeTextUndoManager() { if text.canRedo { text.redo() } }
-            else if isMulticam { multicam.redo() }
-            else { editor.redo() }
+        .disabled(text.isEditing ? !text.canUndo : (isMulticam ? multicam.isBusy || multicam.undoStack.isEmpty : !editor.canUndo))
+        Button(text.isEditing ? text.redoTitle : (isMulticam ? multicam.redoTitle : editor.redoTitle)) {
+            text.performRedo { if isMulticam { multicam.redo() } else { editor.redo() } }
         }
         .keyboardShortcut("z", modifiers: [.command, .shift])
-        .disabled(!text.isEditing && !(isMulticam ? !multicam.isBusy && !multicam.redoStack.isEmpty : editor.canRedo))
+        .disabled(text.isEditing ? !text.canRedo : (isMulticam ? multicam.isBusy || multicam.redoStack.isEmpty : !editor.canRedo))
+        Button("Project History…", action: showHistory)
+            .keyboardShortcut("y", modifiers: [.command, .shift])
+            .disabled(isMulticam ? multicam.isBusy || multicam.notice != nil : editor.isBusy || editor.alert != nil)
     }
 }
 
-@MainActor private var activeTextView: NSTextView? {
-    guard let text = NSApp.keyWindow?.firstResponder as? NSTextView, text.isEditable else { return nil }
-    return text
-}
+/// Project shortcuts follow the field editor while it owns the keyboard, even if its undo stack is empty.
+@MainActor final class TextFocus: NSObject, ObservableObject {
+    private struct Editing: Equatable {
+        let undo: String?
+        let redo: String?
+    }
 
-/// While text is being edited, Undo belongs to the text field rather than to the timeline.
-@MainActor private func activeTextUndoManager() -> UndoManager? {
-    activeTextView.map { $0.undoManager ?? UndoManager() }
-}
+    @Published private var editing: Editing?
+    private let keyWindow: @MainActor () -> NSWindow?
+    var isEditing: Bool { editing != nil }
+    var canUndo: Bool { editing?.undo != nil }
+    var canRedo: Bool { editing?.redo != nil }
+    var undoTitle: String { editing?.undo ?? "Undo" }
+    var redoTitle: String { editing?.redo ?? "Redo" }
 
-/// A focus change publishes nothing by itself, so the Undo commands follow it from here.
-@MainActor private final class TextFocus: ObservableObject {
-    @Published private(set) var isEditing = false
-    private var observer: NSObjectProtocol?
+    init(keyWindow: @escaping @MainActor () -> NSWindow? = { NSApp?.keyWindow }) {
+        self.keyWindow = keyWindow
+        super.init()
+        NotificationCenter.default.addObserver(self, selector: #selector(refresh),
+                                               name: NSApplication.didUpdateNotification, object: nil)
+        refresh()
+    }
 
-    init() {
-        observer = NotificationCenter.default.addObserver(forName: NSApplication.didUpdateNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                let editing = activeTextView != nil
-                if editing != self.isEditing { self.isEditing = editing }
-            }
+    private var fieldEditor: NSTextView? {
+        guard let view = keyWindow()?.firstResponder as? NSTextView, view.isEditable else { return nil }
+        return view
+    }
+
+    @objc func refresh() {
+        let state = fieldEditor.map { view in
+            let manager = view.undoManager
+            return Editing(undo: manager?.canUndo == true ? manager?.undoMenuItemTitle : nil,
+                           redo: manager?.canRedo == true ? manager?.redoMenuItemTitle : nil)
         }
+        if state != editing { editing = state }
+    }
+
+    func performUndo(timeline: () -> Void = {}) {
+        if let view = fieldEditor {
+            if let manager = view.undoManager, manager.canUndo { manager.undo() }
+        } else { timeline() }
+        refresh()
+    }
+
+    func performRedo(timeline: () -> Void = {}) {
+        if let view = fieldEditor {
+            if let manager = view.undoManager, manager.canRedo { manager.redo() }
+        } else { timeline() }
+        refresh()
     }
 }
-
 
 private struct MulticamPlaybackCommands: View {
     @ObservedObject var model: MulticamEditorModel

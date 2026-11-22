@@ -48,11 +48,11 @@ package enum MulticamSilencePlanner {
     }
 
     package static func retainedOccurrences(_ ranges: [MulticamRange], pauses: [MulticamPauseEdit],
-                                            scope: AudioSpan? = nil) -> [(occurrence: Int, span: AudioSpan)] {
+                                            scope: AudioSpan? = nil,
+                                            occurrenceScopes: [AudioSpan?]? = nil) -> [(occurrence: Int, span: AudioSpan)] {
         let cuts = Dictionary(grouping: pauses, by: { $0.id.occurrence })
         return ranges.enumerated().flatMap { index, range -> [(Int, AudioSpan)] in
-            let original = span(range)
-            guard let domain = intersection(original, scope ?? original) else { return [] }
+            guard let domain = scoped(span(range), at: index, group: scope, occurrences: occurrenceScopes) else { return [] }
             return AudioAnalysis.retained(in: domain,
                 removing: (cuts[index] ?? []).compactMap(\.removal)).map { (index, $0) }
         }
@@ -72,10 +72,12 @@ package enum MulticamSilencePlanner {
     package static func plan(project: MulticamProject, media: [String: MediaInfo],
                              ranges: [MulticamRange], silences: [MulticamAudioSelection: SilenceAnalysisResult],
                              scope: AudioSpan?, minimum: Double, leave: Double, protected: Set<AudioSpan>,
-                             keyframesOnly: Bool = false, container: String = "mov") -> [MulticamPauseEdit] {
+                             keyframesOnly: Bool = false, container: String = "mov",
+                             occurrenceScopes: [AudioSpan?]? = nil) -> [MulticamPauseEdit] {
         guard !silences.isEmpty else { return [] }
         return plan(project: project, media: media, ranges: ranges, scope: scope, minimum: minimum,
-                    leave: leave, protected: protected, keyframesOnly: keyframesOnly, container: container) {
+                    leave: leave, protected: protected, keyframesOnly: keyframesOnly, container: container,
+                    occurrenceScopes: occurrenceScopes) {
             intervals, offsets in
             let routes = intervals.compactMap { interval -> MulticamSilenceRoute? in
                 guard let selection = interval.audio, let offset = offsets[selection.source],
@@ -90,6 +92,7 @@ package enum MulticamSilencePlanner {
     private static func plan(project: MulticamProject, media: [String: MediaInfo], ranges: [MulticamRange],
                              scope: AudioSpan?, minimum: Double, leave: Double, protected: Set<AudioSpan>,
                              keyframesOnly: Bool, container: String,
+                             occurrenceScopes: [AudioSpan?]? = nil,
                              pausesForOccurrence: ([MulticamInterval], [String: RationalTime]) -> [AudioSpan])
         -> [MulticamPauseEdit] {
         guard let plan = try? project.plan(ranges: ranges) else { return [] }
@@ -102,7 +105,7 @@ package enum MulticamSilencePlanner {
         let sound = soundIndexes(plan, media: media)
         return ranges.enumerated().flatMap { index, range -> [MulticamPauseEdit] in
             let clip = span(range)
-            guard let scoped = intersection(clip, scope ?? clip) else { return [] }
+            guard let scoped = scoped(clip, at: index, group: scope, occurrences: occurrenceScopes) else { return [] }
             let intervals = intervalGroups[index] ?? []
             let pauses = pausesForOccurrence(intervals, offsets)
             let first = pauses.lowerBound { $0.to > scoped.from }
@@ -123,6 +126,15 @@ package enum MulticamSilencePlanner {
                                          removal: removal, isProtected: keep)
             }
         }
+    }
+
+    private static func scoped(_ clip: AudioSpan, at index: Int, group: AudioSpan?,
+                               occurrences: [AudioSpan?]?) -> AudioSpan? {
+        if let occurrences {
+            guard occurrences.indices.contains(index), let selected = occurrences[index] else { return nil }
+            return intersection(clip, selected)
+        }
+        return intersection(clip, group ?? clip)
     }
 
     private static func pictureEdges(in window: AudioSpan, intervals: [MulticamInterval],

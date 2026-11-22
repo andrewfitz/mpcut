@@ -1,3 +1,4 @@
+import MPCutCore
 import SwiftUI
 
 /// One layout for every sheet: a title, an optional explanation, the content, and a trailing button row.
@@ -104,13 +105,5 @@ struct InsetPanel: ViewModifier {
 }
 
 func containerDisplayName(_ container: String) -> String {
-    switch container.lowercased() {
-    case "mov": "QuickTime (.mov)"
-    case "mp4": "MPEG-4 (.mp4)"
-    case "m4v": "MPEG-4 (.m4v)"
-    case "mkv": "Matroska (.mkv)"
-    case "webm": "WebM (.webm)"
-    case "wav": "WAVE (.wav)"
-    default: container.uppercased()
-    }
+    ExportRules.containerDisplayName(container)
 }

@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from fractions import Fraction
 from pathlib import Path
 import subprocess
 import tempfile
@@ -44,6 +45,20 @@ class CLIAuditFixes(unittest.TestCase):
 
     def bulk(self, directory="."):
         return {"file": "x.mp4", "outputDirectory": directory, "ranges": [{"from": "0", "to": "1"}]}
+
+    def test_ordered_export_ignores_unused_source_replacement(self):
+        source = Path(__file__).resolve().parents[1] / "MPCutAppTests/Fixtures/SmartTrim-GOP.mp4"
+        clips = [{"file": "omitted.mp4"}, {"file": str(source), "from": "2/25", "to": "12/25"}]
+        request = {"output": "ordered.mp4", "clips": clips, "order": [2]}
+        args = ["export", "--no-sidecar", "--stdin", "--json", "--dry-run"]
+        expected = self.report(*args, request=request)
+        self.assertEqual(expected["mode"], "smart")
+        self.assertEqual(self.report(*args, request={**request, "replaceAudio": "omitted.wav"}), expected)
+        clips[0]["replaceAudio"] = "omitted.wav"
+        self.assertEqual(self.report(*args, request=request), expected)
+        clips[0]["file"] = str(source)
+        error = self.failure(*args, request={**request, "mode": "smart"})
+        self.assertIn("Replacement audio requires copy mode", error["message"])
 
     def test_parent_reference_through_a_missing_folder_is_rejected(self):
         before = set(self.root.iterdir())
@@ -132,8 +147,8 @@ class CLIAuditFixes(unittest.TestCase):
         for command in (["bulk", "--json"], ["bulk", "--json", "--dry-run"], ["bulk", "--json", "--", "--stdin"]):
             with self.subTest(command=command):
                 error = self.failure(*command)
-                self.assertEqual((error["code"], error["message"]), ("invalid_arguments", "Bulk requires --json --stdin."))
-        self.assertEqual(self.run_cli("bulk", status=2).stderr, b"mpcut: Bulk requires --json --stdin.\n")
+                self.assertEqual((error["code"], error["message"]), ("invalid_arguments", "Use bulk SOURCE --ranges LIST --output DIRECTORY, or supply a complete bulk request."))
+        self.assertEqual(self.run_cli("bulk", status=2).stderr, b"mpcut: Use bulk SOURCE --ranges LIST --output DIRECTORY, or supply a complete bulk request.\n")
 
     def test_unknown_fields_name_the_object_that_contains_them(self):
         time = {"numerator": 1, "denominator": 1, "x": 2}
@@ -162,6 +177,37 @@ class CLIAuditFixes(unittest.TestCase):
                 self.assertIn("64 MB", error["message"])
         request = json.dumps({"output": "o.mp4", "clips": [{"file": "x.mp4"}]}).encode()
         self.report("export", "--json", "--stdin", "--dry-run", request=request.rjust(limit))
+
+    def test_large_inspection_reports_preserve_order_and_half_open_windows(self):
+        # Both the frame and packet reply exceed the in-memory buffer.
+        source = self.root / "long.mp4"
+        subprocess.run([FFMPEG, "-loglevel", "error", "-f", "lavfi", "-i", "color=s=16x16:r=60:d=180",
+                        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "180",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", source], check=True, timeout=60)
+        for flag, key, expected in [("--frames", "frames", 10800), ("--audio-packets", "audioPackets", None)]:
+            with self.subTest(query=flag):
+                args = ("inspect", "--no-sidecar", flag, str(source))
+                raw = self.run_cli(*args, "--json").stdout
+                self.assertGreater(len(raw), 1024 * 1024)
+                rows = json.loads(raw)["media"][key]
+                if expected is not None:
+                    self.assertEqual(len(rows), expected)
+                else:
+                    probe = subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "a:0",
+                                                     "-show_entries", "stream=nb_frames", "-of", "csv=p=0", source], timeout=30)
+                    self.assertEqual(len(rows), int(probe))
+                times = [Fraction(r["time"]["numerator"], r["time"]["denominator"]) for r in rows]
+                self.assertEqual(times, sorted(times))
+                window = self.report(*args, "--from", "159", "--to", "160")["media"][key]
+                self.assertEqual(window, [r for r, t in zip(rows, times) if 159 <= t < 160])
+                self.assertEqual(self.report(*args, "--from", "200")["media"][key], [])
+
+        with subprocess.Popen([CLI, "inspect", "--no-sidecar", "--frames", "--json", source],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            self.assertTrue(process.stdout.read(256))
+            process.stdout.close()
+            self.assertEqual(process.wait(timeout=30), 1)
+            self.assertEqual(process.stderr.read(), b"")
 
     def test_closed_result_pipe_ends_quietly(self):
         for command in (["inspect", "--json", "--frames", "x.mp4"], ["inspect", "--frames", "x.mp4"], ["--version"],

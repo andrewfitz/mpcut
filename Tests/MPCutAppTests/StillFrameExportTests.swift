@@ -33,6 +33,27 @@ final class StillFrameExportTests: XCTestCase {
         XCTAssertEqual(editor.jpegSourceAtPlayhead?.frame, frames[2].time)
     }
 
+    @MainActor
+    func testWholeSourceJPEGsRemainAvailableBeforeFirstPicture() async throws {
+        let file = try XCTUnwrap(Bundle.module.url(forResource: "Leading-Picture-Gap", withExtension: "avi",
+                                                   subdirectory: "Fixtures"))
+        let editor = EditorModel()
+        editor.useAnalysisSidecars = false
+        defer { editor.endSession() }
+        editor.importFiles([file])
+        let deadline = ContinuousClock.now + .seconds(10)
+        while editor.isBusy, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertNil(editor.alert)
+        let source = try XCTUnwrap(editor.jpegSourceAtPlayhead)
+        XCTAssertGreaterThan(try XCTUnwrap(source.media.frames.first?.time), .zero)
+        XCTAssertNil(source.frame)
+        let options = JPEGExportOptions()
+        _ = options.panel(source: file, hasAudio: false, hasPictureAtPlayhead: false)
+        XCTAssertEqual(options.mode, .scenes)
+        editor.seek(try XCTUnwrap(source.media.frames.first?.time.seconds))
+        XCTAssertNotNil(editor.jpegSourceAtPlayhead?.frame)
+    }
+
     func testMulticamProgramCutAndReorderedExclusiveEndUseExactSourceClock() throws {
         let engine = CutEngine(useSidecar: false)
         let source = try fixture("Multicam-Delayed-ProRes")

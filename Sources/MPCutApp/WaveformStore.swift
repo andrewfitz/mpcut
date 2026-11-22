@@ -12,6 +12,7 @@ final class WaveformStore {
 
 
     private var usesSidecar = true
+    private var exclusions: Set<URL> = []
     private var keys: [UUID: AudioAnalysisCacheKey] = [:]
     private var completedTracks: [UUID: [Int: Completed]] = [:]
     private var jobs: [UUID: EditCancellation] = [:]
@@ -20,13 +21,19 @@ final class WaveformStore {
     private(set) var issues: [UUID: String] = [:]
     var changed: ((_ completed: Bool) -> Void)?
 
-    func update(sources: [UUID: MediaInfo], track: Int, useSidecar: Bool = true) {
+    func update(sources: [UUID: MediaInfo], track: Int, useSidecar: Bool = true, excludedSources: Set<URL> = []) {
         if usesSidecar != useSidecar {
             for id in Array(jobs.keys) { forget(id) }
             usesSidecar = useSidecar
         }
+        if exclusions != excludedSources {
+            for (id, media) in sources where AnalysisSidecar.isExcluded(media.url, in: exclusions) != AnalysisSidecar.isExcluded(media.url, in: excludedSources) {
+                forget(id)
+            }
+            exclusions = excludedSources
+        }
         detail.changed = { [weak self] in self?.changed?(false) }
-        detail.update(sources: sources, track: track, readSidecars: useSidecar)
+        detail.update(sources: sources, track: track, readSidecars: useSidecar, excludedSources: excludedSources)
         completedTracks = completedTracks.filter { sources[$0.key] != nil }
         for id in Array(keys.keys) where sources[id] == nil { forget(id) }
         for (id, media) in sources {
@@ -42,6 +49,7 @@ final class WaveformStore {
                 finished.insert(id)
                 continue
             }
+            let useSidecar = useSidecar && !AnalysisSidecar.isExcluded(media.url, in: excludedSources)
             let token = EditCancellation()
             jobs[id] = token
             EditorAnalysisQueues.scans.addOperation { [weak self] in

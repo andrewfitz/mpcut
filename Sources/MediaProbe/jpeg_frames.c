@@ -150,6 +150,13 @@ static int read_to(MPJPEGReader *r, int64_t pts)
         if (failures < 64 && skip_damage(r, ret)) { failures++; continue; }
         if (ret >= 0) {
             failures = 0;
+            if (r->frame->decode_error_flags || (r->frame->flags & AV_FRAME_FLAG_CORRUPT)) {
+                // A software decoder can deliver a concealed picture with a success status.
+                // Later pictures can depend on it until a new keyframe has decoded.
+                skip_damage(r, AVERROR_INVALIDDATA);
+                av_frame_unref(r->frame);
+                continue;
+            }
             r->hardware_failures = 0;
             r->saw_frame = true;
             const AVFrameSideData *matrix = av_frame_get_side_data(r->frame, AV_FRAME_DATA_DISPLAYMATRIX);

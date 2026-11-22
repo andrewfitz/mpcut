@@ -16,7 +16,7 @@ final class SidecarStorageTests: XCTestCase {
 
     func testReadOnlyLookupAndSelectiveIntegrity() throws {
         let sidecar = try makeSidecar()
-        XCTAssertEqual(sidecar.url.lastPathComponent, "shot.mov.mpcut")
+        XCTAssertEqual(sidecar.url.lastPathComponent, "shot.mov.cutdb")
         XCTAssertEqual(sidecar.status(), "missing")
         XCTAssertNil(sidecar.read("a"))
         XCTAssertEqual(sidecar.keys(), [])
@@ -40,6 +40,68 @@ final class SidecarStorageTests: XCTestCase {
         try sidecar.save(["a": Data([3, 4])])
         XCTAssertEqual(sidecar.read("a"), Data([3, 4]))
         XCTAssertEqual(sidecar.keys(), ["a", "b"])
+    }
+
+    func testProjectHistoryExcludesOnlyCollidingCachesEvenWhenNoStepsAreRestored() throws {
+        let cache = try makeSidecar()
+        let folder = cache.source.deletingLastPathComponent()
+        let other = folder.appendingPathComponent("Other.mov")
+        try Data([4, 5]).write(to: other)
+        let otherCache = try AnalysisSidecar(source: other)
+        let document = folder.appendingPathComponent("Edit.cut")
+        func clip(_ name: String) -> CutSequenceClip {
+            .init(id: name, file: name, from: .zero, to: .init(numerator: 1))
+        }
+        let current = CutProject.sequence([clip(cache.source.lastPathComponent), clip(other.lastPathComponent)])
+        let history = CutHistoryState(action: "Remove Source",
+                                      project: .sequence([clip(cache.url.lastPathComponent)]))
+        try current.save(to: document, undo: [history], redo: [])
+        let opened = try CutProject.loadEditorDocument(from: document, limit: 0)
+        XCTAssertTrue(opened.undo.isEmpty)
+        let blocked = opened.media.sidecarExclusions(relativeTo: document)
+        XCTAssertTrue(AnalysisSidecar.isExcluded(cache.source, in: blocked))
+        XCTAssertFalse(AnalysisSidecar.isExcluded(other, in: blocked))
+        try AnalysisSidecar.$excludedSources.withValue(blocked) {
+            cache.saveAutomatically(["peek": Data([1])])
+            XCTAssertFalse(FileManager.default.fileExists(atPath: cache.url.path))
+            XCTAssertThrowsError(try cache.save(["manual": Data()]))
+            otherCache.saveAutomatically(["peek": Data([2])])
+            XCTAssertEqual(otherCache.read("peek"), Data([2]))
+        }
+        try cache.save(["old": Data([1])])
+        let before = try Data(contentsOf: cache.url)
+        AnalysisSidecar.$excludedSources.withValue(blocked) {
+            XCTAssertEqual(cache.keys(), [])
+            XCTAssertNil(cache.read("old"))
+            XCTAssertEqual(cache.status(), "excluded")
+            cache.saveAutomatically(["new": Data([3])])
+        }
+        XCTAssertEqual(try Data(contentsOf: cache.url), before)
+    }
+
+    func testSidecarExclusionsFollowCameraAliasesJournalTargetsAndHardLinks() throws {
+        let cache = try makeSidecar()
+        let folder = cache.source.deletingLastPathComponent()
+        let sourceAlias = folder.appendingPathComponent("selected.mov")
+        try FileManager.default.createSymbolicLink(at: sourceAlias, withDestinationURL: cache.source)
+        let protected = folder.appendingPathComponent("offline.wav")
+        for suffix in ["", "-journal", "-wal", "-shm"] {
+            let destination = URL(fileURLWithPath: cache.url.path + suffix)
+            try FileManager.default.createSymbolicLink(at: protected, withDestinationURL: destination)
+            let blocked = CutProject.sidecarExclusions(absoluteSources: [protected.path: "mic"], candidates: [sourceAlias])
+            XCTAssertTrue(AnalysisSidecar.isExcluded(cache.source, in: blocked), suffix)
+            XCTAssertTrue(AnalysisSidecar.isExcluded(sourceAlias, in: blocked), suffix)
+            try FileManager.default.removeItem(at: protected)
+        }
+        try Data([1]).write(to: cache.url)
+        try FileManager.default.linkItem(at: cache.url, to: protected)
+        XCTAssertTrue(AnalysisSidecar.isExcluded(cache.source, in: CutProject.sidecarExclusions(
+            absoluteSources: [protected.path: "mic"], candidates: [cache.source])))
+        if try folder.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames == false {
+            let caseVariant = folder.appendingPathComponent(cache.url.lastPathComponent.uppercased())
+            XCTAssertTrue(AnalysisSidecar.isExcluded(sourceAlias, in: CutProject.sidecarExclusions(
+                absoluteSources: [caseVariant.path: "mic"], candidates: [sourceAlias])))
+        }
     }
 
     func testStaleSourceCannotPublishAndRefreshDropsOldSections() throws {

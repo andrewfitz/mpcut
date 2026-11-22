@@ -114,7 +114,7 @@ int mp_float_pcm_peaks(const float *samples, int frames, int channels, int rate,
     return peaks(&plane, AV_SAMPLE_FMT_FLT, frames, channels, rate, start, duration, visit, context);
 }
 
-static int read_peaks(const char *path, int stream, double origin, double duration, MPAudioEnvelope *window, int seek,
+static int read_peaks(const char *path, int stream, double origin, double duration, MPAudioEnvelope *window, int seek, int ordered_clock,
                    MPProbeCancelled cancelled, MPPeakVisit visit, void *context,
                    char *error, size_t capacity)
 {
@@ -224,7 +224,8 @@ static int read_peaks(const char *path, int stream, double origin, double durati
             if (frame->best_effort_timestamp == AV_NOPTS_VALUE) damaged++;
             else {
                 decoded++;
-                double start = frame->best_effort_timestamp * timestamp_tick - origin;
+                const double timestamp = frame->best_effort_timestamp * timestamp_tick - origin;
+                double start = timestamp;
                 // A millisecond container clock can round neighboring PCM blocks in opposite
                 // directions. Keep a sample-continuous clock within its timestamp precision.
                 // On an exact sample clock even a one-sample gap is meaningful.
@@ -241,8 +242,14 @@ static int read_peaks(const char *path, int stream, double origin, double durati
                     }
                     run_samples += frame->nb_samples;
                 }
+                // On a coarse clock the next corrected sample time can precede its rounded PTS.
+                // Wait until even that earliest time is outside the peak collection interval.
+                double tolerance = coarse_clock ? timestamp_tick + 0.5 / frame->sample_rate : 0;
+                if ((window && start >= duration) || (ordered_clock && timestamp - tolerance >= duration)) {
+                    ret = 0;
+                    goto done;
+                }
                 if (window) {
-                    if (start >= window->to) { ret = 0; goto done; }
                     ret = mp_envelope_frame(frame->extended_data, frame->format, frame->nb_samples,
                                             frame->ch_layout.nb_channels, frame->sample_rate, start, window);
                 } else {
@@ -264,19 +271,19 @@ done:
     avcodec_free_context(&decoder);
     avformat_close_input(&input);
     if (retry_from_start)
-        return read_peaks(path, stream, origin, duration, window, 0, cancelled, visit, context, error, capacity);
+        return read_peaks(path, stream, origin, duration, window, 0, ordered_clock, cancelled, visit, context, error, capacity);
     return ret;
 }
 
-int mp_audio_peaks(const char *path, int stream, double origin, double duration,
+int mp_audio_peaks(const char *path, int stream, double origin, double duration, int ordered_clock,
                    MPProbeCancelled cancelled, MPPeakVisit visit, void *context,
                    char *error, size_t capacity)
 {
-    return read_peaks(path, stream, origin, duration, NULL, 0, cancelled, visit, context, error, capacity);
+    return read_peaks(path, stream, origin, duration, NULL, 0, ordered_clock, cancelled, visit, context, error, capacity);
 }
 
 int mp_audio_envelope(const char *path, int stream, double origin, MPAudioEnvelope *window,
                       MPProbeCancelled cancelled, void *context, char *error, size_t capacity)
 {
-    return read_peaks(path, stream, origin, window->to, window, 1, cancelled, NULL, context, error, capacity);
+    return read_peaks(path, stream, origin, window->to, window, 1, 0, cancelled, NULL, context, error, capacity);
 }

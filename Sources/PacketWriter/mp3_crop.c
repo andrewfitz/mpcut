@@ -7,45 +7,34 @@
 // LAME stores encoder delay and end padding as two unsigned 12-bit fields.
 // The MPEG audio decoder adds 529 samples to encoder delay and subtracts
 // them from end padding. Neither stored field may be clipped by the muxer.
-enum { decoder_delay = 529, max_skip = 4095 + decoder_delay };
+enum { decoder_delay = 529, max_skip = MPCUT_MP3_MAX_SKIP };
 
-typedef struct {
-    int samples, back_reference, main_bytes, reservoir_limit;
-} Layer3Frame;
-
-static int layer3_frame(const AVPacket *packet, int rate, Layer3Frame *frame) {
-    static const int rates[] = {44100, 48000, 32000};
-    static const int kbps[2][15] = {
-        {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160},
-        {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320}
-    };
-    if (packet->size < 4) return 0;
-    const uint8_t *data = packet->data;
-    int version = (data[1] >> 3) & 3;
-    int mpeg1 = version == 3;
-    int rate_code = (data[2] >> 2) & 3, bit_rate = data[2] >> 4;
-    if (data[0] != 255 || (data[1] & 0xe6) != 0xe2 || version == 1 || rate_code == 3 ||
-        bit_rate == 0 || bit_rate == 15 || rate != rates[rate_code] / (mpeg1 ? 1 : version == 2 ? 2 : 4))
-        return 0;
-    int size = (mpeg1 ? 144000 : 72000) * kbps[mpeg1][bit_rate] / rate + ((data[2] >> 1) & 1);
-    int mono = data[3] >> 6 == 3;
-    int side_offset = 4 + ((data[1] & 1) ? 0 : 2);
-    int side_size = mpeg1 ? (mono ? 17 : 32) : (mono ? 9 : 17);
-    if (size != packet->size || size < side_offset + side_size) return 0;
-    frame->samples = mpeg1 ? 1152 : 576;
-    frame->back_reference = mpeg1 ? AV_RB16(data + side_offset) >> 7 : data[side_offset];
-    frame->main_bytes = size - side_offset - side_size;
-    frame->reservoir_limit = mpeg1 ? 511 : 255;
-    return 1;
-}
+#include "../CFFmpeg/layer3_frame.h"
 
 static int crop_error(char *error, size_t capacity, const char *message) {
     if (error && capacity) snprintf(error, capacity, "%s", message);
     return 1;
 }
 
+// Seek a separate demuxer so a missing or stale anchor leaves the original
+// demuxer's buffered packets available for sequential verification.
+static AVFormatContext *seek_anchor(AVFormatContext *input, int index, int64_t start,
+                                    MPCutMP3Anchor anchor, AVPacket *packet) {
+    if (anchor.sample <= 0 || anchor.sample > start - max_skip || anchor.offset <= 0) return NULL;
+    AVFormatContext *seek = NULL;
+    if (avformat_open_input(&seek, input->url, input->iformat, NULL) < 0) return NULL;
+    avformat_flush(seek);
+    if (seek->pb && avio_seek(seek->pb, anchor.offset, SEEK_SET) == anchor.offset &&
+        av_read_frame(seek, packet) >= 0 && packet->stream_index == index &&
+        packet->pts != AV_NOPTS_VALUE && packet->pos == anchor.offset &&
+        av_adler32_update(1, packet->data, packet->size) == anchor.checksum) return seek;
+    av_packet_unref(packet);
+    avformat_close_input(&seek);
+    return NULL;
+}
+
 static int crop(AVFormatContext *input, int index, AVFormatContext *output,
-                int64_t start, int64_t end, MPCutProgress progress, void *context,
+                int64_t start, int64_t end, MPCutMP3Anchor anchor, MPCutProgress progress, void *context,
                 char *error, size_t capacity) {
     if (index < 0 || (unsigned)index >= input->nb_streams || end <= start || start < 0 ||
         strcmp(input->iformat->name, "mp3") || input->streams[index]->codecpar->codec_id != AV_CODEC_ID_MP3)
@@ -61,7 +50,11 @@ static int crop(AVFormatContext *input, int index, AVFormatContext *output,
     uint64_t seen = 0;
     int64_t next = AV_NOPTS_VALUE, first = 0, stop = 0, stable_after = 0;
     const char *failure = "The MP3 ended before the requested samples.";
-    while (av_read_frame(input, packet) >= 0) {
+    AVFormatContext *seek = seek_anchor(input, index, start, anchor, packet);
+    int buffered = seek != NULL;
+    int64_t base_sample = buffered ? av_rescale_q(packet->pts, stream->time_base, samples) : 0;
+    while (buffered || av_read_frame(seek ? seek : input, packet) >= 0) {
+        buffered = 0;
         if (packet->stream_index != index) {
             av_packet_unref(packet);
             continue;
@@ -69,6 +62,10 @@ static int crop(AVFormatContext *input, int index, AVFormatContext *output,
         Layer3Frame frame;
         int64_t pts = av_rescale_q_rnd(packet->pts, stream->time_base, samples,
                                        AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+        if (seek && pts != AV_NOPTS_VALUE) {
+            int64_t relative = av_sat_sub64(pts, base_sample);
+            pts = av_sat_add64(anchor.sample, relative);
+        }
         if (pts == AV_NOPTS_VALUE || (next != AV_NOPTS_VALUE && pts != next) ||
             !layer3_frame(packet, rate, &frame) || (spf && spf != frame.samples) ||
             pts < 0 || pts > INT64_MAX - 2 * 1152) {
@@ -83,7 +80,7 @@ static int crop(AVFormatContext *input, int index, AVFormatContext *output,
             // Include as much original history as the encoder-delay field can hide.
             int64_t offset = distance > max_skip ? (distance - max_skip + spf - 1) / spf : 0;
             first = pts + offset * spf;
-            from_source_head = first == pts;
+            from_source_head = !seek && first == pts;
             stable_after = first;
             if (start - first < decoder_delay) {
                 failure = "Xing cannot represent the required leading skip at this MP3 cut.";
@@ -141,13 +138,14 @@ static int crop(AVFormatContext *input, int index, AVFormatContext *output,
             break;
         }
     }
+    avformat_close_input(&seek);
     av_packet_free(&packet);
     if (result) crop_error(error, capacity, failure);
     return result;
 }
 
 int mpcut_check_mp3_crop(const char *path, int index, int64_t start, int64_t end,
-                         MPCutProgress progress, void *context, char *error, size_t capacity) {
+                         MPCutMP3Anchor anchor, MPCutProgress progress, void *context, char *error, size_t capacity) {
     if (progress && progress(context, 0)) {
         crop_error(error, capacity, "Export cancelled");
         return 2;
@@ -160,13 +158,13 @@ int mpcut_check_mp3_crop(const char *path, int index, int64_t start, int64_t end
         avformat_close_input(&input);
         return crop_error(error, capacity, "Cannot open the MP3 source to verify decoder preroll.");
     }
-    result = crop(input, index, NULL, start, end, progress, context, error, capacity);
+    result = crop(input, index, NULL, start, end, anchor, progress, context, error, capacity);
     avformat_close_input(&input);
     return result;
 }
 
 int mpcut_write_mp3_crop(AVFormatContext *input, int index, AVFormatContext *output,
-                         int64_t start, int64_t end, MPCutProgress progress, void *context,
+                         int64_t start, int64_t end, MPCutMP3Anchor anchor, MPCutProgress progress, void *context,
                          char *error, size_t capacity) {
-    return crop(input, index, output, start, end, progress, context, error, capacity);
+    return crop(input, index, output, start, end, anchor, progress, context, error, capacity);
 }

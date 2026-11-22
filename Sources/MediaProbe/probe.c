@@ -1,5 +1,6 @@
 #include "MediaProbe.h"
 #include "codec_header.h"
+#include "../CFFmpeg/layer3_frame.h"
 #include "../CFFmpeg/copy_probe.h"
 #include "mov_index.h"
 #include "video_clock.h"
@@ -39,6 +40,7 @@ void mp_probe_free(MPProbeResult *result)
         if (stream->flac_parser)
             av_parser_close(stream->flac_parser);
         avcodec_free_context(&stream->flac_context);
+        av_free(stream->mp3_anchors);
         av_free(stream->packets);
         av_free(stream->config);
         av_free(stream->metadata);
@@ -477,6 +479,29 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
             return AVERROR(ENOMEM);
         stream->packets = packets;
         stream->capacity = capacity;
+    }
+    // Index only a verified continuous Layer III sample clock. An unusual file
+    // keeps the sequential crop verifier, including its prefix diagnostics.
+    if (params->codec_id == AV_CODEC_ID_MP3 && !strcmp(result->format, "mp3") && !stream->mp3_unindexed) {
+        Layer3Frame frame;
+        AVRational base = {stream->tb_num, stream->tb_den}, samples = {1, params->sample_rate};
+        if (!layer3_frame(packet, params->sample_rate, &frame) || packet->pos < 0 ||
+            stream->count > INT64_MAX / frame.samples ||
+            av_rescale_q(packet->pts, base, samples) != (int64_t)stream->count * frame.samples ||
+            av_rescale_q(packet->duration, base, samples) != frame.samples) {
+            stream->mp3_unindexed = 1;
+            stream->mp3_anchor_count = 0;
+        } else if (stream->count % 64 == 0) {
+            size_t n = stream->mp3_anchor_count;
+            if (n % 128 == 0) {
+                void *anchors = av_realloc_array(stream->mp3_anchors, n + 128, sizeof(*stream->mp3_anchors));
+                if (!anchors) return AVERROR(ENOMEM);
+                stream->mp3_anchors = anchors;
+            }
+            stream->mp3_anchors[n] = (MPProbeMP3Anchor){(int64_t)stream->count * frame.samples,
+                packet->pos, av_adler32_update(1, packet->data, packet->size)};
+            stream->mp3_anchor_count++;
+        }
     }
     MPProbePacket *sample = &stream->packets[stream->count];
     *sample = (MPProbePacket){.pts = packet->pts, .dts = packet->dts, .duration = packet->duration,

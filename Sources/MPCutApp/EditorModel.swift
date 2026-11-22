@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Foundation
 import MPCutCore
+import UniformTypeIdentifiers
 
 private struct IndexedSource: Sendable {
     let id: UUID
@@ -44,8 +45,17 @@ private struct IndexedSource: Sendable {
     }
 }
 
+/// Occurrences can link to the same working movie with different replacement provenance.
+private struct DocumentSourceKey: Hashable {
+    let file: URL
+    let original: URL
+    let track: Int?
+    let names: [Int: String]
+}
+
 private struct EditorSegment: Sendable {
     let id: UUID
+    let documentID: String
     let source: IndexedSource
     var start: RationalTime
     var end: RationalTime
@@ -53,9 +63,10 @@ private struct EditorSegment: Sendable {
     // Retained pieces share protection choices belonging to this occurrence of a source.
     let occurrence: UUID
 
-    init(id: UUID = UUID(), source: IndexedSource, start: RationalTime = .zero, end: RationalTime? = nil,
+    init(id: UUID = UUID(), documentID: String? = nil, source: IndexedSource, start: RationalTime = .zero, end: RationalTime? = nil,
          displayRange: AudioSpan? = nil, occurrence: UUID? = nil) {
         self.id = id
+        self.documentID = documentID ?? id.uuidString
         self.source = source
         self.start = start
         self.displayRange = displayRange
@@ -63,7 +74,22 @@ private struct EditorSegment: Sendable {
         self.end = end ?? source.duration
     }
 
+    func split(at boundary: RationalTime, rightID: UUID) -> (left: Self, right: Self) {
+        var left = self
+        left.end = boundary
+        left.displayRange = AudioSpan(from: min(start, displayRange?.from ?? .zero), to: boundary)
+        let right = Self(id: rightID, source: source, start: boundary, end: end,
+                         displayRange: AudioSpan(from: boundary, to: max(end, displayRange?.to ?? source.duration)),
+                         occurrence: occurrence)
+        return (left, right)
+    }
+
     var duration: RationalTime { end - start }
+    func sequenceSeconds(at sourceTime: RationalTime, offset: RationalTime) -> Double {
+        if let exact = try? offset.adding(sourceTime.subtracting(start)) { return exact.seconds }
+        return offset.seconds + (sourceTime.seconds - start.seconds)
+    }
+
     var preview: PreviewRange {
         var range = PreviewRange(media: source.media, from: start, to: end)
         range.audioTrack = source.replacementTrack
@@ -100,20 +126,25 @@ private struct BoundaryIndex: Sendable {
         return first ? wholeEnds : finalEnds
     }
 
-    init(media: MediaInfo, container: String, engine: CutEngine) {
-        wholeStarts = engine.validBoundaries(in: media, start: true, container: container)
-        wholeEnds = engine.validBoundaries(in: media, start: false, container: container)
+    init(media: MediaInfo, container: String, engine: CutEngine) throws {
+        func boundaries(start: Bool, first: Bool = true, last: Bool = true) throws -> [RationalTime] {
+            try Task.checkCancellation()
+            return engine.validBoundaries(in: media, start: start, first: first, last: last, container: container)
+        }
+        wholeStarts = try boundaries(start: true)
+        wholeEnds = try boundaries(start: false)
         if media.audio.isEmpty {
             firstStarts = wholeStarts
             interiorStarts = wholeStarts
             finalEnds = wholeEnds
             interiorEnds = wholeEnds
         } else {
-            firstStarts = engine.validBoundaries(in: media, start: true, last: false, container: container)
-            interiorStarts = engine.validBoundaries(in: media, start: true, first: false, last: false, container: container)
-            finalEnds = engine.validBoundaries(in: media, start: false, first: false, container: container)
-            interiorEnds = engine.validBoundaries(in: media, start: false, first: false, last: false, container: container)
+            firstStarts = try boundaries(start: true, last: false)
+            interiorStarts = try boundaries(start: true, first: false, last: false)
+            finalEnds = try boundaries(start: false, first: false)
+            interiorEnds = try boundaries(start: false, first: false, last: false)
         }
+        try Task.checkCancellation()
         if engine.coalescesAdjacentRanges(in: media, container: container) {
             // Splitting a continuous source adds a timeline seam only. There is
             // no audio decoder restart at that point until the pieces move apart.
@@ -133,13 +164,16 @@ private struct BoundaryIndex: Sendable {
 
 private struct PreparedEdit: Sendable {
     var container: String?
+    static let backgroundCopyCheckBytes = 512 * 1024
     var firstSourceID: UUID?
+    var requiresBackgroundCopyChecks = false
     var sourceMedia: [UUID: MediaInfo] = [:]
 
     init() {}
 
     init(segments: [EditorSegment], previous: Self, engine: CutEngine) {
         sourceMedia = Dictionary(segments.map { ($0.source.id, $0.source.media) }, uniquingKeysWith: { first, _ in first })
+        requiresBackgroundCopyChecks = sourceMedia.values.reduce(0) { $0 + $1.indexStorageBytes } >= PreparedEdit.backgroundCopyCheckBytes
         guard let first = segments.first?.source, first.isIndexed else { return }
         firstSourceID = first.id
         container = first.id == previous.firstSourceID
@@ -148,6 +182,8 @@ private struct PreparedEdit: Sendable {
 }
 
 private struct EditSnapshot {
+    // Value-semantic clip records share storage with every retained history snapshot.
+    var documentClips: [CutSequenceClip] = []
     var segments: [EditorSegment] = []
     var timelineClips: [TimelineClip] = []
     var timelineThumbnailHeight = TimelineClip.minimumThumbnailHeight
@@ -164,6 +200,7 @@ private struct EditSnapshot {
 }
 
 final class EditCancellation: @unchecked Sendable {
+    let id = UUID()
     private let lock = NSLock()
     private var cancelled = false
     private var reportedProgress = 0.0
@@ -209,10 +246,28 @@ final class EditCancellation: @unchecked Sendable {
 }
 
 // Index and thumbnail workers consult the current preference before publishing a sidecar.
-private final class SidecarPreference: @unchecked Sendable {
+final class SidecarPreference: @unchecked Sendable {
     private let lock = NSLock()
     private var value = true
     private var change = EditCancellation()
+    private var exclusions: Set<URL> = []
+    private var cachedPermissions: [URL: Bool] = [:]
+
+    func setExclusions(_ urls: Set<URL>) {
+        let previous: EditCancellation? = lock.withLock {
+            guard urls != exclusions else { return nil }
+            exclusions = urls
+            cachedPermissions.removeAll()
+            let previous = change
+            change = EditCancellation()
+            return previous
+        }
+        previous?.cancel()
+    }
+
+    func permits(_ url: URL) -> Bool {
+        indexSettings(for: url).enabled
+    }
 
     var enabled: Bool {
         get { lock.withLock { value } }
@@ -228,8 +283,14 @@ private final class SidecarPreference: @unchecked Sendable {
         }
     }
 
-    func indexSettings() -> (enabled: Bool, change: EditCancellation) {
-        lock.withLock { (value, change) }
+    func indexSettings(for url: URL) -> (enabled: Bool, change: EditCancellation) {
+        lock.withLock {
+            guard value, !exclusions.isEmpty else { return (value, change) }
+            if let allowed = cachedPermissions[url] { return (allowed, change) }
+            let allowed = !AnalysisSidecar.isExcluded(url, in: exclusions)
+            cachedPermissions[url] = allowed
+            return (allowed, change)
+        }
     }
 }
 
@@ -253,6 +314,313 @@ final class EditorModel: ObservableObject {
     let preview: SequencePreview
 
     @Published private var edit = EditSnapshot()
+    @Published private(set) var projectURL: URL?
+    private(set) var openingProjectURL: URL?
+    let draft: ProjectDraft
+    private var committedBeforeImport: [CutSequenceClip]?
+    private var savedSequence: [CutSequenceClip] = []
+    // A named file can still reference older history beyond this window’s retention limit.
+    private var savedMediaPaths: [String: String] = [:]
+    private var lastSidecarPaths: Set<String> = []
+    private var lastSidecarCandidates: Set<URL> = []
+    private(set) var sidecarExclusions: Set<URL> = []
+    private var savedUndoIDs: [UUID] = []
+    private var savedRedoIDs: [UUID] = []
+    private var recoveredDraft = false
+    private var deferredDraftSave = false
+    var canSaveProjectTo: ((URL) -> Bool)?
+
+    private(set) var mcpGeneration = UUID()
+    private(set) var mcpRevision = 0
+    var mcpSequenceOffsets: [RationalTime] { edit.offsets }
+    var mcpClipIDs: [UUID] { edit.segments.map(\.id) }
+    var mcpTrimBoundary: RationalTime? { trimAudition?.2 }
+    private(set) var mcpTrimPreview: UUID?
+    func mcpTrimMatches(_ id: UUID, edge: TimelineEdge) -> Bool {
+        trimAudition?.0 == id && trimAudition?.1 == edge
+    }
+    func cancelMCPTrimPreview() {
+        if mcpTrimPreview != nil { cancelTrim() }
+    }
+
+    var mcpHasActiveTrim: Bool { trimOrigin != nil || trimValidation != nil }
+    var mcpHistoryLimit: Int { preferences.historyLimit }
+    var mcpDuration: RationalTime { edit.duration }
+
+    func mcpOccurrence(_ id: UUID) -> (start: RationalTime, end: RationalTime, offset: RationalTime, sourceDuration: RationalTime)? {
+        guard let index = segments.firstIndex(where: { $0.id == id }) else { return nil }
+        return (segments[index].start, segments[index].end, edit.offsets[index], segments[index].source.duration)
+    }
+
+    var mcpCopyContainers: [String] {
+        guard let source = segments.first?.source.media else { return [] }
+        let choices = CutEngine(tracks: source.hasVideo ? .all : .audio)
+            .suggestedContainers(for: source, clips: segments.map(\.request))
+        return source.hasVideo && choices.isEmpty ? [preferredCopyContainer ?? "mp4"] : choices
+    }
+
+    var sequenceClips: [CutSequenceClip] { edit.documentClips }
+
+    private func sequenceClips(for segments: [EditorSegment]) -> [CutSequenceClip] {
+        segments.map { clip in
+            CutSequenceClip(id: clip.documentID, file: clip.source.url.path,
+                            from: clip.start, to: clip.end, audioTrack: clip.source.replacementTrack,
+                            originalFile: clip.source.originalURL == clip.source.url ? nil : clip.source.originalURL.path,
+                            replacementNames: clip.source.replacementNames)
+        }
+    }
+
+    @Published private(set) var isProjectChanged = false
+
+    var canOpenProject: Bool {
+        projectURL == nil && draft.url == nil && isEmpty && !hasHistory && queuedRanges.isEmpty && !isBusy && alert == nil
+    }
+
+    func openProject(_ clips: [CutSequenceClip], at url: URL,
+                     history: (undo: [CutHistoryState], redo: [CutHistoryState])? = nil,
+                     reservation: ProjectDraft.Reservation? = nil, archiveMedia: CutProjectMedia? = nil,
+                     allowCommit: (() -> Bool)? = nil) throws {
+        guard canOpenProject else {
+            throw CutError(code: "editor_in_use", message: "Open the project in an empty editor window.")
+        }
+        let reservation = try reservation ?? draft.reserveIfRecoverable(url)
+        try CutProject.sequence(clips).validate()
+        let disk = history == nil && FileManager.default.fileExists(atPath: url.path)
+            ? try CutProject.loadEditorDocument(from: url, limit: preferences.historyLimit) : nil
+        let archive = history ?? (undo: disk?.undo ?? [], redo: disk?.redo ?? [])
+        let diskPaths = (archiveMedia ?? disk?.media)?.absoluteSources(relativeTo: url)
+        var resolvedPaths: [String: String] = [:]
+        func resolve(_ file: String) -> String {
+            if let cached = resolvedPaths[file] { return cached }
+            let path = CutProject.mediaURL(file, relativeTo: url).path
+            resolvedPaths[file] = path
+            return path
+        }
+        func absolute(_ clips: [CutSequenceClip]) -> [CutSequenceClip] {
+            clips.map { clip in
+                var copy = clip
+                copy.file = resolve(clip.file)
+                copy.originalFile = clip.originalFile.map(resolve)
+                return copy
+            }
+        }
+        func entries(_ states: [CutHistoryState]) throws -> [HistoryEntry] {
+            try states.map { state in
+                guard case .sequence(let clips) = state.project else {
+                    throw CutError(code: "invalid_cut_project", message: "A sequence history state must contain a sequence.")
+                }
+                return HistoryEntry(action: state.action, contents: .document(absolute(clips)))
+            }
+        }
+        let undo = try entries(archive.undo), redo = try entries(archive.redo)
+        let document = absolute(clips)
+        var paths = diskPaths ?? [:]
+        if diskPaths == nil {
+            for (relative, path) in resolvedPaths { paths[path] = relative }
+        }
+        let opened = {
+            self.mcpGeneration = UUID()
+            self.mcpRevision = 0
+            self.savedMediaPaths = paths
+            self.recoveredDraft = self.draft.adopt(reservation)
+            self.projectURL = self.recoveredDraft ? nil : url
+            self.undoStack = undo
+            self.redoStack = redo
+            self.enforceHistoryLimit()
+            self.markSaved()
+        }
+        if clips.isEmpty {
+            if allowCommit?() != false { opened() }
+        } else {
+            let files = try checkedFiles(document)
+            openingProjectURL = url
+            importFiles(files, projectClips: document, openingMedia: paths, allowCommit: allowCommit, installed: opened)
+        }
+    }
+
+    private func checkedFiles(_ clips: [CutSequenceClip]) throws -> [URL] {
+        // Archive references are absolute here. A once-offline traversal may now
+        // resolve through a mounted directory or a restored symlink.
+        var files: [String: URL] = [:]
+        return try clips.map { clip in
+            if let file = files[clip.file] { return file }
+            let file = URL(fileURLWithPath: clip.file)
+            let resolved = clip.file.split(separator: "/").contains("..")
+                ? try CutProject.checkedMediaURL(clip.file, relativeTo: file) : file
+            files[clip.file] = resolved
+            return resolved
+        }
+    }
+
+    private func markSaved() {
+        savedSequence = sequenceClips
+        savedUndoIDs = undoStack.map(\.id)
+        savedRedoIDs = redoStack.map(\.id)
+        isProjectChanged = recoveredDraft
+    }
+
+    func requestSaveProject(asNew: Bool = false) {
+        guard !isBusy else { return }
+        if let projectURL, !asNew { _ = saveProject(to: projectURL); return }
+        let panel = ProjectPanels.cutSavePanel(name: projectURL?.lastPathComponent ?? "Untitled.cut")
+        ProjectPanels.present(panel, in: editorWindow) { accepted in
+            if accepted, let url = panel.url { _ = self.saveProject(to: url) }
+        }
+    }
+
+    @discardableResult
+    func saveProject(to url: URL) -> Bool {
+        do {
+            try writeProject(to: url)
+            return true
+        } catch {
+            ProjectPanels.present(NSAlert(error: error), in: editorWindow)
+            return false
+        }
+    }
+
+    func writeProject(to url: URL, replacingExisting: Bool = true) throws {
+        guard !isBusy else {
+            throw CutError(code: "editor_busy", message: "Wait for the current operation to finish.")
+        }
+        guard canSaveProjectTo?(url) != false else {
+            throw CutError(code: "project_open", message: "Another window already has this project open.")
+        }
+        guard !ProjectDraft.isManaged(url), !draft.managesDestination(url) else {
+            throw CutError(code: "project_draft_destination", message: "Choose a location outside MPCut’s recovery folder.")
+        }
+        try validateHistoryDestination(url)
+        try documentWriter(replacingExisting: replacingExisting)(url)
+        // Keep every recording referenced by the saved file until the next explicit save.
+        savedMediaPaths = documentMedia()
+        refreshSidecarExclusions()
+        projectURL = url
+        recoveredDraft = false
+        markSaved()
+        draft.discard()
+    }
+
+    private func documentMedia(including saved: [String: String] = [:]) -> [String: String] {
+        var paths = saved
+        func collect(_ clips: [CutSequenceClip]) {
+            for clip in clips {
+                paths[clip.file] = clip.id
+                if let original = clip.originalFile { paths[original] = clip.id }
+            }
+        }
+        collect(sequenceClips)
+        for entry in undoStack { collect(entry.clips) }
+        for entry in redoStack { collect(entry.clips) }
+        return paths
+    }
+
+    private var protectedMedia: [String: String] {
+        var files = documentMedia(including: savedMediaPaths)
+        for range in queuedRanges {
+            for clip in range.clips { files[clip.file.path] = clip.file.lastPathComponent }
+        }
+        return files
+    }
+
+    func validateHistoryDestination(_ output: URL, includesContents: Bool = false) throws {
+        try CutProject.validateMediaDestination(output, absoluteSources: protectedMedia, includesContents: includesContents)
+    }
+
+    private func refreshSidecarExclusions(adding urls: [URL] = [], openingMedia: [String: String] = [:]) {
+        var paths = protectedMedia
+        paths.merge(openingMedia) { current, _ in current }
+        for url in urls { paths[url.path] = url.lastPathComponent }
+        let candidates = Set(segments.map { $0.source.url }).union(urls)
+        let sourcePaths = Set(paths.keys)
+        guard sourcePaths != lastSidecarPaths || candidates != lastSidecarCandidates else { return }
+        lastSidecarPaths = sourcePaths
+        lastSidecarCandidates = candidates
+        let excluded = CutProject.sidecarExclusions(absoluteSources: paths, candidates: Array(candidates))
+        guard excluded != sidecarExclusions else { return }
+        sidecarExclusions = excluded
+        sidecarPreference.setExclusions(excluded)
+        if !isEmpty { syncWaveforms(invalidatingPauses: true) }
+    }
+
+    private func canExport(to output: URL, includesContents: Bool = false) -> Bool {
+        do {
+            try validateHistoryDestination(output, includesContents: includesContents)
+            return true
+        } catch {
+            alert = EditorNotice(title: "Couldn’t Export", message: error.localizedDescription)
+            return false
+        }
+    }
+
+    private func documentWriter(clips: [CutSequenceClip]? = nil, replacingExisting: Bool = true) -> @Sendable (URL) throws -> Void {
+        func state(_ entry: HistoryEntry) -> CutHistoryState {
+            CutHistoryState(action: entry.action, project: .sequence(entry.clips))
+        }
+        let clips = clips ?? sequenceClips, undo = undoStack.map(state), redo = redoStack.map(state)
+        return { url in
+            var paths: [String: String] = [:]
+            func relative(_ file: String) -> String {
+                if let cached = paths[file] { return cached }
+                let path = CutProject.relativeMediaPath(file, to: url)
+                paths[file] = path
+                return path
+            }
+            func document(_ clips: [CutSequenceClip]) -> CutProject {
+                .sequence(clips.map { clip in
+                    var copy = clip
+                    copy.file = relative(clip.file)
+                    copy.originalFile = clip.originalFile.map(relative)
+                    return copy
+                })
+            }
+            func rebased(_ state: CutHistoryState) -> CutHistoryState {
+                guard case .sequence(let clips) = state.project else { return state }
+                return CutHistoryState(action: state.action, project: document(clips))
+            }
+            try document(clips).save(to: url, undo: undo.map(rebased), redo: redo.map(rebased), replacingExisting: replacingExisting)
+        }
+    }
+
+    private func saveUntitledDraft() {
+        guard projectURL == nil, openingProjectURL == nil,
+              draft.url != nil || !segments.isEmpty || hasHistory else { return }
+        // An import can temporarily display a provisional first frame or a partial batch.
+        // Only committed edits may become the recovery document.
+        guard !isImporting else { deferredDraftSave = true; return }
+        deferredDraftSave = false
+        let writer = documentWriter()
+        do {
+            let records = undoStack.reduce(segments.count) { $0 + $1.clipCount }
+            let total = redoStack.reduce(records) { $0 + $1.clipCount }
+            if draft.url != nil, total >= 1_000 || draft.hasScheduledWrites {
+                try draft.schedule(writer) { [weak self] error in self?.reportDraftError(error) }
+            } else {
+                try draft.write(writer)
+            }
+        } catch { reportDraftError(error) }
+    }
+
+    private func reportDraftError(_ error: Error) {
+        alert = EditorNotice(title: "Couldn’t Save Recovery Project", message: error.localizedDescription)
+    }
+
+    func confirmCloseProject() -> Bool {
+        guard isProjectChanged else { return true }
+        let confirmation = NSAlert()
+        confirmation.messageText = "Save changes to " + (projectURL?.lastPathComponent ?? "Untitled Project") + "?"
+        for title in ["Save", "Discard Changes", "Cancel"] { confirmation.addButton(withTitle: title) }
+        switch confirmation.runModal() {
+        case .alertFirstButtonReturn:
+            if let projectURL { return saveProject(to: projectURL) }
+            let panel = ProjectPanels.cutSavePanel(name: "Untitled.cut")
+            guard panel.runModal() == .OK, let url = panel.url else { return false }
+            return saveProject(to: url)
+        case .alertSecondButtonReturn: return true
+        default: return false
+        }
+    }
+
+    @Published var rangeTool = false
     @Published private(set) var playhead = 0.0
     @Published private(set) var importProgress = 0.0
     @Published private(set) var isImporting = false
@@ -290,22 +658,45 @@ final class EditorModel: ObservableObject {
         get { preferences.largeThumbnails }
         set { preferences.largeThumbnails = newValue }
     }
-    @Published var timelineZoom = 0.0
+    private(set) var previousTimelineZoom = 1.0
+    @Published var timelineZoom = 0.0 {
+        didSet { if timelineZoom == 0, oldValue > 0 { previousTimelineZoom = oldValue } }
+    }
     @Published private(set) var timeEntryRequest = 0
     private var explicitCopyContainer: String?
     private var copyBoundaryIndices: [UUID: BoundaryIndex] = [:]
-    private struct TrimCheck {
+    private var boundaryPreparation: Task<Void, Never>?
+    private var boundaryPreparationID: UUID?
+    @Published private(set) var isPreparingCopyBoundaries = false
+    private var trimValidation: Task<Void, Never>?
+    private var trimValidationID: UUID?
+    private var isCommittingHandle = false
+    private struct TrimCheck: Sendable {
         let error: CutError?
     }
     private var checkingTrim: (UUID, TimelineEdge)?
     private var trimChecks: [RationalTime: TrimCheck] = [:]
     private var fixedTrimIssue: CutError?
 
+    private enum HistoryContents {
+        case live(EditSnapshot)
+        // Offline recordings in earlier states must not prevent opening the current edit.
+        case document([CutSequenceClip])
+    }
+
     private struct HistoryEntry {
-        let edit: EditSnapshot
-        let action: String
-        let copyContainer: String?
-        let analysisTrack: Int?
+        var id = UUID()
+        var action: String
+        var contents: HistoryContents
+        var clips: [CutSequenceClip] {
+            switch contents {
+            case .live(let edit): edit.documentClips
+            case .document(let clips): clips
+            }
+        }
+        var clipCount: Int { clips.count }
+        var copyContainer: String?
+        var analysisTrack: Int?
     }
     /// Save and open panels attach to the editor, not to whichever window is main.
     weak var editorWindow: NSWindow?
@@ -320,16 +711,37 @@ final class EditorModel: ObservableObject {
         }
     }
     private var cancellation: EditCancellation?
+    var activeNativeOperation: MCPNativeOperation? {
+        guard let cancellation, isImporting || isExporting else { return nil }
+        return MCPNativeOperation(id: cancellation.id, kind: isImporting ? "import" : "export",
+                                  label: statusMessage, progress: isImporting ? importProgress : exportProgress,
+                                  cancelling: cancellation.isCancelled)
+    }
     private var exportOptions = ExportSheetOptions()
     private var exportDirectory: URL?
     private var exportTasks: [UUID: Task<Void, Never>] = [:]
     private var waitingForExportCleanup = false
     private var pendingOpenFiles: [URL] = []
     private var session = UUID()
+    var mcpSceneReceipt: MCPAnalysisReceipt?
+    var mcpSilenceReceipt: MCPAnalysisReceipt?
+    var mcpSidecarReceipt: MCPAnalysisReceipt?
     private var sceneToken: EditCancellation?
-    private var sceneReports: [UUID: SceneReport] = [:]
+    private var sceneSourceIDs = Set<UUID>()
+    private(set) var sceneReports: [UUID: SceneReport] = [:]
+    var analysisSourceMedia: [UUID: MediaInfo] { edit.preparation.sourceMedia }
     private var snapScanRequests = Set<UUID>()
     private var sidecarSaveToken: EditCancellation?
+    var nativeSidecarSave: MCPNativeOperation? {
+        guard let token = sidecarSaveToken, mcpSidecarReceipt == nil else { return nil }
+        return MCPNativeOperation(id: token.id, kind: "sidecars", label: "Saving analysis sidecars…",
+                                  progress: nil, cancelling: token.isCancelled)
+    }
+
+    func cancelNativeSidecarSave(id: UUID) {
+        if sidecarSaveToken?.id == id { sidecarSaveToken?.cancel() }
+    }
+
     private var lastSidecarWrite: (id: UUID, task: Task<Void, Never>)?
     private var pendingMetadata: [UUID: EditorMetadataEdits] = [:]
     private var filmstripTiles = FilmstripTileBuffer()
@@ -369,6 +781,17 @@ final class EditorModel: ObservableObject {
         get { preferences.leavePause }
         set { preferences.leavePause = newValue }
     }
+    private var useSavedMonitoringTracks = true
+
+    func chooseAnalysisTrack(_ track: Int) {
+        useSavedMonitoringTracks = false
+        if analysisTrack != track {
+            analysisTrack = track
+        } else if isAudioOnly {
+            restorePreview(at: playhead)
+        }
+    }
+
     @Published var analysisTrack = 0 {
         didSet {
             if oldValue != analysisTrack {
@@ -387,6 +810,7 @@ final class EditorModel: ObservableObject {
     private(set) var pausePlan: [TimelinePause] = []
     private var protectedPauses: [TimelinePause.Source: [AudioSpan]] = [:]
     private var pauseDetections: [UUID: Task<Void, Never>] = [:]
+    private var mcpSilenceWorkers = Set<UUID>()
     private var activeAudioSources = Set<UUID>()
     private(set) var shortenedPauseCount = 0
     private(set) var removedPauseSeconds = 0.0
@@ -430,8 +854,9 @@ final class EditorModel: ObservableObject {
         self.init(preferences: EditorPreferences(defaults: defaults))
     }
 
-    init(preferences: EditorPreferences) {
+    init(preferences: EditorPreferences, draft: ProjectDraft = ProjectDraft()) {
         self.preferences = preferences
+        self.draft = draft
         preview = SequencePreview(preferences: preferences)
         sidecarPreference.enabled = useAnalysisSidecars
         exportOptions.mode = defaultExportMode
@@ -458,18 +883,26 @@ final class EditorModel: ObservableObject {
 
     private func applyPreference(_ change: EditorPreferences.Change) {
         switch change {
-        case .volume, .isMuted, .scrubSoundEnabled, .jpegPreset:
+        case .volume, .isMuted, .scrubSoundEnabled, .jpegPreset, .localMCPEnabled:
             return
         case .useAnalysisSidecars:
             sidecarPreference.enabled = useAnalysisSidecars
             for task in pauseDetections.values { task.cancel() }
             checkedSilenceSidecars.subtract(pauseDetections.keys)
             pauseDetections.removeAll()
+            mcpSilenceWorkers.removeAll()
             syncWaveforms()
         case .defaultExportMode:
             exportOptions.mode = defaultExportMode
         case .snapTarget:
             updateSnapTarget()
+        case .historyLimit:
+            if enforceHistoryLimit() {
+                if !isImporting && !sidecarExclusions.isEmpty { refreshSidecarExclusions() }
+                mcpRevision += 1
+                updateStatus()
+                saveUntitledDraft()
+            }
         case .largeThumbnails:
             break
         case .minimumPause:
@@ -524,7 +957,7 @@ final class EditorModel: ObservableObject {
     var markIn: Double? { edit.markIn?.seconds }
     var markOut: Double? { edit.markOut?.seconds }
     var duration: Double { edit.duration.seconds }
-    var isBusy: Bool { isImporting || isExporting || isCheckingEdit || isPresentingPanel || isBulkQueuePresented || cutPreview != nil || waitingForExportCleanup }
+    var isBusy: Bool { isImporting || isExporting || isCheckingEdit || isPreparingCopyBoundaries || isPresentingPanel || isBulkQueuePresented || cutPreview != nil || waitingForExportCleanup }
     /// Window-modal alerts leave the menu bar active, so plain-key edits stay off until the alert closes.
     var canEdit: Bool { !isEmpty && !isBusy && alert == nil }
     var canNavigate: Bool { canEdit || (isImporting && !isEmpty && !isCancelling && alert == nil) }
@@ -533,8 +966,13 @@ final class EditorModel: ObservableObject {
     var hasHistory: Bool { !undoStack.isEmpty || !redoStack.isEmpty }
     var undoTitle: String { undoStack.last.map { "Undo \($0.action)" } ?? "Undo" }
     var redoTitle: String { redoStack.last.map { "Redo \($0.action)" } ?? "Redo" }
-    var deleteTitle: String { markIn != nil || markOut != nil ? "Delete Marked Range" : "Delete Clip" }
-    var canDelete: Bool { canEdit && (markedRange != nil || selectedID != nil) }
+    var deleteTitle: String { rangeTool || markIn != nil || markOut != nil ? "Delete Marked Range" : "Delete Clip" }
+    var canActOnRange: Bool { canEdit && selectedSpan != nil }
+    var canSplitSelectedRange: Bool {
+        guard canEdit, let span = selectedSpan else { return false }
+        return isInsideClip(span.from) || isInsideClip(span.to)
+    }
+    var canDelete: Bool { canActOnRange || (canEdit && !rangeTool && selectedID != nil) }
     var canClearMarks: Bool { !isBusy && (markIn != nil || markOut != nil) }
     var canMoveEarlier: Bool { canEdit && selectedClipIndex.map { $0 > 0 } == true }
     var canMoveLater: Bool { canEdit && selectedClipIndex.map { $0 < segments.count - 1 } == true }
@@ -564,8 +1002,12 @@ final class EditorModel: ObservableObject {
         let clip = segments[index]
         let sourceTime = restore ? (edge == .start ? 0 : clip.source.duration.seconds)
             : clip.start.seconds + playhead - edit.offsets[index].seconds
-        _ = trim(clip.id, edge: edge, sourceTime: sourceTime, commit: true,
-                 snap: !restore && usesPointerPosition ? .off : effectiveSnapTarget)
+        let snap = !restore && usesPointerPosition ? TimelineSnapTarget.off : effectiveSnapTarget
+        if snap == .keyframes && usesBackgroundTrimValidation {
+            validateHandle(clip.id, edge: edge, target: sourceTime, commit: true) { _ in }
+        } else {
+            _ = trim(clip.id, edge: edge, sourceTime: sourceTime, commit: true, snap: snap)
+        }
     }
 
     func showExportInFinder() {
@@ -574,8 +1016,7 @@ final class EditorModel: ObservableObject {
     }
 
     var markedRange: ClosedRange<Double>? {
-        guard let markIn, let markOut, markIn != markOut else { return nil }
-        return min(markIn, markOut)...max(markIn, markOut)
+        selectedSpan.map { $0.from.seconds...$0.to.seconds }
     }
 
     var formatSummary: String? {
@@ -634,17 +1075,31 @@ final class EditorModel: ObservableObject {
         resumePendingWork()
     }
 
-    func importFiles(_ urls: [URL], at index: Int? = nil) {
-        guard !isBusy, !urls.isEmpty else { return }
+    func importFiles(_ urls: [URL], at index: Int? = nil, allowCommit: (() -> Bool)? = nil) {
+        importFiles(urls, at: index, projectClips: nil, allowCommit: allowCommit)
+    }
+
+    private func importFiles(_ urls: [URL], at index: Int? = nil, projectClips: [CutSequenceClip]?,
+                             historyAction: String? = nil, openingMedia: [String: String] = [:],
+                             beforeInstall: (() throws -> Bool)? = nil, allowCommit: (() -> Bool)? = nil,
+                             requestCancellation: EditCancellation? = nil, installed: (() -> Void)? = nil,
+                             completion: ((Result<Void, Error>) -> Void)? = nil) {
+        guard !isBusy, !urls.isEmpty else {
+            completion?(.failure(CutError(code: "editor_busy", message: "The editor could not start loading the media.")))
+            return
+        }
+        refreshSidecarExclusions(adding: urls, openingMedia: openingMedia)
         cancelTrim()
         preview.pause()
-        let token = EditCancellation()
+        let token = requestCancellation ?? EditCancellation()
         cancellation = token
         let preference = sidecarPreference
         let engine = CutEngine(cancelled: { token.isCancelled })
-        let existing = segments
+        let existing = projectClips == nil ? segments : []
         let priorPreparation = edit.preparation
+        let publishPartial = allowCommit == nil && requestCancellation == nil
         let beforeImport = snapshot()
+        committedBeforeImport = beforeImport.documentClips
         let insertion = min(max(0, index ?? existing.count), existing.count)
         let currentSession = session
         let pendingWrite = lastSidecarWrite?.task
@@ -658,7 +1113,10 @@ final class EditorModel: ObservableObject {
                 var rejected: [String] = []
                 var savedAnalysis: [UUID: SavedEditorAnalysis] = [:]
                 var indexed = Dictionary(existing.map { ($0.source.url, $0.source) }, uniquingKeysWith: { first, _ in first })
-                for clip in existing { indexed[clip.source.originalURL] = clip.source }
+                for clip in existing where indexed[clip.source.originalURL] == nil {
+                    indexed[clip.source.originalURL] = clip.source
+                }
+                var documentSources: [DocumentSourceKey: IndexedSource] = [:]
                 var reference = existing.first?.source.media
                 var lastPublication: ContinuousClock.Instant?
                 var prior = priorPreparation
@@ -683,7 +1141,7 @@ final class EditorModel: ObservableObject {
                         } else {
                             func read(_ preview: Bool, identity: SourceIdentity? = nil) async throws -> MediaInfo {
                                 while !token.isCancelled {
-                                    let settings = preference.indexSettings()
+                                    let settings = preference.indexSettings(for: canonical)
                                     do {
                                         let key = SourceIndexLoader.Key(url: canonical, sidecars: settings.enabled,
                                                                         preview: preview, identity: identity)
@@ -698,7 +1156,7 @@ final class EditorModel: ObservableObject {
                             }
 
                             let header = try? await read(true)
-                            if existing.isEmpty, additions.isEmpty, let preview = header, preview.timelineIssue == nil {
+                            if publishPartial, projectClips == nil, existing.isEmpty, additions.isEmpty, let preview = header, preview.timelineIssue == nil {
                                 let clip = EditorSegment(source: IndexedSource(media: preview))
                                 provisional = clip
                                 let prepared = PreparedEdit(segments: [clip], previous: prior, engine: engine)
@@ -718,14 +1176,41 @@ final class EditorModel: ObservableObject {
                                 try engine.checkCompatibility(media, with: reference)
                             }
                             source = IndexedSource(media: media, id: provisional?.source.id ?? UUID())
-                            if preference.enabled {
-                                savedAnalysis[source.id] = SavedEditorAnalysis(media: media, cancelled: { token.isCancelled || !preference.enabled })
+                            if preference.permits(canonical) {
+                                savedAnalysis[source.id] = SavedEditorAnalysis(media: media, cancelled: { token.isCancelled || !preference.permits(canonical) })
                             }
                             indexed[canonical] = source
                         }
                         if reference == nil { reference = source.media }
-                        additions.append(EditorSegment(id: provisional?.id ?? UUID(), source: source))
-                        if offset + 1 < urls.count, lastPublication.map({ $0.duration(to: .now) >= .milliseconds(250) }) ?? true {
+                        if let document = projectClips?[offset] {
+                            guard document.from >= .zero, document.from < document.to, document.to <= source.duration else {
+                                throw CutError(code: "project_clip_range", message: "The saved trim exceeds the recording duration.")
+                            }
+                            let original = document.originalFile.map { URL(fileURLWithPath: $0) } ?? source.url
+                            let key = DocumentSourceKey(file: source.url, original: original, track: document.audioTrack,
+                                                        names: document.replacementNames)
+                            let restored: IndexedSource
+                            if let cached = documentSources[key] {
+                                restored = cached
+                            } else if source.originalURL == original, source.replacementTrack == document.audioTrack,
+                               source.replacementNames == document.replacementNames {
+                                restored = source
+                            } else {
+                                let trackCount = source.media.streams.filter { $0.kind == "audio" }.count
+                                guard document.audioTrack.map({ $0 < trackCount }) ?? true,
+                                      document.replacementNames.keys.allSatisfy({ $0 < trackCount }) else {
+                                    throw CutError(code: "project_audio_track", message: "A saved audio track is missing from the recording.")
+                                }
+                                restored = IndexedSource(media: source.media, originalURL: original,
+                                                         replacementNames: document.replacementNames, replacementTrack: document.audioTrack)
+                                savedAnalysis[restored.id] = savedAnalysis[source.id]
+                            }
+                            documentSources[key] = restored
+                            additions.append(EditorSegment(documentID: document.id, source: restored, start: document.from, end: document.to))
+                        } else {
+                            additions.append(EditorSegment(id: provisional?.id ?? UUID(), source: source))
+                        }
+                        if publishPartial, projectClips == nil, offset + 1 < urls.count, lastPublication.map({ $0.duration(to: .now) >= .milliseconds(250) }) ?? true {
                             var partial = existing
                             partial.insert(contentsOf: additions, at: insertion)
                             let clips = partial
@@ -743,6 +1228,7 @@ final class EditorModel: ObservableObject {
                         if provisional != nil {
                             await MainActor.run {
                                 guard self.session == currentSession, !token.isCancelled else { return }
+                                self.mcpRevision += 1
                                 self.edit = beforeImport
                                 self.syncWaveforms()
                                 self.restorePreview(at: beforeImport.playhead)
@@ -758,19 +1244,52 @@ final class EditorModel: ObservableObject {
                 return (candidate, additions.count, rejected, prepared, savedAnalysis)
             }.value
 
-            guard session == currentSession else { return }
+            var outcome: Result<Void, Error> = .failure(CutError(code: "cancelled", message: "Media loading was cancelled."))
+            defer { completion?(outcome) }
+            guard session == currentSession else {
+                outcome = .failure(CutError(code: "project_closed", message: "The project closed or changed while loading media."))
+                return
+            }
+            committedBeforeImport = nil
             isImporting = false
             isCancelling = false
             cancellation = nil
-            defer { resumePendingWork() }
-            if token.isCancelled {
-                edit = beforeImport
-                syncWaveforms()
-                restorePreview(at: beforeImport.playhead)
+            defer {
+                refreshSidecarExclusions()
+                openingProjectURL = nil
+                if deferredDraftSave {
+                    updateStatus()
+                    saveUntitledDraft()
+                }
+                resumePendingWork()
+            }
+            if token.isCancelled || allowCommit?() == false {
+                if publishPartial && projectClips == nil {
+                    mcpRevision += 1
+                    edit = beforeImport
+                    prepareCopyBoundaries()
+                    syncWaveforms()
+                    restorePreview(at: beforeImport.playhead)
+                }
                 updateStatus()
                 return
             }
+            if projectClips != nil, !result.2.isEmpty {
+                let title = historyAction.map { "Couldn’t Restore “\($0)”" } ?? "Couldn’t Open Project"
+                let message = result.2.joined(separator: "\n\n")
+                outcome = .failure(CutError(code: "import_incomplete", message: message))
+                if completion == nil { alert = EditorNotice(title: title, message: message) }
+                return
+            }
             if result.1 > 0 {
+                do { guard try beforeInstall?() ?? true else { return } }
+                catch {
+                    outcome = .failure(error)
+                    if completion == nil {
+                        alert = EditorNotice(title: "Couldn’t Open Project", message: error.localizedDescription)
+                    }
+                    return
+                }
                 if useAnalysisSidecars && !result.4.isEmpty {
                     for (id, saved) in result.4 {
                         if let report = saved.report {
@@ -784,9 +1303,16 @@ final class EditorModel: ObservableObject {
                     }
                     sceneRevision += 1
                 }
-                apply(result.0, prepared: result.3, selecting: result.0[insertion].id, at: playhead,
-                      action: result.1 == 1 ? "Add Clip" : "Add Clips", historySnapshot: beforeImport,
-                      preservePreview: true)
+                let applied = apply(result.0, prepared: result.3, selecting: result.0[insertion].id, at: projectClips == nil ? playhead : 0,
+                      action: result.1 == 1 ? "Add Clip" : "Add Clips", recordHistory: projectClips == nil, historySnapshot: beforeImport,
+                      preservePreview: true, replacementTrack: projectClips?.first?.audioTrack)
+                if applied {
+                    outcome = .success(())
+                    if projectClips != nil { installed?() }
+                } else {
+                    outcome = .failure(CutError(code: "import_incomplete", message: alert?.message ?? "The editor could not install the media."))
+                    if completion != nil { alert = nil }
+                }
                 if useAnalysisSidecars {
                     let restored = Set(result.4.compactMap { $0.value.thresholdsByTrack.isEmpty ? nil : $0.key })
                     if !restored.isEmpty { refreshDetectedPauses(invalidating: restored) }
@@ -911,17 +1437,18 @@ final class EditorModel: ObservableObject {
 
     private func persistMetadata<Value: Codable & Sendable>(_ value: Value?, key: Int, section: String, media: MediaInfo,
                                                            seed: [Int: Value], source: UUID, edits: EditorMetadataEdits) {
-        let automatic = useAnalysisSidecars
+        let preference = sidecarPreference
+        let automatic = preference.permits(media.url)
         let currentSession = session
         enqueueSidecarWrite {
             var saved = false
-            if automatic {
+            if automatic && preference.permits(media.url) {
                 saved = await Task.detached(priority: .utility) {
                     do {
                         try AnalysisSidecar(media: media).save([:], updating: [section: { old in
                             let values = EditorMetadataEdits.merged(old, seed: seed, edits: [key: value])
                             return try JSONEncoder().encode(values)
-                        }])
+                        }], cancelled: { !preference.permits(media.url) })
                         return true
                     } catch {
                         return false
@@ -935,13 +1462,20 @@ final class EditorModel: ObservableObject {
     }
 
     private func updateSnapTarget() {
-        // Settings and other windows change the shared target without passing through this editor's picker.
+        // A shared setting invalidates pending keyframe checks. Another window's
+        // picker must leave the currently auditioned trim in place until release.
+        if isCommittingHandle {
+            cancelTrim()
+        } else {
+            cancelHandleValidation()
+        }
         usesPointerPosition = false
         checkingTrim = nil
         trimChecks.removeAll()
         snapScanRequests.removeAll()
+        prepareCopyBoundaries()
         rebuildPausePlan()
-        requestSnapAnalysis()
+        resumePendingWork()
     }
 
     /// Selecting a target requests its missing analysis once. Cancelling a scan
@@ -961,6 +1495,9 @@ final class EditorModel: ObservableObject {
     }
 
     func cancelSceneAnalysis() {
+        mcpSceneReceipt?.finish("cancelled")
+        mcpSceneReceipt = nil
+        sceneSourceIDs.removeAll()
         if snapTarget == .scenes, sceneToken != nil {
             snapScanRequests.formUnion(edit.preparation.sourceMedia.keys)
         }
@@ -996,11 +1533,24 @@ final class EditorModel: ObservableObject {
                                           silence: completedSilences(for: source.id),
                                           filmstrip: filmstripTiles.snapshot(for: source.id))
         }
+        let excluded = CutProject.sidecarExclusions(absoluteSources: protectedMedia, candidates: snapshots.map { $0.media.url })
+        if let conflict = snapshots.first(where: { AnalysisSidecar.isExcluded($0.media.url, in: excluded) }) {
+            alert = EditorNotice(title: "Couldn’t Save Analysis",
+                                 message: "The analysis file for ‘\(conflict.media.url.lastPathComponent)’ would overwrite media referenced by this project.")
+            return
+        }
         let token = EditCancellation()
         sidecarSaveToken = token
+        let receipt = mcpSidecarReceipt
+        let outputs = receipt.map { _ in MCPLiveOutputProgress() }
+        let endWork = receipt?.cleanup.begin()
+        receipt?.cancelNative = { token.cancel() }
+        receipt?.cancelledDetail = { outputs?.snapshot ?? [:] }
+        receipt?.nativeProgress = { outputs?.snapshot["progress"] as? Double }
         isSavingSidecars = true
         statusMessage = "Saving analysis sidecars…"
         enqueueSidecarWrite { [self] in
+            defer { endWork?() }
             guard sidecarSaveToken === token else { return }
             // An earlier autosave may have committed since these snapshots were captured.
             let snapshots = snapshots.map { original in
@@ -1016,7 +1566,10 @@ final class EditorModel: ObservableObject {
                     do {
                         try snapshot.save(cancelled: { token.isCancelled })
                         saved.append(snapshot.sourceID)
+                        outputs?.published(AnalysisSidecar.url(for: snapshot.media.url))
+                        outputs?.update(Double(saved.count) / Double(snapshots.count))
                     } catch {
+                        if token.isCancelled { break }
                         failures.append("\(snapshot.media.url.lastPathComponent) — \(error.localizedDescription)")
                     }
                 }
@@ -1028,6 +1581,10 @@ final class EditorModel: ObservableObject {
             }
             isSavingSidecars = false
             sidecarSaveToken = nil
+            let paths = snapshots.filter { saved.contains($0.sourceID) }.map { AnalysisSidecar.url(for: $0.media.url).path }
+            receipt?.finish(token.isCancelled ? "cancelled" : (failures.isEmpty ? "succeeded" : "failed"),
+                            detail: ["outputs": paths, "errors": failures])
+            mcpSidecarReceipt = nil
             let count = saved.count
             statusMessage = count == 1 ? "Saved 1 analysis sidecar" : "Saved \(count) analysis sidecars"
             if !failures.isEmpty {
@@ -1053,9 +1610,18 @@ final class EditorModel: ObservableObject {
         }
         let token = EditCancellation()
         sceneToken = token
-        let readSidecars = useAnalysisSidecars
+        sceneSourceIDs = Set(analysisSourceMedia.keys)
+        let receipt = mcpSceneReceipt
+        let endWork = receipt?.cleanup.begin()
+        let sourceIDs = sources.map(\.id)
+        receipt?.cancelledDetail = { [weak self] in
+            ["sources": sourceIDs.filter { self?.sceneReports[$0] != nil }.map(\.uuidString)]
+        }
+        let preference = sidecarPreference
         sceneProgress = 0
         Task {
+            defer { endWork?() }
+            var completed: [String] = []
             do {
                 for (i, source) in sources.enumerated() {
                     let report = try await EditorAnalysisQueues.scan { [self] in
@@ -1074,7 +1640,8 @@ final class EditorModel: ObservableObject {
                                 self.sceneRevision += 1
                             }
                         }
-                        return try SceneAnalysis.scan(source.media, useSidecar: readSidecars, cancelled: { token.isCancelled }, progress: { fraction in
+                        return try SceneAnalysis.scan(source.media, useSidecar: preference.permits(source.url),
+                                                      allowAutomaticSave: { preference.permits(source.url) }, cancelled: { token.isCancelled }, progress: { fraction in
                             publishMarkers()
                             let total = (Double(i) + fraction) / Double(sources.count)
                             guard token.shouldReport(total) else { return }
@@ -1100,12 +1667,17 @@ final class EditorModel: ObservableObject {
                     }
                     guard sceneToken === token else { return }
                     installSceneReport(report, for: source.id)
+                    completed.append(source.id.uuidString)
                 }
+                receipt?.finish("succeeded", detail: ["sources": completed])
+                mcpSceneReceipt = nil
                 sceneToken = nil
+                sceneSourceIDs.removeAll()
                 sceneProgress = nil
                 requestSnapAnalysis()
             } catch {
                 guard sceneToken === token else { return }
+                receipt?.finish("failed", detail: ["error": error.localizedDescription, "sources": completed])
                 cancelSceneAnalysis()
                 alert = EditorNotice(title: "Scene Analysis", message: error.localizedDescription)
             }
@@ -1165,7 +1737,7 @@ final class EditorModel: ObservableObject {
                 if direction > 0 && local < segment.start.seconds { cut = segment.start }
                 else { cut = segment.source.media.steppingAudioBoundary(from: min(local, segment.end.seconds), direction: direction) }
                 guard cut >= segment.start, cut <= segment.end else { continue }
-                let time = (offset + (cut - segment.start)).seconds
+                let time = segment.sequenceSeconds(at: cut, offset: offset)
                 if direction > 0 ? time <= playhead : time >= playhead { continue }
                 seek(time)
                 return
@@ -1186,9 +1758,60 @@ final class EditorModel: ObservableObject {
                 }
                 guard index >= 0, times[index] >= segment.start else { continue }
             }
-            seek((offset + (times[index] - segment.start)).seconds)
+            seek(segment.sequenceSeconds(at: times[index], offset: offset))
             return
         }
+    }
+
+    private var selectedSpan: AudioSpan? {
+        guard let a = edit.markIn, let b = edit.markOut, a != b else { return nil }
+        return AudioSpan(from: min(a, b), to: max(a, b))
+    }
+
+    func selectRange(_ anchor: Double, _ end: Double) {
+        guard canEdit, anchor.isFinite, end.isFinite else { return }
+        guard let a = markBoundary(at: max(0, min(duration, anchor)), pointer: true),
+              let b = markBoundary(at: max(0, min(duration, end)), pointer: true) else { return }
+        let lower = min(a, b), upper = max(a, b)
+        guard edit.markIn != lower || edit.markOut != upper
+                || !edit.pointerMarkIn || !edit.pointerMarkOut else { return }
+        preview.pause()
+        var selection = edit
+        selection.markIn = lower
+        selection.markOut = upper
+        selection.pointerMarkIn = true
+        selection.pointerMarkOut = true
+        edit = selection
+        rebuildPausePlan()
+    }
+
+    private func isInsideClip(_ time: RationalTime) -> Bool {
+        guard time > .zero, time < edit.duration else { return false }
+        let index = edit.offsets.lowerBound { $0 >= time }
+        return index == edit.offsets.count || edit.offsets[index] != time
+    }
+
+    func splitSelectedRange() {
+        guard canSplitSelectedRange, let span = selectedSpan else { return }
+        var proposed: [EditorSegment] = []
+        proposed.reserveCapacity(segments.count + 2)
+        var selected: UUID?
+        for (clip, offset) in zip(segments, edit.offsets) {
+            var piece = clip
+            for edge in [span.from, span.to] where edge > offset && edge < offset + clip.duration {
+                guard let boundary = try? clip.start.adding(edge.subtracting(offset)) else {
+                    alert = EditorNotice(title: "Can’t Split Selected Range", message: "The selection exceeds the supported time precision.")
+                    return
+                }
+                let halves = piece.split(at: boundary, rightID: UUID())
+                proposed.append(halves.left)
+                piece = halves.right
+                if edge == span.from { selected = piece.id }
+            }
+            if offset == span.from { selected = clip.id }
+            proposed.append(piece)
+        }
+        validate(proposed, selecting: selected, at: span.from.seconds, action: "Split Selected Range", preserveMarks: true)
     }
 
     func setIn() {
@@ -1232,72 +1855,221 @@ final class EditorModel: ObservableObject {
                                         before: clip.end, includingLimits: true)
         }
         if let boundary, abs(boundary.seconds - local) <= tolerance {
-            return (offset + (boundary - clip.start)).seconds
+            return clip.sequenceSeconds(at: boundary, offset: offset)
         }
         return time
     }
 
     func split() {
         guard canEdit else { return }
+        let mode = usesPointerPosition ? TimelineSnapTarget.off : effectiveSnapTarget
         cancelTrim()
         preview.pause()
-        guard let (index, segment, offset) = locatedSegment(at: playhead),
-              playhead - offset.seconds > max(playhead.ulp * 4, 0.000000001) else {
+        let position = playhead
+        guard let (index, segment, offset) = locatedSegment(at: position),
+              position - offset.seconds > max(position.ulp * 4, 0.000000001) else {
             alert = EditorNotice(title: "Can’t Split Clip", message: "The playhead is already at a cut. Move it inside a clip to split it.")
             return
         }
-        let target = playhead - offset.seconds + segment.start.seconds
+        split(index: index, atSourceTime: position - offset.seconds + segment.start.seconds,
+              mode: mode, check: {}, completion: nil)
+    }
+
+    struct SplitOutcome {
+        let left: UUID
+        let right: UUID
+        let sourceTime: RationalTime
+        let sequenceTime: RationalTime
+        let revision: Int
+        let historyRetained: Bool
+    }
+
+    func split(_ occurrence: UUID, atSourceTime target: RationalTime, cancellation: EditCancellation,
+               check: @escaping @MainActor () throws -> Void, completion: @escaping (Result<SplitOutcome, Error>) -> Void) {
+        guard canEdit, let index = segments.firstIndex(where: { $0.id == occurrence }) else {
+            completion(.failure(CutError(code: "editor_busy", message: "The clip is unavailable for editing.")))
+            return
+        }
+        let segment = segments[index]
+        guard target > segment.start, target < segment.end else {
+            completion(.failure(CutError(code: "invalid_boundary", message: "Choose a time inside the requested clip.")))
+            return
+        }
+        split(index: index, atSourceTime: target.seconds, mode: effectiveSnapTarget,
+              cancellation: cancellation, check: check, completion: completion)
+    }
+
+    /// Both the GUI shortcut and an explicit remote edit use the same snap search and history commit.
+    private func split(index: Int, atSourceTime target: Double, mode targetMode: TimelineSnapTarget, cancellation requestToken: EditCancellation? = nil,
+               check: @escaping @MainActor () throws -> Void,
+               completion: ((Result<SplitOutcome, Error>) -> Void)?) {
+        let title = "Can’t Split Clip"
+        func fail(_ message: String) {
+            if let completion { completion(.failure(CutError(code: "invalid_boundary", message: message))) }
+            else { alert = EditorNotice(title: title, message: message) }
+        }
+        let segment = segments[index], offset = edit.offsets[index]
         let candidates: [RationalTime]
-        let targetMode: TimelineSnapTarget = usesPointerPosition ? .off : effectiveSnapTarget
         switch targetMode {
         case .off: candidates = segment.source.media.hasVideo ? segment.source.frames :
             [segment.source.media.audioEditBoundary(near: target)]
         case .keyframes: candidates = copyBoundaries(for: segment.source)?.splitPoints ?? []
         case .scenes, .silence:
             guard let boundary = analysisBoundary(in: segment.source, to: target, after: segment.start, before: segment.end) else {
-                showAnalysisBoundaryError(segment, title: "Can’t Split Clip")
+                showAnalysisBoundaryError(segment, title: title)
+                if let completion, let issue = alert { alert = nil; completion(.failure(CutError(code: "unavailable_analysis", message: issue.message))) }
                 return
             }
             candidates = [boundary]
         }
-        let rightID = UUID()
-        var firstIssue: EditorNotice?
-        for cut in nearestBoundaries(in: candidates, to: target, after: segment.start, before: segment.end) {
-            var proposed = segments
-            proposed[index].end = cut
-            let left = min(segment.start, segment.displayRange?.from ?? .zero)
-            let right = max(segment.end, segment.displayRange?.to ?? segment.source.duration)
-            proposed[index].displayRange = AudioSpan(from: left, to: cut)
-            proposed.insert(EditorSegment(id: rightID, source: segment.source, start: cut, end: segment.end,
-                                          displayRange: AudioSpan(from: cut, to: right), occurrence: segment.occurrence), at: index + 1)
-            if targetMode == .keyframes, let error = copyIssue(proposed) {
-                if firstIssue == nil {
-                    firstIssue = EditorNotice(title: "Can’t Split Clip", message: copyMessage(error, in: proposed))
+        let original = segments, rightID = UUID(), revision = mcpRevision
+        let container = preferredCopyContainer
+        let perform: @Sendable (CutEngine) -> SplitSearch = { engine in
+            var result = SplitSearch()
+            for boundary in Self.nearestBoundaries(in: candidates, to: target, after: segment.start, before: segment.end) {
+                var proposed = original
+                let halves = segment.split(at: boundary, rightID: rightID)
+                proposed[index] = halves.left
+                proposed.insert(halves.right, at: index + 1)
+                if targetMode == .keyframes, let error = Self.copyIssue(proposed, container: container, engine: engine) {
+                    if error.code == "cancelled" { break }
+                    if result.issue == nil {
+                        result.issue = error
+                        result.proposed = proposed
+                    }
+                    if Self.blocksAllSnapCandidates(error, in: proposed, container: container) { break }
+                    continue
                 }
-                if blocksAllSnapCandidates(error, in: proposed) { break }
-                continue
+                result.cut = boundary
+                result.proposed = proposed
+                break
             }
-            let snapped = (offset + (cut - segment.start)).seconds
-            validate(proposed, selecting: rightID, at: snapped, action: "Split Clip")
-            return
+            return result
         }
-        if let firstIssue {
-            alert = firstIssue
-        } else if targetMode == .keyframes {
-            showCopyBoundaryError(segment, at: target, edge: .start, title: "Can’t Split Clip", first: false, last: false)
+        let finish: (SplitSearch) -> Void = { [self] result in
+            do { try check() } catch { completion?(.failure(error)); return }
+            if let cut = result.cut {
+                let snapped: RationalTime
+                do {
+                    snapped = try offset.adding(cut.subtracting(segment.start))
+                } catch {
+                    if let completion { completion(.failure(error)) }
+                    else { alert = EditorNotice(title: title, message: error.localizedDescription) }
+                    return
+                }
+                guard validate(result.proposed, selecting: rightID, at: snapped.seconds, action: "Split Clip") else {
+                    if let completion {
+                        let message = alert?.message ?? "Split validation failed."
+                        alert = nil
+                        completion(.failure(CutError(code: "invalid_edit", message: message)))
+                    }
+                    return
+                }
+                completion?(.success(SplitOutcome(left: segment.id, right: rightID, sourceTime: cut,
+                                                  sequenceTime: snapped, revision: mcpRevision,
+                                                  historyRetained: mcpHistoryLimit > 0)))
+            } else if let issue = result.issue {
+                fail(copyMessage(issue, in: result.proposed))
+            } else if targetMode == .keyframes {
+                showCopyBoundaryError(segment, at: target, edge: .start, title: title, first: false, last: false)
+                if let completion, let issue = alert { alert = nil; completion(.failure(CutError(code: "invalid_boundary", message: issue.message))) }
+            } else {
+                let unit = isAudioOnly ? "audio cut point" : "frame boundary"
+                fail("There is no \(unit) inside this range.")
+            }
+        }
+        if targetMode == .keyframes && edit.preparation.requiresBackgroundCopyChecks {
+            let token = requestToken ?? EditCancellation()
+            cancellation = token
+            isCheckingEdit = true
+            Task {
+                let result = await Task.detached(priority: .userInitiated) {
+                    perform(CutEngine(cancelled: { token.isCancelled }))
+                }.value
+                guard cancellation === token else {
+                    completion?(.failure(CutError(code: "cancelled", message: "The split was cancelled.")))
+                    return
+                }
+                cancellation = nil
+                isCheckingEdit = false
+                defer { resumePendingWork() }
+                // Prefer the bridge's revocation or stale-revision error when access was lost.
+                if effectiveSnapTarget != targetMode || preferredCopyContainer != container ||
+                    (requestToken != nil && revision != mcpRevision) || token.isCancelled {
+                    do { try check() } catch { completion?(.failure(error)); return }
+                    if token.isCancelled {
+                        completion?(.failure(CutError(code: "cancelled", message: "The split was cancelled.")))
+                    } else {
+                        completion?(.failure(CutError(code: "edit_context_changed", message: "The split context changed.")))
+                    }
+                    return
+                }
+                finish(result)
+            }
         } else {
-            let unit = isAudioOnly ? "audio cut point" : "frame boundary"
-            alert = EditorNotice(title: "Can’t Split Clip", message: "There is no \(unit) inside this range.")
+            finish(perform(CutEngine()))
         }
+    }
+
+    private struct SplitSearch: Sendable {
+        var cut: RationalTime?
+        var proposed: [EditorSegment] = []
+        var issue: CutError?
     }
 
     func trim(_ id: UUID, edge: TimelineEdge, sourceTime: Double, commit: Bool) -> Double? {
         trim(id, edge: edge, sourceTime: sourceTime, commit: commit, snap: effectiveSnapTarget)
     }
 
-    private func trim(_ id: UUID, edge: TimelineEdge, sourceTime: Double, commit: Bool, snap: TimelineSnapTarget) -> Double? {
+    /// Large native copy-boundary searches can finish after a setting changes or a window closes.
+    func mcpTrim(_ id: UUID, edge: TimelineEdge, time: Double, preview: UUID?, cancellation token: EditCancellation,
+                 check: @escaping @MainActor () throws -> Void) async throws -> Double? {
+        func applyTrim(verified: TrimSearch? = nil) -> Double? {
+            let result = trim(id, edge: edge, sourceTime: time, commit: preview == nil,
+                              snap: effectiveSnapTarget, verified: verified)
+            if result != nil { mcpTrimPreview = preview }
+            return result
+        }
+        guard usesBackgroundTrimValidation,
+              let index = segments.firstIndex(where: { $0.id == id }),
+              let boundaries = copyBoundaries(for: segments[index].source) else {
+            try check()
+            return applyTrim()
+        }
+        let original = segments, revision = mcpRevision, generation = mcpGeneration
+        let container = preferredCopyContainer
+        let previewID = mcpTrimPreview
+        let candidates = trimCandidates(at: index, edge: edge, boundaries: boundaries)
+        let cached = checkingTrim?.0 == id && checkingTrim?.1 == edge ? trimChecks : [:]
+        cancellation = token
+        isCheckingEdit = true
+        let worker = Task.detached(priority: .userInitiated) {
+            Self.searchCopyTrim(segments: original, index: index, edge: edge, target: time,
+                                options: candidates, container: container, cached: cached)
+        }
+        let cancelID = token.onCancel { worker.cancel() }
+        let result = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
+        token.removeCancellationHandler(cancelID)
+        guard cancellation === token else {
+            try check()
+            throw CutError(code: "cancelled", message: "The trim was cancelled.")
+        }
+        cancellation = nil
+        isCheckingEdit = false
+        defer { resumePendingWork() }
+        try check()
+        guard canEdit, generation == mcpGeneration, revision == mcpRevision, mcpTrimPreview == previewID, !token.isCancelled,
+              effectiveSnapTarget == .keyframes, preferredCopyContainer == container else {
+            throw CutError(code: "edit_context_changed", message: "The trim context changed. Read the current editor state.")
+        }
+        return applyTrim(verified: result)
+    }
+
+    private func trim(_ id: UUID, edge: TimelineEdge, sourceTime: Double, commit: Bool, snap: TimelineSnapTarget,
+                      verified: TrimSearch? = nil) -> Double? {
         guard canEdit, sourceTime.isFinite,
               let index = segments.firstIndex(where: { $0.id == id }) else { return nil }
+        mcpTrimPreview = nil
         let segment = segments[index]
         let offset = edit.offsets[index]
         let minimum = edge == .end ? segment.start : nil
@@ -1324,22 +2096,11 @@ final class EditorModel: ObservableObject {
                 return nil
             }
             let options = trimCandidates(at: index, edge: edge, boundaries: boundaries)
-            var tried: CutError?
-            var chosen: RationalTime?
-            for candidate in nearestBoundaries(in: options, to: sourceTime, after: minimum, before: maximum) {
-                let check = trimChecks[candidate] ?? TrimCheck(error: copyIssue(replacingBoundary(candidate)))
-                trimChecks[candidate] = check
-                if let error = check.error {
-                    if tried == nil { tried = error }
-                    if blocksAllSnapCandidates(error, in: replacingBoundary(candidate), moving: id, edge: edge) {
-                        fixedTrimIssue = error
-                        break
-                    }
-                } else {
-                    chosen = candidate
-                    break
-                }
-            }
+            let result = verified ?? Self.searchCopyTrim(segments: segments, index: index, edge: edge, target: sourceTime,
+                                             options: options, container: preferredCopyContainer, cached: trimChecks)
+            trimChecks.merge(result.newChecks) { _, new in new }
+            fixedTrimIssue = result.fixedIssue
+            let tried = result.firstIssue, chosen = result.cut
             guard let chosen else {
                 if commit {
                     if let tried {
@@ -1398,7 +2159,7 @@ final class EditorModel: ObservableObject {
         case .start:
             landing = offset.seconds
         case .end:
-            landing = (offset + (precedingFrame(in: segment, before: cut) - segment.start)).seconds
+            landing = segment.sequenceSeconds(at: precedingFrame(in: segment, before: cut), offset: offset)
         }
         trimOrigin = nil
         trimAudition = nil
@@ -1406,13 +2167,208 @@ final class EditorModel: ObservableObject {
         return cut.seconds
     }
 
+    private struct TrimSearch: Sendable {
+        var cut: RationalTime?
+        var firstIssue: CutError?
+        var fixedIssue: CutError?
+        var newChecks: [RationalTime: TrimCheck] = [:]
+    }
+
+    private nonisolated static func searchCopyTrim(segments: [EditorSegment], index: Int, edge: TimelineEdge,
+                                                   target: Double, options: [RationalTime], container: String?,
+                                                   cached: [RationalTime: TrimCheck]) -> TrimSearch {
+        let segment = segments[index]
+        let candidates = nearestBoundaries(in: options, to: target, after: edge == .end ? segment.start : nil,
+                                           before: edge == .start ? segment.end : nil)
+        var result = TrimSearch()
+        let engine = CutEngine(cancelled: { Task.isCancelled })
+        for candidate in candidates {
+            if Task.isCancelled { break }
+            if let check = cached[candidate], check.error == nil { result.cut = candidate; break }
+            var proposed = segments
+            if edge == .start { proposed[index].start = candidate } else { proposed[index].end = candidate }
+            let check = cached[candidate] ?? TrimCheck(error: copyIssue(proposed, container: container, engine: engine))
+            if cached[candidate] == nil { result.newChecks[candidate] = check }
+            guard let error = check.error else { result.cut = candidate; break }
+            if result.firstIssue == nil { result.firstIssue = error }
+            if blocksAllSnapCandidates(error, in: proposed, container: container, moving: segment.id, edge: edge) {
+                result.fixedIssue = error
+                break
+            }
+        }
+        return result
+    }
+
+    var usesBackgroundTrimValidation: Bool {
+        effectiveSnapTarget == .keyframes && edit.preparation.requiresBackgroundCopyChecks
+    }
+
+    /// Newer mouse events supersede older candidate searches. A committed handle changes
+    /// history once, after the same copy planner used by a synchronous edit accepts it.
+    func validateHandle(_ id: UUID, edge: TimelineEdge, target: Double, commit: Bool,
+                        completion: @escaping (Double?) -> Void) {
+        guard canEdit, effectiveSnapTarget == .keyframes, let index = segments.firstIndex(where: { $0.id == id }),
+              let bounds = copyBoundaries(for: segments[index].source) else {
+            completion(trim(id, edge: edge, sourceTime: target, commit: commit))
+            return
+        }
+        let previous = trimValidation
+        previous?.cancel()
+        let request = UUID()
+        trimValidationID = request
+        let original = segments, container = preferredCopyContainer
+        let options = trimCandidates(at: index, edge: edge, boundaries: bounds)
+        let cached = checkingTrim?.0 == id && checkingTrim?.1 == edge ? trimChecks : [:]
+        isCommittingHandle = commit
+        if commit { isCheckingEdit = true }
+        trimValidation = Task { [weak self] in
+            // Coalesce rapid drag events while an older native planner call winds down.
+            await previous?.value
+            guard !Task.isCancelled else { return }
+            let worker = Task.detached(priority: .userInitiated) {
+                Self.searchCopyTrim(segments: original, index: index, edge: edge, target: target,
+                                    options: options, container: container, cached: cached)
+            }
+            let result = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
+            guard let self, self.trimValidationID == request else { return }
+            self.trimValidation = nil
+            self.trimValidationID = nil
+            self.isCommittingHandle = false
+            if commit { self.isCheckingEdit = false }
+            guard self.canEdit, self.effectiveSnapTarget == .keyframes, self.preferredCopyContainer == container else {
+                completion(nil)
+                return
+            }
+            self.checkingTrim = (id, edge)
+            self.trimChecks = cached.merging(result.newChecks) { _, new in new }
+            self.fixedTrimIssue = nil
+            completion(self.trim(id, edge: edge, sourceTime: target, commit: commit, snap: .keyframes, verified: result))
+            if commit { self.resumePendingWork() }
+        }
+    }
+
+    private func cancelHandleValidation() {
+        trimValidation?.cancel()
+        trimValidation = nil
+        trimValidationID = nil
+        if isCommittingHandle {
+            isCheckingEdit = false
+            isCommittingHandle = false
+        }
+    }
+
     func cancelTrim() {
+        mcpTrimPreview = nil
+        cancelHandleValidation()
         checkingTrim = nil
         trimChecks.removeAll()
         guard let original = trimOrigin else { return }
         trimOrigin = nil
         trimAudition = nil
         restorePreview(at: original)
+    }
+
+    func dropOnViewer(_ urls: [URL]) {
+        guard let csv = urls.first(where: { $0.pathExtension.lowercased() == "csv" }) else {
+            importFiles(urls)
+            return
+        }
+        guard canEdit, urls.count == 1, let clip = locatedSegment(at: playhead)?.1 ?? segments.last else {
+            alert = EditorNotice(title: "Couldn’t Apply CSV", message: "Open a clip, then drop one CSV file onto it.")
+            return
+        }
+        applyClipCSV(csv, to: clip.id)
+    }
+
+    func chooseClipCSV() {
+        guard canEdit, let id = selectedID else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Apply CSV to Selected Clip"
+        panel.allowedContentTypes = [.commaSeparatedText]
+        let currentSession = session
+        isPresentingPanel = true
+        present(panel) { [weak self] accepted in
+            guard let self, self.session == currentSession else { return }
+            self.isPresentingPanel = false
+            if accepted, let url = panel.url { self.applyClipCSV(url, to: id) }
+            self.resumePendingWork()
+        }
+    }
+
+    func applyClipCSV(_ url: URL, to id: UUID, requestCancellation: EditCancellation? = nil,
+                      beforeCommit: (() throws -> Void)? = nil,
+                      completion: ((Result<Int, Error>) -> Void)? = nil) {
+        guard canEdit, let index = segments.firstIndex(where: { $0.id == id }) else {
+            completion?(.failure(CutError(code: "editor_busy", message: "The clip is unavailable for editing.")))
+            return
+        }
+        let clip = segments[index]
+        let scope = AudioSpan(from: clip.start, to: clip.end)
+        let currentSession = session
+        let token = requestCancellation ?? EditCancellation()
+        cancellation = token
+        isCheckingEdit = true
+        Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { try ClipEditCSV.ranges(in: url, clip: scope, cancelled: { token.isCancelled }) }
+            }.value
+            guard session == currentSession, cancellation === token else {
+                completion?(.failure(CutError(code: "project_closed", message: "The project closed during the CSV import.")))
+                return
+            }
+            cancellation = nil
+            isCheckingEdit = false
+            defer { resumePendingWork() }
+            do {
+                let ranges = try result.get()
+                guard ranges != [scope] else {
+                    try beforeCommit?()
+                    completion?(.success(mcpRevision))
+                    return
+                }
+                guard let index = segments.firstIndex(where: { $0.id == id }) else {
+                    throw CutError(code: "invalid_target", message: "The clip is no longer in the timeline.")
+                }
+                var occurrence = clip.occurrence
+                var newOccurrences: [UUID] = []
+                let pieces = ranges.enumerated().map { offset, range in
+                    if offset > 0, range.from < ranges[offset - 1].to {
+                        occurrence = UUID()
+                        newOccurrences.append(occurrence)
+                    }
+                    let displayFrom = range.from == scope.from ? clip.displayRange?.from ?? .zero : range.from
+                    let displayTo = range.to == scope.to ? clip.displayRange?.to ?? clip.source.duration : range.to
+                    return EditorSegment(id: offset == 0 ? clip.id : UUID(), documentID: offset == 0 ? clip.documentID : nil,
+                                         source: clip.source, start: range.from, end: range.to,
+                                         displayRange: AudioSpan(from: displayFrom, to: displayTo), occurrence: occurrence)
+                }
+                var proposed = segments
+                proposed.replaceSubrange(index...index, with: pieces)
+                try beforeCommit?()
+                guard validate(proposed, selecting: pieces.first?.id, at: edit.offsets[index].seconds, action: "Apply CSV") else {
+                    if let completion {
+                        let message = alert?.message ?? "Invalid CSV edit."
+                        alert = nil
+                        completion(.failure(CutError(code: "invalid_edit", message: message)))
+                    }
+                    return
+                }
+                defer { completion?(.success(mcpRevision)) }
+                guard !newOccurrences.isEmpty else { return }
+                let inherited = protectedPauses.filter { $0.key.occurrence == clip.occurrence }
+                if !inherited.isEmpty {
+                    for occurrence in newOccurrences {
+                        for (key, spans) in inherited {
+                            protectedPauses[TimelinePause.Source(occurrence: occurrence, track: key.track)] = spans
+                        }
+                    }
+                    rebuildPausePlan()
+                }
+            } catch {
+                if let completion { completion(.failure(error)) }
+                else { alert = EditorNotice(title: "Couldn’t Apply CSV", message: error.localizedDescription) }
+            }
+        }
     }
 
     func move(_ id: UUID, to insertionIndex: Int) {
@@ -1436,72 +2392,172 @@ final class EditorModel: ObservableObject {
         } else if markIn != nil || markOut != nil {
             let missing = markIn == nil ? "Mark In" : "Mark Out"
             alert = EditorNotice(title: "Finish the Marked Range", message: "Set \(missing) to finish the range, or press Esc to clear the mark and delete a whole clip.")
-        } else if let selectedID, let index = segments.firstIndex(where: { $0.id == selectedID }) {
-            var proposed = segments
-            proposed.remove(at: index)
-            validate(proposed, selecting: proposed.indices.contains(index) ? proposed[index].id : proposed.last?.id,
-                     at: edit.offsets[index].seconds, action: "Delete Clip")
+        } else if let selectedID {
+            deleteClip(selectedID)
         }
     }
 
-    func undo() {
-        guard canUndo, let previous = undoStack.popLast() else { return }
-        cancelTrim()
-        redoStack.append(HistoryEntry(edit: snapshot(), action: previous.action, copyContainer: explicitCopyContainer,
-                                      analysisTrack: previous.analysisTrack.map { _ in analysisTrack }))
-        copyBoundaryIndices.removeAll()
-        // The next import may use a format that this container cannot carry.
-        explicitCopyContainer = previous.edit.segments.isEmpty ? nil : explicitCopyContainer ?? previous.copyContainer
-        edit = previous.edit
-        if let track = previous.analysisTrack, track != analysisTrack { analysisTrack = track }
-        syncWaveforms()
-        requestSnapAnalysis()
-        restorePreview(at: edit.playhead)
-        updateStatus()
+    func deleteClip(_ id: UUID) {
+        guard canEdit, let index = segments.firstIndex(where: { $0.id == id }) else { return }
+        var proposed = segments
+        proposed.remove(at: index)
+        validate(proposed, selecting: proposed.indices.contains(index) ? proposed[index].id : proposed.last?.id,
+                 at: edit.offsets[index].seconds, action: "Delete Clip")
     }
 
-    func redo() {
-        guard canRedo, let next = redoStack.popLast() else { return }
+    var historyActions: [String] { undoStack.map(\.action) + redoStack.reversed().map(\.action) }
+    var historyEntryIDs: [UUID] { undoStack.map(\.id) + redoStack.reversed().map(\.id) }
+    var historyCursor: Int { undoStack.count }
+
+    @discardableResult
+    private func enforceHistoryLimit() -> Bool {
+        let counts = CutProject.historyCounts(undo: undoStack.count, redo: redoStack.count, limit: preferences.historyLimit)
+        guard counts.undo != undoStack.count || counts.redo != redoStack.count else { return false }
+        undoStack.removeFirst(undoStack.count - counts.undo)
+        redoStack.removeFirst(redoStack.count - counts.redo)
+        return true
+    }
+
+    func undo() { moveToHistoryState(historyCursor - 1) }
+    func redo() { moveToHistoryState(historyCursor + 1) }
+
+    func moveToHistoryState(_ index: Int) { moveToHistoryState(index, beforeRestore: nil, completion: nil) }
+
+    func moveToHistoryState(_ index: Int, requestCancellation: EditCancellation? = nil,
+                            beforeRestore: (() throws -> Void)?, completion: ((Result<Void, Error>) -> Void)?) {
+        let title = "Couldn’t Restore History State"
+        func fail(_ error: Error) {
+            if let completion { completion(.failure(error)) }
+            else { alert = EditorNotice(title: title, message: error.localizedDescription) }
+        }
+        guard !isBusy, alert == nil, index >= 0, index <= undoStack.count + redoStack.count else {
+            completion?(.failure(CutError(code: "editor_busy", message: "The history state is unavailable.")))
+            return
+        }
+        guard index != historyCursor else { completion?(.success(())); return }
         cancelTrim()
-        undoStack.append(HistoryEntry(edit: snapshot(), action: next.action, copyContainer: explicitCopyContainer,
-                                      analysisTrack: next.analysisTrack.map { _ in analysisTrack }))
-        copyBoundaryIndices.removeAll()
-        // The next import may use a format that this container cannot carry.
-        explicitCopyContainer = next.edit.segments.isEmpty ? nil : explicitCopyContainer ?? next.copyContainer
-        edit = next.edit
-        if let track = next.analysisTrack, track != analysisTrack { analysisTrack = track }
-        syncWaveforms()
-        requestSnapAnalysis()
-        restorePreview(at: edit.playhead)
-        updateStatus()
+        let backwards = index < historyCursor
+        var from = backwards ? undoStack : redoStack
+        var to = backwards ? redoStack : undoStack
+        var target = HistoryEntry(action: "", contents: .live(snapshot()),
+                                  copyContainer: explicitCopyContainer, analysisTrack: analysisTrack)
+        for _ in 0..<abs(historyCursor - index) {
+            let step = from.removeLast()
+            to.append(HistoryEntry(id: step.id, action: step.action, contents: target.contents,
+                                   copyContainer: target.copyContainer,
+                                   analysisTrack: step.analysisTrack == nil ? nil : target.analysisTrack))
+            let effectiveTrack = step.analysisTrack ?? target.analysisTrack
+            let container = step.clipCount == 0 ? nil : target.copyContainer ?? step.copyContainer
+            target = step
+            target.analysisTrack = effectiveTrack
+            target.copyContainer = container
+        }
+        let finish = {
+            if self.explicitCopyContainer != target.copyContainer {
+                self.explicitCopyContainer = target.copyContainer
+                self.copyBoundaryIndices.removeAll()
+                self.prepareCopyBoundaries()
+                self.rebuildPausePlan()
+            }
+            self.undoStack = backwards ? from : to
+            self.redoStack = backwards ? to : from
+            self.enforceHistoryLimit()
+            self.updateStatus()
+            self.saveUntitledDraft()
+        }
+        if case .live(let state) = target.contents,
+           state.preparation.sourceMedia.values.allSatisfy(Self.currentSource) {
+            do { try beforeRestore?() } catch { fail(error); return }
+            let sources = Set(state.preparation.sourceMedia.values.map(\.url))
+            if !sources.isSubset(of: lastSidecarCandidates) { refreshSidecarExclusions(adding: Array(sources)) }
+            copyBoundaryIndices.removeAll()
+            explicitCopyContainer = target.copyContainer
+            mcpRevision += 1
+            edit = state
+            prepareCopyBoundaries()
+            if let track = target.analysisTrack, track != analysisTrack { analysisTrack = track }
+            syncWaveforms()
+            requestSnapAnalysis()
+            restorePreview(at: edit.playhead)
+            finish()
+            completion?(.success(()))
+        } else {
+            let clips = target.clips
+            if let restored = cachedSegments(for: clips) {
+                let prepared = PreparedEdit(segments: restored, previous: edit.preparation, engine: CutEngine())
+                do { try beforeRestore?() } catch { fail(error); return }
+                if apply(restored, prepared: prepared, selecting: restored.first?.id, at: 0,
+                         action: target.action, recordHistory: false, replacementTrack: clips.first?.audioTrack) {
+                    finish()
+                    completion?(.success(()))
+                } else if let completion {
+                    let message = alert?.message ?? "The history state could not be restored."
+                    alert = nil
+                    completion(.failure(CutError(code: "invalid_edit", message: message)))
+                }
+            } else {
+                // Prepare all sources before committing either the timeline or its cursor.
+                // A retention change while indexing may have removed this transition.
+                let originalHistory = historyEntryIDs
+                let originalCursor = historyCursor
+                do {
+                    try importFiles(checkedFiles(clips), projectClips: clips, historyAction: target.action, beforeInstall: {
+                        try beforeRestore?()
+                        guard self.historyEntryIDs == originalHistory, self.historyCursor == originalCursor else {
+                            if completion == nil { return false }
+                            throw CutError(code: "stale_history", message: "The history changed while preparing this state.")
+                        }
+                        return true
+                    }, requestCancellation: requestCancellation, installed: finish, completion: completion)
+                } catch { fail(error) }
+            }
+        }
+    }
+
+    private static func currentSource(_ media: MediaInfo) -> Bool {
+        (try? SourceIdentity(media.url)) == media.identity
+    }
+
+    /// Reuse the indexed media already on the timeline when walking through saved trims or rearrangements.
+    private func cachedSegments(for clips: [CutSequenceClip]) -> [EditorSegment]? {
+        var sources: [DocumentSourceKey: IndexedSource] = [:]
+        for segment in segments {
+            let source = segment.source
+            sources[DocumentSourceKey(file: source.url, original: source.originalURL, track: source.replacementTrack,
+                                      names: source.replacementNames)] = source
+        }
+        var checked: Set<UUID> = []
+        var restored: [EditorSegment] = []
+        for clip in clips {
+            let file = URL(fileURLWithPath: clip.file)
+            let key = DocumentSourceKey(file: file, original: clip.originalFile.map(URL.init(fileURLWithPath:)) ?? file,
+                                        track: clip.audioTrack, names: clip.replacementNames)
+            guard let source = sources[key], clip.to <= source.duration else { return nil }
+            if checked.insert(source.id).inserted, !Self.currentSource(source.media) { return nil }
+            restored.append(EditorSegment(documentID: clip.id, source: source, start: clip.from, end: clip.to))
+        }
+        return restored
     }
 
     func preferCopyContainer(_ container: String) {
+        cancelTrim()
         explicitCopyContainer = container
         copyBoundaryIndices.removeAll()
+        prepareCopyBoundaries()
         rebuildPausePlan()
         checkingTrim = nil
         trimChecks.removeAll()
     }
 
-    var canAddMarkedRange: Bool { canEdit && markedRange != nil }
+    var canAddMarkedRange: Bool { canActOnRange }
     var canShowBulkQueue: Bool { !isBusy && alert == nil && (!isEmpty || !queuedRanges.isEmpty) }
 
     func addMarkedRange() {
-        guard canAddMarkedRange, let markIn = edit.markIn, let markOut = edit.markOut else { return }
-        let start = min(markIn, markOut), end = max(markIn, markOut)
-        var requests: [ClipRequest] = []
-        var media: [URL: MediaInfo] = [:]
-        for (segment, offset) in zip(segments, edit.offsets) {
-            let lower = max(offset, start), upper = min(offset + segment.duration, end)
-            guard lower < upper else { continue }
-            let source = segment.source
-            requests.append(ClipRequest(file: source.url, from: segment.start + (lower - offset),
-                                        to: segment.start + (upper - offset)))
-            media[source.url] = source.media
-        }
-        guard !requests.isEmpty else { return }
-        queuedRanges.append(QueuedRange(start: start, end: end, clips: requests, media: media))
+        guard canAddMarkedRange, let span = selectedSpan else { return }
+        let selection = pieces(in: span)
+        guard !selection.isEmpty else { return }
+        let media = Dictionary(selection.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { first, _ in first })
+        queuedRanges.append(QueuedRange(start: span.from, end: span.to, clips: selection.map(\.request), media: media))
         clearMarks()
         statusMessage = "Added range \(queuedRanges.count) to the export queue."
     }
@@ -1540,6 +2596,7 @@ final class EditorModel: ObservableObject {
         exportDirectory = directory
         isBulkQueuePresented = false
         let ranges = queuedRanges
+        let protected = protectedMedia
         runExport { token, progress in
             var media: [URL: MediaInfo] = [:]
             for range in ranges { media.merge(range.media) { first, _ in first } }
@@ -1547,6 +2604,9 @@ final class EditorModel: ObservableObject {
                                        tracks: options.tracks, audioTrackOrdinal: options.audioTrackOrdinal,
                                        container: options.container.isEmpty ? nil : options.container,
                                        settings: options.settings, media: media, cancelled: { token.isCancelled })
+            for item in batch.items {
+                try CutProject.validateMediaDestination(item.output, absoluteSources: protected)
+            }
             for (index, item) in batch.items.enumerated() {
                 do {
                     try batch.write(item) { _ = progress((Double(index) + $0) / Double(batch.items.count)) }
@@ -1563,12 +2623,11 @@ final class EditorModel: ObservableObject {
     var jpegSourceAtPlayhead: EditorJPEGSource? {
         guard !segments.isEmpty else { return nil }
         let clip: EditorSegment
-        let picture: RationalTime
+        let picture: RationalTime?
         if let (id, edge, cut) = trimAudition, let auditioned = segments.first(where: { $0.id == id }) {
             clip = auditioned
-            guard let frame = try? JPEGExport.stillFrameTime(in: clip.source.media, at: cut,
-                                                            exclusiveEnd: edge == .end) else { return nil }
-            picture = frame
+            guard clip.source.media.hasVideo else { return nil }
+            picture = try? JPEGExport.stillFrameTime(in: clip.source.media, at: cut, exclusiveEnd: edge == .end)
         } else if let (_, active, offset) = locatedSegment(at: playhead) {
             clip = active
             let frames = clip.source.media.frames
@@ -1580,15 +2639,17 @@ final class EditorModel: ObservableObject {
                 return offset.seconds + (sourceTime.seconds - clip.start.seconds)
             }
             let index = frames.lowerBound { $0.time >= clip.end || sequenceTime($0.time) > playhead } - 1
-            guard frames.indices.contains(index), let frameEnd = try? frames[index].time.adding(frames[index].duration),
-                  playhead < sequenceTime(frameEnd) else { return nil }
-            picture = max(.zero, frames[index].time)
+            guard clip.source.media.hasVideo else { return nil }
+            if frames.indices.contains(index), let frameEnd = try? frames[index].time.adding(frames[index].duration),
+               playhead < sequenceTime(frameEnd) {
+                picture = max(.zero, frames[index].time)
+            } else {
+                picture = nil
+            }
         } else {
-            guard playhead == duration, let last = segments.last,
-                  let frame = try? JPEGExport.stillFrameTime(in: last.source.media, at: last.end,
-                                                            exclusiveEnd: true) else { return nil }
+            guard playhead == duration, let last = segments.last, last.source.media.hasVideo else { return nil }
             clip = last
-            picture = frame
+            picture = try? JPEGExport.stillFrameTime(in: last.source.media, at: last.end, exclusiveEnd: true)
         }
         let media = clip.source.media
         let tracks = media.streams.filter { $0.kind == "audio" }
@@ -1601,7 +2662,7 @@ final class EditorModel: ObservableObject {
     func chooseStillFrame() {
         guard canEdit else { return }
         preview.pause()
-        guard let source = jpegSourceAtPlayhead else { return }
+        guard let source = jpegSourceAtPlayhead, let frame = source.frame else { return }
         let options = StillFrameSaveOptions()
         let panel = options.panel(source: source.media.url, directory: exportDirectory)
         let currentSession = session
@@ -1611,9 +2672,10 @@ final class EditorModel: ObservableObject {
             isPresentingPanel = false
             guard accepted, let output = panel.url else { resumePendingWork(); return }
             exportDirectory = output.deletingLastPathComponent()
+            guard canExport(to: output) else { return }
             let confirmed = options.confirmedDestination(at: output)
             runExport { token, _ in
-                try JPEGExport.writeStill(source.media, at: source.frame, to: output, replacing: confirmed,
+                try JPEGExport.writeStill(source.media, at: frame, to: output, replacing: confirmed,
                                           cancelled: { token.isCancelled })
                 return (output, "Exported " + output.lastPathComponent)
             }
@@ -1626,7 +2688,7 @@ final class EditorModel: ObservableObject {
         preview.pause()
         guard let source = jpegSourceAtPlayhead else { return }
         let options = JPEGExportOptions(preset: preferences.jpegPreset)
-        let panel = options.panel(source: source.media.url, directory: exportDirectory, hasAudio: source.audioStream != nil)
+        let panel = options.panel(source: source.media.url, directory: exportDirectory, hasAudio: source.audioStream != nil, hasPictureAtPlayhead: source.frame != nil)
         let currentSession = session
         isPresentingPanel = true
         present(panel) { [weak self, options] accepted in
@@ -1645,8 +2707,10 @@ final class EditorModel: ObservableObject {
         guard !isEmpty, !isBusy else { return }
         do {
             let limit = try options.frameLimit()
+            try validateHistoryDestination(directory, includesContents: true)
             let preset = options.preset, sample = options.sample, mode = options.mode
-            let useSidecar = useAnalysisSidecars
+            let useSidecar = sidecarPreference.permits(source.media.url)
+            let currentSidecarPreference = sidecarPreference
             let wave = audioStore.finished.contains(source.id) ? audioStore.waves[source.id] : nil
             let sceneReport = sceneReports[source.id]
             let savedSilence = source.audioStream.flatMap { stream in
@@ -1659,7 +2723,9 @@ final class EditorModel: ObservableObject {
             runExport { [self] token, progress in
                 let selection = try source.selection(for: mode) {
                     if let sceneReport { return sceneReport }
-                    let report = try SceneAnalysis.scan(source.media, useSidecar: useSidecar, cancelled: { token.isCancelled })
+                    let report = try SceneAnalysis.scan(source.media, useSidecar: useSidecar && currentSidecarPreference.permits(source.media.url),
+                                                        allowAutomaticSave: { currentSidecarPreference.permits(source.media.url) },
+                                                        cancelled: { token.isCancelled })
                     DispatchQueue.main.async {
                         guard self.session == currentSession else { return }
                         self.installSceneReport(report, for: source.id)
@@ -1724,6 +2790,8 @@ final class EditorModel: ObservableObject {
     }
 
     private func prepareReplacement(source: IndexedSource, replacement: URL) {
+        refreshSidecarExclusions(adding: [source.url, replacement])
+        let excluded = sidecarExclusions
         let currentSession = session
         let token = EditCancellation()
         let useSidecar = useAnalysisSidecars
@@ -1732,14 +2800,14 @@ final class EditorModel: ObservableObject {
         isCheckingEdit = true
         Task { [self] in
             let inspection = await Task.detached(priority: .userInitiated) {
-                Result { try CutEngine(cancelled: { token.isCancelled }, useSidecar: useSidecar).inspectSummary(replacement) }
+                Result { try CutEngine(cancelled: { token.isCancelled }, useSidecar: useSidecar && !AnalysisSidecar.isExcluded(replacement, in: excluded)).inspectSummary(replacement) }
             }.value
             guard session == currentSession else { return }
             cancellation = nil
             isCheckingEdit = false
             do {
                 let control = try ReplacementExportPanel(source: source.media, replacement: inspection.get(),
-                                                         sourceName: source.name, useSidecar: useSidecar)
+                                                         sourceName: source.name, useSidecar: useSidecar, excludedSources: excluded)
                 let panel = NSSavePanel()
                 panel.title = "Apply Replacement Audio"
                 panel.message = "Save a lossless working copy to use for every cut of this source in the timeline."
@@ -1767,17 +2835,23 @@ final class EditorModel: ObservableObject {
         }
     }
 
-    func applyReplacement(_ plan: AudioReplacementPlan, output: URL, useSidecar: Bool, sourceID: UUID? = nil) {
+    @discardableResult
+    func applyReplacement(_ plan: AudioReplacementPlan, output: URL, useSidecar: Bool, sourceID: UUID? = nil,
+                          validateCommit: @escaping @MainActor () throws -> Void = {},
+                          completed: ((Result<Int, MCPCommandError>) -> Void)? = nil) -> EditCancellation? {
         // An analysis notice can arrive while the save panel is open.
-        guard !isEmpty, !isBusy else { return }
+        guard !isEmpty, !isBusy else { return nil }
         guard let source = segments.lazy.map(\.source).first(where: {
             $0.url.standardizedFileURL == plan.source.standardizedFileURL && (sourceID == nil || $0.id == sourceID)
         }), source.media.identity == plan.sourceIdentity else {
             alert = EditorNotice(title: "Couldn’t Apply Replacement Audio",
                                  message: "The planned source no longer matches the recording on the timeline.")
             resumePendingWork()
-            return
+            return nil
         }
+        guard canExport(to: output) else { return nil }
+        refreshSidecarExclusions(adding: [source.url, plan.replacement, output])
+        let excluded = sidecarExclusions
         let lastCut = segments.lazy.filter { $0.source.id == source.id }.map(\.end).max() ?? source.duration
         preview.pause()
         lastExportedURL = nil
@@ -1800,11 +2874,18 @@ final class EditorModel: ObservableObject {
             defer { exportTasks.removeValue(forKey: currentSession) }
             let exported = await Task.detached(priority: .userInitiated) {
                 Result {
-                    try AudioReplacementEngine(cancelled: { token.isCancelled }, useSidecar: useSidecar)
-                        .exportWorkingCopy(plan, to: output) { report($0 * 0.75) }
+                    try AnalysisSidecar.$excludedSources.withValue(excluded) {
+                        try AudioReplacementEngine(cancelled: { token.isCancelled }, useSidecar: useSidecar)
+                            .exportWorkingCopy(plan, to: output) { report($0 * 0.75) }
+                    }
                 }
             }.value
-            guard session == currentSession else { return }
+            let published = "The working copy was saved to \(output.path)."
+            guard session == currentSession else {
+                let message = (try? exported.get()) == nil ? "The project changed." : published + " The project changed."
+                completed?(.failure(MCPCommandError("project_closed", message)))
+                return
+            }
             let saved: Bool
             let result: Result<IndexedSource, Error>
             switch exported {
@@ -1816,7 +2897,7 @@ final class EditorModel: ObservableObject {
                 exportProgress = 0.8
                 result = await Task.detached(priority: .userInitiated) {
                     Result {
-                        let media = try CutEngine(cancelled: { token.isCancelled }, useSidecar: useSidecar)
+                        let media = try CutEngine(cancelled: { token.isCancelled }, useSidecar: useSidecar && !AnalysisSidecar.isExcluded(output, in: excluded))
                             .inspect(output, keyframes: true, expectedIdentity: identity) { _ = report(0.8 + $0 * 0.2) }
                         try Self.checkEditable(media)
                         guard media.duration >= lastCut else {
@@ -1830,7 +2911,10 @@ final class EditorModel: ObservableObject {
                     }
                 }.value
             }
-            guard session == currentSession else { return }
+            guard session == currentSession else {
+                completed?(.failure(MCPCommandError("project_closed", saved ? published + " The project changed." : "The project changed.")))
+                return
+            }
             cancellation = nil
             isExporting = false
             isCancelling = false
@@ -1839,22 +2923,45 @@ final class EditorModel: ObservableObject {
                 statusMessage = saved
                     ? "Audio replacement cancelled. The working copy was saved to \(output.lastPathComponent)."
                     : "Audio replacement cancelled."
+                completed?(.failure(MCPCommandError("cancelled", saved ? "Audio replacement cancelled. " + published : statusMessage)))
                 return
             }
             do {
                 let updated = try result.get()
+                try validateCommit()
                 let proposed = segments.map { clip in
                     guard clip.source.id == source.id else { return clip }
-                    return EditorSegment(id: clip.id, source: updated, start: clip.start, end: clip.end,
+                    return EditorSegment(id: clip.id, documentID: clip.documentID, source: updated, start: clip.start, end: clip.end,
                                          displayRange: clip.displayRange, occurrence: clip.occurrence)
                 }
-                validate(proposed, selecting: selectedID, at: playhead, action: "Replace Source Audio",
-                         replacementTrack: plan.targetAudioOrdinal)
+                guard validate(proposed, selecting: selectedID, at: playhead, action: "Replace Source Audio",
+                               replacementTrack: plan.targetAudioOrdinal) else {
+                    throw MCPCommandError("replacement_failed", alert?.message ?? "The new soundtrack could not be applied.")
+                }
+                completed?(.success(mcpRevision))
             } catch {
                 let message = saved
                     ? "The working copy was saved to \(output.lastPathComponent). \(error.localizedDescription)"
                     : error.localizedDescription
                 alert = EditorNotice(title: "Couldn’t Apply Replacement Audio", message: message)
+                let code = (error as? MCPCommandError)?.code ?? (error as? CutError)?.code ?? "replacement_failed"
+                completed?(.failure(MCPCommandError(code, saved ? published + " " + error.localizedDescription : error.localizedDescription)))
+            }
+        }
+        return token
+    }
+
+    func chooseResolveExport() {
+        guard canEdit else { return }
+        let clips = segments.map(\.request)
+        let imported = Array(edit.preparation.sourceMedia.values)
+        let name = clips.first?.file.deletingPathExtension().lastPathComponent ?? "Untitled"
+        ResolveExportPanel.choose(name: name, in: editorWindow) { output, open in
+            guard self.canExport(to: output) else { return }
+            self.runExport { token, _ in
+                try ResolveExport.write(clips, to: output, matching: imported, cancelled: { token.isCancelled })
+                if open { try ResolveExport.openInResolve(output, cancelled: { token.isCancelled }) }
+                return (output, "Exported \(output.lastPathComponent).")
             }
         }
     }
@@ -1863,8 +2970,17 @@ final class EditorModel: ObservableObject {
         chooseExport(mode: nil)
     }
 
+    func chooseSelectionExport() {
+        guard canActOnRange, let span = selectedSpan else { return }
+        chooseExport(mode: nil, candidate: pieces(in: span), selectionOnly: true)
+    }
+
     func chooseExport(mode: ExportMode?) {
-        guard canEdit, let first = segments.first else { return }
+        chooseExport(mode: mode, candidate: segments, selectionOnly: false)
+    }
+
+    private func chooseExport(mode: ExportMode?, candidate: [EditorSegment], selectionOnly: Bool) {
+        guard canEdit, let first = candidate.first else { return }
         cancelTrim()
         preview.pause()
         let currentSession = session
@@ -1873,11 +2989,13 @@ final class EditorModel: ObservableObject {
         isCheckingEdit = true
         let source = first.source.media
         let preferred = preferredCopyContainer
-        let candidate = segments
+        let excluded = sidecarExclusions
         let useSidecar = useAnalysisSidecars
         Task {
             let choices = await Task.detached(priority: .userInitiated) {
-                ExportContainerChoices(source: source, clips: candidate.map(\.request), preferred: preferred, cancelled: { token.isCancelled })
+                AnalysisSidecar.$excludedSources.withValue(excluded) {
+                    ExportContainerChoices(source: source, clips: candidate.map(\.request), preferred: preferred, cancelled: { token.isCancelled })
+                }
             }.value
             guard session == currentSession else { return }
             cancellation = nil
@@ -1885,6 +3003,8 @@ final class EditorModel: ObservableObject {
             var options = exportOptions
             options.mode = mode ?? defaultExportMode
             options.tracks = source.hasVideo ? .all : .audio
+            // Every export starts from Lossless Copy for sound. Conversion is offered when copy cannot be exact.
+            options.audioMode = .copy
             options.audioTrackOrdinal = nil
             let available = choices.choices(for: options)
             if let preferred, options.tracks == .all, available.contains(preferred) {
@@ -1892,28 +3012,29 @@ final class EditorModel: ObservableObject {
             } else {
                 options.copyContainer = available.first ?? source.url.pathExtension.lowercased()
             }
-            presentExport(options: options, copyContainers: choices, candidate: candidate, useSidecar: useSidecar)
+            presentExport(options: options, copyContainers: choices, candidate: candidate, useSidecar: useSidecar, selectionOnly: selectionOnly)
         }
     }
 
     private func presentExport(options: ExportSheetOptions, copyContainers: ExportContainerChoices,
-                               candidate: [EditorSegment], useSidecar: Bool) {
+                               candidate: [EditorSegment], useSidecar: Bool, selectionOnly: Bool) {
         guard let first = candidate.first else { return }
         let panel = NSSavePanel()
-        panel.title = "Export Media"
+        panel.title = selectionOnly ? "Export Selection" : "Export Media"
         panel.prompt = "Export"
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
         panel.directoryURL = exportDirectory
-        panel.nameFieldStringValue = "\(first.source.url.deletingPathExtension().lastPathComponent) Edit.\(options.container)"
+        panel.nameFieldStringValue = "\(first.source.url.deletingPathExtension().lastPathComponent) \(selectionOnly ? "Selection" : "Edit").\(options.container)"
         let media = Dictionary(candidate.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { first, _ in first })
         let currentSession = session
         let formatControl = ExportFormatControl(panel: panel, options: options, copyContainers: copyContainers,
-                                               clips: candidate.map(\.request), media: media, useSidecar: useSidecar,
+                                               clips: candidate.map(\.request), media: media, useSidecar: useSidecar, excludedSources: sidecarExclusions,
+                                               allowsApplyingReviewToTimeline: !selectionOnly,
                                                changed: { [weak self] options, explicitCopyContainer in
             guard let self, self.session == currentSession else { return }
             self.exportOptions = options
-            if explicitCopyContainer { self.preferCopyContainer(options.copyContainer) }
+            if explicitCopyContainer && !selectionOnly { self.preferCopyContainer(options.copyContainer) }
         }, directoryChanged: { [weak self] directory in
             guard let self, self.session == currentSession else { return }
             self.exportDirectory = directory
@@ -1923,7 +3044,7 @@ final class EditorModel: ObservableObject {
             formatControl.stopChecking()
             guard let self, self.session == currentSession else { return }
             self.isPresentingPanel = false
-            if let review = formatControl.appliedReview {
+            if !selectionOnly, let review = formatControl.appliedReview {
                 self.applyExportReview(review)
                 self.resumePendingWork()
             } else if accepted, let output = panel.url, let plan = formatControl.selected {
@@ -1941,7 +3062,7 @@ final class EditorModel: ObservableObject {
                   segment.source.url == range.file && segment.start == range.from && segment.end == range.to
               }) else { return }
         let proposed = zip(segments, review.revised).map { segment, range in
-            EditorSegment(id: segment.id, source: segment.source, start: range.from ?? segment.start, end: range.to, displayRange: segment.displayRange, occurrence: segment.occurrence)
+            EditorSegment(id: segment.id, documentID: segment.documentID, source: segment.source, start: range.from ?? segment.start, end: range.to, displayRange: segment.displayRange, occurrence: segment.occurrence)
         }
         validate(proposed, selecting: selectedID, at: playhead, action: "Apply Reviewed Cuts")
     }
@@ -1969,7 +3090,39 @@ final class EditorModel: ObservableObject {
         return true
     }
 
+    func preserveAfterUnconfirmedClose() {
+        let committed = committedBeforeImport ?? sequenceClips
+        defer { draft.relinquish() }
+        guard draft.hasScheduledWrites || hasUnsavedDocumentChanges else { return }
+        // Closing can bypass the document prompt while an import is showing a partial
+        // batch. Only edits accepted before that batch belong to the recovery project.
+        do { try draft.write(documentWriter(clips: committed)) }
+        catch { reportDraftError(error) }
+    }
+
     func endSession() {
+        mcpSidecarReceipt?.finish("cancelled")
+        mcpSilenceReceipt?.finish("cancelled")
+        mcpSidecarReceipt = nil
+        mcpSilenceReceipt = nil
+        mcpGeneration = UUID()
+        mcpRevision = 0
+        committedBeforeImport = nil
+        savedMediaPaths = [:]
+        lastSidecarPaths = []
+        lastSidecarCandidates = []
+        sidecarExclusions = []
+        sidecarPreference.setExclusions([])
+        rangeTool = false
+        projectURL = nil
+        openingProjectURL = nil
+        savedSequence = []
+        savedUndoIDs = []
+        savedRedoIDs = []
+        recoveredDraft = false
+        deferredDraftSave = false
+        draft.discard()
+        cancelTrim()
         usesPointerPosition = false
         filmstripTiles = FilmstripTileBuffer()
         sidecarSaveToken?.cancel()
@@ -1978,6 +3131,7 @@ final class EditorModel: ObservableObject {
         isSavingSidecars = false
         for task in pauseDetections.values { task.cancel() }
         pauseDetections.removeAll()
+        mcpSilenceWorkers.removeAll()
         silenceMedia.removeAll()
         silenceResults.removeAll()
         silenceIssues.removeAll()
@@ -2016,7 +3170,9 @@ final class EditorModel: ObservableObject {
         checkingTrim = nil
         trimChecks.removeAll()
         edit = EditSnapshot()
+        prepareCopyBoundaries()
         analysisTrack = 0
+        useSavedMonitoringTracks = true
         trimOrigin = nil
         trimAudition = nil
         isImporting = false
@@ -2033,9 +3189,9 @@ final class EditorModel: ObservableObject {
         guard let media = edit.preparation.sourceMedia[sourceID], media.hasVideo else { return nil }
         // The header used during provisional import can have a different presentation clock.
         let key = media.frames.isEmpty ? nil : FilmstripTileKey(time: sourceTime, size: size)
-        let saved = useAnalysisSidecars ? key.map { (AnalysisSidecar(media: media), $0) } : nil
+        let saved = sidecarPreference.permits(media.url) ? key.map { (AnalysisSidecar(media: media), $0) } : nil
         return await preview.thumbnail(source: sourceID, url: media.url, at: sourceTime, size: size, saved: saved,
-                                       cacheEnabled: { [sidecarPreference] in sidecarPreference.enabled },
+                                       cacheEnabled: { [sidecarPreference] in sidecarPreference.permits(media.url) },
                                        preserveAlpha: media.video.hasAlpha || media.video.hasAdditionalVideoLayers) { image in
             if let key, self.edit.preparation.sourceMedia[sourceID] != nil {
                 self.filmstripTiles.remember(FilmstripTile(key: key, image: image), source: sourceID)
@@ -2080,7 +3236,10 @@ final class EditorModel: ObservableObject {
             if end <= marked.lowerBound {
                 before.append(segment)
             } else if offset < marked.lowerBound {
-                let wanted = marked.lowerBound - offset + segment.start
+                guard let wanted = try? segment.start.adding(marked.lowerBound.subtracting(offset)) else {
+                    alert = EditorNotice(title: "Can’t Delete Marked Range", message: "The selection exceeds the supported time precision.")
+                    return
+                }
                 guard let cut = boundary(at: index, target: wanted, edge: .end) else { return }
                 var left = segment
                 left.end = cut
@@ -2089,7 +3248,10 @@ final class EditorModel: ObservableObject {
             if offset >= marked.upperBound {
                 after.append(segment)
             } else if end > marked.upperBound {
-                let wanted = marked.upperBound - offset + segment.start
+                guard let wanted = try? segment.start.adding(marked.upperBound.subtracting(offset)) else {
+                    alert = EditorNotice(title: "Can’t Delete Marked Range", message: "The selection exceeds the supported time precision.")
+                    return
+                }
                 guard let cut = boundary(at: index, target: wanted, edge: .start) else { return }
                 if let left = before.last, left.id == segment.id, left.end >= cut {
                     alert = EditorNotice(title: "Can’t Delete Marked Range", message: "The marks resolve to the same cut point. Move the marks farther apart.")
@@ -2155,20 +3317,66 @@ final class EditorModel: ObservableObject {
         return choices
     }
 
+    /// Full packet scans for large recordings run before keyframe edits are admitted.
+    /// Small indexes stay lazy, as building those only when a handle is used avoids
+    /// preparing every short clip when opening a project or changing the snap target.
+    private func prepareCopyBoundaries() {
+        boundaryPreparation?.cancel()
+        boundaryPreparation = nil
+        boundaryPreparationID = nil
+        guard !isImporting, effectiveSnapTarget == .keyframes, let container = preferredCopyContainer else {
+            isPreparingCopyBoundaries = false
+            return
+        }
+        let sources = edit.preparation.sourceMedia.filter { id, media in
+            copyBoundaryIndices[id] == nil && media.hasFullEditIndex && media.indexStorageBytes >= PreparedEdit.backgroundCopyCheckBytes
+        }
+        guard !sources.isEmpty else {
+            isPreparingCopyBoundaries = false
+            return
+        }
+        let id = UUID()
+        boundaryPreparationID = id
+        isPreparingCopyBoundaries = true
+        boundaryPreparation = Task { [weak self] in
+            let worker = Task.detached(priority: .userInitiated) {
+                var indices: [UUID: BoundaryIndex] = [:]
+                for (id, media) in sources {
+                    guard !Task.isCancelled else { break }
+                    indices[id] = try? BoundaryIndex(media: media, container: container, engine: CutEngine(cancelled: { Task.isCancelled }))
+                }
+                return indices
+            }
+            let indices = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
+            guard let self, self.boundaryPreparationID == id else { return }
+            self.copyBoundaryIndices.merge(indices) { _, new in new }
+            self.boundaryPreparation = nil
+            self.boundaryPreparationID = nil
+            self.isPreparingCopyBoundaries = false
+            self.rebuildPausePlan()
+            self.resumePendingWork()
+        }
+    }
+
     private func copyBoundaries(for source: IndexedSource) -> BoundaryIndex? {
         guard let container = preferredCopyContainer else { return nil }
         if let cached = copyBoundaryIndices[source.id] { return cached }
-        let index = BoundaryIndex(media: source.media, container: container, engine: CutEngine())
+        if isPreparingCopyBoundaries || (isImporting && source.media.indexStorageBytes >= PreparedEdit.backgroundCopyCheckBytes) { return nil }
+        let index = try? BoundaryIndex(media: source.media, container: container, engine: CutEngine())
         copyBoundaryIndices[source.id] = index
         return index
     }
 
     private func copyIssue(_ proposed: [EditorSegment]) -> CutError? {
-        guard let container = preferredCopyContainer else {
+        Self.copyIssue(proposed, container: preferredCopyContainer, engine: CutEngine())
+    }
+
+    private nonisolated static func copyIssue(_ proposed: [EditorSegment], container: String?, engine: CutEngine) -> CutError? {
+        guard let container else {
             return CutError(code: "unsupported_container", message: "No copy container is available for this source.")
         }
         do {
-            _ = try Self.resolve(proposed, engine: CutEngine(), container: container)
+            _ = try Self.resolve(proposed, engine: engine, container: container)
             return nil
         } catch let issue as CutError {
             return issue
@@ -2180,7 +3388,7 @@ final class EditorModel: ObservableObject {
     // Trying another candidate cannot repair a fixed, non-random-access picture
     // elsewhere. A moved edge can still remove a neighbor's unsafe seam by
     // rejoining continuous source ranges, so keep looking in that case.
-    private func blocksAllSnapCandidates(_ issue: CutError, in proposed: [EditorSegment],
+    private nonisolated static func blocksAllSnapCandidates(_ issue: CutError, in proposed: [EditorSegment], container: String?,
                                          moving id: UUID? = nil, edge: TimelineEdge? = nil) -> Bool {
         if issue.code == "source_changed" || issue.code == "unsupported_tracks" { return true }
         guard issue.code == "unsafe_boundary", let number = issue.segment, proposed.indices.contains(number - 1),
@@ -2191,7 +3399,7 @@ final class EditorModel: ObservableObject {
         if segment.id == id && failedEdge == edge { return false }
         let neighbor = failedEdge == .start ? index - 1 : index + 1
         if proposed.indices.contains(neighbor), proposed[neighbor].id == id, edge != failedEdge,
-           proposed[neighbor].source.id == segment.source.id, let container = preferredCopyContainer,
+           proposed[neighbor].source.id == segment.source.id, let container,
            CutEngine().coalescesAdjacentRanges(in: segment.source.media, container: container) { return false }
         let media = segment.source.media
         let time = failedEdge == .start ? segment.start : segment.end
@@ -2264,17 +3472,9 @@ final class EditorModel: ObservableObject {
     }
 
     private func export(_ plan: EditorExportPlan, to output: URL) {
-        guard !isEmpty, !isBusy else { return }
+        guard !isEmpty, !isBusy, canExport(to: output) else { return }
         runExport { token, progress in
-            switch plan {
-            case .packets(let edit, let mode, let tracks):
-                let engine = CutEngine(cancelled: { token.isCancelled }, smartTrim: mode == .smart, tracks: tracks)
-                try engine.export(edit, to: output, progress: progress)
-            case .conversion(let conversion):
-                try ReencodeEngine(cancelled: { token.isCancelled }).write(conversion, to: output) {
-                    _ = progress($0)
-                }
-            }
+            try plan.writeOutput(to: output, cancelled: { token.isCancelled }) { _ = progress($0) }
             return (output, "Exported \(output.lastPathComponent)")
         }
     }
@@ -2288,6 +3488,7 @@ final class EditorModel: ObservableObject {
         exportProgress = 0
         let currentSession = session
         let useSidecar = useAnalysisSidecars
+        let excluded = sidecarExclusions
         let token = EditCancellation()
         cancellation = token
         let reportProgress: @Sendable (Double) -> Bool = { [weak self] progress in
@@ -2303,8 +3504,8 @@ final class EditorModel: ObservableObject {
         exportTasks[currentSession] = Task {
             let result = await Task.detached(priority: .userInitiated) {
                 Result {
-                    try AnalysisSidecar.$readsEnabled.withValue(useSidecar) {
-                        try work(token, reportProgress)
+                    try AnalysisSidecar.$excludedSources.withValue(excluded) {
+                        try AnalysisSidecar.$readsEnabled.withValue(useSidecar) { try work(token, reportProgress) }
                     }
                 }
             }.value
@@ -2331,19 +3532,20 @@ final class EditorModel: ObservableObject {
         }
     }
 
+    @discardableResult
     private func validate(_ proposed: [EditorSegment], selecting id: UUID?, at destination: Double,
-                          action: String, originalPlayhead: Double? = nil, replacementTrack: Int? = nil) {
+                          action: String, originalPlayhead: Double? = nil, replacementTrack: Int? = nil, preserveMarks: Bool = false) -> Bool {
         cancelTrim()
         preview.pause()
         let original = originalPlayhead ?? playhead
         guard proposed.allSatisfy({ $0.start >= .zero && $0.start < $0.end && $0.end <= $0.source.duration }) else {
             restorePreview(at: original)
             alert = EditorNotice(title: "Couldn’t \(action)", message: "Keep a nonempty range within each source.")
-            return
+            return false
         }
         let prepared = PreparedEdit(segments: proposed, previous: edit.preparation, engine: CutEngine())
-        apply(proposed, prepared: prepared, selecting: id, at: destination, action: action, originalPlayhead: original,
-              replacementTrack: replacementTrack)
+        return apply(proposed, prepared: prepared, selecting: id, at: destination, action: action, originalPlayhead: original,
+              replacementTrack: replacementTrack, preserveMarks: preserveMarks)
     }
 
     private nonisolated static func resolve(_ segments: [EditorSegment], engine: CutEngine,
@@ -2352,9 +3554,11 @@ final class EditorModel: ObservableObject {
         return try engine.resolve(segments.map(\.request), media: media, container: container)
     }
 
+    @discardableResult
     private func apply(_ proposed: [EditorSegment], prepared: PreparedEdit, selecting id: UUID?, at destination: Double,
                        action: String, originalPlayhead: Double? = nil, recordHistory: Bool = true,
-                       historySnapshot: EditSnapshot? = nil, preservePreview: Bool = false, replacementTrack: Int? = nil) {
+                       historySnapshot: EditSnapshot? = nil, preservePreview: Bool = false, replacementTrack: Int? = nil,
+                       preserveMarks: Bool = false) -> Bool {
         var duration = RationalTime.zero
         var offsets: [RationalTime] = []
         offsets.reserveCapacity(proposed.count)
@@ -2366,14 +3570,15 @@ final class EditorModel: ObservableObject {
         } catch {
             restorePreview(at: originalPlayhead ?? playhead)
             alert = EditorNotice(title: "Couldn’t Apply Edit", message: error.localizedDescription)
-            return
+            return false
         }
         if recordHistory {
             var original = historySnapshot ?? snapshot()
             if let originalPlayhead { original.playhead = originalPlayhead }
-            undoStack.append(HistoryEntry(edit: original, action: action, copyContainer: explicitCopyContainer,
+            undoStack.append(HistoryEntry(action: action, contents: .live(original), copyContainer: explicitCopyContainer,
                                           analysisTrack: replacementTrack.map { _ in analysisTrack }))
             redoStack.removeAll()
+            enforceHistoryLimit()
         }
         if proposed.isEmpty, explicitCopyContainer != nil {
             // The next import may use a format that this container cannot carry.
@@ -2395,8 +3600,9 @@ final class EditorModel: ObservableObject {
             return proposed[index].timeline(sequenceRange: offsets[index].seconds..<end.seconds)
         }
         let keepPreview = preservePreview && segments.map(\.preview) == proposed.map(\.preview)
-        let keepMarks = replacementTrack != nil
-        edit = EditSnapshot(segments: proposed, timelineClips: clips,
+        let keepMarks = preserveMarks || (recordHistory && replacementTrack != nil)
+        mcpRevision += 1
+        edit = EditSnapshot(documentClips: sequenceClips(for: proposed), segments: proposed, timelineClips: clips,
                             timelineThumbnailHeight: clips.lazy.map(\.thumbnailHeight).max() ?? TimelineClip.minimumThumbnailHeight,
                             largeThumbnailHeight: clips.lazy.map { $0.thumbnailHeight(large: true) }.max() ?? TimelineClip.minimumLargeThumbnailHeight,
                             preparation: prepared, selectedID: id,
@@ -2404,14 +3610,24 @@ final class EditorModel: ObservableObject {
                             pointerMarkIn: keepMarks && edit.pointerMarkIn, pointerMarkOut: keepMarks && edit.pointerMarkOut,
                             playhead: destination,
                             offsets: offsets, duration: duration)
+        prepareCopyBoundaries()
         if let track = replacementTrack, audioTracks.indices.contains(track), track != analysisTrack { analysisTrack = track }
         syncWaveforms()
         requestSnapAnalysis()
         if !keepPreview { restorePreview(at: destination) }
         updateStatus()
+        if recordHistory { saveUntitledDraft() }
+        return true
+    }
+
+    private var hasUnsavedDocumentChanges: Bool {
+        recoveredDraft || (committedBeforeImport ?? sequenceClips) != savedSequence ||
+            undoStack.map(\.id) != savedUndoIDs || redoStack.map(\.id) != savedRedoIDs
     }
 
     private func updateStatus() {
+        let changed = hasUnsavedDocumentChanges
+        if isProjectChanged != changed { isProjectChanged = changed }
         lastExportedURL = nil
         if segments.isEmpty {
             statusMessage = "Add local video or audio files to start."
@@ -2435,7 +3651,9 @@ final class EditorModel: ObservableObject {
 
     private func monitoredPreview(_ segment: EditorSegment) -> PreviewRange {
         var range = segment.preview
-        if range.isAudioOnly { range.audioTrack = analysisTrack }
+        if range.isAudioOnly {
+            range.audioTrack = useSavedMonitoringTracks ? range.audioTrack ?? analysisTrack : analysisTrack
+        }
         return range
     }
 
@@ -2453,12 +3671,12 @@ final class EditorModel: ObservableObject {
         return (index, segments[index], edit.offsets[index])
     }
 
-    private func markBoundary(at time: Double) -> RationalTime? {
+    private func markBoundary(at time: Double, pointer: Bool? = nil) -> RationalTime? {
         guard let (_, segment, offset) = locatedSegment(at: time) else { return edit.duration }
         if time == offset.seconds { return offset }
         let target = time - offset.seconds + segment.start.seconds
         let boundary: RationalTime
-        switch usesPointerPosition ? .off : effectiveSnapTarget {
+        switch (pointer ?? usesPointerPosition) ? .off : effectiveSnapTarget {
         case .off:
             boundary = editBoundary(in: segment.source, to: target) ?? segment.start
         case .keyframes:
@@ -2478,7 +3696,12 @@ final class EditorModel: ObservableObject {
             }
             boundary = point
         }
-        return offset + (min(max(boundary, segment.start), segment.end) - segment.start)
+        do {
+            return try offset.adding(min(max(boundary, segment.start), segment.end).subtracting(segment.start))
+        } catch {
+            alert = EditorNotice(title: "Can’t Set Mark", message: error.localizedDescription)
+            return nil
+        }
     }
 
     private func showAnalysisBoundaryError(_ clip: EditorSegment, title: String) {
@@ -2529,10 +3752,10 @@ final class EditorModel: ObservableObject {
     private func nearest<T: RandomAccessCollection>(in times: T, to target: Double, after minimum: RationalTime? = nil,
                                                     before maximum: RationalTime? = nil, includingLimits: Bool = false) -> RationalTime?
         where T.Index == Int, T.Element == RationalTime {
-        nearestBoundaries(in: times, to: target, after: minimum, before: maximum, includingLimits: includingLimits).first { _ in true }
+        Self.nearestBoundaries(in: times, to: target, after: minimum, before: maximum, includingLimits: includingLimits).first { _ in true }
     }
 
-    private func nearestBoundaries<T: RandomAccessCollection>(in times: T, to target: Double, after minimum: RationalTime?,
+    private nonisolated static func nearestBoundaries<T: RandomAccessCollection>(in times: T, to target: Double, after minimum: RationalTime?,
                                                               before maximum: RationalTime?, includingLimits: Bool = false) -> AnySequence<RationalTime>
         where T.Index == Int, T.Element == RationalTime {
         let start = minimum.map { min in times.lowerBound { includingLimits ? $0 >= min : $0 > min } } ?? times.startIndex
@@ -2611,6 +3834,7 @@ struct CutPreview: Identifiable {
 
 extension EditorModel {
     private func syncWaveforms(invalidatingPauses: Bool = false) {
+        if mcpSceneReceipt != nil, sceneSourceIDs != Set(analysisSourceMedia.keys) { cancelSceneAnalysis() }
         if analysisTrack != 0 && !audioTracks.indices.contains(analysisTrack) {
             analysisTrack = 0
             return
@@ -2620,8 +3844,10 @@ extension EditorModel {
         silenceMedia = sources.filter { _, media in
             (media.hasVideo ? !media.frames.isEmpty : !media.audio.isEmpty) && media.streams.filter { $0.kind == "audio" }.indices.contains(analysisTrack)
         }
-        activeAudioSources = Set(silenceMedia.keys)
-        audioStore.update(sources: sources, track: analysisTrack, useSidecar: useAnalysisSidecars)
+        let nextSources = Set(silenceMedia.keys)
+        if nextSources != activeAudioSources { invalidateMCPSilenceReceipt() }
+        activeAudioSources = nextSources
+        audioStore.update(sources: sources, track: analysisTrack, useSidecar: useAnalysisSidecars, excludedSources: sidecarExclusions)
         refreshDetectedPauses(invalidating: invalidatingPauses ? activeAudioSources : [])
     }
 
@@ -2629,20 +3855,34 @@ extension EditorModel {
         locatedSegment(at: playhead)?.1.source ?? segments.last?.source
     }
 
+    var analysisPlayheadSourceID: UUID? { playheadAudioSource?.id }
+
+    func hasAnalysisTrack(_ track: Int, in source: UUID) -> Bool {
+        guard let media = analysisSourceMedia[source], media.hasFullEditIndex else { return false }
+        return media.streams.filter { $0.kind == "audio" }.indices.contains(track)
+    }
+
+    func analysisThreshold(for source: UUID, track: Int) -> Double? {
+        thresholdOverrides[AudioTrackKey(source: source, track: track)]
+    }
+
     var pauseSourceLabel: String? { activeAudioSources.count > 1 ? playheadAudioSource?.name : nil }
 
     var manualThresholdDB: Double? {
         get {
             guard let id = playheadAudioSource?.id else { return nil }
-            return thresholdOverrides[AudioTrackKey(source: id, track: analysisTrack)]
+            return analysisThreshold(for: id, track: analysisTrack)
         }
         set {
             guard let id = playheadAudioSource?.id else { return }
-            let key = AudioTrackKey(source: id, track: analysisTrack)
-            guard thresholdOverrides[key] != newValue else { return }
-            setThresholdOverride(newValue, source: id)
-            refreshDetectedPauses(invalidating: [id])
+            setAnalysisThreshold(newValue, for: id)
         }
+    }
+
+    func setAnalysisThreshold(_ threshold: Double?, for id: UUID) {
+        guard analysisThreshold(for: id, track: analysisTrack) != threshold else { return }
+        setThresholdOverride(threshold, source: id)
+        refreshDetectedPauses(invalidating: [id])
     }
 
     var effectiveThresholdDB: Double? {
@@ -2670,12 +3910,17 @@ extension EditorModel {
             pendingSilenceRescans = activeAudioSources
         }
         silenceScanRequested = true
+        mcpSilenceReceipt?.cancelledDetail = { [weak self] in
+            guard let self else { return [:] }
+            return ["sources": self.activeAudioSources.subtracting(self.pendingSilenceSources).map(\.uuidString).sorted()]
+        }
         silenceIssues.removeAll()
         audioStore.retryFailures()
         syncWaveforms()
     }
 
     func cancelSilenceScan() {
+        invalidateMCPSilenceReceipt()
         if snapTarget == .silence { snapScanRequests.formUnion(activeAudioSources) }
         silenceScanRequested = false
         pendingSilenceRescans.removeAll()
@@ -2686,7 +3931,18 @@ extension EditorModel {
         refreshDetectedPauses()
     }
 
+    private func invalidateMCPSilenceReceipt() {
+        guard let receipt = mcpSilenceReceipt else { return }
+        receipt.finish("cancelled")
+        mcpSilenceReceipt = nil
+        silenceScanRequested = false
+        pendingSilenceRescans.removeAll()
+        for id in mcpSilenceWorkers { pauseDetections.removeValue(forKey: id)?.cancel() }
+        mcpSilenceWorkers.removeAll()
+    }
+
     private func refreshDetectedPauses(invalidating changed: Set<UUID> = []) {
+        if !changed.isEmpty { invalidateMCPSilenceReceipt() }
         // Once a saved report is visible its controls work just like a fresh scan.
         if !changed.isDisjoint(with: sourcePauses.keys) { silenceScanRequested = true }
         automaticThresholds = automaticThresholds.filter { activeAudioSources.contains($0.key) }
@@ -2696,6 +3952,7 @@ extension EditorModel {
         sourcePauses = sourcePauses.filter { !changed.contains($0.key) && activeAudioSources.contains($0.key) }
         for id in Array(pauseDetections.keys) where changed.contains(id) || !activeAudioSources.contains(id) {
             pauseDetections.removeValue(forKey: id)?.cancel()
+            mcpSilenceWorkers.remove(id)
         }
         let pending = pendingSilenceSources
         for (id, media) in silenceMedia where pending.contains(id) && pauseDetections[id] == nil && silenceIssues[id] == nil {
@@ -2708,11 +3965,11 @@ extension EditorModel {
                 sourcePauses[id] = result.pauses
                 continue
             }
-            let readSaved = !rescan && useAnalysisSidecars && checkedSilenceSidecars.insert(id).inserted
+            let persist = sidecarPreference.permits(media.url)
+            let readSaved = !rescan && persist && checkedSilenceSidecars.insert(id).inserted
             let wave = audioStore.finished.contains(id) ? audioStore.waves[id] : nil
             let calibrated = automaticThresholds[id]
             let requested = silenceScanRequested
-            let persist = useAnalysisSidecars
             guard readSaved || (wave != nil && (requested || calibrated == nil)) else { continue }
             // This job restores saved results even before the waveform has arrived.
             // Fresh detection shares the waveform decoder and runs only on request.
@@ -2740,7 +3997,10 @@ extension EditorModel {
                 }
                 return (try level ?? wave.automaticThresholdDB(checkingCancellation: Task.checkCancellation), nil)
             }
+            let endWork = mcpSilenceReceipt?.cleanup.begin()
+            if endWork != nil { mcpSilenceWorkers.insert(id) }
             pauseDetections[id] = Task {
+                defer { endWork?() }
                 do {
                     let (level, result) = try await withTaskCancellationHandler(operation: { try await worker.value },
                                                                                 onCancel: { worker.cancel() })
@@ -2756,11 +4016,22 @@ extension EditorModel {
                     silenceIssues[id] = error.localizedDescription
                 }
                 pauseDetections[id] = nil
+                mcpSilenceWorkers.remove(id)
                 refreshDetectedPauses()
             }
         }
-        if silenceScanRequested && pendingSilenceSources.isEmpty {
+        if let issue = silenceIssue, let receipt = mcpSilenceReceipt {
+            receipt.finish("failed", detail: ["error": issue])
+            mcpSilenceReceipt = nil
             silenceScanRequested = false
+            pendingSilenceRescans.removeAll()
+            for task in pauseDetections.values { task.cancel() }
+            pauseDetections.removeAll()
+            mcpSilenceWorkers.removeAll()
+        } else if silenceScanRequested && pendingSilenceSources.isEmpty {
+            silenceScanRequested = false
+            mcpSilenceReceipt?.finish("succeeded", detail: ["sources": activeAudioSources.map(\.uuidString).sorted()])
+            mcpSilenceReceipt = nil
         }
         rebuildPausePlan()
     }
@@ -2776,8 +4047,13 @@ extension EditorModel {
         let scope = pauseScope
         var plan: [TimelinePause] = []
         var count = 0, seconds = 0.0
-        var index = 0
-        while index < segments.count {
+        var index = max(0, edit.offsets.lowerBound { $0 > scope.from } - 1)
+        // Include earlier pieces of this continuous occurrence when the scope starts after a split.
+        while index > 0, segments[index - 1].occurrence == segments[index].occurrence,
+              segments[index - 1].end == segments[index].start {
+            index -= 1
+        }
+        while !sourcePauses.isEmpty, index < segments.count, edit.offsets[index] < scope.to {
             var clip = segments[index]
             let offset = edit.offsets[index]
             index += 1
@@ -2788,8 +4064,9 @@ extension EditorModel {
                 clip.end = segments[index].end
                 index += 1
             }
-            let lower = max(.zero, scope.from - offset) + clip.start
-            let upper = min(clip.end, clip.start + (scope.to - offset))
+            let end = index == segments.count ? edit.duration : edit.offsets[index]
+            guard let lower = try? clip.start.adding(max(scope.from, offset).subtracting(offset)),
+                  let upper = try? clip.end.subtracting(end.subtracting(min(scope.to, end))) else { continue }
             guard lower < upper, clip.source.isIndexed, let pauses = sourcePauses[clip.source.id] else { continue }
             let bounds = effectiveSnapTarget == .keyframes ? copyBoundaries(for: clip.source) : nil
             let fullClip = AudioSpan(from: clip.start, to: clip.end)
@@ -2800,7 +4077,8 @@ extension EditorModel {
             for pause in pauses[first...] {
                 if pause.from >= upper { break }
                 let span = AudioSpan(from: max(lower, pause.from), to: min(upper, pause.to))
-                guard (span.to - span.from).seconds >= minimumPause else { continue }
+                let length = (try? span.to.subtracting(span.from))?.seconds ?? (span.to.seconds - span.from.seconds)
+                guard length >= minimumPause else { continue }
                 let key = TimelinePause.Key(source: source, span: pause)
                 let match = protected.lowerBound { $0.to > pause.from }
                 let keep = match < protected.count && protected[match].from < pause.to
@@ -2824,20 +4102,24 @@ extension EditorModel {
                 for i in local.indices where !local[i].keep {
                     let span = local[i].span
                     guard span.from == clip.start || span.to == clip.end else { continue }
-                    let starts = bounds.starts(first: offset == .zero, last: onlyPiece && offset + clip.duration == edit.duration)
-                    let ends = bounds.ends(first: onlyPiece && offset == .zero, last: offset + clip.duration == edit.duration)
+                    let starts = bounds.starts(first: offset == .zero, last: onlyPiece && end == edit.duration)
+                    let ends = bounds.ends(first: onlyPiece && offset == .zero, last: end == edit.duration)
                     local[i].cut = AudioAnalysis.removal(in: span, leave: 0, ends: ends, starts: starts, clip: fullClip)
                 }
             }
-            func sequence(_ range: AudioSpan) -> AudioSpan {
-                AudioSpan(from: offset + (range.from - clip.start), to: offset + (range.to - clip.start))
+            func sequence(_ range: AudioSpan) -> AudioSpan? {
+                guard let from = try? offset.adding(range.from.subtracting(clip.start)),
+                      let to = try? offset.adding(range.to.subtracting(clip.start)) else { return nil }
+                return AudioSpan(from: from, to: to)
             }
             for pause in local {
-                if let cut = pause.cut {
+                guard let visible = sequence(pause.span) else { continue }
+                let removal = pause.cut.flatMap(sequence)
+                if let cut = removal {
                     count += 1
-                    seconds += (cut.to - cut.from).seconds
+                    seconds += cut.to.seconds - cut.from.seconds
                 }
-                plan.append(TimelinePause(key: pause.key, sequence: sequence(pause.span), removal: pause.cut.map(sequence),
+                plan.append(TimelinePause(key: pause.key, sequence: visible, removal: removal,
                                           isProtected: pause.keep))
             }
         }
@@ -2881,36 +4163,37 @@ extension EditorModel {
         rebuildPausePlan()
     }
 
-    var canUseRoomTone: Bool {
-        guard pauseAnalysisReady, hasPauseMarks else { return false }
+    var canUseRoomTone: Bool { roomTonePeaks() != nil }
+
+    private func roomTonePeaks() -> [UUID: Float]? {
+        guard pauseAnalysisReady, hasPauseMarks else { return nil }
         let scope = pauseScope
-        guard scope.from < scope.to else { return false }
-        return zip(segments, edit.offsets).allSatisfy { clip, offset in
-            offset >= scope.to || offset + clip.duration <= scope.from ||
-                audioStore.finished.contains(clip.source.id)
+        guard scope.from < scope.to else { return nil }
+        var peaks: [UUID: Float] = [:]
+        for (index, clip) in segments.enumerated() {
+            let offset = edit.offsets[index]
+            let next = index + 1 < segments.count ? edit.offsets[index + 1] : edit.duration
+            let from = max(scope.from, offset)
+            let to = min(scope.to, next)
+            guard from < to else { continue }
+            guard audioStore.finished.contains(clip.source.id),
+                  let value = audioStore.waves[clip.source.id]?.peak(
+                      from: clip.start.seconds + (from.seconds - offset.seconds),
+                      to: clip.start.seconds + (to.seconds - offset.seconds)) else { return nil }
+            peaks[clip.source.id] = max(peaks[clip.source.id] ?? 0, value)
         }
+        return peaks.isEmpty ? nil : peaks
     }
 
-    func useRoomTone() {
-        guard canUseRoomTone else { return }
-        let scope = pauseScope
-        var peaks: [UUID: Float] = [:]
-        for (clip, offset) in zip(segments, edit.offsets) {
-            let from = max(scope.from, offset)
-            let to = min(scope.to, offset + clip.duration)
-            guard from < to else { continue }
-            let start = clip.start + (from - offset)
-            let end = clip.start + (to - offset)
-            if let value = audioStore.waves[clip.source.id]?.peak(from: start.seconds, to: end.seconds) {
-                peaks[clip.source.id] = max(peaks[clip.source.id] ?? 0, value)
-            }
-        }
-        guard !peaks.isEmpty else { return }
+    @discardableResult
+    func useRoomTone() -> Bool {
+        guard let peaks = roomTonePeaks() else { return false }
         for (id, peak) in peaks {
             setThresholdOverride(AudioAnalysis.roomToneThresholdDB(forPeak: peak), source: id)
         }
         refreshDetectedPauses(invalidating: Set(peaks.keys))
         clearMarks()
+        return true
     }
 
     private func skipPauseIfNeeded(at position: Double) {
@@ -2937,8 +4220,9 @@ extension EditorModel {
         for index in first..<segments.count {
             let clip = segments[index], offset = edit.offsets[index]
             if offset >= span.to { break }
-            let start = clip.start + (max(span.from, offset) - offset)
-            let end = clip.start + (min(span.to, offset + clip.duration) - offset)
+            let next = index + 1 < segments.count ? edit.offsets[index + 1] : edit.duration
+            guard let start = try? clip.start.adding(max(span.from, offset).subtracting(offset)),
+                  let end = try? clip.end.subtracting(next.subtracting(min(span.to, next))) else { return [] }
             if start < end {
                 result.append(start == clip.start && end == clip.end ? clip : EditorSegment(source: clip.source, start: start, end: end,
                     displayRange: AudioSpan(from: start, to: end), occurrence: clip.occurrence))
@@ -2976,48 +4260,95 @@ extension EditorModel {
         var beforeRanges: [AudioSpan] = [], afterRanges: [AudioSpan] = []
         var remaining = second
         for span in kept[..<after].reversed() {
-            let from = max(span.from, span.to - remaining)
+            guard let start = try? span.to.subtracting(remaining) else { cutPreview = nil; return }
+            let from = max(span.from, start)
             beforeRanges.append(AudioSpan(from: from, to: span.to))
-            remaining = remaining - (span.to - from)
+            guard let left = try? remaining.subtracting(span.to.subtracting(from)) else { cutPreview = nil; return }
+            remaining = left
             if remaining == .zero { break }
         }
         remaining = second
         for span in kept[after...] {
-            let to = min(span.to, span.from + remaining)
+            guard let end = try? span.from.adding(remaining) else { cutPreview = nil; return }
+            let to = min(span.to, end)
             afterRanges.append(AudioSpan(from: span.from, to: to))
-            remaining = remaining - (to - span.from)
+            guard let left = try? remaining.subtracting(to.subtracting(span.from)) else { cutPreview = nil; return }
+            remaining = left
             if remaining == .zero { break }
         }
         let ranges = (beforeRanges.reversed() + afterRanges).flatMap(pieces).map(monitoredPreview)
         cutPreview = ranges.isEmpty ? nil : CutPreview(id: id, position: pause.sequence.from, pauseKey: pause.key, ranges: ranges)
     }
 
-    func applyPauses(queueTakes: Bool) {
-        guard pauseAnalysisReady else { return }
+    @discardableResult
+    func applyPauses(queueTakes: Bool) -> Bool {
+        guard pauseAnalysisReady else { return false }
         let cuts = pausePlan.compactMap(\.removal)
-        guard !cuts.isEmpty else { return }
+        guard !cuts.isEmpty else { return false }
         let scope = queueTakes ? pauseScope : AudioSpan(from: .zero, to: edit.duration)
         let ranges = AudioAnalysis.retained(in: scope, removing: cuts)
         guard !ranges.isEmpty else {
             alert = EditorNotice(title: "No media to keep", message: "Increase the time left in each pause or keep a pause.")
-            return
+            return false
+        }
+        let clips = ranges.map(pieces)
+        guard clips.allSatisfy({ !$0.isEmpty }) else {
+            alert = EditorNotice(title: "Can’t Shorten These Pauses", message: "A retained range exceeds the exact timeline clock.")
+            return false
         }
         if queueTakes {
-            let takes = ranges.map { range in
-                let clips = pieces(in: range)
+            let takes = zip(ranges, clips).map { range, clips in
                 let media = Dictionary(clips.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { first, _ in first })
                 return QueuedRange(start: range.from, end: range.to, clips: clips.map(\.request), media: media)
             }
             queuedRanges.append(contentsOf: takes)
             statusMessage = "Added \(ranges.count) takes to the export queue."
-            return
+            return true
         }
-        let proposed = ranges.flatMap(pieces)
+        let proposed = clips.flatMap { $0 }
         if effectiveSnapTarget == .keyframes, let issue = copyIssue(proposed) {
             alert = EditorNotice(title: "Cannot Copy These Joins", message: issue.message)
-            return
+            return false
         }
         let removedBefore = cuts.reduce(0.0) { $0 + max(0, min(playhead, $1.to.seconds) - $1.from.seconds) }
-        validate(proposed, selecting: proposed.first?.id, at: playhead - removedBefore, action: "Shorten Pauses")
+        return validate(proposed, selecting: proposed.first?.id, at: playhead - removedBefore, action: "Shorten Pauses")
+    }
+}
+
+extension EditorModel {
+    /// Capture the very same occurrence pieces and indexed sources as the native export sheet.
+    func mcpExportInput(selection: Bool) throws -> (clips: [ClipRequest], media: [URL: MediaInfo]) {
+        guard canEdit, !mcpHasActiveTrim else { throw MCPCommandError("busy", "Finish the pending edit or import first.") }
+        let items: [EditorSegment]
+        if selection {
+            guard let selectedSpan else { throw MCPCommandError("no_selection", "Select a timeline range first.") }
+            items = pieces(in: selectedSpan)
+        } else { items = segments }
+        guard !items.isEmpty else { throw MCPCommandError("empty_edit", "Add media before exporting.") }
+        return (items.map(\.request), Dictionary(items.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { a, _ in a }))
+    }
+
+    var mcpOutputProtectedMedia: [String: String] { protectedMedia }
+
+    func mcpApplyReplacement(_ plan: AudioReplacementPlan, output: URL, sourceID: UUID,
+                             validateCommit: @escaping @MainActor () throws -> Void) async throws -> Int {
+        var result: Result<Int, MCPCommandError>?
+        guard let token = applyReplacement(plan, output: output, useSidecar: useAnalysisSidecars, sourceID: sourceID,
+                                           validateCommit: validateCommit, completed: { result = $0 }),
+              let job = exportTasks[session] else {
+            throw MCPCommandError("unavailable", alert?.message ?? "Replacement could not start.")
+        }
+        await withTaskCancellationHandler {
+            await job.value
+        } onCancel: { token.cancel() }
+        guard let result else { throw MCPCommandError("replacement_failed", "Replacement did not return an outcome.") }
+        return try result.get()
+    }
+
+    func mcpReplacementSource(_ clipID: UUID) throws -> (UUID, MediaInfo) {
+        guard let source = segments.first(where: { $0.id == clipID })?.source else {
+            throw MCPCommandError("invalid_target", "Choose an existing clip occurrence.")
+        }
+        return (source.id, source.media)
     }
 }

@@ -18,6 +18,8 @@ struct SourceSoundtrack: Equatable {
 }
 
 struct InputClip: Decodable {
+    var legacyCSV = false
+    var csv: String?
     var soundtrack: SourceSoundtrack?
     var file: String?
     var project: String?
@@ -202,10 +204,12 @@ enum CLICommand {
     case silence(SilenceOptions)
     case scenes(file: String?, export: SceneExportOptions?)
     case inspect(file: String, keyframes: Bool, allFrames: Bool, audioPackets: Bool, packetStream: Int?, from: RationalTime?, to: RationalTime?, tracks: ExportTracks, audioStream: Int?)
+    case convert(input: String, output: String, allowLoss: Bool, flattenMulticam: Bool)
+    case resolve(project: String, output: String, open: Bool)
     case inspectProject(String)
     case exportProject(project: String, output: String, dryRun: Bool, options: ExportOptions)
-    case bulk(dryRun: Bool, options: ExportOptions)
-    case export(input: InputEdit?, dryRun: Bool, options: ExportOptions, order: [Int]?)
+    case bulk(dryRun: Bool, options: ExportOptions, list: BulkList?)
+    case export(input: InputEdit?, dryRun: Bool, options: ExportOptions, order: [Int]?, resolveOpen: Bool? = nil)
 }
 
 enum SceneGrouping: String, CaseIterable {
@@ -213,6 +217,7 @@ enum SceneGrouping: String, CaseIterable {
 }
 
 struct SceneExportOptions {
+    var list: String? = nil
     let directory: String
     let grouping: SceneGrouping
     let container: String?
@@ -221,14 +226,40 @@ struct SceneExportOptions {
     let audioStream: Int?
 }
 
+struct BulkList {
+    let source: String
+    let ranges: String
+    let directory: String
+    let container: String?
+}
+
 struct Arguments {
     static let version = MPCutRelease.version
     let command: CLICommand
     let json: Bool
     private(set) var useSidecar = true
+    private(set) var requestFile: String?
+
+    func replacingCommand(_ replacement: CLICommand) -> Arguments {
+        Arguments(command: replacement, json: json, useSidecar: useSidecar)
+    }
 
     static func parse(_ tokens: [String]) throws -> Arguments {
         let end = tokens.firstIndex(of: "--") ?? tokens.endIndex
+        if let index = tokens[..<end].firstIndex(of: "--input") {
+            guard index + 1 < end, !tokens[index + 1].hasPrefix("--"),
+                  tokens[..<end].filter({ $0 == "--input" }).count == 1,
+                  !tokens[..<end].contains("--stdin"),
+                  let command = tokens[..<end].first(where: { !["--json", "--no-sidecar"].contains($0) }),
+                  ["bulk", "export", "resolve", "silence", "scenes"].contains(command) else {
+                throw CLIError("invalid_arguments", "Supply one JSON request with --input FILE on a command that accepts --stdin.")
+            }
+            var normalized = tokens
+            normalized.replaceSubrange(index...index + 1, with: ["--stdin"])
+            if ["export", "bulk"].contains(command), !requestsJSON(normalized) { normalized.insert("--json", at: 0) }
+            let result = try parse(normalized)
+            return Arguments(command: result.command, json: requestsJSON(tokens), useSidecar: result.useSidecar, requestFile: tokens[index + 1])
+        }
         let flags = tokens[..<end].filter { $0 == "--no-sidecar" }
         guard flags.count <= 1 else { throw CLIError("invalid_arguments", "Duplicate --no-sidecar.") }
         if !flags.isEmpty {
@@ -269,6 +300,39 @@ struct Arguments {
             return Arguments(command: .help(try CommandHelp.topic(verb)), json: json)
         }
         switch verb {
+        case "convert":
+            return Arguments(command: try convert(options), json: json)
+        case "resolve":
+            if options.contains("--clips") {
+                let command = try export(options, json: json, forResolve: true)
+                guard case .export(.some, false, _, _, .some) = command else {
+                    throw CLIError("invalid_arguments", "Use resolve --clips LIST --output FILE.fcpxml.")
+                }
+                return Arguments(command: command, json: json)
+            }
+            if options.contains("--stdin") {
+                guard Set(options).isSubset(of: ["--stdin", "--open", "--json"]), Set(options).count == options.count else {
+                    throw CLIError("invalid_arguments", "Use resolve --stdin [--open] [--json] with an edit request.")
+                }
+                return Arguments(command: .export(input: nil, dryRun: false, options: ExportOptions(), order: nil,
+                                                  resolveOpen: options.contains("--open")), json: json)
+            }
+            var values: [String: String] = [:]
+            var flags = Set<String>()
+            var iterator = options.makeIterator()
+            while let option = iterator.next() {
+                guard flags.insert(option).inserted else { throw CLIError("invalid_arguments", "Duplicate " + option) }
+                if option == "--open" || option == "--json" { continue }
+                guard ["--project", "--output"].contains(option), let value = iterator.next(),
+                      !value.isEmpty, !value.hasPrefix("--") else {
+                    throw CLIError("invalid_arguments", "Expected --project PROJECT --output FILE.fcpxml [--open].")
+                }
+                values[option] = value
+            }
+            guard let project = values["--project"], let output = values["--output"] else {
+                throw CLIError("invalid_arguments", "Specify both --project and --output.")
+            }
+            return Arguments(command: .resolve(project: project, output: output, open: flags.contains("--open")), json: json)
         case "sidecar":
             return Arguments(command: .sidecar(try SidecarOptions(options)), json: json)
         case "--version" where options.isEmpty || options == ["--json"]:
@@ -284,10 +348,8 @@ struct Arguments {
         case "inspect":
             return Arguments(command: try inspect(options), json: json)
         case "bulk":
-            guard options.prefix(while: { $0 != "--" }).contains("--stdin") else {
-                throw CLIError("invalid_arguments", "Bulk requires --json --stdin.")
-            }
-            guard case let .export(nil, dryRun, flags, order) = try export(options, json: json) else {
+            if !options.prefix(while: { $0 != "--" }).contains("--stdin") { return Arguments(command: try bulkList(options), json: json) }
+            guard case let .export(nil, dryRun, flags, order, nil) = try export(options, json: json) else {
                 throw CLIError("invalid_arguments", "Bulk requires --json --stdin.")
             }
             guard flags.replaceAudio == nil, flags.replaceTrack == nil, flags.replacementStream == nil else {
@@ -296,7 +358,7 @@ struct Arguments {
             guard order == nil else {
                 throw CLIError("invalid_arguments", "--order belongs to export, which joins clips into one file.")
             }
-            return Arguments(command: .bulk(dryRun: dryRun, options: flags), json: true)
+            return Arguments(command: .bulk(dryRun: dryRun, options: flags, list: nil), json: true)
         case "export":
             return Arguments(command: try export(options, json: json), json: json)
         case "rearrange":
@@ -310,10 +372,97 @@ struct Arguments {
         tokens.prefix(while: { $0 != "--" }).contains("--json")
     }
 
+    private static func convert(_ options: [String]) throws -> CLICommand {
+        var input: String?
+        var output: String?
+        var format: String?
+        var seen = Set<String>()
+        var positionalOnly = false
+        var iterator = options.makeIterator()
+        while let token = iterator.next() {
+            if !positionalOnly && token == "--" {
+                positionalOnly = true
+                continue
+            }
+            if !positionalOnly && token.hasPrefix("-") {
+                guard seen.insert(token).inserted else {
+                    throw CLIError("invalid_arguments", "Duplicate " + token)
+                }
+                switch token {
+                case "--json", "--allow-loss", "--flatten-multicam": continue
+                case "--output", "--to":
+                    guard let value = iterator.next(), !value.isEmpty, !value.hasPrefix("--") else {
+                        throw CLIError("invalid_arguments", token + " requires a value.")
+                    }
+                    if token == "--to" { format = value } else { output = value }
+                default: throw CLIError("invalid_arguments", "Unknown convert option '" + token + "'.")
+                }
+            } else {
+                guard input == nil, !token.isEmpty else {
+                    throw CLIError("invalid_arguments", "Convert accepts one source project.")
+                }
+                input = token
+            }
+        }
+        guard let input, let output else {
+            throw CLIError("invalid_arguments", "Use convert INPUT [--to FORMAT] --output FILE [--allow-loss].")
+        }
+        let destination = URL(fileURLWithPath: output)
+        if let format, !ProjectConverter.accepts(format: format, for: destination) {
+            throw CLIError("invalid_arguments", "Output extension does not match --to " + format + ". Choose cut, resolve, premiere, fcp, or a specific format extension.")
+        }
+        let allowLoss = seen.contains("--allow-loss")
+        let flattenMulticam = seen.contains("--flatten-multicam")
+        if flattenMulticam {
+            guard allowLoss, ProjectConverter.accepts(format: "premiere", for: destination) else {
+                throw CLIError("invalid_arguments", "--flatten-multicam requires --allow-loss and a Premiere Pro .prproj output.")
+            }
+        }
+        return .convert(input: input, output: output, allowLoss: allowLoss, flattenMulticam: flattenMulticam)
+    }
+
+    private static func bulkList(_ options: [String]) throws -> CLICommand {
+        var source: String?, ranges: String?, directory: String?, container: String?
+        var flags: [String] = ["--stdin"]
+        var iterator = options.makeIterator()
+        while let option = iterator.next() {
+            func value() throws -> String {
+                guard let next = iterator.next(), !next.isEmpty, !next.hasPrefix("--") else {
+                    throw CLIError("invalid_arguments", "Missing value for \(option).")
+                }
+                return next
+            }
+            switch option {
+            case "--ranges" where ranges == nil: ranges = try value()
+            case "--output", "--output-directory":
+                guard directory == nil else { throw CLIError("invalid_arguments", "Duplicate output directory.") }
+                directory = try value()
+            case "--container" where container == nil: container = try value()
+            case "--json", "--dry-run", "--audio-only", "--video-only", "--smart-trim": flags.append(option)
+            case "--mode", "--tracks", "--audio-stream", "--snap", "--audio", "--video", "--quality":
+                flags += [option, try value()]
+            case "--":
+                let remaining = Array(iterator)
+                guard source == nil, remaining.count == 1 else { throw CLIError("invalid_arguments", "Expected one source after --.") }
+                source = remaining[0]
+                iterator = [].makeIterator()
+            default:
+                guard !option.hasPrefix("-"), source == nil else { throw CLIError("invalid_arguments", "Unexpected bulk argument '\(option)'.") }
+                source = option
+            }
+        }
+        guard let source, let ranges, let directory,
+              case let .export(nil, dryRun, settings, nil, nil) = try export(flags, json: true) else {
+            throw CLIError("invalid_arguments", "Use bulk SOURCE --ranges LIST --output DIRECTORY, or supply a complete bulk request.")
+        }
+        return .bulk(dryRun: dryRun, options: settings, list: BulkList(source: source, ranges: ranges, directory: directory, container: container))
+    }
+
     private static func rearrange(_ options: [String]) throws -> CLICommand {
         var positional: [String] = []
         var positionalOnly = false
         var output: String?
+        var list: String?
         var dryRun = false
         var seen: Set<String> = []
         var settings = ExportOptions(mode: .smart)
@@ -328,7 +477,7 @@ struct Arguments {
                     guard settings.tracks == nil else { throw CLIError("invalid_arguments", "Choose one track selection.") }
                     settings.tracks = argument == "--audio-only" ? .audio : .video
                     continue
-                case "--output", "--snap", "--tracks", "--audio-stream":
+                case "--output", "--ranges", "--snap", "--tracks", "--audio-stream":
                     guard seen.insert(argument).inserted, !(argument == "--tracks" && settings.tracks != nil) else {
                         throw CLIError("invalid_arguments", "\(argument) may be specified only once.")
                     }
@@ -336,6 +485,7 @@ struct Arguments {
                         throw CLIError("invalid_arguments", "Missing value for \(argument).")
                     }
                     if argument == "--output" { output = value }
+                    else if argument == "--ranges" { list = value }
                     else { try settings.set(String(argument.dropFirst(2)), to: value) }
                     continue
                 default:
@@ -346,7 +496,14 @@ struct Arguments {
             }
             positional.append(argument)
         }
-        guard let output, positional.count == 2 else {
+        if list == nil, positional.count == 2, ListFile.isListPath(positional[1]) { list = positional.removeLast() }
+        if let list, let output, positional.count == 1 {
+            var clip = InputClip(file: positional[0])
+            clip.csv = list
+            settings.snap = settings.snap ?? .nearest
+            return .export(input: InputEdit(output: output, clips: [clip]), dryRun: dryRun, options: settings, order: nil)
+        }
+        guard list == nil, let output, positional.count == 2 else {
             throw CLIError("invalid_arguments", "Use rearrange INPUT --output OUTPUT '23:01-26:12,03:02-4:03'.")
         }
         let clips = try positional[1].split(separator: ",", omittingEmptySubsequences: false).enumerated().map { offset, range in
@@ -380,7 +537,7 @@ struct Arguments {
                 case "--json": continue
                 case "--stdin": stdin = true; continue
                 case "--dry-run": dryRun = true; continue
-                case "--export-to", "--group-by", "--container", "--tracks", "--audio-stream":
+                case "--export-to", "--scenes-file", "--group-by", "--container", "--tracks", "--audio-stream":
                     guard values[option] == nil else {
                         throw CLIError("invalid_arguments", "\(option) may be specified only once.")
                     }
@@ -414,7 +571,7 @@ struct Arguments {
         if let tracks = values["--tracks"] { try settings.set("tracks", to: tracks) }
         if let stream = values["--audio-stream"] { try settings.set("audio-stream", to: stream) }
         try settings.checkTrackSelection()
-        return .scenes(file: file, export: SceneExportOptions(directory: directory, grouping: grouping,
+        return .scenes(file: file, export: SceneExportOptions(list: values["--scenes-file"], directory: directory, grouping: grouping,
                                                             container: values["--container"], dryRun: dryRun, tracks: settings.tracks ?? .all, audioStream: settings.audioStream))
     }
 
@@ -511,8 +668,9 @@ struct Arguments {
         return .inspect(file: file, keyframes: keyframes, allFrames: allFrames, audioPackets: audioPackets, packetStream: packetStream, from: from, to: to, tracks: settings.tracks ?? .all, audioStream: settings.audioStream)
     }
 
-    private static func export(_ options: [String], json: Bool) throws -> CLICommand {
+    private static func export(_ options: [String], json: Bool, forResolve: Bool = false) throws -> CLICommand {
         var arguments = options.makeIterator()
+        var openResolve = false
         var output: String?
         var project: String?
         var clips: [InputClip] = []
@@ -534,6 +692,9 @@ struct Arguments {
             switch argument {
             case "--json":
                 break
+            case "--open" where forResolve:
+                guard !openResolve else { throw CLIError("invalid_arguments", "Duplicate --open.") }
+                openResolve = true
             case "--stdin":
                 stdin = true
             case "--dry-run":
@@ -553,11 +714,14 @@ struct Arguments {
                     throw CLIError("invalid_arguments", "\(argument) may be specified only once.")
                 }
                 try exportOptions.set(String(argument.dropFirst(2)), to: value(for: argument))
-            case "--order":
+            case "--order", "--order-file":
                 guard order == nil else {
                     throw CLIError("invalid_arguments", "--order may be specified only once.")
                 }
-                order = try value(for: argument).split(separator: ",", omittingEmptySubsequences: false).map {
+                let raw = try value(for: argument)
+                let entries = argument == "--order-file" || ListFile.isListPath(raw) ? try ListFile.scalars(raw, header: "order")
+                    : raw.components(separatedBy: ",")
+                order = try entries.map {
                     guard let index = Int($0.trimmingCharacters(in: .whitespaces)) else {
                         throw CLIError("invalid_order", "--order requires comma-separated clip numbers, for example 3,1,2.")
                     }
@@ -568,6 +732,14 @@ struct Arguments {
                     throw CLIError("invalid_arguments", "--output may be specified only once.")
                 }
                 output = try value(for: argument)
+            case "--clips":
+                clips += try ListFile.clips(value(for: argument))
+            case "--csv", "--ranges":
+                guard let index = clips.indices.last, clips[index].csv == nil, clips[index].project == nil else {
+                    throw CLIError("invalid_arguments", "--csv requires a preceding --clip and one CSV per clip.")
+                }
+                clips[index].csv = try value(for: argument)
+                clips[index].legacyCSV = argument == "--csv"
             case "--clip":
                 clips.append(InputClip(file: try value(for: argument)))
             case "--project":
@@ -615,19 +787,17 @@ struct Arguments {
         guard let output, !clips.isEmpty else {
             throw CLIError("invalid_arguments", "Export requires --output and at least one --clip.")
         }
-        return .export(input: InputEdit(output: output, clips: clips), dryRun: dryRun, options: exportOptions, order: order)
+        return .export(input: InputEdit(output: output, clips: clips), dryRun: dryRun, options: exportOptions, order: order,
+                       resolveOpen: forResolve ? openResolve : nil)
     }
 }
-
-private enum TimeFields: String, CodingKey, CaseIterable { case numerator, denominator }
 
 extension KeyedDecodingContainer {
     func inputTime(_ key: Key, in label: String) throws -> String? {
         if let string = try? decode(String.self, forKey: key) { return string }
         guard contains(key), try !decodeNil(forKey: key) else { return nil }
         let decoder = try superDecoder(forKey: key)
-        _ = try decoder.requestFields(TimeFields.self, in: label)
-        return try RationalTime(from: decoder).description
+        return try ListFile.exactRational(from: decoder, in: label).description
     }
 }
 
@@ -636,6 +806,10 @@ struct BulkInput: Decodable {
         let from: String
         let to: String
         private enum Fields: String, CodingKey, CaseIterable { case from, to }
+        init(_ range: AudioSpan) {
+            from = range.from.description
+            to = range.to.description
+        }
         init(from decoder: Decoder) throws {
             let fields = try decoder.requestFields(Fields.self, in: "Range")
             guard let start = try fields.inputTime(.from, in: "Range"), let end = try fields.inputTime(.to, in: "Range") else {
@@ -651,6 +825,12 @@ struct BulkInput: Decodable {
     let container: String?
     let ranges: [RangeInput]
     var options = ExportOptions()
+    init(list: BulkList, spans: [AudioSpan]) {
+        file = list.source
+        outputDirectory = list.directory
+        container = list.container
+        ranges = spans.map(RangeInput.init)
+    }
     private enum Fields: String, CodingKey, CaseIterable {
         case file, outputDirectory, ranges, container, mode, snap, video, quality, audio, tracks, audioStream
     }

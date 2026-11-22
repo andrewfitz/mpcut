@@ -2,6 +2,7 @@
 """Verify scene scans and JPEG export around a picture whose coded data is damaged."""
 import argparse
 import json
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -120,6 +121,42 @@ class DamagedPictureData(unittest.TestCase):
         code, report = self.frames(self.prores, "1.6")
         self.assertEqual((code, report["error"]["code"]), (1, "frame_export_failed"))
 
+    def test_software_concealed_picture_and_its_dependents_are_refused(self):
+        source = self.root / "concealed.avi"
+        encode(source, "mpeg4", "-bf", "0", "-sc_threshold", "1000000000", "-q:v", "3")
+        damage_payload(source, [40])
+        # The MPEG-4 decoder can return a frame and flag its concealed macroblocks.
+        for time in ["1.6", "1.7"]:
+            code, report = self.frames(source, time)
+            self.assertEqual((code, report["error"]["code"]), (1, "frame_export_failed"), time)
+        code, report = self.frames(source, "1.4", "2.48")
+        self.assertEqual(code, 0, report)
+
+    def test_smart_trim_preserves_embedded_ambient_viewing_metadata_by_refusing_the_edge(self):
+        # Type 148 is HEVC ambient viewing environment SEI. Embed its eight-byte
+        # payload before each coded picture without declaring container metadata.
+        fixture = Path(__file__).resolve().parents[1] / "MPCutAppTests/Fixtures/Damage-HEVC.mov"
+        raw = run([FFMPEG, "-v", "error", "-i", fixture, "-an", "-c", "copy",
+                   "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "-"]).stdout
+        start = bytes.fromhex("00000001")
+        sei = bytes.fromhex("4e019408010101010101010180")
+        encoded = bytearray()
+        for unit in re.split(b"\x00\x00\x00?\x01", raw):
+            if unit:
+                if ((unit[0] >> 1) & 63) < 32:
+                    encoded.extend(start + sei)
+                encoded.extend(start + unit)
+        elementary = self.root / "ambient.hevc"
+        elementary.write_bytes(encoded)
+        source = self.root / "ambient.mov"
+        run([FFMPEG, "-v", "error", "-r", "25", "-i", elementary, "-c", "copy", "-tag:v", "hvc1", source])
+        output = self.root / "ambient-cut.mov"
+        code, report = self.mpcut("export", "--json", "--no-sidecar", "--mode", "smart", "--output", output,
+                                  "--clip", source, "--from", "1/25", "--to", "12/25")
+        self.assertEqual(code, 1, report)
+        self.assertIn("metadata", report["error"]["message"])
+        self.assertFalse(output.exists())
+
     def test_a_refused_picture_leaves_no_folder(self):
         folder = Path(tempfile.mkdtemp(dir=self.root))
         code, _ = self.mpcut("frames", "--json", "--no-sidecar", "--at", "0.5", "--at", "1.7",
@@ -202,7 +239,7 @@ class SelectedTrackIssue(unittest.TestCase):
     def test_saved_index_keeps_each_track_issue(self):
         result = run([CLI, "sidecar", "--json", "--only", "index", self.both], check=False)
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertTrue(Path(str(self.both) + ".mpcut").exists())
+        self.assertTrue(Path(str(self.both) + ".cutdb").exists())
         for stream in [1, 2]:
             code, report = self.export(self.both, stream)
             self.assertEqual(code, 1, report)
@@ -210,9 +247,9 @@ class SelectedTrackIssue(unittest.TestCase):
 
 
 class MissingProject(unittest.TestCase):
-    def test_frames_reports_an_unreadable_project_like_inspect(self):
+    def test_project_commands_report_unreadable_files(self):
         with tempfile.TemporaryDirectory() as scratch:
-            missing = Path(scratch) / "missing.multicam.json"
+            missing = Path(scratch) / "missing.cut"
             for project in [missing, Path(scratch)]:
                 codes = []
                 for command in [["inspect", "--json", "--project", project],
@@ -221,7 +258,7 @@ class MissingProject(unittest.TestCase):
                     result = run([CLI, *command], check=False)
                     report = json.loads(result.stdout)
                     codes.append((result.returncode, report["error"]["code"]))
-                self.assertEqual(codes, [(1, "multicam_project_read_failed")] * 2, project)
+                self.assertEqual(codes, [(1, "cut_project_read_failed"), (1, "multicam_project_read_failed")], project)
             self.assertFalse((Path(scratch) / "frames").exists())
 
 

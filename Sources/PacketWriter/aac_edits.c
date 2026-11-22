@@ -575,7 +575,8 @@ const MPCutAACSourceEdit *mpcut_aac_source_track(const MPCutAACSource *source, i
     return NULL;
 }
 
-static int read_source_track(MPCutAACSource *source, Box trak, uint32_t movie_timescale) {
+static int read_source_track(MPCutAACSource *source, Box trak, uint32_t movie_timescale,
+                             const MPCutAACTrackClock *clocks, size_t clock_count) {
     Box mdia, minf, stbl, stsd, entry, edts, elst;
     if (!find_box(trak, BOX('m','d','i','a'), &mdia)
         || !find_box(mdia, BOX('m','i','n','f'), &minf)
@@ -612,16 +613,21 @@ static int read_source_track(MPCutAACSource *source, Box trak, uint32_t movie_ti
     }
 
     Box tkhd, mdhd;
-    uint32_t track_id, sample_rate;
+    uint32_t track_id, media_timescale;
     size_t offset, field_width;
     if (!find_box(trak, BOX('t','k','h','d'), &tkhd)
         || !time_fields(tkhd, 8, &track_id, &offset, &field_width)
         || !find_box(mdia, BOX('m','d','h','d'), &mdhd)
-        || !time_fields(mdhd, 4, &sample_rate, &offset, &field_width)
-        || !track_id || track_id > INT_MAX || !sample_rate || sample_rate > INT_MAX
+        || !time_fields(mdhd, 4, &media_timescale, &offset, &field_width)
+        || !track_id || track_id > INT_MAX || !media_timescale || media_timescale > INT_MAX
         || AV_RB32(stsd.payload + 4) != 1) {
         return 0;
     }
+    size_t index = 0;
+    while (index < clock_count && clocks[index].track_id != (int)track_id) index++;
+    if (index == clock_count) return 1;
+    int sample_rate = clocks[index].sample_rate;
+    if (sample_rate <= 0) return 0;
     uint64_t media_duration = field_width == 8 ? AV_RB64(mdhd.begin + offset) : AV_RB32(mdhd.begin + offset);
 
     AACSourceTrack *track = malloc(sizeof(*track) + (size_t)count * sizeof(*track->edits));
@@ -646,18 +652,27 @@ static int read_source_track(MPCutAACSource *source, Box trak, uint32_t movie_ti
         }
         cursor += (int64_t)duration;
         int64_t presentation_end = av_rescale(cursor, sample_rate, movie_timescale);
-        __int128 media_end = (__int128)media + (presentation_end - (__int128)presentation_start);
+        /* The edit's media offset and mdhd duration use the media clock.
+         * Convert them separately from the movie-clock presentation boundaries. */
+        int64_t media_sample = media < 0 ? -1 : av_rescale(media, sample_rate, media_timescale);
+        /* A fractional-sample media offset cannot survive conversion to the
+         * destination sample clock without changing the decoded waveform. */
+        if (media >= 0 && (__int128)media_sample * media_timescale != (__int128)media * sample_rate)
+            return 0;
+        __int128 media_end = (__int128)media_sample + (presentation_end - (__int128)presentation_start);
         if (presentation_end <= presentation_start || (media >= 0
-            && (media_end > INT64_MAX || media_end > (__int128)media_duration + 1))) {
+            && (media_sample < 0 || media_end > INT64_MAX ||
+                (media_end - 1) * media_timescale > (__int128)media_duration * sample_rate))) {
             return 0;
         }
-        track->edits[i] = (MPCutAACSourceEdit){presentation_start, presentation_end, media};
+        track->edits[i] = (MPCutAACSourceEdit){presentation_start, presentation_end, media_sample};
         presentation_start = presentation_end;
     }
     return 1;
 }
 
-int mpcut_aac_source_open(const char *path, MPCutAACSource **source, char *error, size_t cap) {
+int mpcut_aac_source_open(const char *path, const MPCutAACTrackClock *clocks, size_t clock_count,
+                          MPCutAACSource **source, char *error, size_t cap) {
     *source = NULL;
     FILE *file = fopen(path, "rb");
     if (!file) {
@@ -694,7 +709,7 @@ int mpcut_aac_source_open(const char *path, MPCutAACSource **source, char *error
         for (next = moov.payload; next < moov.end;) {
             Box child;
             if (!next_box(&next, moov.end, &child)
-                || (child.type == BOX('t','r','a','k') && !read_source_track(map, child, timescale))) {
+                || (child.type == BOX('t','r','a','k') && !read_source_track(map, child, timescale, clocks, clock_count))) {
                 ok = 0;
                 break;
             }
@@ -716,11 +731,12 @@ int mpcut_aac_source_open(const char *path, MPCutAACSource **source, char *error
 /* A raw (-ignore_editlist) copy retains all coded access units in the source's
  * media clock. Install its original sample-to-presentation mapping on the new
  * track, shifting only its presentation in the destination movie. */
-int mpcut_restore_copied_aac(const char *source_path, int source_id, const char *output_path,
+int mpcut_restore_copied_aac(const char *source_path, int source_id, int sample_rate, const char *output_path,
                              unsigned index, MPCutTime shift, int movie_timescale,
                              char *error, size_t cap) {
     MPCutAACSource *source = NULL;
-    int status = mpcut_aac_source_open(source_path, &source, error, cap);
+    MPCutAACTrackClock clock = {source_id, sample_rate};
+    int status = mpcut_aac_source_open(source_path, &clock, 1, &source, error, cap);
     if (status) return status;
     size_t count = 0;
     int rate = 0;

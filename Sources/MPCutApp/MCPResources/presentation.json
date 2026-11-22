@@ -1,0 +1,131 @@
+[
+  {
+    "name": "get_presentation",
+    "description": "Read a project window’s timeline zoom, native layout, panel state and scroll positions. Returned scroll surface names identify available controls.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "set_presentation",
+    "description": "Adjust a native presentation control in this project window. For setScroll choose a surface and fraction. For sizing supply points. setPauseControls opens the native silence review and may start its scan. showHelp opens the named guide. Thumbnail size and track label width are shared preferences. Returns the resulting presentation state.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "zoomIn",
+            "zoomOut",
+            "setZoom",
+            "fit",
+            "restoreZoom",
+            "setLargeThumbnails",
+            "setInspector",
+            "setWaveformSpan",
+            "setPauseControls",
+            "setScroll",
+            "setTrackLabelWidth",
+            "setTimelineHeight",
+            "setInspectorWidth",
+            "showAbout",
+            "showSettings",
+            "showHelp",
+            "showLastExport",
+            "revealTime"
+          ]
+        },
+        "zoom": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 13,
+          "description": "Timeline zoom exponent. A value of 0 fits the timeline, and 1 doubles its width."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Used by setLargeThumbnails; shared across windows."
+        },
+        "span": {
+          "type": "string",
+          "enum": [
+            "Timeline zoom",
+            "Whole clip",
+            "10 s",
+            "1 s",
+            "100 ms",
+            "10 ms"
+          ]
+        },
+        "visible": {
+          "type": "boolean",
+          "description": "Required for setPauseControls; defaults to true for setInspector."
+        },
+        "section": {
+          "type": "string",
+          "enum": [
+            "Switch",
+            "Sources",
+            "Assembly",
+            "Export"
+          ]
+        },
+        "surface": {
+          "type": "string",
+          "enum": [
+            "sequence",
+            "assembly",
+            "group",
+            "tracks"
+          ]
+        },
+        "fraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Fraction of available scroll travel. Zero shows the beginning; one shows the far end."
+        },
+        "points": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Divider size in screen points. Track labels accept 106 to 360. Native layout constraints apply."
+        },
+        "topic": {
+          "type": "string",
+          "enum": [
+            "guide",
+            "agentGuide",
+            "releaseNotes"
+          ]
+        },
+        "time": {
+          "type": "string",
+          "description": "For revealTime, a rational timestamp in the named sequence, assembly or group clock. Scrolls the time into view without moving the playhead."
+        }
+      },
+      "required": [
+        "project",
+        "action"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

@@ -3,6 +3,10 @@ import SwiftUI
 @MainActor
 protocol EditorPlayback: ObservableObject {
     var isPlaying: Bool { get }
+    var hasBlockingIssue: Bool { get }
+    var playbackRate: Float { get }
+    var forwardSpeed: PlaybackSpeed { get }
+    func selectPlaybackSpeed(_ speed: PlaybackSpeed)
     var volume: Float { get set }
     var isMuted: Bool { get set }
     var scrubSoundEnabled: Bool { get set }
@@ -11,8 +15,35 @@ protocol EditorPlayback: ObservableObject {
     func pause()
 }
 
+extension EditorPlayback {
+    var displayedSpeed: PlaybackSpeed { PlaybackSpeed(rawValue: playbackRate) ?? forwardSpeed }
+
+    func adjacentSpeed(_ direction: Int) -> PlaybackSpeed? {
+        let speeds = PlaybackSpeed.allCases
+        guard let current = speeds.firstIndex(of: displayedSpeed),
+              speeds.indices.contains(current + direction) else { return nil }
+        return speeds[current + direction]
+    }
+
+    func changeSpeed(_ direction: Int) {
+        if let speed = adjacentSpeed(direction) { selectPlaybackSpeed(speed) }
+    }
+
+    func handleSpeedKey(_ event: NSEvent) -> Bool {
+        switch event.charactersIgnoringModifiers {
+        case "[": changeSpeed(-1)
+        case "]": changeSpeed(1)
+        case "\\": selectPlaybackSpeed(.normal)
+        default: return false
+        }
+        return true
+    }
+}
+
 extension SequencePreview: EditorPlayback {}
-extension MulticamPreview: EditorPlayback {}
+extension MulticamPreview: EditorPlayback {
+    var hasBlockingIssue: Bool { false }
+}
 
 struct EditorTransportCommands<Player: EditorPlayback>: View {
     @ObservedObject var preview: Player
@@ -33,10 +64,16 @@ struct EditorTransportCommands<Player: EditorPlayback>: View {
             .disabled(!canNavigate || !preview.isPlaying)
         Button("Shuttle Forward (L)") { preview.shuttle(1) }
             .disabled(!canPlay)
+        Button("Slower Playback ([)") { preview.changeSpeed(-1) }
+            .disabled(!canPlay || preview.adjacentSpeed(-1) == nil)
+        Button("Faster Playback (])") { preview.changeSpeed(1) }
+            .disabled(!canPlay || preview.adjacentSpeed(1) == nil)
+        Button("Normal Playback Speed (\\)") { preview.selectPlaybackSpeed(.normal) }
+            .disabled(!canPlay)
         Divider()
         Button("Go to Time…", action: enterTime).disabled(!canNavigate)
-        Button("Go to Start") { seekBoundary(false) }.disabled(!canNavigate)
-        Button("Go to End") { seekBoundary(true) }.disabled(!canNavigate)
+        Button("Go to Start") { seekBoundary(false) }.keyboardShortcut(.home, modifiers: []).disabled(!canNavigate)
+        Button("Go to End") { seekBoundary(true) }.keyboardShortcut(.end, modifiers: []).disabled(!canNavigate)
         Button(audioOnly ? "Previous Audio Boundary" : "Previous Frame") { step(-1) }.disabled(!canStep)
         Button(audioOnly ? "Next Audio Boundary" : "Next Frame") { step(1) }.disabled(!canStep)
     }

@@ -82,6 +82,14 @@ struct AACPresentationEdit: Sendable {
     let isAudible: Bool
 }
 
+struct MP3Anchor: Codable, Sendable {
+    let sample: Int64
+    let offset: Int64
+    let checksum: UInt32
+
+    var native: MPCutMP3Anchor { MPCutMP3Anchor(sample: sample, offset: offset, checksum: checksum) }
+}
+
 public struct AudioIndex: Encodable, Sendable {
     public let stream: StreamInfo
     public let packets: [AudioPacket]
@@ -90,6 +98,7 @@ public struct AudioIndex: Encodable, Sendable {
     public let hasPriming: Bool
     public let pcmContinuity: Bool
     let presentationEdits: [AACPresentationEdit]
+    var mp3Anchors: [MP3Anchor] = []
     var opusWindow: OpusTrimWindow? = nil
 
     enum CodingKeys: String, CodingKey {
@@ -142,6 +151,7 @@ public struct MediaInfo: Encodable, Sendable {
         let audioBytes = audio.reduce(0) {
             $0 + MemoryLayout<AudioIndex>.stride
                 + $1.packets.count * MemoryLayout<AudioPacket>.stride
+                + $1.mp3Anchors.count * MemoryLayout<MP3Anchor>.stride
                 + $1.presentationEdits.count * MemoryLayout<AACPresentationEdit>.stride
                 + ($1.opusWindow?.packetStarts.count ?? 0) * MemoryLayout<Int64>.stride
         }
@@ -345,8 +355,11 @@ private extension Probe {
            storage.contains(where: { string($0.codec) == "aac" }) {
             var error = [CChar](repeating: 0, count: 256)
             let capacity = error.count
+            let clocks = storage.filter { string($0.codec) == "aac" }.map {
+                MPCutAACTrackClock(track_id: $0.track_id, sample_rate: $0.sample_rate)
+            }
             let status = url.withUnsafeFileSystemRepresentation { path in
-                mpcut_aac_source_open(path, &aacSource, &error, capacity)
+                mpcut_aac_source_open(path, clocks, clocks.count, &aacSource, &error, capacity)
             }
             if status != 0 {
                 copyIssue = copyIssue ?? String(cString: error)
@@ -462,6 +475,9 @@ private extension Probe {
                     }
                     var index = try buildAudio(stream, packets: packets, origin: origin, standalone: videoIndex < 0,
                                                progress: reportRows, cancelled: cancelled)
+                    index.mp3Anchors = UnsafeBufferPointer(start: value.mp3_anchors, count: value.mp3_anchor_count).map {
+                        MP3Anchor(sample: $0.sample, offset: $0.offset, checksum: $0.checksum)
+                    }
                     if (keyframes || videoIndex < 0), stream.codec == "opus",
                        format.split(separator: ",").contains(where: { $0 == "matroska" || $0 == "ogg" }) {
                         let window = try opusTrimWindow(index, origin: origin) { try checkCancellation(cancelled) }

@@ -318,6 +318,8 @@ int mp_scene_scan(const char *path, int index, int allow_asset_reader,
             scan = (Scan){ .visit = visit, .cancelled = cancelled, .context = context };
         }
     }
+    for (unsigned i = 0; i < format->nb_streams; i++)
+        if (i != (unsigned)index) format->streams[i]->discard = AVDISCARD_ALL;
     const int64_t declared_duration = stream->duration;
     const AVCodec *decoder = avcodec_find_decoder(stream->codecpar->codec_id);
     if (!decoder) { ret = AVERROR_DECODER_NOT_FOUND; goto done; }

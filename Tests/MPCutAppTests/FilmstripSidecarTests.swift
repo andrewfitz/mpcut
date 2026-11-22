@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import MPCutCore
+import SQLite3
 import XCTest
 @testable import MPCutApp
 
@@ -62,7 +63,7 @@ final class FilmstripSidecarTests: XCTestCase {
         XCTAssertGreaterThan(original.width, 1)
         let sidecar = try AnalysisSidecar(source: source)
         XCTAssertEqual(sidecar.status(), "current")
-        XCTAssertEqual(key.image(in: sidecar)?.width, original.width)
+        try await wait { key.image(in: sidecar)?.width == original.width }
         editor.saveAnalysisSidecars()
         try await wait { !editor.isSavingSidecars }
         XCTAssertNil(editor.alert)
@@ -98,6 +99,35 @@ final class FilmstripSidecarTests: XCTestCase {
         let recovered = await editor.thumbnail(for: newID, at: 0, size: size)
         XCTAssertEqual(try centerPixel(XCTUnwrap(recovered)), try centerPixel(original))
         XCTAssertNotNil(try CutEngine().cachedIndex(source))
+    }
+
+    @MainActor
+    func testFilmstripRendersWhileSidecarWriterHoldsLock() async throws {
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
+                                                       subdirectory: "Fixtures"))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("clip.mov")
+        try FileManager.default.copyItem(at: fixture, to: source)
+        let sidecar = try AnalysisSidecar(source: source)
+        try sidecar.save(["marker": Data([1])])
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(sidecar.url.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil), SQLITE_OK)
+        let size = CGSize(width: 92, height: 48)
+        let keys = try [0.0, 0.1].map { try XCTUnwrap(FilmstripTileKey(time: $0, size: size)) }
+        let preview = SequencePreview(), sourceID = UUID()
+        let start = ContinuousClock.now
+        for key in keys {
+            let image = await preview.thumbnail(source: sourceID, url: source, at: key.time, size: size,
+                                                saved: (sidecar, key))
+            XCTAssertNotNil(image)
+        }
+        XCTAssertLessThan(start.duration(to: .now), .seconds(4))
+        XCTAssertEqual(sqlite3_exec(db, "COMMIT", nil, nil, nil), SQLITE_OK)
+        try await wait { keys.allSatisfy { $0.image(in: sidecar) != nil } }
     }
 
     private func centerPixel(_ image: CGImage) throws -> UInt32 {

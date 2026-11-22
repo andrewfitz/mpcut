@@ -1,0 +1,19 @@
+[
+  {
+    "name": "review_frame",
+    "description": "Return one JPEG image content block from the open project's current playhead, or specify an exact sequence, group or assembly time. For multicam, angle optionally selects a specific camera. Reads the current in-memory edit. Preserves playback, selection, history and disk contents. The longest image edge is at most 640 pixels. Metadata identifies the actual source frame time.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {"type": "string", "minLength": 1},
+        "expectedRevision": {"type": "integer", "minimum": 0},
+        "time": {"type": "string", "description": "Rational seconds such as 1001/30000. Supply space with time."},
+        "space": {"type": "string", "enum": ["sequence", "group", "assembly"]},
+        "angle": {"type": "string", "minLength": 1}
+      },
+      "required": ["project"],
+      "additionalProperties": false
+    }
+  }
+]

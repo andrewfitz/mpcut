@@ -1569,7 +1569,8 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
         }
     }
 
-    while (writer->has_first_packet || (result = av_read_frame(input, packet)) >= 0) {
+    result = AVERROR_EOF;
+    while (remaining && (writer->has_first_packet || (result = av_read_frame(input, packet)) >= 0)) {
         writer->has_first_packet = 0;
         if (input->nb_streams != writer->range_track_count || packet->stream_index < 0
             || (unsigned)packet->stream_index >= writer->range_track_count) {
@@ -1784,25 +1785,28 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
         if (result) {
             goto cleanup;
         }
-        int has_aac = 0;
+        unsigned aac_count = 0;
         if (tracks != MPCUT_TRACKS_VIDEO && av_match_name("mov", input->iformat->name)) {
             for (unsigned track = 0; track < input->nb_streams; track++) {
-                has_aac |= selected_stream(&writer, input->streams[track]) && input->streams[track]->codecpar->codec_id == AV_CODEC_ID_AAC;
+                aac_count += selected_stream(&writer, input->streams[track]) && input->streams[track]->codecpar->codec_id == AV_CODEC_ID_AAC;
             }
         }
-        if (has_aac) {
-            result = mpcut_aac_source_open(segment->path, &writer.aac_source, error, error_capacity);
-            if (result) {
+        if (aac_count) {
+            MPCutAACTrackClock *clocks = av_calloc(aac_count, sizeof(*clocks));
+            if (!clocks) {
+                result = fail(&writer, "Cannot allocate AAC track clocks");
                 goto cleanup;
             }
-            if (writer.aac_source && writer.tracks == MPCUT_TRACKS_AUDIO && writer.audio_stream >= 0
-                && (unsigned)writer.audio_stream < input->nb_streams) {
-                size_t count;
-                int rate;
-                if (!aac_source_track(&writer, input->streams[writer.audio_stream], &count, &rate)) {
-                    mpcut_aac_source_free(writer.aac_source);
-                    writer.aac_source = NULL;
-                }
+            size_t n = 0;
+            for (unsigned i = 0; i < input->nb_streams; i++) {
+                AVStream *stream = input->streams[i];
+                if (selected_stream(&writer, stream) && stream->codecpar->codec_id == AV_CODEC_ID_AAC)
+                    clocks[n++] = (MPCutAACTrackClock){stream->id, stream->codecpar->sample_rate};
+            }
+            result = mpcut_aac_source_open(segment->path, clocks, n, &writer.aac_source, error, error_capacity);
+            av_free(clocks);
+            if (result) {
+                goto cleanup;
             }
             if (writer.aac_source && !is_mov(writer.output->oformat)) {
                 result = fail(&writer, "Multiple AAC media edits in %s require MOV or MP4 output", segment->path);
@@ -1912,7 +1916,7 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             AVRational samples = {1, input->streams[video_index]->codecpar->sample_rate};
             result = mpcut_write_mp3_crop(input, video_index, writer.output,
                                           time_round(range.source_start, samples), time_round(range.source_end, samples),
-                                          progress, context, error, error_capacity);
+                                          segment->mp3_anchor, progress, context, error, error_capacity);
         } else {
             result = write_range(&writer, input, &range, time_seconds(total));
         }

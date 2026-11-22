@@ -7,17 +7,13 @@ import XCTest
 final class AuditRegressionTests: XCTestCase {
     private struct TimedOut: Error {}
 
-    func testOpenEventRecognizesSavedJSONProjectAndPreservesMediaProbing() throws {
-        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: folder) }
-        let project = folder.appendingPathComponent("Interview.json")
-        let header = Data([0xEF, 0xBB, 0xBF]) + Data("  \n{\"kind\":\"multicam\"}".utf8)
-        try header.write(to: project)
-        XCTAssertTrue(isMulticamDocument(project))
-        XCTAssertTrue(isMulticamDocument(folder.appendingPathComponent("Interview.multicam.json")))
-        try Data([0, 0, 0, 16, 102, 116, 121, 112]).write(to: project)
-        XCTAssertFalse(isMulticamDocument(project))
+    func testOpenEventRecognizesCutDocumentsAndPreservesMediaProbing() {
+        let folder = FileManager.default.temporaryDirectory
+        XCTAssertTrue(isCutDocument(folder.appendingPathComponent("Interview.cut")))
+        XCTAssertTrue(isCutDocument(folder.appendingPathComponent("Interview.CUT")))
+        XCTAssertFalse(isCutDocument(folder.appendingPathComponent("Interview.json")))
+        XCTAssertFalse(isCutDocument(folder.appendingPathComponent("Interview.mov")))
+        XCTAssertFalse(isCutDocument(folder.appendingPathComponent("Interview.mov.cutdb")))
     }
 
     @MainActor

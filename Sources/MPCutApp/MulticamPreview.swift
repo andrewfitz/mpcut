@@ -294,6 +294,16 @@ final class MulticamPreview: ObservableObject {
     @Published private(set) var time: RationalTime = .zero
     @Published private(set) var duration: RationalTime = .zero
     @Published private(set) var playbackRate: Float = 0
+    @Published private(set) var forwardSpeed: PlaybackSpeed = .normal
+    private var playbackScreen: NSScreen? {
+        surfaces.allObjects.compactMap { $0.window?.screen }.max { $0.maximumFramesPerSecond < $1.maximumFramesPerSecond }
+    }
+
+    func selectPlaybackSpeed(_ speed: PlaybackSpeed) {
+        forwardSpeed = speed
+        if isPlaying { startPlayback(at: speed.rawValue) }
+    }
+
     var isPlaying: Bool { playbackRate != 0 }
     @Published var volume: Float = 1 {
         didSet {
@@ -335,14 +345,14 @@ final class MulticamPreview: ObservableObject {
     private var audio: [MulticamPreviewAudioSpan] = []
     private var plan: MulticamPlan?
     private var media: [String: MediaInfo] = [:]
-    private var ticker: Task<Void, Never>?
+    private var ticker: PreviewDisplayTicker?
     private var frame: PreviewFrame?
     private let surfaces = NSHashTable<PreviewSurface>.weakObjects()
     private var desiredPicture: MulticamPicturePosition?
     private var decodingPicture: MulticamPicturePosition?
     private var failedPicture: MulticamPicturePosition?
     private var prefetchedPicture: (position: MulticamPicturePosition, frame: PreviewFrame)?
-    private var isAuditioning = false
+    private(set) var isAuditioning = false
     private var scrubSpanIndex: Int?
     private var audioIndex = 0
     private var audioStart: RationalTime = .zero
@@ -513,7 +523,7 @@ final class MulticamPreview: ObservableObject {
         if isPlaying { pause(); return }
         guard duration > .zero else { return }
         if time >= duration { seek(to: .zero) }
-        startPlayback(at: 1)
+        startPlayback(at: forwardSpeed.rawValue)
     }
 
     func shuttle(_ direction: Int) {
@@ -547,13 +557,7 @@ final class MulticamPreview: ObservableObject {
         }
         tick()
         guard isPlaying else { return }
-        ticker = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(8))
-                guard let self, !Task.isCancelled else { return }
-                self.tick()
-            }
-        }
+        ticker = PreviewDisplayTicker(screen: playbackScreen) { [weak self] in self?.tick() }
     }
 
     private func startReverseAudio(at position: RationalTime) {

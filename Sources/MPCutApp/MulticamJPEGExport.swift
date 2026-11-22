@@ -22,6 +22,8 @@ extension MulticamEditorModel {
             let panel = options.panel(source: url, directory: projectURL?.deletingLastPathComponent())
             ProjectPanels.present(panel, in: window) { [weak self, options] accepted in
                 guard let self, accepted, let output = panel.url, self.project == project, self.mapping == mapping else { return }
+                do { try self.validateHistoryDestination(output) }
+                catch { self.fail(error.localizedDescription); return }
                 let confirmed = options.confirmedDestination(at: output)
                 self.run("Exporting current frame…", exporting: true) { token, sidecar in
                     let engine = CutEngine(cancelled: { token.isCancelled }, useSidecar: sidecar)
@@ -58,6 +60,7 @@ extension MulticamEditorModel {
         ProjectPanels.present(panel, in: window) { [weak self] accepted in
             guard let self, accepted, let directory = panel.url, self.project == project else { return }
             do {
+                try self.validateHistoryDestination(directory, includesContents: true)
                 let limit = try options.frameLimit()
                 let preset = options.preset, sample = options.sample, mode = options.mode
                 let times = options.allSwitches ? project.switches.map(\.at) : [group]

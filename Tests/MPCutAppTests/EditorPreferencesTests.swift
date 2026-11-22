@@ -1,8 +1,89 @@
+import AppKit
+import SwiftUI
 import MPCutCore
 import XCTest
 @testable import MPCutApp
 
 final class EditorPreferencesTests: XCTestCase {
+    @MainActor
+    func testSteppingFromTypedLimitCommitsOnlyTheFinishedCount() async throws {
+        _ = NSApplication.shared
+        let settings = EditorPreferences()
+        let field = HistoryLimitField(limit: Binding(get: { settings.historyLimit }, set: { settings.historyLimit = $0 }))
+        let host = NSHostingView(rootView: field)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 250, height: 80),
+                              styleMask: .titled, backing: .buffered, defer: false)
+        window.contentView = host
+        window.orderBack(nil)
+        defer { window.orderOut(nil) }
+
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        host.layoutSubtreeIfNeeded()
+        let views = descendants(host)
+        let entry = try XCTUnwrap(views.compactMap { $0 as? NSTextField }.first)
+        let stepper = try XCTUnwrap(views.compactMap { $0 as? NSStepper }.first)
+        XCTAssertTrue(window.makeFirstResponder(entry))
+        let editor = try XCTUnwrap(window.firstResponder as? NSTextView)
+        editor.selectAll(nil)
+        editor.insertText("200", replacementRange: editor.selectedRange())
+        let deadline = ContinuousClock.now + .seconds(2)
+        while entry.stringValue != "200", ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await Task.yield()
+        XCTAssertEqual(settings.historyLimit, 50)
+        XCTAssertEqual(entry.stringValue, "200")
+        // AppKit sends a relative step to the SwiftUI stepper while its neighboring field still owns focus.
+        stepper.integerValue += 1
+        XCTAssertTrue(stepper.sendAction(try XCTUnwrap(stepper.action), to: stepper.target))
+        XCTAssertEqual(settings.historyLimit, 201)
+
+        let stepDeadline = ContinuousClock.now + .seconds(2)
+        while entry.stringValue != "201", ContinuousClock.now < stepDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(entry.stringValue, "201")
+        XCTAssertTrue(window.makeFirstResponder(entry))
+        let currentEditor = try XCTUnwrap(window.firstResponder as? NSTextView)
+        currentEditor.selectAll(nil)
+        currentEditor.insertText("250", replacementRange: currentEditor.selectedRange())
+        XCTAssertEqual(currentEditor.string, "250")
+        XCTAssertEqual(settings.historyLimit, 201)
+        window.isReleasedWhenClosed = false
+        window.close()
+        XCTAssertEqual(settings.historyLimit, 250)
+    }
+
+    @MainActor
+    func testHistoryLimitPersistsZeroAndClampsBeforeNotifyingEditors() throws {
+        let name = "mpcut.history-preferences.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let settings = EditorPreferences(defaults: defaults)
+        XCTAssertEqual(settings.historyLimit, 50)
+        var observed: [Int] = []
+        let observer = settings.observeChanges {
+            if $0 == .historyLimit { observed.append(settings.historyLimit) }
+        }
+        defer { observer.cancel() }
+
+        settings.historyLimit = Int.max
+        XCTAssertEqual(EditorPreferences(defaults: defaults).historyLimit, 500)
+        settings.historyLimit = Int.min
+        XCTAssertEqual(EditorPreferences(defaults: defaults).historyLimit, 0)
+        settings.historyLimit = -1
+        XCTAssertEqual(observed, [500, 0])
+        defaults.set(1500, forKey: "historyLimit")
+        XCTAssertEqual(EditorPreferences(defaults: defaults).historyLimit, 500)
+        XCTAssertEqual(defaults.integer(forKey: "historyLimit"), 500)
+        defaults.set("not a count", forKey: "historyLimit")
+        XCTAssertEqual(EditorPreferences(defaults: defaults).historyLimit, 50)
+        defaults.set(2.5, forKey: "historyLimit")
+        XCTAssertEqual(EditorPreferences(defaults: defaults).historyLimit, 50)
+        defaults.set(false, forKey: "historyLimit")
+        XCTAssertEqual(EditorPreferences(defaults: defaults).historyLimit, 50)
+    }
+
     @MainActor
     func testPreferencesPersistWithoutAnyEditor() throws {
         let name = "mpcut.preferences-test.\(UUID().uuidString)"

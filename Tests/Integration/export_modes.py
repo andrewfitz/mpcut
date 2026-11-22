@@ -55,7 +55,7 @@ class ExportModes(unittest.TestCase):
         index = query("help")
         self.assertEqual(index["version"], query("--version")["version"])
         self.assertEqual(set(index["commands"]), {"help", "version", "inspect", "export", "bulk", "rearrange",
-                                                 "sidecar", "frames", "waveform", "silence", "scenes", "multicam"})
+                                                 "sidecar", "frames", "waveform", "silence", "scenes", "multicam", "resolve", "convert"})
         for name, expected in index["commands"].items():
             verb = "--version" if name == "version" else name
             self.assertEqual(query("help", name), expected)

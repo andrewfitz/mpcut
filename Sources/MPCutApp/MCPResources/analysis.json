@@ -1,0 +1,501 @@
+[
+  {
+    "name": "analysis_state",
+    "description": "Read native scene and silence scan progress, issues, current settings and a bounded page of analyzed source IDs and absolute audio stream indices.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "list_pauses",
+    "description": "Read detected pauses, proposed removals, clock and protection state from the current sequence or multicam assembly. Use the returned pause ID for review.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "list_scenes",
+    "description": "Read one analyzed source’s scenes, exact source-relative boundaries and recurring view names.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        }
+      },
+      "required": [
+        "project",
+        "source"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_waveform_peaks",
+    "description": "Read linear-amplitude peak bins from a completed native waveform on the selected sequence track or a routed multicam track. Unobserved bins are null. Stream uses an absolute stream index. Use get_waveform for a signed envelope or another indexed stream.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "columns": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2048
+        },
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "source",
+        "stream"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "scan_analysis",
+    "description": "Start native background scene or silence analysis or rescan completed silence. Poll analysis_job_status using the returned job ID. An existing GUI scan returns its origin.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "scenes",
+            "silence"
+          ]
+        }
+      },
+      "required": [
+        "project",
+        "kind",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cancel_analysis",
+    "description": "Cancel the active native scene or silence scan in this project.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "scenes",
+            "silence"
+          ]
+        }
+      },
+      "required": [
+        "project",
+        "kind",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "configure_silence",
+    "description": "Set at least one native silence option. Sequence trackOrdinal is zero-based. A sequence threshold applies to the named source, or the source at the playhead when omitted. A null threshold restores automatic detection. Minimum and retained padding are shared editor preferences.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string"
+        },
+        "trackOrdinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source": {
+          "type": "string"
+        },
+        "minimumPause": {
+          "type": "number",
+          "minimum": 0.02,
+          "maximum": 86400
+        },
+        "leavePause": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 86400
+        },
+        "thresholdDB": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -120,
+          "maximum": 0
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "use_room_tone",
+    "description": "Calibrate manual thresholds from measured audio in the marked sequence, group, or assembly range and clear the consumed marks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "rename_view",
+    "description": "Set the name for every matching view in an analyzed source. An empty name restores the default.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "view": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "project",
+        "source",
+        "view",
+        "name",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "review_pause",
+    "description": "Seek, preview, protect or unprotect a pause by its list_pauses ID. Multicam protection applies to the group-time pause across repeated occurrences. Protecting the auditioned multicam pause closes its review. Done closes the review. NextCut and keepAndAdvance operate on an open sequence review.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string"
+        },
+        "pause": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "seek",
+            "preview",
+            "protect",
+            "unprotect",
+            "nextCut",
+            "keepAndAdvance",
+            "done"
+          ]
+        }
+      },
+      "required": [
+        "project",
+        "action",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "set_skip_pauses",
+    "description": "Enable or disable native skipping of detected pauses during playback.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project",
+        "enabled",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "apply_pauses",
+    "description": "Shorten detected pauses using the native timeline edit and history, or queue retained takes using the native export queue.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "shorten",
+            "queue"
+          ]
+        }
+      },
+      "required": [
+        "project",
+        "mode",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "save_analysis_sidecars",
+    "description": "Save completed analysis beside the project sources using the native save operation. Poll the returned job with analysis_job_status.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operationID": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "analysis_job_status",
+    "description": "Return the state, original revision, progress when available, and terminal details for a retained native analysis or sidecar job.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "job": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "job"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "analysis_job_cancel",
+    "description": "Request cancellation of this specific MCP-started scan or sidecar save. Poll analysis_job_status for its terminal state.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "job": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "job"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_waveform",
+    "description": "Read signed minimum and maximum sample amplitudes for equal-width source-time bins using the same envelope decoder as the GUI and CLI. Use source IDs and absolute stream indices from analysis_state.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "columns": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2048
+        },
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project",
+        "source",
+        "stream"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

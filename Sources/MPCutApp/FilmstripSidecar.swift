@@ -96,3 +96,41 @@ struct FilmstripTileBuffer {
         bytes = entries.reduce(0) { $0 + $1.cost }
     }
 }
+
+/// Optional disk writes must never hold the serial decoder queue behind a SQLite writer.
+final class FilmstripTileWriter: @unchecked Sendable {
+    private let queue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "mpcut.filmstrip.persistence"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .utility
+        return queue
+    }()
+    private let lock = NSLock()
+    private var retainedBytes = 0
+    private var retainedCount = 0
+
+    func submit(_ image: CGImage, key: FilmstripTileKey, sidecar: AnalysisSidecar,
+                preserveAlpha: Bool, cancelled: @escaping @Sendable () -> Bool) {
+        let cost = image.bytesPerRow * image.height
+        let accepted = lock.withLock {
+            guard retainedCount < 32, cost <= 16 * 1024 * 1024 - retainedBytes else { return false }
+            retainedCount += 1
+            retainedBytes += cost
+            return true
+        }
+        guard accepted else { return }
+        queue.addOperation { [self] in
+            defer {
+                lock.withLock {
+                    retainedCount -= 1
+                    retainedBytes -= cost
+                }
+            }
+            guard !cancelled(), let data = key.encoded(image, preserveAlpha: preserveAlpha) else { return }
+            sidecar.saveAutomatically([key.section: data],
+                retainingLatest: [FilmstripTileKey.sectionPrefix: FilmstripTileBuffer.countLimit],
+                cancelled: cancelled)
+        }
+    }
+}

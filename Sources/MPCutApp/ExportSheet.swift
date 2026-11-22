@@ -6,7 +6,46 @@ struct ExportSheetOptions: Sendable {
     var mode: ExportMode = .smart
     var tracks: ExportTracks = .all
     var audioTrackOrdinal: Int?
-    var effectiveMode: ExportMode { tracks == .all ? mode : .copy }
+    /// A sound-only export copies packets or converts them. Smart Trim applies to picture.
+    var audioMode: ExportMode = .copy
+    var audioFormat: ReencodeAudio = .pcm
+    var conversionContainer = "wav"
+    var convertsAudio: Bool { tracks == .audio && audioMode == .encode }
+    /// The mode the pickers hold for the selected tracks. The export rules decide what it is written as.
+    var effectiveMode: ExportMode {
+        let held = tracks == .audio ? audioMode : mode
+        return ExportRules.cell(source: .movie, tracks: tracks, mode: held).resolvedMode
+    }
+
+    /// This selection in the terms shared with the CLI.
+    func request(_ clips: [ClipRequest]) -> ExportRequest {
+        ExportRequest(clips: clips, mode: effectiveMode, tracks: tracks, audioTrackOrdinal: audioTrackOrdinal,
+                      container: container.isEmpty ? nil : container, audio: convertsAudio ? audioFormat : effectiveAudio,
+                      codec: codec, quality: quality)
+    }
+
+    /// The selection that an offered alternative stands for.
+    func applying(_ request: ExportRequest, container: String) -> ExportSheetOptions {
+        var next = self
+        next.tracks = request.tracks
+        if request.tracks == .audio {
+            if request.mode == .encode {
+                next.convertAudio(to: request.audio, preferred: container)
+            } else {
+                next.audioMode = .copy
+                next.copyContainer = container
+            }
+        } else {
+            next.mode = request.mode
+            if request.mode != .encode {
+                next.copyContainer = container
+            } else {
+                next.audio = request.audio
+                if next.codec == .prores { next.proResContainer = container } else { next.encodeContainer = container }
+            }
+        }
+        return next
+    }
     var copyContainer = "mp4"
     var encodeContainer = "mp4"
     var proResContainer = "mov"
@@ -16,11 +55,20 @@ struct ExportSheetOptions: Sendable {
     var audio: ReencodeAudio = .auto
 
     var container: String {
+        if convertsAudio { return conversionContainer }
         guard effectiveMode == .encode else { return copyContainer }
         return codec == .prores ? proResContainer : encodeContainer
     }
+
+    /// Selects a conversion and a container it can be written to, keeping `preferred` when it fits.
+    mutating func convertAudio(to format: ReencodeAudio, preferred: String? = nil) {
+        let choices = AudioExportEngine.containers(for: format)
+        audioMode = .encode
+        audioFormat = format
+        conversionContainer = preferred.flatMap { choices.contains($0) ? $0 : nil } ?? choices.first ?? conversionContainer
+    }
     var quality: ReencodeQuality { codec == .prores ? proResQuality : standardQuality }
-    var effectiveAudio: ReencodeAudio { container == "mp4" && audio == .pcm ? .auto : audio }
+    var effectiveAudio: ReencodeAudio { ExportRules.allows(audio: audio, inMovieContainer: container) ? audio : .auto }
     var settings: ReencodeSettings { .init(codec: codec, quality: quality, audio: effectiveAudio) }
 }
 
@@ -51,12 +99,19 @@ struct ExportContainerChoices: Sendable {
     }
 }
 
-enum EditorExportPlan: Sendable {
-    case packets(ResolvedEdit, mode: ExportMode, tracks: ExportTracks)
-    case conversion(ReencodePlan)
+/// The plan every front end receives from the export rules.
+typealias EditorExportPlan = ExportPlan
 
+extension ExportPlan {
     var summary: String {
         switch self {
+        case .audio(let plan):
+            let size = plan.estimatedBytes.map { " · about " + ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? ""
+            let fidelity = plan.isLossless ? "\nLossless: decoding returns the source samples unchanged."
+                : plan.action == .pcm ? "\nNo further quality loss. The file is much larger than the source." : ""
+            let first = "Convert \(Self.seconds(plan.edit.duration.seconds)) of audio to \(plan.formatDescription) "
+                + "(.\(plan.edit.container))\(size)\(fidelity)"
+            return ([first] + plan.warnings).joined(separator: "\n")
         case .packets(let edit, .smart, .all):
             guard let encoded = try? edit.encodedVideoDuration(for: .smart),
                   let copied = try? edit.copiedVideoDuration(for: .smart) else {
@@ -86,9 +141,7 @@ enum EditorExportPlan: Sendable {
         }
     }
 
-    static func seconds(_ value: Double) -> String {
-        value.formatted(.number.precision(.fractionLength(3...6))) + " s"
-    }
+    static func seconds(_ value: Double) -> String { ExportRules.seconds(value) }
 }
 
 struct ExportCutReview: Sendable {
@@ -151,39 +204,52 @@ enum ExportAvailability: Sendable {
     case unavailable(String, ExportCutReview?)
 
     static func check(_ options: ExportSheetOptions, clips: [ClipRequest], media: [URL: MediaInfo], useSidecar: Bool = true) -> Self {
+        resolve(options, clips: clips, media: media, useSidecar: useSidecar).availability
+    }
+
+    /// Asks the shared export rules for the plan, or the failure and every alternative that works.
+    static func resolve(_ options: ExportSheetOptions, clips: [ClipRequest], media: [URL: MediaInfo],
+                        useSidecar: Bool = true) -> (availability: Self, failure: CutError?, offers: [ExportFallback]) {
         let cancelled: @Sendable () -> Bool = { Task.isCancelled }
-        let engine = CutEngine(cancelled: cancelled, smartTrim: options.effectiveMode == .smart, useSidecar: useSidecar,
-                               tracks: options.tracks, audioTrackOrdinal: options.audioTrackOrdinal)
-        do {
-            if options.effectiveMode == .encode {
-                return try AnalysisSidecar.$readsEnabled.withValue(useSidecar && AnalysisSidecar.readsEnabled) {
-                    .ready(.conversion(try ReencodeEngine(cancelled: cancelled)
-                        .resolve(clips, media: media, container: options.container, settings: options.settings)))
-                }
-            }
-            let edit = try engine.resolve(clips, media: media, container: options.container)
-            return .ready(.packets(edit, mode: options.effectiveMode, tracks: options.tracks))
-        } catch {
-            var message = error.localizedDescription
+        let planner = ExportPlanner(cancelled: cancelled, useSidecar: useSidecar)
+        switch planner.resolve(options.request(clips), media: media) {
+        case .ready(let plan, _, _):
+            return (.ready(plan), nil, [])
+        case .unavailable(let issue, let offers):
             var review: ExportCutReview?
-            if let issue = error as? CutError {
-                if let index = issue.segment, clips.indices.contains(index - 1) {
-                    let clip = clips[index - 1]
-                    let boundary = issue.boundary == "from" ? clip.from : issue.boundary == "to" ? clip.to : nil
-                    let location = boundary.map { " at \(EditorExportPlan.seconds($0.seconds))" } ?? ""
-                    message = "Clip \(index) · \(clip.file.lastPathComponent)\(location)\n\(message)"
-                }
-                if let times = issue.nearest, !times.isEmpty {
-                    message += "\nVerified alternatives: " + times.map { EditorExportPlan.seconds($0.seconds) }.joined(separator: ", ")
-                }
-                if options.mode == .copy, options.tracks == .all, issue.code == "unsafe_boundary", !cancelled(),
-                   let snapped = try? engine.resolve(clips, snap: .nearest, media: media, container: options.container) {
-                    review = ExportCutReview(original: clips, snapped: snapped, media: media,
-                                             engine: engine, cancelled: cancelled)
+            // Reviewing cuts edits the timeline, which only this front end has.
+            if options.mode == .copy, options.tracks == .all, issue.code == "unsafe_boundary", !cancelled() {
+                let engine = CutEngine(cancelled: cancelled, useSidecar: useSidecar)
+                if let snapped = try? engine.resolve(clips, snap: .nearest, media: media, container: options.container) {
+                    review = ExportCutReview(original: clips, snapped: snapped, media: media, engine: engine, cancelled: cancelled)
                 }
             }
-            return .unavailable(message, review)
+            let fallbacks = offers.map { offer in
+                ExportFallback(title: offer.alternative.label,
+                               options: options.applying(offer.request, container: offer.alternative.container),
+                               alternative: offer.alternative,
+                               clips: offer.alternative.clips == nil ? nil : offer.request.clips)
+            }
+            return (.unavailable(ExportRules.describe(issue, clips: clips), review), issue, fallbacks)
         }
+    }
+}
+
+/// The next export that works when the selected one does not, least destructive first.
+/// It is offered to the user and never applied on its own.
+struct ExportFallback: Sendable {
+    let title: String
+    let options: ExportSheetOptions
+    /// The alternative as the export rules report it to every front end.
+    let alternative: ExportAlternative
+    /// Set when the alternative moves cuts: the clips to export instead.
+    let clips: [ClipRequest]?
+
+    /// The first alternative of the shared rules. The order and labels are decided in MPCutCore.
+    static func find(after options: ExportSheetOptions, clips: [ClipRequest], media: [URL: MediaInfo],
+                     containers: ExportContainerChoices, useSidecar: Bool = true) -> ExportFallback? {
+        // Callers of this form apply `options` alone, so an alternative that moves cuts is not theirs to take.
+        ExportAvailability.resolve(options, clips: clips, media: media, useSidecar: useSidecar).offers.first { $0.clips == nil }
     }
 }
 
@@ -197,12 +263,19 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private let sourceHasAudio: Bool
     private let clips: [ClipRequest]
     private let media: [URL: MediaInfo]
+    private let allowsApplyingReviewToTimeline: Bool
+    private let excludedSources: Set<URL>
     private let useSidecar: Bool
     private let changed: (ExportSheetOptions, Bool) -> Void
     private let directoryChanged: (URL) -> Void
     private var preflight: Task<ExportAvailability, Never>?
     private var revision = UUID()
     private var availability: ExportAvailability?
+    private(set) var fallback: ExportFallback?
+    var isUnavailable: Bool {
+        if case .unavailable = availability { return true }
+        return false
+    }
     private var review: ExportCutReview?
     private(set) var appliedReview: ExportCutReview?
     var selected: EditorExportPlan? {
@@ -210,16 +283,44 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         return nil
     }
 
-    private let modes: [ExportMode] = [.smart, .copy, .encode]
+    /// Every alternative the export rules report for the current failure, least destructive first.
+    private(set) var alternatives: [ExportFallback] = []
+    /// The failure as the engine reports it, with the same code and message the CLI prints.
+    private(set) var failure: CutError?
+    /// Clips of an applied alternative that moves cuts. Any other change returns to the timeline's clips.
+    private var clipOverride: [ClipRequest]?
+    private var pendingOverride: [ClipRequest]?
+
+    private var sourceKind: ExportSourceKind { sourceHasVideo ? .movie : .audio }
+    private func cell(_ mode: ExportMode) -> ExportCell { ExportRules.cell(source: sourceKind, tracks: options.tracks, mode: mode) }
+    /// The modes the matrix writes as themselves for the selected tracks.
+    private var modes: [ExportMode] {
+        [ExportMode.smart, .copy, .encode].filter { cell($0).isAllowed && cell($0).resolvedMode == $0 }
+    }
+    private func title(of mode: ExportMode) -> String { cell(mode).displayName }
     private let codecs: [ReencodeCodec] = [.h264, .hevc, .prores]
+    /// The source's own format first, then the named conversions of the matrix.
+    private var conversionFormats: [ReencodeAudio] {
+        let selected = options.audioTrackOrdinal.flatMap { audioStreams.indices.contains($0) ? audioStreams[$0] : nil }
+            ?? audioStreams.first
+        let native = selected.flatMap { ExportRules.sameFormat(for: $0.codec) }
+        let named = cell(.encode).audioActions.filter { !ExportRules.conversionContainers($0).isEmpty }
+        return ([native].compactMap { $0 } + named).reduce(into: []) { list, format in
+            if !list.contains(format) { list.append(format) }
+        }
+    }
     private var audioChoices: [ReencodeAudio] {
-        ReencodeAudio.allCases.filter { $0 != .removeAudio && (options.container != "mp4" || $0 != .pcm) }
+        if options.convertsAudio { return conversionFormats }
+        return ExportRules.movieAudioActions.filter {
+            $0 != .removeAudio && ExportRules.allows(audio: $0, inMovieContainer: options.container)
+        }
     }
     private var qualities: [ReencodeQuality] {
         options.codec == .prores ? [.proresLT, .prores422, .proresHQ] : [.smallerFile, .balanced, .highQuality]
     }
     private var containers: [String] {
-        options.effectiveMode == .encode ? (options.codec == .prores ? ["mov", "mkv"] : ["mp4", "mov", "mkv"]) : copyContainers.choices(for: options)
+        if options.convertsAudio { return ExportRules.conversionContainers(options.audioFormat) }
+        return options.effectiveMode == .encode ? ExportRules.reencodeContainers(options.codec) : copyContainers.choices(for: options)
     }
     private let videoCheck = NSButton(checkboxWithTitle: "Video", target: nil, action: nil)
     private let audioCheck = NSButton(checkboxWithTitle: "Audio", target: nil, action: nil)
@@ -231,6 +332,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private let audioTrackPicker = NSPopUpButton()
     private let trackRow = NSStackView()
     private let settings = NSStackView()
+    private var videoSettings: NSView?
     private let statusIcon = NSImageView()
     private let summary = NSTextField(wrappingLabelWithString: "")
     private let reviewButton = NSButton(title: "Review Cuts…", target: nil, action: nil)
@@ -241,14 +343,16 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private let accessory = NSStackView()
 
     init(panel: NSSavePanel, options: ExportSheetOptions, copyContainers: ExportContainerChoices,
-         clips: [ClipRequest], media: [URL: MediaInfo], useSidecar: Bool = true,
-         changed: @escaping (ExportSheetOptions, Bool) -> Void,
+         clips: [ClipRequest], media: [URL: MediaInfo], useSidecar: Bool = true, excludedSources: Set<URL> = [],
+         allowsApplyingReviewToTimeline: Bool = true, changed: @escaping (ExportSheetOptions, Bool) -> Void,
          directoryChanged: @escaping (URL) -> Void) {
+        self.allowsApplyingReviewToTimeline = allowsApplyingReviewToTimeline
         self.panel = panel
         self.options = options
         self.copyContainers = copyContainers
         self.clips = clips
         self.media = media
+        self.excludedSources = excludedSources
         self.useSidecar = useSidecar
         audioStreams = clips.first.flatMap { media[$0.file] }?.streams.filter { $0.kind == "audio" } ?? []
         sourceHasVideo = media.values.contains(where: \.hasVideo)
@@ -270,12 +374,14 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         configure(qualityPicker, label: "Quality", action: #selector(selectQuality))
         configure(audioPicker, label: "Audio", action: #selector(selectAudio))
         configure(reviewButton, action: #selector(showReview))
-        configure(encodeButton, action: #selector(chooseEncode))
+        configure(encodeButton, action: #selector(applyFallback))
         configure(applyButton, action: #selector(applyReview))
 
         settings.orientation = .vertical
         settings.alignment = .leading
-        settings.addArrangedSubview(paired(row("Video", codecPicker), row("Quality", qualityPicker)))
+        let picture = paired(row("Video", codecPicker), row("Quality", qualityPicker))
+        videoSettings = picture
+        settings.addArrangedSubview(picture)
         if media.values.contains(where: { !$0.audio.isEmpty }) {
             settings.addArrangedSubview(row("Audio", audioPicker))
         }
@@ -314,7 +420,16 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         checkAvailability()
     }
 
-    func stopChecking() { preflight?.cancel() }
+    private var fallbackSearch: Task<ExportFallback?, Never>?
+    /// True until the current selection has its answer from the export rules.
+    private(set) var isChecking = false
+    private var resolution: Task<(availability: ExportAvailability, failure: CutError?, offers: [ExportFallback]), Never>?
+
+    func stopChecking() {
+        preflight?.cancel()
+        fallbackSearch?.cancel()
+        resolution?.cancel()
+    }
 
     private func configure(_ button: NSButton, action: Selector) {
         button.target = self
@@ -361,13 +476,15 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         trackRow.isHidden = options.tracks != .audio || audioStreams.count < 2
         fill(audioTrackPicker, titles: ["All audio tracks"] + audioStreams.map(\.exportLabel),
              selected: options.audioTrackOrdinal.flatMap { audioStreams.indices.contains($0) ? $0 + 1 : nil })
-        fill(modePicker, titles: modes.map(\.displayName), selected: modes.firstIndex(of: options.effectiveMode))
-        modePicker.isEnabled = options.tracks == .all
+        fill(modePicker, titles: modes.map(title(of:)), selected: modes.firstIndex(of: options.effectiveMode))
+        modePicker.isEnabled = options.tracks != .video
         fill(containerPicker, titles: containers.map(containerDisplayName), selected: containers.firstIndex(of: options.container))
         fill(codecPicker, titles: codecs.map(\.displayName), selected: codecs.firstIndex(of: options.codec))
         fill(qualityPicker, titles: qualities.map(\.displayName), selected: qualities.firstIndex(of: options.quality))
-        fill(audioPicker, titles: audioChoices.map(\.displayName), selected: audioChoices.firstIndex(of: options.effectiveAudio))
+        fill(audioPicker, titles: audioChoices.map(\.displayName),
+             selected: audioChoices.firstIndex(of: options.convertsAudio ? options.audioFormat : options.effectiveAudio))
         settings.isHidden = options.effectiveMode != .encode
+        videoSettings?.isHidden = options.convertsAudio
     }
 
     private func didChange(from previousContainer: String, explicitCopyContainer: Bool = false) {
@@ -377,6 +494,8 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
                 panel.nameFieldStringValue = "\(name.deletingPathExtension).\(options.container)"
             }
         }
+        clipOverride = pendingOverride
+        pendingOverride = nil
         changed(options, explicitCopyContainer)
         updatePickers()
         checkAvailability()
@@ -406,19 +525,40 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
 
     @objc private func selectMode() {
         let previousContainer = options.container
-        options.mode = modes[modePicker.indexOfSelectedItem]
+        let mode = modes[modePicker.indexOfSelectedItem]
+        if options.tracks != .audio {
+            options.mode = mode
+        } else if mode == .encode {
+            // Start from the source's own format where the helper can write it.
+            let format = conversionFormats.contains(options.audioFormat) && options.audioMode == .encode
+                ? options.audioFormat : conversionFormats[0]
+            options.convertAudio(to: format, preferred: previousContainer)
+        } else {
+            options.audioMode = .copy
+        }
         didChange(from: previousContainer)
     }
 
-    @objc private func chooseEncode() {
-        modePicker.selectItem(at: 2)
-        selectMode()
+    /// Switches to the offered alternative. The destination is checked again when the panel is confirmed.
+    @objc private func applyFallback() {
+        guard let fallback else { return }
+        apply(fallback)
+    }
+
+    /// Applies one of `alternatives`: the same request the CLI makes with that alternative's arguments.
+    func apply(_ fallback: ExportFallback) {
+        let previousContainer = options.container
+        options = fallback.options
+        pendingOverride = fallback.clips
+        didChange(from: previousContainer)
     }
 
     @objc private func selectContainer() {
         let previousContainer = options.container
         let container = containers[containerPicker.indexOfSelectedItem]
-        if options.effectiveMode != .encode {
+        if options.convertsAudio {
+            options.conversionContainer = container
+        } else if options.effectiveMode != .encode {
             options.copyContainer = container
         } else if options.codec == .prores {
             options.proResContainer = container
@@ -445,8 +585,14 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     }
 
     @objc private func selectAudio() {
-        options.audio = audioChoices[audioPicker.indexOfSelectedItem]
-        didChange(from: options.container)
+        let previousContainer = options.container
+        let choice = audioChoices[audioPicker.indexOfSelectedItem]
+        if options.convertsAudio {
+            options.convertAudio(to: choice, preferred: previousContainer)
+        } else {
+            options.audio = choice
+        }
+        didChange(from: previousContainer)
     }
 
     private func checkAvailability() {
@@ -454,16 +600,28 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         let id = UUID()
         revision = id
         availability = nil
+        fallback = nil
+        alternatives = []
+        failure = nil
         review = nil
+        isChecking = true
         updateActions()
-        let task = Task.detached(priority: .userInitiated) { [options, clips, media, useSidecar] in
-            ExportAvailability.check(options, clips: clips, media: media, useSidecar: useSidecar)
+        let clips = clipOverride ?? self.clips
+        // One call to the shared rules returns the plan, or the failure with the alternatives that work.
+        let task = Task.detached(priority: .userInitiated) { [options, media, useSidecar, excludedSources] in
+            AnalysisSidecar.$excludedSources.withValue(excludedSources) {
+                ExportAvailability.resolve(options, clips: clips, media: media, useSidecar: useSidecar)
+            }
         }
-        preflight = task
+        resolution = task
         Task { [weak self] in
             let result = await task.value
             guard let self, self.revision == id, !task.isCancelled else { return }
-            self.availability = result
+            self.availability = result.availability
+            self.failure = result.failure
+            self.alternatives = result.offers
+            self.fallback = result.offers.first
+            self.isChecking = false
             self.updateActions()
         }
     }
@@ -476,7 +634,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
             symbol = "clock"
             description = "Checking export"
             statusIcon.contentTintColor = .secondaryLabelColor
-            summary.stringValue = "Checking \(options.effectiveMode.displayName) for this timeline…"
+            summary.stringValue = "Checking \(title(of: options.effectiveMode)) for this timeline…"
         case .ready(let plan):
             symbol = "checkmark.circle"
             description = "Export ready"
@@ -486,19 +644,20 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
             symbol = "exclamationmark.triangle.fill"
             description = "Export unavailable"
             statusIcon.contentTintColor = .systemOrange
-            summary.stringValue = "\(options.effectiveMode.displayName) unavailable\n\(message)"
+            summary.stringValue = "\(title(of: options.effectiveMode)) unavailable\n\(message)"
         }
         statusIcon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)
         statusIcon.setAccessibilityLabel(description)
         if case .unavailable(_, let proposed) = availability {
             reviewButton.isHidden = proposed == nil || review != nil
-            encodeButton.isHidden = options.effectiveMode != .smart
+            encodeButton.isHidden = fallback == nil
+            if let fallback { encodeButton.title = fallback.title }
         } else {
             reviewButton.isHidden = true
             encodeButton.isHidden = true
         }
         reviewScroll.isHidden = review == nil
-        applyButton.isHidden = review == nil
+        applyButton.isHidden = review == nil || !allowsApplyingReviewToTimeline
         accessory.layoutSubtreeIfNeeded()
         accessory.frame.size = accessory.fittingSize
         if panel?.accessoryView !== accessory { panel?.accessoryView = accessory }
@@ -513,7 +672,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     }
 
     @objc private func applyReview() {
-        guard let review else { return }
+        guard allowsApplyingReviewToTimeline, let review else { return }
         appliedReview = review
         panel?.cancel(nil)
     }
@@ -541,11 +700,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
 
 extension ExportMode {
     var displayName: String {
-        switch self {
-        case .smart: return "Smart Trim"
-        case .copy: return "Lossless Copy"
-        case .encode: return "Re-encode"
-        }
+        ExportRules.displayName(mode: self)
     }
 }
 
@@ -574,13 +729,7 @@ extension ReencodeQuality {
 
 extension ReencodeAudio {
     var displayName: String {
-        switch self {
-        case .auto: return "Auto"
-        case .copyOriginal: return "Copy Original"
-        case .aac: return "AAC"
-        case .pcm: return "PCM"
-        case .removeAudio: return "Remove Audio"
-        }
+        ExportRules.displayName(audio: self)
     }
 }
 

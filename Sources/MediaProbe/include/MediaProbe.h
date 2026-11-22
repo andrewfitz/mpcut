@@ -11,6 +11,11 @@ typedef struct {
 } MPProbePacket;
 
 typedef struct {
+    int64_t sample, offset;
+    uint32_t checksum;
+} MPProbeMP3Anchor;
+
+typedef struct {
     const char *kind, *codec, *pixel_format;
     char codec_tag[32], channel_layout[128];
     const char *primaries, *transfer, *matrix, *range, *chroma_location;
@@ -30,6 +35,9 @@ typedef struct {
     struct AVCodecParserContext *flac_parser;
     struct AVCodecContext *flac_context;
     int64_t last_audio_pts;
+    MPProbeMP3Anchor *mp3_anchors;
+    size_t mp3_anchor_count;
+    int mp3_unindexed;
     MPProbePacket *packets;
     size_t count, capacity;
 } MPProbeStream;
@@ -40,6 +48,9 @@ typedef struct {
     int stream_count, video_index, source_start_safe, has_unsupported_auxiliary;
     int64_t origin, end;
 } MPProbeResult;
+
+int mp_source_timecode(const char *path, int stream, int rate_num, int rate_den,
+                       int64_t *units, int *scale_num, int *scale_den);
 
 typedef int (*MPProbeCancelled)(void *context);
 typedef void (*MPProbeProgress)(void *context, double fraction);
@@ -65,7 +76,7 @@ enum { MP_PEAK_RATE = 50 };
 typedef void (*MPPeakVisit)(void *context, int64_t bin, float peak);
 int mp_float_pcm_peaks(const float *samples, int frames, int channels, int rate,
                        double start, double duration, MPPeakVisit visit, void *context);
-int mp_audio_peaks(const char *path, int stream, double origin, double duration,
+int mp_audio_peaks(const char *path, int stream, double origin, double duration, int ordered_clock,
                    MPProbeCancelled cancelled, MPPeakVisit visit, void *context,
                    char *error, size_t capacity);
 // Native signed sample extrema for a bounded window. low/high arrays have columns elements.

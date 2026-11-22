@@ -4,6 +4,48 @@ import XCTest
 
 final class SourceIndexLoaderTests: XCTestCase {
     @MainActor
+    func testDelayedMovieFitsOrdinaryCacheAndConvertsOnMulticamAdmission() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Multicam-Delayed-ProRes", withExtension: "mov",
+                                                  subdirectory: "Fixtures"))
+        let ordinary = try CutEngine(useSidecar: false).inspect(url, keyframes: true)
+        XCTAssertGreaterThan(ordinary.multicamSourceOffset, .zero)
+        let loader = SourceIndexLoader(completedIndexByteLimit: ordinary.indexStorageBytes)
+        let key = SourceIndexLoader.Key(url: url, sidecars: false, preview: false)
+        let first = try await read(key, using: loader)
+        XCTAssertEqual(first.storageBytes, ordinary.indexStorageBytes)
+        let admitted = try await admit(key, using: loader)
+        XCTAssertEqual(admitted.multicam.multicamClockOffset, ordinary.multicamSourceOffset)
+        XCTAssertEqual(admitted.multicam.frames.first?.time,
+                       try XCTUnwrap(ordinary.frames.first).time.adding(ordinary.multicamSourceOffset))
+        let warm = try await read(key, using: loader)
+        XCTAssertTrue(warm === first)
+        let tooLargeToCache = try await admit(key, using: loader)
+        XCTAssertFalse(admitted === tooLargeToCache)
+
+        let roomy = SourceIndexLoader(completedIndexByteLimit: ordinary.indexStorageBytes + admitted.multicam.indexStorageBytes)
+        let copy = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mov")
+        try FileManager.default.copyItem(at: url, to: copy)
+        defer { try? FileManager.default.removeItem(at: copy) }
+        let otherKey = SourceIndexLoader.Key(url: copy, sidecars: false, preview: false)
+        let older = try await read(otherKey, using: roomy)
+        async let one = admit(key, using: roomy)
+        async let two = admit(key, using: roomy)
+        let (shared, other) = try await (one, two)
+        let cached = try await admit(key, using: roomy)
+        XCTAssertTrue(shared === other)
+        XCTAssertTrue(shared === cached)
+        let evicted = try await read(otherKey, using: roomy)
+        XCTAssertFalse(older === evicted)
+    }
+
+    @MainActor
+    private func admit(_ key: SourceIndexLoader.Key, using loader: SourceIndexLoader) async throws -> SourceIndexLoader.MulticamIndex {
+        try await withCheckedThrowingContinuation { continuation in
+            _ = loader.admit(key) { continuation.resume(with: $0) }
+        }
+    }
+
+    @MainActor
     func testCompletedIndexReuseRequiresSameFileIdentityAndPreference() async throws {
         let (directory, fixture) = try fixtureDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

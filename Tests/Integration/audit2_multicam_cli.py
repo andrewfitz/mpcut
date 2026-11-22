@@ -30,7 +30,7 @@ class MulticamCLITests(unittest.TestCase):
         camera(cls.fixtures / "ntsc.mov", marker_base=0, frequency=419, rate="30000/1001", gop=30, length="4.004")
         (cls.fixtures / "interview.mov").symlink_to(cls.fixtures / "wide.mov")
         cls.base = {
-            "schemaVersion": 1, "kind": "multicam", "referenceAngle": "wide",
+            "format": "mpcut", "schemaVersion": 1, "kind": "multicam", "referenceAngle": "wide",
             "range": {"from": "0", "to": "4"},
             "angles": [{"id": "wide", "file": "wide.mov", "offset": "0", "audioStream": 1},
                        {"id": "close", "file": "close.mov", "offset": "0", "audioStream": 1}],
@@ -40,14 +40,14 @@ class MulticamCLITests(unittest.TestCase):
         }
 
     def setUp(self):
-        self.project = self.fixtures / "edit.multicam.json"
+        self.project = self.fixtures / "edit.cut"
         self.project.write_text(json.dumps(self.base))
         self.before = self.listing()
 
     def listing(self):
         # Reusable analysis sidecars are saved beside sources by design.
         return sorted(str(path.relative_to(self.fixtures)) for path in self.fixtures.rglob("*")
-                      if path.suffix != ".mpcut")
+                      if path.suffix != ".cutdb")
 
     def run_cli(self, *args, request=None):
         text = request if request is None or isinstance(request, str) else json.dumps(request)
@@ -176,11 +176,11 @@ class MulticamCLITests(unittest.TestCase):
         self.failure(*stdin, request={"clips": [{"project": project, "from": "-1"}], "output": "program.mov"},
                      status=2, code="invalid_time")
 
-        broken = self.fixtures / "broken.multicam.json"
+        broken = self.fixtures / "broken.cut"
         broken.write_text(json.dumps({**self.base, "kind": "edit"}))
         self.addCleanup(broken.unlink)
         self.before = self.listing()
-        for path, code in ((broken, "invalid_multicam_project"), (self.fixtures / "absent.json", "multicam_project_read_failed"),
+        for path, code in ((broken, "invalid_multicam_project"), (self.fixtures / "absent.cut", "multicam_project_read_failed"),
                            (self.fixtures / "wide.mov", "invalid_multicam_project")):
             with self.subTest(path=path.name):
                 request = {"clips": [{"project": project}, {"project": str(path)}], "output": "program.mov"}
@@ -192,7 +192,7 @@ class MulticamCLITests(unittest.TestCase):
     def test_project_and_stdin_clip_resolve_the_same_plan(self):
         direct = self.success("export", "--project", self.project, "--output", "program.mov", "--json", "--dry-run")
         clip = self.success("export", "--stdin", "--json", "--dry-run",
-                            request={"clips": [{"project": "edit.multicam.json"}], "output": "program.mov"})
+                            request={"clips": [{"project": "edit.cut"}], "output": "program.mov"})
         for key in ("plan", "sources", "picture", "audio", "mode", "duration", "container"):
             self.assertEqual(direct[key], clip[key], key)
         self.assertEqual(direct["mode"], "smart")
@@ -207,10 +207,11 @@ class MulticamCLITests(unittest.TestCase):
         for args in (["inspect", "--project", recording, "--json"],
                      ["export", "--project", recording, "--output", "program.mov", "--json"],
                      ["frames", "--project", recording, "--at", "1", "--output", "review", "--json"]):
-            error = self.failure(*args, status=1, code="invalid_multicam_project")
+            code = "invalid_multicam_project" if args[0] == "frames" else "invalid_cut_project"
+            error = self.failure(*args, status=1, code=code)
             self.assertIn("64 MB", error["message"])
-        self.failure("inspect", "--project", "/dev/null", "--json", status=1, code="multicam_project_read_failed")
-        self.failure("inspect", "--project", self.fixtures, "--json", status=1, code="multicam_project_read_failed")
+        self.failure("inspect", "--project", "/dev/null", "--json", status=1, code="cut_project_read_failed")
+        self.failure("inspect", "--project", self.fixtures, "--json", status=1, code="cut_project_read_failed")
         self.failure("inspect", "--project", "", "--json", status=2, code="invalid_path")
 
     def test_output_never_replaces_a_source_or_the_project(self):
@@ -493,12 +494,14 @@ class MulticamCLITests(unittest.TestCase):
         frames = self.success("frames", "--project", "-", "--at", "1", "--output", "review", "--json", request=document)
         self.addCleanup(lambda: [path.unlink() for path in (self.fixtures / "review").iterdir()]
                         and (self.fixtures / "review").rmdir())
-        self.assertEqual([angle["file"] for angle in frames["angles"]],
-                         [str((self.fixtures / name).resolve()) for name in ("wide.mov", "close.mov")])
+        angle_files = [Path(angle["file"]) for angle in frames["angles"]]
+        self.assertTrue(all(path.is_absolute() for path in angle_files))
+        self.assertEqual([path.resolve(strict=True) for path in angle_files],
+                         [(self.fixtures / name).resolve(strict=True) for name in ("wide.mov", "close.mov")])
         self.before = self.listing()
 
         # The same faults as a saved project, and the request limit of every stdin command.
-        self.failure("inspect", "--project", "-", "--json", request="{", status=1, code="invalid_multicam_project")
+        self.failure("inspect", "--project", "-", "--json", request="{", status=1, code="invalid_cut_project")
         broken = json.dumps({**self.base, "switches": []})
         self.failure("export", "--project", "-", *export, request=broken, status=1, code="invalid_multicam_project")
         # Standard input already carries an edit request.

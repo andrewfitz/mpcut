@@ -29,13 +29,16 @@ struct FrameExportOptions {
                 file = flag
                 continue
             }
-            guard flag == "--at" || seen.insert(flag).inserted else { throw invalid("Duplicate option \(flag).") }
+            guard ["--at", "--at-file"].contains(flag) || seen.insert(flag).inserted else { throw invalid("Duplicate option \(flag).") }
             switch flag {
             case "--": positional = true
             case "--json": break
             case "--output": output = try value(flag)
             case "--project": project = try value(flag)
-            case "--at": times.append(try RationalTime(parsing: value(flag)))
+            case "--at", "--at-file":
+                let raw = try value(flag)
+                let entries = flag == "--at-file" || ListFile.isListPath(raw) ? try ListFile.scalars(raw, header: "time") : [raw]
+                times += try entries.map(RationalTime.init(parsing:))
             case "--select":
                 let choice = try value(flag)
                 guard ["scenes", "non-silent"].contains(choice) else { throw invalid("Choose scenes or non-silent.") }

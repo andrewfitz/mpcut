@@ -447,6 +447,82 @@ final class EditorModelTests: XCTestCase {
     }
 
     @MainActor
+    func testRangeToolSplitPreservesTrimmedOuterHandles() async throws {
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
+                                                     subdirectory: "Fixtures"))
+        let model = EditorModel()
+        defer { model.endSession() }
+        model.importFiles([source])
+        try await waitForEdit(model)
+        let id = try XCTUnwrap(model.selectedID)
+        let frame = 1001.0 / 30000
+        model.trim(id, edge: .start, sourceTime: frame * 2, commit: true)
+        model.trim(id, edge: .end, sourceTime: frame * 10, commit: true)
+        model.selectRange(frame * 2, frame * 5)
+        model.splitSelectedRange()
+        let clips = model.timelineClips
+        XCTAssertEqual(clips.count, 3)
+        XCTAssertEqual(clips.first?.id, id)
+        XCTAssertEqual(clips.map { Int(($0.sourceStart / frame).rounded()) }, [2, 4, 7])
+        XCTAssertEqual(clips.map { Int(($0.sourceEnd / frame).rounded()) }, [4, 7, 10])
+        XCTAssertEqual(clips.compactMap { $0.displayRange }.map { Int(($0.from.seconds / frame).rounded()) }, [0, 4, 7])
+        XCTAssertEqual(clips.compactMap { $0.displayRange }.map { Int(($0.to.seconds / frame).rounded()) }, [4, 7, 12])
+    }
+
+    @MainActor
+    func testRangeToolSplitsAcrossOccurrencesAndKeepsMarksForDeleteAndExport() async throws {
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
+                                                     subdirectory: "Fixtures"))
+        let model = EditorModel()
+        defer { model.endSession() }
+        model.importFiles([source, source])
+        try await waitForEdit(model)
+        model.rangeTool = true
+        let original = model.sequenceClips
+        let frame = 1001.0 / 30000
+        model.deleteSelection()
+        XCTAssertEqual(model.sequenceClips, original)
+        model.selectRange(3 * frame, 3 * frame)
+        XCTAssertFalse(model.canDelete)
+        XCTAssertFalse(model.canSplitSelectedRange)
+        model.selectRange(15.1 * frame, 4.2 * frame)
+        XCTAssertEqual(model.markIn ?? -1, 4 * frame, accuracy: 1e-9)
+        XCTAssertEqual(model.markOut ?? -1, 15 * frame, accuracy: 1e-9)
+        XCTAssertTrue(model.canSplitSelectedRange)
+        model.splitSelectedRange()
+        XCTAssertEqual(model.timelineClips.count, 4)
+        XCTAssertEqual(model.selectedID, model.timelineClips[1].id)
+        XCTAssertFalse(model.canSplitSelectedRange)
+        XCTAssertTrue(model.canDelete)
+        let split = model.sequenceClips
+        model.splitSelectedRange()
+        model.undo()
+        XCTAssertEqual(model.sequenceClips, original)
+        model.redo()
+        XCTAssertEqual(model.sequenceClips, split)
+        model.deleteSelection()
+        XCTAssertEqual(model.duration, 13 * frame, accuracy: 1e-9)
+        model.undo()
+        model.addMarkedRange()
+        let range = try XCTUnwrap(model.queuedRanges.first)
+        XCTAssertEqual(range.clips.count, 2)
+        XCTAssertEqual(range.clips.first?.from?.seconds ?? -1, 4 * frame, accuracy: 1e-9)
+        XCTAssertEqual(range.clips.last?.to?.seconds ?? -1, 3 * frame, accuracy: 1e-9)
+
+        model.selectRange(-1, 2 * model.duration)
+        XCTAssertEqual(model.markIn, 0)
+        XCTAssertEqual(model.markOut, model.duration)
+        XCTAssertFalse(model.canSplitSelectedRange)
+        XCTAssertTrue(model.canDelete)
+        model.selectRange(.nan, 0)
+        XCTAssertEqual(model.markedRange, 0...model.duration)
+        model.deleteSelection()
+        XCTAssertTrue(model.timelineClips.isEmpty)
+        model.undo()
+        XCTAssertEqual(model.sequenceClips, split)
+    }
+
+    @MainActor
     func testQueueCapturesIndependentTimelineRangesAcrossSourceSeams() async throws {
         let source = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
                                                      subdirectory: "Fixtures"))
@@ -1288,6 +1364,33 @@ final class EditorModelTests: XCTestCase {
         model.redo()
         XCTAssertTrue(model.isEmpty)
         XCTAssertNotEqual(model.preferredCopyContainer, "mkv")
+    }
+
+    @MainActor
+    func testBackgroundHandleValidationCommitsOnlyLatestDragAndPreservesUndo() async throws {
+        let file = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
+                                                   subdirectory: "Fixtures"))
+        let editor = EditorModel()
+        editor.useAnalysisSidecars = false
+        defer { editor.endSession() }
+        editor.importFiles([file])
+        try await waitForEdit(editor)
+        editor.snapTarget = .keyframes
+        try await waitForEdit(editor)
+        let clip = try XCTUnwrap(editor.timelineClips.first)
+        let cut = clip.frames[3].seconds
+        editor.validateHandle(clip.id, edge: .start, target: clip.frames[1].seconds, commit: false) { _ in
+            XCTFail("A superseded drag published a handle")
+        }
+        var committed: Double?
+        editor.validateHandle(clip.id, edge: .start, target: cut, commit: true) { committed = $0 }
+        XCTAssertTrue(editor.isCheckingEdit)
+        try await waitForEdit(editor)
+        XCTAssertEqual(committed, cut)
+        XCTAssertEqual(editor.timelineClips.first?.sourceStart, cut)
+        XCTAssertEqual(editor.undoTitle, "Undo Trim Clip")
+        editor.undo()
+        XCTAssertEqual(editor.timelineClips.first?.sourceStart, clip.sourceStart)
     }
 
     @MainActor

@@ -44,7 +44,7 @@ class Silence(unittest.TestCase):
 
     def project(self, location, *, audio, switches, assembly=None):
         doc = {
-            "schemaVersion": 1, "kind": "multicam", "referenceAngle": "a",
+            "format": "mpcut", "schemaVersion": 1, "kind": "multicam", "referenceAngle": "a",
             "range": {"from": "0", "to": "6"},
             "angles": [
                 {"id": "a", "file": self.source.name, "audioStream": 1},
@@ -62,7 +62,7 @@ class Silence(unittest.TestCase):
                  seconds(item["output"]["from"]), seconds(item["output"]["to"])) for item in report[key]]
 
     def test_project_repeated_fixed_audio_report_dry_run_and_export(self):
-        project = self.source.parent / "repeated.mpcut"
+        project = self.source.parent / "repeated.cut"
         self.project(project, audio={"mode": "fixed", "source": "a", "stream": 1},
                      switches=[{"at": "0", "angle": "a"}, {"at": "4", "angle": "b"}],
                      assembly=[(4, 6), (0, 3), (4, 6)])
@@ -107,7 +107,7 @@ class Silence(unittest.TestCase):
         self.assertEqual(project.read_bytes(), project_before)
 
     def test_project_follow_and_override_use_offsets_and_absolute_streams(self):
-        project = self.source.parent / "follow.mpcut"
+        project = self.source.parent / "follow.cut"
         switches = [{"at": "0", "angle": "a"}, {"at": "3", "angle": "b"}]
         self.project(project, audio={"mode": "follow"}, switches=switches)
         report = self.cli("--project", project, "--threshold-db", "-40", "--no-sidecar")
@@ -131,9 +131,9 @@ class Silence(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / self.source.name
             source.hardlink_to(self.source)
-            project = Path(folder) / "edit.json"
+            project = Path(folder) / "edit.cut"
             self.project(project, audio={"mode": "follow"}, switches=[{"at": "0", "angle": "a"}])
-            sidecar = source.with_suffix(".mov.mpcut")
+            sidecar = source.with_suffix(".mov.cutdb")
             failure = self.cli("--project", project, "--output", sidecar, "--dry-run", success=False)
             self.assertEqual(failure["error"]["code"], "unsupported_container")
             self.assertFalse(sidecar.exists())
@@ -156,7 +156,7 @@ class Silence(unittest.TestCase):
                 wav.write(struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", size + 36, b"WAVE", b"fmt ", 16,
                                       1, 1, 48_000, 96_000, 2, 16, b"data", size))
                 wav.truncate(size + 44)
-            project = folder / "edit.json"
+            project = folder / "edit.cut"
             self.project(project, audio={"mode": "fixed", "source": "z", "stream": 0},
                          switches=[{"at": "0", "angle": "a"}])
             document = json.loads(project.read_text())
@@ -169,7 +169,7 @@ class Silence(unittest.TestCase):
                 try:
                     deadline = time.monotonic() + 10
                     # Source z is indexed after source a. Its sidecar marks the end of the picture scan.
-                    sidecar = audio.with_suffix(".wav.mpcut")
+                    sidecar = audio.with_suffix(".wav.cutdb")
                     while not sidecar.exists() and process.poll() is None and time.monotonic() < deadline:
                         time.sleep(0.002)
                     self.assertTrue(sidecar.exists())
@@ -190,7 +190,7 @@ class Silence(unittest.TestCase):
     def test_project_joins_short_quiet_runs_at_microphone_switch(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "switch.mov"
-            project = Path(folder) / "switch.mpcut"
+            project = Path(folder) / "switch.cut"
             before = "0.25*sin(2*PI*440*t)*if(between(t,1,3.1),0,1)"
             after = "0.25*sin(2*PI*880*t)*if(between(t,2.9,5),0,1)"
             subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=s=64x64:r=25:d=6",
@@ -199,7 +199,7 @@ class Silence(unittest.TestCase):
                             "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264",
                             "-g", "25", "-bf", "0", "-c:a", "pcm_s16le", source], check=True, timeout=30)
             project.write_text(json.dumps({
-                "schemaVersion": 1, "kind": "multicam", "referenceAngle": "a",
+                "format": "mpcut", "schemaVersion": 1, "kind": "multicam", "referenceAngle": "a",
                 "range": {"from": "0", "to": "6"},
                 "angles": [{"id": "a", "file": source.name, "audioStream": 1}],
                 "audio": {"mode": "follow"},
@@ -212,13 +212,13 @@ class Silence(unittest.TestCase):
             self.assertEqual(self.intervals(report, "pauses"), [(0, 1, 5, 1, 5)])
             self.assertEqual(self.intervals(report, "removals"), [(0, 1, 5, 1, 5)])
             self.assertEqual([span["stream"] for span in report["preflight"]["mapping"]["audio"]], [1, 2])
-            self.assertFalse(source.with_suffix(".mov.mpcut").exists())
+            self.assertFalse(source.with_suffix(".mov.cutdb").exists())
             self.assertFalse(output.exists())
 
     def test_project_checks_blip_context_after_routing_the_microphones(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "blips.mov"
-            project = Path(folder) / "blips.mpcut"
+            project = Path(folder) / "blips.cut"
             blip = "0.25*sin(2*PI*440*t)*gte(t,1.5)*lt(t,1.54)"
             speech = "0.25*sin(2*PI*880*t)*gte(t,1.54)"
             subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=s=64x64:r=25:d=3",
@@ -229,7 +229,7 @@ class Silence(unittest.TestCase):
                             "-c:v", "libx264", "-g", "25", "-bf", "0", "-c:a", "pcm_s16le", source],
                            check=True, timeout=30)
             document = {
-                "schemaVersion": 1, "kind": "multicam", "referenceAngle": "a",
+                "format": "mpcut", "schemaVersion": 1, "kind": "multicam", "referenceAngle": "a",
                 "range": {"from": "0", "to": "3"},
                 "angles": [{"id": "a", "file": source.name, "audioStream": 1}],
                 "audio": {"mode": "follow"},
@@ -256,7 +256,7 @@ class Silence(unittest.TestCase):
             ])
 
     def test_project_uncovered_audio_is_not_silence(self):
-        project = self.source.parent / "partial-coverage.mpcut"
+        project = self.source.parent / "partial-coverage.cut"
         self.project(project, audio={"mode": "fixed", "source": "recorder", "stream": 1},
                      switches=[{"at": "0", "angle": "a"}])
         document = json.loads(project.read_text())
@@ -274,14 +274,14 @@ class Silence(unittest.TestCase):
     def test_project_cuts_fit_both_fractional_picture_and_sound_grids(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "fractional.mov"
-            project = Path(folder) / "fractional.mpcut"
+            project = Path(folder) / "fractional.cut"
             tone = "0.25*sin(2*PI*440*t)*if(between(t,1,5),0,1)"
             subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=s=320x96:r=30000/1001:d=6.006",
                             "-f", "lavfi", "-i", f"aevalsrc='{tone}':s=48000:d=6.006",
                             "-c:v", "libx264", "-g", "30", "-bf", "0", "-c:a", "pcm_s16le", source],
                            check=True, timeout=30)
             project.write_text(json.dumps({
-                "schemaVersion": 1, "kind": "multicam", "referenceAngle": "a",
+                "format": "mpcut", "schemaVersion": 1, "kind": "multicam", "referenceAngle": "a",
                 "range": {"from": "0", "to": "6.006"},
                 "angles": [{"id": "a", "file": source.name, "audioStream": 1}],
                 "audio": {"mode": "follow"}, "switches": [{"at": "0", "angle": "a"}],

@@ -63,7 +63,7 @@ final class MulticamPreviewTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
         try FileManager.default.copyItem(at: original.url, to: file)
-        let projectURL = directory.appendingPathComponent("edit.multicam.json")
+        let projectURL = directory.appendingPathComponent("edit.cut")
         let project = MulticamProject(referenceAngle: "wide", range: .init(from: .zero, to: .init(numerator: 1)),
                                       angles: [.init(id: "wide", file: file.lastPathComponent)],
                                       audio: .none, switches: [.init(at: .zero, angle: "wide")])

@@ -96,7 +96,7 @@ struct BulkQueueView: View {
                         }
                         if hasAudio {
                             Picker("Audio", selection: $options.audio) {
-                                ForEach(ReencodeAudio.allCases.filter { $0 != .removeAudio && ($0 != .pcm || options.container != "mp4") }, id: \.self) { Text($0.displayName) }
+                                ForEach(ReencodeAudio.movieCases.filter { $0 != .removeAudio && ($0 != .pcm || options.container != "mp4") }, id: \.self) { Text($0.displayName) }
                             }
                             .onChange(of: options.container) { _, format in
                                 if format == "mp4" && options.audio == .pcm { options.audio = .auto }

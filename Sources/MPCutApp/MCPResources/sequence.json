@@ -1,0 +1,712 @@
+[
+  {
+    "name": "split_at",
+    "description": "Split the specified clip or assembly occurrence using native snapping and undo history.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Opaque live document handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "description": "Document revision observed by the caller."
+        },
+        "operationID": {
+          "type": "string",
+          "description": "Unique mutation ID. Reuse only for an identical retry."
+        },
+        "space": {
+          "type": "string",
+          "enum": [
+            "sequence",
+            "source",
+            "group",
+            "assembly"
+          ]
+        },
+        "time": {
+          "type": "string",
+          "description": "Exact media time as rational seconds, e.g. 1001/30000."
+        },
+        "occurrence": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Ordinary clip occurrence UUID."
+            },
+            {
+              "type": "integer",
+              "description": "Revision-scoped multicam assembly occurrence index.",
+              "minimum": 0
+            }
+          ]
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "space",
+        "time",
+        "occurrence"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "seek",
+    "description": "Seek within the named project. Source time requires a clip occurrence. Multicam group time with an occurrence seeks that use in assembly preview; an occurrence supplied with assembly time must match the position.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Opaque live document handle from list_projects."
+        },
+        "space": {
+          "type": "string",
+          "enum": [
+            "sequence",
+            "source",
+            "group",
+            "assembly"
+          ]
+        },
+        "time": {
+          "type": "string",
+          "description": "Exact media time as rational seconds, e.g. 1001/30000."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Pin the seek to the document revision used to resolve the occurrence."
+        },
+        "occurrence": {
+          "description": "Clip UUID for an ordinary editor, or zero-based assembly occurrence index for multicam.",
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Ordinary clip occurrence UUID."
+            },
+            {
+              "type": "integer",
+              "description": "Revision-scoped multicam assembly occurrence index.",
+              "minimum": 0
+            }
+          ]
+        }
+      },
+      "required": [
+        "project",
+        "space",
+        "time"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "set_playback",
+    "description": "Play or pause the preview in the named project.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Opaque live document handle from list_projects."
+        },
+        "playing": {
+          "type": "boolean",
+          "description": "Whether the preview should be playing."
+        }
+      },
+      "required": [
+        "project",
+        "playing"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_history",
+    "description": "Read retained native history, cursor, and history token for this project.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Opaque live document handle from list_projects."
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "undo",
+    "description": "Undo one native history action in the specified document.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Opaque live document handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "description": "Document revision observed by the caller."
+        },
+        "operationID": {
+          "type": "string",
+          "description": "Unique mutation ID. Reuse only for an identical retry."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "redo",
+    "description": "Redo one native history action in the specified document.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Opaque live document handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "description": "Document revision observed by the caller."
+        },
+        "operationID": {
+          "type": "string",
+          "description": "Unique mutation ID. Reuse only for an identical retry."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "restore_history",
+    "description": "Restore a retained native history state by zero-based index and get_history token.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Opaque live document handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "description": "Document revision observed by the caller."
+        },
+        "operationID": {
+          "type": "string",
+          "description": "Unique mutation ID. Reuse only for an identical retry."
+        },
+        "index": {
+          "type": "integer",
+          "description": "0 is the first retained state.",
+          "minimum": 0
+        },
+        "historyToken": {
+          "type": "string",
+          "description": "Token from get_history."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "index",
+        "historyToken"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "sequence_control",
+    "description": "Operate the ordinary sequence editor. Trim time is source time. from/to are sequence times. Move uses insertion slots. fit toggles fit/previous zoom.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Opaque live document handle from list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "description": "Document revision observed by the caller."
+        },
+        "operationID": {
+          "type": "string",
+          "description": "Unique mutation ID. Reuse only for an identical retry."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "select",
+            "selectRange",
+            "markIn",
+            "markOut",
+            "clearMarks",
+            "rangeTool",
+            "snap",
+            "copyContainer",
+            "move",
+            "trim",
+            "restoreEdge",
+            "deleteClip",
+            "deleteRange",
+            "splitRange",
+            "applyCSV",
+            "step",
+            "shuttle",
+            "speed",
+            "scrub",
+            "endScrub",
+            "zoom",
+            "fit",
+            "thumbnails",
+            "previewTrim",
+            "cancelTrim"
+          ]
+        },
+        "occurrence": {
+          "type": "string",
+          "description": "Clip occurrence UUID from get_editor_state."
+        },
+        "from": {
+          "type": "string",
+          "description": "Sequence start time in seconds."
+        },
+        "to": {
+          "type": "string",
+          "description": "Sequence end time in seconds."
+        },
+        "space": {
+          "type": "string",
+          "enum": [
+            "sequence",
+            "source",
+            "group",
+            "assembly"
+          ]
+        },
+        "time": {
+          "type": "string",
+          "description": "Exact media time as rational seconds, e.g. 1001/30000."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Requested setting."
+        },
+        "value": {
+          "type": "string",
+          "description": "Snap target off, keyframes, scenes, or silence, or a copy container extension supported by this sequence."
+        },
+        "slot": {
+          "type": "integer",
+          "description": "Insertion slot before moving, 0 through clip count.",
+          "minimum": 0
+        },
+        "edge": {
+          "type": "string",
+          "enum": [
+            "start",
+            "end"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "description": "Absolute input CSV path."
+        },
+        "direction": {
+          "type": "integer",
+          "enum": [
+            -1,
+            1
+          ]
+        },
+        "unit": {
+          "type": "string",
+          "enum": [
+            "frame",
+            "keyframe",
+            "scene",
+            "pause"
+          ]
+        },
+        "rate": {
+          "type": "number",
+          "enum": [
+            0.125,
+            0.25,
+            0.5,
+            0.75,
+            1,
+            1.25,
+            1.5,
+            2,
+            4,
+            8
+          ]
+        },
+        "zoom": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 13
+        },
+        "trimPreview": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Receipt identifying your active trim preview. Use it to preview or commit the same occurrence and edge, or to cancel."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "action"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "select"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "occurrence"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "selectRange"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "from",
+              "to"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "markIn"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "space",
+              "time"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "markOut"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "space",
+              "time"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "rangeTool"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "snap"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "value"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "copyContainer"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "value"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "move"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "occurrence",
+              "slot"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "trim"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "occurrence",
+              "edge",
+              "time"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "restoreEdge"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "occurrence",
+              "edge"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "deleteClip"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "occurrence"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "deleteRange"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "from",
+              "to"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "splitRange"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "from",
+              "to"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "applyCSV"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "occurrence",
+              "path"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "step"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "direction",
+              "unit"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "shuttle"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "direction"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "speed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "rate"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "scrub"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "space",
+              "time"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "zoom"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "zoom"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "thumbnails"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "previewTrim"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "occurrence",
+              "edge",
+              "time"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "cancelTrim"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "trimPreview"
+            ]
+          }
+        }
+      ]
+    }
+  }
+]

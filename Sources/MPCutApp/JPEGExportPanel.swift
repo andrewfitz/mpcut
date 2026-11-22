@@ -31,7 +31,7 @@ final class StillFrameSaveOptions: NSObject, NSOpenSavePanelDelegate {
 struct EditorJPEGSource {
     let id: UUID
     let media: MediaInfo
-    let frame: RationalTime
+    let frame: RationalTime?
     let scenes: SceneReport?
     let audioStream: Int?
     let pauses: [AudioSpan]?
@@ -43,6 +43,7 @@ struct EditorJPEGSource {
                    analyzeSilence: (Int) throws -> SilenceAnalysisResult) throws -> JPEGSelection {
         switch mode {
         case .playhead:
+            guard let frame else { throw CutError(code: "no_frame", message: "There is no picture at the playhead.") }
             return .times([frame])
         case .scenes:
             return .sceneReport(try scenes ?? analyzeScenes())
@@ -76,7 +77,8 @@ final class JPEGExportOptions: NSObject, ObservableObject, NSOpenSavePanelDelega
         super.init()
     }
 
-    func panel(source: URL, directory: URL? = nil, hasAudio: Bool, multicam: Bool = false) -> NSSavePanel {
+    func panel(source: URL, directory: URL? = nil, hasAudio: Bool, hasPictureAtPlayhead: Bool = true, multicam: Bool = false) -> NSSavePanel {
+        if !hasPictureAtPlayhead { mode = .scenes }
         let panel = NSSavePanel()
         panel.title = "Export JPEG Frames"
         panel.prompt = "Export"
@@ -86,7 +88,7 @@ final class JPEGExportOptions: NSObject, ObservableObject, NSOpenSavePanelDelega
         panel.canCreateDirectories = true
         panel.delegate = self
         let accessory = NSHostingView(rootView: JPEGExportAccessory(source: source, hasAudio: hasAudio,
-                                                                    multicam: multicam, options: self))
+                                                                    hasPictureAtPlayhead: hasPictureAtPlayhead, multicam: multicam, options: self))
         accessory.frame.size = accessory.fittingSize
         panel.accessoryView = accessory
         return panel
@@ -112,6 +114,7 @@ final class JPEGExportOptions: NSObject, ObservableObject, NSOpenSavePanelDelega
 private struct JPEGExportAccessory: View {
     let source: URL
     let hasAudio: Bool
+    let hasPictureAtPlayhead: Bool
     let multicam: Bool
     @ObservedObject var options: JPEGExportOptions
 
@@ -122,6 +125,7 @@ private struct JPEGExportAccessory: View {
             }
             Picker("Frames", selection: $options.mode) {
                 Text(multicam ? "Compare all camera angles" : "Current picture at playhead").tag(JPEGExportMode.playhead)
+                    .disabled(!hasPictureAtPlayhead)
                 Text("Each scene in the whole source").tag(JPEGExportMode.scenes)
                 Text("Each non-silent range in the whole source").tag(JPEGExportMode.nonSilent)
                     .disabled(!hasAudio)

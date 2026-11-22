@@ -75,11 +75,12 @@ class MulticamTests(unittest.TestCase):
         # Run from a different directory to prove that source paths belong to the project.
         self.project_dir = self.root / "project"
         self.project_dir.mkdir()
-        self.project_path = self.project_dir / "edit.multicam.json"
+        self.project_path = self.project_dir / "edit.cut"
         self.output = self.root / "program.mov"
 
     def project(self, *, close=None, wide=None, lav=None, end="4", offset="0", switches=None, **changes):
         payload = {
+            "format": "mpcut",
             "schemaVersion": 1,
             "kind": "multicam",
             "referenceAngle": "wide",
@@ -128,6 +129,49 @@ class MulticamTests(unittest.TestCase):
             expected_packets = [packet for source, start, end in spans for packet in packets[source][start:end]]
             self.assertEqual(frames(self.output), expected_frames)
             self.assertEqual(sample_hashes(self.output), expected_packets)
+
+    def test_audio_edge_can_rejoin_an_mp3_between_packets(self):
+        mp3 = self.root / "voice.mp3"
+        ffmpeg("-f", "lavfi", "-i", "sine=sample_rate=48000:duration=8", "-c:a", "libmp3lame", mp3)
+        def plan(end):
+            self.project(lav=mp3, end="8", switches=[{"at": "0", "angle": "wide"}],
+                         assembly=[{"from": "0", "to": end}, {"from": "6", "to": "7"}])
+        plan("1")
+        output = self.root / "edited.mp3"
+        issue = self.export("--tracks", "audio", "--dry-run", output=output, ok=False)["error"]
+        self.assertEqual([rational_time(t) for t in issue["nearest"]], [Fraction(6)])
+        plan("6")
+        self.export("--tracks", "audio", "--dry-run", output=output)
+
+    def test_moving_edge_across_microphone_switch_uses_new_sample_phase(self):
+        camera = self.root / "all-intra.mov"
+        ffmpeg("-f", "lavfi", "-i", "color=size=32x32:rate=25:duration=4",
+               "-c:v", "prores_ks", "-profile:v", "proxy", camera)
+        microphones = [{"id": "good", "file": str(self.lav)}, {"id": "late", "file": str(self.lav),
+                                                              "offset": "-1/96000"}]
+        self.project(wide=camera, audioSources=microphones, audio={"mode": "fixed", "source": "good", "stream": 0},
+                     switches=[{"at": "0", "angle": "wide"}, {"at": "2", "angle": "wide",
+                               "audio": {"source": "late", "stream": 0}}],
+                     assembly=[{"from": "5/2", "to": "19/5"}])
+        issue = self.export("--dry-run", ok=False)["error"]
+        self.assertEqual([rational_time(t) for t in issue["nearest"]], [Fraction(49, 25)])
+
+    def test_range_edge_offers_shared_ntsc_and_44100_sample_boundaries(self):
+        camera = self.root / "ntsc.mov"
+        ffmpeg("-f", "lavfi", "-i", "color=size=64x64:rate=30000/1001:d=8",
+               "-f", "lavfi", "-i", "sine=sample_rate=44100:duration=8",
+               "-c:v", "prores_ks", "-profile:v", "proxy", "-c:a", "pcm_s16le", camera)
+        def plan(start):
+            self.project(wide=camera, audio={"mode": "follow"}, switches=[{"at": "0", "angle": "wide"}],
+                         end="1001/150", assembly=[{"from": start, "to": "1001/150"}])
+        plan("101101/60000")
+        issue = self.export("--dry-run", ok=False)["error"]
+        self.assertEqual(issue["code"], "unsafe_boundary")
+        offered = [rational_time(t) for t in issue["nearest"]]
+        self.assertEqual(offered, [Fraction(0), Fraction(1001, 300)])
+        for t in offered:
+            plan(str(t))
+            self.export("--dry-run")
 
     def test_microphone_only_switch_off_sample_has_two_usable_alternatives(self):
         initial = {"at": "0", "angle": "wide"}
@@ -210,7 +254,7 @@ class MulticamTests(unittest.TestCase):
         help_json = subprocess.run([CLI, "help", "multicam", "--json"], check=True,
                                    capture_output=True, text=True, timeout=90)
         template = json.loads(help_json.stdout)["projectTemplate"]
-        self.assertEqual((template["schemaVersion"], template["kind"]), (1, "multicam"))
+        self.assertEqual((template["format"], template["schemaVersion"], template["kind"]), ("mpcut", 1, "multicam"))
         self.project()
         inspected = self.cli("inspect", "--project", self.project_path, "--json")
         self.assertEqual(Path(inspected["project"]), self.project_path)
@@ -274,7 +318,7 @@ class MulticamTests(unittest.TestCase):
 
     def test_ordered_request_combines_file_and_two_projects_with_shared_source_ids(self):
         second_payload = self.project(audio={"mode": "fixed", "source": "wide", "stream": 1})
-        second = self.project_dir / "second.multicam.json"
+        second = self.project_dir / "second.cut"
         second_payload["angles"][0]["file"] = str(self.pcm_close)
         second.write_text(json.dumps(second_payload))
         delayed = self.root / "delayed-file-clip.mov"
@@ -354,7 +398,7 @@ class MulticamTests(unittest.TestCase):
             with self.subTest(project=project):
                 self.project_path.write_text(project)
                 failure = self.export("--dry-run", ok=False)["error"]
-                self.assertEqual(failure["code"], "invalid_multicam_project")
+                self.assertEqual(failure["code"], "invalid_cut_project")
 
     def test_smart_trim_encodes_edges_and_keeps_interior_video(self):
         self.project(switches=[
@@ -444,6 +488,25 @@ class MulticamTests(unittest.TestCase):
         self.assertIn("close", short_aac["message"])
         self.assertIn("stream 1", short_aac["message"])
         self.assertFalse(self.output.exists())
+
+    def test_csv_boundary_suggestions_move_only_the_failing_row(self):
+        self.project()
+        manifest = self.root / "sources.json"
+        manifest.write_text(json.dumps([{"project": str(self.project_path), "from": "0", "to": "1"}]))
+        cuts = self.root / "cuts.csv"
+        cuts.write_text("from,to\n0,1\n2.5,4")
+        common = ("export", "--json", "--dry-run", "--output", self.output, "--clips", manifest,
+                  "--mode", "copy", "--tracks", "video")
+        reference = self.cli(*common, "--clip", self.wide, "--from", "0", "--to", "1",
+                             "--clip", self.wide, "--from", "2.5", "--to", "4", ok=False)["error"]
+        issue = self.cli(*common, "--clip", self.wide, "--ranges", cuts, ok=False)["error"]
+        self.assertEqual(issue["segment"], 2)
+        self.assertEqual(issue["multicam"]["edge"]["range"], 2)
+        self.assertTrue(reference["nearest"])
+        self.assertEqual(issue["nearest"], reference["nearest"])
+        cuts.write_text("from,to\n0,1\n2,4")
+        intervals = self.cli(*common, "--clip", self.wide, "--ranges", cuts)["plan"]["intervals"]
+        self.assertEqual([row["assemblyIndex"] for row in intervals], [0, 1, 1])
 
     def test_copy_offers_joint_boundaries_on_group_clock_without_retiming(self):
         self.project(offset="1", switches=[{"at": "0", "angle": "wide"}, {"at": "57/25", "angle": "close"}])

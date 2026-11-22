@@ -4,6 +4,61 @@ import XCTest
 @testable import MPCutApp
 
 final class FallbackPreviewTests: XCTestCase {
+    func testNegativeFractionalOriginSeeksBeforeNextKeyframe() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
+                                                  subdirectory: "Fixtures"))
+        // The source clock is 1/12800. At timeline second one the next keyframe is still half a tick away.
+        let origin = RationalTime(numerator: -1, denominator: 25_600)
+        let reader = FFPreviewReader(videoOnly: true)
+        try reader.seek(url: url, to: 1, audioOrigin: origin)
+        let frame = try XCTUnwrap(reader.still(at: 1) { false })
+        XCTAssertEqual(frame.time.seconds, 0.96 - origin.seconds, accuracy: 1e-8)
+    }
+
+    @MainActor
+    func testLeadingPictureGapClearsTheParkedPreviewAndRemainsPlayable() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Leading-Picture-Gap", withExtension: "avi",
+                                                   subdirectory: "Fixtures"))
+        let preview = SequencePreview()
+        defer { preview.pause() }
+        preview.update([PreviewRange(url: url, exactStart: .zero, exactEnd: .init(numerator: 2))], at: 0.4)
+        func wait(_ condition: () -> Bool) async throws {
+            let deadline = ContinuousClock.now + .seconds(5)
+            while !condition(), .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertTrue(condition(), preview.issue ?? "Preview did not reach the expected state")
+        }
+        try await wait { preview.displayedFrameTime != nil }
+        preview.seek(to: 0.05)
+        try await wait { preview.displayedFrameTime == nil }
+        XCTAssertNil(preview.issue)
+        preview.togglePlayback()
+        XCTAssertTrue(preview.isPlaying)
+        try await wait { preview.displayedFrameTime != nil }
+        XCTAssertGreaterThanOrEqual(preview.time, 0.2)
+        XCTAssertNil(preview.issue)
+    }
+
+    @MainActor
+    func testRangeEntirelyInsideALeadingGapClearsThePreviousClip() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Leading-Picture-Gap", withExtension: "avi",
+                                                   subdirectory: "Fixtures"))
+        let ranges = [(2, 4), (0, 1), (4, 8)].map { start, end in
+            PreviewRange(url: url, exactStart: .init(numerator: Int64(start), denominator: 10),
+                         exactEnd: .init(numerator: Int64(end), denominator: 10))
+        }
+        var events: [String] = []
+        let player = WebSequencePlayback(ranges: ranges, onFrame: { _ in
+            if events.last != "picture" { events.append("picture") }
+        }, onTime: { _ in }, onIssue: { XCTFail($0) }, onAudioWarning: { _ in }, onGap: {
+            events.append("gap")
+        })
+        player.play()
+        defer { player.pause() }
+        let deadline = ContinuousClock.now + .seconds(4)
+        while events.count < 3, .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(events, ["picture", "gap", "picture"])
+    }
+
     func testScrubCacheReusesSurfacesAndRespectsTrimBoundariesAndSources() throws {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
                                                   subdirectory: "Fixtures"))

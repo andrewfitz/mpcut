@@ -115,7 +115,60 @@ final class SidecarRepairTests: XCTestCase {
         XCTAssertEqual(sidecar.status(), "current")
         XCTAssertEqual(sidecar.read("a"), Data([1]))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: sidecar.source.deletingLastPathComponent().path).sorted(),
-                       ["shot.mov", "shot.mov.mpcut"])
+                       ["shot.mov", "shot.mov.cutdb"])
+    }
+
+    func testForeignJournalSurvivesFirstSaveRepairAndUpdates() throws {
+        for state in ["missing", "empty", "healthy", "truncated"] {
+            let store = try makeSidecar()
+            switch state {
+            case "empty":
+                try Data().write(to: store.url)
+            case "healthy", "truncated":
+                try store.save(["previous": Data([1])])
+                if state == "truncated" {
+                    let bytes = try Data(contentsOf: store.url)
+                    try bytes.prefix(4096).write(to: store.url)
+                }
+            default:
+                break
+            }
+            let before = try? Data(contentsOf: store.url)
+            let journal = URL(fileURLWithPath: store.url.path + "-journal")
+            let foreign = Data("Unrelated application data".utf8)
+            try foreign.write(to: journal)
+            _ = store.status()
+            XCTAssertThrowsError(try store.save(["new": Data([2])]), state)
+            XCTAssertEqual(try Data(contentsOf: journal), foreign, state)
+            XCTAssertEqual(try? Data(contentsOf: store.url), before, state)
+        }
+    }
+
+    func testStatusLeavesForeignDatabaseAndHotJournalIntact() throws {
+        let store = try makeSidecar()
+        let donor = store.url.deletingLastPathComponent().appendingPathComponent("other.sqlite")
+        var connection: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(donor.path, &connection), SQLITE_OK)
+        defer { sqlite3_close(connection) }
+        XCTAssertEqual(sqlite3_exec(connection, """
+            CREATE TABLE item(value BLOB);
+            INSERT INTO item VALUES(zeroblob(200000));
+            """, nil, nil, nil), SQLITE_OK)
+        try FileManager.default.copyItem(at: donor, to: store.url)
+        XCTAssertEqual(sqlite3_exec(connection, """
+            PRAGMA cache_size = 2;
+            BEGIN;
+            UPDATE item SET value = randomblob(200000);
+            """, nil, nil, nil), SQLITE_OK)
+        let journal = URL(fileURLWithPath: store.url.path + "-journal")
+        try FileManager.default.copyItem(atPath: donor.path + "-journal", toPath: journal.path)
+        let original = try Data(contentsOf: store.url)
+        let rollback = try Data(contentsOf: journal)
+        XCTAssertGreaterThan(rollback.count, 512)
+        XCTAssertEqual(store.status(), "unsupported")
+        XCTAssertThrowsError(try store.save(["key": Data([1])]))
+        XCTAssertEqual(try Data(contentsOf: journal), rollback)
+        XCTAssertEqual(try Data(contentsOf: store.url), original)
     }
 
     func testTruncatedSidecarIsReplaced() throws {

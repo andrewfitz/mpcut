@@ -3,8 +3,10 @@ import MPCutCore
 
 extension MulticamEditorModel {
     private var currentScene: MulticamAnalysisStore.ScenePosition? {
-        guard let project else { return nil }
-        return analysis.currentScene(at: currentGroupTime(), project: project)
+        let output = preview.currentTime()
+        guard let interval = interval(at: output) else { return nil }
+        return analysis.currentScene(at: groupTime(at: output), angle: interval.angle,
+                                     exclusiveEnd: output == mapping?.duration)
     }
 
     var currentSceneLabel: String? {
@@ -34,19 +36,17 @@ extension MulticamEditorModel {
         }
     }
 
-    private var roomToneScope: MulticamRange? {
-        markedGroupSpan.map { MulticamRange(from: $0.from, to: $0.to) }
-    }
-
     var canUseRoomTone: Bool {
-        guard !isBusy, let roomToneScope else { return false }
-        return analysis.canUseRoomTone(in: roomToneScope)
+        !isBusy && analysis.canUseRoomTone(in: selectedExportRanges)
     }
 
-    func useRoomTone() {
-        guard !isBusy, let roomToneScope, analysis.useRoomTone(in: roomToneScope) else { return }
+    @discardableResult
+    func useRoomTone() -> Bool {
+        guard !isBusy, analysis.useRoomTone(in: selectedExportRanges) else { return false }
         markIn = nil
         markOut = nil
+        assemblySelection = nil
+        return true
     }
 
     func canScanAnalysis(_ target: TimelineSnapTarget) -> Bool { !isBusy && analysis.canScan(target) }
@@ -72,6 +72,7 @@ extension MulticamEditorModel {
     func markAnalysisTime() -> RationalTime {
         let output = preview.currentTime()
         let group = groupTime(at: output)
+        if assemblyPreview, output == mapping?.duration { return group }
         return snappedAnalysisTime(group, within: activeAnalysisOccurrence(containing: group, at: output)) ?? group
     }
 
@@ -85,13 +86,13 @@ extension MulticamEditorModel {
     }
 
     func snappedAnalysisTime(_ time: RationalTime, excludingGroupEdges: Bool = false,
-                             within scope: MulticamRange? = nil) -> RationalTime? {
+                             within scope: MulticamRange? = nil, includeEnd: Bool = false) -> RationalTime? {
         let target = analysis.snapTarget
         guard target != .off, let project else { return nil }
         let markers = analysis.markers(target, project: project, media: media)
         let first = scope.map { scope in markers.lowerBound { $0 >= scope.from } }
             ?? (excludingGroupEdges ? markers.lowerBound { $0 > project.range.from } : markers.startIndex)
-        let end = scope.map { scope in markers.lowerBound { $0 >= scope.to } }
+        let end = scope.map { scope in markers.lowerBound { includeEnd ? $0 > scope.to : $0 >= scope.to } }
             ?? (excludingGroupEdges ? markers.lowerBound { $0 >= project.range.to } : markers.endIndex)
         let eligible = markers[first..<end]
         let next = eligible.lowerBound { $0 >= time }
@@ -109,12 +110,15 @@ extension MulticamEditorModel {
 
     func canStepAnalysis(_ target: TimelineSnapTarget) -> Bool {
         guard !isBusy, let project, let mapping else { return false }
+        if let cached = analysisNavigationAvailability[target] { return cached }
         let markers = analysis.markers(target, project: project, media: media)
-        return mapping.intervals.contains { interval in
+        let available = !markers.isEmpty && mapping.intervals.contains { interval in
             let first = markers.lowerBound { $0 >= interval.group.from }
             return first < markers.count && (markers[first] < interval.group.to ||
                 (markers[first] == interval.group.to && interval.output.to == mapping.duration))
         }
+        analysisNavigationAvailability[target] = available
+        return available
     }
 
     func stepAnalysis(_ target: TimelineSnapTarget, direction: Int) {

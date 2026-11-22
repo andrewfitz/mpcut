@@ -10,13 +10,13 @@ Build the CLI and XCTest targets from the same checkout. Python 3, FFmpeg with l
 swift build
 fixture_dir=$(mktemp -d /tmp/mpcut-multicam.XXXXXX)
 python3 Tests/Benchmarks/multicam.py .build/debug/mpcut --fixture-dir "$fixture_dir"
-MPCUT_MULTICAM_BENCHMARK_PROJECT="$fixture_dir/benchmark.multicam.json" \
+MPCUT_MULTICAM_BENCHMARK_PROJECT="$fixture_dir/benchmark.cut" \
   swift test --filter MulticamPerformanceTests/testPreviewPerformance
 ```
 
-Without `--fixture-dir`, the CLI benchmark uses temporary assets. To generate the project separately, run `python3 Tests/Benchmarks/multicam.py --fixture-only --fixture-dir "$fixture_dir"`. Then pass `--project "$fixture_dir/benchmark.multicam.json"` to run the CLI benchmark on those files. The CLI benchmark requires the source directory to have no saved indexes before it runs.
+Without `--fixture-dir`, the CLI benchmark uses temporary assets. To generate the project separately, run `python3 Tests/Benchmarks/multicam.py --fixture-only --fixture-dir "$fixture_dir"`. Then pass `--project "$fixture_dir/benchmark.cut"` to run the CLI benchmark on those files. The CLI benchmark requires the source directory to have no saved indexes before it runs.
 
-The first uncached measurement includes CLI startup and index discovery. The script then runs five more preflights without sidecars, saves the five source indexes, and runs five preflights with sidecars. This tests application cache state. The operating system’s file cache is left in its normal state. macOS `/usr/bin/time -lp` reports subprocess wall time and peak resident memory. Fixture generation, index creation, export, and output verification are timed separately or excluded from preflight. The script checks that both cache conditions produce identical dry-run JSON and that the eventual export uses the same plan.
+The first uncached measurement includes CLI startup and index discovery. All six uncached preflights use `--no-sidecar`, and the harness checks that no index was written before timing index creation. The script then runs five more preflights without sidecars, saves the five source indexes, and runs five preflights with sidecars. This tests application cache state. The operating system’s file cache is left in its normal state. macOS `/usr/bin/time -lp` reports subprocess wall time and peak resident memory. Fixture generation, index creation, export, and output verification are timed separately or excluded from preflight. The script checks that both cache conditions produce identical dry-run JSON and that the eventual export uses the same plan.
 
 Independent FFprobe packet hashes and presentation timestamps verify picture identity, switch order, and absence of output clock drift. A full FFmpeg decode compares every output PCM sample with the independently sliced source WAV. The CLI plan’s picture and audio spans must also agree with the fixture.
 
@@ -24,17 +24,17 @@ The optional desktop test attaches the production preview to an offscreen AppKit
 
 ## CLI results
 
-Measured with a Swift debug build on an Apple M4 Max running macOS 27.0.1. The table reports the median wall time for the two five-run conditions and their maximum peak RSS.
+Measured with a Swift debug build on an Apple M4 Max running macOS 27.0.1 during concurrent build and test activity. The table reports the median wall time for the two five-run conditions and their maximum peak RSS.
 
 | Operation | Wall time | Peak RSS |
 | --- | ---: | ---: |
-| First preflight without sidecars | 0.20 s | 21.1 MiB |
-| Preflight without sidecars | 0.05 s | 18.2 MiB |
-| Preflight with sidecars | 0.05 s | 18.3 MiB |
-| Copy export with sidecars | 0.42 s | 62.5 MiB |
-| Aligned JPEG review with sidecars | 0.59 s | 52.3 MiB |
+| First preflight without sidecars | 0.11 s | 21.4 MiB |
+| Preflight without sidecars | 0.14 s | 21.8 MiB |
+| Preflight with sidecars | 0.07 s | 19.8 MiB |
+| Copy export with sidecars | 3.53 s | 61.7 MiB |
+| Aligned JPEG review with sidecars | 0.93 s | 50.1 MiB |
 
-Each camera index took 0.03 seconds to save. The WAV index took 0.02 seconds. For this fixture the two preflight medians were equal at the timer's 10 ms resolution. All 4,500 compressed picture packets matched their mapped input, every picture PTS matched the exact 25 fps output grid, and all 8,640,000 decoded PCM samples matched. The review command produced 20 JPEGs, selecting the containing frame for all five requested group times in all four angles.
+The four camera indexes took 0.07–0.24 seconds each to save. The WAV index took 0.06 seconds. All 4,500 compressed picture packets matched their mapped input, every picture PTS matched the exact 25 fps output grid, and all 8,640,000 decoded PCM samples matched. The review command produced 20 JPEGs, selecting the containing frame for all five requested group times in all four angles.
 
 ## Desktop results
 

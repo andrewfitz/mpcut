@@ -37,8 +37,9 @@ class MulticamAudioConversionTests(unittest.TestCase):
         run(["swiftc", "-suppress-warnings", "-parse-as-library", Path(__file__).with_name("DecodeAudio.swift"), "-o", cls.decoder])
 
     def export(self, second, *, first=None, treatment=None, suffix="mov", mode="encode", succeed=True):
-        project = self.root / f"project-{second.stem}.json"
+        project = self.root / f"project-{second.stem}.cut"
         project.write_text(json.dumps({
+            "format": "mpcut",
             "schemaVersion": 1,
             "kind": "multicam",
             "referenceAngle": "cam",
@@ -73,6 +74,43 @@ class MulticamAudioConversionTests(unittest.TestCase):
         seek = ffmpeg("-ss", f"{seek_ms / 1000:.3f}", "-i", output, "-map", "0:a:0", "-f", "s16le", "-")
         self.assertEqual(seek, audio(output)[seek_ms * rate // 1000 * channels * 2:])
         return pcm_packets
+
+    def test_reordered_pcm_wav_uses_exact_samples_after_a_seek(self):
+        source = self.root / "seek-noise.wav"
+        ffmpeg("-f", "lavfi", "-i", "anoisesrc=sample_rate=44100:duration=3:seed=7",
+               "-c:a", "pcm_s16le", source)
+        output, _ = self.export(source, first=source, treatment="pcm")
+        decoded = audio(source)
+        cut = 48 * 44100 // 25 * 2
+        self.assertEqual(audio(output), decoded[cut:] + decoded[:cut])
+
+    def test_shared_compressed_decode_matches_individual_reordered_ranges(self):
+        coarse = self.root / "shared-aac.mka"
+        ffmpeg("-i", self.aac, "-c:a", "copy", coarse)
+        for source in [self.mp3, coarse, self.aac]:
+            with self.subTest(source=source.name):
+                # Distinct paths force independent decoders in the reference program.
+                duplicate = self.root / ("duplicate-" + source.name)
+                duplicate.write_bytes(source.read_bytes())
+                def render(other, label):
+                    project = self.root / ("shared-" + label + ".cut")
+                    project.write_text(json.dumps({
+                        "format": "mpcut", "schemaVersion": 1, "kind": "multicam", "referenceAngle": "cam",
+                        "range": {"from": "0", "to": "3"},
+                        "angles": [{"id": "cam", "file": self.angle.name}],
+                        "audioSources": [{"id": "a", "file": source.name}, {"id": "b", "file": other.name}],
+                        "audio": {"mode": "fixed", "source": "a", "stream": 0},
+                        "switches": [{"at": "0", "angle": "cam"}, {"at": "48/25", "angle": "cam",
+                                     "audio": {"source": "b", "stream": 0}}],
+                        "assembly": [{"from": "48/25", "to": "72/25"}, {"from": "6/25", "to": "18/25"}] * 2,
+                    }))
+                    output = self.root / (source.name + "-" + label + ".mov")
+                    run([CLI, "export", "--project", project, "--mode", "encode", "--audio", "pcm",
+                         "--output", output, "--json"], allow_diagnostics=True)
+                    return ffmpeg("-i", output, "-map", "0:a:0", "-c:a", "copy", "-f", "data", "-")
+                reference = render(duplicate, "independent")
+                self.assertEqual(len(reference), RATE * 72 // 25 * 4)
+                self.assertEqual(render(source, "shared"), reference)
 
     def test_pcm_preserves_mono_and_handles_mp3_gapless_samples_at_reordered_join(self):
         self.export(self.mp3, mode="copy", succeed=False)

@@ -1,0 +1,13 @@
+{
+  "manifestVersion": 5,
+  "id": "com.mpcut.project-converter",
+  "name": "MPCut Project Converter",
+  "version": "1.0.0",
+  "main": "index.html",
+  "host": { "app": "premierepro", "minVersion": "26.0.0" },
+  "entrypoints": [{
+    "id": "mpcutConverter", "type": "panel",
+    "label": { "default": "MPCut Project Converter" },
+    "minimumSize": { "width": 200, "height": 100 }
+  }]
+}

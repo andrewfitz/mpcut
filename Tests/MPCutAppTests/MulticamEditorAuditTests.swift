@@ -7,23 +7,40 @@ import XCTest
 final class MulticamEditorAuditTests: XCTestCase {
     @MainActor
     func testFourCameraTransportFitsAtMinimumAndWideWindowSizes() throws {
+        try verifyTransportLayout(cameraCount: 4, rangeTool: false)
+    }
+
+    @MainActor
+    func testNineCameraRangeTransportAtMinimumAndWideWindowSizes() throws {
+        try verifyTransportLayout(cameraCount: 9, rangeTool: true)
+    }
+
+    @MainActor
+    private func verifyTransportLayout(cameraCount: Int, rangeTool: Bool) throws {
         _ = NSApplication.shared
         let url = try fixture("ProRes-2997", "mov")
         let media = try CutEngine(useSidecar: false).inspectMulticamSource(url)
         let model = MulticamEditorModel()
         defer { model.reset() }
         model.useAnalysisSidecars = false
-        let names = ["Wide", "Close", "Side", "Overhead"]
+        let names = (1...cameraCount).map { "Camera \($0)" }
         model.confirmSetup(drafts: names.map { .init(source: .init(id: $0, file: url.path, name: $0), media: media) },
                            opening: names[0], audio: .none)
         let project = try XCTUnwrap(model.project)
+        model.rangeTool = rangeTool
         let hosting = NSHostingView(rootView: MulticamTransport(model: model, preview: model.preview, project: project))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 810, height: 43),
                               styleMask: .titled, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
         window.contentView = hosting
+        window.orderBack(nil)
+        defer { window.close() }
 
         for width: CGFloat in [810, 1_160] {
             window.setContentSize(NSSize(width: width, height: 43))
+            // Mount the view and let AppKit negotiate the actual window minimum.
+            // Before this pass its bounds can still be the requested size even with overflowing controls.
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
             hosting.layoutSubtreeIfNeeded()
             XCTAssertEqual(hosting.bounds.width, width, accuracy: 0.5)
             XCTAssertEqual(hosting.fittingSize.height, 43, accuracy: 0.5)
@@ -55,6 +72,59 @@ final class MulticamEditorAuditTests: XCTestCase {
         while model.isBusy, .now < next { try await Task.sleep(for: .milliseconds(5)) }
         XCTAssertFalse(model.isBusy)
         XCTAssertEqual(stopped, 1)
+    }
+
+    @MainActor
+    func testReencodeWithoutSoundAcceptsOfflineSoundtrack() async throws {
+        let (model, _) = try twoAngleModel()
+        defer { model.reset() }
+        XCTAssertTrue(model.edit { project in
+            project.audioSources = [.init(id: "mic", file: "/missing/offline-mic.wav", audioStream: 0)]
+            project.audio = .fixed(.init(source: "mic", stream: 0))
+        })
+        XCTAssertNotNil(model.exportSourceIssue(tracks: .all, wholeGroup: false))
+        XCTAssertNil(model.exportSourceIssue(tracks: .all, wholeGroup: false, mode: .encode,
+                                             settings: .init(audio: .removeAudio)))
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mov")
+        model.export(output: output, mode: .encode, tracks: .all, dryRun: true, wholeGroup: false,
+                     settings: .init(audio: .removeAudio))
+        XCTAssertTrue(model.isBusy, "The editor must submit the picture-only request for encoder preflight.")
+        try await waitForIdle(model)
+    }
+
+    @MainActor
+    func testParkedAssemblyEndpointKeepsExactMarkAndOutgoingCamera() throws {
+        let (model, media) = try twoAngleModel()
+        defer { model.reset() }
+        let frame = media.frames[4]
+        let end = try frame.time.adding(frame.duration.multiplied(by: .init(numerator: 1, denominator: 2)))
+        XCTAssertTrue(model.edit {
+            $0.switches.append(.init(at: end, angle: "close"))
+            $0.assembly = [.init(from: .zero, to: end)]
+        })
+        model.setAnalysisSnap(.keyframes)
+        model.setAssemblyPreview(true)
+        model.seekPlaybackBoundary(end: true)
+        XCTAssertEqual(model.interval(at: model.preview.time)?.angle, "wide")
+        XCTAssertEqual(model.markAnalysisTime(), end)
+    }
+
+    @MainActor
+    func testSplitSnapsInsideTrimmedOccurrence() throws {
+        let (model, media) = try twoAngleModel()
+        defer { model.reset() }
+        let frames = media.frames
+        let delta = RationalTime(numerator: 1, denominator: 1_000)
+        let start = try frames[3].time.adding(delta)
+        XCTAssertTrue(model.edit { $0.assembly = [.init(from: start, to: frames[8].time)] })
+        model.setAnalysisSnap(.keyframes)
+        model.setAssemblyPreview(true)
+        model.preview.seek(to: delta)
+        XCTAssertEqual(model.occurrenceCut?.time, frames[4].time)
+        XCTAssertTrue(model.canStepAnalysis(.keyframes))
+        let beforeKeyframe = try frames[4].time.subtracting(delta)
+        XCTAssertTrue(model.edit { $0.assembly = [.init(from: start, to: beforeKeyframe)] })
+        XCTAssertFalse(model.canStepAnalysis(.keyframes))
     }
 
     @MainActor
@@ -127,7 +197,7 @@ final class MulticamEditorAuditTests: XCTestCase {
         let nested = root.appendingPathComponent("a/b")
         try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let first = root.appendingPathComponent("edit.multicam.json")
+        let first = root.appendingPathComponent("edit.cut")
         XCTAssertTrue(model.saveProject(to: first))
         XCTAssertFalse(model.isChanged)
         XCTAssertEqual(model.project, edited)
@@ -147,7 +217,7 @@ final class MulticamEditorAuditTests: XCTestCase {
         }
         XCTAssertEqual(physical(try resolved(first)), physical(edited))
 
-        let second = nested.appendingPathComponent("copy.json")
+        let second = nested.appendingPathComponent("copy.cut")
         XCTAssertTrue(model.saveProject(to: second))
         XCTAssertEqual(model.projectURL, second.standardizedFileURL)
         XCTAssertEqual(physical(try resolved(second)), physical(edited))
@@ -544,9 +614,9 @@ final class MulticamEditorAuditTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
-        XCTAssertTrue(model.saveProject(to: directory.appendingPathComponent("Interview.multicam.json")))
+        XCTAssertTrue(model.saveProject(to: directory.appendingPathComponent("Interview.cut")))
         XCTAssertTrue(model.enqueueRanges([.init(from: .zero, to: media.frames[3].time)]))
-        XCTAssertTrue(model.saveProject(to: directory.appendingPathComponent("Plain.json")))
+        XCTAssertTrue(model.saveProject(to: directory.appendingPathComponent("Plain.cut")))
         XCTAssertTrue(model.enqueueRanges([.init(from: .zero, to: media.frames[3].time)]))
         XCTAssertEqual(model.queuedRanges.map(\.name), ["Interview", "Plain"])
     }

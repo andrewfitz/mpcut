@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import MPCutCore
 import XCTest
 @testable import MPCutApp
@@ -207,7 +209,9 @@ final class MulticamRangeEditsTests: XCTestCase {
         model.preview.togglePlayback()
         XCTAssertTrue(model.preview.isPlaying)
         model.skipMulticamPause(plan)
-        XCTAssertGreaterThanOrEqual(model.preview.time, try range.to.adding(pause.to))
+        // Playing preview time is published on display ticks. The live clock can
+        // already have crossed the pause while this synchronous test holds the main actor.
+        XCTAssertGreaterThanOrEqual(model.preview.currentTime(), try range.to.adding(pause.to))
         XCTAssertEqual(model.ranges, [range, range])
     }
 
@@ -267,6 +271,191 @@ final class MulticamRangeEditsTests: XCTestCase {
         model.undo()
         XCTAssertEqual(model.ranges, [first, second])
         XCTAssertEqual(model.selectedOccurrence, 0)
+    }
+
+    @MainActor
+    func testGroupSurfaceCommitsDragAndCancelsWithEscape() async throws {
+        let (project, media) = try fixture()
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [.init(source: project.angles[0], media: media)], opening: "wide", audio: .none)
+        model.setAnalysisSnap(.off)
+        let timeline = MulticamTimeline(project: project, media: model.media, playhead: .zero,
+                                        seek: { _ in XCTFail("Range gesture sought") }, take: { _ in },
+                                        moveSwitch: { _, _ in XCTFail("Range gesture moved a switch") },
+                                        deleteSwitch: { _ in }, selectSwitch: { _ in },
+                                        thumbnailService: model.filmstrip, selectRange: model.selectGroupRange)
+        _ = NSApplication.shared
+        let host = NSHostingView(rootView: timeline)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 260), styleMask: .borderless,
+                              backing: .buffered, defer: false)
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        func findSurface(_ view: NSView) -> MulticamGroupRangeSurface.Surface? {
+            (view as? MulticamGroupRangeSurface.Surface) ?? view.subviews.lazy.compactMap(findSurface).first
+        }
+        for _ in 0..<30 where findSurface(host) == nil { try await Task.sleep(for: .milliseconds(10)) }
+        let surface = try XCTUnwrap(findSurface(host))
+        func mouse(_ type: NSEvent.EventType, _ x: CGFloat) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.mouseEvent(with: type, location: surface.convert(.init(x: x, y: 10), to: nil),
+                                             modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber,
+                                             context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+        }
+        surface.mouseDown(with: try mouse(.leftMouseDown, 40))
+        surface.mouseDragged(with: try mouse(.leftMouseDragged, 240))
+        XCTAssertNil(model.markedGroupSpan)
+        surface.mouseUp(with: try mouse(.leftMouseUp, 240))
+        let selected = try XCTUnwrap(model.markedGroupSpan)
+        surface.mouseDown(with: try mouse(.leftMouseDown, 120))
+        surface.mouseDragged(with: try mouse(.leftMouseDragged, 350))
+        surface.cancelOperation(nil)
+        surface.mouseUp(with: try mouse(.leftMouseUp, 350))
+        XCTAssertEqual(model.markedGroupSpan, selected)
+        surface.mouseDown(with: try mouse(.leftMouseDown, 100))
+        surface.mouseUp(with: try mouse(.leftMouseUp, 100))
+        XCTAssertFalse(model.canActOnRange)
+    }
+
+    @MainActor
+    func testAssemblyDragAcrossRepeatEditsOnlySelectedOutput() throws {
+        let (project, media) = try fixture()
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [.init(source: project.angles[0], media: media)], opening: "wide", audio: .none)
+        model.setAnalysisSnap(.off)
+        let frames = media.frames.map(\.time)
+        let clip = MulticamRange(from: frames[1], to: frames[7])
+        XCTAssertTrue(model.edit { $0.assembly = [clip, clip, clip] })
+        model.rangeTool = true
+        let duration = try clip.to.subtracting(clip.from)
+        let start = try frames[4].subtracting(clip.from).seconds + 0.000001
+        let end = duration.seconds + (try frames[3].subtracting(clip.from)).seconds + 0.000001
+        model.selectAssemblyRange(end, start)
+        let head = MulticamRange(from: clip.from, to: frames[4])
+        let tail = MulticamRange(from: frames[3], to: clip.to)
+        let expected = [MulticamRange(from: frames[4], to: clip.to), MulticamRange(from: clip.from, to: frames[3])]
+        XCTAssertEqual(model.selectedExportRanges, expected)
+        model.chooseSelectionExport()
+        XCTAssertEqual(model.exportProgram, .selection)
+        model.splitSelectedRange()
+        XCTAssertEqual(model.ranges, [head] + expected + [tail, clip])
+        XCTAssertEqual(model.selectedExportRanges, expected)
+        model.deleteSelection()
+        XCTAssertEqual(model.ranges, [head, tail, clip])
+        XCTAssertTrue(model.selectedExportRanges.isEmpty)
+        XCTAssertEqual(model.exportProgram, .selection)
+        XCTAssertNotNil(model.exportSourceIssue(tracks: .video, wholeGroup: false, selection: model.selectedExportRanges))
+        model.undo()
+        XCTAssertEqual(model.ranges, [head] + expected + [tail, clip])
+        XCTAssertEqual(model.selectedExportRanges, expected)
+        XCTAssertFalse(model.canSplitSelectedRange)
+        model.undo()
+        XCTAssertEqual(model.ranges, [clip, clip, clip])
+        XCTAssertEqual(model.selectedExportRanges, expected)
+        XCTAssertTrue(model.canSplitSelectedRange)
+        model.redo()
+        model.redo()
+        XCTAssertEqual(model.ranges, [head, tail, clip])
+        XCTAssertTrue(model.selectedExportRanges.isEmpty)
+        model.undo()
+        model.undo()
+        model.selectAssemblyRange(start, start)
+        XCTAssertFalse(model.canDeleteSelection)
+        model.deleteSelection()
+        XCTAssertEqual(model.ranges, [clip, clip, clip])
+    }
+
+    @MainActor
+    func testSelectionCopyWritesOnlyFramesFromSelectedOccurrences() async throws {
+        let (project, media) = try fixture()
+        let model = MulticamEditorModel()
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("selection-\(UUID()).mov")
+        defer { model.reset(); try? FileManager.default.removeItem(at: url) }
+        model.confirmSetup(drafts: [.init(source: project.angles[0], media: media)], opening: "wide", audio: .none)
+        model.setAnalysisSnap(.off)
+        let frames = media.frames.map(\.time)
+        let clip = MulticamRange(from: .zero, to: frames[7])
+        XCTAssertTrue(model.edit { $0.assembly = [clip, clip, clip] })
+        model.selectAssemblyRange(frames[5].seconds + 0.000001, clip.to.seconds + frames[3].seconds + 0.000001)
+        model.export(output: url, mode: .copy, tracks: .video, dryRun: false, wholeGroup: false,
+                     selection: model.selectedExportRanges)
+        let deadline = ContinuousClock.now + .seconds(10)
+        while model.isBusy && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertNil(model.notice)
+        let written = try CutEngine(useSidecar: false).inspectMulticamSource(url)
+        XCTAssertEqual(written.frames.count, 5)
+        XCTAssertEqual(written.duration, frames[5])
+        XCTAssertEqual(model.ranges, [clip, clip, clip])
+    }
+
+    @MainActor
+    func testGroupDragUsesGroupClockAndClickDisablesRangeActions() throws {
+        let (project, media) = try fixture()
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [.init(source: project.angles[0], media: media)], opening: "wide", audio: .none)
+        model.setAnalysisSnap(.off)
+        let frames = media.frames.map(\.time)
+        let clip = MulticamRange(from: .zero, to: frames[9])
+        XCTAssertTrue(model.edit { $0.assembly = [clip, clip] })
+        model.rangeTool = true
+        model.selectGroupRange(frames[6], frames[2])
+        XCTAssertEqual(model.selectedExportRanges, [.init(from: frames[2], to: frames[6])])
+        model.deleteSelection()
+        let kept = [MulticamRange(from: clip.from, to: frames[2]), MulticamRange(from: frames[6], to: clip.to)]
+        XCTAssertEqual(model.ranges, kept + kept)
+        model.undo()
+        model.selectGroupRange(frames[4], frames[4])
+        XCTAssertFalse(model.canActOnRange)
+        model.deleteSelection()
+        XCTAssertEqual(model.ranges, [clip, clip])
+    }
+
+    @MainActor
+    func testRangeActionsMatchAssemblyCoverage() throws {
+        let (project, media) = try fixture()
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [.init(source: project.angles[0], media: media)], opening: "wide", audio: .none)
+        model.setAnalysisSnap(.off)
+        model.rangeTool = true
+        let frames = media.frames.map(\.time)
+        let clip = MulticamRange(from: frames[3], to: frames[9])
+        XCTAssertTrue(model.edit { $0.assembly = [clip, clip] })
+
+        model.selectGroupRange(frames[0], frames[2])
+        XCTAssertTrue(model.canActOnRange)
+        XCTAssertFalse(model.canSplitSelectedRange)
+        XCTAssertFalse(model.canDeleteSelectedRange)
+
+        let duration = try clip.to.subtracting(clip.from)
+        model.selectAssemblyRange(0, duration.seconds)
+        XCTAssertEqual(model.selectedExportRanges, [clip])
+        XCTAssertFalse(model.canSplitSelectedRange)
+        XCTAssertTrue(model.canDeleteSelectedRange)
+
+        model.selectAssemblyRange(0, duration.seconds * 2)
+        XCTAssertEqual(model.selectedExportRanges, [clip, clip])
+        XCTAssertFalse(model.canSplitSelectedRange)
+        XCTAssertFalse(model.canDeleteSelectedRange)
+        model.deleteSelection()
+        XCTAssertEqual(model.ranges, [clip, clip])
+        XCTAssertTrue(model.canActOnRange)
+
+        model.chooseSelectionExport()
+        model.markIn = nil
+        model.markOut = nil
+        XCTAssertTrue(model.selectedExportRanges.isEmpty)
+        XCTAssertFalse(model.canActOnRange)
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent("empty-selection-\(UUID()).mov")
+        defer { try? FileManager.default.removeItem(at: destination) }
+        model.export(output: destination, mode: .copy, tracks: .video, dryRun: false, wholeGroup: false,
+                     selection: model.selectedExportRanges)
+        XCTAssertNotNil(model.notice)
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        model.chooseProgramExport()
+        XCTAssertEqual(model.exportProgram, .assembly)
     }
 
     private func fixture() throws -> (MulticamProject, MediaInfo) {

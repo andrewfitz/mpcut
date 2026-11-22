@@ -69,7 +69,7 @@ final class MulticamProjectTests: XCTestCase {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
-        let url = folder.appendingPathComponent("edit.multicam.json")
+        let url = folder.appendingPathComponent("edit.cut")
         var edit = project
         edit.angles.reverse()
         edit.angles[0].name = "Close-up"
@@ -189,7 +189,7 @@ final class MulticamProjectTests: XCTestCase {
         let handle = try FileHandle(forWritingTo: recording)
         try handle.truncate(atOffset: UInt64(MulticamProject.maximumFileSize) + 1)
         try handle.close()
-        let link = folder.appendingPathComponent("link.multicam.json")
+        let link = folder.appendingPathComponent("link.cut")
         try manager.createSymbolicLink(at: link, withDestinationURL: recording)
         for url in [recording, link] {
             XCTAssertThrowsError(try MulticamProject.load(from: url)) {
@@ -198,7 +198,7 @@ final class MulticamProjectTests: XCTestCase {
                 XCTAssertTrue(issue?.message.contains("64 MB") == true, issue?.message ?? "")
             }
         }
-        XCTAssertThrowsError(try MulticamProject.load(from: folder.appendingPathComponent("absent.json"))) {
+        XCTAssertThrowsError(try MulticamProject.load(from: folder.appendingPathComponent("absent.cut"))) {
             XCTAssertEqual(($0 as? CutError)?.code, "multicam_project_read_failed")
         }
     }
@@ -216,7 +216,7 @@ final class MulticamProjectTests: XCTestCase {
         edit.audio = .follow
         edit.switches[1] = .init(at: frame, angle: "close", audio: .init(source: "lav", stream: 0))
         edit.assembly = [.init(from: frame, to: t(20)), r(0, 12), .init(from: frame, to: t(20))]
-        let url = folder.appendingPathComponent("edit.multicam.json")
+        let url = folder.appendingPathComponent("edit.cut")
         try edit.save(to: url)
         let first = try Data(contentsOf: url)
         let reopened = try MulticamProject.load(from: url)
@@ -234,15 +234,37 @@ final class MulticamProjectTests: XCTestCase {
                                                    .init(numerator: 25, denominator: 2)])
     }
 
+    func testSaveCompactsAtSizeLimitAndPreservesPreviousFileOnOverflow() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("edit.cut")
+        var edit = project
+        edit.angles[0].name = ""
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let overhead = try encoder.encode(edit).count
+        edit.angles[0].name = String(repeating: "x", count: MulticamProject.maximumFileSize - overhead)
+        try edit.save(to: url)
+        XCTAssertEqual(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize, MulticamProject.maximumFileSize)
+        XCTAssertEqual(try MulticamProject.load(from: url), edit)
+
+        edit.angles[0].name!.append("x")
+        XCTAssertThrowsError(try edit.save(to: url)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "invalid_multicam_project")
+        }
+        XCTAssertEqual(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize, MulticamProject.maximumFileSize)
+    }
+
     func testSavingOverSourceOrLinkLeavesMediaIntact() throws {
         let manager = FileManager.default
         let folder = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try manager.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? manager.removeItem(at: folder) }
         let source = folder.appendingPathComponent("wide.mov")
-        let hardLink = folder.appendingPathComponent("hardlink.json")
-        let symlink = folder.appendingPathComponent("symlink.json")
-        let alias = folder.appendingPathComponent("alias.json")
+        let hardLink = folder.appendingPathComponent("hardlink.cut")
+        let symlink = folder.appendingPathComponent("symlink.cut")
+        let alias = folder.appendingPathComponent("alias.cut")
         let media = Data("original media".utf8)
         try media.write(to: source)
         try manager.linkItem(at: source, to: hardLink)
@@ -266,6 +288,9 @@ final class MulticamProjectTests: XCTestCase {
         edit.audio = .none
         edit.assembly = [edit.range, edit.range]
         XCTAssertThrowsError(try edit.plan()) {
+            XCTAssertEqual(($0 as? CutError)?.code, "time_overflow")
+        }
+        XCTAssertThrowsError(try JSONEncoder().encode(CutProject.multicam(edit))) {
             XCTAssertEqual(($0 as? CutError)?.code, "time_overflow")
         }
     }

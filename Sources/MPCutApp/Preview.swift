@@ -41,7 +41,7 @@ func previewOffsets(_ ranges: [PreviewRange]) -> (offsets: [Double], duration: D
 func previewShuttleRate(_ rate: Float, direction: Int) -> Float {
     let sign: Float = direction < 0 ? -1 : 1
     let speed = rate * sign
-    return sign * (speed > 0 ? min(8, speed * 2) : 1)
+    return sign * ([Float(1), 2, 4, 8].first { $0 > speed } ?? 8)
 }
 
 func previewAudioGain(volume: Float, muted: Bool) -> Float {
@@ -123,6 +123,14 @@ final class HardwareFrames: @unchecked Sendable {
 
     deinit {
         if let session { VTDecompressionSessionInvalidate(session) }
+    }
+
+    /// Later pictures of the group can be predicted from the rejected one. Dropping the session
+    /// makes the next request decode again from its own keyframe.
+    private func decodeFailure(_ status: OSStatus) -> PreviewFailure {
+        if let session { VTDecompressionSessionInvalidate(session) }
+        session = nil
+        return PreviewFailure("Hardware video decoding failed for \(asset.url.lastPathComponent) (\(status)).")
     }
 
     private func reset(at start: AVSampleCursor) throws {
@@ -213,9 +221,7 @@ final class HardwareFrames: @unchecked Sendable {
             let matching = frames.first { $0.time == desiredTime }
             let error = decodeError
             frameLock.unlock()
-            if error != noErr {
-                throw PreviewFailure("Hardware video decoding failed for \(asset.url.lastPathComponent) (\(error)).")
-            }
+            if error != noErr { throw decodeFailure(error) }
             if let matching { return matching }
             guard let cursor else { return nil }
             if hasMultipleDescriptions, let format = sessionFormat,
@@ -236,16 +242,13 @@ final class HardwareFrames: @unchecked Sendable {
                 session, sampleBuffer: sample, flags: [],
                 frameRefcon: nil, infoFlagsOut: nil
             )
-            if status != noErr {
-                throw PreviewFailure("Hardware video decoding failed for \(asset.url.lastPathComponent) (\(status)).")
-            }
+            if status != noErr { throw decodeFailure(status) }
             if cursor.stepInDecodeOrder(byCount: 1) == 0 {
                 self.cursor = nil
                 let finishStatus = VTDecompressionSessionFinishDelayedFrames(session)
                 let waitStatus = VTDecompressionSessionWaitForAsynchronousFrames(session)
                 guard finishStatus == noErr, waitStatus == noErr else {
-                    let status = finishStatus == noErr ? waitStatus : finishStatus
-                    throw PreviewFailure("Hardware video decoding failed for \(asset.url.lastPathComponent) (\(status)).")
+                    throw decodeFailure(finishStatus == noErr ? waitStatus : finishStatus)
                 }
             }
         }
@@ -392,9 +395,20 @@ private final class ThumbnailDecoder: @unchecked Sendable {
 final class SequencePreview: ObservableObject {
     @Published private(set) var time: Double = 0
     @Published private(set) var playbackRate: Float = 0
+    @Published private(set) var forwardSpeed: PlaybackSpeed = .normal
+    private var playbackScreen: NSScreen? {
+        surfaces.allObjects.compactMap { $0.window?.screen }.max { $0.maximumFramesPerSecond < $1.maximumFramesPerSecond }
+    }
+
+    func selectPlaybackSpeed(_ speed: PlaybackSpeed) {
+        forwardSpeed = speed
+        if isPlaying { startPlayback(at: speed.rawValue) }
+    }
+
     var isPlaying: Bool { playbackRate != 0 }
     @Published private(set) var issue: String?
     // Damaged audio stops one decoding pass. Seeking or playing again may get past it.
+    // A damaged picture leaves one position without a picture. Playback resumes at the next keyframe.
     private var issueAllowsRetry = false
     var hasBlockingIssue: Bool { issue != nil && !issueAllowsRetry }
     @Published private(set) var audioWarning: String?
@@ -437,18 +451,21 @@ final class SequencePreview: ObservableObject {
 
     private let requests = DecodeRequests(label: "mpcut.preview.video", qos: .userInteractive)
     private var audioPlayer: AVPlayer?
-    private var ranges: [PreviewRange] = []
+    private(set) var ranges: [PreviewRange] = []
     private var offsets: [Double] = []
     private var duration = 0.0
     private var playable = false
     private var readyForTransport: Bool {
-        frame != nil || (ranges.first?.isAudioOnly == true && (playable || fallback != nil))
+        frame != nil || (canPlayWithoutPicture && fallback != nil)
+            || (ranges.first?.isAudioOnly == true && (playable || fallback != nil))
     }
+    // The position has no picture to show. The fallback transport can still play on from it.
+    private var canPlayWithoutPicture = false
     private var audioEnd = 0.0
     private var usingAudioClock = false
     private var loading: Task<Void, Never>?
     private var observedAudioItem: NSKeyValueObservation?
-    private var ticker: Task<Void, Never>?
+    private var ticker: PreviewDisplayTicker?
     private var clockStart = ContinuousClock.now
     private var startTime = 0.0
     private var rendering = false
@@ -459,7 +476,9 @@ final class SequencePreview: ObservableObject {
     private var audioSeeking = false
     private var auditionPosition: (url: URL, time: Double)?
     private var frame: PreviewFrame?
+    var displayedFrameTime: CMTime? { frame?.time }
     private var thumbnails = ThumbnailDecoder()
+    private let tileWriter = FilmstripTileWriter()
     private let surfaces = NSHashTable<PreviewSurface>.weakObjects()
 
     init(reverseAudioEngine: AVAudioEngine? = nil, scrubAudioEngine: AVAudioEngine? = nil,
@@ -512,6 +531,7 @@ final class SequencePreview: ObservableObject {
         playable = false
         issue = nil
         issueAllowsRetry = false
+        canPlayWithoutPicture = false
         audioWarning = nil
         clearPicture()
         removeAudioItem()
@@ -669,10 +689,11 @@ final class SequencePreview: ObservableObject {
         removeAudioItem()
         audioPlayer = nil
         let generation = sequenceGeneration
-        let alternative = WebSequencePlayback(ranges: ranges, onFrame: { [weak self] frame in
+        let alternative = WebSequencePlayback(ranges: ranges, screen: { [weak self] in self?.playbackScreen }, onFrame: { [weak self] frame in
             guard let self, self.sequenceGeneration == generation else { return }
             if self.issue != nil { self.issue = nil }
             self.issueAllowsRetry = false
+            self.canPlayWithoutPicture = false
             self.frame = frame
             self.surfaces.allObjects.forEach { $0.display(frame) }
         }, onTime: { [weak self] position in
@@ -685,12 +706,19 @@ final class SequencePreview: ObservableObject {
         }, onIssue: { [weak self] error in
             guard let self, self.sequenceGeneration == generation else { return }
             self.clearPicture()
-            self.issueAllowsRetry = error == WebSequencePlayback.undecodableAudio
+            self.canPlayWithoutPicture = error == WebSequencePlayback.damagedPicture
+            self.issueAllowsRetry = error == WebSequencePlayback.undecodableAudio || self.canPlayWithoutPicture
             self.issue = nativeIssue.map { "\(error) \($0)" } ?? error
             self.pause()
         }, onAudioWarning: { [weak self] message in
             guard let self, self.sequenceGeneration == generation else { return }
             self.audioWarning = message
+        }, onGap: { [weak self] in
+            guard let self, self.sequenceGeneration == generation else { return }
+            self.clearPicture()
+            self.canPlayWithoutPicture = true
+            self.issue = nil
+            self.issueAllowsRetry = false
         })
         alternative.setGain(isMuted ? 0 : volume)
         fallback = alternative
@@ -817,7 +845,7 @@ final class SequencePreview: ObservableObject {
         clearRetryableIssue()
         if readyForTransport && issue == nil {
             if time >= duration { seek(to: 0) }
-            startPlayback(at: 1)
+            startPlayback(at: forwardSpeed.rawValue)
         }
     }
 
@@ -857,13 +885,7 @@ final class SequencePreview: ObservableObject {
         }
         if rate > 0, audioEnd > 0 { seekAudio() }
         if rate < 0 { startReverseAudio() }
-        ticker = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(16))
-                guard !Task.isCancelled, let self else { return }
-                self.tick()
-            }
-        }
+        ticker = PreviewDisplayTicker(screen: playbackScreen) { [weak self] in self?.tick() }
     }
 
     private func startReverseAudio() {
@@ -967,20 +989,19 @@ final class SequencePreview: ObservableObject {
         guard !Task.isCancelled, size.width > 0, size.height > 0 else { return nil }
         let request = ThumbnailRequest()
         let thumbnails = thumbnails
+        let tileWriter = tileWriter
         let result: (image: CGImage?, restored: Bool) = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 thumbnails.queue.async {
-                    let skipCache = { request.isCancelled || !cacheEnabled() }
+                    let skipCache: @Sendable () -> Bool = { request.isCancelled || !cacheEnabled() }
                     if let (sidecar, key) = saved, let image = key.image(in: sidecar, cancelled: skipCache), !skipCache() {
                         continuation.resume(returning: (image, true))
                         return
                     }
                     let image = thumbnails.image(source: source, url: url, time: time, size: size, request: request)
-                    if let image, let (sidecar, key) = saved, !skipCache(),
-                       let bytes = key.encoded(image, preserveAlpha: preserveAlpha) {
-                        sidecar.saveAutomatically([key.section: bytes],
-                            retainingLatest: [FilmstripTileKey.sectionPrefix: FilmstripTileBuffer.countLimit],
-                            cancelled: skipCache)
+                    if let image, let (sidecar, key) = saved, !skipCache() {
+                        tileWriter.submit(image, key: key, sidecar: sidecar, preserveAlpha: preserveAlpha,
+                                          cancelled: skipCache)
                     }
                     continuation.resume(returning: (image, false))
                 }

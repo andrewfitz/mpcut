@@ -1,0 +1,505 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:mpcut:cut:1",
+  "title": "MPCut project v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/sequence"
+    },
+    {
+      "$ref": "#/$defs/multicam"
+    }
+  ],
+  "$defs": {
+    "sequence": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": "mpcut"
+        },
+        "schemaVersion": {
+          "const": 1
+        },
+        "kind": {
+          "const": "sequence"
+        },
+        "clips": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/clip"
+          },
+          "minItems": 0
+        },
+        "history": {
+          "$ref": "#/$defs/sequenceHistory"
+        }
+      },
+      "required": [
+        "format",
+        "schemaVersion",
+        "kind",
+        "clips"
+      ],
+      "additionalProperties": false
+    },
+    "clip": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "file": {
+          "$ref": "#/$defs/file"
+        },
+        "from": {
+          "$ref": "#/$defs/time"
+        },
+        "to": {
+          "$ref": "#/$defs/time"
+        },
+        "originalFile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/file"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "audioTrack": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/stream"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "replacementNames": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "propertyNames": {
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "file",
+        "from",
+        "to"
+      ],
+      "additionalProperties": false
+    },
+    "multicam": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "const": "mpcut"
+        },
+        "schemaVersion": {
+          "const": 1
+        },
+        "kind": {
+          "const": "multicam"
+        },
+        "referenceAngle": {
+          "$ref": "#/$defs/id"
+        },
+        "range": {
+          "$ref": "#/$defs/range"
+        },
+        "angles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/source"
+          },
+          "minItems": 1
+        },
+        "audioSources": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/source"
+              },
+              "minItems": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "audio": {
+          "$ref": "#/$defs/audio"
+        },
+        "switches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/switch"
+          },
+          "minItems": 1
+        },
+        "assembly": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/range"
+              },
+              "minItems": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "history": {
+          "$ref": "#/$defs/multicamHistory"
+        }
+      },
+      "required": [
+        "format",
+        "schemaVersion",
+        "kind",
+        "referenceAngle",
+        "range",
+        "angles",
+        "audio",
+        "switches"
+      ],
+      "additionalProperties": false
+    },
+    "range": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/time"
+        },
+        "to": {
+          "$ref": "#/$defs/time"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "file": {
+          "$ref": "#/$defs/file"
+        },
+        "offset": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "audioStream": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/stream"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "file"
+      ],
+      "additionalProperties": false
+    },
+    "audio": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "enum": [
+                "none",
+                "follow"
+              ]
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "const": "fixed"
+            },
+            "source": {
+              "$ref": "#/$defs/id"
+            },
+            "stream": {
+              "$ref": "#/$defs/stream"
+            }
+          },
+          "required": [
+            "mode",
+            "source",
+            "stream"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "switch": {
+      "type": "object",
+      "properties": {
+        "at": {
+          "$ref": "#/$defs/time"
+        },
+        "angle": {
+          "$ref": "#/$defs/id"
+        },
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/selection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "at",
+        "angle"
+      ],
+      "additionalProperties": false
+    },
+    "selection": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/id"
+        },
+        "stream": {
+          "$ref": "#/$defs/stream"
+        }
+      },
+      "required": [
+        "source",
+        "stream"
+      ],
+      "additionalProperties": false
+    },
+    "id": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "file": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!(?:[^\\u0000]*/)?\\.{1,2}$)[^\\u0000]*[^/\\u0000]$"
+    },
+    "time": {
+      "type": "string",
+      "pattern": "^[+-]?(?:[0-9]+/[0-9]*[1-9][0-9]*|(?:[0-9]+:(?:0*[0-5]?[0-9]:)?0*[0-5]?[0-9]|[0-9]+)(?:\\.[0-9]+)?|\\.[0-9]+)$"
+    },
+    "stream": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2147483647
+    },
+    "sequenceStep": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/historyAction"
+        },
+        "clips": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/historyCopy"
+              },
+              {
+                "$ref": "#/$defs/clip"
+              }
+            ]
+          }
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "additionalProperties": false
+    },
+    "sequenceHistory": {
+      "type": "object",
+      "properties": {
+        "undo": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "$ref": "#/$defs/sequenceStep"
+          }
+        },
+        "redo": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "$ref": "#/$defs/sequenceStep"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "multicamStep": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/historyAction"
+        },
+        "angles": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/historyCopy"
+              },
+              {
+                "$ref": "#/$defs/source"
+              }
+            ]
+          }
+        },
+        "audioSources": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/historyCopy"
+              },
+              {
+                "$ref": "#/$defs/source"
+              }
+            ]
+          }
+        },
+        "switches": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/historyCopy"
+              },
+              {
+                "$ref": "#/$defs/switch"
+              }
+            ]
+          }
+        },
+        "assembly": {
+          "type": "array",
+          "maxItems": 1000000,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/historyCopy"
+              },
+              {
+                "$ref": "#/$defs/range"
+              }
+            ]
+          }
+        },
+        "referenceAngle": {
+          "$ref": "#/$defs/id"
+        },
+        "range": {
+          "$ref": "#/$defs/range"
+        },
+        "audio": {
+          "$ref": "#/$defs/audio"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "additionalProperties": false
+    },
+    "multicamHistory": {
+      "type": "object",
+      "properties": {
+        "undo": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "$ref": "#/$defs/multicamStep"
+          }
+        },
+        "redo": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "$ref": "#/$defs/multicamStep"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "historyAction": {
+      "type": "string",
+      "pattern": "\\S",
+      "maxLength": 1024
+    },
+    "historyCopy": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "integer",
+          "minimum": 1
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    }
+  }
+}

@@ -29,6 +29,46 @@ final class WindowAuditTests: XCTestCase {
                  backing: .buffered, defer: true)
     }
 
+    @MainActor
+    func testSessionWindowForwardsResizeAndFocusAcrossRebindingAndRestoresDelegate() throws {
+        final class ResizeDelegate: NSObject, NSWindowDelegate {
+            var resizeCount = 0
+            var focusCount = 0
+            func windowDidBecomeKey(_ notification: Notification) { focusCount += 1 }
+            func windowDidResize(_ notification: Notification) { resizeCount += 1 }
+            func windowShouldClose(_ sender: NSWindow) -> Bool { false }
+        }
+        _ = NSApplication.shared
+        let sessions = ProjectSessions(preferences: EditorPreferences(), openWindow: { _ in })
+        let session = sessions.session(for: UUID())
+        let first = window(), second = window()
+        var original: ResizeDelegate? = ResizeDelegate()
+        weak var forwarded = original
+        first.delegate = original
+        sessions.register(session, window: first)
+        let delegate = try XCTUnwrap(first.delegate)
+        original = nil
+        session.isMulticam = true
+        sessions.register(session, window: first)
+        XCTAssertTrue(first.delegate === delegate)
+        let target = try XCTUnwrap(forwarded)
+        let before = target.resizeCount
+        NotificationCenter.default.post(name: NSWindow.didResizeNotification, object: first)
+        XCTAssertEqual(target.resizeCount, before + 1)
+        let initialFocus = target.focusCount
+        NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: first)
+        XCTAssertEqual(target.focusCount, initialFocus + 1)
+        XCTAssertEqual(delegate.windowShouldClose?(first), false)
+
+        let secondOriginal = ResizeDelegate()
+        second.delegate = secondOriginal
+        sessions.register(session, window: second)
+        XCTAssertTrue(first.delegate === target)
+        XCTAssertFalse(second.delegate === delegate)
+        sessions.windowClosed(session)
+        XCTAssertTrue(second.delegate === secondOriginal)
+    }
+
     // MARK: Sessions
 
     @MainActor
@@ -113,7 +153,7 @@ final class WindowAuditTests: XCTestCase {
         let folder = base.appendingPathComponent("Shoot")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: base) }
-        let document = folder.appendingPathComponent("Interview.multicam.json")
+        let document = folder.appendingPathComponent("Interview.cut")
         try makeProject(angle: "wide").save(to: document)
         let alias = base.appendingPathComponent("Linked")
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: folder)
@@ -126,10 +166,10 @@ final class WindowAuditTests: XCTestCase {
         sessions.openFiles([document], in: blank)
         XCTAssertEqual(opened.count, 1)
         let variants = [
-            alias.appendingPathComponent("Interview.multicam.json"),
-            folder.appendingPathComponent("../Shoot/./Interview.multicam.json"),
-            URL(fileURLWithPath: "Shoot/Interview.multicam.json", relativeTo: URL(fileURLWithPath: base.path, isDirectory: true)),
-            folder.appendingPathComponent("INTERVIEW.MULTICAM.JSON"),
+            alias.appendingPathComponent("Interview.cut"),
+            folder.appendingPathComponent("../Shoot/./Interview.cut"),
+            URL(fileURLWithPath: "Shoot/Interview.cut", relativeTo: URL(fileURLWithPath: base.path, isDirectory: true)),
+            folder.appendingPathComponent("INTERVIEW.CUT"),
         ]
         // While the project is still loading and again once it is open.
         for round in 0..<2 {
@@ -235,9 +275,9 @@ final class WindowAuditTests: XCTestCase {
         let regular = try XCTUnwrap(sessions.sessions.values.first)
         var dirty: [ProjectSession] = []
         for name in ["first", "second"] {
-            let document = folder.appendingPathComponent("\(name).multicam.json")
+            let document = folder.appendingPathComponent("\(name).cut")
             try makeProject(angle: name).save(to: document)
-            sessions.openFiles([document])
+            sessions.openProject(document, in: nil)
             let session = try XCTUnwrap(sessions.project(at: document))
             let deadline = ContinuousClock.now + .seconds(5)
             while session.multicam.isBusy, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
@@ -273,12 +313,13 @@ final class WindowAuditTests: XCTestCase {
         XCTAssertEqual(sessions.prepareToQuit(stopExports: { XCTFail("no export"); return true },
                                               confirmClose: { asked.append($0.id); return asked.count < 2 },
                                               reply: { replies.append($0) }), .cancel)
-        XCTAssertEqual(Set(asked), Set(dirty.map(\.id)))
+        XCTAssertEqual(Set(asked).count, 2)
+        XCTAssertTrue(Set(asked).isSubset(of: Set((dirty + [regular]).map(\.id))))
         asked = []
         XCTAssertEqual(sessions.prepareToQuit(stopExports: { true }, confirmClose: { asked.append($0.id); return true },
                                               reply: { replies.append($0) }), .now)
-        XCTAssertEqual(asked.count, 2)
-        XCTAssertEqual(Set(asked), Set(dirty.map(\.id)))
+        XCTAssertEqual(asked.count, 3)
+        XCTAssertEqual(Set(asked), Set((dirty + [regular]).map(\.id)))
 
         // Declining to stop an export cancels the quit before any window is asked.
         regular.editor.exportJPEGFrames(source, to: folder.appendingPathComponent("Again", isDirectory: true), options: options)

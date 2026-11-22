@@ -105,8 +105,45 @@ struct TimelineTimeControl: View {
     }
 }
 
+enum TimelineWheelAction: Equatable {
+    case zoom(Double)
+    case pan(CGFloat)
+
+    init?(horizontal: CGFloat, vertical: CGFloat, precise: Bool, inverted: Bool, modifiers: NSEvent.ModifierFlags) {
+        let keys = modifiers.intersection([.command, .option, .control, .shift])
+        if keys == .command {
+            // AppKit's deltas already reflect the user's natural scrolling preference.
+            let delta = abs(horizontal) > abs(vertical) ? horizontal : vertical
+            self = .pan(-delta * (precise ? 1 : 16))
+        } else if (keys.isEmpty || keys == .option), vertical != 0, abs(vertical) >= abs(horizontal) {
+            let direction = inverted ? -vertical : vertical
+            self = .zoom(direction * (precise ? 0.0125 : 0.25))
+        } else {
+            return nil
+        }
+    }
+
+    init?(_ event: NSEvent) {
+        self.init(horizontal: event.scrollingDeltaX, vertical: event.scrollingDeltaY,
+                  precise: event.hasPreciseScrollingDeltas, inverted: event.isDirectionInvertedFromDevice,
+                  modifiers: event.modifierFlags)
+    }
+}
+
 struct TimelineViewControls: View {
     static let maximumZoom = 13.0
+
+    static func adjustedZoom(_ zoom: Double, by amount: Double) -> Double {
+        min(maximumZoom, max(0, zoom + amount))
+    }
+
+    static func keyZoom(_ character: String?) -> Double? {
+        switch character {
+        case "=": return 1
+        case "-": return -1
+        default: return nil
+        }
+    }
 
     @Binding var zoom: Double
     @Binding var largeThumbnails: Bool
@@ -158,7 +195,7 @@ struct TimelineViewControls: View {
 
     private func zoomButton(_ title: String, symbol: String, amount: Double) -> some View {
         Button {
-            zoom = min(Self.maximumZoom, max(0, zoom + amount))
+            zoom = Self.adjustedZoom(zoom, by: amount)
         } label: {
             Image(systemName: symbol)
                 .font(.system(size: 12, weight: .medium))
@@ -167,7 +204,7 @@ struct TimelineViewControls: View {
         .buttonStyle(ToolButtonStyle())
         .disabled(amount > 0 ? zoom >= Self.maximumZoom : zoom <= 0)
         .accessibilityLabel(title)
-        .help(title)
+        .help(title + (amount > 0 ? " (= or ⌘=)" : " (- or ⌘-)"))
     }
 }
 
@@ -224,7 +261,7 @@ struct TimelineMarkReadouts: View {
     }
 
     @ViewBuilder private func readouts(marks: Bool, duration: Bool) -> some View {
-        let length = markIn.flatMap { start in markOut.flatMap { $0 > start ? $0 - start : nil } }
+        let length = markIn.flatMap { start in markOut.flatMap { $0 != start ? abs($0 - start) : nil } }
         if marks || length != nil {
             HStack(spacing: 8) {
                 if marks, let markIn { readout("In", time: markIn) }

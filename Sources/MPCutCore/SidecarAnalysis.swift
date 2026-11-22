@@ -337,7 +337,7 @@ extension AnalysisSidecar {
 
     func saveOverviewAutomatically(_ overview: AudioEnvelope, for media: MediaInfo, stream: Int,
                                    cancelled: () -> Bool) {
-        guard Self.readsEnabled, Self.automaticWritesEnabled, !cancelled() else { return }
+        guard Self.readsEnabled, Self.automaticWritesEnabled, !isExcluded, !cancelled() else { return }
         let key = "envelope.v2.\(stream)"
         guard let data = try? Self.sections(media: media, envelopeOverviews: [stream: overview], cancelled: cancelled)[key] else { return }
         try? save([:], updating: [key: { current in

@@ -83,6 +83,7 @@ final class MulticamThumbnailService {
         let gaps: [Range<Double>]
     }
 
+    let sidecarPreference = SidecarPreference()
     private static let byteLimit = 16 * 1024 * 1024
     private var sources: [URL: (identity: SourceIdentity, id: UUID)] = [:]
     private var decoders: [URL: Decoder] = [:]
@@ -121,7 +122,8 @@ final class MulticamThumbnailService {
         let url = media.url
         let sourceID = sources[url].flatMap { $0.identity == media.identity ? $0.id : nil } ?? UUID()
         sources[url] = (media.identity, sourceID)
-        let cacheKey = CacheKey(source: sourceID, section: key.section, reuseSidecar: reuseSidecar,
+        let cacheKey = CacheKey(source: sourceID, section: key.section,
+                                reuseSidecar: reuseSidecar && sidecarPreference.permits(media.url),
                                 indexed: media.hasFullEditIndex)
         if let image = cachedImage(cacheKey) { return image }
         return await MulticamThumbnailWork.shared.run(url: url) {
@@ -165,7 +167,8 @@ final class MulticamThumbnailService {
         let saved = cacheKey.reuseSidecar && cacheKey.indexed ? (AnalysisSidecar(media: media), key) : nil
         var rendered = false
         let image = await decoder.preview.thumbnail(source: decoder.id, url: url, at: key.time, size: key.size,
-                                                    saved: saved, preserveAlpha: media.video.hasAlpha ||
+                                                    saved: saved, cacheEnabled: { [sidecarPreference] in sidecarPreference.permits(url) },
+                                                    preserveAlpha: media.video.hasAlpha ||
                                                         media.video.hasAdditionalVideoLayers) { _ in rendered = true }
         guard let image, sources[url]?.id == sourceID else { return nil }
         let entry = CachedTile(tile: FilmstripTile(key: key, image: image), rendered: rendered)

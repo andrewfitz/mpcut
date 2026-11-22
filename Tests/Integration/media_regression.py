@@ -364,7 +364,7 @@ class MediaRegression(unittest.TestCase):
         self.assertEqual(report["error"]["code"], "output_exists")
         self.assertEqual(output.read_bytes(), b"preserve this destination")
         inputs = {source, other, audio_mismatch}
-        self.assertEqual(set(self.root.iterdir()), inputs | {output} | {Path(str(p) + ".mpcut") for p in inputs})
+        self.assertEqual(set(self.root.iterdir()), inputs | {output} | {Path(str(p) + ".cutdb") for p in inputs})
 
     def test_prores_alpha_color_and_orientation(self):
         for profile in ["4", "5"]:
@@ -676,6 +676,64 @@ class MediaRegression(unittest.TestCase):
         report = self.export(unsupported, edits, dry_run=True, ok=False)
         self.assertEqual((report["error"]["code"], report["error"]["track"]), ("unsafe_boundary", 1), report)
         self.assertFalse(unsupported.exists())
+
+    def test_aac_edits_with_independent_media_clock(self):
+        source = self.root / "tone.m4a"
+        ffmpeg("-f", "lavfi", "-i", "sine=f=567:r=48000:d=4", "-c:a", "aac", "-aac_pns", "0", source)
+        control = self.root / "edited.m4a"
+        self.export(control, [self.edit(source, "0.1", "0.9"), self.edit(source, "1.1", "1.9")])
+        scaled = self.root / "scaled.m4a"
+        data = bytearray(control.read_bytes())
+
+        # This audio-only fixture has one mdhd, stts and elst. Double only
+        # fields expressed in media ticks, leaving movie times and AAC unchanged.
+        def value(offset, width):
+            return int.from_bytes(data[offset:offset + width], "big")
+
+        def double(offset, width):
+            data[offset:offset + width] = (2 * value(offset, width)).to_bytes(width, "big")
+
+        def payload(tag):
+            self.assertEqual(data.count(tag), 1)
+            return data.index(tag) + 4
+
+        mdhd = payload(b"mdhd")
+        wide = data[mdhd] == 1
+        clock = mdhd + (20 if wide else 12)
+        self.assertEqual(value(clock, 4), 48000)
+        double(clock, 4)
+        double(clock + 4, 8 if wide else 4)
+        stts = payload(b"stts")
+        for i in range(value(stts + 4, 4)):
+            double(stts + 12 + 8 * i, 4)
+        elst = payload(b"elst")
+        width = 8 if data[elst] == 1 else 4
+        self.assertEqual(value(elst + 4, 4), 2)
+        for i in range(2):
+            double(elst + 8 + i * (2 * width + 4) + width, width)
+        scaled.write_bytes(data)
+
+        info = self.cli("inspect", "--json", scaled)
+        self.assertEqual(ratio(info["media"]["duration"]), Fraction(8, 5))
+        decode = self.native_audio_decoder()
+        expected = decode(control)
+        self.assertEqual(len(expected), 2 * 76800)
+        self.assertEqual(decode(scaled), expected)
+        for name, bounds in [("whole", (None, None)), ("across-join", ("0.4", "1.2"))]:
+            baseline, output = (self.root / f"{name}-{stem}.m4a" for stem in ("base", "scaled"))
+            self.export(baseline, [self.edit(control, *bounds)])
+            self.export(output, [self.edit(scaled, *bounds)])
+            self.assertEqual(sample_hashes(output, "a:0"), sample_hashes(baseline, "a:0"))
+            self.assertEqual(decode(output), decode(baseline))
+            self.assertEqual(decode(output), expected if name == "whole" else expected[2 * 19200:2 * 57600])
+
+        half_sample = self.root / "half-sample.m4a"
+        first_offset = elst + 8 + width
+        data[first_offset:first_offset + width] = (value(first_offset, width) + 1).to_bytes(width, "big")
+        half_sample.write_bytes(data)
+        refused = self.root / "unrepresentable.m4a"
+        self.export(refused, [self.edit(half_sample)], dry_run=True, ok=False)
+        self.assertFalse(refused.exists())
 
     def test_aac_whole_clip_joins_preserve_priming_and_tail_padding(self):
         # Disable random perceptual noise substitution for byte-exact decode

@@ -1,5 +1,7 @@
 # MPCut release audit
 
+The November 21 review covers the CLI, desktop editor, native media paths and performance measurements. [Audit plan, fixes and verification](docs/DEEP-AUDIT.md)
+
 Reviewed the native editor, both hardware-preview paths, media inspection, cut planning, packet writing, CLI, and standalone app build. The design review covered the empty window, an assembled sequence, keyboard navigation, and the save workflow.
 
 | Area | Corrected behavior | Evidence |
@@ -137,6 +139,7 @@ python3 Tests/Integration/silence.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/sidecar.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/frames.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/audio_tracks.py dist/MPCut.app/Contents/Helpers/mpcut
+python3 Tests/Integration/audio_convert.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/audio_copy_edges.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/replace_audio.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/waveform.py dist/MPCut.app/Contents/Helpers/mpcut
@@ -151,6 +154,7 @@ python3 Tests/Integration/audit_fixes_writer.py dist/MPCut.app/Contents/Helpers/
 python3 Tests/Integration/audit2_multicam_cli.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/audit2_multicam_core.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Integration/audit2_probe.py dist/MPCut.app/Contents/Helpers/mpcut
+python3 Tests/Integration/audit3_damage.py dist/MPCut.app/Contents/Helpers/mpcut
 python3 Tests/Packaging/test_build_publication.py
 ```
 

@@ -21,6 +21,11 @@ public enum ReencodeAudio: String, CaseIterable, Codable, Sendable {
     case copyOriginal = "copy"
     case aac, pcm
     case removeAudio = "remove"
+    /// Audio-only conversion targets. Movie re-encoding does not write them.
+    case mp3, flac
+
+    /// The actions a movie re-encode accepts.
+    public static var movieCases: [ReencodeAudio] { ExportRules.movieAudioActions }
 }
 
 public struct ReencodeSettings: Codable, Equatable, Sendable {
@@ -40,6 +45,17 @@ public struct ReencodeAudioAction: Encodable, Sendable {
     public let track: Int
     public let action: ReencodeAudio
     public let reason: String?
+    /// Reported by audio-only exports: the written codec and its rate control.
+    public var codec: String? = nil
+    public var bitRate: Int? = nil
+    public var quality: Int? = nil
+    public var bitDepth: Int? = nil
+
+    public init(track: Int, action: ReencodeAudio, reason: String?) {
+        self.track = track
+        self.action = action
+        self.reason = reason
+    }
 }
 
 public struct ReencodePlan: Encodable, Sendable {
@@ -80,6 +96,10 @@ public struct ReencodeEngine: Sendable {
             throw CutError(code: "unsupported_container", message: "Choose MP4, MOV, or MKV for Re-encode. ProRes requires MOV or MKV.")
         }
         if let output { try checkDestination(output, container: container) }
+        guard ReencodeAudio.movieCases.contains(settings.audio) else {
+            throw CutError(code: "unsupported_audio",
+                           message: "\(settings.audio.rawValue.uppercased()) conversion applies to audio-only exports. Choose auto, copy, aac, pcm or remove for a movie.")
+        }
 
         let engine = CutEngine(cancelled: cancelled)
         var media: [URL: MediaInfo] = [:]
@@ -192,7 +212,7 @@ public struct ReencodeEngine: Sendable {
                             audioCopy: audioCopy, timeScale: timeScale, exactPCM: exactPCM)
     }
 
-    func conversionMedia(_ file: URL, indexed: MediaInfo? = nil) throws -> MediaInfo {
+    package func conversionMedia(_ file: URL, indexed: MediaInfo? = nil) throws -> MediaInfo {
         guard file.isFileURL else { throw CutError(code: "invalid_input", message: "Choose a local video file.") }
         let source: MediaInfo?
         if let indexed, indexed.url == file, !indexed.frames.isEmpty {

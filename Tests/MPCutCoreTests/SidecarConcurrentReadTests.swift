@@ -62,7 +62,7 @@ final class SidecarConcurrentReadTests: XCTestCase {
         XCTAssertEqual(sidecar.read("a"), Data([1]))
         XCTAssertThrowsError(try sidecar.save(["b": Data()]))
         sidecar.saveAutomatically(["b": Data()])
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted(), ["shot.mov", "shot.mov.mpcut"])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted(), ["shot.mov", "shot.mov.cutdb"])
     }
 
     func testSectionReadObservesCancellationBeforeReturning() throws {
@@ -97,7 +97,7 @@ final class SidecarConcurrentReadTests: XCTestCase {
         }
         XCTAssertEqual(try Data(contentsOf: sidecar.url), original)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: source.deletingLastPathComponent().path).sorted(),
-                       ["shot.mov", "shot.mov.mpcut"])
+                       ["shot.mov", "shot.mov.cutdb"])
     }
 
     func testMetadataSaveSucceedsWhileSceneReportIsRead() throws {

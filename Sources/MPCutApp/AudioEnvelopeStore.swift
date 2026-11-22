@@ -119,12 +119,12 @@ final class AudioEnvelopeStore {
     private var failed: [Key: Request] = [:]
     var changed: (() -> Void)?
 
-    func update(sources: [UUID: MediaInfo], track: Int, readSidecars: Bool) {
+    func update(sources: [UUID: MediaInfo], track: Int, readSidecars: Bool, excludedSources: Set<URL> = []) {
         var current = [UUID: Input]()
         for (id, media) in sources where !media.hasVideo {
             let streams = media.streams.filter { $0.kind == "audio" }
             guard streams.indices.contains(track) else { continue }
-            current[id] = Input(media: media, stream: streams[track].index, readSidecars: readSidecars)
+            current[id] = Input(media: media, stream: streams[track].index, readSidecars: readSidecars && !AnalysisSidecar.isExcluded(media.url, in: excludedSources))
         }
         for id in Set(inputs.keys).union(current.keys).union(overviews.keys) {
             let before = inputs[id], after = current[id]

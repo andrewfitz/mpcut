@@ -7,6 +7,7 @@ struct MulticamTimeline: View {
     let project: MulticamProject
     let media: [String: MediaInfo]
     let playhead: RationalTime
+    var exclusiveEnd = false
     let seek: (RationalTime) -> Void
     let take: (String) -> Void
     let moveSwitch: (RationalTime, RationalTime) -> Void
@@ -24,10 +25,13 @@ struct MulticamTimeline: View {
     var jump: ((RationalTime) -> Void)? = nil
     var markIn: RationalTime? = nil
     var markOut: RationalTime? = nil
+    var assemblySelection: AudioSpan? = nil
+    var selectRange: ((RationalTime, RationalTime) -> Void)? = nil
     var assembly: MulticamAssemblyTimeline? = nil
 
     @Environment(\.displayScale) private var displayScale
-    @AppStorage("multicamTimelineTrackWidth") private var savedTrackWidth = 172.0
+    static let trackWidthPreference = "multicamTimelineTrackWidth"
+    @AppStorage(MulticamTimeline.trackWidthPreference) private var savedTrackWidth = 172.0
     @State private var scroll = MulticamScrollPosition()
     @GestureState private var trackResizeDelta: CGFloat = 0
     @State private var hoveringTrackDivider = false
@@ -94,7 +98,8 @@ struct MulticamTimeline: View {
                 }
                 .layoutPriority(1)
                 Spacer(minLength: 0)
-                TimelineMarkReadouts(markIn: markIn?.seconds, markOut: markOut?.seconds)
+                TimelineMarkReadouts(markIn: assemblySelection?.from.seconds ?? markIn?.seconds,
+                                     markOut: assemblySelection?.to.seconds ?? markOut?.seconds)
                 SnapTargetPicker(selection: snapTarget)
                     .pickerStyle(.menu)
                     .fixedSize()
@@ -135,7 +140,11 @@ struct MulticamTimeline: View {
                                 ScrollView(.horizontal) {
                                     lanes(width: width, scale: scale, visible: visible, heights: heights, panelHeight: panel.size.height)
                                         .background {
-                                            MulticamScrollViewLocator(position: scroll) { origin in
+                                            MulticamScrollViewLocator(position: scroll, zoom: zoom, revealTime: { time in
+                                                guard (0...extent).contains(time) else { return false }
+                                                reveal(time)
+                                                return true
+                                            }) { origin in
                                                 if scrollOrigin != origin { scrollOrigin = origin }
                                                 if let pendingReveal { reveal(pendingReveal) }
                                             }
@@ -276,8 +285,8 @@ struct MulticamTimeline: View {
     private func lanes(width: CGFloat, scale: CGFloat, visible: Range<CGFloat>, heights: [CGFloat],
                        panelHeight: CGFloat) -> some View {
         let intervals = analysis?.groupIntervals ?? (try? project.groupIntervals()) ?? []
-        let active = intervals.lowerBound { $0.group.to > playhead }
-        let current = active < intervals.count && intervals[active].group.contains(playhead) ? intervals[active] : nil
+        let active = intervals.lowerBound { exclusiveEnd ? $0.group.to >= playhead : $0.group.to > playhead }
+        let current = active < intervals.count ? intervals[active] : nil
         let first = intervals.lowerBound { x($0.group.to.seconds, scale: scale) > visible.lowerBound }
         let end = intervals.lowerBound { x($0.group.from.seconds, scale: scale) >= visible.upperBound }
         let visibleIntervals = intervals[first..<end]
@@ -324,12 +333,25 @@ struct MulticamTimeline: View {
                 .accessibilityValue(audioStatus(current))
         }
         .frame(width: width)
+        .overlay {
+            if let selectRange {
+                MulticamGroupRangeSurface(markIn: markIn, markOut: markOut, markTop: Self.rulerTickTop,
+                                          timeAt: { pointerTime(at: $0, scale: scale) },
+                                          positionAt: { x($0.seconds, scale: scale) }, commit: selectRange)
+                    .accessibilityHidden(true)
+            }
+        }
         .overlay(alignment: .topLeading) {
             GeometryReader { geometry in
-                if let markIn {
+                if selectRange == nil, let markIn, let markOut {
+                    Rectangle().fill(Color.accentColor.opacity(0.18))
+                        .frame(width: abs(markOut.seconds - markIn.seconds) * scale)
+                        .offset(x: x(min(markIn, markOut).seconds, scale: scale))
+                }
+                if selectRange == nil, let markIn {
                     mark(at: x(markIn.seconds, scale: scale), isIn: true, height: geometry.size.height)
                 }
-                if let markOut {
+                if selectRange == nil, let markOut {
                     mark(at: x(markOut.seconds, scale: scale), isIn: false, height: geometry.size.height)
                 }
                 let position = x(playhead.seconds, scale: scale)
@@ -537,7 +559,12 @@ struct MulticamTimeline: View {
     }
 
     private func audioLane(intervals: ArraySlice<MulticamInterval>, scale: CGFloat, visible: Range<CGFloat>) -> some View {
-        let tracks = analysis?.soundtrack(project: project, media: media) ?? []
+        let tracks: [MulticamAnalysisAudioSpan]
+        if let first = intervals.first, let last = intervals.last, let analysis {
+            tracks = analysis.soundtrack(in: .init(from: first.group.from, to: last.group.to))
+        } else {
+            tracks = []
+        }
         let pauses = analysis?.routedPauses(project: project, media: media) ?? []
         return ZStack(alignment: .topLeading) {
             Color.clear
@@ -739,7 +766,7 @@ struct MulticamTimeline: View {
 
     private func cameraStatus(_ angle: MulticamSource, active: Bool) -> String {
         guard let info = media[angle.id], let local = try? playhead.subtracting(angle.offset),
-              MulticamPicturePosition.at(local, source: angle.id, media: info, spanIndex: -1) != nil else {
+              MulticamPicturePosition.at(local, source: angle.id, media: info, spanIndex: -1, exclusiveEnd: exclusiveEnd) != nil else {
             return active ? "Selected, no picture" : "No picture"
         }
         return active ? "On air" : "Off air"
@@ -749,7 +776,10 @@ struct MulticamTimeline: View {
         guard let interval else { return "Outside the group" }
         guard let selection = interval.audio else { return project.audio == .none ? "Video only" : "Missing audio" }
         let label = "\(name(for: selection.source)), stream \(selection.stream)"
-        return audioCoverage(selection)?.contains(playhead.seconds) == true ? label : "\(label), unavailable"
+        let covered = audioCoverage(selection).map {
+            exclusiveEnd ? $0.lowerBound < playhead.seconds && playhead.seconds <= $0.upperBound : $0.contains(playhead.seconds)
+        } ?? false
+        return covered ? label : "\(label), unavailable"
     }
 
     private func shade(_ context: GraphicsContext, range: Range<CGFloat>, height: CGFloat, color: Color) {
@@ -824,12 +854,17 @@ private final class MulticamScrollPosition {
     }
 }
 
-private struct MulticamScrollViewLocator: NSViewRepresentable {
+struct MulticamScrollViewLocator: NSViewRepresentable {
     private let position: MulticamScrollPosition?
+    private var zoom: Binding<Double>?
     private let didScroll: (CGRect) -> Void
+    private var revealTime: ((Double) -> Bool)?
 
-    init(position: MulticamScrollPosition, didScroll: @escaping (CGFloat) -> Void) {
+    fileprivate init(position: MulticamScrollPosition, zoom: Binding<Double>, revealTime: @escaping (Double) -> Bool,
+                     didScroll: @escaping (CGFloat) -> Void) {
         self.position = position
+        self.zoom = zoom
+        self.revealTime = revealTime
         self.didScroll = { didScroll($0.minX) }
     }
 
@@ -843,15 +878,20 @@ private struct MulticamScrollViewLocator: NSViewRepresentable {
     }
 
     func updateNSView(_ view: Locator, context: Context) {
+        view.zoom = zoom
         view.didScroll = didScroll
+        view.revealTime = revealTime
     }
 
     final class Locator: NSView {
         private let position: MulticamScrollPosition?
+        var zoom: Binding<Double>?
+        var revealTime: ((Double) -> Bool)?
+        private var wheelMonitor: Any?
         var didScroll: (CGRect) -> Void
         override var isFlipped: Bool { true }
 
-        init(position: MulticamScrollPosition?, didScroll: @escaping (CGRect) -> Void) {
+        fileprivate init(position: MulticamScrollPosition?, didScroll: @escaping (CGRect) -> Void) {
             self.position = position
             self.didScroll = didScroll
             super.init(frame: .zero)
@@ -863,8 +903,30 @@ private struct MulticamScrollViewLocator: NSViewRepresentable {
             super.viewDidMoveToWindow()
             let center = NotificationCenter.default
             center.removeObserver(self)
+            if let wheelMonitor { NSEvent.removeMonitor(wheelMonitor); self.wheelMonitor = nil }
             guard window != nil, let scroll = enclosingScrollView else { return }
+            scroll.identifier = NSUserInterfaceItemIdentifier(position == nil ? "MPCutGroupTrackScroll" : "MPCutGroupTimeScroll")
             position?.view = scroll
+            if position != nil {
+                wheelMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self, weak scroll] event in
+                    guard let self, let scroll, let zoom = self.zoom,
+                          event.window === scroll.window, scroll.window?.attachedSheet == nil,
+                          scroll.contentView.visibleRect.contains(scroll.contentView.convert(event.locationInWindow, from: nil))
+                    else { return event }
+                    switch TimelineWheelAction(event) {
+                    case .zoom(let amount):
+                        zoom.wrappedValue = TimelineViewControls.adjustedZoom(zoom.wrappedValue, by: amount)
+                    case .pan(let delta):
+                        let clip = scroll.contentView
+                        var bounds = clip.bounds
+                        bounds.origin.x += delta
+                        clip.scroll(to: clip.constrainBoundsRect(bounds).origin)
+                        scroll.reflectScrolledClipView(clip)
+                    case nil: return event
+                    }
+                    return nil
+                }
+            }
             scroll.contentView.postsBoundsChangedNotifications = true
             center.addObserver(self, selector: #selector(clipBoundsChanged), name: NSView.boundsDidChangeNotification,
                                object: scroll.contentView)
@@ -886,5 +948,174 @@ private struct MulticamScrollViewLocator: NSViewRepresentable {
         }
 
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+}
+
+struct MulticamGroupRangeSurface: NSViewRepresentable {
+    let markIn: RationalTime?
+    let markOut: RationalTime?
+    let markTop: CGFloat
+    let timeAt: (CGFloat) -> RationalTime?
+    let positionAt: (RationalTime) -> CGFloat
+    let commit: (RationalTime, RationalTime) -> Void
+
+    func makeNSView(context: Context) -> Surface { Surface() }
+
+    func updateNSView(_ view: Surface, context: Context) {
+        view.configuration = self
+    }
+
+    final class Surface: NSView {
+        var configuration: MulticamGroupRangeSurface? {
+            didSet { updateRangeOverlay() }
+        }
+        private let rangeOverlay = TimelineRangeOverlay()
+        private var anchor: RationalTime?
+        private var downX: CGFloat = 0
+        private var endpoint: RationalTime?
+        private var dragLocation: NSPoint?
+        private var edgeScrollTimer: Timer?
+        override var acceptsFirstResponder: Bool { true }
+        override var isFlipped: Bool { true }
+
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            rangeOverlay.drawRange = { [weak self] visible in self?.drawRange(visible) }
+            addSubview(rangeOverlay)
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+        override func layout() {
+            super.layout()
+            updateRangeOverlay()
+        }
+
+        private func updateRangeOverlay() {
+            let hasMarks = endpoint != nil || configuration?.markIn != nil || configuration?.markOut != nil
+            rangeOverlay.update(viewport: visibleRect.intersection(bounds), showMarks: hasMarks)
+        }
+
+        override func resetCursorRects() {
+            super.resetCursorRects()
+            addCursorRect(visibleRect, cursor: .iBeam)
+        }
+
+        private func drawRange(_ dirtyRect: NSRect) {
+            guard let configuration else { return }
+            let markIn: RationalTime?
+            let markOut: RationalTime?
+            if let anchor, let endpoint {
+                markIn = min(anchor, endpoint)
+                markOut = max(anchor, endpoint)
+            } else {
+                markIn = configuration.markIn
+                markOut = configuration.markOut
+            }
+            if let markIn, let markOut {
+                let left = configuration.positionAt(min(markIn, markOut))
+                let right = configuration.positionAt(max(markIn, markOut))
+                NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+                NSRect(x: left, y: 0, width: right - left, height: bounds.height).intersection(dirtyRect).fill()
+            }
+            NSColor.controlAccentColor.setFill()
+            for (mark, isIn) in [(markIn, true), (markOut, false)] {
+                guard let mark else { continue }
+                for rect in timelineMarkRects(at: configuration.positionAt(mark), isIn: isIn,
+                                              bottom: bounds.height, top: configuration.markTop) {
+                    rect.intersection(dirtyRect).fill()
+                }
+            }
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            endInteraction()
+            window?.makeFirstResponder(self)
+            downX = convert(event.locationInWindow, from: nil).x
+            anchor = configuration?.timeAt(downX)
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard anchor != nil else { return }
+            let location = event.locationInWindow
+            updateEndpoint(at: location)
+            dragLocation = location
+            guard edgeScrollTimer == nil else { return }
+            let timer = Timer(timeInterval: 1 / 30, target: self, selector: #selector(scrollDragEdge),
+                              userInfo: nil, repeats: true)
+            edgeScrollTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+
+        private func updateEndpoint(at location: NSPoint) {
+            let x = convert(location, from: nil).x
+            guard endpoint != nil || abs(x - downX) > 3,
+                  let target = configuration?.timeAt(x), target != endpoint else { return }
+            endpoint = target
+            updateRangeOverlay()
+        }
+
+        @objc private func scrollDragEdge() {
+            guard let dragLocation, let scrollView = enclosingScrollView else { return }
+            let clip = scrollView.contentView
+            let visible = clip.bounds
+            let x = clip.convert(dragLocation, from: nil).x
+            let zone = min(24, visible.width / 4)
+            var bounds = visible
+            if x < visible.minX + zone {
+                bounds.origin.x -= 12
+            } else if x > visible.maxX - zone {
+                bounds.origin.x += 12
+            } else {
+                return
+            }
+            let target = clip.constrainBoundsRect(bounds).origin
+            guard target.x != visible.minX else { return }
+            clip.scroll(to: target)
+            scrollView.reflectScrolledClipView(clip)
+            updateEndpoint(at: dragLocation)
+            updateRangeOverlay()
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            guard let anchor else { return }
+            if dragLocation != nil { updateEndpoint(at: event.locationInWindow) }
+            let endpoint = endpoint ?? anchor
+            endInteraction()
+            configuration?.commit(min(anchor, endpoint), max(anchor, endpoint))
+        }
+
+        private func endInteraction() {
+            anchor = nil
+            let wasDragging = endpoint != nil
+            endpoint = nil
+            if wasDragging { updateRangeOverlay() }
+            dragLocation = nil
+            edgeScrollTimer?.invalidate()
+            edgeScrollTimer = nil
+        }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            if newWindow == nil { endInteraction() }
+            super.viewWillMove(toWindow: newWindow)
+        }
+
+        override func cancelOperation(_ sender: Any?) {
+            if anchor != nil { endInteraction() }
+            else { super.cancelOperation(sender) }
+        }
+
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            if event.keyCode == 53, anchor != nil, window?.firstResponder === self {
+                endInteraction()
+                return true
+            }
+            return super.performKeyEquivalent(with: event)
+        }
+
+        override func keyDown(with event: NSEvent) {
+            if event.keyCode == 53, anchor != nil { endInteraction() }
+            else { super.keyDown(with: event) }
+        }
     }
 }

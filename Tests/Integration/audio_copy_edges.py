@@ -2,7 +2,10 @@
 """Check audible extents and codec delay when copying edited audio tracks."""
 import argparse
 from fractions import Fraction
+import hashlib
 import json
+import plistlib
+import sqlite3
 from pathlib import Path
 import subprocess
 import tempfile
@@ -115,10 +118,40 @@ class CopyEdges(unittest.TestCase):
 
         # This tonal VBR stream uses more reservoir history than Xing delay can hide.
         output = self.root / "unsafe.mp3"
-        error = self.run_cli("export", "--clip", self.root / "vbr.mp3", "--from", "44223/44100",
-                             "--to", "47556/44100", "--output", output, success=False)
-        self.assertEqual(error["error"]["code"], "unsafe_boundary")
-        self.assertFalse(output.exists())
+        for start, end in [(44223, 47556), (93001, 93998)]:
+            error = self.run_cli("export", "--clip", self.root / "vbr.mp3", "--from", f"{start}/44100",
+                                 "--to", f"{end}/44100", "--output", output, success=False)
+            self.assertEqual(error["error"]["code"], "unsafe_boundary")
+            self.assertFalse(output.exists())
+
+    def test_indexed_mp3_seek_matches_sequential_decode_and_old_sidecars(self):
+        for name, options in [("cbr", ["-b:a", "128k"]), ("vbr", ["-q:a", "2"])]:
+            source = self.root / f"{name}.mp3"
+            ffmpeg("-i", self.wave, "-c:a", "libmp3lame", "-reservoir", "0", *options, source)
+            start, end = 103123, 129057
+            expected = ffmpeg("-i", source, "-f", "f32le", "-")[4 * start:4 * end]
+            self.run_cli("sidecar", "--only", "index", source)
+            for mode in ["indexed", "bad_checksum", "legacy"]:
+                with self.subTest(name=name, mode=mode):
+                    if mode != "indexed":
+                        with sqlite3.connect(str(source) + ".cutdb") as db:
+                            value, = db.execute("SELECT value FROM sections WHERE name='index.v1'").fetchone()
+                            stamp, = db.execute("SELECT stamp FROM source").fetchone()
+                            header = plistlib.loads(value)
+                            anchors = header["audio"][0]["mp3Anchors"]
+                            self.assertGreater(len(anchors), 1)
+                            if mode == "bad_checksum":
+                                for anchor in anchors:
+                                    anchor["checksum"] ^= 1
+                            else:
+                                del header["audio"][0]["mp3Anchors"]
+                            value = plistlib.dumps(header, fmt=plistlib.FMT_BINARY)
+                            digest = hashlib.sha256(stamp.encode() + b"\0index.v1\0" + value).digest()
+                            db.execute("UPDATE sections SET value=?, digest=? WHERE name='index.v1'", (value, digest))
+                    output = self.root / f"{name}-{mode}.mp3"
+                    self.run_cli("export", "--clip", source, "--from", f"{start}/44100",
+                                 "--to", f"{end}/44100", "--output", output)
+                    self.assertEqual(ffmpeg("-i", output, "-f", "f32le", "-"), expected)
 
     def test_untagged_mp3_whole_copy_keeps_all_samples(self):
         source = self.root / "untagged.mp3"

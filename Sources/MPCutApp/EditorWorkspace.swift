@@ -107,6 +107,16 @@ struct EditorMarkActions {
     let clear: () -> Void
 }
 
+struct TimelineRangeTools {
+    @Binding var active: Bool
+    let canAct: Bool
+    let canSplit: Bool
+    let canDelete: Bool
+    let split: () -> Void
+    let export: () -> Void
+    let delete: () -> Void
+}
+
 struct EditorCameraAction: Identifiable {
     let id: String
     let number: Int
@@ -115,7 +125,7 @@ struct EditorCameraAction: Identifiable {
     let perform: () -> Void
 }
 
-struct EditorTransportBar<Play: View, Accessory: View>: View {
+struct EditorTransportBar<Player: EditorPlayback, Accessory: View>: View {
     enum Navigation {
         case picture(scenes: EditorStepAction, keyframes: EditorStepAction)
         case audio(pauses: EditorStepAction)
@@ -132,12 +142,13 @@ struct EditorTransportBar<Play: View, Accessory: View>: View {
     let delete: EditorEditAction
     let undo: EditorEditAction
     let redo: EditorEditAction
-    let play: Play
+    let rangeTools: TimelineRangeTools
+    let preview: Player
     @ViewBuilder let accessory: Accessory
 
     var body: some View {
         Group {
-            if cameras.isEmpty {
+            if cameras.isEmpty && !rangeTools.active {
                 tools(compact: false)
             } else {
                 ViewThatFits(in: .horizontal) {
@@ -154,8 +165,9 @@ struct EditorTransportBar<Play: View, Accessory: View>: View {
         HStack(spacing: compact ? 3 : 10) {
             HStack(spacing: 4) {
                 steps(-1)
-                play
+                PreviewPlayButton(preview: preview)
                 steps(1)
+                PreviewSpeedMenu(preview: preview)
             }
             .disabled(!canNavigate)
 
@@ -163,6 +175,10 @@ struct EditorTransportBar<Play: View, Accessory: View>: View {
 
             // Clear Marks keeps its place so the tools after it never shift.
             HStack(spacing: compact ? 2 : 4) {
+                ClipTool(icon: "text.cursor", label: "Range Selection Tool", shortcut: "R",
+                         active: rangeTools.active) { rangeTools.active.toggle() }
+                    .accessibilityValue(rangeTools.active ? "On" : "Off")
+                    .help("Drag to select a timeline range (R). Return to the pointer with A.")
                 ClipTool(icon: nil, label: "Mark In", visibleTitle: compact ? "In" : nil,
                          shortcut: "I", active: marks.hasIn, action: marks.setIn)
                     .fixedSize(horizontal: true, vertical: false)
@@ -171,14 +187,15 @@ struct EditorTransportBar<Play: View, Accessory: View>: View {
                     .fixedSize(horizontal: true, vertical: false)
                 if !cameras.isEmpty {
                     separator.padding(.horizontal, compact ? 4 : 6)
-                    if cameras.count > 4 {
+                    if cameras.count > 4 || (compact && cameras.count > 2) {
                         ScrollView(.horizontal) { cameraButtons }
-                            .frame(width: 124, height: 28)
+                            .frame(minWidth: compact ? 56 : 124, idealWidth: compact ? 56 : 124, maxWidth: 124)
+                            .frame(height: 28)
                     } else {
                         cameraButtons.fixedSize()
                     }
                 }
-                ClipTool(icon: "xmark.circle", label: "Clear Marks", shortcut: "Esc", action: marks.clear)
+                ClipTool(icon: "xmark.circle", label: "Clear Marks", shortcut: "⌥X or Esc", action: marks.clear)
                     .disabled(!marks.hasIn && !marks.hasOut)
                 editTool(addRange, icon: "text.badge.plus", shortcut: "⇧⌘A")
             }
@@ -187,10 +204,18 @@ struct EditorTransportBar<Play: View, Accessory: View>: View {
             separator
 
             HStack(spacing: 4) {
-                editTool(split, icon: "scissors", shortcut: "⌘B", visibleTitle: compact ? nil : "Split")
-                editTool(delete, icon: "trash", shortcut: "⌫")
+                if rangeTools.active {
+                    ClipTool(icon: "scissors", label: "Split at Selection Edges", shortcut: "⌘B", action: rangeTools.split)
+                        .disabled(!rangeTools.canSplit)
+                    ClipTool(icon: "square.and.arrow.up", label: "Export Selection…", shortcut: "⌥⌘E", action: rangeTools.export)
+                    ClipTool(icon: "trash", label: "Delete Selection", shortcut: "⌫", action: rangeTools.delete)
+                        .disabled(!rangeTools.canDelete)
+                } else {
+                    editTool(split, icon: "scissors", shortcut: "⌘B", visibleTitle: compact ? nil : "Split")
+                    editTool(delete, icon: "trash", shortcut: "⌫")
+                }
             }
-            .disabled(!canEdit)
+            .disabled(!canEdit || (rangeTools.active && !rangeTools.canAct))
 
             Spacer(minLength: 0)
             accessory
@@ -200,6 +225,7 @@ struct EditorTransportBar<Play: View, Accessory: View>: View {
             }
         }
         .padding(.horizontal, EditorMetrics.barInset - ClipTool.iconInset)
+        .controlSize(compact ? .small : .regular)
     }
 
     private var separator: some View {
@@ -436,18 +462,36 @@ struct PreviewSoundControls: View {
     }
 }
 
-struct PreviewPlayButton: View {
-    let rate: Float
-    let disabled: Bool
-    let toggle: () -> Void
+struct PreviewPlayButton<Player: EditorPlayback>: View {
+    @ObservedObject var preview: Player
 
     var body: some View {
-        let speed = "\(rate < 0 ? "−" : "")\(Int(abs(rate)))×"
-        let label = rate == 0 ? "Play" : (rate == 1 ? "Pause" : "Pause \(speed) Playback")
-        ClipTool(icon: rate == 0 ? "play.fill" : "pause.fill", label: label,
-                 visibleTitle: rate == 0 || rate == 1 ? nil : speed,
-                 shortcut: "Space · J / K / L", prominent: true, action: toggle)
-            .disabled(disabled)
+        ClipTool(icon: preview.isPlaying ? "pause.fill" : "play.fill",
+                 label: preview.isPlaying ? "Pause" : "Play",
+                 shortcut: "Space · J / K / L", prominent: true, action: preview.togglePlayback)
+            .disabled(preview.hasBlockingIssue)
+    }
+}
+
+struct PreviewSpeedMenu<Player: EditorPlayback>: View {
+    @ObservedObject var preview: Player
+
+    var body: some View {
+        Menu {
+            Picker("Playback Speed", selection: Binding(get: { preview.displayedSpeed },
+                                                       set: preview.selectPlaybackSpeed)) {
+                ForEach(PlaybackSpeed.allCases, id: \.self) { speed in
+                    Text(speed.label).tag(speed)
+                }
+            }
+        } label: {
+            Text(preview.playbackRate < 0 ? PlaybackSpeed.label(for: preview.playbackRate) : preview.displayedSpeed.label)
+                .monospacedDigit()
+        }
+        .fixedSize()
+        .accessibilityLabel("Playback Speed")
+        .help("Playback speed · [ slower · ] faster · backslash normal")
+        .disabled(preview.hasBlockingIssue)
     }
 }
 
@@ -495,6 +539,8 @@ struct ToolButtonStyle: ButtonStyle {
 }
 
 struct ClipTool: View {
+    @Environment(\.controlSize) private var controlSize
+
     /// The space between a 28-point icon button's edge and its glyph.
     static let iconInset: CGFloat = 7
 
@@ -523,7 +569,7 @@ struct ClipTool: View {
                 }
             }
             .padding(.horizontal, title == nil ? 0 : 8)
-            .frame(minWidth: 28, minHeight: 28)
+            .frame(minWidth: controlSize == .small ? 24 : 28, minHeight: 28)
         }
         .buttonStyle(ToolButtonStyle(active: active, outlined: outlined))
         .help(shortcut.isEmpty ? label : "\(label) (\(shortcut))")
@@ -552,6 +598,7 @@ struct EditorMediaDrop: ViewModifier {
             .dropDestination(for: URL.self) { urls, _ in
                 let files = urls.filter(\.isFileURL)
                 guard !files.isEmpty else { return false }
+                if files.count > 1, files.contains(where: { $0.pathExtension.lowercased() == "csv" }) { return false }
                 // A project opens the way File → Open does, also while this editor is busy.
                 let media = openDroppedProjects(files)
                 if enabled, !media.isEmpty { importFiles(media) }

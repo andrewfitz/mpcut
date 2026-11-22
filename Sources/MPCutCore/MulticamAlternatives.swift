@@ -120,53 +120,136 @@ extension MulticamEngine {
             let local = try span.input.from.adding(seam.subtracting(span.output.from))
             return (span, try edge.at.subtracting(local))
         }
+        func continuousInput(_ spans: [MulticamSpan], with selected: MulticamSpan) throws -> RationalTime? {
+            // Moving this edge may reconnect it to the other side of the assembly seam.
+            let neighbor = spans.first {
+                starting ? $0.output.from < seam && seam <= $0.output.to : $0.output.from <= seam && seam < $0.output.to
+            }
+            guard let neighbor, neighbor.source == selected.source, neighbor.stream == selected.stream else { return nil }
+            return try neighbor.input.from.adding(seam.subtracting(neighbor.output.from))
+        }
         var grids: [MulticamBoundary.Grid] = []
         if picture, let (span, offset) = try lane(mapping.picture), let source = media[span.source] {
             let engine = CutEngine(multicamSmartPicture: mode == .smart, cancelled: cancelled)
-            grids.append(.init(media: (try? isolatedPicture(source, using: engine)) ?? source, offset: offset,
-                               edge: starting ? .start : .end, mode: mode, container: container,
-                               first: starting && seam == .zero, last: !starting && seam == mapping.duration))
+            let grid = MulticamBoundary.Grid(media: try isolatedPicture(source, using: engine), offset: offset,
+                                             edge: starting ? .start : .end, mode: mode, container: container,
+                                             first: starting && seam == .zero, last: !starting && seam == mapping.duration)
+            grids.append(grid.including(try continuousInput(mapping.picture, with: span)))
         }
+        var checksSamples = false
         if sound, let (span, offset) = try lane(mapping.audio), let source = media[span.source],
            let index = span.stream, let track = source.audio.first(where: { $0.stream.index == index }) {
             let selector = CutEngine(cancelled: cancelled, tracks: .audio, audioStream: index)
             let selected = try selector.selectedMedia(source)
-            if !track.stream.isPCM && !selector.supportsAACEdits(track.stream, container: container) {
-                grids.append(.init(times: selector.audioPacketBoundaries(selected, starting: starting), offset: offset))
-            } else if grids.isEmpty, track.stream.sampleRate > 0 {
-                // Sample-accurate sound has no picture to follow. Offer the neighbouring samples.
+            let join = try continuousInput(mapping.audio, with: span)
+            let first = starting ? seam == .zero : span.output.from == .zero
+            let last = starting ? span.output.to == mapping.duration : seam == mapping.duration
+            let sampleCopy = track.stream.isPCM || selector.supportsAACEdits(track.stream, container: container)
+            let wholeCrop = first && last && (supportsOpusTrim(track, media: selected, container: container)
+                || selector.supportsMP3Crop(track.stream, media: selected, container: container))
+            if sampleCopy || wholeCrop {
                 let rate = track.stream.sampleRate
-                let sample = try selected.origin.adding(edge.at.subtracting(offset)).roundedToSamples(rate)
-                let times = try [-1, 0, 1].compactMap { delta -> RationalTime? in
-                    let (moved, overflow) = sample.addingReportingOverflow(Int64(delta))
-                    return overflow ? nil : try RationalTime(numerator: moved, denominator: Int64(rate)).subtracting(selected.origin)
+                guard rate > 0 else { return [] }
+                let origin = sampleCopy ? selected.origin : .zero
+                checksSamples = true
+                if grids.isEmpty {
+                    let sample = try origin.adding(edge.at.subtracting(offset)).roundedToSamples(rate)
+                    let times = try [-1, 0, 1].compactMap { delta -> RationalTime? in
+                        let (moved, overflow) = sample.addingReportingOverflow(Int64(delta))
+                        return overflow ? nil : try RationalTime(numerator: moved, denominator: Int64(rate)).subtracting(origin)
+                    }
+                    grids.append(MulticamBoundary.Grid(times: times, offset: offset).including(join))
                 }
-                grids.append(.init(times: times, offset: offset))
+            } else {
+                let needsHistory = ["aac", "mp3", "opus", "vorbis"].contains(track.stream.codec)
+                let times: [RationalTime]
+                if needsHistory, starting || !last || !track.presentationEdits.isEmpty {
+                    // A discontinuous internal edge cannot restore decoder history.
+                    // Only a continuous join or an original outer edge can work.
+                    times = starting ? (first ? [.zero] : []) : (last ? [track.end] : [])
+                } else {
+                    var packets = track.packets.compactMap { packet in
+                        packet.time >= .zero && packet.time <= track.end ? packet.time : nil
+                    }
+                    if starting, first, packets.first != .zero { packets.insert(.zero, at: 0) }
+                    if !starting, packets.last != track.end, let tail = track.packets.last,
+                       last || (tail.discardSamples == 0 && (try? tail.time.adding(tail.duration)) == track.end) {
+                        packets.append(track.end)
+                    }
+                    times = packets
+                }
+                grids.append(MulticamBoundary.Grid(times: times, offset: offset).including(join))
             }
         }
         let extents = try grids.compactMap { try $0.extent() }
         guard !grids.isEmpty, extents.count == grids.count,
-              let lower = extents.map(\.lowerBound).min(), let upper = extents.map(\.upperBound).max() else { return [] }
-        // Each attempt resolves the whole program.
-        var attempts = (earlier: 0, later: 0)
-        return try MulticamBoundary.candidates(near: edge.at, among: grids, within: lower...upper,
-                                               cancelled: cancelled ?? { false }) { candidate in
-            guard candidate != edge.at else { return false }
-            if candidate < edge.at { attempts.earlier += 1 } else { attempts.later += 1 }
-            guard (candidate < edge.at ? attempts.earlier : attempts.later) <= 48 else { return false }
+              let lower = extents.map(\.lowerBound).max(), let upper = extents.map(\.upperBound).min(),
+              lower <= upper else { return [] }
+
+        // The active microphone can change when a range crosses a switch. Inspect
+        // the widest feasible occurrence once, then reject off-clock candidates
+        // without rebuilding the assembly for each picture or packet.
+        let clockPlan: MulticamPlan
+        if checksSamples, let grid = grids.first {
+            clockPlan = try grid.expandedPlan(from: edge.at, toward: starting ? max(.zero, lower) : upper,
+                                              original: mapping) { candidate in
+                do { return try adjusting(edge.range, edge.boundary, candidate) }
+                catch let issue as CutError where issue.code != "cancelled" && issue.code != "source_changed" {
+                    return nil
+                }
+            }
+        } else { clockPlan = mapping }
+        var decisions: [MulticamInterval] = []
+        if checksSamples {
+            for interval in clockPlan.intervals where interval.assemblyIndex == edge.range - 1 {
+                if let previous = decisions.last, previous.group.to != interval.group.from { break }
+                decisions.append(interval)
+            }
+        }
+        let neighbor = mapping.audio.first {
+            starting ? $0.output.from < seam && seam <= $0.output.to : $0.output.from <= seam && seam < $0.output.to
+        }
+        let neighborTime = try neighbor.map { try $0.input.from.adding(seam.subtracting($0.output.from)) }
+        let audioEngine = CutEngine(cancelled: cancelled)
+        func admitsSample(_ candidate: RationalTime) throws -> Bool {
+            let index = decisions.lowerBound { starting ? $0.group.to > candidate : $0.group.to >= candidate }
+            guard decisions.indices.contains(index) else { return true }
+            let decision = decisions[index]
+            guard decision.group.from <= candidate, let selected = decision.audio, let source = media[selected.source],
+                  let track = source.audio.first(where: { $0.stream.index == selected.stream }) else { return true }
+            let spanIndex = clockPlan.audio.lowerBound { $0.output.to > decision.output.from }
+            guard clockPlan.audio.indices.contains(spanIndex) else { return true }
+            let span = clockPlan.audio[spanIndex]
+            let local = try span.input.from.adding(decision.output.from.subtracting(span.output.from))
+                .adding(candidate.subtracting(decision.group.from))
+            if neighbor?.source == selected.source, neighbor?.stream == selected.stream, local == neighborTime { return true }
+            let rate = Int64(track.stream.sampleRate)
+            guard rate > 0 else { return false }
+            let sampleCopy = track.stream.isPCM || audioEngine.supportsAACEdits(track.stream, container: container)
+            if !sampleCopy { return true } // Packet grids or a replan validate other codecs.
+            let output = starting ? seam : try seam.adding(candidate.subtracting(edge.at))
+            return try rate.isMultiple(of: source.origin.adding(local).denominator) && rate.isMultiple(of: output.denominator)
+        }
+
+        return try MulticamBoundary.search(near: edge.at, among: grids, within: lower...upper,
+                                           cancelled: cancelled ?? { false }) { candidate in
+            if checksSamples, try !admitsSample(candidate) { return .skip }
             let plan: MulticamPlan
             do {
                 plan = try adjusting(edge.range, edge.boundary, candidate)
-            } catch let issue as CutError where issue.code != "cancelled" {
-                return false
+            } catch let issue as CutError where issue.code != "cancelled" && issue.code != "source_changed" {
+                // The requested edge is inside the group. Once it passes the
+                // opposite range edge or the group extent, farther times are outside too.
+                if issue.code == "invalid_range" || issue.code == "invalid_multicam_project" { return .stopDirection }
+                return .skip
             }
-            guard output(of: candidate, in: plan) != nil else { return false }
-            guard let issue = try failure(plan) else { return true }
+            guard output(of: candidate, in: plan) != nil else { return .skip }
+            guard let issue = try failure(plan) else { return .accept }
             if issue.code == "cancelled" || issue.code == "source_changed" { throw issue }
-            // Sound is checked before picture, so the first fault of the moved program can lie
-            // anywhere. Only a located fault at another boundary leaves this edge acceptable.
-            guard let context = issue.multicam, issue.boundary != nil else { return false }
-            return context.edge.map { $0.range != edge.range || $0.boundary != edge.boundary } ?? true
+            // A located fault at another boundary leaves this edge acceptable.
+            guard let context = issue.multicam, issue.boundary != nil else { return .skip }
+            if let other = context.edge, other.range == edge.range, other.boundary == edge.boundary { return .skip }
+            return .accept
         }
     }
 

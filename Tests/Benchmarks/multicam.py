@@ -37,7 +37,7 @@ def make_fixture(directory, duration):
     step = duration // (SWITCH_COUNT + 1)
     split = 10 * step + step // 2
     project = {
-        "schemaVersion": 1, "kind": "multicam", "referenceAngle": "wide",
+        "format": "mpcut", "schemaVersion": 1, "kind": "multicam", "referenceAngle": "wide",
         "range": {"from": "0", "to": str(duration)},
         "angles": [{"id": angle, "file": f"{angle}.mov", "offset": "0"} for angle in ANGLE_IDS],
         "audioSources": [{"id": "lav", "file": "lav.wav", "offset": "0"}],
@@ -46,7 +46,7 @@ def make_fixture(directory, duration):
                      for number in range(SWITCH_COUNT + 1)],
         "assembly": [{"from": str(split), "to": str(duration)}, {"from": "0", "to": str(split)}],
     }
-    project_path = directory / "benchmark.multicam.json"
+    project_path = directory / "benchmark.cut"
     project_path.write_text(json.dumps(project, indent=2) + "\n")
     return project_path
 
@@ -143,20 +143,23 @@ def review_frames(cli, project, output):
 
 def benchmark(cli, project, runs, scratch):
     assets = [project.parent / f"{angle}.mov" for angle in ANGLE_IDS] + [project.parent / "lav.wav"]
-    sidecars = [path.with_name(path.name + ".mpcut") for path in assets]
+    sidecars = [path.with_name(path.name + ".cutdb") for path in assets]
     if any(path.exists() for path in sidecars):
         raise ValueError("benchmark requires generated source files without sidecars")
     output = scratch / "program.mov"
     export = ("export", "--project", project, "--mode", "copy", "--output", output)
-    first_report, first_metrics = timed(cli, *export, "--dry-run")
+    first_report, first_metrics = timed(cli, *export, "--dry-run", "--no-sidecar")
     if output.exists():
         raise AssertionError("preflight created an output file")
     fresh = []
     for _ in range(runs):
-        report, metrics = timed(cli, *export, "--dry-run")
+        report, metrics = timed(cli, *export, "--dry-run", "--no-sidecar")
         if report != first_report:
             raise AssertionError("fresh preflight is inconsistent")
         fresh.append(metrics)
+
+    if any(path.exists() for path in sidecars):
+        raise AssertionError("uncached preflight created a sidecar")
 
     build = {}
     for asset in assets:

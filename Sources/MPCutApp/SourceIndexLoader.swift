@@ -13,15 +13,23 @@ final class SourceIndexLoader {
 
     final class Index: Sendable {
         let ordinary: MediaInfo
+
+        init(ordinary: MediaInfo) {
+            self.ordinary = ordinary
+        }
+
+        var storageBytes: Int {
+            ordinary.indexStorageBytes
+        }
+    }
+
+    final class MulticamIndex: Sendable {
+        let ordinary: MediaInfo
         let multicam: MediaInfo
 
         init(ordinary: MediaInfo, multicam: MediaInfo) {
             self.ordinary = ordinary
             self.multicam = multicam
-        }
-
-        var storageBytes: Int {
-            ordinary.indexStorageBytes + (multicam.multicamClockOffset == .zero ? 0 : multicam.indexStorageBytes)
         }
     }
 
@@ -31,7 +39,8 @@ final class SourceIndexLoader {
             let url: URL
             let sidecars: Bool
             let index: Index
-            let cost: Int
+            var cost: Int
+            var multicam: MulticamIndex?
         }
 
         private let lock = NSLock()
@@ -66,6 +75,26 @@ final class SourceIndexLoader {
             }
         }
 
+        func multicam(for index: Index) -> MulticamIndex? {
+            lock.withLock { entries.first { $0.index === index }?.multicam }
+        }
+
+        func store(_ converted: MulticamIndex, for index: Index) {
+            let extra = converted.multicam.indexStorageBytes
+            lock.withLock {
+                guard let position = entries.firstIndex(where: { $0.index === index }),
+                      entries[position].multicam == nil, extra <= byteLimit - entries[position].cost else { return }
+                var entry = entries.remove(at: position)
+                while bytes > byteLimit - extra {
+                    bytes -= entries.removeFirst().cost
+                }
+                entry.multicam = converted
+                entry.cost += extra
+                bytes += extra
+                entries.append(entry)
+            }
+        }
+
         func store(_ index: Index, for key: Key) {
             let cost = index.storageBytes
             guard cost <= byteLimit else { return }
@@ -90,6 +119,11 @@ final class SourceIndexLoader {
         var fraction = 0.0
     }
 
+    private final class Conversion {
+        let token = EditCancellation()
+        var completions: [UUID: (Result<MulticamIndex, Error>) -> Void] = [:]
+    }
+
     private struct Subscriber {
         let progress: (Double) -> Void
         let completion: (Result<Index, Error>) -> Void
@@ -100,6 +134,7 @@ final class SourceIndexLoader {
     private let indexes = OperationQueue()
     private let completed: CompletedIndexes
     private var requests: [Key: Request] = [:]
+    private var conversions: [ObjectIdentifier: Conversion] = [:]
 
     init(completedIndexByteLimit: Int = 64 * 1_024 * 1_024) {
         completed = CompletedIndexes(byteLimit: completedIndexByteLimit)
@@ -135,18 +170,74 @@ final class SourceIndexLoader {
     }
 
     func admit(_ key: Key, progress: @escaping (Double) -> Void = { _ in },
-               completion: @escaping (Result<Index, Error>) -> Void) -> () -> Void {
+               completion: @escaping (Result<MulticamIndex, Error>) -> Void) -> () -> Void {
         var cancel: (() -> Void)?
+        let convert: (Result<Index, Error>) -> Void = { result in
+            switch result {
+            case let .failure(error): completion(.failure(error))
+            case let .success(index): cancel = self.convert(index, key: key, completion: completion)
+            }
+        }
         cancel = load(key, progress: progress) { result in
             // Some containers do not declare a usable duration in the header.
             if case let .failure(error as PreviewUnavailable) = result {
                 cancel = self.load(.init(url: key.url, sidecars: key.sidecars, preview: false, identity: error.identity),
-                                   progress: progress, completion: completion)
+                                   progress: progress, completion: convert)
             } else {
-                completion(result)
+                convert(result)
             }
         }
         return { cancel?() }
+    }
+
+    private func convert(_ index: Index, key: Key,
+                         completion: @escaping (Result<MulticamIndex, Error>) -> Void) -> () -> Void {
+        let ordinary = index.ordinary
+        if ordinary.hasFullEditIndex, ordinary.multicamSourceOffset == .zero {
+            completion(.success(MulticamIndex(ordinary: ordinary, multicam: ordinary)))
+            return {}
+        }
+        if let warm = completed.multicam(for: index) {
+            completion(.success(warm))
+            return {}
+        }
+        let id = ObjectIdentifier(index)
+        let subscriber = UUID()
+        if let conversion = conversions[id] {
+            conversion.completions[subscriber] = completion
+        } else {
+            let conversion = Conversion()
+            conversion.completions[subscriber] = completion
+            conversions[id] = conversion
+            let token = conversion.token
+            let queue = ordinary.hasFullEditIndex ? indexes : probes
+            queue.addOperation { [weak self] in
+                guard !token.isCancelled else { return }
+                let result = Result {
+                    let engine = CutEngine(cancelled: { token.isCancelled }, useSidecar: key.sidecars)
+                    let multicam = try engine.multicamClock(ordinary)
+                    guard try SourceIdentity(key.url) == ordinary.identity else {
+                        throw CutError(code: "source_changed", message: "The recording changed while loading. Relink it to continue.")
+                    }
+                    return MulticamIndex(ordinary: ordinary, multicam: multicam)
+                }
+                Task { @MainActor [weak self] in
+                    guard let self, let current = self.conversions[id], current.token === token else { return }
+                    self.conversions[id] = nil
+                    if case let .success(converted) = result, ordinary.hasFullEditIndex {
+                        self.completed.store(converted, for: index)
+                    }
+                    for completion in current.completions.values { completion(result) }
+                }
+            }
+        }
+        return { [weak self] in
+            guard let self, let conversion = self.conversions[id],
+                  conversion.completions.removeValue(forKey: subscriber) != nil,
+                  conversion.completions.isEmpty else { return }
+            conversion.token.cancel()
+            self.conversions[id] = nil
+        }
     }
 
     func load(_ key: Key, progress: @escaping (Double) -> Void = { _ in },
@@ -208,7 +299,7 @@ final class SourceIndexLoader {
                     guard key.preview || ordinary.hasFullEditIndex else {
                         throw CutError(code: "incomplete_index", message: "The recording has no complete editing index.")
                     }
-                    let index = Index(ordinary: ordinary, multicam: try engine.multicamClock(ordinary))
+                    let index = Index(ordinary: ordinary)
                     guard ordinary.identity == identity, try SourceIdentity(key.url) == identity else {
                         throw CutError(code: "source_changed", message: "The recording changed while loading. Relink it to continue.")
                     }

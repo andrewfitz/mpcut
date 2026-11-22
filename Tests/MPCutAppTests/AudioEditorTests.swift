@@ -156,6 +156,33 @@ final class AudioEditorTests: XCTestCase {
     }
 
     @MainActor
+    func testCSVRepeatInheritsPauseProtectionAndCanChangeIndependently() async throws {
+        let url = try recording()
+        let csv = url.appendingPathExtension("csv")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: csv)
+        }
+        let model = EditorModel()
+        defer { model.endSession() }
+        model.useAnalysisSidecars = false
+        model.minimumPause = 0.5
+        model.importFiles([url])
+        try await wait { model.canEdit }
+        model.scanForSilence()
+        try await wait { model.pauseAnalysisReady }
+        model.seek(1.5)
+        model.protectCurrentPause()
+        try "0,3\n0,3".write(to: csv, atomically: true, encoding: .utf8)
+        model.dropOnViewer([csv])
+        try await wait { model.canEdit }
+        XCTAssertEqual(model.pausePlan.map(\.isProtected), [true, true])
+        model.seek(4.5)
+        model.protectCurrentPause()
+        XCTAssertEqual(model.pausePlan.map(\.isProtected), [true, false])
+    }
+
+    @MainActor
     func testKeepFromCutPreviewTargetsTheReviewedPause() async throws {
         let url = try recording()
         defer { try? FileManager.default.removeItem(at: url) }

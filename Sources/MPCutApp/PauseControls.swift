@@ -11,7 +11,7 @@ struct PauseControls: View {
             SectionHeading("Detection")
             if editor.audioTracks.count > 1 {
                 InspectorRow("Analyze track", labelWidth: 96) {
-                    Picker("Analyze track", selection: $editor.analysisTrack) {
+                    Picker("Analyze track", selection: Binding(get: { editor.analysisTrack }, set: editor.chooseAnalysisTrack)) {
                         ForEach(Array(editor.audioTracks.enumerated()), id: \.offset) { index, stream in
                             Text("Track \(index + 1) · \(stream.codec) · \(stream.language)").tag(index)
                         }
@@ -46,7 +46,7 @@ struct PauseControls: View {
             PauseSetting(label: "Minimum pause", unit: "s", value: $editor.minimumPause,
                          minimum: 1.0 / Double(AudioWaveform.rate), step: 0.1)
             PauseSetting(label: "Leave per pause", unit: "s", value: $editor.leavePause, minimum: 0, step: 0.1)
-            Button("Use Marked Room Tone", action: editor.useRoomTone)
+            Button("Use Marked Room Tone") { editor.useRoomTone() }
                 .disabled(!editor.canUseRoomTone)
                 .help("Use the marked audio to set a manual threshold for each recording in the selection.")
             Divider().padding(.vertical, 2)

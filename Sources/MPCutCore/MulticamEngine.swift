@@ -19,6 +19,22 @@ public struct MulticamDiagnostic: Codable, Sendable {
     public let edge: MulticamEdge?
 }
 
+extension CutError {
+    /// Report an expanded edit-list row against its original input clip.
+    package func reportingInputClip(_ number: Int) -> CutError {
+        let context = multicam.map { context in
+            MulticamDiagnostic(source: context.source, group: context.group, sourceTime: context.sourceTime,
+                               output: context.output, at: context.at, edge: context.edge.map {
+                                   MulticamEdge(range: number, boundary: $0.boundary, at: $0.at)
+                               })
+        }
+        var issue = CutError(code: code, message: message, segment: number, boundary: boundary,
+                             nearest: nearest, track: track, multicam: context)
+        issue.alternatives = alternatives
+        return issue
+    }
+}
+
 /// The plan that results from moving one edge of a one-based assembly range to a group time.
 public typealias MulticamEdgePlanner = (_ range: Int, _ boundary: String, _ time: RationalTime) throws -> MulticamPlan
 
@@ -304,6 +320,10 @@ public struct MulticamEngine: Sendable {
             _ = try groupCoverage(of: bySource[span.source]!, source: span.source, offset: offset)
         }
 
+        guard mode != .encode || ReencodeAudio.movieCases.contains(settings.audio) else {
+            throw CutError(code: "unsupported_audio",
+                           message: "Multicam conversion writes AAC or PCM sound. Choose auto, copy, aac, pcm or remove.")
+        }
         let convertAudio = useAudio && mode == .encode && [.aac, .pcm].contains(settings.audio)
         var sound: ResolvedEdit?
         if useAudio && !convertAudio {

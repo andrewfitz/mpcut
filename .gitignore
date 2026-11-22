@@ -3,3 +3,7 @@
 dist/
 .DS_Store
 __pycache__/
+*.cutdb
+*.cutdb-journal
+*.cutdb-wal
+*.cutdb-shm

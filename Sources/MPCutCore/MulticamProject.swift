@@ -1,46 +1,5 @@
 import Foundation
 
-private struct MulticamField: CodingKey {
-    let stringValue: String
-    var intValue: Int? { nil }
-
-    init(stringValue: String) { self.stringValue = stringValue }
-    init?(intValue: Int) { return nil }
-
-    static func rejectUnknown<K: CodingKey>(_ keys: K.Type, in decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: Self.self)
-        if let field = container.allKeys.map(\.stringValue).sorted().first(where: { K(stringValue: $0) == nil }) {
-            throw CutError(code: "invalid_multicam_project",
-                           message: "Unknown field ‘\(field)’ in \(location(decoder.codingPath))")
-        }
-    }
-
-    /// A JSON path such as `switches[1].at`.
-    static func location(_ path: [CodingKey]) -> String {
-        let text = path.reduce(into: "") { text, key in
-            if let index = key.intValue {
-                text += "[\(index)]"
-            } else {
-                text += (text.isEmpty ? "" : ".") + key.stringValue
-            }
-        }
-        return text.isEmpty ? "the project root" : text
-    }
-
-    /// A malformed time is a fault in the project document, reported with its JSON location.
-    static func time<K: CodingKey>(_ values: KeyedDecodingContainer<K>, _ key: K,
-                                   default fallback: String? = nil) throws -> RationalTime {
-        let text = try values.decodeIfPresent(String.self, forKey: key) ?? fallback
-            ?? values.decode(String.self, forKey: key)
-        do {
-            return try RationalTime(parsing: text)
-        } catch {
-            throw CutError(code: "invalid_multicam_project",
-                           message: "Invalid timestamp ‘\(text)’ in \(location(values.codingPath + [key]))")
-        }
-    }
-}
-
 public struct MulticamRange: Codable, Hashable, Sendable {
     public var from: RationalTime
     public var to: RationalTime
@@ -57,9 +16,9 @@ public struct MulticamRange: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey { case from, to }
 
     public init(from decoder: Decoder) throws {
-        try MulticamField.rejectUnknown(CodingKeys.self, in: decoder)
+        try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(from: try MulticamField.time(values, .from), to: try MulticamField.time(values, .to))
+        self.init(from: try ProjectField.time(values, .from), to: try ProjectField.time(values, .to))
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -88,11 +47,11 @@ public struct MulticamSource: Codable, Hashable, Sendable, Identifiable {
     private enum CodingKeys: String, CodingKey { case id, file, offset, name, audioStream }
 
     public init(from decoder: Decoder) throws {
-        try MulticamField.rejectUnknown(CodingKeys.self, in: decoder)
+        try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
         let values = try decoder.container(keyedBy: CodingKeys.self)
         self.init(id: try values.decode(String.self, forKey: .id),
                   file: try values.decode(String.self, forKey: .file),
-                  offset: try MulticamField.time(values, .offset, default: "0"),
+                  offset: try ProjectField.time(values, .offset, default: "0"),
                   name: try values.decodeIfPresent(String.self, forKey: .name),
                   audioStream: try values.decodeIfPresent(Int.self, forKey: .audioStream))
     }
@@ -119,7 +78,7 @@ public struct MulticamAudioSelection: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey { case source, stream }
 
     public init(from decoder: Decoder) throws {
-        try MulticamField.rejectUnknown(CodingKeys.self, in: decoder)
+        try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
         let values = try decoder.container(keyedBy: CodingKeys.self)
         self.init(source: try values.decode(String.self, forKey: .source),
                   stream: try values.decode(Int.self, forKey: .stream))
@@ -135,7 +94,7 @@ public enum MulticamAudioPolicy: Codable, Hashable, Sendable {
     private enum Mode: String, Codable { case fixed, follow, none }
 
     public init(from decoder: Decoder) throws {
-        try MulticamField.rejectUnknown(CodingKeys.self, in: decoder)
+        try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
         let values = try decoder.container(keyedBy: CodingKeys.self)
         let mode = try values.decode(Mode.self, forKey: .mode)
         if mode == .fixed {
@@ -177,9 +136,9 @@ public struct MulticamSwitch: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey { case at, angle, audio }
 
     public init(from decoder: Decoder) throws {
-        try MulticamField.rejectUnknown(CodingKeys.self, in: decoder)
+        try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(at: try MulticamField.time(values, .at),
+        self.init(at: try ProjectField.time(values, .at),
                   angle: try values.decode(String.self, forKey: .angle),
                   audio: try values.decodeIfPresent(MulticamAudioSelection.self, forKey: .audio))
     }
@@ -193,7 +152,7 @@ public struct MulticamSwitch: Codable, Hashable, Sendable {
 }
 
 public struct MulticamProject: Codable, Equatable, Sendable {
-    public static let schemaVersion = 1
+    public static let schemaVersion = CutProject.schemaVersion
     public var referenceAngle: String
     public var range: MulticamRange
     public var angles: [MulticamSource]
@@ -217,17 +176,20 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, kind, referenceAngle, range, angles, audioSources, audio, switches, assembly
+        case format, schemaVersion, kind, referenceAngle, range, angles, audioSources, audio, switches, assembly, history
     }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        guard try values.decode(String.self, forKey: .format) == CutProject.format else {
+            throw Self.invalid("Expected an MPCut project document")
+        }
         let version = try values.decode(Int.self, forKey: .schemaVersion)
         guard version == Self.schemaVersion else {
             throw CutError(code: "unsupported_multicam_version",
                            message: "Multicam schema version \(version) is unsupported")
         }
-        try MulticamField.rejectUnknown(CodingKeys.self, in: decoder)
+        try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
         guard try values.decode(String.self, forKey: .kind) == "multicam" else {
             throw Self.invalid("Expected a multicam project")
         }
@@ -244,6 +206,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         try validate()
         var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(CutProject.format, forKey: .format)
         try values.encode(Self.schemaVersion, forKey: .schemaVersion)
         try values.encode("multicam", forKey: .kind)
         try values.encode(referenceAngle, forKey: .referenceAngle)
@@ -262,115 +225,23 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     public static let maximumFileSize = 64 * 1024 * 1024
 
     public static func load(from url: URL) throws -> Self {
-        let data: Data
-        do {
-            // A recording passed by mistake must not be read into memory whole.
-            if let size = try url.resolvingSymlinksInPath().resourceValues(forKeys: [.fileSizeKey]).fileSize,
-               size > maximumFileSize {
-                throw invalid("Multicam project exceeds the 64 MB limit")
-            }
-            data = try Data(contentsOf: url)
-        } catch let error as CutError {
-            throw error
-        } catch {
-            throw CutError(code: "multicam_project_read_failed",
-                           message: "Could not read \(url.path): \(error.localizedDescription)")
-        }
-        return try decode(data)
+        try ProjectFile.read(Self.self, from: url, multicam: true)
     }
 
-    /// Decode a project document that was read from a file or from standard input.
     public static func decode(_ data: Data) throws -> Self {
-        do {
-            guard data.count <= maximumFileSize else {
-                throw invalid("Multicam project exceeds the 64 MB limit")
-            }
-            guard !data.contains(0), String(data: data, encoding: .utf8) != nil else {
-                throw invalid("Multicam project must contain a UTF-8 JSON object")
-            }
-            let project = try JSONDecoder().decode(Self.self, from: data)
-            if let issue = jsonInputIssue(data) {
-                throw invalid("Multicam project \(issue)")
-            }
-            return project
-        } catch let error as CutError {
-            throw error
-        } catch let error as DecodingError {
-            throw invalid("Invalid Multicam JSON: \(error)")
-        }
+        try ProjectFile.decode(Self.self, data: data, multicam: true)
     }
 
     public func save(to url: URL) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        var data = try encoder.encode(self)
-        data.append(0x0A)
-        let destination = Self.canonicalFileURL(url)
-        let destinationIdentity = Self.fileIdentity(destination)
-        for source in sources {
-            let location = sourceURL(for: source, relativeTo: url)
-            // An unavailable directory prefix has no source file to protect.
-            guard !location.path.split(separator: "/").contains("..") else { continue }
-            let media = Self.canonicalFileURL(location)
-            guard media != destination,
-                  destinationIdentity.map({ $0 != Self.fileIdentity(media) }) ?? true else {
-                throw CutError(code: "multicam_project_source_collision",
-                               message: "Project destination overlaps source ‘\(source.id)’ at \(media.path)")
-            }
-        }
-        do {
-            try data.write(to: url, options: .atomic)
-        } catch {
-            throw CutError(code: "multicam_project_write_failed",
-                           message: "Could not save \(url.path): \(error.localizedDescription)")
-        }
+        try ProjectFile.write(self, to: url, sources: sources.map { ($0.id, $0.file) }, multicam: true)
     }
 
     public func sourceURL(for source: MulticamSource, relativeTo projectURL: URL) -> URL {
-        sourceURL(for: source, in: projectURL.deletingLastPathComponent())
+        sourceURL(for: source, in: ProjectFile.directory(of: projectURL))
     }
 
     func sourceURL(for source: MulticamSource, in directory: URL) -> URL {
-        let path = source.file.hasPrefix("/") ? source.file :
-            directory.path + "/" + source.file
-        let components = path.split(separator: "/")
-        guard let parent = components.lastIndex(of: "..") else {
-            return URL(fileURLWithPath: path).standardizedFileURL
-        }
-        let prefix = "/" + components[...parent].joined(separator: "/")
-        if let resolved = realpath(prefix, nil) {
-            defer { free(resolved) }
-            let path = String(cString: resolved) + "/" + components[(parent + 1)...].joined(separator: "/")
-            return URL(fileURLWithPath: path).standardizedFileURL
-        }
-        // Preserve the unresolved traversal for diagnostics and missing-source
-        // checks. Standardizing here could select another recording.
-        var url = URLComponents()
-        url.scheme = "file"
-        url.host = ""
-        url.path = path
-        return url.url!
-    }
-
-    private static func canonicalFileURL(_ url: URL) -> URL {
-        let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
-        if (try? resolved.resourceValues(forKeys: [.isAliasFileKey]).isAliasFile) == true,
-           let target = try? URL(resolvingAliasFileAt: resolved, options: [.withoutUI, .withoutMounting]) {
-            return target.standardizedFileURL.resolvingSymlinksInPath()
-        }
-        return resolved
-    }
-
-    private struct FileIdentity: Equatable {
-        let device: NSNumber
-        let inode: NSNumber
-    }
-
-    private static func fileIdentity(_ url: URL) -> FileIdentity? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let device = attributes[.systemNumber] as? NSNumber,
-              let inode = attributes[.systemFileNumber] as? NSNumber else { return nil }
-        return .init(device: device, inode: inode)
+        ProjectFile.sourceURL(file: source.file, in: directory)
     }
 
     public func validate() throws {
@@ -383,8 +254,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
                   !source.file.isEmpty, !source.file.contains("\0") else {
                 throw Self.invalid("Each source needs a nonempty ID and file path")
             }
-            let endpoint = source.file.split(separator: "/").last
-            guard !source.file.hasSuffix("/"), endpoint != ".", endpoint != ".." else {
+            guard ProjectFile.validMediaPath(source.file) else {
                 throw Self.invalid("Source ‘\(source.id)’ must name a recording file")
             }
             guard sourceIDs.insert(source.id).inserted else {
@@ -423,11 +293,13 @@ public struct MulticamProject: Codable, Equatable, Sendable {
 
     private func validateRanges(_ ranges: [MulticamRange]) throws {
         guard !ranges.isEmpty else { throw Self.invalid("Assembly must contain at least one range") }
+        var duration = RationalTime.zero
         for (index, requested) in ranges.enumerated() {
             guard range.contains(requested.from), requested.from < requested.to,
                   requested.to <= range.to else {
                 throw Self.invalid("Assembly range \(index + 1) (\(requested.from)–\(requested.to)) lies outside the group or is empty")
             }
+            duration = try duration.adding(requested.to.subtracting(requested.from))
         }
     }
 
@@ -580,24 +452,59 @@ public struct MulticamPlan: Codable, Equatable, Sendable {
     }
 }
 
+package enum JSONInputLocation: Hashable, Sendable {
+    case key(String)
+    case index(Int)
+}
+
+private struct JSONInputContainer {
+    var keys: Set<String>?
+    var expectsKey: Bool
+    var location: JSONInputLocation?
+
+    init(object: Bool) {
+        keys = object ? [] : nil
+        expectsKey = object
+        location = object ? nil : .index(0)
+    }
+}
+
 /// Check syntax that JSONDecoder accepts silently. Call after decoding syntactically valid UTF-8.
-package func jsonInputIssue(_ data: Data) -> String? {
+/// The observer receives fractional and exponent spellings, which Foundation may round when decoding.
+package func jsonInputIssue(_ data: Data, integerNumbersOnly: Bool = false,
+                            inspectDecimal: (([JSONInputLocation], ArraySlice<UInt8>) -> Void)? = nil) -> String? {
     let bytes = [UInt8](data)
-    var objects: [(keys: Set<String>, expectsKey: Bool)?] = []
+    var containers = [JSONInputContainer]()
     var index = 0
     var previous: UInt8?
     while index < bytes.count {
         let byte = bytes[index]
         switch byte {
-        case UInt8(ascii: "{"): objects.append((keys: [], expectsKey: true))
-        case UInt8(ascii: "["): objects.append(nil)
+        case UInt8(ascii: "-"), UInt8(ascii: "0")...UInt8(ascii: "9"):
+            if integerNumbersOnly || inspectDecimal != nil {
+                let start = index
+                while index + 1 < bytes.count,
+                      ![9, 10, 13, 32, 44, 93, 125].contains(bytes[index + 1]) { index += 1 }
+                let token = bytes[start...index]
+                if token.contains(UInt8(ascii: ".")) || token.contains(UInt8(ascii: "e")) || token.contains(UInt8(ascii: "E")) {
+                    if integerNumbersOnly, integralJSONParts(token) == nil {
+                        return "contains a non-integer JSON number"
+                    }
+                    inspectDecimal?(containers.compactMap(\.location), token)
+                }
+            }
+        case UInt8(ascii: "{"): containers.append(JSONInputContainer(object: true))
+        case UInt8(ascii: "["): containers.append(JSONInputContainer(object: false))
         case UInt8(ascii: "}"), UInt8(ascii: "]"):
             if previous == UInt8(ascii: ",") {
                 return "contains a trailing comma"
             }
-            _ = objects.popLast()
+            _ = containers.popLast()
         case UInt8(ascii: ","):
-            if objects.last??.keys != nil { objects[objects.count - 1]?.expectsKey = true }
+            if let last = containers.indices.last {
+                if containers[last].keys != nil { containers[last].expectsKey = true }
+                else if case let .index(item) = containers[last].location { containers[last].location = .index(item + 1) }
+            }
         case UInt8(ascii: "\""):
             let start = index
             index += 1
@@ -605,12 +512,13 @@ package func jsonInputIssue(_ data: Data) -> String? {
                 index += bytes[index] == UInt8(ascii: "\\") ? 2 : 1
             }
             guard index < bytes.count else { return nil }
-            if objects.last??.expectsKey == true {
+            if let last = containers.indices.last, containers[last].expectsKey {
                 let key = (try? JSONDecoder().decode(String.self, from: Data(bytes[start...index]))) ?? ""
-                if objects[objects.count - 1]?.keys.insert(key).inserted == false {
+                if containers[last].keys?.insert(key).inserted == false {
                     return "repeats the field '\(key)'"
                 }
-                objects[objects.count - 1]?.expectsKey = false
+                containers[last].expectsKey = false
+                containers[last].location = .key(key)
             }
         default: break
         }
@@ -618,4 +526,35 @@ package func jsonInputIssue(_ data: Data) -> String? {
         index += 1
     }
     return nil
+}
+
+/// Return the exact integer represented by a previously validated JSON number token.
+package func exactJSONInteger(_ number: ArraySlice<UInt8>) -> Int? {
+    guard let (coefficient, last, zeros) = integralJSONParts(number) else { return nil }
+    guard let last, let first = coefficient.firstIndex(where: { (49...57).contains($0) }) else { return 0 }
+    // An Int on the supported 64-bit platforms has at most 19 decimal digits.
+    guard zeros <= 19, last - first + zeros <= 19 else { return nil }
+    var digits = String(decoding: coefficient[first...last].filter { $0 != UInt8(ascii: ".") }, as: UTF8.self)
+    digits += String(repeating: "0", count: zeros)
+    if number.first == UInt8(ascii: "-") { digits.insert("-", at: digits.startIndex) }
+    return Int(digits)
+}
+
+/// Use the original significand and exponent even when floating-point decoding loses precision.
+private func integralJSONParts(_ number: ArraySlice<UInt8>) -> (ArraySlice<UInt8>, Int?, Int)? {
+    let exponentIndex = number.firstIndex { $0 == UInt8(ascii: "e") || $0 == UInt8(ascii: "E") }
+    let coefficient = number[..<(exponentIndex ?? number.endIndex)]
+    guard let lastNonzero = coefficient.lastIndex(where: { (49...57).contains($0) }) else { return (coefficient, nil, 0) }
+    let decimal = coefficient.firstIndex(of: UInt8(ascii: "."))
+    let fractionalDigits = decimal.map { coefficient.endIndex - $0 - 1 } ?? 0
+    let trailingZeros = coefficient.endIndex - lastNonzero - 1 - (decimal.map { $0 > lastNonzero ? 1 : 0 } ?? 0)
+    var exponent = 0
+    if let exponentIndex {
+        let text = String(decoding: number[(exponentIndex + 1)...], as: UTF8.self)
+        exponent = Int(text) ?? (text.hasPrefix("-") ? Int.min : Int.max)
+    }
+    let integralShift = fractionalDigits - trailingZeros
+    guard exponent >= integralShift else { return nil }
+    let padding = exponent.subtractingReportingOverflow(integralShift)
+    return (coefficient, lastNonzero, padding.overflow ? Int.max : padding.partialValue)
 }

@@ -1,0 +1,24 @@
+[
+  {
+    "name": "list_projects",
+    "description": "List the live MPCut project windows, including untitled projects. Use each returned project handle to target exactly that window. Focus is informational.",
+    "annotations": {"readOnlyHint":true, "openWorldHint":false},
+    "inputSchema": {"type":"object", "properties":{}, "additionalProperties":false}
+  },
+  {
+    "name": "get_editor_state",
+    "description": "Read a live project's revision, editor state and a page of sequence clips or multicam occurrences. Pass the first page's revision on subsequent pages to detect concurrent edits.",
+    "annotations": {"readOnlyHint":true, "openWorldHint":false},
+    "inputSchema": {
+      "type":"object",
+      "properties":{
+        "project":{"type":"string","minLength":1,"description":"Project handle returned by list_projects."},
+        "offset":{"type":"integer","minimum":0,"description":"Zero-based position of the first timeline entry. Defaults to zero."},
+        "limit":{"type":"integer","minimum":1,"maximum":200,"description":"Maximum timeline entries to return. Defaults to 50."},
+        "expectedRevision":{"type":"integer","minimum":0,"description":"Require this document revision for a consistent view across pages."}
+      },
+      "required":["project"],
+      "additionalProperties":false
+    }
+  }
+]

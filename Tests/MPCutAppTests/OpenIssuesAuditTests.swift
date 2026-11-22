@@ -48,19 +48,19 @@ final class OpenIssuesAuditTests: XCTestCase {
         let window = closableWindow()
         session.window = window
         session.isMulticam = true
-        session.applyCloseState()
         XCTAssertTrue(window.styleMask.contains(.closable))
 
+        // The window follows the model without waiting for a SwiftUI update.
         let release = DispatchSemaphore(value: 0)
         session.multicam.run("Saving analysis sidecars…") { _, _ in release.wait() } onSuccess: { _ in }
-        session.applyCloseState()
+        try await waitUntil(seconds: 2) { !window.styleMask.contains(.closable) }
         // A refused close with an enabled close button gives no feedback.
         XCTAssertFalse(window.styleMask.contains(.closable))
         XCTAssertFalse(session.confirmClose())
 
         release.signal()
-        try await waitUntil { !session.multicam.isBusy }
-        session.applyCloseState()
+        try await waitUntil(seconds: 5) { window.styleMask.contains(.closable) }
+        XCTAssertFalse(session.multicam.isBusy)
         XCTAssertTrue(window.styleMask.contains(.closable))
         XCTAssertTrue(session.confirmClose())
     }
@@ -237,8 +237,8 @@ final class OpenIssuesAuditTests: XCTestCase {
     func testProjectDroppedOnAnEditorOpensAsAProjectAndLeavesTheMediaToImport() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let document = directory.appendingPathComponent("Interview.multicam.json")
-        let plain = directory.appendingPathComponent("Second.json")
+        let document = directory.appendingPathComponent("Interview.cut")
+        let plain = directory.appendingPathComponent("Second.cut")
         for (url, angle) in [(document, "wide"), (plain, "close")] {
             try MulticamProject(referenceAngle: angle, range: .init(from: .zero, to: .init(numerator: 1)),
                                 angles: [.init(id: angle, file: "offline.mov")], audio: .none,
@@ -255,7 +255,9 @@ final class OpenIssuesAuditTests: XCTestCase {
         let blank = try XCTUnwrap(sessions.sessions.values.first)
 
         // A blank editor becomes the project, as it does for File → Open.
+        // The project opens once the drag session has ended.
         XCTAssertEqual(sessions.openDroppedProjects([document, media], in: blank), [media])
+        try await waitUntil(seconds: 2) { sessions.project(at: document) != nil }
         XCTAssertTrue(sessions.project(at: document) === blank)
         XCTAssertTrue(blank.isMulticam)
         XCTAssertEqual(opened.count, 1)
@@ -266,6 +268,7 @@ final class OpenIssuesAuditTests: XCTestCase {
         // Dropped on a window that holds a project, another project gets its own window
         // and the one that is already open is not opened twice.
         XCTAssertEqual(sessions.openDroppedProjects([plain, document], in: blank), [])
+        try await waitUntil(seconds: 2) { sessions.project(at: plain) != nil }
         XCTAssertEqual(opened.count, 2)
         let second = try XCTUnwrap(sessions.project(at: plain))
         XCTAssertFalse(second === blank)

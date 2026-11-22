@@ -1,0 +1,500 @@
+[
+  {
+    "name": "set_camera_at",
+    "description": "Take a camera by angle ID or displayed number at an explicit group time with native snapping and history. Returns the actual time and end of the affected switch interval.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Live project handle returned by list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "description": "Revision from get_editor_state."
+        },
+        "operationID": {
+          "type": "string",
+          "description": "Unique operation ID for this edit. Retry the same request with the same ID."
+        },
+        "angle": {
+          "type": "string",
+          "description": "Stable camera source ID from the live project."
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "One-based displayed camera number from the current revision."
+        },
+        "time": {
+          "type": "string",
+          "description": "Exact rational seconds on the multicam group clock."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "time"
+      ],
+      "oneOf": [
+        { "required": ["angle"] },
+        { "required": ["number"] }
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "multicam_switch",
+    "description": "Edit an existing group switch at time. move/apply_suggestion require to, angle requires angle, audio requires source and stream. default_audio restores project routing.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Live project handle returned by list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "description": "Revision from get_editor_state."
+        },
+        "operationID": {
+          "type": "string",
+          "description": "Unique operation ID for this edit. Retry the same request with the same ID."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "move",
+            "apply_suggestion",
+            "delete",
+            "angle",
+            "audio",
+            "default_audio"
+          ]
+        },
+        "time": {
+          "type": "string",
+          "description": "Exact rational seconds on the multicam group clock."
+        },
+        "to": {
+          "type": "string",
+          "description": "Exact rational seconds on the multicam group clock."
+        },
+        "angle": {
+          "type": "string",
+          "description": "Stable camera source ID from the live project."
+        },
+        "source": {
+          "type": "string",
+          "description": "Stable ID of a camera or separate audio source."
+        },
+        "stream": {
+          "type": "integer",
+          "description": "Absolute audio stream index in the indicated source."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "action",
+        "time"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "multicam_source",
+    "description": "Edit a camera or recorder. rename requires name; offset requires offset; nudge/move require direction; nudge also accepts a group time; microphone sets stream (omit to clear); relink requires an absolute path.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Live project handle returned by list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "description": "Revision from get_editor_state."
+        },
+        "operationID": {
+          "type": "string",
+          "description": "Unique operation ID for this edit. Retry the same request with the same ID."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "rename",
+            "offset",
+            "nudge",
+            "move",
+            "microphone",
+            "relink"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "description": "Stable ID of a camera or separate audio source."
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name; empty restores default."
+        },
+        "offset": {
+          "type": "string",
+          "description": "Exact sync offset in rational seconds."
+        },
+        "time": {
+          "type": "string",
+          "description": "Group time for the frame or audio sample used by nudge. Omit to use the current group playhead."
+        },
+        "direction": {
+          "type": "integer",
+          "enum": [
+            -1,
+            1
+          ]
+        },
+        "stream": {
+          "type": "integer",
+          "description": "Absolute audio stream index in the indicated source."
+        },
+        "path": {
+          "type": "string",
+          "description": "Absolute replacement file path."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "action",
+        "source"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "multicam_audio",
+    "description": "Set program audio routing. A fixed master requires a source ID and an absolute audio stream.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Live project handle returned by list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "description": "Revision from get_editor_state."
+        },
+        "operationID": {
+          "type": "string",
+          "description": "Unique operation ID for this edit. Retry the same request with the same ID."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "fixed",
+            "follow",
+            "none"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "description": "Stable ID of a camera or separate audio source."
+        },
+        "stream": {
+          "type": "integer",
+          "description": "Absolute audio stream index in the indicated source."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "mode"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "multicam_group",
+    "description": "Set the group end using time or extend to the last available camera.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Live project handle returned by list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "description": "Revision from get_editor_state."
+        },
+        "operationID": {
+          "type": "string",
+          "description": "Unique operation ID for this edit. Retry the same request with the same ID."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "set_end",
+            "extend"
+          ]
+        },
+        "time": {
+          "type": "string",
+          "description": "Exact rational seconds on the multicam group clock."
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "action"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "multicam_assembly",
+    "description": "Edit retained occurrences. append requires group from/to; trim requires occurrence and from or to; move requires occurrence and before; remove requires an explicit occurrence. Removing the last explicit occurrence restores the implicit full group. Selection actions require space, from and to matching the selected range; read those values from multicam_select. Use trim_edge or preview_trim with occurrence, edge and group time for native handle snapping.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Live project handle returned by list_projects."
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "description": "Revision from get_editor_state."
+        },
+        "operationID": {
+          "type": "string",
+          "description": "Unique operation ID for this edit. Retry the same request with the same ID."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "append",
+            "trim",
+            "move",
+            "remove",
+            "split_selection",
+            "subtract_selection",
+            "trim_edge",
+            "preview_trim"
+          ]
+        },
+        "occurrence": {
+          "type": "integer",
+          "description": "Zero-based assembly occurrence."
+        },
+        "before": {
+          "type": "integer",
+          "description": "Zero-based insertion slot before removal, from 0 through count."
+        },
+        "from": {
+          "type": "string",
+          "description": "Exact rational seconds on the group clock for append or trim, or the selected clock for a selection edit."
+        },
+        "to": {
+          "type": "string",
+          "description": "Exact rational seconds on the group clock for append or trim, or the selected clock for a selection edit."
+        },
+        "edge": {
+          "type": "string",
+          "enum": [
+            "start",
+            "end"
+          ]
+        },
+        "time": {
+          "type": "string",
+          "description": "Group time for a snapped trim edge."
+        },
+        "space": {
+          "type": "string",
+          "enum": [
+            "group",
+            "assembly"
+          ]
+        }
+      },
+      "required": [
+        "project",
+        "expectedRevision",
+        "operationID",
+        "action"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "multicam_select",
+    "description": "Select a switch at group time, occurrence by index, a range with from/to in the named clock, tool or marks in this window.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Live project handle returned by list_projects."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "switch",
+            "occurrence",
+            "group_range",
+            "assembly_range",
+            "mark_in",
+            "mark_out",
+            "clear_marks",
+            "pointer",
+            "range_tool"
+          ]
+        },
+        "time": {
+          "type": "string",
+          "description": "Exact rational seconds on the multicam group clock."
+        },
+        "occurrence": {
+          "type": "integer",
+          "description": "Zero-based assembly occurrence."
+        },
+        "from": {
+          "type": "string",
+          "description": "Inclusive range start, rational seconds."
+        },
+        "to": {
+          "type": "string",
+          "description": "Exclusive range end, rational seconds."
+        }
+      },
+      "required": [
+        "project",
+        "action"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "multicam_preview",
+    "description": "Set preview mode or transport. audition takes angle; speed takes a rate; shuttle and step actions take direction; snap takes target.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Live project handle returned by list_projects."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "group",
+            "assembly",
+            "audition",
+            "program",
+            "shuttle",
+            "speed",
+            "step",
+            "step_keyframe",
+            "step_scene",
+            "step_pause",
+            "start",
+            "end",
+            "snap",
+            "scrub_group",
+            "scrub_assembly",
+            "end_scrub"
+          ]
+        },
+        "angle": {
+          "type": "string",
+          "description": "Stable camera source ID from the live project."
+        },
+        "speed": {
+          "type": "number",
+          "enum": [
+            0.125,
+            0.25,
+            0.5,
+            0.75,
+            1,
+            1.25,
+            1.5,
+            2,
+            4,
+            8
+          ]
+        },
+        "direction": {
+          "type": "integer",
+          "enum": [
+            -1,
+            1
+          ]
+        },
+        "target": {
+          "type": "string",
+          "enum": [
+            "off",
+            "keyframes",
+            "scenes",
+            "silence"
+          ]
+        },
+        "time": {
+          "type": "string",
+          "description": "Scrub position in the specified clock, rational seconds."
+        }
+      },
+      "required": [
+        "project",
+        "action"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "get_multicam",
+    "description": "Inspect the live group, program audio and reference camera. Page sources with offsets, index issues and stream IDs, switches with overrides, or suggested switch boundaries.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "type": "string"
+        },
+        "section": {
+          "type": "string",
+          "enum": [
+            "sources",
+            "switches",
+            "suggestions"
+          ]
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "project",
+        "section"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

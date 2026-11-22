@@ -151,7 +151,7 @@ final class MulticamQueueAndAudioTests: XCTestCase {
         model.undo()
         let interval = MulticamRange(from: .zero, to: .init(numerator: 32, denominator: 125))
         model.edit { $0.assembly = [interval] }
-        let projectURL = directory.appendingPathComponent("edit.multicam.json")
+        let projectURL = directory.appendingPathComponent("edit.cut")
         XCTAssertTrue(model.saveProject(to: projectURL))
         XCTAssertEqual(try MulticamProject.load(from: projectURL).audioSources.first?.file, "donor.mov")
 

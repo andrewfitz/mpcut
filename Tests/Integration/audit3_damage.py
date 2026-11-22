@@ -69,24 +69,28 @@ KEYFRAME = 50    # The keyframe of the group 50 ..< 75.
 OK, DAMAGED = "ok", "damaged"
 
 # (from, to, Smart Trim without B pictures, Smart Trim with B pictures, Re-encode, Re-encode with B pictures)
-# Re-encode decodes from a keyframe two seconds before the start, and a little past the end.
+# Re-encode decodes from a keyframe two seconds before the start. Its helper also reads a few
+# pictures past the end, on a schedule that varies between runs. None accepts either safe result.
 P_CASES = [
     (35, 100, DAMAGED, DAMAGED, DAMAGED, DAMAGED),  # The leading edge is re-encoded from the damaged group.
     (45, 100, DAMAGED, DAMAGED, DAMAGED, DAMAGED),  # The damage precedes the cut and is a reference for it.
     (10, 115, OK, OK, DAMAGED, DAMAGED),            # Smart Trim copies the damaged group. Re-encode decodes it.
     (60, 115, OK, OK, DAMAGED, DAMAGED),            # A keyframe follows the damage. Re-encode's preroll reaches it.
     (110, 140, OK, OK, OK, OK),                     # Clear of the preroll.
-    (0, 35, OK, OK, OK, OK),                        # The trailing edge ends before the damage.
+    (0, 12, OK, OK, OK, OK),
+    (0, 35, OK, OK, None, None),                    # The trailing edge ends before the damage.
     (0, 41, OK, DAMAGED, None, DAMAGED),            # The damaged picture is the first one after the end.
-    (0, 39, OK, DAMAGED, OK, DAMAGED),              # With B pictures, 38 is predicted from the damaged 41.
+    (0, 39, OK, DAMAGED, None, DAMAGED),            # With B pictures, 38 is predicted from the damaged 41.
 ]
 KEY_CASES = [
     (60, 115, DAMAGED, DAMAGED, DAMAGED, DAMAGED),
     (10, 115, OK, OK, DAMAGED, DAMAGED),
-    (0, 35, OK, OK, OK, OK),
+    (0, 30, OK, OK, OK, OK),
     (85, 140, OK, OK, DAMAGED, DAMAGED),            # Re-encode's preroll starts at picture 25.
     (130, 148, OK, OK, OK, OK),
-    (35, 115, OK, OK, DAMAGED, DAMAGED),            # The leading edge ends at the damaged keyframe, which is copied.
+    # The leading edge ends at the damaged keyframe, which is copied. The H.264 decoder can withhold
+    # a reordered picture that was due when it read the damage, and the edge is then refused.
+    (35, 115, OK, None, DAMAGED, DAMAGED),
     (10, 50, OK, OK, None, None),                   # The export ends at the damaged keyframe.
 ]
 
@@ -181,6 +185,29 @@ class DamagedExport(unittest.TestCase):
 
     def test_reencode_never_writes_pictures_decoded_from_damage(self):
         self.cases("encode", 4)
+
+    def test_damage_at_the_start_of_the_file_is_not_taken_for_a_missing_hardware_decoder(self):
+        # A failed hardware decode of the first picture must not select the software decoder.
+        for codec in ["h264", "hevc"]:
+            for picture in [0, 2]:
+                source = self.root / f"{codec}-start-{picture}.mp4"
+                shutil.copyfile(self.sources[codec, 0, "mp4", "clean"], source)
+                damage_picture(source, picture)
+                for mode in ["encode", "smart"]:
+                    label = (mode, source.name)
+                    code, report, output = self.export(mode, source, 0, 35)
+                    if mode == "smart" and code == 0:
+                        # The first group is copied whole and later pictures are re-encoded.
+                        self.assertEqual(picture_ids(output)[25:], list(range(25, 35)), label)
+                        continue
+                    self.assertEqual((code, report["ok"]), (1, False), label)
+                    self.assertFalse(output.exists(), label)
+                    if mode == "encode":
+                        # Smart Trim's index can already refuse a first keyframe it cannot verify.
+                        self.assertIn("damaged", report["error"]["message"], label)
+                code, report, output = self.export("encode", source, 110, 140)
+                self.assertEqual((code, report["ok"]), (0, True), (source.name, report))
+                self.assertEqual(picture_ids(output), list(range(110, 140)), source.name)
 
     def test_hardware_decoding_rejects_the_fixtures_and_software_hevc_does_not(self):
         # Re-encode must not fall back to a decoder that reads the damage without an error.

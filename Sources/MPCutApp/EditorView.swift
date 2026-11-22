@@ -4,9 +4,8 @@ import SwiftUI
 struct EditorView: View {
     @ObservedObject var editor: EditorModel
     @ObservedObject var multicam: MulticamEditorModel
+    @ObservedObject var presentation: EditorPresentation
     let addMulticam: () -> Void
-    @State private var showPauseControls = false
-    @State private var audioViewSpan = AudioViewerSpan.timeline
     @Environment(\.openDroppedProjects) private var openDroppedProjects
 
     var body: some View {
@@ -46,6 +45,7 @@ struct EditorView: View {
     }
 
     private var windowTitle: String {
+        if let url = editor.projectURL { return url.deletingPathExtension().lastPathComponent }
         guard let first = editor.timelineClips.first else { return "Untitled" }
         let additionalSources = Set(editor.timelineClips.map(\.sourceID)).count - 1
         return additionalSources > 0 ? "\(first.name) + \(additionalSources)" : first.name
@@ -55,12 +55,12 @@ struct EditorView: View {
         Group {
             if let audio = editor.audioPreviewClip {
                 AudioWaveformViewer(clip: audio.clip, offset: audio.offset, sourceTime: editor.audioPreviewSourceTime ?? audio.clip.sourceStart,
-                                    zoom: editor.timelineZoom, span: audioViewSpan, revision: editor.waveformRevision, store: editor.audioStore.detail,
+                                    zoom: editor.timelineZoom, span: presentation.waveformSpan, revision: editor.waveformRevision, store: editor.audioStore.detail,
                                     coarse: editor.audioStore.waves[audio.clip.sourceID], pauses: editor.sourcePauses[audio.clip.sourceID] ?? [],
                                     markIn: editor.markIn, markOut: editor.markOut, enabled: editor.canNavigate,
                                     pointerTarget: editor.pointerTarget, onPointerSeek: editor.seekFromPointer, seek: editor.seek, scrub: editor.scrub, endScrub: editor.preview.endScrub)
                     .overlay(alignment: .bottom) {
-                        Picker("Waveform span", selection: $audioViewSpan) {
+                        Picker("Waveform span", selection: $presentation.waveformSpan) {
                             ForEach(AudioViewerSpan.allCases, id: \.self) { span in
                                 Text(span.rawValue).tag(span)
                             }
@@ -83,7 +83,7 @@ struct EditorView: View {
         }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(editor.isEmpty ? Color(nsColor: .windowBackgroundColor) : .black)
-            .modifier(EditorMediaDrop(enabled: !editor.isBusy) { editor.importFiles($0) })
+            .modifier(EditorMediaDrop(enabled: !editor.isBusy, importFiles: editor.dropOnViewer))
     }
 
     private var transport: some View {
@@ -103,12 +103,22 @@ struct EditorView: View {
             delete: .init(title: editor.deleteTitle, enabled: editor.canDelete, perform: editor.deleteSelection),
             undo: .init(title: editor.undoTitle, enabled: editor.canUndo, perform: editor.undo),
             redo: .init(title: editor.redoTitle, enabled: editor.canRedo, perform: editor.redo),
-            play: SequencePreviewPlayButton(preview: editor.preview)
+            rangeTools: .init(active: $editor.rangeTool, canAct: editor.canActOnRange, canSplit: editor.canSplitSelectedRange,
+                              canDelete: editor.canActOnRange, split: editor.splitSelectedRange,
+                              export: editor.chooseSelectionExport, delete: editor.deleteSelection),
+            preview: editor.preview
         ) { EmptyView() }
     }
 
+    private var handleValidation: TimelineHandleValidation? {
+        guard editor.usesBackgroundTrimValidation else { return nil }
+        return { id, edge, target, commit, completion in
+            editor.validateHandle(id, edge: edge, target: target, commit: commit, completion: completion)
+        }
+    }
+
     private var timeline: some View {
-        SequenceTimeline(
+        var timeline = SequenceTimeline(
             clips: editor.timelineClips,
             playhead: editor.playhead,
             selection: editor.selectedID,
@@ -136,9 +146,12 @@ struct EditorView: View {
             pointerTarget: editor.pointerTarget, onPointerSeek: editor.seekFromPointer,
             onScrub: editor.scrub, onEndScrub: editor.preview.endScrub,
             onCancelTrim: editor.cancelTrim,
+            validateHandle: handleValidation,
             thumbnail: editor.thumbnail
         )
-        .disabled(editor.isBusy && !editor.canNavigate)
+        if editor.canEdit { timeline.onClipCSV = { editor.applyClipCSV($0, to: $1) } }
+        if editor.rangeTool && editor.canEdit { timeline.onRangeSelect = editor.selectRange }
+        return timeline.disabled(editor.isBusy && !editor.canNavigate)
     }
 
     private var status: some View {
@@ -163,11 +176,11 @@ struct EditorView: View {
                 Spacer()
                 Button("Cancel", action: editor.cancelImport)
                     .disabled(editor.isCancelling)
-            } else if editor.isCheckingEdit {
+            } else if editor.isCheckingEdit || editor.isPreparingCopyBoundaries {
                 ProgressView()
                     .controlSize(.small)
                     .accessibilityHidden(true)
-                Text("Checking edit…")
+                Text(editor.isPreparingCopyBoundaries ? "Preparing keyframe edit points…" : "Checking edit…")
                 Spacer()
             } else {
                 if !editor.audioTracks.isEmpty {
@@ -225,12 +238,12 @@ struct EditorView: View {
             ?? (editor.pauseAnalysisReady ? (count == 1 ? "1 pause" : "\(count) pauses") : "Scan for Silence")
         Button {
             if editor.canScanSilence && !editor.pauseAnalysisReady { editor.scanForSilence() }
-            showPauseControls = true
+            presentation.pauseControls = true
         } label: {
             Label(title, systemImage: "waveform")
                 .monospacedDigit()
         }
-        .popover(isPresented: $showPauseControls, arrowEdge: .top) { PauseControls(editor: editor) }
+        .popover(isPresented: $presentation.pauseControls, arrowEdge: .top) { PauseControls(editor: editor) }
         .help("Find quiet ranges and adjust silence detection and editing controls.")
         if progress != nil {
             Button("Cancel", action: editor.cancelSilenceScan)
@@ -246,12 +259,23 @@ struct EditorView: View {
     }
 
     private func handleKey(_ event: NSEvent, modifiers: NSEvent.ModifierFlags) -> NSEvent? {
+        if modifiers == .option, event.charactersIgnoringModifiers?.lowercased() == "x", editor.canClearMarks {
+            editor.clearMarks()
+            return nil
+        }
         if modifiers.isEmpty, editor.canNavigate {
+            if let amount = TimelineViewControls.keyZoom(event.charactersIgnoringModifiers) {
+                editor.timelineZoom = TimelineViewControls.adjustedZoom(editor.timelineZoom, by: amount)
+                return nil
+            }
+            if editor.preview.handleSpeedKey(event) { return nil }
             if event.keyCode == 49 {
                 if !event.isARepeat { editor.preview.togglePlayback() }
                 return nil
             }
             switch event.charactersIgnoringModifiers?.lowercased() {
+            case "r" where editor.canEdit: editor.rangeTool = true
+            case "a" where editor.canEdit: editor.rangeTool = false
             case "j": if !event.isARepeat { editor.preview.shuttle(-1) }
             case "k": if !event.isARepeat { editor.preview.pause() }
             case "l": if !event.isARepeat { editor.preview.shuttle(1) }
@@ -334,14 +358,5 @@ private struct SequencePreviewSoundControls: View {
     var body: some View {
         PreviewSoundControls(volume: $preview.volume, isMuted: $preview.isMuted,
                              scrubSoundEnabled: $preview.scrubSoundEnabled)
-    }
-}
-
-private struct SequencePreviewPlayButton: View {
-    @ObservedObject var preview: SequencePreview
-
-    var body: some View {
-        PreviewPlayButton(rate: preview.playbackRate, disabled: preview.hasBlockingIssue,
-                          toggle: preview.togglePlayback)
     }
 }

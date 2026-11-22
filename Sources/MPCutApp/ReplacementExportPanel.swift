@@ -18,12 +18,14 @@ final class ReplacementExportPanel: NSObject, ObservableObject, NSOpenSavePanelD
     private var preflight: Task<AudioReplacementPlan, Error>?
     private weak var panel: NSSavePanel?
     private var fileExtension: String
+    private let excludedSources: Set<URL>
     private let useSidecar: Bool
 
-    init(source: MediaInfo, replacement: MediaInfo, sourceName: String? = nil, useSidecar: Bool = true) throws {
+    init(source: MediaInfo, replacement: MediaInfo, sourceName: String? = nil, useSidecar: Bool = true, excludedSources: Set<URL> = []) throws {
         self.source = source
         self.replacement = replacement
         self.sourceName = sourceName ?? source.url.lastPathComponent
+        self.excludedSources = excludedSources
         self.useSidecar = useSidecar
         targets = source.streams.filter { $0.kind == "audio" }
         replacements = replacement.streams.filter { $0.kind == "audio" }
@@ -58,10 +60,12 @@ final class ReplacementExportPanel: NSObject, ObservableObject, NSOpenSavePanelD
         let source = source, replacement = replacement
         let requestedContainer = container, target = targetIndex, processed = replacementIndex
         let useSidecar = useSidecar
-        let resolve = Task.detached(priority: .userInitiated) {
-            try AudioReplacementEngine(cancelled: { Task.isCancelled }, useSidecar: useSidecar).resolve(
-                source: source, replacement: replacement, container: requestedContainer,
-                targetStream: target, replacementStream: processed)
+        let resolve = Task.detached(priority: .userInitiated) { [excludedSources] in
+            try AnalysisSidecar.$excludedSources.withValue(excludedSources) {
+                try AudioReplacementEngine(cancelled: { Task.isCancelled }, useSidecar: useSidecar).resolve(
+                    source: source, replacement: replacement, container: requestedContainer,
+                    targetStream: target, replacementStream: processed)
+            }
         }
         preflight = resolve
         task = Task { [weak self] in

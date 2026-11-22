@@ -79,6 +79,25 @@ class Waveform(unittest.TestCase):
             with self.subTest(path=path):
                 self.check_window(path, 204801, 3277, 321)
 
+    def test_selected_stream_can_extend_past_the_last_picture(self):
+        movie = self.wav.with_name("long-soundtracks.mov")
+        run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=s=32x32:r=10:d=1",
+             "-f", "lavfi", "-i", "aevalsrc=0.25:d=2:s=48000",
+             "-f", "lavfi", "-i", "aevalsrc=-0.5:d=3:s=48000",
+             "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "prores", "-c:a", "pcm_s16le", movie], check=True)
+        for cached in (False, True):
+            if cached:
+                check_output([CLI, "sidecar", "--only", "index", movie])
+            flags = [] if cached else ["--no-sidecar"]
+            for stream, end, level in [(1, 2, 0.25), (2, 3, -0.5)]:
+                with self.subTest(cached=cached, stream=stream):
+                    command = [CLI, *flags, "waveform", "--json", "--columns", "2", "--stream", str(stream)]
+                    whole = json.loads(check_output([*command, movie]))["envelope"]
+                    tail = json.loads(check_output([*command, "--from", "1", "--to", str(end), movie]))["envelope"]
+                    self.assertEqual(whole["to"], end)
+                    self.assertEqual(tail["low"], [level, level])
+                    self.assertEqual(tail["high"], [level, level])
+
     def test_sample_and_subsample_detail(self):
         self.check_window(self.flac, 773, 1024, 1024)
         self.check_window(self.flac, 4606, 4, 15)
@@ -125,7 +144,7 @@ class Waveform(unittest.TestCase):
                 self.assertEqual(json.loads(check_output(inspect))["media"]["duration"], duration)
                 check_output([CLI, "sidecar", "--json", "--only", "index", path])
                 self.assertEqual(json.loads(check_output(inspect))["media"]["duration"], duration)
-                with sqlite3.connect(path.with_suffix(".mka.mpcut")) as cache:
+                with sqlite3.connect(path.with_suffix(".mka.cutdb")) as cache:
                     key = "index.v1"
                     stamp = cache.execute("SELECT stamp FROM source WHERE id = 1").fetchone()[0]
                     saved = cache.execute("SELECT value FROM sections WHERE name = ?", (key,)).fetchone()[0]
@@ -160,9 +179,9 @@ class Waveform(unittest.TestCase):
         self.addCleanup(scratch.cleanup)
         source = Path(scratch.name) / "stereo.wav"
         shutil.copyfile(self.wav, source)
-        shared_sidecar = self.wav.with_name(self.wav.name + ".mpcut")
+        shared_sidecar = self.wav.with_name(self.wav.name + ".cutdb")
         shared_stamp = shared_sidecar.stat().st_mtime_ns if shared_sidecar.exists() else None
-        sidecar = source.with_name(source.name + ".mpcut")
+        sidecar = source.with_name(source.name + ".cutdb")
 
         def status():
             return json.loads(check_output([CLI, "sidecar", "--json", "--status", source]))

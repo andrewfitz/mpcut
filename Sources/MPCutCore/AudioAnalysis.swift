@@ -468,7 +468,12 @@ public enum AudioAnalysis {
             }
         } else {
             var error = [CChar](repeating: 0, count: 256)
-            let status = mp_audio_peaks(media.url.path, Int32(stream), media.origin.seconds, media.duration.seconds, {
+            // A full audio packet inspection verifies that later blocks cannot return to this interval.
+            let ordered = !media.hasProvisionalClock && media.audioIssues[stream] == nil && media.audio.contains { track in
+                track.stream.index == stream && (track.stream.isPCM ? track.pcmContinuity : !track.packets.isEmpty)
+            }
+            let status = mp_audio_peaks(media.url.path, Int32(stream), media.origin.seconds, media.duration.seconds,
+                                        ordered ? 1 : 0, {
                 Unmanaged<PeakCollector>.fromOpaque($0!).takeUnretainedValue().cancelled() ? 1 : 0
             }, collectPeak, Unmanaged.passUnretained(collector).toOpaque(), &error, error.count)
             if status < 0 { decoderFailure = String(cString: error) }

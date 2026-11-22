@@ -5,6 +5,7 @@ struct MulticamAudioConversionPlan: Sendable {
         let audio: AudioIndex
         let samples: Range<Int64>
         let decodedStart: Int64?
+        let seekablePCM: Bool
         let count: Int64
     }
 
@@ -17,6 +18,18 @@ struct MulticamAudioConversionPlan: Sendable {
     let channels: Int
     let layout: String
     let floatingPoint: Bool
+    /// Final encoder arguments and muxer chosen by a plain audio export.
+    var encoderArguments: [String]? = nil
+    var muxer: String? = nil
+    var verifiesSampleRange = false
+}
+
+/// One retained range of a soundtrack on the program clock.
+struct ConvertedSoundSpan {
+    let media: MediaInfo?
+    let stream: Int?
+    let input: MulticamRange
+    let output: MulticamRange
 }
 
 extension MulticamEngine {
@@ -31,7 +44,19 @@ extension MulticamEngine {
         default:
             break
         }
+        let lane = mapping.audio.map {
+            ConvertedSoundSpan(media: sources[$0.source], stream: $0.stream, input: $0.input, output: $0.output)
+        }
+        return try resolveConvertedSound(lane, duration: mapping.duration, container: container, action: action) { issue, index in
+            try contextual(issue, span: mapping.audio[index], mapping: mapping, index: index + 1)
+        }
+    }
 
+    /// Plans sample-exact conversion of ordered soundtrack ranges. `contextual` places
+    /// a failure of the span at the given zero-based position in the caller's terms.
+    func resolveConvertedSound(_ lane: [ConvertedSoundSpan], duration: RationalTime, container: String,
+                               action: ReencodeAudio,
+                               contextual: (CutError, Int) throws -> CutError) throws -> MulticamAudioConversionPlan {
         struct SourceRange {
             let media: MediaInfo
             let audio: AudioIndex
@@ -42,10 +67,10 @@ extension MulticamEngine {
 
         let engine = CutEngine(cancelled: cancelled)
         var aacClocks: [URL: [Int: Bool]] = [:]
-        let spans = try mapping.audio.enumerated().map { index, span in
+        let spans = try lane.enumerated().map { index, span in
             try engine.checkCancellation()
             do {
-                guard let media = sources[span.source], let stream = span.stream,
+                guard let media = span.media, let stream = span.stream,
                       let audio = media.audio.first(where: { $0.stream.index == stream }) else {
                     throw CutError(code: "missing_audio", message: "The selected audio stream is unavailable.")
                 }
@@ -80,7 +105,7 @@ extension MulticamEngine {
                 return SourceRange(media: media, audio: audio, layout: layout, samples: first..<last,
                                    decodedStart: contiguous ? lower : nil)
             } catch let issue as CutError {
-                throw try contextual(issue, span: span, mapping: mapping, index: index + 1)
+                throw try contextual(issue, index)
             }
         }
         guard let first = spans.first else {
@@ -89,14 +114,19 @@ extension MulticamEngine {
         let commonLayout = spans.allSatisfy { $0.layout == first.layout && $0.audio.stream.channels == first.audio.stream.channels }
         let commonRate = spans.allSatisfy { $0.audio.stream.sampleRate == first.audio.stream.sampleRate }
         let aacRates = [7_350, 8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000]
+        let mp3Rates = [8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000]
         let preserveRate = commonRate && (action != .aac || aacRates.contains(first.audio.stream.sampleRate))
+            && (action != .mp3 || mp3Rates.contains(first.audio.stream.sampleRate))
         let rate = preserveRate ? first.audio.stream.sampleRate : 48_000
         let layout = commonLayout ? first.layout : "stereo"
         let channels = commonLayout ? first.audio.stream.channels : 2
         guard action != .aac || channels <= 8 else {
             throw CutError(code: "unsupported_audio", message: "AAC cannot preserve the selected channel layout. Choose PCM.")
         }
-        let floatingPoint = action == .aac || spans.contains {
+        guard action != .mp3 || channels <= 2 else {
+            throw CutError(code: "unsupported_audio", message: "MP3 carries mono or stereo sound. Choose PCM for this channel layout.")
+        }
+        let floatingPoint = action == .aac || action == .mp3 || spans.contains {
             $0.audio.stream.codec.hasPrefix("pcm_f") || !$0.audio.presentationEdits.isEmpty
         }
         var warnings: [String] = []
@@ -107,7 +137,7 @@ extension MulticamEngine {
         var inputs: [MulticamAudioConversionPlan.Input] = []
         var identities: [URL: SourceIdentity] = [:]
         var end: Int64 = 0
-        for (index, span) in mapping.audio.enumerated() {
+        for (index, span) in lane.enumerated() {
             let source = spans[index]
             let media = source.media
             let audio = source.audio
@@ -117,7 +147,7 @@ extension MulticamEngine {
             let next = try span.output.to.roundedToSamples(rate)
             guard start == end, next > start else {
                 let issue = CutError(code: "unsupported_audio", message: "The soundtrack must cover the program with at least one output sample per span.")
-                throw try contextual(issue, span: span, mapping: mapping, index: index + 1)
+                throw try contextual(issue, index)
             }
             let track = ResolvedTrack(index: audio.stream.index, kind: "audio",
                                       sourceStart: span.input.from, sourceEnd: span.input.to,
@@ -125,14 +155,17 @@ extension MulticamEngine {
             segments.append(ResolvedSegment(file: media.url, from: span.input.from, to: span.input.to,
                                             outputStart: span.output.from, tracks: [track], sourceOrigin: media.origin,
                                             reachesEnd: span.input.to == audio.end))
-            inputs.append(.init(audio: audio, samples: source.samples, decodedStart: source.decodedStart, count: next - start))
+            inputs.append(.init(audio: audio, samples: source.samples, decodedStart: source.decodedStart,
+                                seekablePCM: media.format == "wav" && audio.stream.isPCM && audio.pcmContinuity
+                                    && source.decodedStart == 0 && media.origin == .zero,
+                                count: next - start))
             identities[media.url] = media.identity
             end = next
         }
-        guard end == (try mapping.duration.roundedToSamples(rate)) else {
+        guard end == (try duration.roundedToSamples(rate)) else {
             throw CutError(code: "uncovered_audio", message: "The soundtrack does not cover the entire program.")
         }
-        let edit = ResolvedEdit(segments: segments, duration: mapping.duration, container: container,
+        let edit = ResolvedEdit(segments: segments, duration: duration, container: container,
                                 identities: identities, tracks: .audio)
         return MulticamAudioConversionPlan(edit: edit, inputs: inputs, action: action, warnings: warnings,
                                            helper: try ReencodeEngine.findHelper(override: nil), sampleRate: rate,
@@ -187,50 +220,107 @@ extension MulticamEngine {
         let rawFormat = plan.floatingPoint ? "f32le" : "s32le"
         let stagedFormat = ["-f", rawFormat, "-ar", "\(plan.sampleRate)", "-ch_layout", plan.layout]
 
-        // Stage one input at a time so long assemblies do not require an open
-        // demuxer per cut. The final pass writes one continuous encoded track.
+        func trim(_ input: MulticamAudioConversionPlan.Input, decodedStart: Int64?) -> String {
+            let start = input.samples.lowerBound, end = input.samples.upperBound
+            if let decodedStart {
+                return "atrim=start_sample=\(start - decodedStart):end_sample=\(end - decodedStart),"
+            }
+            let rate = input.audio.stream.sampleRate
+            return "asettb=1/\(rate),atrim=start_pts=\(start):end_pts=\(end),asetpts=PTS-(\(start)),"
+                + "aresample=\(rate):async=1:first_pts=0:min_hard_comp=0,"
+        }
+
+        func part(_ index: Int) -> URL { directory.appendingPathComponent("audio-\(index).raw") }
+
+        func outputArguments(prefix: String, for index: Int) -> [String] {
+            let count = plan.inputs[index].count
+            let filter = prefix + "aresample=\(plan.sampleRate):out_chlayout=\(plan.layout),"
+                + "apad=whole_len=\(count),atrim=end_sample=\(count),asetpts=N/SR/TB"
+            return ["-af", filter, "-c:a", "pcm_\(rawFormat)"] + stagedFormat + [part(index).path]
+        }
+
+        // Share decoder history for adjacent cuts from the same compressed track. Each
+        // output keeps its own trim and resampler. Stage only retained samples, with
+        // at most eight outputs and 32 MiB of PCM per group.
+        func stageCompressedGroup(from index: Int) throws -> Int {
+            let file = plan.edit.segments[index].file
+            let stream = plan.inputs[index].audio.stream
+            guard !stream.isPCM, plan.inputs[index].audio.presentationEdits.isEmpty else { return index }
+            var capacity = Int64(32 << 20) / Int64(plan.channels * 4)
+            var end = index
+            while end < plan.inputs.count && end - index < 8 {
+                let input = plan.inputs[end]
+                guard plan.edit.segments[end].file == file, input.audio.stream.index == stream.index,
+                      input.audio.presentationEdits.isEmpty, input.count <= capacity else { break }
+                capacity -= input.count
+                end += 1
+            }
+            guard end - index >= 2 else { return index }
+            var arguments = ["-xerror", "-copyts", "-n", "-i", file.path]
+            for item in index..<end {
+                let input = plan.inputs[item]
+                arguments += ["-map", "0:\(stream.index)"]
+                    + outputArguments(prefix: trim(input, decodedStart: input.decodedStart), for: item)
+            }
+            do {
+                try runner.runHelper(plan.helper, arguments: arguments, in: directory)
+                return end
+            } catch let error as CutError where error.code == "encode_failed" {
+                // Retry individually to preserve the failing segment and track diagnostic.
+                for item in index..<end where FileManager.default.fileExists(atPath: part(item).path) {
+                    try FileManager.default.removeItem(at: part(item))
+                }
+                return index
+            }
+        }
+
+        var stagedThrough = 0
         for (index, pair) in zip(plan.edit.segments, plan.inputs).enumerated() {
             try runner.checkCancellation()
             let (segment, input) = pair
-            let part = directory.appendingPathComponent("audio-\(index).raw")
+            let part = part(index)
             let caf = directory.appendingPathComponent("audio-\(index).caf")
             defer {
                 try? FileManager.default.removeItem(at: part)
                 try? FileManager.default.removeItem(at: caf)
             }
             let track = input.audio.stream
-            var arguments = ["-xerror", "-copyts"]
-            let prefix: String
-            if !input.audio.presentationEdits.isEmpty {
-                if input.audio.presentationEdits.contains(where: { $0.isAudible && $0.samples.overlaps(input.samples) }) {
-                    try runner.stageEditedAudio(segment.file, track: track, source: input.samples,
-                                                count: input.samples.upperBound - input.samples.lowerBound,
-                                                to: caf, segment: index + 1)
-                    arguments += ["-i", caf.path, "-map", "0:a:0"]
-                    prefix = ""
-                } else {
-                    let source = "anullsrc=r=\(track.sampleRate):cl=\(try audioLayout(track))"
-                    arguments += ["-f", "lavfi", "-i", source, "-map", "0:a:0"]
-                    prefix = "atrim=end_sample=\(input.samples.upperBound - input.samples.lowerBound),"
-                }
-            } else {
-                arguments += ["-i", segment.file.path, "-map", "0:\(track.index)"]
-                if let start = input.decodedStart {
-                    prefix = "atrim=start_sample=\(input.samples.lowerBound - start):end_sample=\(input.samples.upperBound - start),"
-                } else {
-                    let rate = track.sampleRate
-                    let start = input.samples.lowerBound
-                    let end = input.samples.upperBound
-                    prefix = "asettb=1/\(rate),atrim=start_pts=\(start):end_pts=\(end),asetpts=PTS-(\(start)),"
-                        + "aresample=\(rate):async=1:first_pts=0:min_hard_comp=0,"
-                }
-            }
-            let filter = prefix
-                + "aresample=\(plan.sampleRate):out_chlayout=\(plan.layout),"
-                + "apad=whole_len=\(input.count),atrim=end_sample=\(input.count),asetpts=N/SR/TB"
-            arguments += ["-af", filter, "-c:a", "pcm_\(rawFormat)"] + stagedFormat + ["-n", part.path]
             do {
-                try runner.runHelper(plan.helper, arguments: arguments, in: directory)
+                if index >= stagedThrough {
+                    stagedThrough = try stageCompressedGroup(from: index)
+                }
+                if index >= stagedThrough {
+                    var arguments = ["-xerror", "-copyts", "-n"]
+                    let prefix: String
+                    if !input.audio.presentationEdits.isEmpty {
+                        if input.audio.presentationEdits.contains(where: { $0.isAudible && $0.samples.overlaps(input.samples) }) {
+                            try runner.stageEditedAudio(segment.file, track: track, source: input.samples,
+                                                        count: input.samples.upperBound - input.samples.lowerBound,
+                                                        to: caf, segment: index + 1)
+                            arguments += ["-i", caf.path, "-map", "0:a:0"]
+                            prefix = ""
+                        } else {
+                            let source = "anullsrc=r=\(track.sampleRate):cl=\(try audioLayout(track))"
+                            arguments += ["-f", "lavfi", "-i", source, "-map", "0:a:0"]
+                            prefix = "atrim=end_sample=\(input.samples.upperBound - input.samples.lowerBound),"
+                        }
+                    } else {
+                        var decodedStart = input.decodedStart
+                        if input.seekablePCM {
+                            // Integer seconds are exact on both FFmpeg's seek clock and the WAV sample clock.
+                            let rate = Int64(track.sampleRate)
+                            let seconds = input.samples.lowerBound / rate
+                            if seconds > 0 {
+                                arguments += ["-ss", String(seconds)]
+                                decodedStart = seconds * rate
+                            }
+                        }
+                        arguments += ["-i", segment.file.path, "-map", "0:\(track.index)"]
+                        prefix = trim(input, decodedStart: decodedStart)
+                    }
+                    arguments += outputArguments(prefix: prefix, for: index)
+                    try runner.runHelper(plan.helper, arguments: arguments, in: directory)
+                }
                 let attributes = try FileManager.default.attributesOfItem(atPath: part.path)
                 let expected = input.count.multipliedReportingOverflow(by: Int64(plan.channels * 4))
                 guard !expected.overflow, (attributes[.size] as? NSNumber)?.int64Value == expected.partialValue else {
@@ -255,7 +345,9 @@ extension MulticamEngine {
 
         let container = plan.edit.container
         var arguments = ["-xerror"] + stagedFormat + ["-i", raw.path, "-map", "0:a:0"]
-        if plan.action == .aac {
+        if let custom = plan.encoderArguments {
+            arguments += custom
+        } else if plan.action == .aac {
             arguments += ["-c:a", "aac", "-b:a", "\(max(96, min(512, plan.channels * 96)))k"]
         } else {
             if container == "mkv" {
@@ -267,10 +359,10 @@ extension MulticamEngine {
             }
             arguments += ["-c:a", "pcm_\(rawFormat)"]
         }
-        if MulticamMux.movieContainers.contains(container) {
+        if MulticamMux.movieContainers.contains(container) || container == "m4a" {
             arguments += ["-movie_timescale", "705600000", "-use_editlist", "1"]
         }
-        arguments += ["-f", muxerName(container), "-n", output.path]
+        arguments += ["-f", plan.muxer ?? muxerName(container), "-n", output.path]
         do {
             try runner.runHelper(plan.helper, arguments: arguments, in: directory, duration: plan.edit.duration) {
                 progress?(0.8 + 0.2 * $0)
@@ -281,10 +373,12 @@ extension MulticamEngine {
                   (try? audioLayout(sound.stream)) == plan.layout else {
                 throw CutError(code: "audio_conversion_failed", message: "The output container changed the selected audio clock or channel layout.")
             }
-            if MulticamMux.movieContainers.contains(container) {
+            if MulticamMux.movieContainers.contains(container) || plan.verifiesSampleRange {
                 let expected = try plan.edit.duration.roundedToSamples(plan.sampleRate)
-                let start = try result.origin.adding(sound.start).roundedToSamples(plan.sampleRate)
-                let end = try result.origin.adding(sound.end).roundedToSamples(plan.sampleRate)
+                // An MP3 file places its first audible sample after the encoder delay.
+                let origin = container == "mp3" ? RationalTime.zero : result.origin
+                let start = try origin.adding(sound.start).roundedToSamples(plan.sampleRate)
+                let end = try origin.adding(sound.end).roundedToSamples(plan.sampleRate)
                 guard start == 0, end == expected else {
                     throw CutError(code: "audio_conversion_failed", message: "The converted track did not retain the planned presentation sample range.")
                 }

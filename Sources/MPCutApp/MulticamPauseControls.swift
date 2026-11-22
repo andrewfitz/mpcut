@@ -34,7 +34,7 @@ struct MulticamPauseControls: View {
             PauseSetting(label: "Leave per pause", unit: "s", value: Binding(
                 get: { model.preferences.leavePause }, set: { model.preferences.leavePause = $0 }
             ), minimum: 0, step: 0.1)
-            Button("Use Marked Room Tone", action: model.useRoomTone)
+            Button("Use Marked Room Tone") { model.useRoomTone() }
                 .disabled(!model.canUseRoomTone)
                 .help("Measure room tone in the marked range on each microphone routed there.")
             Divider().padding(.vertical, 2)
@@ -100,7 +100,7 @@ struct MulticamPauseControls: View {
     }
 
     private func summary(pauses: [MulticamPauseEdit], cuts: [AudioSpan]) -> String {
-        let scope = model.markedGroupSpan != nil ? "marked range" : "assembly"
+        let scope = model.markedGroupSpan != nil || model.assemblySelection != nil ? "marked range" : "assembly"
         if pauses.isEmpty { return "No qualifying pauses in the \(scope)." }
         let seconds = cuts.reduce(0) { $0 + $1.to.seconds - $1.from.seconds }
         return "\(cuts.count) of \(pauses.count) pauses · \(seconds.formatted(.number.precision(.fractionLength(1)))) s shorter"
@@ -113,7 +113,8 @@ private struct MulticamProgramMicrophone: View {
 
     var body: some View {
         if let project = model.project {
-            let track = model.analysis.programMicrophone(at: model.groupTime(at: preview.time), project: project)
+            let track = model.analysis.programMicrophone(at: model.groupTime(at: preview.time), project: project,
+                                                         exclusiveEnd: preview.time == preview.duration)
             let count = model.analysis.silenceTrackCount
             Text("Program microphone: \(track)")
                 .font(.callout).lineLimit(2).help(track)
@@ -153,13 +154,7 @@ private struct MulticamPauseNavigation: View {
     private func keepButton(_ current: MulticamPauseEdit?) -> some View {
         Button(current?.isProtected == true ? "Shorten This Pause" : "Keep This Pause") {
             guard let current else { return }
-            if current.isProtected {
-                model.pauseEdits.protected = model.pauseEdits.protected.filter {
-                    MulticamSilencePlanner.intersection($0, current.id.span) == nil
-                }
-            } else {
-                model.pauseEdits.protected.insert(current.id.span)
-            }
+            model.setPauseProtection(!current.isProtected, for: current)
         }.disabled(current == nil)
     }
 

@@ -42,6 +42,7 @@ Proposed CLI entry points reuse familiar commands. The project contains the angl
 
 ```json
 {
+  "format": "mpcut",
   "schemaVersion": 1,
   "kind": "multicam",
   "referenceAngle": "wide",
@@ -72,14 +73,14 @@ For a separate recorder, declare `"audioSources":[{"id":"lav","file":"lav.wav","
 
 ```sh
 mpcut help multicam --json
-mpcut inspect --project interview.multicam.json --json
-mpcut export --project interview.multicam.json --mode smart --output interview.mov --dry-run --json
-mpcut export --project interview.multicam.json --mode smart --output interview.mov --json
+mpcut inspect --project interview.cut --json
+mpcut export --project interview.cut --mode smart --output interview.mov --dry-run --json
+mpcut export --project interview.cut --mode smart --output interview.mov --json
 ```
 
 - Discovery should include a minimal editable JSON template and examples for fixed, follow, and overridden audio. Validate unknown angle IDs, repeated IDs, conflicting switches at the same instant, missing files, unavailable streams, and out-of-range decisions. Require a selection at the group start and strictly increasing switch times before the exclusive end. Write project changes atomically. Reject unsupported schema versions before editing or saving.
 - Inspection should return angle coverage, indexed stream choices, and effective picture/audio intervals in group time. Export preflight should also return output time, original source time and stream IDs, packet-copy versus encode actions, and proposed timing alternatives. The existing explicit track-selection flags select stream copy. Preserve that contract and report a conflict if a project request explicitly asks for both single-type output and encoding under those flags.
-- For an explicit ordered request such as `{"clips":[{"project":"interview.multicam.json","from":"12","to":"20"}],"output":"answer.mov","mode":"smart"}`, a clip selects exactly one of `file` or `project`. A project clip always addresses original group time, even when the document has a saved assembly. A bare `export --project` renders the saved assembly. The GUI should distinguish editing a group switch (all occurrences update) from trimming an occurrence in the assembly (only that occurrence changes).
+- For an explicit ordered request such as `{"clips":[{"project":"interview.cut","from":"12","to":"20"}],"output":"answer.mov","mode":"smart"}`, a clip selects exactly one of `file` or `project`. A project clip always addresses original group time, even when the document has a saved assembly. A bare `export --project` renders the saved assembly. The GUI should distinguish editing a group switch (all occurrences update) from trimming an occurrence in the assembly (only that occurrence changes).
 - For visual review, extend frame export to return aligned JPEGs for every available angle at requested group times. Its manifest should include group time, angle ID, actual source frame time, and availability. An agent can compare framings, write switches, and inspect the resulting program without decoding every angle continuously. Scene and silence analysis stay source-specific and map onto the group clock.
 - Store reusable indexes, thumbnails, waveforms, and detections in the existing per-recording sidecars. Save manual sync, switches, and the audio policy explicitly in the project. Offer relinking if a source moves and revalidate timing if it changes.
 

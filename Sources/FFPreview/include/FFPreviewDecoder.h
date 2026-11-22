@@ -23,7 +23,7 @@ enum MPPreviewTracks {
 };
 
 /* A valid origin is the source presentation timestamp at timeline zero.
- * An audio ordinal of -1 uses the default for the source. */
+ * An audio ordinal of -1 mixes linked movie tracks or selects the first standalone sound track. */
 MPPreviewDecoder *mp_preview_open(const char *path, enum MPPreviewTracks tracks, int audio_ordinal, CMTime origin,
                                  MPPreviewCancelled cancelled,
                                  void *context, const char **error);

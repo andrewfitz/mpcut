@@ -5,13 +5,31 @@ import MPCutCore
 @MainActor
 final class EditorPreferences: ObservableObject {
     enum Change {
-        case useAnalysisSidecars, defaultExportMode, snapTarget, largeThumbnails
-        case minimumPause, leavePause, volume, isMuted, scrubSoundEnabled, jpegPreset
+        case localMCPEnabled, useAnalysisSidecars, defaultExportMode, snapTarget, largeThumbnails
+        case minimumPause, leavePause, volume, isMuted, scrubSoundEnabled, jpegPreset, historyLimit
     }
 
     private let defaults: UserDefaults?
     // Subscribers that recalculate project state need to read the new value after it is stored.
     private let changes = PassthroughSubject<Change, Never>()
+
+    static let historyStepRange = 0...CutProject.maximumHistorySteps
+    @Published private var storedHistoryLimit = 50
+    var historyLimit: Int {
+        get { storedHistoryLimit }
+        set {
+            let bounded = min(Self.historyStepRange.upperBound, max(Self.historyStepRange.lowerBound, newValue))
+            let previous = storedHistoryLimit
+            guard previous != bounded else { return }
+            storedHistoryLimit = bounded
+            save(bounded, replacing: previous, key: "historyLimit", change: .historyLimit)
+        }
+    }
+
+    @Published var localMCPEnabled = false {
+        didSet { save(localMCPEnabled, replacing: oldValue, key: "localMCPEnabled", change: .localMCPEnabled) }
+    }
+    @Published var localMCPStatus = "Off"
 
     @Published var useAnalysisSidecars = true {
         didSet { save(useAnalysisSidecars, replacing: oldValue, key: "useAnalysisSidecars", change: .useAnalysisSidecars) }
@@ -54,6 +72,13 @@ final class EditorPreferences: ObservableObject {
     init(defaults: UserDefaults? = nil) {
         self.defaults = defaults
         guard let defaults else { return }
+        if let storedLimit = defaults.object(forKey: "historyLimit"),
+           CFGetTypeID(storedLimit as CFTypeRef) != CFBooleanGetTypeID(),
+           let steps = Self.number(storedLimit), steps.rounded() == steps {
+            storedHistoryLimit = Int(min(Double(Self.historyStepRange.upperBound), max(0, steps)))
+            if steps != Double(historyLimit) { defaults.set(historyLimit, forKey: "historyLimit") }
+        }
+        localMCPEnabled = Self.flag(defaults.object(forKey: "localMCPEnabled")) ?? false
         useAnalysisSidecars = Self.flag(defaults.object(forKey: "useAnalysisSidecars")) ?? true
         largeThumbnails = Self.flag(defaults.object(forKey: "largeTimelineThumbnails")) ?? false
         snapTarget = defaults.string(forKey: "timelineSnapTarget").flatMap(TimelineSnapTarget.init(rawValue:))

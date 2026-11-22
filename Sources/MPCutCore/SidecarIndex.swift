@@ -81,6 +81,7 @@ private struct IndexHeader: Codable {
         let packetCount: Int
         let editCount: Int
         let opus: OpusHeader?
+        let mp3Anchors: [MP3Anchor]?
     }
 
     struct OpusHeader: Codable {
@@ -111,7 +112,8 @@ private struct IndexHeader: Codable {
             }
             return Track(index: track.stream.index, start: track.start, end: track.end, hasPriming: track.hasPriming,
                          pcmContinuity: track.pcmContinuity, packetCount: track.packets.count,
-                         editCount: track.presentationEdits.count, opus: opus)
+                         editCount: track.presentationEdits.count, opus: opus,
+                         mp3Anchors: track.mp3Anchors.isEmpty ? nil : track.mp3Anchors)
         }
         copyIssue = media.copyIssue
         audioIssues = media.audioIssues.isEmpty ? nil : media.audioIssues
@@ -453,6 +455,6 @@ private extension IndexReader {
         }
         return AudioIndex(stream: stream, packets: packets, start: track.start, end: track.end,
                           hasPriming: track.hasPriming, pcmContinuity: track.pcmContinuity,
-                          presentationEdits: edits, opusWindow: window)
+                          presentationEdits: edits, mp3Anchors: track.mp3Anchors ?? [], opusWindow: window)
     }
 }

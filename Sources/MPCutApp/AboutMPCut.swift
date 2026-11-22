@@ -12,13 +12,15 @@ struct AboutCommands: Commands {
         CommandGroup(replacing: .help) {
             Button("MPCut User Guide") { NSWorkspace.shared.open(MPCutDocument.guide.url) }
                 .keyboardShortcut("?", modifiers: .command)
+            Button("MPCut Agent Guide") { NSWorkspace.shared.open(MPCutDocument.agentGuide.url) }
             Button("Release Notes") { NSWorkspace.shared.open(MPCutDocument.releaseNotes.url) }
         }
     }
 }
 
-private enum MPCutDocument: String {
+enum MPCutDocument: String {
     case guide = "docs/USAGE"
+    case agentGuide = "docs/MCP-AGENT-GUIDE"
     case releaseNotes = "CHANGELOG"
 
     var url: URL {

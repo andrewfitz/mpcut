@@ -43,6 +43,47 @@ final class MulticamSoundTests: XCTestCase {
         return try MulticamEngine().resolveSound(mapping, sources: ["mic": flagged], container: "wav")
     }
 
+    func testTwoHoursOfIncompatiblePictureAndSamplePhasesSkipFullResolution() throws {
+        let mic = try microphone()
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures/Multicam-Delayed-ProRes.mov")
+        let movie = try CutEngine(useSidecar: false).inspectMulticamSource(fixture)
+        let video = try XCTUnwrap(movie.videoStream)
+        let duration = RationalTime(numerator: 7200)
+        let tick = RationalTime(numerator: 1, denominator: 30)
+        let frames = (0..<216_000).map { index in
+            FrameInfo(dts: nil, time: RationalTime(numerator: Int64(index), denominator: 30),
+                      duration: tick, keyframe: true, canStart: true, canEnd: true, byteCount: 1)
+        }
+        let camera = MediaInfo(url: movie.url, format: movie.format, duration: duration, origin: .zero,
+                               streams: [video], frames: frames, audio: [], copyIssue: nil,
+                               sourceStartSafe: true, identity: movie.identity, videoIndex: 0)
+        let start = RationalTime(numerator: 3600)
+        let retained = MulticamRange(from: start, to: duration)
+        let original = try XCTUnwrap(mic.audio.first)
+        let end = RationalTime(numerator: 7201)
+        let track = AudioIndex(stream: original.stream, packets: [], start: .zero, end: end,
+                               hasPriming: false, pcmContinuity: true, presentationEdits: [])
+        let recorder = MediaInfo(url: mic.url, format: mic.format, duration: end, origin: .zero,
+                                 streams: mic.streams, frames: [], audio: [track], copyIssue: nil,
+                                 sourceStartSafe: true, identity: mic.identity, videoIndex: -1)
+        let project = MulticamProject(referenceAngle: "cam", range: .init(from: .zero, to: duration),
+            angles: [.init(id: "cam", file: fixture.path)],
+            audioSources: [.init(id: "mic", file: mic.url.path, offset: .init(numerator: -1, denominator: 96000))],
+            audio: .fixed(.init(source: "mic", stream: 0)), switches: [.init(at: .zero, angle: "cam")],
+            assembly: [retained])
+        var replans = 0, resolutions = 0
+        let alternatives = try MulticamEngine().edgeAlternatives(.init(range: 1, boundary: "from", at: start),
+            mapping: project.plan(), media: ["cam": camera, "mic": recorder], mode: .encode, container: "mov",
+            picture: true, sound: true, adjusting: { _, _, time in
+                replans += 1
+                return try project.plan(ranges: [.init(from: time, to: duration)])
+            }, failure: { _ in resolutions += 1; return nil })
+        XCTAssertTrue(alternatives.isEmpty)
+        XCTAssertEqual(replans, 1)
+        XCTAssertEqual(resolutions, 0)
+    }
+
     func testAnIndexedIssueOnTheSelectedSoundtrackBlocksItsCopy() throws {
         let media = try microphone()
         XCTAssertEqual(try resolve(media, issue: nil).segments.count, 1)

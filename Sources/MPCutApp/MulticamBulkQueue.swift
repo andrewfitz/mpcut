@@ -74,6 +74,7 @@ extension MulticamEditorModel {
     func removeQueuedRange(_ id: UUID) {
         guard !isExporting else { return }
         queuedRanges.removeAll { $0.id == id }
+        reconcileSourceLoads()
     }
 
     func showBulkQueue() {
@@ -110,11 +111,15 @@ extension MulticamEditorModel {
         bulkExportDirectory = directory
         isBulkQueuePresented = false
         let ranges = queuedRanges
+        let protected = protectedMediaPaths
         run("Exporting queued multicam ranges…", exporting: true) { [weak self] token, useSidecar in
             try AnalysisSidecar.$readsEnabled.withValue(useSidecar) {
                 let engine = MulticamEngine(cancelled: { token.isCancelled })
                 let batch = try MulticamBulkExport(ranges: ranges, directory: directory, container: container,
                                                   mode: mode, tracks: tracks, settings: settings, engine: engine)
+                for item in batch.items {
+                    try CutProject.validateMediaDestination(item.output, absoluteSources: protected)
+                }
                 for (index, item) in batch.items.enumerated() {
                     do {
                         try engine.write(item.plan, to: item.output) { [weak self] fraction in

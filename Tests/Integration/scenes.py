@@ -60,7 +60,7 @@ class Scenes(unittest.TestCase):
                          [0, Fraction(11, 25), Fraction(24, 25)])
         self.assertEqual([time(scene["end"]) for scene in report["scenes"]],
                          [Fraction(11, 25), Fraction(24, 25), Fraction(41, 25)])
-        self.assertEqual(set(self.source.parent.iterdir()), {self.source, Path(str(self.source) + ".mpcut")})
+        self.assertEqual(set(self.source.parent.iterdir()), {self.source, Path(str(self.source) + ".cutdb")})
 
     def test_scene_files_match_chronology_and_frame_counts(self):
         report = self.cli("--export-to", self.output, self.source)

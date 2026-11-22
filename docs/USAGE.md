@@ -9,17 +9,80 @@ Jump to [working with several windows](#work-with-several-editor-windows), [mult
 1. Open MPCut and choose **Add Clips**. Select a movie or audio recording. To join multiple clips, select compatible recordings of the same kind.
 2. Drag the clips into playback order. Press Space to preview the join.
 3. To shorten a clip, drag its leading or trailing edge. To remove a section in the middle, seek to its start and click **Mark In** (I). A bracket appears at the playhead and the timeline shows its **In** time. Seek to the end and click **Mark Out** (O). Press **Delete** to remove the shaded range, **Esc** to clear the marks, or **⌘Z** to undo an edit.
-4. Choose **Export** to write all retained footage in timeline order. To save one or more marked sections as separate files, add them to the **Export Queue**. Ordinary timelines and queues last for the editor session.
+4. Choose **Export** to write all retained footage in timeline order. To save one or more marked sections as separate files, add them to the **Export Queue**. Choose **File → Save Project** to keep the ordered edit in a `.cut` document. Export queues are session-based.
+
+## Apply CSV cut points to a clip
+
+Drop one UTF-8 `.csv` file directly onto a clip in the sequence timeline. The outline shows which occurrence will be edited. Dropping the file on the viewer edits the clip at the playhead. You can also select a clip and choose **Sequence → Apply CSV to Selected Clip…**. Undo (⌘Z) restores the whole edit in one step.
+
+To split at 2 and 5 seconds and keep all three pieces, use one timestamp per row under an optional `time` header. Points must increase and fall inside the clip.
+
+To remove gaps, rearrange sections, or repeat a take, write one keep range per row. This example plays seconds 5–8, then 0–2, then 5–8 again.
+
+```csv
+from,to
+5,8
+0,2
+5,8
+```
+
+A CSV file can contain up to 64 MiB. An edit can expand CSV rows and repeats into up to 100,000 pieces. The range header is optional. `start,end` also works. Every start is inclusive and every end is exclusive. Both CSV layouts accept seconds, clock times such as `01:02.5`, and exact fractions such as `1001/30000`. Zero means the beginning of the clip as trimmed. Export uses the normal boundary rules for the chosen mode.
+
+In the CLI, attach `--csv` to its `--clip`. Use `--from` and `--to` on that clip to set the scope first. Add `--dry-run --json` to inspect the resolved edit.
+
+```sh
+mpcut export --clip interview.mov --csv selects.csv --mode smart --snap nearest --output selects.mov
+```
+
+## Pass lists to CLI commands
+
+Use UTF-8 CSV or JSON list files anywhere the CLI accepts an ordered list. Relative media paths use the command’s working directory, just as they do on the command line.
+
+| Command and parameter | CSV rows | JSON array example |
+| --- | --- | --- |
+| `rearrange SOURCE --ranges LIST`, `bulk SOURCE --ranges LIST`, `export --clip SOURCE --ranges LIST` | `from,to` keep ranges, or one `time` per split point | `[{"from":"5","to":"8"},{"from":"0","to":"2"}]` or `[2,5]` |
+| `export --clips LIST`, `resolve --clips LIST` | One path per row, or a header beginning with `file` or `project` and optional `from,to` columns | `["intro.mov","talk.mov"]` or `[{"file":"talk.mov","from":"1/2","to":"3"}]` |
+| `export --order-file LIST` | One clip number per row, optional `order` header | `[2,1,2]` |
+| `frames --at-file LIST` | One timestamp per row, optional `time` header | `[0,"1/2","00:03"]` |
+| `sidecar --only-file LIST` | One section per row, optional `section` header | `["index","audio"]` |
+| `scenes --export-to DIR --scenes-file LIST` | Header `start,end,view`, optional `number` | `[{"start":0,"end":1,"view":1}]` |
+| `silence SOURCE --pauses-file LIST` or `silence --input REPORT.json --pauses-file LIST` | `from,to` explicit, non-overlapping pause intervals in source order | `[{"from":"1","to":"2"}]` |
+
+`rearrange` also accepts the list path in place of its inline range argument. Likewise, `--at`, `--order`, and `--only` accept a CSV or JSON path directly. Quote CSV paths containing commas or quotes using standard CSV quoting. JSON list files accept numbers with up to 38 significant digits. For frame-exact times, use a quoted fraction such as `"1001/24000"`.
+
+```sh
+mpcut rearrange interview.mov --ranges selects.json --output highlights.mov
+mpcut bulk interview.mov --ranges selects.csv --output clips --dry-run
+mpcut export --clips sources.csv --order-file playback.json --output assembly.mov
+```
+
+`rearrange` joins the retained pieces into one movie. `bulk` writes one numbered file per piece to an existing directory. For complete requests and saved analysis reports, `export`, `bulk`, `resolve`, `scenes`, and `silence` accept `--input FILE.json` with the same JSON object as `--stdin`.
+
+## Select and edit a timeline range
+
+Press **R** or click the I-beam in the transport bar. Drag from one edge of the range to the other. You can drag in either direction and across clip boundaries. Click once to collapse the highlight, or press **A** to return to the pointer for moving and trimming clips.
+
+| With a range highlighted | Action |
+| --- | --- |
+| **⌘B** or the scissors | Split at both edges in one undoable edit. Existing cuts inside the range stay in place. Split is available when at least one edge falls inside a clip. |
+| **⌥⌘E** or **Export Selection** | Open export options for just the highlighted material. Splitting first is optional. |
+| **Delete** | Remove the highlighted time and close the gap. **⌘Z** restores it. |
+
+In multicam, drag on the **Assembly** row to target one occurrence, even when footage appears more than once. A selection on the **Group** lanes uses camera-group time. Splitting or deleting it affects every retained occurrence of that interval. Exporting it produces the selected group interval once. Multicam projects require at least one retained range.
 
 ## Work with several editor windows
 
-Choose **File → New Project Window** (⌘N) for an empty editor. Each window has its own timeline, playhead and edit history. **⌘O** adds recordings to the active window. **Add as Multicam…** uses an empty editor or opens a separate window if the current timeline has clips. Choose **File → Open Multicam Project…** (⇧⌘O) to open a saved project. If it is already open, MPCut brings that window forward.
+Choose **File → New Project Window** (⌘N) for an empty editor. Each window has its own timeline, playhead and edit history. **⌘O** adds recordings to the active window. **Add as Multicam…** uses an empty editor or opens a separate window if the current timeline has clips. Choose **File → Open MPCut Project…** (⇧⌘O) to open a saved project. If it is already open, MPCut brings that window forward.
 
 Windows opening the same recording can share one background index scan. MPCut also keeps a bounded in-memory cache of completed indexes for the current app session, including when automatic sidecars are off. It checks the file identity before reusing an index.
 
-**⌘W** closes the active window. MPCut asks about unsaved multicam edits when you close their window. **⌘S** saves a multicam project in a multicam window and saves analysis sidecars in an ordinary editor window.
+**⌘W** closes the active window. MPCut asks about unsaved timeline edits when you close their window. **⌘S** saves the project. **File → Save Analysis Sidecars** writes completed analysis to each recording’s `.cutdb` cache.
+
+MPCut writes an untitled `.cut` draft when you add clips. Each window keeps its own draft in the macOS Autosave Information directory. **⌘S** writes the project and its retained history to the location you choose, then removes the draft. If the app stops unexpectedly, choose **File → Recover Untitled Project…** and select the last edit time. Saving the recovered project lets you give it a name. If macOS closes a window without completing its save prompt, you can also recover unsaved edits to a named project here. The saved original stays at its last explicit save.
 
 Choose **View → Show Video Monitor** to review the active project in a video-only window. Drag it to another display or use its full-screen control.
+
+Use **File → Import External Project…** to convert an editor project into a new `.cut` and open it. **File → Export Project** writes the current edit in the chosen format. During conversion, **File → Cancel Project Conversion** requests cancellation. MPCut waits for the active host operation to finish cleanup. Ordinary timelines use the desktop editor’s source compatibility checks when opened. [Converter requirements](../README.md#convert-projects) · [Project schema and examples](CUT-FORMAT.md)
 
 ## Edit a sequence
 
@@ -33,7 +96,11 @@ Beside Play, the inner arrows step one frame, the next pair jump by keyframe, an
 
 After analysis, the status bar shows the current scene and estimated recurring view within the source. Matching shots get the same lettered label and color. Click the status label or choose **Playback → Rename Current View** to apply a name such as “Wide” to every matching shot in the current session. A blank name restores the default. A camera punch-in can form a separate view. Camera movement, changed lighting and similar compositions can affect grouping. Gradual dissolves and single-frame flashes are outside the hard-cut target.
 
-**Clear Marks** beside Mark Out clears both marks. Hover over Undo or Redo to see which edit it will affect. Use the magnifying-glass buttons beside the zoom slider to change the timeline scale, or **Fit** to see the full sequence. The thumbnail-size button beside **Snap To** switches between Small and Large. The same setting is in **View → Large Timeline Thumbnails**.
+Choose **Edit → Project History…** (⇧⌘Y) to see each retained edit in order. The current state has a checkmark. Select an earlier or later state and choose **Restore State** to jump there. Undo and Redo also work after reopening the saved `.cut` project. Making a new edit after undoing replaces the remaining redo steps.
+
+In **Settings → General → Project history**, set **Maximum steps** to a value from 0 to 500. The default is 50 steps shared between undo and redo for each project. Lowering the limit trims open projects immediately and takes effect in a named project file the next time you save it. At 0, MPCut records no timeline history.
+
+**Clear Marks** beside Mark Out clears both marks. Hover over Undo or Redo to see which edit it will affect. Wheel up over the timeline to zoom in and down to zoom out. Option-wheel also zooms. Hold Command and scroll to pan horizontally using your macOS scrolling direction. Horizontal trackpad swipes pan directly. These gestures also work over the multicam lanes. Use the magnifying-glass buttons beside the zoom slider to change the timeline scale, or **Fit** to see the full sequence. The thumbnail-size button beside **Snap To** switches between Small and Large. The same setting is in **View → Large Timeline Thumbnails**.
 
 Press **J** to play backward, **K** to pause, and **L** to play forward. Repeating J or L increases the speed to 2×, 4× and 8×. Changing direction starts at 1×. During reverse playback you hear the source audio backward, following the current order and trims as the playhead crosses each join. The speaker’s volume and mute controls apply in both directions. **Play audio while scrubbing** controls the short previews you hear when dragging the playhead.
 
@@ -41,6 +108,10 @@ Press **J** to play backward, **K** to pause, and **L** to play forward. Repeati
 | --- | --- |
 | Play or pause | Space |
 | Shuttle backward / pause / shuttle forward | J / K / L |
+| Slower / faster / normal playback | [ / ] / Backslash |
+| Zoom timeline out / in | − / = or ⌘− / ⌘= |
+| Toggle fit / previous zoom | Shift-Z |
+| Go to timeline start / end | Home / End |
 | Step one frame | ← / → |
 | Jump by keyframe | Option–← / Option–→ |
 | Jump by scene | Shift–← / Shift–→ |
@@ -49,8 +120,9 @@ Press **J** to play backward, **K** to pause, and **L** to play forward. Repeati
 | Split at the playhead | ⌘B |
 | Remove the marked range or selected clip | Delete |
 | Undo / redo | ⌘Z / ⇧⌘Z |
-| Clear marks | Esc |
-| Save analysis sidecars on an ordinary timeline | ⌘S |
+| Project history | ⇧⌘Y |
+| Clear marks | ⌥X or Esc |
+| Save project | ⌘S |
 | Open Settings | ⌘, |
 | Export media | ⌘E |
 | Add marked range to export queue | ⇧⌘A |
@@ -61,7 +133,7 @@ Press **J** to play backward, **K** to pause, and **L** to play forward. Repeati
 1. Click **Add as Multicam…** on the blank start screen or choose **File → Add as Multicam…**. Select at least one camera recording and any separate audio recordings. In **Set Up Multicam**, check the source order, opening camera, and soundtrack, then click **Create Multicam**. The opening camera sets the reference and the initial group duration. To add recordings later, use **Add Sources** in the toolbar or press **⌘O**. In **Sources**, you can relink recordings, rename and reorder angles, assign microphones, enter exact offsets, nudge camera sources by a frame or separate audio sources by a sample, and change the group end.
 2. In **Group** preview, click the ruler or a filmstrip to seek. Click a numbered camera button next to the mark controls, click **Take** in a camera lane, or press **1–9** to switch at the playhead. The camera buttons highlight the on-air camera, and the audio lane shows the selected soundtrack. Drag a switch marker to change its time. Select it to edit its picture or microphone in **Switch**, or delete it to extend the previous selection. The opening switch stays at zero.
 3. Use **Mark In**, **Mark Out**, and **Add to Assembly** to build an **Assembly**. Open the **Assembly** inspector or choose **Assembly** preview to show the assembly timeline. Click a range to select that occurrence, drag either edge to trim it, or drag the range body to reorder it. The assembly ruler shows output time. The camera and switch lanes below stay on group time. **Snap To → Keyframes** uses indexed picture entry and exit points for assembly trim handles. Export preflight checks the selected soundtrack and container. With an assembly range selected, press **Delete** to remove that occurrence or subtract a complete marked group range wherever it appears in the assembly. At least one retained range must remain. In the group timeline, **Delete** removes the selected switch after the opening switch.
-4. Choose **Save Project** (⌘S) and use **File → Open Multicam Project…** to reopen the same edit. **Save Project As…** (⇧⌘S) saves a separate version, and **Save Analysis Sidecars** stores reusable source analysis. Open **Export** with **⌘E**. Choose **Current assembly** or **Whole group**, then select tracks, mode and container. **Check Export** lets you review the plan before **Export…**. For a full conversion, choose video and audio under **Re-encode**, run **Check Re-encode**, then choose **Export Re-encoded…**.
+4. Choose **Save Project** (⌘S) and use **File → Open MPCut Project…** to reopen the same edit. **Save Project As…** (⇧⌘S) saves a separate version, and **Save Analysis Sidecars** stores reusable source analysis. Open **Export** with **⌘E**. Choose **Current assembly** or **Whole group**, then select tracks, mode and container. **Check Export** lets you review the plan before **Export…**. For a full conversion, choose video and audio under **Re-encode**, run **Check Re-encode**, then choose **Export Re-encoded…**.
 
 New projects and saved projects can open before all sources finish indexing. Watch, scrub and switch available cameras while the status bar shows how many sources are indexing. Camera filmstrips can start filling from source headers as indexing runs. The finished indexes refine frame times and gaps and enable exact frame stepping and export. If MPCut cannot read a source, use **Sources → Relink…** to locate its recording.
 
@@ -71,7 +143,9 @@ Choose **Fixed master** for a continuous soundtrack from one camera or a separat
 
 Starts are inclusive and ends are exclusive. Exact switches need an outgoing frame end and an incoming frame start at the same group time. Manual sync can put two cameras on different frame grids, so visually aligned preview frames may still fail export preflight. Short recordings limit when those streams can be selected. Use the export plan to check the chosen picture and sound over each retained range. [Multicam export modes](EXPORT-MODES.md#multicam-exports)
 
-Press **J**, **K**, and **L** to shuttle backward, pause, or shuttle forward. Repeated **J** or **L** presses increase speed to 2×, 4× and 8×. **Preview Audio** controls volume, mute and scrub sound. Click the time readout to enter a position in seconds or as a timecode. Use the timeline zoom controls or **Fit** to change the scale. Use **Use Large Thumbnails** or **Use Small Thumbnails** to change the filmstrip size. Drag the divider above the timeline to change its height, or drag the divider beside the track names to resize that column. Scroll the camera lanes to see more tracks. Drag the ruler or a camera or audio lane to scrub.
+The speed menu after the forward navigation buttons sets forward preview speed from 0.125× to 8×. Space resumes at the selected speed. At 0.25×, 240 fps footage advances by 60 source frames per second. Playback presents frames according to the display refresh rate.
+
+Press **J**, **K**, and **L** to shuttle backward, pause, or shuttle forward. Repeated **J** or **L** presses increase speed to 2×, 4× and 8×. **Preview Audio** controls volume, mute and scrub sound. Click the time readout to enter a position in seconds or as a timecode. Use the timeline zoom controls or **Fit** to change the scale. Use **Use Large Thumbnails** or **Use Small Thumbnails** to change the filmstrip size. Drag the divider above the timeline to change its height, or drag the divider beside the track names to resize that column. Scroll over the track names to see more tracks. Drag the ruler or a camera or audio lane to scrub.
 
 Use the scissors button, **Sequence → Split Assembly Range at Playhead**, or **⌘B** when the playhead is inside a retained range. In **Group** preview, MPCut splits the selected occurrence if it covers the playhead, or another range that contains that group time. In **Assembly** preview, it splits the occurrence at the output playhead. The assembly opens with the right-hand range selected.
 
@@ -84,6 +158,10 @@ In **Switch**, audition another angle and click **Show Program** to return to th
 | Add sources to this project | ⌘O |
 | Play or pause | Space |
 | Shuttle backward / pause / shuttle forward | J / K / L |
+| Slower / faster / normal playback | [ / ] / Backslash |
+| Zoom timeline out / in | − / = or ⌘− / ⌘= |
+| Toggle fit / previous zoom | Shift-Z |
+| Go to timeline start / end | Home / End |
 | Step one frame | ← / → |
 | Jump by keyframe | Option–← / Option–→ |
 | Jump by detected scene | Shift–← / Shift–→ |
@@ -94,9 +172,10 @@ In **Switch**, audition another angle and click **Show Program** to return to th
 | Add the marked range to the export queue | ⇧⌘A |
 | Split an assembly range at the playhead | ⌘B |
 | Remove the selected assembly range or marked range, or delete the selected group switch | Delete |
-| Clear marks | Esc |
+| Clear marks | ⌥X or Esc |
 | Open the export queue | ⇧⌘E |
 | Undo / redo | ⌘Z / ⇧⌘Z |
+| Project history | ⇧⌘Y |
 | Save project / save project as | ⌘S / ⇧⌘S |
 | Open the Export inspector | ⌘E |
 
@@ -117,7 +196,7 @@ Choose **File → Replace Source Audio…** to use a stream from the project or 
 Given a saved project, one command validates the edit and writes the program using its saved assembly, or its full group when no assembly is saved.
 
 ```sh
-mpcut export --project interview.multicam.json --output interview.mov --json
+mpcut export --project interview.cut --output interview.mov --json
 ```
 
 Smart Trim and exact boundaries are the defaults. Add `--dry-run` to review the plan without creating the movie. Use `inspect --project` to inspect coverage or troubleshoot the source setup. Both are optional before a direct export.
@@ -125,8 +204,9 @@ Smart Trim and exact boundaries are the defaults. Add `--dry-run` to review the 
 To create a project from an agent, retrieve `projectTemplate` with `mpcut help multicam --json | jq '.projectTemplate'` or write the JSON directly. This example assumes two compatible MOV angles covering 12 seconds and one WAV master covering the same interval. The switches at 4 and 8 seconds must fall on frame boundaries in both recordings. Save the project beside the source files. Relative media paths in a saved project are based on the project's directory.
 
 ```sh
-cat > interview.multicam.json <<'JSON'
+cat > interview.cut <<'JSON'
 {
+  "format": "mpcut",
   "schemaVersion": 1,
   "kind": "multicam",
   "referenceAngle": "wide",
@@ -145,8 +225,8 @@ cat > interview.multicam.json <<'JSON'
   "assembly": [{"from": "8", "to": "12"}, {"from": "0", "to": "8"}]
 }
 JSON
-mpcut inspect --project interview.multicam.json --json
-mpcut export --project interview.multicam.json --output interview.mov --dry-run --json > plan.json
+mpcut inspect --project interview.cut --json
+mpcut export --project interview.cut --output interview.mov --dry-run --json > plan.json
 ```
 
 In the inspection report, `groupIntervals` lists the decisions in original group order. Use `inspection.sources` to check each recording's coverage and stream indices, and `inspection.issues` to find uncovered ranges or missing soundtrack selections. An unreadable recording returns a structured error. In `plan.json`, `plan.intervals` maps group intervals to output intervals, while `plan.picture` and `plan.audio` give the source and output ranges for each lane. Check the top-level `picture` and `audio` arrays for the resolved track actions, and `copiedVideoDuration` and `encodedVideoDuration` for the Smart Trim totals.
@@ -160,8 +240,8 @@ mpcut export --stdin --dry-run --json <<'JSON'
 {
   "output": "selects.mov",
   "clips": [
-    {"project": "interview.multicam.json", "from": "0", "to": "4"},
-    {"project": "interview.multicam.json", "from": "4", "to": "8"}
+    {"project": "interview.cut", "from": "0", "to": "4"},
+    {"project": "interview.cut", "from": "4", "to": "8"}
   ],
   "order": [1, 2, 1]
 }
@@ -171,7 +251,7 @@ JSON
 ### Compare all angles at the same time
 
 ```sh
-mpcut frames --project interview.multicam.json --at 4 --at 8 --output review --json
+mpcut frames --project interview.cut --at 4 --at 8 --output review --json
 ```
 
 Pass one `--at` per original group time. The manifest's `frames` list follows request order, then project angle order. Each row gives `groupTime`, `angleID`, `sourceTime`, and `availability`. An available row also gives the JPEG `file`, the actual source `frameTime`, and `groupCoverage`, the half-open group interval where that frame is visible. Check the outgoing and incoming frame edges before using a time for a switch. Preflight tests both boundaries. Use `--preset full` for a display-resolution comparison.
@@ -181,10 +261,10 @@ Pass one `--at` per original group time. The manifest's `frames` list follows re
 `silence --project` scans the soundtrack selected by the project's fixed master, camera microphones and switch overrides. It follows the saved assembly in playback order, including repeated ranges, or uses the whole group when the project has no assembly. Automatic thresholds are calculated per routed track. Supply `--threshold-db` to use the same cutoff across those tracks. A continuous quiet interval can extend across a camera switch.
 
 ```sh
-mpcut silence --project interview.multicam.json --min-pause 1.5 --leave 0.4 --json > project-pauses.json
-mpcut silence --project interview.multicam.json --min-pause 1.5 --leave 0.4 \
+mpcut silence --project interview.cut --min-pause 1.5 --leave 0.4 --json > project-pauses.json
+mpcut silence --project interview.cut --min-pause 1.5 --leave 0.4 \
   --output shortened.mov --dry-run --json
-mpcut silence --project interview.multicam.json --min-pause 1.5 --leave 0.4 \
+mpcut silence --project interview.cut --min-pause 1.5 --leave 0.4 \
   --output shortened.mov --json
 ```
 
@@ -235,7 +315,7 @@ In the `waveform` JSON, `envelope.low` and `envelope.high` give the lowest and h
 
 For a complete FLAC recording, `.flac` preserves the original packets. For cuts or reordered FLAC ranges, use `.mka` so the container can give those same packets new timestamps. For one contiguous MP3 range, MPCut can copy the original frames into an MP3 and set gapless start and end padding. The player must honor that padding to reproduce the exact first and last samples. Some Apple readers ignore it on lower-rate MP3 files.
 
-Ogg Opus can preserve an interior cut in MKA. Vorbis supports a prefix ending at a suitable packet boundary. Separate MP3, Vorbis, and Opus ranges can depend on earlier packets at joins. Use `--dry-run --json` to check the actual boundaries and output format. Reordered AAC in M4A or MOV uses a presentation edit list. Players differ in how they apply multiple entries, so check the joins in the intended playback system when individual samples matter.
+Ogg Opus can preserve an interior cut in MKA. Vorbis supports a prefix ending at a suitable packet boundary. Separate MP3, Vorbis, and Opus ranges can depend on earlier packets at joins, so Lossless Copy cannot join them. The app and the CLI then report the same ordered alternatives, least destructive first: the export sheet shows the first as a button, and the CLI lists them in `error.alternatives` with the arguments that request each one. [Export rules](EXPORT-RULES.md) is the full matrix of modes, containers, audio actions and alternatives. Opus and Vorbis convert to WAV or AAC. A conversion decodes each kept range to the sample and encodes the result once. From the CLI use `export --mode encode` with a sound-only source or `--tracks audio`: `--audio auto` copies when an exact copy is possible and otherwise applies the first alternative that fits the output extension, and `--audio pcm|aac|mp3|flac` names a format. Use `--dry-run --json` to check the actual boundaries, output format and bit rate. Reordered AAC in M4A or MOV uses a presentation edit list. Players differ in how they apply multiple entries, so check the joins in the intended playback system when individual samples matter.
 
 Select a clip and choose **File → Replace Source Audio…** and pick a movie or audio file. **Save and Apply** creates a lossless working movie and uses it for every timeline cut of the selected source. The teal strip lists the replaced tracks. Playback monitors the most recently replaced track for that source, and the waveform selector switches to its track number. Exports use the working movie with all retained tracks. Undo restores the prior source. Extract the soundtrack, apply effects in your audio editor, and render the full track with the same duration. Select that recording as the replacement and choose the original and replacement tracks. MPCut places it at the original track's start time, including when the soundtrack starts after the picture. The replacement may use a different codec when the destination supports it. For example, an externally processed PCM WAV can replace AAC in a MOV. The other original tracks stay in their original order.
 
@@ -252,7 +332,7 @@ For whole-source replacement, a dry run checks the plan and muxer. MPCut verifie
 
 ## Choose an export mode
 
-Press **⌘E** to choose a mode, container and filename in one save sheet. For movies, the initial default is **Smart Trim**. You can change the movie default in Settings. Audio-only exports use **Lossless Copy**. The sheet checks the current timeline as you change settings.
+Press **⌘E** to choose a mode, container and filename in one save sheet. For movies, the initial default is **Smart Trim**. You can change the movie default in Settings. Audio-only exports start with **Lossless Copy** and can switch to **Convert Audio**. The sheet checks the current timeline as you change settings. When the selected mode cannot write the timeline, a button under the message names the least destructive export that can, and nothing changes until you click it.
 
 | Mode | When to use it |
 | --- | --- |
@@ -271,6 +351,8 @@ MPCut copies complete, independently decodable sections and encodes the frames n
 Smart Trim supports progressive 4:2:0 SDR footage with even dimensions and a verified starting frame. H.264 Baseline, Constrained Baseline, Main, and High profiles and HEVC Main (8-bit) or Main 10 (10-bit) in compatible MOV/MP4 files use the Mac’s hardware encoder. H.264 Smart Trim requires at least 192 × 96 pixels so the hardware encoder can match the coded dimensions at each splice. MOV files containing multiple compatible sample descriptions use copy mode. AV1 Main in WebM or MKV requires dimensions of at least 64 × 64 and a Mac with hardware AV1 decoding. The bundled SVT-AV1 software encoder handles its cut edges. ProRes already supports frame cuts in copy mode.
 
 ## Use the CLI from an agent
+
+For agent control of open and unsaved GUI projects, enable **Settings → General → Automation → Enable local MCP control** and connect the bundled stdio helper. [MCP setup, editing recipes and recovery](MCP-AGENT-GUIDE.md)
 
 Start with the installed executable. In a shell, set `mpcut=/Applications/MPCut.app/Contents/Helpers/mpcut`, use the path copied from **About MPCut**, or use `dist/MPCut.app/Contents/Helpers/mpcut` in a source checkout. The examples below using the bare command `mpcut` assume that executable is on your PATH. Python and other subprocess clients can pass its absolute path directly.
 
@@ -428,7 +510,7 @@ Open **MPCut → Settings…** (⌘,). In **General**, choose the timeline snap 
 
 ## Save and reuse analysis
 
-Completed indexes, scene scans, thumbnails, waveforms and silence results are saved automatically. Choose **File → Save Analysis Sidecars** to save the full edit index and the analysis already completed for each loaded recording. This includes scene cuts and view names, available filmstrip thumbnails, waveforms, calibrated room floors, and silence intervals for the scanned tracks and settings. The sidecar is a versioned SQLite file beside the original, such as `interview.mov.mpcut`. Subsequent saves merge completed sections.
+Completed indexes, scene scans, thumbnails, waveforms and silence results are saved automatically. Choose **File → Save Analysis Sidecars** to save the full edit index and the analysis already completed for each loaded recording. This includes scene cuts and view names, available filmstrip thumbnails, waveforms, calibrated room floors, and silence intervals for the scanned tracks and settings. The sidecar is a versioned SQLite file beside the original, such as `interview.mov.cutdb`. Subsequent saves merge completed sections.
 
 The app reads available sections when a recording opens. In **MPCut → Settings… → Analysis**, clear **Automatically save and load analysis beside each recording** to bypass automatic sidecars, including during export checks. An explicit **Save Analysis Sidecars** can still save the current analysis.
 

@@ -20,6 +20,13 @@ typedef struct {
     int64_t target_bit_rate;
 } MPCutEdgeRange;
 
+/* Xing stores 12 bits of encoder delay in addition to decoder latency. */
+enum { MPCUT_MP3_MAX_SKIP = 4095 + 529 };
+typedef struct {
+    int64_t sample, offset;
+    uint32_t checksum;
+} MPCutMP3Anchor;
+
 typedef struct {
     const char *path;
     MPCutTime start;
@@ -36,6 +43,7 @@ typedef struct {
     MPCutTime source_origin; /* Indexed video or audio presentation origin, when available. */
     MPCutTime output_start; /* Planned movie time of the range start. Positive in a whole MOV copy whose linked audio leads. */
     unsigned audio_stream_override; /* Absolute audio stream index + 1, or 0 to use the export-wide selector. */
+    MPCutMP3Anchor mp3_anchor;
 } MPCutSegment;
 
 /* AAC presentation edits in their track's native sample clock. */
@@ -46,7 +54,13 @@ typedef struct {
     int64_t media_start; /* -1 for an empty edit */
 } MPCutAACSourceEdit;
 
-int mpcut_aac_source_open(const char *path, MPCutAACSource **source, char *error, size_t error_capacity);
+typedef struct {
+    int track_id;
+    int sample_rate;
+} MPCutAACTrackClock;
+
+int mpcut_aac_source_open(const char *path, const MPCutAACTrackClock *clocks, size_t clock_count,
+                          MPCutAACSource **source, char *error, size_t error_capacity);
 void mpcut_aac_source_free(MPCutAACSource *source);
 const MPCutAACSourceEdit *mpcut_aac_source_track(const MPCutAACSource *source, int track_id,
                                                 size_t *count, int *sample_rate);
@@ -57,7 +71,7 @@ int mpcut_align_copied_aac(const char *path, unsigned track_index, int sample_ra
                            int64_t priming, MPCutTime start, MPCutTime end, int movie_timescale,
                            char *error, size_t capacity);
 
-int mpcut_restore_copied_aac(const char *source_path, int source_track_id, const char *output_path,
+int mpcut_restore_copied_aac(const char *source_path, int source_track_id, int sample_rate, const char *output_path,
                              unsigned output_index, MPCutTime shift, int movie_timescale,
                              char *error, size_t capacity);
 
@@ -73,7 +87,7 @@ enum {
 
 /* Validate one standalone MP3 crop on its absolute decoded-sample clock. */
 int mpcut_check_mp3_crop(const char *path, int stream_index, int64_t start_sample, int64_t end_sample,
-                         MPCutProgress progress, void *context, char *error, size_t capacity);
+                         MPCutMP3Anchor anchor, MPCutProgress progress, void *context, char *error, size_t capacity);
 
 /* Checks the selected tracks against the output container without creating a file. */
 int mpcut_check_mux(const char *input_path, const char *output_path, int padded_opus_track, int tracks, int audio_stream,

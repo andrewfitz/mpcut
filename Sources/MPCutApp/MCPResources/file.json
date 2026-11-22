@@ -1,0 +1,1648 @@
+[
+  {
+    "name": "file_inspect",
+    "description": "Inspect one file, saved project, or inline .cut document. Choose a half-open window for frame or packet queries. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "project": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "project_data": {
+          "type": "object",
+          "description": "Inline .cut document. Use absolute media paths, or set working_directory for relative assets."
+        },
+        "detail": {
+          "type": "string",
+          "enum": [
+            "metadata",
+            "frames",
+            "keyframes",
+            "audio_packets"
+          ]
+        },
+        "from": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."
+        },
+        "stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tracks": {
+          "type": "string",
+          "enum": [
+            "all",
+            "video",
+            "audio"
+          ]
+        },
+        "audio_stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "file"
+              ]
+            },
+            {
+              "required": [
+                "project"
+              ]
+            },
+            {
+              "required": [
+                "project_data"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "file_waveform",
+    "description": "Query a signed audio amplitude envelope. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "from": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."
+        },
+        "columns": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65536
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID",
+        "file"
+      ]
+    }
+  },
+  {
+    "name": "file_silence",
+    "description": "Analyze a recording or a project soundtrack, replay a saved silence report, or write shortened media. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "project": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "project_data": {
+          "type": "object",
+          "description": "Inline .cut document. Use absolute media paths, or set working_directory for relative assets."
+        },
+        "report": {
+          "type": "object",
+          "description": "Existing native CLI JSON report; retain its file, source stamp, and indices."
+        },
+        "stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "threshold_db": {
+          "type": "number",
+          "minimum": -120,
+          "maximum": 0
+        },
+        "min_pause": {
+          "type": "number"
+        },
+        "leave": {
+          "type": "number",
+          "minimum": 0
+        },
+        "waveform": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8192
+        },
+        "tracks": {
+          "type": "string",
+          "enum": [
+            "all",
+            "video",
+            "audio"
+          ]
+        },
+        "audio_stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "smart",
+            "copy"
+          ]
+        },
+        "output": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute destination path. Existing media outputs are protected."
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "input_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "pauses_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "file"
+              ]
+            },
+            {
+              "required": [
+                "project"
+              ]
+            },
+            {
+              "required": [
+                "project_data"
+              ]
+            },
+            {
+              "required": [
+                "report"
+              ]
+            },
+            {
+              "required": [
+                "input_file"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "file_scenes",
+    "description": "Detect scene cuts or export grouped scenes/views from a file or saved report. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "report": {
+          "type": "object",
+          "description": "Existing native CLI JSON report; retain its file, source stamp, and indices."
+        },
+        "export_to": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to an existing output directory. Each rendered file needs a new name."
+        },
+        "group_by": {
+          "type": "string",
+          "enum": [
+            "scene",
+            "view"
+          ]
+        },
+        "container": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Container extension."
+        },
+        "tracks": {
+          "type": "string",
+          "enum": [
+            "all",
+            "video",
+            "audio"
+          ]
+        },
+        "audio_stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "input_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "scenes_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "file"
+              ]
+            },
+            {
+              "required": [
+                "report"
+              ]
+            },
+            {
+              "required": [
+                "input_file"
+              ]
+            }
+          ]
+        },
+        {
+          "if": {
+            "oneOf": [
+              {
+                "required": [
+                  "report"
+                ]
+              },
+              {
+                "required": [
+                  "input_file"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "required": [
+              "export_to"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "file_frames",
+    "description": "Write JPEG review images and a manifest for a source or every angle at group times. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "project": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "project_data": {
+          "type": "object",
+          "description": "Inline .cut document. Use absolute media paths, or set working_directory for relative assets."
+        },
+        "output": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a new directory for the JPEGs and manifest."
+        },
+        "at": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."
+          },
+          "minItems": 1
+        },
+        "preset": {
+          "type": "string",
+          "enum": [
+            "review",
+            "full"
+          ]
+        },
+        "select": {
+          "type": "string",
+          "enum": [
+            "scenes",
+            "non-silent"
+          ]
+        },
+        "sample": {
+          "type": "string",
+          "enum": [
+            "first",
+            "midpoint"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "threshold_db": {
+          "type": "number",
+          "minimum": -120,
+          "maximum": 0
+        },
+        "min_pause": {
+          "type": "number"
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "at_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID",
+        "output"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "file"
+              ]
+            },
+            {
+              "required": [
+                "project"
+              ]
+            },
+            {
+              "required": [
+                "project_data"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "file_sidecar",
+    "description": "Read the sidecar inventory or build and merge selected analysis sections. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "status": {
+          "type": "boolean"
+        },
+        "only": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "index",
+              "scenes",
+              "audio"
+            ]
+          },
+          "minItems": 1
+        },
+        "stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "threshold_db": {
+          "type": "number",
+          "minimum": -120,
+          "maximum": 0
+        },
+        "min_pause": {
+          "type": "number"
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "only_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID",
+        "file"
+      ]
+    }
+  },
+  {
+    "name": "file_export",
+    "description": "Render an ordered edit, replace a soundtrack, or export a saved project. For a project provide output; for an edit supply edit.output. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "project": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "project_data": {
+          "type": "object",
+          "description": "Inline .cut document. Use absolute media paths, or set working_directory for relative assets."
+        },
+        "edit": {
+          "type": "object",
+          "properties": {
+            "clips": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Absolute path to the source file."
+                  },
+                  "project": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+                  },
+                  "from": {
+                    "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "numerator": {
+                            "type": "integer"
+                          },
+                          "denominator": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
+                        },
+                        "required": [
+                          "numerator",
+                          "denominator"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "to": {
+                    "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "numerator": {
+                            "type": "integer"
+                          },
+                          "denominator": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
+                        },
+                        "required": [
+                          "numerator",
+                          "denominator"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "csv": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "CSV split points or keep ranges. For file-based exports."
+                  },
+                  "rangesFile": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Native CSV/JSON ranges file. For file-based exports."
+                  },
+                  "replaceAudio": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Absolute path to the source file."
+                  },
+                  "replaceTrack": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "replacementStream": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              },
+              "minItems": 1
+            },
+            "file": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute path to the source file."
+            },
+            "output": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute destination path. Existing media outputs are protected."
+            },
+            "order": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "minItems": 1
+            },
+            "replaceAudio": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute path to the source file."
+            },
+            "replaceTrack": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "replacementStream": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "clips",
+            "output"
+          ]
+        },
+        "output": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute destination path. Existing media outputs are protected."
+        },
+        "tracks": {
+          "type": "string",
+          "enum": [
+            "all",
+            "video",
+            "audio"
+          ]
+        },
+        "audio_stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "copy",
+            "smart",
+            "encode"
+          ]
+        },
+        "video": {
+          "type": "string",
+          "enum": [
+            "h264",
+            "hevc",
+            "prores"
+          ]
+        },
+        "quality": {
+          "type": "string",
+          "enum": [
+            "smaller",
+            "balanced",
+            "high",
+            "422-lt",
+            "422",
+            "422-hq"
+          ]
+        },
+        "audio": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "copy",
+            "aac",
+            "pcm",
+            "remove",
+            "mp3",
+            "flac"
+          ]
+        },
+        "snap": {
+          "type": "string",
+          "enum": [
+            "exact",
+            "nearest"
+          ]
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "input_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "clips_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "order_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "project"
+              ]
+            },
+            {
+              "required": [
+                "project_data"
+              ]
+            },
+            {
+              "required": [
+                "clips_file"
+              ]
+            },
+            {
+              "required": [
+                "edit"
+              ]
+            },
+            {
+              "required": [
+                "input_file"
+              ]
+            }
+          ]
+        },
+        {
+          "if": {
+            "oneOf": [
+              {
+                "required": [
+                  "project"
+                ]
+              },
+              {
+                "required": [
+                  "project_data"
+                ]
+              },
+              {
+                "required": [
+                  "clips_file"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "required": [
+              "output"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "file_rearrange",
+    "description": "Render ordered or repeated ranges of a single recording. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "output": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute destination path. Existing media outputs are protected."
+        },
+        "ranges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "numerator": {
+                        "type": "integer"
+                      },
+                      "denominator": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "numerator",
+                      "denominator"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "to": {
+                "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "numerator": {
+                        "type": "integer"
+                      },
+                      "denominator": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "numerator",
+                      "denominator"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "from",
+              "to"
+            ]
+          },
+          "minItems": 1
+        },
+        "snap": {
+          "type": "string",
+          "enum": [
+            "exact",
+            "nearest"
+          ]
+        },
+        "tracks": {
+          "type": "string",
+          "enum": [
+            "all",
+            "video",
+            "audio"
+          ]
+        },
+        "audio_stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "ranges_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID",
+        "file",
+        "output"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "ranges"
+              ]
+            },
+            {
+              "required": [
+                "ranges_file"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "file_bulk",
+    "description": "Write separate numbered outputs for ranges of one recording. Results include completed outputs on a partial failure. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "output_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to an existing output directory. Each rendered file needs a new name."
+        },
+        "ranges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "numerator": {
+                        "type": "integer"
+                      },
+                      "denominator": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "numerator",
+                      "denominator"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "to": {
+                "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "numerator": {
+                        "type": "integer"
+                      },
+                      "denominator": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "numerator",
+                      "denominator"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "from",
+              "to"
+            ]
+          },
+          "minItems": 1
+        },
+        "container": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Container extension."
+        },
+        "tracks": {
+          "type": "string",
+          "enum": [
+            "all",
+            "video",
+            "audio"
+          ]
+        },
+        "audio_stream": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "copy",
+            "smart",
+            "encode"
+          ]
+        },
+        "video": {
+          "type": "string",
+          "enum": [
+            "h264",
+            "hevc",
+            "prores"
+          ]
+        },
+        "quality": {
+          "type": "string",
+          "enum": [
+            "smaller",
+            "balanced",
+            "high",
+            "422-lt",
+            "422",
+            "422-hq"
+          ]
+        },
+        "audio": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "copy",
+            "aac",
+            "pcm",
+            "remove",
+            "mp3",
+            "flac"
+          ]
+        },
+        "snap": {
+          "type": "string",
+          "enum": [
+            "exact",
+            "nearest"
+          ]
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "input_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "ranges_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "input_file"
+              ]
+            },
+            {
+              "required": [
+                "file",
+                "output_directory",
+                "ranges"
+              ]
+            },
+            {
+              "required": [
+                "file",
+                "output_directory",
+                "ranges_file"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "file_convert",
+    "description": "Convert between editable MPCut, Resolve, Premiere and Final Cut Pro projects. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "output": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute destination path. Existing media outputs are protected."
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Destination format name or extension."
+        },
+        "allow_loss": {
+          "type": "boolean"
+        },
+        "flatten_multicam": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID",
+        "file",
+        "output"
+      ]
+    }
+  },
+  {
+    "name": "file_resolve",
+    "description": "Write an editable Resolve timeline with optional import into the currently open Resolve project. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "project": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "project_data": {
+          "type": "object",
+          "description": "Inline .cut document. Use absolute media paths, or set working_directory for relative assets."
+        },
+        "output": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute destination path. Existing media outputs are protected."
+        },
+        "edit": {
+          "type": "object",
+          "properties": {
+            "clips": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Absolute path to the source file."
+                  },
+                  "from": {
+                    "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "numerator": {
+                            "type": "integer"
+                          },
+                          "denominator": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
+                        },
+                        "required": [
+                          "numerator",
+                          "denominator"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "to": {
+                    "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "numerator": {
+                            "type": "integer"
+                          },
+                          "denominator": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
+                        },
+                        "required": [
+                          "numerator",
+                          "denominator"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "replaceAudio": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Absolute path to the source file."
+                  },
+                  "replaceTrack": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "replacementStream": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              },
+              "minItems": 1
+            },
+            "file": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute path to the source file."
+            },
+            "output": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute destination path. Existing media outputs are protected."
+            },
+            "order": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "minItems": 1
+            },
+            "replaceAudio": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute path to the source file."
+            },
+            "replaceTrack": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "replacementStream": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "clips",
+            "output"
+          ]
+        },
+        "open": {
+          "type": "boolean"
+        },
+        "input_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "clips_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "project"
+              ]
+            },
+            {
+              "required": [
+                "project_data"
+              ]
+            },
+            {
+              "required": [
+                "clips_file"
+              ]
+            },
+            {
+              "required": [
+                "edit"
+              ]
+            },
+            {
+              "required": [
+                "input_file"
+              ]
+            }
+          ]
+        },
+        {
+          "if": {
+            "oneOf": [
+              {
+                "required": [
+                  "project"
+                ]
+              },
+              {
+                "required": [
+                  "project_data"
+                ]
+              },
+              {
+                "required": [
+                  "clips_file"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "required": [
+              "output"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "file_help",
+    "description": "Read native help, manual, examples, or the multicam project template. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "topic": {
+          "type": "string",
+          "enum": [
+            "help",
+            "manual",
+            "version",
+            "inspect",
+            "convert",
+            "resolve",
+            "multicam",
+            "waveform",
+            "silence",
+            "scenes",
+            "frames",
+            "sidecar",
+            "export",
+            "rearrange",
+            "bulk"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID"
+      ]
+    }
+  },
+  {
+    "name": "file_version",
+    "description": "Identify the bundled file CLI build. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operationID": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operationID"
+      ]
+    }
+  },
+  {
+    "name": "file_job_status",
+    "description": "Get state, native progress when available and the terminal JSON result. For large results, read result_bytes using file_job_result.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "description": "The job UUID returned when the request was accepted.",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "job_id"
+      ]
+    }
+  },
+  {
+    "name": "file_job_result",
+    "description": "Read an exact byte range from the terminal CLI JSON document as base64; concatenate decoded chunks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "description": "The job UUID returned when the request was accepted.",
+          "format": "uuid"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 131072
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "job_id"
+      ]
+    }
+  },
+  {
+    "name": "file_job_cancel",
+    "description": "Request cancellation. Poll status until completion to see any outputs the job already published.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "description": "The job UUID returned when the request was accepted.",
+          "format": "uuid"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "job_id"
+      ]
+    }
+  }
+]
