@@ -25,7 +25,7 @@ final class MCPReviewFrameTests: XCTestCase {
         let request: [String: Any] = ["space": "sequence", "time": time.description]
         let result = try await registry.mcpReviewFrame(arguments: request, session: session, checkAccess: {})
         XCTAssertEqual(result["occurrence"] as? String, editor.mcpClipIDs.last?.uuidString)
-        XCTAssertEqual(result["sourceTime"] as? String, editor.sequenceClips.last?.from.description)
+        XCTAssertEqual(result["source_time"] as? String, editor.sequenceClips.last?.from.description)
         let encoded = try XCTUnwrap(result["jpeg"] as? String)
         let bytes = try XCTUnwrap(Data(base64Encoded: encoded))
         XCTAssertLessThanOrEqual(bytes.count, 1_048_576)
@@ -67,12 +67,37 @@ final class MCPReviewFrameTests: XCTestCase {
         let secondFrame = try XCTUnwrap(media.frames.dropFirst().first?.time)
         let assemblyTime = try range.to.adding(secondFrame)
         let result = try await registry.mcpReviewFrame(arguments: [
-            "time": assemblyTime.description, "space": "assembly", "angle": "wide"
+            "time": assemblyTime.description, "space": "assembly", "angle_id": "wide"
         ], session: session, checkAccess: {})
-        XCTAssertEqual(result["sourceTime"] as? String, secondFrame.description)
+        XCTAssertEqual(result["source_time"] as? String, secondFrame.description)
         XCTAssertEqual(result["time"] as? String, assemblyTime.description)
-        XCTAssertEqual(result["groupTime"] as? String, secondFrame.description)
-        XCTAssertEqual(result["angle"] as? String, "wide")
+        XCTAssertEqual(result["group_time"] as? String, secondFrame.description)
+        XCTAssertEqual(result["angle_id"] as? String, "wide")
+        XCTAssertEqual(result["source_id"] as? String, "wide")
+        XCTAssertEqual(result["occurrence"] as? String, "1")
+    }
+
+    func testReviewFrameIdentifiesRecordingAndLogicalAngle() async throws {
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let registry = ProjectSessions(preferences: preferences)
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        defer { session.end() }
+        session.isMulticam = true
+        let model = session.multicam
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov", subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(fixture)
+        model.confirmSetup(drafts: [.init(source: .init(id: "wide", file: fixture.path), media: media)],
+                           opening: "wide", audio: .none)
+        let end = try XCTUnwrap(media.frames.last)
+        let start = try end.time.adding(end.duration)
+        let recording = try await model.addRecording(to: "wide", from: fixture, at: start)
+        for clock in ["group", "assembly"] {
+            let result = try await registry.mcpReviewFrame(arguments: ["time": start.description, "space": clock],
+                                                           session: session, checkAccess: {})
+            XCTAssertEqual(result["angle_id"] as? String, "wide")
+            XCTAssertEqual(result["source_id"] as? String, recording)
+        }
     }
 
     func testProgramReviewSelectsAnUnsavedInsertAndRetainedCamera() async throws {
@@ -89,7 +114,6 @@ final class MCPReviewFrameTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(25))
         }
         let (asset, directory) = try makeArtwork()
-        defer { try? FileManager.default.removeItem(at: directory) }
         let title = StillInsert(id: "title", assetID: asset.id, duration: .init(numerator: 1), cadence: .init(numerator: 1, denominator: 30))
         let clips = session.editor.sequenceClips.map(StillSequenceItem.source)
         let edited = CutProject.stillSequence(StillSequenceProject(items: [.still(title)] + clips, stillAssets: [asset]))
@@ -99,7 +123,7 @@ final class MCPReviewFrameTests: XCTestCase {
         let held = try await registry.mcpReviewFrame(arguments: ["space": "sequence", "time": "1/2"], session: session, checkAccess: {})
         XCTAssertEqual(held["asset"] as? String, "art")
         XCTAssertEqual(held["placement"] as? String, "title")
-        XCTAssertNil(held["sourceTime"])
+        XCTAssertNil(held["source_time"])
         let encoded = try XCTUnwrap(held["jpeg"] as? String)
         let jpeg = try XCTUnwrap(Data(base64Encoded: encoded))
         let source = try XCTUnwrap(CGImageSourceCreateWithData(jpeg as CFData, nil))
@@ -109,7 +133,7 @@ final class MCPReviewFrameTests: XCTestCase {
 
         let next = try await registry.mcpReviewFrame(arguments: ["space": "sequence", "time": "1"], session: session, checkAccess: {})
         XCTAssertNil(next["placement"])
-        XCTAssertEqual(next["sourceTime"] as? String, session.editor.sequenceClips.first?.from.description)
+        XCTAssertEqual(next["source_time"] as? String, session.editor.sequenceClips.first?.from.description)
         let output = directory.appendingPathComponent("review", isDirectory: true)
         let job = try XCTUnwrap(registry.mcpProgramFrameExport(session: session, output: output, args: ["space": "sequence"],
                                                                mode: "times", times: [.zero, title.duration], preset: .review))
@@ -119,12 +143,35 @@ final class MCPReviewFrameTests: XCTestCase {
         let manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any])
         let frames = try XCTUnwrap(manifest["frames"] as? [[String: Any]])
         XCTAssertEqual(frames.first?["placement"] as? String, "title")
-        let sourceTime = try XCTUnwrap(frames.last?["sourceTime"] as? [String: Int64])
+        let sourceTime = try XCTUnwrap(frames.last?["source_time"] as? [String: Int64])
         XCTAssertEqual(sourceTime["numerator"], session.editor.sequenceClips.first?.from.numerator)
         XCTAssertEqual(sourceTime["denominator"], session.editor.sequenceClips.first?.from.denominator)
         XCTAssertEqual(session.mcpRevision, revision)
     }
 
+    func testSingleStillExportUsesReviewPreset() throws {
+        let suite = "MPCut.ReviewPreset.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = EditorPreferences(defaults: defaults)
+        let registry = ProjectSessions(preferences: preferences)
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        defer { session.end() }
+        let (asset, directory) = try makeArtwork()
+        let format = StillTimelineFormat(width: 1280, height: 720, cadence: .init(numerator: 1, denominator: 30),
+                                         codec: .h264, container: "mp4")
+        let project = try CutProject.makeStillTimeline(format: format, asset: asset, placementID: "title",
+                                                       duration: .init(numerator: 1))
+        try session.editor.applyStillProject(project, action: "Add title")
+        let output = directory.appendingPathComponent("review.jpg")
+        let job = try XCTUnwrap(registry.mcpProgramFrameExport(session: session, output: output, args: ["space": "sequence"],
+                                                               mode: "still", times: [], preset: .review))
+        XCTAssertEqual(try job(MCPLiveOutputProgress())["placement"] as? String, "title")
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(output as CFURL, nil))
+        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        XCTAssertEqual(image.width, 640)
+        XCTAssertEqual(image.height, 360)
+    }
 
     func testMulticamProgramReviewKeepsAngleAddressingAcrossStillEdits() async throws {
         let preferences = EditorPreferences()
@@ -138,7 +185,6 @@ final class MCPReviewFrameTests: XCTestCase {
         let model = session.multicam
         model.confirmSetup(drafts: [.init(source: .init(id: "wide", file: fixture.path), media: media)], opening: "wide", audio: .none)
         let (asset, directory) = try makeArtwork()
-        defer { try? FileManager.default.removeItem(at: directory) }
         let range = try XCTUnwrap(model.project?.range)
         let replacementEnd = try XCTUnwrap(media.frames.dropFirst(3).first?.time)
         let replacement = StillReplacement(id: "photo", assetID: asset.id,
@@ -152,18 +198,18 @@ final class MCPReviewFrameTests: XCTestCase {
         let groupPicture = try await registry.mcpReviewFrame(arguments: ["space": "group", "time": range.from.description],
                                                               session: session, checkAccess: {})
         XCTAssertEqual(groupPicture["placement"] as? String, "photo")
-        let angleFrame = try await registry.mcpReviewFrame(arguments: ["space": "group", "time": range.from.description, "angle": "wide"],
+        let angleFrame = try await registry.mcpReviewFrame(arguments: ["space": "group", "time": range.from.description, "angle_id": "wide"],
                                                             session: session, checkAccess: {})
-        XCTAssertEqual(angleFrame["angle"] as? String, "wide")
-        XCTAssertNotNil(angleFrame["sourceTime"])
+        XCTAssertEqual(angleFrame["angle_id"] as? String, "wide")
+        XCTAssertNotNil(angleFrame["source_time"])
         XCTAssertNil(angleFrame["placement"])
 
         let insert = try await registry.mcpReviewFrame(arguments: ["space": "assembly", "time": "0"],
                                                        session: session, checkAccess: {})
         XCTAssertEqual(insert["placement"] as? String, "title")
-        XCTAssertNil(insert["groupTime"])
+        XCTAssertNil(insert["group_time"])
         do {
-            _ = try await registry.mcpReviewFrame(arguments: ["space": "assembly", "time": "0", "angle": "wide"],
+            _ = try await registry.mcpReviewFrame(arguments: ["space": "assembly", "time": "0", "angle_id": "wide"],
                                                   session: session, checkAccess: {})
             XCTFail("An inserted still has no angle frame.")
         } catch let error as MCPCommandError {
@@ -173,12 +219,13 @@ final class MCPReviewFrameTests: XCTestCase {
         let secondPhoto = try await registry.mcpReviewFrame(arguments: ["space": "assembly", "time": repeated.description],
                                                             session: session, checkAccess: {})
         XCTAssertEqual(secondPhoto["placement"] as? String, "photo")
-        XCTAssertEqual(secondPhoto["groupTime"] as? String, range.from.description)
+        XCTAssertEqual(secondPhoto["group_time"] as? String, range.from.description)
     }
 
     private func makeArtwork() throws -> (StillAsset, URL) {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        addTeardownBlock { try FileManager.default.removeItem(at: directory) }
         let titleURL = directory.appendingPathComponent("title.png")
         let png = try XCTUnwrap(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"))
         try png.write(to: titleURL)

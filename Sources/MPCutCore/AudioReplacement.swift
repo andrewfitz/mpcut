@@ -295,7 +295,7 @@ public struct AudioReplacementEngine: Sendable {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: folder) }
         let partial = folder.appendingPathComponent("replacement").appendingPathExtension(plan.container)
-        let cancellation = ReplacementCancellation()
+        let cancellation = AudioExportCancellation()
         let runner = ReencodeEngine(cancelled: { cancelled?() == true || cancellation.isCancelled })
         do {
             try runner.runHelper(plan.helper, arguments: plan.arguments + ["-f", plan.muxer, "-n", partial.path], in: folder,
@@ -382,7 +382,7 @@ public struct AudioReplacementEngine: Sendable {
     }
 }
 
-private final class ReplacementCancellation: @unchecked Sendable {
+final class AudioExportCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var value = false
     var isCancelled: Bool { lock.withLock { value } }

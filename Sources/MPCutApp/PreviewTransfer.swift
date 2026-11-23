@@ -6,6 +6,7 @@ struct PreviewTransfer {
     let program: String
     let source: String
     let convertsProgramToSDR: Bool
+    let usesSDRCameraPreview: Bool
     let isVerified: Bool
 
     init(frame: PreviewFrame) {
@@ -15,6 +16,8 @@ struct PreviewTransfer {
         let expected = Self.hdrTransfer(frame.programTransfer)
         let specifiesSDR = frame.programTransfer.map { expected == nil && $0 != "unknown" } ?? false
         convertsProgramToSDR = specifiesSDR && actualHDR != nil
+        usesSDRCameraPreview = frame.cameraTransfer != nil && Self.hdrTransfer(frame.cameraTransfer) == nil &&
+            expected != nil && actualHDR == nil
         source = frame.sourceRendition ?? actualHDR ?? (transfer == nil ? "untagged" : "SDR")
         program = expected ?? (specifiesSDR ? "SDR" : actualHDR ?? (transfer == nil ? "unspecified" : "SDR"))
         if actualHDR != nil {
@@ -22,7 +25,7 @@ struct PreviewTransfer {
             isVerified = Self.extendedFormats.contains(format) && primaries != nil &&
                 (expected == nil || actualHDR == expected)
         } else {
-            isVerified = expected == nil
+            isVerified = expected == nil || usesSDRCameraPreview
         }
     }
 
@@ -37,6 +40,11 @@ struct PreviewTransfer {
         kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr10BiPlanarFullRange,
         kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_444YpCbCr10BiPlanarFullRange,
         kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange, kCVPixelFormatType_4444AYpCbCr16,
+        // VideoToolbox can return losslessly packed 10-bit decoder surfaces.
+        kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarVideoRange,
+        kCVPixelFormatType_Lossless_420YpCbCr10PackedBiPlanarFullRange,
+        kCVPixelFormatType_Lossless_422YpCbCr10PackedBiPlanarVideoRange,
+        kCVPixelFormatType_Lossless_64RGBAHalf,
         kCVPixelFormatType_ARGB2101010LEPacked, kCVPixelFormatType_64RGBAHalf,
         kCVPixelFormatType_64RGBALE
     ]

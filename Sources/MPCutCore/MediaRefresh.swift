@@ -11,7 +11,8 @@ public enum MediaRefreshState: String, Codable, Sendable {
 
 public struct MediaRefreshReferenceIssue: Codable, Hashable, Sendable {
     public enum Reason: String, Codable, Sendable {
-        case offline, rangeOutsideMedia, trackNeedsReview
+        case offline, rangeOutsideMedia = "range_outside_media", trackNeedsReview = "track_needs_review"
+        case participantGeometryNeedsReview = "participant_geometry_needs_review"
     }
 
     public let id: String
@@ -91,7 +92,10 @@ public enum MediaRefresh {
                                       displayChanged: false, persistenceError: nil, referenceEvidence: evidence)
         }
         if verification == .stamp {
-            if snapshotMatches { return unchanged(previous?.refreshEvidence ?? cacheEvidence) }
+            if snapshotMatches, previous != nil || cacheEvidence != nil {
+                try checkCancellation(cancelled)
+                return unchanged(previous?.refreshEvidence ?? cacheEvidence)
+            }
             if let previous, stampMatches, previous.identity.device != identity.device, previous.hasFullEditIndex {
                 // A remount can change the device number of the same stamped
                 // media. Rebind pinned readers to the new live snapshot.

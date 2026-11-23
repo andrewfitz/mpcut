@@ -39,6 +39,12 @@ final class TimelineTierGateTests: XCTestCase {
 
     private let insideGOP = 7.0 / 25
 
+    func testAudioMovementUsesExactTimeAndReportsKeptMaterial() {
+        let movement = TierPrompt.CutMovement(label: "Clip 1 In", requested: .init(numerator: 3, denominator: 48000),
+                                              resolved: .init(numerator: 1, denominator: 48000), edge: .start, exactTime: true)
+        XCTAssertEqual(movement.text, "Clip 1 In: 1/16000 s → 1/48000 s (1/24000 s earlier, keeps more material)")
+    }
+
     /// Splitting keeps the packets continuous. Deleting the head exposes a real cut.
     @MainActor
     private func splitBeforeExposingCut(_ model: EditorModel) async throws -> UUID {
@@ -79,6 +85,9 @@ final class TimelineTierGateTests: XCTestCase {
         XCTAssertEqual(prompt.buttons.map(\.title), ["Cut at Nearest Keyframe", "Cut Here", "Cancel"])
         XCTAssertEqual(prompt.title, "Keep the cut here?")
         XCTAssertTrue(prompt.message.contains("Smart Trim") && prompt.message.contains("True Lossless"), prompt.message)
+        XCTAssertEqual(prompt.movements, [.init(label: "Clip 1 In", requested: .init(numerator: 18, denominator: 25),
+                                                resolved: .init(numerator: 1), frameCount: 7, edge: .start)])
+        XCTAssertTrue(prompt.message.contains("00:00.720 → 00:01.000 (280 ms later, 7 frames, removes material)"), prompt.message)
         XCTAssertEqual(model.timelineClips.count, 1)
         XCTAssertEqual(model.tierState?.tier, .lossless)
         XCTAssertEqual(Set(model.tierState?.factors.map(\.id) ?? []), [.cutVideoStart])
@@ -337,10 +346,11 @@ final class TimelineTierGateTests: XCTestCase {
     @MainActor
     func testReplacingSourceAudioAsksBeforeTheWorkingCopyIsSaved() async throws {
         let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let helper = ProcessInfo.processInfo.environment["MPCUT_FFMPEG_HELPER"]
-            ?? repository.appendingPathComponent(".build/mpcut-ffmpeg/install/bin/ffmpeg").path
+        let previousHelper = ProcessInfo.processInfo.environment["MPCUT_FFMPEG_HELPER"]
+        let helper = previousHelper ?? repository.appendingPathComponent(".build/mpcut-ffmpeg/install/bin/ffmpeg").path
         try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: helper), "Needs the FFmpeg helper to write a working copy.")
-        setenv("MPCUT_FFMPEG_HELPER", helper, 0)
+        if previousHelper == nil { setenv("MPCUT_FFMPEG_HELPER", helper, 0) }
+        defer { if previousHelper == nil { unsetenv("MPCUT_FFMPEG_HELPER") } }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }

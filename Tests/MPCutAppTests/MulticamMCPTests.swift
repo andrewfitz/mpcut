@@ -28,10 +28,10 @@ final class MulticamMCPTests: XCTestCase {
         let initialRevision = model.mcpRevision
         let frame = try XCTUnwrap(model.media["wide"]?.frames.dropFirst().first?.time)
         let output = try range.to.adding(frame)
-        let reply = try await model.mcpCommand(tool: "split_at", arguments: [
+        let reply = try await model.mcpCommand(tool: "timeline_item_split", arguments: [
             "space": "assembly", "time": output.description, "occurrence": 1
         ]) {}
-        XCTAssertEqual(reply?["groupTime"] as? String, frame.description)
+        XCTAssertEqual(reply?["group_time"] as? String, frame.description)
         XCTAssertEqual(reply?["boundary"] as? String, output.description)
         XCTAssertEqual(model.ranges, [range, .init(from: range.from, to: frame), .init(from: frame, to: range.to)])
         XCTAssertEqual(model.historyActions, ["Repeat", "Split Assembly Range"])
@@ -54,16 +54,16 @@ final class MulticamMCPTests: XCTestCase {
         let revision = model.mcpRevision
         let expected = try range.to.adding(group)
 
-        let second = try await model.mcpCommand(tool: "seek", arguments: [
+        let second = try await model.mcpCommand(tool: "timeline_playhead_seek", arguments: [
             "space": "group", "time": group.description, "occurrence": 1
         ]) {}
         XCTAssertEqual(second?["space"] as? String, "assembly")
         XCTAssertEqual(second?["time"] as? String, expected.description)
-        XCTAssertEqual(second?["groupTime"] as? String, group.description)
+        XCTAssertEqual(second?["group_time"] as? String, group.description)
         XCTAssertEqual(second?["occurrence"] as? Int, 1)
 
         do {
-            _ = try await model.mcpCommand(tool: "seek", arguments: [
+            _ = try await model.mcpCommand(tool: "timeline_playhead_seek", arguments: [
                 "space": "assembly", "time": range.to.description, "occurrence": 0
             ]) {}
             XCTFail("The join belongs to the next occurrence.")
@@ -73,14 +73,40 @@ final class MulticamMCPTests: XCTestCase {
         XCTAssertEqual(model.preview.currentTime(), expected)
         XCTAssertEqual(model.selectedOccurrence, 1)
 
-        let join = try await model.mcpCommand(tool: "seek", arguments: [
+        let join = try await model.mcpCommand(tool: "timeline_playhead_seek", arguments: [
             "space": "assembly", "time": range.to.description, "occurrence": 1
         ]) {}
         XCTAssertEqual(join?["time"] as? String, range.to.description)
-        XCTAssertEqual(join?["groupTime"] as? String, "0")
+        XCTAssertEqual(join?["group_time"] as? String, "0")
         XCTAssertEqual(join?["occurrence"] as? Int, 1)
         XCTAssertEqual(model.mcpRevision, revision)
         XCTAssertEqual(model.historyActions, ["Repeat"])
+    }
+
+    @MainActor
+    func testAssemblySeekReportsThePinnedCameraAndRecording() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = try model(in: directory)
+        defer { model.reset() }
+        XCTAssertTrue(model.edit("Pin Camera") { project in
+            var pinned = project.angles[0]
+            pinned.id = "pinned"
+            project.angles.append(pinned)
+            project.assemblyItems = [.group(project.range, angle: pinned.id)]
+        })
+
+        let assembly = try await model.mcpCommand(tool: "timeline_playhead_seek", arguments: [
+            "space": "assembly", "time": "0"
+        ]) {}
+        XCTAssertEqual(assembly?["angle_id"] as? String, "pinned")
+        XCTAssertEqual(assembly?["picture_source_id"] as? String, "pinned")
+
+        let group = try await model.mcpCommand(tool: "timeline_playhead_seek", arguments: [
+            "space": "group", "time": "0"
+        ]) {}
+        XCTAssertEqual(group?["angle_id"] as? String, "wide")
+        XCTAssertEqual(group?["picture_source_id"] as? String, "wide")
     }
 
     @MainActor
@@ -92,18 +118,18 @@ final class MulticamMCPTests: XCTestCase {
         model.preferences.historyLimit = 0
         let time = try XCTUnwrap(model.media["wide"]?.frames.dropFirst().first?.time)
         let revision = model.mcpRevision
-        let args: [String: Any] = ["angle": "wide", "time": time.description]
-        let reply = try await model.mcpCommand(tool: "set_camera_at", arguments: args) {}
-        XCTAssertEqual(reply?["time"] as? String, time.description)
-        XCTAssertEqual(reply?["action"] as? String, "Switch Camera")
-        XCTAssertEqual(reply?["historyRetained"] as? Bool, false)
+        let args: [String: Any] = ["angle_id": "wide", "group_time": time.description]
+        let reply = try await model.mcpCommand(tool: "multicam_camera_take", arguments: args) {}
+        XCTAssertEqual(reply?["group_time"] as? String, time.description)
+        XCTAssertEqual(reply?["action"] as? String, "Take Camera")
+        XCTAssertEqual(reply?["history_retained"] as? Bool, false)
         XCTAssertEqual(model.project?.switches.map(\.at), [.zero, time])
         XCTAssertTrue(model.historyActions.isEmpty)
         XCTAssertGreaterThan(model.mcpRevision, revision)
         let current = model.mcpRevision
-        let sources = try await model.mcpCommand(tool: "get_multicam", arguments: ["section": "sources"]) {}
-        XCTAssertEqual((sources?["sources"] as? [[String: Any]])?.first?["number"] as? Int, 1)
-        let again = try await model.mcpCommand(tool: "set_camera_at", arguments: ["number": 1, "time": time.description]) {}
+        let sources = try await model.mcpCommand(tool: "multicam_state_read", arguments: ["section": "sources"]) {}
+        XCTAssertEqual((sources?["sources"] as? [[String: Any]])?.first?["camera_number"] as? Int, 1)
+        let again = try await model.mcpCommand(tool: "multicam_camera_take", arguments: ["camera_number": 1, "group_time": time.description]) {}
         XCTAssertEqual(again?["changed"] as? Bool, false)
         XCTAssertEqual(model.mcpRevision, current)
     }
@@ -116,14 +142,14 @@ final class MulticamMCPTests: XCTestCase {
         defer { model.reset() }
         let original = model.project
         do {
-            _ = try await model.mcpCommand(tool: "split_at", arguments: [
+            _ = try await model.mcpCommand(tool: "timeline_item_split", arguments: [
                 "occurrence": 8, "space": "assembly", "time": "1"
             ]) {}
             XCTFail("Expected invalid occurrence")
         } catch is MCPCommandError {}
         do {
-            _ = try await model.mcpCommand(tool: "multicam_source", arguments: [
-                "source": "wide", "action": "rename", "name": "new"
+            _ = try await model.mcpCommand(tool: "multicam_source_edit", arguments: [
+                "source_id": "wide", "action": "rename", "name": "new"
             ]) { throw MCPCommandError("disabled", "Disabled by editor.") }
             XCTFail("Expected disabled error")
         } catch is MCPCommandError {}
@@ -140,10 +166,10 @@ final class MulticamMCPTests: XCTestCase {
         let replacement = directory.appendingPathComponent("new camera.mov")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try FileManager.default.copyItem(at: URL(fileURLWithPath: old), to: replacement)
-        let args: [String: Any] = ["source": "wide", "action": "relink", "path": replacement.path]
+        let args: [String: Any] = ["source_id": "wide", "action": "relink", "path": replacement.path]
         var validations = 0
         do {
-            _ = try await model.mcpCommand(tool: "multicam_source", arguments: args) {
+            _ = try await model.mcpCommand(tool: "multicam_source_edit", arguments: args) {
                 validations += 1
                 if validations > 1 { throw MCPCommandError("control_disabled", "Control was disabled.") }
             }
@@ -154,9 +180,9 @@ final class MulticamMCPTests: XCTestCase {
         XCTAssertEqual(validations, 2)
         XCTAssertEqual(model.project?.angles.first?.file, old)
         XCTAssertTrue(model.historyActions.isEmpty)
-        let changed = try await model.mcpCommand(tool: "multicam_source", arguments: args) {}
+        let changed = try await model.mcpCommand(tool: "multicam_source_edit", arguments: args) {}
         XCTAssertEqual(changed?["changed"] as? Bool, true)
-        XCTAssertEqual(changed?["historyRetained"] as? Bool, true)
+        XCTAssertEqual(changed?["history_retained"] as? Bool, true)
         XCTAssertEqual(model.project?.angles.first?.file, replacement.path)
         XCTAssertEqual(model.historyActions, ["Relink Source"])
         let generation = model.mcpGeneration
@@ -192,7 +218,7 @@ final class MulticamMCPTests: XCTestCase {
                                    "from": try XCTUnwrap(model.markIn).description, "to": try XCTUnwrap(model.markOut).description]
         model.selectGroupRange(frames[2].time, frames[3].time)
         do {
-            _ = try await model.mcpCommand(tool: "multicam_assembly", arguments: args) {}
+            _ = try await model.mcpCommand(tool: "multicam_assembly_edit", arguments: args) {}
             XCTFail("Expected the changed selection to invalidate the request.")
         } catch let error as MCPCommandError {
             XCTAssertEqual(error.code, "selection_changed")
@@ -212,26 +238,26 @@ final class MulticamMCPTests: XCTestCase {
         let start = RationalTime(numerator: 3_000_000_001, denominator: 3_000_000_000)
         XCTAssertTrue(model.edit("Extend Group") { $0.range.to = end })
         let revision = model.mcpRevision
-        let select = try await model.mcpCommand(tool: "multicam_select", arguments: [
+        let select = try await model.mcpCommand(tool: "multicam_selection_set", arguments: [
             "action": "assembly_range", "from": start.description, "to": end.description
         ]) {}
-        XCTAssertEqual(select?["markIn"] as? String, start.description)
+        XCTAssertEqual(select?["mark_in"] as? String, start.description)
         XCTAssertEqual(model.assemblySelection?.from, start)
         XCTAssertEqual(model.mcpRevision, revision)
 
-        let preview = try await model.mcpCommand(tool: "multicam_assembly", arguments: [
+        let preview = try await model.mcpCommand(tool: "multicam_assembly_edit", arguments: [
             "action": "preview_trim", "occurrence": 0, "edge": "start", "time": start.description
         ]) {}
         XCTAssertEqual(preview?["boundary"] as? String, start.description)
         XCTAssertEqual(model.mcpRevision, revision)
-        let trim = try await model.mcpCommand(tool: "multicam_assembly", arguments: [
+        let trim = try await model.mcpCommand(tool: "multicam_assembly_edit", arguments: [
             "action": "trim_edge", "occurrence": 0, "edge": "start", "time": start.description
         ]) {}
         XCTAssertEqual(trim?["boundary"] as? String, start.description)
         XCTAssertEqual(model.ranges, [.init(from: start, to: end)])
         XCTAssertEqual(model.historyActions, ["Extend Group", "Trim Assembly Range"])
 
-        let remove = try await model.mcpCommand(tool: "multicam_assembly", arguments: [
+        let remove = try await model.mcpCommand(tool: "multicam_assembly_edit", arguments: [
             "action": "remove", "occurrence": 0
         ]) {}
         XCTAssertEqual(remove?["action"] as? String, "Delete Assembly Range")
@@ -251,10 +277,10 @@ final class MulticamMCPTests: XCTestCase {
         let frame = try XCTUnwrap(model.media["wide"]?.frames.dropFirst().first?.time)
         XCTAssertTrue(model.edit("Repeat Range") { $0.assembly = [range, range] })
         model.selectedOccurrence = 0
-        let trim = try await model.mcpCommand(tool: "multicam_assembly", arguments: [
+        let trim = try await model.mcpCommand(tool: "multicam_assembly_edit", arguments: [
             "action": "trim", "occurrence": 1, "from": frame.description
         ]) {}
-        XCTAssertEqual(trim?["historyRetained"] as? Bool, true)
+        XCTAssertEqual(trim?["history_retained"] as? Bool, true)
         XCTAssertEqual(model.ranges, [range, .init(from: frame, to: range.to)])
         XCTAssertEqual(model.selectedOccurrence, 1)
         model.undo()
@@ -273,8 +299,8 @@ final class MulticamMCPTests: XCTestCase {
         try FileManager.default.copyItem(at: URL(fileURLWithPath: old), to: replacement)
         let revision = model.mcpRevision
         let operation = Task {
-            try await model.mcpCommand(tool: "multicam_source", arguments: [
-                "source": "wide", "action": "relink", "path": replacement.path
+            try await model.mcpCommand(tool: "multicam_source_edit", arguments: [
+                "source_id": "wide", "action": "relink", "path": replacement.path
             ]) {}
         }
         for _ in 0..<100 where !model.isBusy { await Task.yield() }

@@ -23,7 +23,7 @@ extension MulticamEditorModel {
         guard document.programColorPolicy == nil, case .multicam(let snapshot) = document,
               !snapshot.stillReplacements.isEmpty || !document.stillInserts.isEmpty else { return document }
         let retained = try snapshot.plan().picture.lazy.compactMap { self.media[$0.source]?.videoStream }.first
-        let reference = retained ?? snapshot.angles.lazy.compactMap { self.media[$0.id]?.videoStream }.first
+        let reference = retained ?? snapshot.pictureSources.lazy.compactMap { self.media[$0.id]?.videoStream }.first
         guard let reference, let policy = try? StillProgramColorPolicy.resolving(source: reference) else { return document }
         return try document.settingStillColorPolicy(policy)
     }
@@ -31,8 +31,8 @@ extension MulticamEditorModel {
     private func stillPresentationBoundary(_ time: RationalTime) -> RationalTime {
         guard let project, time != project.range.from, time != project.range.to else { return time }
         guard let selection = project.selection(at: time), selection.at != time else { return time }
-        guard let source = project.angles.first(where: { $0.id == selection.angle }),
-              let frames = media[selection.angle]?.frames, !frames.isEmpty,
+        guard let source = project.pictureSource(for: selection.angle, at: time),
+              let frames = media[source.id]?.frames, !frames.isEmpty,
               let localTime = try? time.subtracting(source.offset) else {
             return snappedFrame(time, delta: 0) ?? time
         }
@@ -50,8 +50,13 @@ extension MulticamEditorModel {
     }
 
     func multicamStillCadence(atGroup time: RationalTime) -> RationalTime? {
-        guard let id = project?.selection(at: time)?.angle ?? project?.switches.last?.angle,
-              let info = media[id], info.hasFullEditIndex, let rate = info.videoStream?.frameRate, rate > .zero else {
+        guard let project, let id = project.selection(at: time)?.angle ?? project.switches.last?.angle,
+              let source = project.pictureSource(for: id, at: time, exclusiveEnd: time == project.range.to) else { return nil }
+        return multicamStillCadence(angle: source.id)
+    }
+
+    private func multicamStillCadence(angle id: String) -> RationalTime? {
+        guard let info = media[id], info.hasFullEditIndex, let rate = info.videoStream?.frameRate, rate > .zero else {
             return nil
         }
         let cadence = RationalTime(numerator: rate.denominator, denominator: rate.numerator)
@@ -86,29 +91,103 @@ extension MulticamEditorModel {
     }
 
     func chooseReplaceMulticamPicture() {
-        guard canReplaceMulticamPicture else { return }
+        guard canReplaceMulticamPicture, let span = markedGroupSpan else { return }
+        let bounds = stillReplacementBounds(span)
         let revision = mcpRevision
         StillPanels.chooseImage(in: window) { [weak self] url in
             guard let self, self.mcpRevision == revision else { return }
-            self.replaceMulticamPicture(with: url)
+            self.replaceMulticamPicture(with: url, bounds: bounds)
         }
     }
 
     func replaceMulticamPicture(with url: URL) {
         guard let span = markedGroupSpan else { return }
-        let bounds = stillReplacementBounds(span)
-        addMulticamStill(url, title: "Replace Picture") { document, asset in
-            try document.addingStillReplacement(.init(id: UUID().uuidString, assetID: asset.id,
-                                                       framing: .fit, coverage: .group(bounds)))
+        replaceMulticamPicture(with: url, bounds: stillReplacementBounds(span))
+    }
+
+    private func replaceMulticamPicture(with url: URL, bounds: MulticamRange) {
+        inspectMulticamImages([url]) { [weak self] assets in
+            let asset = assets[0]
+            self?.performStillEditByHand("Replace Picture") { document in
+                try document.addingStillAsset(asset).addingStillReplacement(
+                    .init(id: UUID().uuidString, assetID: asset.id, framing: .fit, coverage: .group(bounds))
+                )
+            }
+        }
+    }
+
+    func dropMulticamMedia(_ urls: [URL], atGroup group: RationalTime? = nil,
+                           atAssembly assembly: RationalTime? = nil) {
+        if !urls.isEmpty, urls.allSatisfy(StillPanels.isSupportedImage) {
+            dropMulticamStills(urls, atGroup: group, atAssembly: assembly,
+                               replacingMarkedRange: NSEvent.modifierFlags.contains(.option))
+        } else {
+            importSources(urls)
+        }
+    }
+
+    func dropMulticamStills(_ urls: [URL], atGroup group: RationalTime? = nil,
+                            atAssembly assembly: RationalTime? = nil, replacingMarkedRange: Bool) {
+        guard !isBusy, project != nil, !urls.isEmpty else { return }
+        if replacingMarkedRange {
+            guard urls.count == 1, let url = urls.first, canReplaceMulticamPicture else {
+                fail("Mark a picture range and drop one image to replace it.")
+                return
+            }
+            replaceMulticamPicture(with: url)
+        } else if let group {
+            guard let position = assemblyPosition(for: group) else {
+                fail("This group position is outside the assembled ranges. Drop the still on the assembly timeline.")
+                return
+            }
+            insertMulticamStills(urls, atAssembly: position)
+        } else {
+            insertMulticamStills(urls, atAssembly: assembly)
+        }
+    }
+
+    var canSpaceClips: Bool { !isBusy && project.map { CutProject.multicam($0).hasSpacingBoundaries } == true }
+
+    func chooseSpaceClips() {
+        guard canSpaceClips else { return }
+        preview.pause()
+        let revision = mcpRevision
+        StillPanels.spaceClips(cadence: multicamStillCadence(atAssembly: .zero), in: window) { [weak self] timing, cadence, background in
+            guard let self, self.mcpRevision == revision, self.canSpaceClips else { return }
+            self.performStillEditByHand("Space Clips") { document in
+                try timing.applying(to: document, cadence: cadence, background: background,
+                                    relativeTo: self.projectURL ?? self.draft.url)
+            }
+        }
+    }
+
+    func chooseInsertGap() {
+        guard !isBusy, project != nil else { return }
+        preview.pause()
+        guard let requested = stillInsertionPlayhead() else { return }
+        let position = snappedAssemblyStillPosition(requested)
+        let revision = mcpRevision
+        StillPanels.gap(cadence: multicamStillCadence(atAssembly: position), in: window) { [weak self] duration, cadence, framing in
+            guard let self, self.mcpRevision == revision, !self.isBusy else { return }
+            let id = UUID().uuidString
+            if self.performStillEditByHand("Insert Color Gap", { document in
+                let asset = document.stillAssets.first(where: \.isGap) ?? StillAsset(gapID: UUID().uuidString)
+                let gap = StillInsert(id: id, assetID: asset.id, duration: duration, cadence: cadence, framing: framing)
+                return try document.addingStillAsset(asset).insertingStill(gap, at: position)
+            }), let index = self.assemblyItems.firstIndex(where: { $0.still?.id == id }) {
+                self.selectAssemblyOccurrence(index)
+            }
         }
     }
 
     func chooseInsertMulticamStill() {
         guard !isBusy, project != nil else { return }
+        preview.pause()
+        guard let position = stillInsertionPlayhead() else { return }
         let revision = mcpRevision
         StillPanels.chooseImage(in: window) { [weak self] url in
             guard let self, self.mcpRevision == revision else { return }
-            self.insertMulticamStill(url)
+            self.insertMulticamStill(url, atAssembly: position)
         }
     }
 
@@ -116,39 +195,67 @@ extension MulticamEditorModel {
         insertMulticamStills([url], atAssembly: explicitTime)
     }
 
+    private func stillInsertionPlayhead() -> RationalTime? {
+        if assemblyPreview { return preview.currentTime() }
+        if let position = assemblyPosition(for: currentGroupTime()) { return position }
+        fail("The group playhead is outside the assembled ranges. Choose an insertion point in the assembly.")
+        return nil
+    }
+
+    func assemblyStillDropTime(_ seconds: Double) -> RationalTime? {
+        let index = assemblyRangeEnds.lowerBound { $0.seconds >= seconds }
+        if assemblyRangeEnds.indices.contains(index), assemblyRangeEnds[index].seconds == seconds {
+            return assemblyRangeEnds[index]
+        }
+        return timelineRationalTime(seconds)
+    }
+
     func insertMulticamStills(_ urls: [URL], atAssembly explicitTime: RationalTime? = nil) {
         guard !urls.isEmpty, !isBusy, project != nil else { return }
-        let group = currentGroupTime()
-        guard let requested = explicitTime ?? (assemblyPreview ? preview.currentTime() : assemblyPosition(for: group)) else {
-            fail("The group playhead is outside the assembled ranges. Choose an insertion point in the assembly.")
-            return
-        }
+        preview.pause()
+        guard let requested = explicitTime ?? stillInsertionPlayhead() else { return }
         let position = snappedAssemblyStillPosition(requested)
-        let cadence = multicamStillCadence(atGroup: group) ?? .init(numerator: 1, denominator: 30)
+        let cadence = multicamStillCadence(atAssembly: position) ?? .init(numerator: 1, denominator: 30)
         let duration = max(cadence, stillFrameBoundary(.init(numerator: 2), cadence: cadence, nearest: true) ?? cadence)
         let revision = mcpRevision
         let title = urls.count == 1 ? "Insert Still" : "Insert \(urls.count) Stills"
         StillPanels.duration(title: "\(title) at Assembly Time \(position)", duration: duration,
                              cadence: cadence, in: window) { [weak self] duration, cadence in
             guard let self, self.mcpRevision == revision else { return }
-            var ids: [String] = []
-            if self.performStillEdit(title, { project in
-                var document = project
-                var at = position
-                for url in urls {
-                    let asset = try StillPanels.asset(for: url, existing: document.stillAssets)
-                    let id = UUID().uuidString
-                    ids.append(id)
-                    document = try document.addingStillAsset(asset)
-                    document = try document.insertingStill(.init(id: id, assetID: asset.id, duration: duration,
-                                                                 cadence: cadence), at: at)
-                    at = try at.adding(duration)
+            self.inspectMulticamImages(urls) { [weak self] assets in
+                guard let self else { return }
+                let firstID = UUID().uuidString
+                if self.performStillEditByHand(title, { project in
+                    var document = project
+                    var at = position
+                    for (index, asset) in assets.enumerated() {
+                        let id = index == 0 ? firstID : UUID().uuidString
+                        document = try document.addingStillAsset(asset)
+                        document = try document.insertingStill(.init(id: id, assetID: asset.id, duration: duration,
+                                                                     cadence: cadence), at: at)
+                        at = try at.adding(duration)
+                    }
+                    return document
+                }), let index = self.assemblyItems.firstIndex(where: { $0.still?.id == firstID }) {
+                    self.preferences.recentFiles.record(urls)
+                    self.selectAssemblyOccurrence(index)
                 }
-                return document
-            }), let index = self.assemblyItems.firstIndex(where: { $0.still.map { $0.id == ids.first } == true }) {
-                self.selectAssemblyOccurrence(index)
             }
         }
+    }
+
+    func multicamStillCadence(atAssembly position: RationalTime) -> RationalTime? {
+        guard !assemblyItems.isEmpty else { return nil }
+        let index = min(assemblyItems.count - 1, assemblyRangeEnds.lowerBound { $0 > position })
+        if let still = assemblyStill(at: index) { return still.cadence }
+        guard let range = assemblyRange(at: index),
+              let time = try? range.from.adding(position.subtracting(assemblyStart(at: index))) else { return nil }
+        // At the final assembly boundary, use the rate of the range that just ended.
+        if time >= range.to,
+           let angle = project?.switches.last(where: { $0.at < range.to })?.angle {
+            return multicamStillCadence(angle: angle)
+        }
+        return multicamStillCadence(atGroup: max(range.from, time))
     }
 
     func snappedAssemblyStillPosition(_ requested: RationalTime) -> RationalTime {
@@ -176,12 +283,22 @@ extension MulticamEditorModel {
         return output
     }
 
-    @discardableResult
-    private func addMulticamStill(_ url: URL, title: String,
-                                  change: (CutProject, StillAsset) throws -> CutProject) -> Bool {
-        performStillEdit(title) { document in
-            let asset = try StillPanels.asset(for: url, existing: document.stillAssets)
-            return try change(document.addingStillAsset(asset), asset)
+    private func inspectMulticamImages(_ urls: [URL], reuseAssets: Bool = true,
+                                       completion: @escaping ([StillAsset]) -> Void) {
+        guard !isBusy, let project else { return }
+        let existing = reuseAssets ? project.stillAssets : []
+        let revision = mcpRevision
+        let generation = mcpGeneration
+        preview.pause()
+        run("Reading still images…", kind: "still_import") { token, _ in
+            try StillPanels.assets(for: urls, existing: existing, cancelled: { token.isCancelled })
+        } onSuccess: { [weak self] assets in
+            guard let self, self.mcpGeneration == generation else { return }
+            guard self.mcpRevision == revision else {
+                self.fail("The project changed while reading the images.")
+                return
+            }
+            completion(assets)
         }
     }
 }
@@ -195,7 +312,7 @@ extension MulticamEditorModel {
             guard let insert = item.still, let asset = assets[insert.assetID] else { return nil }
             return StillPlacementRow(id: insert.id, title: asset.displayName, details:
                 "Insert · Assembly \(assemblyStart(at: index))–\(assemblyRangeEnds[index]) · \(insert.duration)s · \(insert.framing.mode.rawValue.capitalized)\(stillOffline(asset))",
-                isInsert: true)
+                isInsert: true, isGap: asset.isGap)
         }
         let replacements = project.stillReplacements.compactMap { replacement -> StillPlacementRow? in
             guard let asset = assets[replacement.assetID], case .group(let bounds) = replacement.coverage else { return nil }
@@ -234,7 +351,7 @@ extension MulticamEditorModel {
         if let replacement, [.move, .resize, .duplicate].contains(action) {
             StillPanels.editReplacement(replacement, action: action, in: window) { [weak self] request in
                 guard let self, self.mcpRevision == revision else { return }
-                self.performStillEdit(request.title) { document in
+                self.performStillEditByHand(request.title) { document in
                     try request.apply(to: document) { time, _, _ in
                         guard project.range.contains(time) else { return time }
                         return self.stillReplacementBounds(.init(from: time, to: time)).from
@@ -246,16 +363,16 @@ extension MulticamEditorModel {
         switch action {
         case .frame:
             guard let framing = insert?.framing ?? replacement?.framing else { return }
-            StillPanels.frame(title: "Still Framing", framing: framing, in: window) { [weak self] framing in
+            StillPanels.frame(title: "Still Framing", framing: framing, gap: row.isGap, in: window) { [weak self] framing in
                 guard let self, self.mcpRevision == revision else { return }
-                self.performStillEdit("Change Still Framing") { try $0.updatingStill(id: row.id, assetID: assetID, framing: framing) }
+                self.performStillEditByHand("Change Still Framing") { try $0.updatingStill(id: row.id, assetID: assetID, framing: framing) }
             }
         case .move:
             guard let index = assemblyItems.firstIndex(where: { $0.still?.id == row.id }) else { return }
             StillPanels.text(title: "Move Still", label: "Assembly time (seconds)",
                              value: assemblyStart(at: index).description, in: window) { [weak self] text in
                 guard let self, self.mcpRevision == revision else { return }
-                if self.performStillEdit("Move Still", { document in
+                if self.performStillEditByHand("Move Still", { document in
                     let requested = try RationalTime(parsing: text)
                     return try document.movingStill(id: row.id, to: self.snappedAssemblyStillPosition(requested))
                 }), let inserted = self.assemblyItems.firstIndex(where: { $0.still?.id == row.id }) {
@@ -267,22 +384,24 @@ extension MulticamEditorModel {
             StillPanels.duration(title: "Change Still Duration", duration: insert.duration,
                                  cadence: insert.cadence, in: window) { [weak self] duration, cadence in
                 guard let self, self.mcpRevision == revision else { return }
-                self.performStillEdit("Change Still Duration") { try $0.resizingStill(id: row.id, duration: duration, cadence: cadence) }
+                self.performStillEditByHand("Change Still Duration") { try $0.resizingStill(id: row.id, duration: duration, cadence: cadence) }
             }
         case .duplicate:
             guard var insert, let index = assemblyItems.firstIndex(where: { $0.still?.id == row.id }) else { return }
             insert.id = UUID().uuidString
             let end = assemblyRangeEnds[index]
-            performStillEdit("Duplicate Still") { try $0.insertingStill(insert, at: end) }
+            performStillEditByHand("Duplicate Still") { try $0.insertingStill(insert, at: end) }
         case .detach: return
         case .remove:
-            performStillEdit("Delete Still") { try $0.removingStill(id: row.id) }
+            performStillEditByHand("Delete Still") { try $0.removingStill(id: row.id) }
         case .relink:
             StillPanels.chooseImage(in: window) { [weak self] url in
                 guard let self, self.mcpRevision == revision else { return }
-                self.performStillEdit("Relink Still Image") {
-                    let asset = try StillPanels.asset(for: url, existing: [])
-                    return try $0.relinkingStillAsset(assetID, file: asset.file, fingerprint: asset.fingerprint)
+                self.inspectMulticamImages([url], reuseAssets: false) { [weak self] assets in
+                    let asset = assets[0]
+                    self?.performStillEditByHand("Relink Still Image") {
+                        try $0.relinkingStillAsset(assetID, file: asset.file, fingerprint: asset.fingerprint)
+                    }
                 }
             }
         }
@@ -328,12 +447,12 @@ extension MulticamEditorModel {
         guard let project, !project.stillAssets.isEmpty else { return [] }
         let document = CutProject.multicam(project)
         guard let plan = try? document.resolveStills() else { return [] }
-        let names = Dictionary(uniqueKeysWithValues: project.stillAssets.map { ($0.id, $0.displayName) })
+        let names = Dictionary(uniqueKeysWithValues: project.stillAssets.filter { !$0.isGap }.map { ($0.id, $0.displayName) })
         let assetIDs = Dictionary(uniqueKeysWithValues:
             project.stillReplacements.map { ($0.id, $0.assetID) } + document.stillInserts.map { ($0.id, $0.assetID) })
         return plan.spans.enumerated().compactMap { index, span in
-            guard let id = span.placementID, let asset = assetIDs[id] else { return nil }
-            return .init(id: "\(id)-\(index)", title: names[asset] ?? asset, interval: span.output)
+            guard let id = span.placementID, let asset = assetIDs[id], let title = names[asset] else { return nil }
+            return .init(id: "\(id)-\(index)", title: title, interval: span.output)
         }
     }
 }

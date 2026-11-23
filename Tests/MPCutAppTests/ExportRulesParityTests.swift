@@ -146,12 +146,12 @@ final class ExportRulesParityTests: XCTestCase {
         }
     }
 
-    /// Runs `mpcut export --dry-run --json` and reads the fields the sheet also knows.
+    /// Runs `mpcut export clips join --dry-run --json` and reads the fields the sheet also knows.
     private func runCLI(_ flags: [String], clips: [String], container: String, helper: String? = nil) throws
         -> (outcome: Outcome, alternatives: [[String: Any]]) {
         let process = Process()
         process.executableURL = cli
-        process.arguments = ["export", "--json", "--no-sidecar", "--dry-run"] + flags
+        process.arguments = ["export", "clips", "join", "--json", "--no-sidecar", "--dry-run"] + flags
             + ["--output", scratch.appendingPathComponent("\(UUID().uuidString).\(container)").path] + clips
         var environment = ProcessInfo.processInfo.environment
         environment["MPCUT_FFMPEG_HELPER"] = helper ?? Self.helper
@@ -174,9 +174,9 @@ final class ExportRulesParityTests: XCTestCase {
         }
         outcome.mode = report["mode"] as? String ?? ""
         outcome.container = report["container"] as? String ?? ""
-        let actions = report["audioActions"] as? [[String: Any]] ?? []
+        let actions = report["audio_actions"] as? [[String: Any]] ?? []
         outcome.actions = actions.compactMap { $0["action"] as? String }
-        outcome.bitRate = actions.first?["bitRate"] as? Int
+        outcome.bitRate = actions.first?["bit_rate"] as? Int
         return (outcome, [])
     }
 
@@ -318,7 +318,7 @@ final class ExportRulesParityTests: XCTestCase {
         }
 
         try await assertParity("MP3 join", file: mp3, clips: cuts(mp3), options: soundOptions("mp3"),
-                               expecting: ["convertSameFormat", "convertPCM", "convertAAC"])
+                               expecting: ["convert_same_format", "convert_pcm", "convert_aac"])
         let whole = try CutEngine(useSidecar: false).inspect(mp3, keyframes: true)
         try await assertParity("contiguous MP3", file: mp3, clips: [ClipRequest(file: mp3, from: .zero, to: whole.duration)],
                                options: soundOptions("mp3"), expecting: [])
@@ -327,13 +327,13 @@ final class ExportRulesParityTests: XCTestCase {
 
         let flac = try converted("Tone.flac", to: .flac)
         try await assertParity("FLAC join inside frames", file: flac, clips: cuts(flac), options: soundOptions("flac"),
-                               expecting: ["convertSameFormat", "convertPCM", "convertAAC"])
+                               expecting: ["convert_same_format", "convert_pcm", "convert_aac"])
         let frames = CutEngine(useSidecar: false, tracks: .audio)
             .validBoundaries(in: try CutEngine(useSidecar: false).inspect(flac, keyframes: true), start: true)
         if frames.count > 4 {
             let aligned = [ClipRequest(file: flac, from: frames[1], to: frames[2]), ClipRequest(file: flac, from: frames[3], to: frames[4])]
             try await assertParity("FLAC join on frame boundaries", file: flac, clips: aligned, options: soundOptions("flac"),
-                                   expecting: ["copyOtherContainer:mka", "convertSameFormat", "convertPCM", "convertAAC"])
+                                   expecting: ["copy_other_container:mka", "convert_same_format", "convert_pcm", "convert_aac"])
         }
 
         let m4a = try converted("Tone.m4a", to: .aac)
@@ -342,12 +342,17 @@ final class ExportRulesParityTests: XCTestCase {
         try await assertParity("AAC in M4A cut between samples", file: m4a, clips: between, options: soundOptions("m4a"))
         let media = try CutEngine(useSidecar: false).inspect(m4a, keyframes: true)
         let first = ExportAvailability.resolve(soundOptions("m4a"), clips: between, media: [m4a: media], useSidecar: false).offers.first
-        XCTAssertEqual(first?.alternative.id, "copySampleAligned", "An exact copy on the sample clock ranks before any conversion.")
+        XCTAssertEqual(first?.alternative.id, "copy_sample_aligned", "An exact copy on the sample clock ranks before any conversion.")
         XCTAssertEqual(first?.alternative.lossless, true)
 
         let opus = try fixture("Standalone-Chirp", "opus")
         try await assertParity("Opus join", file: opus, clips: cuts(opus), options: soundOptions("opus"),
-                               expecting: ["convertPCM", "convertAAC"])
+                               expecting: ["convert_same_format", "convert_pcm", "convert_aac"])
+        try await assertParity("Opus join converting to Opus in WebM", file: opus, clips: cuts(opus),
+                               options: soundOptions("webm", converting: .opus))
+        try await assertParity("MP3 join converting to Opus", file: mp3, clips: cuts(mp3), options: soundOptions("opus", converting: .opus))
+        try await assertParity("Opus conversion in a wrong extension", file: opus, clips: cuts(opus),
+                               options: soundOptions("m4a", converting: .opus))
 
         let movie = try fixture("SmartTrim-GOP", "mp4")
         let picture = try CutEngine(useSidecar: false).inspect(movie, keyframes: true)
@@ -374,7 +379,7 @@ final class ExportRulesParityTests: XCTestCase {
     }
 
     /// A sound-only timeline whose exact copy is unavailable opens on Lossless Copy, where the alternatives that work
-    /// are listed best first. Opening on the tier's conversion, PCM, hid `copySampleAligned`, which ranks above it.
+    /// are listed best first. Opening on the tier's conversion, PCM, hid `copy_sample_aligned`, which ranks above it.
     /// `--audio auto` applies the same first alternative.
     @MainActor
     func testSoundOnlyExportOpensOnCopyWithTheBestWorkingAlternativeFirst() async throws {
@@ -419,7 +424,7 @@ final class ExportRulesParityTests: XCTestCase {
         XCTAssertEqual(copied.outcome.alternatives, offered)
         let process = Process()
         process.executableURL = cli
-        process.arguments = ["export", "--json", "--no-sidecar", "--dry-run", "--mode", "encode", "--audio", "auto"] + flags
+        process.arguments = ["export", "clips", "join", "--json", "--no-sidecar", "--dry-run", "--mode", "encode", "--audio", "auto"] + flags
             + ["--output", scratch.appendingPathComponent("auto.wav").path] + arguments(clips)
         var environment = ProcessInfo.processInfo.environment
         environment["MPCUT_FFMPEG_HELPER"] = Self.helper
@@ -438,11 +443,11 @@ final class ExportRulesParityTests: XCTestCase {
     @MainActor
     func testMissingEncoderIsSkippedIdenticallyInBothFrontEnds() async throws {
         _ = NSApplication.shared
-        // Stand in for an earlier helper: the same program, reporting no MP3 or FLAC encoder.
+        // Stand in for an earlier helper: the same program, reporting no MP3, FLAC or Opus encoder.
         let folder = scratch.appendingPathComponent("earlier helper", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
         let old = folder.appendingPathComponent("ffmpeg")
-        let script = "#!/bin/sh\ncase \" $* \" in\n  *\" -encoders \"*) \"\(Self.helper)\" \"$@\" | grep -v -e libmp3lame -e \" flac \"; exit 0 ;;\nesac\nexec \"\(Self.helper)\" \"$@\"\n"
+        let script = "#!/bin/sh\ncase \" $* \" in\n  *\" -encoders \"*) \"\(Self.helper)\" \"$@\" | grep -v -e libmp3lame -e \" flac \" -e libopus; exit 0 ;;\nesac\nexec \"\(Self.helper)\" \"$@\"\n"
         try script.write(to: old, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: old.path)
         let previous = ProcessInfo.processInfo.environment["MPCUT_FFMPEG_HELPER"]
@@ -451,9 +456,18 @@ final class ExportRulesParityTests: XCTestCase {
         let mp3 = try fixture("Gapless-Crop", "mp3")
         let clips = [ClipRequest(file: mp3, from: time(1, 10), to: time(3, 10)), ClipRequest(file: mp3, from: time(1, 2), to: time(7, 10))]
         try await assertParity("MP3 join without an MP3 encoder", file: mp3, clips: clips, options: soundOptions("mp3"),
-                               expecting: ["convertPCM", "convertAAC"], helper: old.path)
+                               expecting: ["convert_pcm", "convert_aac"], helper: old.path)
         try await assertParity("MP3 conversion without an MP3 encoder", file: mp3, clips: clips,
                                options: soundOptions("mp3", converting: .mp3), helper: old.path)
+        let opus = try fixture("Standalone-Chirp", "opus")
+        let pieces = [ClipRequest(file: opus, from: time(1, 10), to: time(3, 10)), ClipRequest(file: opus, from: time(1, 2), to: time(7, 10))]
+        try await assertParity("Opus join without an Opus encoder", file: opus, clips: pieces, options: soundOptions("opus"),
+                               expecting: ["convert_pcm", "convert_aac"], helper: old.path)
+        try await assertParity("Opus conversion without an Opus encoder", file: opus, clips: pieces,
+                               options: soundOptions("opus", converting: .opus), helper: old.path)
+        let refused = ExportAvailability.resolve(soundOptions("opus", converting: .opus), clips: pieces,
+                                                 media: [opus: try CutEngine(useSidecar: false).inspect(opus, keyframes: true)], useSidecar: false)
+        XCTAssertEqual(refused.failure?.code, "encoder_unavailable")
     }
 
     // MARK: Every cell of the matrix
@@ -561,14 +575,14 @@ final class ExportRulesParityTests: XCTestCase {
         let common = ["--json", "--no-sidecar", "--dry-run"]
         switch entry {
         case .cliBulk:
-            var request: [String: Any] = ["file": file, "outputDirectory": folder.path, "ranges": [["from": from, "to": to]]]
+            var request: [String: Any] = ["file": file, "output_directory": folder.path, "ranges": [["from": from, "to": to]]]
             if let container { request["container"] = container }
-            return try tool(["bulk", "--stdin"] + common + flags, stdin: JSONSerialization.data(withJSONObject: request))
-        case .cliRearrange: return try tool(["rearrange"] + common + flags + [file, "--output", output, "\(from)-\(to)"])
-        case .cliSilence: return try tool(["silence"] + common + flags + ["--output", output, file])
-        case .cliScenes: return try tool(["scenes"] + common + ["--export-to", folder.path] + flags + [file])
+            return try tool(["export", "ranges", "separate", "--stdin"] + common + flags, stdin: JSONSerialization.data(withJSONObject: request))
+        case .cliRearrange: return try tool(["export", "ranges", "join"] + common + flags + [file, "--output", output, "\(from)-\(to)"])
+        case .cliSilence: return try tool(["silence", "plan"] + common + flags + ["--output", output, file])
+        case .cliScenes: return try tool(["scenes", "export"] + common + ["--export-to", folder.path] + flags + [file])
         default:
-            var arguments = ["export"] + common + flags + ["--output", output, "--clip", file, "--from", from]
+            var arguments = ["export", "clips", "join"] + common + flags + ["--output", output, "--clip", file, "--from", from]
             if clip.to != nil { arguments += ["--to", to] }
             return try tool(arguments)
         }
@@ -621,7 +635,7 @@ final class ExportRulesParityTests: XCTestCase {
     }
 
     private func exportProject(_ file: URL, flags: [String], container: String) throws -> (outcome: Outcome, alternatives: [[String: Any]]) {
-        try tool(["export", "--project", file.path, "--json", "--no-sidecar", "--dry-run"] + flags
+        try tool(["export", "project", "render", "--project", file.path, "--json", "--no-sidecar", "--dry-run"] + flags
                  + ["--output", scratch.appendingPathComponent("\(UUID().uuidString).\(container)").path])
     }
 
@@ -731,7 +745,7 @@ final class ExportRulesParityTests: XCTestCase {
                             choices.mode = mode
                             XCTAssertEqual(choices.effectiveMode, answer.resolvedMode, name)
                             XCTAssertEqual(choices.containers(), ExportRules.multicamListedContainers(tracks: tracks, mode: mode), name)
-                            if mode == .encode { XCTAssertEqual(choices.audioActions, answer.audioActions, name) }
+                            XCTAssertEqual(choices.deliveryActions, answer.audioActions, name)
                             let app: Outcome = AnalysisSidecar.$readsEnabled.withValue(false) {
                                 if entry == .multicamQueue {
                                     let range = MulticamQueuedRange(name: "Program", range: program.project.range, project: program.project, media: [:])
@@ -745,7 +759,7 @@ final class ExportRulesParityTests: XCTestCase {
                             }
                             var tool = result
                             if entry == .multicamQueue { tool.mode = ""; tool.container = "" }
-                            XCTAssertEqual(app, tool, "\(name): the app and `mpcut export --project` disagree.")
+                            XCTAssertEqual(app, tool, "\(name): the app and `mpcut export project render --project` disagree.")
                         case .replacement:
                             continue
                         }
@@ -788,8 +802,8 @@ final class ExportRulesParityTests: XCTestCase {
         for mode in [ExportMode.smart, .copy] {
             let denied = try run(.cliExport, flags: ["--mode", mode.rawValue], clip: cut, container: "webm")
             XCTAssertEqual(denied.outcome.code, "unsupported_container")
-            XCTAssertFalse(denied.outcome.alternatives.contains { $0.hasPrefix("copyOtherContainer") })
-            let trim = try XCTUnwrap(denied.alternatives.first { $0["id"] as? String == "smartTrim:mp4" })
+            XCTAssertFalse(denied.outcome.alternatives.contains { $0.hasPrefix("copy_other_container") })
+            let trim = try XCTUnwrap(denied.alternatives.first { $0["id"] as? String == "smart_trim:mp4" })
             XCTAssertEqual(trim["lossless"] as? Bool, false)
             let replay = try run(.cliExport, flags: XCTUnwrap(trim["arguments"] as? [String]), clip: cut, container: "mp4")
             XCTAssertEqual([replay.outcome.code, replay.outcome.mode, replay.outcome.container], ["", "smart", "mp4"])
@@ -807,7 +821,7 @@ final class ExportRulesParityTests: XCTestCase {
         // People who run the CLI read the wording of the sheet, and each alternative under the label of its button.
         let human = Process()
         human.executableURL = cli
-        human.arguments = ["export", "--no-sidecar", "--dry-run", "--mode", "copy", "--output", scratch.appendingPathComponent("human.mp4").path,
+        human.arguments = ["export", "clips", "join", "--no-sidecar", "--dry-run", "--mode", "copy", "--output", scratch.appendingPathComponent("human.mp4").path,
                            "--clip", movie.path, "--from", "7/25"]
         let said = Pipe()
         human.standardError = said
@@ -884,7 +898,7 @@ final class ExportRulesParityTests: XCTestCase {
             return XCTFail("WebM cannot carry this H.264 video.")
         }
         XCTAssertEqual(issue.code, "unsupported_container")
-        XCTAssertTrue(trims.contains { $0.alternative.id == "smartTrim:mp4" })
+        XCTAssertTrue(trims.contains { $0.alternative.id == "smart_trim:mp4" })
 
         let audio = try fixture("Covered-Audio", "mp3")
         let audioRequest = ExportRequest(clips: [.init(file: audio)], mode: .encode)
@@ -915,7 +929,7 @@ final class ExportRulesParityTests: XCTestCase {
         try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: cli.path), "The mpcut binary is not built at \(cli.path).")
         let movie = try fixture("Pause-Quiet", "mov")
         let saved = try program(movie)
-        let silence = ["silence", "--project", saved.file.path, "--json", "--no-sidecar", "--min-pause", "0.3", "--leave", "0.1"]
+        let silence = ["silence", "plan", "--project", saved.file.path, "--json", "--no-sidecar", "--min-pause-seconds", "0.3", "--padding-per-side-seconds", "0.05"]
         for mode in ExportEntryPoint.cliSilence.modes {
             // The retained ranges of the report, saved as the assembly of a second project.
             let process = Process()
@@ -948,7 +962,7 @@ final class ExportRulesParityTests: XCTestCase {
                 // The pauses are planned for the container that is written, and the report above planned for the
                 // default one. For the other containers nothing is removed, so the ranges are the saved program's.
                 let ranged = container == ExportRules.multicamContainers[0]
-                let command = ranged ? silence : ["silence", "--project", saved.file.path, "--json", "--no-sidecar", "--min-pause", "100"]
+                let command = ranged ? silence : ["silence", "plan", "--project", saved.file.path, "--json", "--no-sidecar", "--min-pause-seconds", "100"]
                 let shortened = try tool(command + ["--mode", mode.rawValue, "--output", output, "--dry-run"])
                 let exported = try exportProject(ranged ? assembled : saved.file, flags: ["--mode", mode.rawValue], container: container)
                 if ranged { XCTAssertTrue(shortened.outcome.code.isEmpty, shortened.outcome.description) }
@@ -991,7 +1005,7 @@ final class ExportRulesParityTests: XCTestCase {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         let help = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        let listed = try XCTUnwrap(help["defaultExportModes"] as? [String: String])
+        let listed = try XCTUnwrap(help["default_export_modes"] as? [String: String])
 
         for kind in ExportSourceKind.allCases {
             let table = ExportRules.defaultMode(for: kind, tracks: .all)
@@ -1011,7 +1025,7 @@ final class ExportRulesParityTests: XCTestCase {
                 commands = try [ExportEntryPoint.cliExport, .cliBulk, .cliRearrange, .cliScenes].map {
                     ($0.rawValue, try run($0, flags: [], clip: clip, container: nil).outcome.mode)
                 } + [(ExportEntryPoint.cliSilence.rawValue, try run(.cliSilence, flags: [], clip: ClipRequest(file: talkie), container: nil).outcome.mode),
-                     ("export --order", try tool(["export", "--json", "--no-sidecar", "--dry-run", "--order", "1", "--output",
+                     ("export --order", try tool(["export", "clips", "join", "--json", "--no-sidecar", "--dry-run", "--order", "1", "--output",
                                                  scratch.appendingPathComponent("ordered.mp4").path, "--clip", movie.path]).outcome.mode)]
             case .audio:
                 var options = ExportSheetOptions()
@@ -1046,35 +1060,35 @@ final class ExportRulesParityTests: XCTestCase {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         let help = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(Set(help["audioOptions"] as? [String] ?? []),
+        XCTAssertEqual(Set(help["audio_options"] as? [String] ?? []),
                        Set((ExportRules.movieAudioActions + ExportRules.soundAudioActions).map(\.rawValue)))
-        XCTAssertEqual(help["exportModes"] as? [String], ExportMode.allCases.map(\.rawValue))
-        XCTAssertEqual(help["exportTracks"] as? [String], ExportTracks.allCases.map(\.rawValue))
-        XCTAssertEqual(help["defaultBulkMode"] as? String, ExportRules.defaultMode(for: .movie).rawValue)
-        XCTAssertEqual(help["defaultMulticamExportMode"] as? String, ExportRules.defaultMode(for: .multicam).rawValue)
+        XCTAssertEqual(help["export_modes"] as? [String], ExportMode.allCases.map(\.rawValue))
+        XCTAssertEqual(help["export_tracks"] as? [String], ExportTracks.allCases.map(\.rawValue))
+        XCTAssertEqual(help["export_ranges_separate_default_mode"] as? String, ExportRules.defaultMode(for: .movie).rawValue)
+        XCTAssertEqual(help["default_multicam_export_mode"] as? String, ExportRules.defaultMode(for: .multicam).rawValue)
         // `export` has no default of its own: with or without --order it is the table's, like every other command.
-        XCTAssertEqual(help["defaultExportMode"] as? String, ExportRules.defaultMode(for: .movie).rawValue)
-        XCTAssertEqual(help["defaultOrderedExportMode"] as? String, ExportRules.defaultMode(for: .movie).rawValue)
+        XCTAssertEqual(help["default_export_mode"] as? String, ExportRules.defaultMode(for: .movie).rawValue)
+        XCTAssertEqual(help["default_ordered_export_mode"] as? String, ExportRules.defaultMode(for: .movie).rawValue)
         XCTAssertFalse(ExportRules.markdown().contains("defaultCopy"))
         XCTAssertFalse(ExportEntryPoint.allCases.contains { $0.restrictions.contains { $0.hasPrefix("defaultCopy") } })
         let commands = try XCTUnwrap(help["commands"] as? [String: Any])
-        let exportHelp = try XCTUnwrap(commands["export"] as? [String: Any])
+        let exportHelp = try XCTUnwrap(commands["export clips join"] as? [String: Any])
         XCTAssertTrue((exportHelp["instructions"] as? [String] ?? []).joined(separator: " ").contains(ExportRules.modeHelp(.cliExport)))
         // Usage and instructions list the modes, tracks and multicam rules of the module.
-        let usages: [(String, ExportEntryPoint)] = [("export", .cliExport), ("bulk", .cliBulk), ("silence", .cliSilence), ("multicam", .cliProject)]
+        let usages: [(String, ExportEntryPoint)] = [("export clips join", .cliExport), ("export ranges separate", .cliBulk), ("silence export", .cliSilence), ("export project render", .cliProject)]
         for (name, entry) in usages {
             let command = try XCTUnwrap(commands[name] as? [String: Any])
             let usage = (command["usage"] as? [String] ?? []).joined(separator: " ")
             XCTAssertTrue(usage.contains(ExportRules.modeUsage(entry)), "\(name) usage does not list the modes of \(entry.rawValue).")
-            XCTAssertTrue(usage.contains(ExportRules.tracksUsage) || name == "multicam" && usage.contains(ExportRules.tracksUsage), name)
+            XCTAssertTrue(usage.contains(ExportRules.tracksUsage), name)
         }
         let multicam = try XCTUnwrap(commands["multicam"] as? [String: Any])
         XCTAssertTrue((multicam["instructions"] as? [String] ?? []).joined(separator: " ").contains(ExportRules.multicamHelpSummary))
-        for (name, entry) in [("scenes", ExportEntryPoint.cliScenes), ("rearrange", .cliRearrange), ("bulk", .cliBulk), ("silence", .cliSilence)] {
+        for (name, entry) in [("scenes export", ExportEntryPoint.cliScenes), ("export ranges join", .cliRearrange), ("export ranges separate", .cliBulk), ("silence export", .cliSilence)] {
             let command = try XCTUnwrap(commands[name] as? [String: Any])
             XCTAssertTrue((command["instructions"] as? [String] ?? []).joined(separator: " ").contains(ExportRules.modeHelp(entry)), name)
         }
-        for name in ["export", "bulk"] {
+        for name in ["export clips join", "export ranges separate"] {
             let command = try XCTUnwrap(commands[name] as? [String: Any])
             let text = (command["instructions"] as? [String] ?? []).joined(separator: " ")
             XCTAssertTrue(text.contains(ExportRules.helpSummary), "\(name) help does not carry the rules summary.")

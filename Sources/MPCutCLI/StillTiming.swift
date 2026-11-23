@@ -1,10 +1,10 @@
 import Foundation
 import MPCutCore
 
-struct StillAuthoringTiming {
+final class StillAuthoringTiming {
     private enum Source {
         case sequence(CutSequenceClip)
-        case group(MulticamProject, MulticamRange)
+        case group(MulticamProject, MulticamRange, occurrence: Int)
     }
 
     private struct Item {
@@ -16,6 +16,14 @@ struct StillAuthoringTiming {
     let project: CutProject
     let location: URL
     let engine: CutEngine
+
+    private var lastIndex: (url: URL, media: MediaInfo)?
+
+    init(project: CutProject, location: URL, engine: CutEngine) {
+        self.project = project
+        self.location = location
+        self.engine = engine
+    }
 
     private func items() throws -> [Item] {
         var outputStart = RationalTime.zero
@@ -38,9 +46,9 @@ struct StillAuthoringTiming {
                 }
             }
         case .multicam(let multicam):
-            for item in multicam.assemblyItems ?? [.group(multicam.range)] {
+            for (index, item) in (multicam.assemblyItems ?? [.group(multicam.range)]).enumerated() {
                 switch item {
-                case .group(let group): try append(length: group.to.subtracting(group.from), source: .group(multicam, group))
+                case .group(let group, _): try append(length: group.to.subtracting(group.from), source: .group(multicam, group, occurrence: index))
                 case .still(let card): try append(length: card.duration, insert: card)
                 }
             }
@@ -49,15 +57,17 @@ struct StillAuthoringTiming {
     }
 
     private func index(_ url: URL) throws -> MediaInfo? {
+        if let lastIndex, lastIndex.url == url { return lastIndex.media }
         guard (try? SourceIdentity(url)) != nil else { return nil }
         let media = try engine.inspect(url, keyframes: true)
         guard media.hasVideo, !media.frames.isEmpty else {
             throw CutError(code: "no_video", message: "Still placement requires indexed picture in ‘\(url.path)’.")
         }
+        lastIndex = (url, media)
         return media
     }
 
-    func inferredCadence(_ at: RationalTime) throws -> RationalTime {
+    func inferredCadence(_ at: RationalTime, requireUniform: Bool = true) throws -> RationalTime {
         let items = try items()
         let item = items.first { $0.output.contains(at) } ?? (items.last?.output.to == at ? items.last : nil)
         if let insert = item?.insert { return insert.cadence }
@@ -65,7 +75,7 @@ struct StillAuthoringTiming {
         switch item?.source {
         case .sequence(let clip):
             url = CutProject.mediaURL(clip.file, relativeTo: location)
-        case .group(let multicam, _):
+        case .group(let multicam, _, _):
             url = multicam.angles.first { $0.id == multicam.referenceAngle }.map {
                 multicam.sourceURL(for: $0, relativeTo: location)
             }
@@ -77,7 +87,7 @@ struct StillAuthoringTiming {
             throw error
         }
         let cadence = RationalTime(numerator: rate.denominator, denominator: rate.numerator)
-        guard media.frames.allSatisfy({ $0.duration == cadence }) else { throw error }
+        guard !requireUniform || media.frames.allSatisfy({ $0.duration == cadence }) else { throw error }
         return cadence
     }
 
@@ -92,10 +102,10 @@ struct StillAuthoringTiming {
             case .source(let id, _):
                 guard let clip = clips[id] else { continue }
                 url = CutProject.mediaURL(clip.file, relativeTo: location)
-            case .group(_, let range):
+            case .group(let occurrence, let range):
                 guard case .multicam(let multicam) = updated,
-                      let camera = multicam.selection(at: range.from)?.angle,
-                      let source = multicam.angles.first(where: { $0.id == camera }) else { continue }
+                      let camera = multicam.pictureAngle(at: range.from, in: occurrence),
+                      let source = multicam.pictureSource(for: camera, at: range.from) else { continue }
                 url = multicam.sourceURL(for: source, relativeTo: location)
             case .insert:
                 continue
@@ -131,7 +141,7 @@ struct StillAuthoringTiming {
         let startCamera = multicam.selection(at: range.from)?.angle
         let endCamera = multicam.switches.last { $0.at < range.to }?.angle
         try validateGroupBoundary(range.from, multicam: multicam, angle: startCamera, label: "from")
-        try validateGroupBoundary(range.to, multicam: multicam, angle: endCamera, label: "to")
+        try validateGroupBoundary(range.to, multicam: multicam, angle: endCamera, label: "to", exclusiveEnd: true)
     }
 
     func validateInsertBoundary(_ at: RationalTime, moving placement: String? = nil) throws {
@@ -142,16 +152,16 @@ struct StillAuthoringTiming {
         case .sequence(let clip):
             let url = CutProject.mediaURL(clip.file, relativeTo: location)
             if let media = try index(url) { try validateBoundary(clip.from.adding(local), in: media, label: "at") }
-        case .group(let multicam, let range):
+        case .group(let multicam, let range, let occurrence):
             let group = try range.from.adding(local)
-            try validateGroupBoundary(group, multicam: multicam, angle: multicam.selection(at: group)?.angle, label: "at")
+            try validateGroupBoundary(group, multicam: multicam, angle: multicam.pictureAngle(at: group, in: occurrence), label: "at")
         case nil: break
         }
     }
 
     private func validateGroupBoundary(_ time: RationalTime, multicam: MulticamProject, angle: String?,
-                                       label: String) throws {
-        guard let camera = multicam.angles.first(where: { $0.id == angle }),
+                                       label: String, exclusiveEnd: Bool = false) throws {
+        guard let camera = angle.flatMap({ multicam.pictureSource(for: $0, at: time, exclusiveEnd: exclusiveEnd) }),
               let media = try index(multicam.sourceURL(for: camera, relativeTo: location)) else { return }
         try validateBoundary(time.subtracting(camera.offset).subtracting(media.multicamSourceOffset), in: media, label: label)
     }

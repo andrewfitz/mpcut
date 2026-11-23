@@ -107,14 +107,14 @@ final class MCPAnalysisReceipt {
             result["scope"] = sceneRequest.target == nil ? "all" : "selected"
             result["target"] = sceneRequest.target
             result["policy"] = sceneRequest.policyName
-            result["workerOrigin"] = sceneWorkerOrigin
+            result["worker_origin"] = sceneWorkerOrigin
         }
-        result["job"] = id
-        result["inputRevision"] = revision
+        result["job_id"] = id
+        result["input_revision"] = revision
         result["kind"] = kind
         result["status"] = state
         result["origin"] = "mcp"
-        if cancellationRequested && state == "running" { result["cancellationRequested"] = true }
+        if cancellationRequested && state == "running" { result["cancellation_requested"] = true }
         if let progress = nativeProgress?() { result["progress"] = progress }
         if state == "succeeded" { result["progress"] = 1.0 }
         return result
@@ -290,9 +290,10 @@ final class MCPAnalysisJobs {
     }
 
     func close(owner: String) {
-        revoke(receipts.filter { $0.owner == owner })
-        receipts.removeAll { $0.owner == owner }
-        if let requests = waveformRequests[owner] {
+        let window = owner.prefix(while: { $0 != "/" }) + "/"
+        revoke(receipts.filter { $0.owner.hasPrefix(window) })
+        receipts.removeAll { $0.owner.hasPrefix(window) }
+        for (handle, requests) in waveformRequests where handle.hasPrefix(window) {
             for request in requests.values { request.token.cancel() }
         }
     }

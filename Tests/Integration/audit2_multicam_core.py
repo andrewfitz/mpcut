@@ -50,7 +50,7 @@ class MulticamCoreAudit(unittest.TestCase):
         self.assertEqual([path.name for path in self.root.iterdir() if path.name.startswith(".mpcut")], [])
 
     def test_combined_movie_is_published_with_ordinary_permissions(self):
-        self.project(switches=[{"at": "0", "angle": "wide"}, {"at": "2", "angle": "wide"}])
+        self.project(switches=[{"group_time": "0", "angle_id": "wide"}, {"group_time": "2", "angle_id": "wide"}])
         mask = os.umask(0)
         os.umask(mask)
         expected = 0o666 & ~mask
@@ -67,30 +67,30 @@ class MulticamCoreAudit(unittest.TestCase):
     def test_smart_trim_edge_uses_the_movie_clock_of_a_late_starting_picture(self):
         # Group 1 is fifteen frames into the late camera: an encoded edge up to
         # its keyframe at movie time 1.4, then copied pictures.
-        self.project(switches=[{"at": "0", "angle": "wide"}, {"at": "1", "angle": "close"},
-                               {"at": "3", "angle": "wide"}],
+        self.project(switches=[{"group_time": "0", "angle_id": "wide"}, {"group_time": "1", "angle_id": "close"},
+                               {"group_time": "3", "angle_id": "wide"}],
                      assembly=[{"from": "2", "to": "3"}, {"from": "0", "to": "2"}, {"from": "3", "to": "4"}])
         wide, late = picture_ids(self.wide), picture_ids(self.close)
         first = FPS - 10  # Movie time 1 on a picture track that starts at 0.4.
         expected = (late[first + FPS:first + 2 * FPS] + wide[:FPS] + late[first:first + FPS]
                     + wide[3 * FPS:4 * FPS])
         report = self.export(mode="smart")
-        self.assertGreater(multicam.rational_time(report["encodedVideoDuration"]), 0)
+        self.assertGreater(multicam.rational_time(report["encoded_video_duration"]), 0)
         self.assertEqual(picture_ids(self.output), expected)
         pcm = audio(self.lav)
         self.assertEqual(audio(self.output), pcm_slice(pcm, 2, 3) + pcm_slice(pcm, 0, 2) + pcm_slice(pcm, 3, 4))
 
         # The same pictures when the project offset puts the late camera's first frame at group zero.
         self.project(offset=f"-{LATE}", end="3",
-                     switches=[{"at": "0", "angle": "close"}, {"at": "37/25", "angle": "wide"},
-                               {"at": "2", "angle": "close"}])
+                     switches=[{"group_time": "0", "angle_id": "close"}, {"group_time": "37/25", "angle_id": "wide"},
+                               {"group_time": "2", "angle_id": "close"}])
         output = self.root / "offset.mov"
         self.export(mode="smart", output=output)
         self.assertEqual(picture_ids(output), late[:37] + wide[37:50] + late[50:75])
 
     def test_preflight_rejects_priming_a_program_soundtrack_cannot_keep(self):
-        self.project(audioSources=[{"id": "lav", "file": str(self.aac), "offset": "0"}],
-                     switches=[{"at": "0", "angle": "wide"}])
+        self.project(audio_sources=[{"id": "lav", "file": str(self.aac), "offset": "0"}],
+                     switches=[{"group_time": "0", "angle_id": "wide"}])
         for tracks, suffix in (("all", "mkv"), ("audio", "mka")):
             output = self.root / f"program.{suffix}"
             for options in (["--dry-run"], []):
@@ -98,7 +98,7 @@ class MulticamCoreAudit(unittest.TestCase):
                     report = self.export("--tracks", tracks, *options, output=output, ok=False)
                     self.assertEqual(report["error"]["code"], "unsupported_container")
                     self.assertIn("priming", report["error"]["message"])
-                    self.assertEqual(report["error"]["multicam"]["source"], "lav")
+                    self.assertEqual(report["error"]["multicam"]["source_id"], "lav")
                     self.assertFalse(output.exists())
         self.assert_nothing_staged()
         # The same master keeps its priming through MOV edit lists.

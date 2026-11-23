@@ -49,7 +49,7 @@ final class StillImageTests: XCTestCase {
             let canvas = StillImageCanvas(width: 64, height: 64, transfer: "pq", primaries: "bt2020")
             let hdr = try StillImage.render(url, canvas: canvas)
             XCTAssertEqual(hdr.sourceInfo.rendition, .gainMap)
-            XCTAssertTrue(hdr.sourceInfo.auxiliaryImages.contains("isoGainMap"))
+            XCTAssertTrue(hdr.sourceInfo.auxiliaryImages.contains("iso_gain_map"))
             XCTAssertEqual(component(hdr, x: 16, y: 32), 0.510, accuracy: 0.004)
             XCTAssertEqual(component(hdr, x: 48, y: 32), 0.729, accuracy: 0.004)
             let sdr = try StillImage.render(url, canvas: canvas, forceSDR: true)
@@ -109,6 +109,93 @@ final class StillImageTests: XCTestCase {
             XCTAssertThrowsError(try StillImage.inspect(fixture("animated.\(suffix)"))) { error in
                 XCTAssertEqual((error as? CutError)?.code, "still_animated")
             }
+        }
+    }
+
+    func testAVIFCompatibleBrandsIdentifyExtensionlessFilesAndRejectSequences() throws {
+        var data = try Data(contentsOf: fixture("patch.avif"))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: url) }
+        data.replaceSubrange(8..<12, with: "miaf".utf8)
+        try data.write(to: url)
+        XCTAssertTrue(StillImage.isImageInput(url))
+        XCTAssertEqual(try StillImage.inspect(url).codec, .avif)
+
+        // Keep the primary image intact and advertise a sequence as a compatible brand.
+        data.replaceSubrange(28..<32, with: "avis".utf8)
+        try data.write(to: url)
+        XCTAssertThrowsError(try StillImage.inspect(url)) { error in
+            XCTAssertEqual((error as? CutError)?.code, "still_animated")
+        }
+    }
+
+    func testImageDataProviderRetainsTheValidatedFileWhenItsPathIsReplaced() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let original = try Data(contentsOf: fixture("patch.png"))
+        try original.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let handle = try StillImage.openRegularImage(url)
+        try Data("other file".utf8).write(to: url, options: .atomic)
+        let provider = try XCTUnwrap(StillImage.imageDataProvider(handle))
+        try handle.close()
+        XCTAssertEqual(provider.data as Data?, original)
+    }
+
+    func testInspectAndFingerprintRejectsInPlaceChangesWithRestoredModificationTime() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        var original = try Data(contentsOf: fixture("patch.png"))
+        try original.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let modifiedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let attributes: [FileAttributeKey: Any] = [.modificationDate: modifiedAt]
+        try FileManager.default.setAttributes(attributes, ofItemAtPath: url.path)
+        let result = try StillImage.inspectAndFingerprint(url)
+        XCTAssertEqual(result.info.codec, .png)
+        XCTAssertEqual(result.fingerprint, try StillImage.fingerprint(url))
+
+        var checks = 0
+        var mutationError: Error?
+        XCTAssertThrowsError(try StillImage.inspectAndFingerprint(url, cancelled: {
+            checks += 1
+            if checks == 2 {
+                do {
+                    original[original.count - 1] ^= 1
+                    try original.write(to: url)
+                    try FileManager.default.setAttributes(attributes, ofItemAtPath: url.path)
+                } catch {
+                    mutationError = error
+                }
+            }
+            return false
+        })) { error in
+            XCTAssertEqual((error as? CutError)?.code, "source_changed")
+        }
+        XCTAssertNil(mutationError)
+    }
+
+    func testJPEGXLHeaderRequiresEnoughBitsToDetermineAnimation() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try Data([0xff, 0x0a, 0x00]).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let handle = try StillImage.openRegularImage(url)
+        defer { try? handle.close() }
+        XCTAssertThrowsError(try StillImage.jpegXLHasAnimation(handle)) { error in
+            XCTAssertEqual((error as? CutError)?.code, "still_decode")
+        }
+        XCTAssertEqual(try StillImage.inspect(fixture("square-extended-size-container.jxl")).codec, .jxl)
+    }
+
+    func testRenderChecksTheExpectedSourceAtOpen() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let original = try Data(contentsOf: fixture("patch.png"))
+        try original.write(to: url)
+        let identity = try SourceIdentity(url)
+        let canvas = StillImageCanvas(width: 32, height: 32)
+        XCTAssertEqual(try StillImage.render(url, canvas: canvas, expectedIdentity: identity).sourceInfo.codec, .png)
+        try original.write(to: url, options: .atomic)
+        XCTAssertThrowsError(try StillImage.render(url, canvas: canvas, expectedIdentity: identity)) { error in
+            XCTAssertEqual((error as? CutError)?.code, "source_changed")
         }
     }
 

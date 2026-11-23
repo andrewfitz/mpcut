@@ -3,6 +3,7 @@ import Foundation
 import MPCutCore
 
 struct MulticamAnalysisAudioSpan {
+    let laneID: String?
     let selection: MulticamAudioSelection
     let group: MulticamRange
     let input: MulticamRange
@@ -42,7 +43,7 @@ struct MulticamAnalysisSnapshot: Sendable {
             updates[AnalysisSidecar.viewNameSectionKey] = updating(
                 edits.names, seed: Dictionary(shown, uniquingKeysWith: { _, latest in latest }))
         }
-        if !edits.thresholds.isEmpty { updates["thresholdOverrides.v1"] = updating(edits.thresholds) }
+        if !edits.thresholds.isEmpty { updates[AnalysisSidecar.silenceThresholdOverridesKey] = updating(edits.thresholds) }
         return updates
     }
 }
@@ -91,12 +92,22 @@ final class MulticamAnalysisStore: ObservableObject {
     let waveformDetail = WaveformEnvelopeStore<MulticamAudioSelection>()
     private var sources: [String: MediaInfo] = [:]
     private var pictureSourceIDs = Set<String>()
+    private var recordingsByCamera: [String: [String]] = [:]
     private var sourceVersions: [String: SourceVersion] = [:]
     private var presentationOffsets: [String: RationalTime] = [:]
     private var keyframes: [String: [RationalTime]] = [:]
     private var groupPlan: MulticamPlan?
     var groupIntervals: [MulticamInterval] { groupPlan?.intervals ?? [] }
-    private var activeRoutes: [MulticamSilenceRoute] = []
+    private var audioRouting = MulticamSilenceRouting()
+    private var replacements: [MulticamAudioReplacement] = []
+    private var routeIssue: String?
+    private var routeReviewStreams: [URL: Set<Int>] = [:]
+    private var routeIndexedSources: Set<String> = []
+    var groupAudioLanes: [MulticamPlannedAudioLane] { audioRouting.lanes }
+    private var activeRoutes: [MulticamSilenceRoute] { audioRouting.routes }
+    // Prefix maxima keep the route lookup ordered when lane ends overlap.
+    private var routeEndBounds: [RationalTime] = []
+
     private var activeSilenceTracks = Set<MulticamAudioSelection>()
     private var selectedSilenceTracks = Set<MulticamAudioSelection>()
     private var routedSceneMarkers: [RationalTime] = []
@@ -128,8 +139,9 @@ final class MulticamAnalysisStore: ObservableObject {
     }
 
     func sceneDisposition(camera: String?) -> SceneScanDisposition? {
-        let stale = camera.map(refreshStaleScenes.contains) ?? !refreshStaleScenes.isEmpty
-        return stale ? .stale : sceneScan.disposition(sceneRequests(camera: camera))
+        let requests = sceneRequests(camera: camera)
+        let stale = requests.contains { refreshStaleScenes.contains($0.id) }
+        return stale ? .stale : sceneScan.disposition(requests)
     }
 
     var mcpReceipts: [TimelineSnapTarget: MCPAnalysisReceipt] = [:]
@@ -165,11 +177,24 @@ final class MulticamAnalysisStore: ObservableObject {
     private var requested = Set<TimelineSnapTarget>()
     var changed: (() -> Void)?
     private(set) var snapTarget: TimelineSnapTarget = .off
+    var maxBlip = AudioWaveform.defaultMaxBlip {
+        didSet {
+            updatePauses()
+            publish()
+        }
+    }
     private(set) var pauseMinimum = 1.5
     private(set) var pauseThreshold: Double?
 
     private var inputPauseMinimum: Double {
         MulticamSilencePlanner.inputMinimum(pauseMinimum, routes: activeRoutes)
+    }
+
+    private func routes(in range: MulticamRange) -> [MulticamSilenceRoute] {
+        guard range.from < range.to else { return [] }
+        let first = routeEndBounds.lowerBound { $0 > range.from }
+        let end = activeRoutes.lowerBound { $0.group.from >= range.to }
+        return activeRoutes[first..<end].filter { $0.group.to > range.from }
     }
 
     var silenceTrackCount: Int { activeSilenceTracks.count }
@@ -186,6 +211,7 @@ final class MulticamAnalysisStore: ObservableObject {
     }
 
     var silenceIssue: String? {
+        if let routeIssue { return routeIssue }
         for route in activeRoutes {
             if let issue = issues[.silence(route.selection)] { return issue }
         }
@@ -198,15 +224,20 @@ final class MulticamAnalysisStore: ObservableObject {
         let atEnd = exclusiveEnd || time == interval.group.to
         let index = groupPlan.intervals.lowerBound { atEnd ? $0.group.to >= time : $0.group.to > time }
         let onAir = groupPlan.intervals.indices.contains(index) ? groupPlan.intervals[index] : interval
-        guard let selection = onAir.audio else { return "None routed here" }
+        let first = routeEndBounds.lowerBound { atEnd ? $0 >= time : $0 > time }
+        let end = activeRoutes.lowerBound { atEnd ? $0.group.from >= time : $0.group.from > time }
+        let audible = activeRoutes[first..<end].filter {
+            atEnd ? $0.group.to >= time : $0.group.to > time
+        }
+        if project.audio == .mix {
+            let activeIDs = Set(audible.compactMap(\.laneID))
+            let labels = groupAudioLanes.filter { activeIDs.contains($0.id) }.map(\.label)
+            return labels.isEmpty ? "No audio here" : labels.joined(separator: " · ")
+        }
+        guard let selection = audible.first?.selection ?? onAir.audio else { return "None routed here" }
         let name = project.sources.first { $0.id == selection.source }?.displayName ?? selection.source
         let track = "\(name) · stream \(selection.stream)"
-        let coverage = activeRoutes.lowerBound { atEnd ? $0.group.to >= time : $0.group.to > time }
-        guard activeRoutes.indices.contains(coverage),
-              activeRoutes[coverage].selection == selection,
-              atEnd ? activeRoutes[coverage].group.from < time : activeRoutes[coverage].group.from <= time else {
-            return "\(track) · no audio here"
-        }
+        guard !audible.isEmpty else { return "\(track) · no audio here" }
         if let result = silences[selection] {
             let level = result.thresholdDB.formatted(.number.precision(.fractionLength(0...1)))
             return "\(track) · \(level) dBFS threshold"
@@ -285,11 +316,17 @@ final class MulticamAnalysisStore: ObservableObject {
         issues = [:]
         sources = [:]
         pictureSourceIDs = []
+        recordingsByCamera = [:]
         sourceVersions = [:]
         presentationOffsets = [:]
         keyframes = [:]
         groupPlan = nil
-        activeRoutes = []
+        audioRouting = .init()
+        routeEndBounds = []
+        replacements = []
+        routeIssue = nil
+        routeReviewStreams = [:]
+        routeIndexedSources = []
         activeSilenceTracks = []
         selectedSilenceTracks = []
         angleOffsets = [:]
@@ -324,7 +361,10 @@ final class MulticamAnalysisStore: ObservableObject {
         let offsets = media.mapValues(\.multicamClockOffset)
         let changedSources = next != sourceVersions || offsets != presentationOffsets || !refreshes.isEmpty
         let nextPlan = try? project.plan(ranges: [project.range])
-        if (changedSources || groupPlan != nextPlan), mcpReceipts[.silence] != nil { cancel(.silence) }
+        let indexedSources = Set(media.compactMap { $0.value.hasFullEditIndex ? $0.key : nil })
+        let changedRouting = groupPlan != nextPlan || replacements != project.audioReplacements
+            || routeReviewStreams != reviewStreams || routeIndexedSources != indexedSources
+        if (changedSources || changedRouting), mcpReceipts[.silence] != nil { cancel(.silence) }
         let sidecarPolicyChanged = self.useSidecars != useSidecars || self.excludedSources != excludedSources
         if sidecarPolicyChanged {
             sceneScan.invalidateInspection()
@@ -396,25 +436,46 @@ final class MulticamAnalysisStore: ObservableObject {
         roomThresholds = roomThresholds.filter { versions.contains($0.key.version) }
         sourceVersions = next
         sources = ordinary
-        pictureSourceIDs = Set(project.angles.compactMap { angle in
+        recordingsByCamera = Dictionary(uniqueKeysWithValues: project.angles.map { ($0.id, $0.recordings.map(\.id)) })
+        pictureSourceIDs = Set(project.pictureSources.compactMap { angle in
             guard let media = ordinary[angle.id], !reviewPicture.contains(media.url) else { return nil }
             return angle.id
         })
         sceneScan.pruneCheckpoints(keeping: Array(ordinary.values))
         presentationOffsets = offsets
-        let nextAngles = Dictionary(uniqueKeysWithValues: project.angles.map { ($0.id, $0.offset) })
-        let routesChanged = groupPlan != nextPlan || changedSources || angleOffsets != nextAngles
+        let nextAngles = Dictionary(uniqueKeysWithValues: project.pictureSources.map { ($0.id, $0.offset) })
+        let routesChanged = changedRouting || changedSources || angleOffsets != nextAngles
         if routesChanged {
             let oldMinimum = inputPauseMinimum
             groupPlan = nextPlan
-            activeRoutes = MulticamSilencePlanner.routes(plan: groupPlan, project: project, media: media).filter { route in
-                guard let url = media[route.selection.source]?.url else { return false }
-                return reviewStreams[url]?.contains(route.selection.stream) != true
+            replacements = project.audioReplacements
+            routeReviewStreams = reviewStreams
+            routeIndexedSources = indexedSources
+            routeIssue = nil
+            do {
+                audioRouting = try MulticamSilencePlanner.routing(plan: groupPlan, project: project, media: media,
+                                                                  assumeUnindexedCoverage: true)[0] ?? .init()
+            } catch {
+                audioRouting = .init()
+                audioRouting.selections = groupPlan.map { project.requiredAudioSelections(for: $0) } ?? []
+                routeIssue = (error as? CutError)?.message ?? error.localizedDescription
+            }
+            let underReview = Set(audioRouting.selections.filter { route in
+                guard let url = media[route.source]?.url else { return false }
+                return reviewStreams[url]?.contains(route.stream) == true
+            })
+            let blockedRoutes = audioRouting.routes.filter { underReview.contains($0.selection) }
+            audioRouting.unindexed += blockedRoutes.map(\.group)
+            audioRouting.routes.removeAll { underReview.contains($0.selection) }
+            var latestEnd = RationalTime.zero
+            routeEndBounds = activeRoutes.map { route in
+                latestEnd = max(latestEnd, route.group.to)
+                return latestEnd
             }
             activeSilenceTracks = Set(activeRoutes.map(\.selection))
             visibleOnlyWaveforms.formUnion(activeSilenceTracks.filter { refreshes[$0.source] != nil })
             pendingSilenceRescans.formIntersection(activeSilenceTracks)
-            selectedSilenceTracks = Set(groupPlan?.intervals.compactMap(\.audio) ?? [])
+            selectedSilenceTracks = audioRouting.selections
             if refreshes.isEmpty, oldMinimum != inputPauseMinimum {
                 if !silences.isEmpty { requested.insert(.silence) }
                 invalidateSilenceResults()
@@ -477,8 +538,9 @@ final class MulticamAnalysisStore: ObservableObject {
     }
 
     func currentScene(at groupTime: RationalTime, project: MulticamProject) -> ScenePosition? {
-        guard let angle = project.selection(at: groupTime)?.angle else { return nil }
-        return currentScene(at: groupTime, angle: angle, exclusiveEnd: false)
+        guard let angle = project.selection(at: groupTime)?.angle,
+              let source = project.pictureSource(for: angle, at: groupTime) else { return nil }
+        return currentScene(at: groupTime, angle: source.id, exclusiveEnd: false)
     }
 
     func currentScene(at groupTime: RationalTime, angle: String, exclusiveEnd: Bool) -> ScenePosition? {
@@ -494,10 +556,12 @@ final class MulticamAnalysisStore: ObservableObject {
 
     func rename(_ scene: ScenePosition, to text: String) {
         guard let report = sceneReports[scene.source], report.sourceStamp == scene.report.sourceStamp,
-              report.file == scene.report.file else { return }
+              report.file == scene.report.file,
+              let view = report.views.first(where: { $0.view == scene.view }),
+              view.sceneNumbers == scene.report.views.first(where: { $0.view == scene.view })?.sceneNumbers else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let name = trimmed.isEmpty ? nil : trimmed
-        guard report.views.first(where: { $0.view == scene.view })?.name != name else { return }
+        guard view.name != name else { return }
         sceneReports[scene.source]?.setViewName(name, for: scene.view)
         if let media = sources[scene.source] { sceneScan.cache.setViewName(name, view: scene.view, for: media) }
         persistMetadata(scene.source, edits: EditorMetadataEdits(names: [scene.view: name]))
@@ -505,10 +569,9 @@ final class MulticamAnalysisStore: ObservableObject {
     }
 
     func soundtrack(in visible: MulticamRange) -> [MulticamAnalysisAudioSpan] {
-        let first = activeRoutes.lowerBound { $0.group.to > visible.from }
-        let end = activeRoutes.lowerBound { $0.group.from >= visible.to }
-        return activeRoutes[first..<end].map { route in
-            MulticamAnalysisAudioSpan(selection: route.selection, group: route.group, input: route.input, waveform: waves[route.selection])
+        routes(in: visible).map { route in
+            MulticamAnalysisAudioSpan(laneID: route.laneID, selection: route.selection, group: route.group,
+                                      input: route.input, waveform: waves[route.selection])
         }
     }
 
@@ -569,7 +632,7 @@ final class MulticamAnalysisStore: ObservableObject {
     }
 
     private func sceneRequests(camera: String?) -> [EditorSceneRequest] {
-        let ids = camera.map { [$0] } ?? pictureSourceIDs.sorted()
+        let ids = camera.map { recordingsByCamera[$0] ?? [$0] } ?? pictureSourceIDs.sorted()
         return ids.compactMap { id in
             guard pictureSourceIDs.contains(id), let media = sources[id], media.hasVideo else { return nil }
             return EditorSceneRequest(id: id, media: media)
@@ -701,14 +764,8 @@ final class MulticamAnalysisStore: ObservableObject {
         var peaks: [SourceTrack: (source: String, peak: Float)] = [:]
         for range in ranges {
             guard range.from < range.to else { continue }
-            let firstInterval = groupIntervals.lowerBound { $0.group.to > range.from }
-            let lastInterval = groupIntervals.lowerBound { $0.group.from >= range.to }
-            guard groupIntervals[firstInterval..<lastInterval].compactMap(\.audio).allSatisfy({ route in
-                sources[route.source]?.audio.contains { $0.stream.index == route.stream } == true
-            }) else { return nil }
-            let first = activeRoutes.lowerBound { $0.group.to > range.from }
-            let end = activeRoutes.lowerBound { $0.group.from >= range.to }
-            for route in activeRoutes[first..<end] {
+            guard silenceRoutesAvailable(in: [range]) else { return nil }
+            for route in routes(in: range) {
                 guard finishedWaves.contains(route.selection), let track = sourceTrack(for: route.selection),
                       let from = try? max(range.from, route.group.from).subtracting(route.offset),
                       let to = try? min(range.to, route.group.to).subtracting(route.offset),
@@ -864,17 +921,13 @@ final class MulticamAnalysisStore: ObservableObject {
                             }
                         }
                     let level = level(for: route)
-                    var saved = useSidecars ? AnalysisSidecar(media: audioMedia).silence(for: audioMedia, stream: route.stream,
+                    let saved = useSidecars ? AnalysisSidecar(media: audioMedia).silence(for: audioMedia, stream: route.stream,
                         thresholdDB: level, minimum: minimum, cancelled: { token.isCancelled }) : nil
-                    if saved?.hasRouting == false {
-                        saved = try AudioAnalysis.silence(audioMedia, stream: route.stream, thresholdDB: level,
-                            minimum: minimum, waveform: wave, requireRouting: true, cancelled: { token.isCancelled })
-                    }
                     return .waveform(wave, saved)
                 case .silence(let route):
                     let audioMedia = try media.extendingToAudioEnd(stream: route.stream)
                     let detection = try AudioAnalysis.silence(audioMedia, stream: route.stream, thresholdDB: level(for: route),
-                        minimum: minimum, waveform: cached, useSidecar: useSidecars && !rescan, requireRouting: true,
+                        minimum: minimum, waveform: cached, useSidecar: useSidecars && !rescan,
                         cancelled: { token.isCancelled })
                     if useSidecars && rescan {
                         let sections = try AnalysisSidecar.sections(media: audioMedia, silence: [detection],
@@ -921,20 +974,20 @@ extension MulticamAnalysisStore {
 
     func hasSilenceResults(project: MulticamProject, media: [String: MediaInfo]) -> Bool {
         // A valid selected track can have no samples in a route's time window.
-        !activeSilenceTracks.isEmpty && activeSilenceTracks.allSatisfy { silences[$0] != nil }
-            && unindexedSilenceSources.isEmpty && !hasMissingSilenceTrack
+        !activeSilenceTracks.isEmpty && activeSilenceTracks.allSatisfy { complete(.silence($0)) }
+            && audioRouting.unindexed.isEmpty && routeIssue == nil && unindexedSilenceSources.isEmpty && !hasMissingSilenceTrack
+    }
+
+    private func silenceRoutesAvailable(in ranges: [MulticamRange]) -> Bool {
+        routeIssue == nil && !audioRouting.unindexed.contains { missing in
+            ranges.contains { $0.from < missing.to && missing.from < $0.to }
+        }
     }
 
     func hasSilenceResults(in ranges: [MulticamRange]) -> Bool {
-        func overlaps(_ group: MulticamRange) -> Bool {
-            ranges.contains { $0.from < group.to && group.from < $0.to }
-        }
-        let selected = Set(groupIntervals.lazy.filter { overlaps($0.group) }.compactMap(\.audio))
-        guard selected.allSatisfy({ route in
-            sources[route.source]?.audio.contains { $0.stream.index == route.stream } == true
-        }) else { return false }
-        let covered = Set(activeRoutes.lazy.filter { overlaps($0.group) }.map(\.selection))
-        return !covered.isEmpty && covered.allSatisfy { silences[$0] != nil }
+        guard silenceRoutesAvailable(in: ranges) else { return false }
+        let covered = Set(ranges.flatMap { routes(in: $0).map(\.selection) })
+        return !covered.isEmpty && covered.allSatisfy { complete(.silence($0)) }
     }
 
     func routedPauses(project: MulticamProject, media: [String: MediaInfo]) -> [AudioSpan] {
@@ -942,7 +995,7 @@ extension MulticamAnalysisStore {
     }
 
     private func updatePauses() {
-        groupPauses = MulticamSilencePlanner.routedPauses(activeRoutes, silences: silences)
+        groupPauses = silences.isEmpty ? [] : audioRouting.pauses(silences: silences, maxBlip: maxBlip)
         routedSilenceMarkers = groupPauses.lazy.filter { ($0.to - $0.from).seconds >= self.pauseMinimum }
             .flatMap { [$0.from, $0.to] }
     }
@@ -956,10 +1009,53 @@ extension MulticamAnalysisStore {
         }
     }
 
+    func pictureSnapMarkers(_ target: TimelineSnapTarget, angle: String, project: MulticamProject,
+                            near time: RationalTime, within range: MulticamRange, includeEnd: Bool) -> [RationalTime] {
+        let times = target == .scenes ? scenes : keyframes
+        return project.recordings(for: angle).flatMap { recording -> [RationalTime] in
+            let coverageEnd = min(project.range.to, recording.coverage?.to ?? project.range.to)
+            let inclusive = includeEnd && range.to < coverageEnd
+            guard pictureSourceIDs.contains(recording.id), let local = times[recording.id],
+                  let requested = try? time.subtracting(recording.offset),
+                  let lower = try? max(project.range.from, range.from, recording.coverage?.from ?? range.from).subtracting(recording.offset),
+                  let upper = try? min(range.to, coverageEnd).subtracting(recording.offset)
+            else { return [] }
+            let first = local.lowerBound { $0 >= lower }
+            let last = local.lowerBound { inclusive ? $0 > upper : $0 >= upper }
+            guard first < last else { return [] }
+            let next = local[first..<last].lowerBound { $0 >= requested }
+            return [next - 1, next].filter { first <= $0 && $0 < last }.compactMap { index in
+                try? local[index].adding(recording.offset)
+            }
+        }.sorted()
+    }
+
     private func routedPictureMarkers(_ times: [String: [RationalTime]]) -> [RationalTime] {
+        pictureMarkers(times, in: groupPlan?.picture ?? [])
+    }
+
+    func pictureOutputMarkers(_ target: TimelineSnapTarget, in plan: MulticamPlan) -> [RationalTime] {
+        switch target {
+        case .scenes: return pictureMarkers(scenes, in: plan.picture)
+        case .keyframes: return pictureMarkers(keyframes, in: plan.picture)
+        default: return []
+        }
+    }
+
+    func hasPictureMarker(_ target: TimelineSnapTarget, in plan: MulticamPlan) -> Bool {
+        let times = target == .scenes ? scenes : keyframes
+        return plan.picture.contains { span in
+            guard pictureSourceIDs.contains(span.source), let local = times[span.source] else { return false }
+            let index = local.lowerBound { $0 >= span.input.from }
+            return index < local.count && local[index] < span.input.to
+        }
+    }
+
+    private func pictureMarkers(_ times: [String: [RationalTime]], in spans: [MulticamSpan]) -> [RationalTime] {
         var result: [RationalTime] = []
-        for span in groupPlan?.picture ?? [] {
-            guard let offset = angleOffsets[span.source], let sourceTimes = times[span.source] else { continue }
+        for span in spans {
+            guard pictureSourceIDs.contains(span.source), let sourceTimes = times[span.source],
+                  let offset = try? span.output.from.subtracting(span.input.from) else { continue }
             let lower = sourceTimes.lowerBound { $0 >= span.input.from }
             let upper = sourceTimes.lowerBound { $0 >= span.input.to }
             result.append(contentsOf: sourceTimes[lower..<upper].compactMap { try? $0.adding(offset) })

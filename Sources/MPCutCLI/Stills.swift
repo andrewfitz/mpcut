@@ -2,7 +2,7 @@ import Foundation
 import MPCutCore
 
 struct StillOptions {
-    enum Operation: String { case add, list, update, relink, remove }
+    enum Operation: String { case add, list, update, relink, remove, space }
     enum Clock: String { case sequence, group, assembly, source }
     enum Fit: String { case fit, fill }
 
@@ -13,6 +13,7 @@ struct StillOptions {
     let image: String?
     let asset: String?
     let placement: String?
+    let gap: Bool
     let replace: Bool
     let clock: Clock?
     let from: RationalTime?
@@ -22,6 +23,7 @@ struct StillOptions {
     let duplicateID: String?
     let detachID: String?
     let duration: RationalTime?
+    let sourceTiming: Bool
     let cadence: RationalTime?
     let fit: Fit?
     let cropX: RationalTime?
@@ -31,11 +33,8 @@ struct StillOptions {
     let background: String?
     let color: StillTimelineFormat.Color?
 
-    init(_ arguments: [String]) throws {
+    init(operation: Operation, arguments: [String], gap: Bool, replace: Bool) throws {
         var arguments = arguments.filter { $0 != "--json" }.makeIterator()
-        guard let verb = arguments.next(), let operation = Operation(rawValue: verb) else {
-            throw CLIError("invalid_arguments", "Use mpcut still add, list, update, relink or remove.")
-        }
         self.operation = operation
         let destinations: Set<String> = ["--out-project", "--in-place"]
         let framing: Set<String> = ["--fit", "--crop-x", "--crop-y", "--crop-width", "--crop-height", "--background"]
@@ -44,7 +43,9 @@ struct StillOptions {
         switch operation {
         case .add:
             allowed = destinations.union(framing).union(length).union(
-                ["--image", "--asset", "--replace", "--insert", "--clock", "--from", "--to", "--at", "--color"])
+                ["--image", "--asset", "--clock", "--from", "--to", "--at", "--color"])
+        case .space:
+            allowed = destinations.union(length).union(["--source-timing", "--background", "--color"])
         case .list:
             allowed = ["--placement"]
         case .update:
@@ -62,7 +63,7 @@ struct StillOptions {
                 throw CLIError("invalid_arguments", "Unknown still \(operation.rawValue) option '\(flag)'.")
             }
             guard seen.insert(flag).inserted else { throw CLIError("invalid_arguments", "Duplicate \(flag).") }
-            if ["--in-place", "--insert", "--replace"].contains(flag) { continue }
+            if ["--in-place", "--source-timing"].contains(flag) { continue }
             guard let value = arguments.next(), !value.isEmpty, !value.hasPrefix("--") else {
                 throw CLIError("invalid_arguments", "Missing value for \(flag).")
             }
@@ -77,14 +78,15 @@ struct StillOptions {
         if operation != .list, inPlace == (output != nil) {
             throw CLIError("invalid_arguments", "Choose either --out-project FILE or --in-place.")
         }
+        self.gap = gap
         image = values["--image"]
         asset = values["--asset"]
         placement = values["--placement"]
-        replace = seen.contains("--replace")
-        let insert = seen.contains("--insert")
+        self.replace = replace
+        let insert = operation == .add && !replace
         if operation == .add {
-            guard replace != insert, (asset == nil) != (image == nil) else {
-                throw CLIError("invalid_arguments", "Choose one of --replace or --insert and one of --image or --asset.")
+            guard replace != insert, [gap, asset != nil, image != nil].filter({ $0 }).count == 1, !gap || insert else {
+                throw CLIError("invalid_arguments", "Supply one image or asset for a still placement. Gap insertion takes neither.")
             }
         }
         if (operation == .update || operation == .remove) && placement == nil {
@@ -135,16 +137,20 @@ struct StillOptions {
         } else {
             duration = requestedDuration
         }
-        if let duration, duration <= .zero {
+        sourceTiming = seen.contains("--source-timing")
+        if operation == .space, sourceTiming == (duration != nil) {
+            throw CLIError("invalid_arguments", "Choose one of --source-timing, --duration, or --frames with --rate for Space Clips.")
+        }
+        if let duration, duration < .zero || (duration == .zero && operation != .space) {
             throw CLIError("invalid_time", "--duration must be positive.")
         }
         if replace {
             guard let from, let to, from >= .zero, to > from, at == nil, duration == nil, cadence == nil else {
-                throw CLIError("invalid_arguments", "Use --replace with a nonempty --from/--to range.")
+                throw CLIError("invalid_arguments", "Picture replacement requires a nonempty --from/--to range.")
             }
         } else if insert {
             guard let at, at >= .zero, duration != nil, from == nil, to == nil else {
-                throw CLIError("invalid_arguments", "Use --insert with --at and --duration or --frames and --rate.")
+                throw CLIError("invalid_arguments", "Insertion requires --at and a duration. Supply --duration or --frames with --rate.")
             }
         }
         if let raw = values["--fit"] {
@@ -176,8 +182,9 @@ func hasStillPlacements(_ project: CutProject) -> Bool {
 struct StillInspection: Encodable {
     struct Asset: Encodable {
         let id: String
-        let file: String
-        let resolvedFile: String
+        let file: String?
+        let kind: String?
+        let resolvedFile: String?
         let displayName: String
         let fingerprint: String
         let offline: Bool
@@ -185,11 +192,12 @@ struct StillInspection: Encodable {
         init(_ asset: StillAsset, relativeTo location: URL) {
             let url = CutProject.mediaURL(asset.file, relativeTo: location)
             id = asset.id
-            file = asset.file
-            resolvedFile = url.path
+            kind = asset.isGap ? "gap" : nil
+            file = asset.isGap ? nil : asset.file
+            resolvedFile = asset.isGap ? nil : url.path
             displayName = asset.displayName
             fingerprint = asset.fingerprint
-            offline = (try? SourceIdentity(url)) == nil
+            offline = !asset.isGap && (try? SourceIdentity(url)) == nil
         }
     }
 
@@ -209,19 +217,21 @@ struct StillInspection: Encodable {
     }
 
     let ok = true
-    let project: String
+    let projectPath: String
     let kind: String
     let duration: RationalTime
     let assets: [Asset]
     let placements: [Placement]
     let colorPolicy: StillProgramColorPolicy?
-    let timeline: CutProject
+    var timeline: CutProject
     var placementID: String?
     var assetID: String?
+    var inspection: MulticamInspection?
+    var tier: TierSummary?
 
     init(_ timeline: CutProject, location: URL, input: String, placement: String? = nil) throws {
         self.timeline = timeline
-        project = input
+        projectPath = input
         let isMulticam: Bool
         if case .multicam = timeline { isMulticam = true } else { isMulticam = false }
         kind = isMulticam ? "multicam" : "sequence"
@@ -281,15 +291,10 @@ extension StillOptions {
         return framing
     }
 
-    func sourceAsset(at location: URL, id: String = UUID().uuidString) throws -> StillAsset {
+    func sourceAsset(at location: URL, id: String = UUID().uuidString, cancelled: @escaping () -> Bool) throws -> StillAsset {
         guard let image else { throw CLIError("invalid_arguments", "Specify --image FILE.") }
         let url = try fileURL(image, label: "Image")
-        let identity = try SourceIdentity(url)
-        _ = try StillImage.inspect(url)
-        let fingerprint = try StillImage.fingerprint(url)
-        guard (try? SourceIdentity(url)) == identity else {
-            throw CutError(code: "source_changed", message: "Image ‘\(url.path)’ changed while opening it.")
-        }
+        let fingerprint = try StillImage.inspectAndFingerprint(url, cancelled: cancelled).fingerprint
         return StillAsset(id: id, file: CutProject.relativeMediaPath(url.path, to: location),
                           displayName: url.lastPathComponent, fingerprint: fingerprint)
     }
@@ -297,7 +302,7 @@ extension StillOptions {
 
 struct StillCLIExportReport: Encodable {
     private enum CodingKeys: String, CodingKey {
-        case ok, dryRun, output, copiedDuration, encodedDuration, audioActions, audioStream, tier
+        case ok, dryRun, output, copiedDuration, encodedDuration, audioActions, audioStream, tier, cutMap
     }
 
     let dryRun: Bool
@@ -312,6 +317,7 @@ struct StillCLIExportReport: Encodable {
         try fields.encode(dryRun, forKey: .dryRun)
         try fields.encode(output, forKey: .output)
         try fields.encodeIfPresent(audioStream, forKey: .audioStream)
+        try fields.encode(report.cutMap, forKey: .cutMap)
         try fields.encode(report.selectedTier, forKey: .tier)
         try fields.encode(report.soundActions, forKey: .audioActions)
         if report.tracks == .audio {
@@ -340,8 +346,25 @@ extension StillOptions {
         switch operation {
         case .list:
             throw CLIError("invalid_arguments", "Listing stills does not edit the project.")
+        case .space:
+            let interval = try cadence ?? project.stillFormat?.cadence ?? (duration == .zero
+                ? .init(numerator: 1, denominator: 30) : timing.inferredCadence(.zero, requireUniform: !sourceTiming))
+            let fill = background ?? "#000000"
+            var result: CutProject
+            if sourceTiming {
+                result = try project.spacingClipsUsingSourceTiming(cadence: interval, background: fill, relativeTo: location)
+            } else if let duration {
+                result = try project.spacingClips(duration: duration, cadence: interval, background: fill)
+            } else {
+                preconditionFailure("Space Clips requires source timing or a fixed duration.")
+            }
+            if duration != .zero, result.hasInteriorSpacingGaps || color != nil,
+               let policy = try color?.policy ?? (result.programColorPolicy == nil ? timing.colorPolicy(in: result) : nil) {
+                result = try result.settingStillColorPolicy(policy)
+            }
+            return Edit(project: result, placementID: nil, assetID: nil, action: "Space Clips")
         case .add:
-            return try add(to: project, timing: timing)
+            return try add(to: project, timing: timing, cancelled: cancelled)
         case .update:
             guard let placement else { throw CLIError("invalid_arguments", "Specify --placement ID.") }
             let insert = project.stillInserts.first { $0.id == placement }
@@ -404,7 +427,7 @@ extension StillOptions {
             return Edit(project: updated, placementID: resultID, assetID: asset ?? insert?.assetID ?? replacement?.assetID, action: action)
         case .relink:
             guard let asset else { throw CLIError("invalid_arguments", "Specify --asset ID.") }
-            let replacement = try sourceAsset(at: location, id: asset)
+            let replacement = try sourceAsset(at: location, id: asset, cancelled: cancelled)
             let updated = try project.relinkingStillAsset(asset, file: replacement.file, fingerprint: replacement.fingerprint)
             return Edit(project: updated, placementID: nil, assetID: asset, action: "Relink Still")
         case .remove:
@@ -414,7 +437,7 @@ extension StillOptions {
         }
     }
 
-    private func add(to project: CutProject, timing: StillAuthoringTiming) throws -> Edit {
+    private func add(to project: CutProject, timing: StillAuthoringTiming, cancelled: @escaping () -> Bool) throws -> Edit {
         let expected: Clock
         switch project {
         case .multicam: expected = replace ? .group : .assembly
@@ -427,15 +450,19 @@ extension StillOptions {
         let framing = try checkedFraming()
         var updated = project
         let assetID: String
-        if let asset {
+        if gap {
+            let source = project.stillAssets.first(where: \.isGap) ?? StillAsset(gapID: UUID().uuidString)
+            updated = try updated.addingStillAsset(source)
+            assetID = source.id
+        } else if let asset {
             guard project.stillAssets.contains(where: { $0.id == asset }) else {
                 throw CutError(code: "invalid_target", message: "Unknown still asset ‘\(asset)’.")
             }
             assetID = asset
         } else {
-            let source = try sourceAsset(at: timing.location)
+            let source = try sourceAsset(at: timing.location, cancelled: cancelled)
             if let existing = project.stillAssets.first(where: {
-                $0.fingerprint == source.fingerprint &&
+                !$0.isGap && $0.fingerprint == source.fingerprint &&
                     CutProject.mediaURL($0.file, relativeTo: timing.location).resolvingSymlinksInPath() ==
                     CutProject.mediaURL(source.file, relativeTo: timing.location).resolvingSymlinksInPath()
             }) {
@@ -471,6 +498,6 @@ extension StillOptions {
             updated = try updated.settingStillColorPolicy(inferred)
         }
         return Edit(project: updated, placementID: placement, assetID: assetID,
-                    action: replace ? "Replace Picture" : "Insert Still")
+                    action: replace ? "Replace Picture" : (gap ? "Insert Color Gap" : "Insert Still"))
     }
 }

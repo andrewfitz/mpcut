@@ -1,27 +1,199 @@
 import Darwin
 import Foundation
+import MPCutCore
 import XCTest
 @testable import MPCutApp
 
 final class MCPFileJobTests: XCTestCase {
+    func testFileSilenceForwardsBlipDurationOnlyForNewScans() throws {
+        let schema = try MCPSchemas.loaded.get()
+        func request(_ fields: [String: Any]) throws -> MCPFileRequest {
+            var args = fields
+            args["operation_id"] = UUID().uuidString
+            return try MCPFileRequest(tool: "silence_file_scan", fields: schema.validate(tool: "silence_file_scan", arguments: args))
+        }
+        let scan = try request(["file": "/tmp/interview.wav", "silence_max_blip_seconds": 0.3, "silence_padding_per_side_seconds": 0.25])
+        XCTAssertEqual(scan.arguments, ["silence", "scan", "--json", "--padding-per-side-seconds", "0.25", "--max-blip-seconds", "0.3", "--", "/tmp/interview.wav"])
+        for value: Any in [-0.01, 1.01, true, "0.3"] {
+            XCTAssertThrowsError(try request(["file": "/tmp/interview.wav", "silence_max_blip_seconds": value]))
+        }
+        XCTAssertThrowsError(try request(["report": [:], "silence_max_blip_seconds": 0.3]))
+        XCTAssertThrowsError(try request(["file": "/tmp/interview.wav", "protect_pauses": ["pause-1"]]))
+        XCTAssertThrowsError(try request(["project_path": "/tmp/timeline.cut", "waveform": 64]))
+    }
+
+    func testFileRoutesKeepScanningPlanningAndPublicationDistinct() throws {
+        let schemas = try MCPSchemas.loaded.get()
+        let id = UUID().uuidString
+        let source = ["operation_id": id, "file": "/tmp/source.mov"]
+        let output = source.merging(["output": "/tmp/output.mov"]) { _, new in new }
+        XCTAssertThrowsError(try schemas.validate(tool: "file_silence", arguments: source))
+        XCTAssertThrowsError(try schemas.validate(tool: "silence_file_scan", arguments: output))
+        XCTAssertThrowsError(try schemas.validate(tool: "silence_file_export", arguments: source))
+        XCTAssertThrowsError(try schemas.validate(tool: "project_file_resolve_export",
+                                                arguments: ["operation_id": id, "open": true,
+                                                            "project_path": "/tmp/source.cut", "output": "/tmp/out.fcpxml"]))
+        for (tool, path) in [("silence_file_plan", ["silence", "plan"]), ("silence_file_export", ["silence", "export"])] {
+            let result = try MCPFileRequest(tool: tool, fields: output)
+            XCTAssertEqual(Array(result.arguments.prefix(path.count)), path)
+            XCTAssertTrue(MCPFileRequest.isFileTool(tool))
+        }
+        let frames = try MCPFileRequest(tool: "review_file_frames_export",
+                                        fields: ["operation_id": id, "file": "/tmp/source.mov", "output": "/tmp/pictures",
+                                                 "select": "non_silent", "silence_audio_stream_index": 2])
+        XCTAssertEqual(frames.arguments, ["review", "frames", "export", "--json", "--stream", "2", "--select",
+                                          "non-silent", "--output", "/tmp/pictures", "--", "/tmp/source.mov"])
+        let inspect = try MCPFileRequest(tool: "media_file_inspect",
+                                         fields: ["operation_id": id, "file": "/tmp/source.mov", "detail": "audio_packets",
+                                                  "source_from": "1/2", "source_to": "2", "packet_audio_stream_index": 1])
+        XCTAssertEqual(inspect.arguments, ["media", "inspect", "--json", "--stream", "1", "--from", "1/2", "--to", "2",
+                                           "--audio-packets", "--", "/tmp/source.mov"])
+        let help = try MCPFileRequest(tool: "cli_help_read", fields: ["operation_id": id, "topic": "silence plan"])
+        XCTAssertEqual(help.arguments, ["help", "--json", "silence", "plan"])
+    }
+
+    func testSavedAssemblyFrameRequestsRequireExactTimes() throws {
+        let fields = ["operation_id": UUID().uuidString, "project_path": "/tmp/Assembly.cut",
+                      "clock": "assembly", "output": "/tmp/AssemblyFrames"]
+        let tool = "review_file_frames_export"
+        XCTAssertThrowsError(try MCPFileRequest(tool: tool, fields: fields))
+        var timed: [String: Any] = fields
+        timed["at"] = ["2/3"]
+        let request = try MCPFileRequest(tool: tool, fields: timed)
+        XCTAssertEqual(request.arguments, ["review", "frames", "export", "--json", "--clock", "assembly",
+                                           "--output", "/tmp/AssemblyFrames", "--at", "2/3", "--project", "/tmp/Assembly.cut"])
+        timed["select"] = "scenes"
+        XCTAssertThrowsError(try MCPFileRequest(tool: tool, fields: timed))
+    }
+
+    func testSavedAuthoringForwardsMulticamRecordingOperations() throws {
+        let tool = "project_file_edit"
+        var operation = ["action": "add_recording", "angle_id": "wide",
+                         "path": "/tmp/Recording 2.mov", "group_start": "1001/300"]
+        func request(_ mutation: [String: String]) throws -> MCPFileRequest {
+            try MCPFileRequest(tool: tool, fields: [
+                "operation_id": UUID().uuidString,
+                "request": ["project_path": "/tmp/Assembly.cut", "out_project": "/tmp/Updated.cut", "operations": [mutation]]
+            ])
+        }
+        let encoded = try XCTUnwrap(request(operation).input)
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(body["operations"] as? [[String: String]], [operation])
+        operation["group_start"] = nil
+        XCTAssertThrowsError(try request(operation))
+    }
+
+    func testSavedMulticamAudioDeliveryAndSyncReachCLI() throws {
+        let export = try MCPFileRequest(tool: "export_file_project_render", fields: [
+            "operation_id": UUID().uuidString, "project_path": "/tmp/Mix.cut", "output": "/tmp/Mix.mov",
+            "mode": "copy", "audio": "pcm", "audio_output": "downmix_stereo", "dry_run": true
+        ])
+        XCTAssertEqual(export.arguments, ["export", "project", "render", "--json", "--dry-run", "--audio", "pcm",
+                                          "--audio-output", "downmix_stereo", "--mode", "copy",
+                                          "--output", "/tmp/Mix.mov", "--project", "/tmp/Mix.cut"])
+        let silenceFields: [String: Any] = [
+            "operation_id": UUID().uuidString, "project_path": "/tmp/Mix.cut", "output": "/tmp/ShortMix.mov",
+            "mode": "copy", "audio": "pcm", "audio_output": "downmix_mono"
+        ]
+        let silenceTool = "silence_file_plan"
+        let silence = try MCPFileRequest(tool: silenceTool, fields: silenceFields)
+        XCTAssertEqual(silence.arguments, ["silence", "plan", "--json", "--audio", "pcm", "--audio-output",
+                                           "downmix_mono", "--mode", "copy", "--output", "/tmp/ShortMix.mov",
+                                           "--project", "/tmp/Mix.cut"])
+        XCTAssertThrowsError(try MCPFileRequest(tool: silenceTool,
+                                                fields: silenceFields.filter { $0.key != "output" }))
+        let fields: [String: Any] = [
+            "operation_id": UUID().uuidString, "project_path": "/tmp/Mix.cut", "reference_source_id": "camera-b",
+            "reference_stream": 1, "replacement": "/tmp/Replacement.wav", "replacement_stream": 0, "seed": "3/2"
+        ]
+        let tool = "multicam_file_sync_suggest"
+        let sync = try MCPFileRequest(tool: tool, fields: fields)
+        XCTAssertEqual(sync.arguments, ["multicam", "sync", "suggest", "--json", "--project", "/tmp/Mix.cut",
+                                        "--reference-source-id", "camera-b", "--replacement", "/tmp/Replacement.wav",
+                                        "--reference-stream", "1", "--replacement-stream", "0", "--seed", "3/2"])
+        XCTAssertThrowsError(try MCPFileRequest(tool: tool, fields: fields.filter { $0.key != "replacement_stream" }))
+        var program = fields
+        program["reference_stream"] = nil
+        XCTAssertThrowsError(try MCPFileRequest(tool: tool, fields: program))
+        program["program"] = true
+        let aligned = try MCPFileRequest(tool: tool, fields: program)
+        XCTAssertEqual(aligned.arguments, ["multicam", "sync", "suggest", "--json", "--project", "/tmp/Mix.cut",
+                                           "--reference-source-id", "camera-b", "--replacement", "/tmp/Replacement.wav",
+                                           "--replacement-stream", "0", "--program", "--seed", "3/2"])
+    }
+
+    func testMulticamProgramReplacementSchemaKeepsLegacyRequests() throws {
+        let schemas = try MCPSchemas.loaded.get()
+        let base: [String: Any] = ["project_handle": "test", "expected_revision": 0, "operation_id": "replace"]
+        let tool = "multicam_program_audio_set"
+        var arguments = base
+        arguments["mode"] = "follow"
+        XCTAssertNoThrow(try schemas.validate(tool: tool, arguments: arguments))
+        arguments["mode"] = "replace"
+        arguments["replacement"] = "/tmp/Replacement.wav"
+        XCTAssertNoThrow(try schemas.validate(tool: tool, arguments: arguments))
+        arguments["reference_source_id"] = "camera-b"
+        arguments["relative_offset"] = "-1/20"
+        XCTAssertThrowsError(try schemas.validate(tool: tool, arguments: arguments))
+        arguments["replacement_audio_stream_index"] = 0
+        XCTAssertNoThrow(try schemas.validate(tool: tool, arguments: arguments))
+
+        let sync = "multicam_track_audio_sync_suggest"
+        var suggestion = base
+        suggestion["original"] = ["source_id": "camera-b"]
+        suggestion["path"] = "/tmp/Replacement.wav"
+        suggestion["replacement_stream_index"] = 0
+        XCTAssertThrowsError(try schemas.validate(tool: sync, arguments: suggestion))
+        suggestion["program"] = true
+        XCTAssertNoThrow(try schemas.validate(tool: sync, arguments: suggestion))
+    }
+
+    func testSavedTranscriptCorrectionKeepsCallerRecordID() throws {
+        let request = try MCPFileRequest(tool: "transcript_file_words_correct", fields: [
+            "operation_id": UUID().uuidString,
+            "request": ["project_path": "/tmp/Assembly.cut", "in_place": true,
+                        "record_id": "review-pass-7", "change": ["kind": "correction"]]
+        ])
+        XCTAssertEqual(request.arguments, ["transcript", "words", "correct", "--stdin", "--json"])
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.input)) as? [String: Any])
+        XCTAssertEqual(body["record_id"] as? String, "review-pass-7")
+    }
+
+    func testFileExportRejectsDirectoryPathsAsNames() throws {
+        XCTAssertThrowsError(try MCPFileRequest(tool: "export_file_ranges_separate", fields: [
+            "operation_id": UUID().uuidString,
+            "file": "/tmp/Interview.mov", "output_directory": "/tmp",
+            "ranges": [["from": "0", "to": "1"]], "subfolder": "../other"
+        ])) { error in
+            XCTAssertEqual((error as? CutError)?.code, "invalid_output")
+        }
+    }
+
     func testRenderRequestsPreserveNativeStructuredInputsAndLiteralPaths() throws {
         let path = "/tmp/interview $1;cut.mp4"
         let fields: [String: Any] = [
-            "edit": ["output": "/tmp/final.mp4", "clips": [["file": path, "from": "1001/30000"], ["project": "/tmp/assembly.cut"]]],
+            "operation_id": UUID().uuidString,
+            "edit": ["output": "/tmp/final.mp4", "clips": [["file": path, "from": "1001/30000"], ["project_path": "/tmp/assembly.cut"]]],
             "dry_run": true, "no_sidecar": true, "mode": "smart"
         ]
-        let request = try MCPFileRequest(tool: "file_export", fields: fields)
-        XCTAssertEqual(request.arguments, ["export", "--json", "--dry-run", "--no-sidecar", "--mode", "smart", "--stdin"])
+        let request = try MCPFileRequest(tool: "export_file_clips_join", fields: fields)
+        XCTAssertEqual(request.arguments, ["export", "clips", "join", "--json", "--dry-run", "--no-sidecar", "--mode", "smart", "--stdin"])
         let edit = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.input)) as? [String: Any])
         XCTAssertEqual((edit["clips"] as? [[String: String]])?.first?["file"], path)
 
-        let csv = try MCPFileRequest(tool: "file_export", fields: [
-            "edit": ["output": "/tmp/final.mp4", "clips": [["file": path, "csv": "/tmp/list.csv"]]]
+        let csv = try MCPFileRequest(tool: "export_file_clips_join", fields: [
+            "operation_id": UUID().uuidString,
+            "edit": ["output": "/tmp/final.mp4", "clips": [
+                ["file": path, "ranges_file": "/tmp/list.csv"], ["project_path": "/tmp/assembly.cut"]
+            ]]
         ])
-        XCTAssertEqual(csv.arguments, ["export", "--json", "--output", "/tmp/final.mp4", "--clip", path, "--csv", "/tmp/list.csv"])
-        XCTAssertNil(csv.input)
-        XCTAssertThrowsError(try MCPFileRequest(tool: "file_inspect", fields: ["file": path, "project": path]))
-        XCTAssertThrowsError(try MCPFileRequest(tool: "file_export", fields: ["file": path, "argv": ["--help"]]))
+        XCTAssertEqual(csv.arguments, ["export", "clips", "join", "--json", "--stdin"])
+        let csvEdit = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(csv.input)) as? [String: Any])
+        XCTAssertEqual(csvEdit["clips"] as? [[String: String]], [
+            ["file": path, "ranges_file": "/tmp/list.csv"], ["project_path": "/tmp/assembly.cut"]
+        ])
+        XCTAssertThrowsError(try MCPFileRequest(tool: "media_file_inspect", fields: ["file": path, "project_path": path]))
+        XCTAssertThrowsError(try MCPFileRequest(tool: "export_file_clips_join", fields: ["file": path, "argv": ["--help"]]))
     }
 
     func testFileRequestAndSchemaKeepExactNumbersAndNativeInputChoices() throws {
@@ -31,21 +203,47 @@ final class MCPFileJobTests: XCTestCase {
         let id = UUID().uuidString
         let start = ["numerator": 9_007_199_254_740_993, "denominator": Int.max]
         let ranges: [[String: Any]] = [["from": start, "to": "1"]]
-        let args: [String: Any] = ["operationID": id, "file": path, "output": output, "ranges": ranges,
-                                    "tracks": "audio", "audio_stream": Int.max]
-        _ = try schema.validate(tool: "file_rearrange", arguments: args)
-        let request = try MCPFileRequest(tool: "file_rearrange", fields: args)
+        let args: [String: Any] = ["operation_id": id, "file": path, "output": output, "ranges": ranges,
+                                    "tracks": "audio", "audio_stream_index": Int.max]
+        _ = try schema.validate(tool: "export_file_ranges_join", arguments: args)
+        let request = try MCPFileRequest(tool: "export_file_ranges_join", fields: args)
         XCTAssertEqual(request.arguments.suffix(3), ["--", path, "9007199254740993/9223372036854775807-1"])
         XCTAssertTrue(request.arguments.contains("9223372036854775807"))
-        XCTAssertThrowsError(try schema.validate(tool: "file_rearrange", arguments: args.merging(["ranges_file": "/tmp/list.csv"]) { _, new in new }))
-        XCTAssertThrowsError(try schema.validate(tool: "file_rearrange", arguments: args.merging(["audio_stream": true]) { _, new in new }))
-        XCTAssertThrowsError(try MCPFileRequest(tool: "file_frames", fields: ["file": path, "output": "/tmp/stills", "at": ["/tmp/list.csv"]]))
+        XCTAssertThrowsError(try schema.validate(tool: "export_file_ranges_join", arguments: args.merging(["ranges_file": "/tmp/list.csv"]) { _, new in new }))
+        XCTAssertThrowsError(try schema.validate(tool: "export_file_ranges_join", arguments: args.merging(["audio_stream_index": true]) { _, new in new }))
+        XCTAssertThrowsError(try MCPFileRequest(tool: "review_file_frames_export", fields: ["file": path, "output": "/tmp/stills", "at": ["/tmp/list.csv"]]))
 
-        let resolve = try MCPFileRequest(tool: "file_resolve", fields: [
-            "project": "/tmp/Edit.cut", "output": "/tmp/Timeline.fcpxml", "no_sidecar": true
+        let resolve = try MCPFileRequest(tool: "project_file_resolve_export", fields: [
+            "operation_id": UUID().uuidString,
+            "project_path": "/tmp/Edit.cut", "output": "/tmp/Timeline.fcpxml", "no_sidecar": true
         ])
-        XCTAssertEqual(resolve.arguments, ["resolve", "--json", "--no-sidecar", "--output", "/tmp/Timeline.fcpxml", "--project", "/tmp/Edit.cut"])
-        XCTAssertThrowsError(try schema.validate(tool: "file_resolve", arguments: ["operationID": id, "project": "/tmp/Edit.cut"]))
+        XCTAssertEqual(resolve.arguments, ["project", "resolve", "export", "--json", "--no-sidecar", "--output", "/tmp/Timeline.fcpxml", "--project", "/tmp/Edit.cut"])
+        XCTAssertThrowsError(try schema.validate(tool: "project_file_resolve_export", arguments: ["operation_id": id, "project_path": "/tmp/Edit.cut"]))
+    }
+
+    func testFileExportSpacingForwardsProjectsAndOrderedClips() throws {
+        let schema = try MCPSchemas.loaded.get()
+        let base: [String: Any] = ["operation_id": UUID().uuidString, "output": "/tmp/Spaced.mp4"]
+        func request(_ fields: [String: Any]) throws -> MCPFileRequest {
+            let args = base.merging(fields) { _, new in new }
+            let tool = fields["clips_file"] == nil ? "export_file_project_render" : "export_file_clips_join"
+            return try MCPFileRequest(tool: tool, fields: schema.validate(tool: tool, arguments: args))
+        }
+        let saved = try request(["project_path": "/tmp/Selects.cut", "space_clips": "source"])
+        XCTAssertEqual(saved.arguments, ["export", "project", "render", "--json", "--output", "/tmp/Spaced.mp4",
+                                         "--space-clips", "source", "--project", "/tmp/Selects.cut"])
+        XCTAssertNil(saved.input)
+        let inline = try request(["project_data": ["kind": "sequence"], "space_clips": "1001/15000"])
+        XCTAssertEqual(inline.arguments, ["export", "project", "render", "--json", "--output", "/tmp/Spaced.mp4", "--space-clips", "1001/15000", "--project", "-"])
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: XCTUnwrap(inline.input)) as? [String: String], ["kind": "sequence"])
+        let rawFields: [String: Any] = ["operation_id": UUID().uuidString, "space_clips": "source",
+            "edit": ["output": "/tmp/Spaced.mp4", "clips": [["file": "/tmp/Source.mp4", "from": "0", "to": "1"]]]]
+        let raw = try MCPFileRequest(tool: "export_file_clips_join", fields: schema.validate(tool: "export_file_clips_join", arguments: rawFields))
+        XCTAssertEqual(raw.arguments, ["export", "clips", "join", "--json", "--space-clips", "source", "--stdin"])
+        let list = try request(["clips_file": "/tmp/Clips.csv", "space_clips": "source"])
+        XCTAssertEqual(list.arguments, ["export", "clips", "join", "--json", "--output", "/tmp/Spaced.mp4",
+                                        "--space-clips", "source", "--clips", "/tmp/Clips.csv"])
+        XCTAssertThrowsError(try request(["project_path": "/tmp/Selects.cut", "space_clips": "-1"]))
     }
 
     func testSceneAndRefreshRequestsForwardNativeScopeAndPolicy() throws {
@@ -56,20 +254,32 @@ final class MCPFileJobTests: XCTestCase {
         let clip = UUID().uuidString
         func request(_ tool: String, _ args: [String: Any]) throws -> [String] {
             var input = args
-            input["operationID"] = id.uuidString.lowercased()
+            input["operation_id"] = id.uuidString.lowercased()
             return try MCPFileRequest(tool: tool, fields: schemas.validate(tool: tool, arguments: input)).arguments
         }
-        XCTAssertEqual(try request("file_scenes", ["file": file, "from": "1/3", "to": "2/3", "policy": "restart"]),
-                       ["scenes", "--json", "--from", "1/3", "--to", "2/3", "--policy", "restart", "--operation-id",
+        XCTAssertEqual(try request("scenes_file_scan", ["file": file, "source_from": "1/3", "source_to": "2/3", "policy": "restart"]),
+                       ["scenes", "scan", "--json", "--from", "1/3", "--to", "2/3", "--policy", "restart", "--operation-id",
                         id.uuidString, "--progress", "jsonl", "--", file])
-        XCTAssertEqual(try request("file_scenes", ["project": project, "clip_id": clip, "policy": "resume"]),
-                       ["scenes", "--json", "--clip-id", clip, "--policy", "resume", "--progress", "jsonl", "--project", project])
-        XCTAssertEqual(try request("file_refresh", ["project": project, "deep": true, "no_sidecar": true]),
-                       ["refresh", "--json", "--no-sidecar", "--deep", "--progress", "jsonl", "--project", project])
-        XCTAssertThrowsError(try request("file_scenes", ["file": file, "from": "1"]))
-        XCTAssertThrowsError(try request("file_scenes", ["project": project, "clip_id": clip, "all_sources": true]))
-        XCTAssertThrowsError(try request("file_scenes", ["file": file, "project": project]))
-        XCTAssertThrowsError(try request("file_refresh", ["file": file]))
+        XCTAssertEqual(try request("scenes_file_scan", ["project_path": project, "clip_id": clip, "policy": "resume"]),
+                       ["scenes", "scan", "--json", "--clip-id", clip, "--policy", "resume", "--progress", "jsonl", "--project", project])
+        XCTAssertEqual(try request("project_file_media_refresh", ["project_path": project, "deep": true, "no_sidecar": true]),
+                       ["project", "media", "refresh", "--json", "--no-sidecar", "--deep", "--progress", "jsonl", "--project", project])
+        XCTAssertThrowsError(try request("scenes_file_scan", ["file": file, "source_from": "1"]))
+        XCTAssertThrowsError(try request("scenes_file_scan", ["project_path": project, "clip_id": clip, "all_sources": true]))
+        XCTAssertThrowsError(try request("scenes_file_scan", ["file": file, "project_path": project]))
+        XCTAssertThrowsError(try request("project_file_media_refresh", ["file": file]))
+    }
+
+    func testSavedSyncForwardsExplicitReferenceRecording() throws {
+        let schema = try MCPSchemas.loaded.get()
+        let tool = "multicam_file_sync_suggest"
+        let fields: [String: Any] = ["operation_id": UUID().uuidString, "project_path": "/tmp/Assembly.cut",
+                                     "source_id": "target", "reference_source_id": "restart", "metadata_only": true]
+        let command = try MCPFileRequest(tool: tool, fields: schema.validate(tool: tool, arguments: fields))
+        XCTAssertEqual(command.arguments, [
+            "multicam", "sync", "suggest", "--json", "--project", "/tmp/Assembly.cut",
+            "--source-id", "target", "--reference-source-id", "restart", "--metadata-only"
+        ])
     }
 
     @MainActor
@@ -78,11 +288,11 @@ final class MCPFileJobTests: XCTestCase {
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: cli.path))
         let jobs = MCPFileJobs(executable: cli)
         let id = UUID()
-        let args = ["operationID": id.uuidString]
-        _ = try jobs.start(tool: "file_version", arguments: args)
-        let replay = try jobs.start(tool: "file_version", arguments: ["operationID": id.uuidString.lowercased()])
+        let args = ["operation_id": id.uuidString]
+        _ = try jobs.start(tool: "cli_version_read", arguments: args)
+        let replay = try jobs.start(tool: "cli_version_read", arguments: ["operation_id": id.uuidString.lowercased()])
         XCTAssertEqual(replay["job_id"] as? String, id.uuidString)
-        XCTAssertThrowsError(try jobs.start(tool: "file_help", arguments: args))
+        XCTAssertThrowsError(try jobs.start(tool: "cli_help_read", arguments: args))
         let completed = try await wait(jobs, id: id)
         XCTAssertEqual(completed["state"] as? String, "succeeded")
         let report = try XCTUnwrap(completed["result"] as? [String: String])
@@ -101,8 +311,8 @@ final class MCPFileJobTests: XCTestCase {
         let jobs = MCPFileJobs(executable: productsDirectory.appendingPathComponent("mpcut"))
         defer { jobs.disable() }
         let id = UUID()
-        _ = try jobs.start(tool: "file_inspect", arguments: [
-            "operationID": id.uuidString, "file": "/tmp/missing-" + UUID().uuidString, "no_sidecar": true
+        _ = try jobs.start(tool: "media_file_inspect", arguments: [
+            "operation_id": id.uuidString, "file": "/tmp/missing-" + UUID().uuidString, "no_sidecar": true
         ])
         let status = try await wait(jobs, id: id)
         XCTAssertEqual(status["state"] as? String, "failed")
@@ -117,8 +327,8 @@ final class MCPFileJobTests: XCTestCase {
         defer { jobs.disable() }
         let file = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
         let id = UUID()
-        _ = try jobs.start(tool: "file_scenes", arguments: [
-            "file": file.path, "operationID": id.uuidString, "no_sidecar": true, "from": "0", "to": "1"
+        _ = try jobs.start(tool: "scenes_file_scan", arguments: [
+            "file": file.path, "operation_id": id.uuidString, "no_sidecar": true, "source_from": "0", "source_to": "1"
         ])
         let completed = try await wait(jobs, id: id)
         XCTAssertEqual(completed["state"] as? String, "succeeded", String(describing: completed))
@@ -149,8 +359,8 @@ final class MCPFileJobTests: XCTestCase {
         let jobs = MCPFileJobs(executable: mock)
         let id = UUID()
         var cleaned = false
-        _ = try jobs.start(tool: "file_version",
-                           arguments: ["operationID": id.uuidString, "working_directory": folder.path]) {
+        _ = try jobs.start(tool: "cli_version_read",
+                           arguments: ["operation_id": id.uuidString, "working_directory": folder.path]) {
             cleaned = true
         }
         defer { jobs.disable() }
@@ -181,9 +391,9 @@ final class MCPFileJobTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: mock.path)
         let jobs = MCPFileJobs(executable: mock)
         let id = UUID()
-        let args = ["operationID": id.uuidString, "working_directory": folder.path]
+        let args = ["operation_id": id.uuidString, "working_directory": folder.path]
         var removed = 0
-        _ = try jobs.start(tool: "file_version", arguments: args) { removed += 1 }
+        _ = try jobs.start(tool: "cli_version_read", arguments: args) { removed += 1 }
         let marker = folder.appendingPathComponent("worker")
         let deadline = ContinuousClock.now + .seconds(5)
         while !FileManager.default.fileExists(atPath: marker.path), ContinuousClock.now < deadline {
@@ -192,12 +402,36 @@ final class MCPFileJobTests: XCTestCase {
         let pid = try XCTUnwrap(Int32(String(contentsOf: marker, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
         jobs.disable()
         XCTAssertTrue(jobs.hasRunningJobs)
-        XCTAssertThrowsError(try jobs.start(tool: "file_version", arguments: args) { removed += 1 })
+        XCTAssertThrowsError(try jobs.start(tool: "cli_version_read", arguments: args) { removed += 1 })
         XCTAssertEqual(removed, 1)
         await jobs.cancelAndWaitForJobs()
         XCTAssertEqual(kill(pid, 0), -1)
         XCTAssertEqual(removed, 2)
         XCTAssertFalse(jobs.hasRunningJobs)
+    }
+
+    @MainActor
+    func testFileEditKeepsUserHistoryAndRecordsAgent() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov", subdirectory: "Fixtures"))
+        let project = directory.appendingPathComponent("Original.cut")
+        let destination = directory.appendingPathComponent("Edited.cut")
+        let clip = CutSequenceClip(id: "first", file: source.path, from: .zero, to: .init(numerator: 1))
+        try CutProject.sequence([clip]).save(to: project, undo: [.init(action: "Add Clip", project: .sequence([]))], redo: [])
+        let jobs = MCPFileJobs(executable: productsDirectory.appendingPathComponent("mpcut"))
+        defer { jobs.disable() }
+        let id = UUID()
+        _ = try jobs.start(tool: "project_file_edit", arguments: [
+            "operation_id": id.uuidString,
+            "request": ["project_path": project.path, "out_project": destination.path,
+                        "operations": [["action": "remove", "id": "first"]]]
+        ])
+        let result = try await wait(jobs, id: id)
+        XCTAssertEqual(result["state"] as? String, "succeeded", result.description)
+        let history = try CutProject.loadHistory(from: destination, limit: 10)
+        XCTAssertEqual(history.undo.map(\.origin), [.user, .agent])
     }
 
     @MainActor
@@ -211,7 +445,7 @@ final class MCPFileJobTests: XCTestCase {
 
         func run(_ tool: String, _ fields: [String: Any], expected: String = "succeeded") async throws -> [String: Any] {
             let id = UUID()
-            _ = try jobs.start(tool: tool, arguments: fields.merging(["operationID": id.uuidString]) { _, new in new })
+            _ = try jobs.start(tool: tool, arguments: fields.merging(["operation_id": id.uuidString]) { _, new in new })
             let completed = try await wait(jobs, id: id)
             XCTAssertEqual(completed["state"] as? String, expected, String(describing: completed))
             return try XCTUnwrap(completed["result"] as? [String: Any])
@@ -220,40 +454,45 @@ final class MCPFileJobTests: XCTestCase {
         let to = ["numerator": 1001, "denominator": 3000]
         let ranges: [[String: Any]] = [["from": "0", "to": to]]
         let movie = folder.appendingPathComponent("Select.mov")
-        let bulk = try await run("file_bulk", ["file": source.path, "output_directory": folder.path,
-                                              "ranges": ranges, "dry_run": true, "no_sidecar": true])
-        XCTAssertEqual((bulk["outputs"] as? [Any])?.count, 1)
-        let rearrange = try await run("file_rearrange", ["file": source.path, "output": movie.path, "ranges": ranges,
+        let bulk = try await run("export_file_ranges_separate", ["file": source.path, "output_directory": folder.path,
+                                              "ranges": ranges, "base_name": "Select", "subfolder": "Review",
+                                              "dry_run": true, "no_sidecar": true])
+        let outputs = try XCTUnwrap(bulk["outputs"] as? [[String: Any]])
+        XCTAssertEqual(outputs.count, 1)
+        let output = try XCTUnwrap(outputs.first?["output"] as? String)
+        XCTAssertEqual(URL(fileURLWithPath: output).deletingLastPathComponent().lastPathComponent, "Review")
+        XCTAssertTrue(URL(fileURLWithPath: output).lastPathComponent.hasPrefix("Select-"))
+        let rearrange = try await run("export_file_ranges_join", ["file": source.path, "output": movie.path, "ranges": ranges,
                                                         "dry_run": true, "no_sidecar": true])
         XCTAssertEqual(rearrange["output"] as? String, movie.path)
         XCTAssertFalse(FileManager.default.fileExists(atPath: movie.path))
         let original = Data("Existing output".utf8)
         try original.write(to: movie)
-        _ = try await run("file_rearrange", ["file": source.path, "output": movie.path, "ranges": ranges,
+        _ = try await run("export_file_ranges_join", ["file": source.path, "output": movie.path, "ranges": ranges,
                                              "no_sidecar": true], expected: "failed")
         XCTAssertEqual(try Data(contentsOf: movie), original)
 
         let camera = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4", subdirectory: "Fixtures"))
         let unsupported = folder.appendingPathComponent("Remux.webm")
-        let refused = try await run("file_export", ["mode": "copy", "dry_run": true, "no_sidecar": true,
+        let refused = try await run("export_file_clips_join", ["mode": "copy", "dry_run": true, "no_sidecar": true,
                                                     "edit": ["output": unsupported.path, "clips": [["file": camera.path]]]],
                                     expected: "failed")
         let issue = try XCTUnwrap(refused["error"] as? [String: Any])
         XCTAssertEqual(issue["code"] as? String, "unsupported_container")
         let alternatives = try XCTUnwrap(issue["alternatives"] as? [[String: Any]])
-        let offer = try XCTUnwrap(alternatives.first { $0["id"] as? String == "copyOtherContainer:mov" })
+        let offer = try XCTUnwrap(alternatives.first { $0["id"] as? String == "copy_other_container:mov" })
         XCTAssertEqual(offer["lossless"] as? Bool, true)
         XCTAssertFalse(FileManager.default.fileExists(atPath: unsupported.path))
 
         let remux = folder.appendingPathComponent("Remux.mov")
-        let copied = try await run("file_export", ["mode": XCTUnwrap(offer["mode"] as? String), "no_sidecar": true,
+        let copied = try await run("export_file_clips_join", ["mode": XCTUnwrap(offer["mode"] as? String), "no_sidecar": true,
                                                    "edit": ["output": remux.path, "clips": [["file": camera.path]]]])
         XCTAssertEqual(copied["mode"] as? String, "copy")
-        XCTAssertEqual((copied["encodedDuration"] as? [String: Int])?["numerator"], 0)
+        XCTAssertEqual((copied["encoded_duration"] as? [String: Int])?["numerator"], 0)
         XCTAssertTrue(FileManager.default.fileExists(atPath: remux.path))
 
         let xml = folder.appendingPathComponent("Resolve.fcpxml")
-        let resolve = try await run("file_resolve", ["edit": ["output": xml.path,
+        let resolve = try await run("project_file_resolve_export", ["edit": ["output": xml.path,
                                                               "clips": [["file": source.path, "from": "0", "to": to]]],
                                                      "no_sidecar": true])
         XCTAssertEqual(resolve["output"] as? String, xml.path)
@@ -266,7 +505,7 @@ final class MCPFileJobTests: XCTestCase {
         let jobs = MCPFileJobs(executable: productsDirectory.appendingPathComponent("mpcut"))
         defer { jobs.disable() }
         let id = UUID()
-        _ = try jobs.start(tool: "file_waveform", arguments: ["operationID": id.uuidString, "file": source.path,
+        _ = try jobs.start(tool: "waveform_file_envelope_read", arguments: ["operation_id": id.uuidString, "file": source.path,
                                                              "columns": 65_536, "no_sidecar": true])
         let status = try await wait(jobs, id: id)
         XCTAssertEqual(status["state"] as? String, "succeeded")

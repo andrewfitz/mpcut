@@ -83,9 +83,15 @@ public enum MulticamBoundary {
                        evaluate: (RationalTime) throws -> Decision) throws -> [RationalTime] {
         guard !grids.isEmpty, grids.allSatisfy({ !$0.times.isEmpty }) else { return [] }
         func nearest(later: Bool) throws -> RationalTime? {
+            if later ? requested >= bounds.upperBound : requested <= bounds.lowerBound { return nil }
+            let limit = later ? bounds.lowerBound : bounds.upperBound
+            let includeLimit = later ? requested < limit : requested > limit
             var indices = try grids.map { grid in
-                let local = try requested.subtracting(grid.offset)
-                return later ? grid.times.lowerBound { $0 > local } : grid.times.lowerBound { $0 >= local } - 1
+                let local = try (includeLimit ? limit : requested).subtracting(grid.offset)
+                if later {
+                    return grid.times.lowerBound { includeLimit ? $0 >= local : $0 > local }
+                }
+                return grid.times.lowerBound { includeLimit ? $0 > local : $0 >= local } - 1
             }
             while true {
                 if cancelled() { throw CutError(code: "cancelled", message: "Multicam boundary search cancelled.") }

@@ -3,7 +3,7 @@ import Foundation
 extension AudioAnalysis {
     /// Align the removable interval inward to the audio timeline’s cut points.
     /// This keeps the requested room on either side without materializing sample timestamps.
-    public static func audioRemoval(in pause: AudioSpan, leave: Double, media: MediaInfo,
+    public static func audioRemoval(in pause: AudioSpan, padding: Double, media: MediaInfo,
                                     stream: Int? = nil, clip: AudioSpan, container: String? = nil) -> AudioSpan? {
         let linkedTracks = media.audio.filter { stream == nil || $0.stream.index == stream }
         let sampleRate = commonAudioSampleRate(linkedTracks.map { $0.stream.sampleRate })
@@ -24,10 +24,10 @@ extension AudioAnalysis {
             }
             return media.audioEditBoundary(near: time, rounding: rounding, stream: stream)
         }
-        let from = leave == 0 && pause.from == clip.from ? clip.from :
-            boundary(pause.from.seconds + leave / 2, rounding: .up)
-        let to = leave == 0 && pause.to == clip.to ? clip.to :
-            boundary(pause.to.seconds - leave / 2, rounding: .down)
+        let from = padding == 0 && pause.from == clip.from ? clip.from :
+            boundary(pause.from.seconds + padding, rounding: .up)
+        let to = padding == 0 && pause.to == clip.to ? clip.to :
+            boundary(pause.to.seconds - padding, rounding: .down)
         guard from < to, from >= pause.from, to <= pause.to else { return nil }
         return AudioSpan(from: from, to: to)
     }

@@ -1,0 +1,19 @@
+{
+  "format": "mpcut",
+  "schema_version": 3,
+  "kind": "sequence",
+  "clips": [],
+  "source_selects": [
+    {"id": "reaction", "name": "Reaction shot", "range": {"file": "reaction.mov", "from": "5/2", "to": "4"}}
+  ],
+  "history": {
+    "undo": [{
+      "action": "Remove Source Select",
+      "source_selects": [
+        [0, 1],
+        {"id": "unused", "name": "Wide cutaway", "range": {"file": "cutaway.mov", "from": "0", "to": "1"}}
+      ]
+    }],
+    "redo": [{"action": "Remove Source Select", "source_selects": []}]
+  }
+}

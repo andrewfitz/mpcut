@@ -21,6 +21,13 @@ final class ProjectMediaRefreshTests: XCTestCase {
         try await wait { !model.isBusy }
         XCTAssertEqual(model.timelineClips.count, 2)
         XCTAssertEqual(model.timelineClips.first?.id, moved)
+        let sourceIDs = model.timelineClips.map(\.id)
+        let asset = StillAsset(id: "title", file: directory.appendingPathComponent("title.png").path,
+                               displayName: "Title", fingerprint: String(repeating: "a", count: 64))
+        let cadence = RationalTime(numerator: 1, denominator: 30)
+        let card = StillInsert(id: "card", assetID: asset.id, duration: cadence, cadence: cadence)
+        let project = try model.stillProject.addingStillAsset(asset).insertingStill(card, at: .zero)
+        try model.applyStillProject(project, action: "Insert Still")
         let ids = model.timelineClips.map(\.id)
         let trims = model.sequenceClips
         let history = model.historyEntryIDs
@@ -31,7 +38,8 @@ final class ProjectMediaRefreshTests: XCTestCase {
         XCTAssertEqual(model.timelineClips.map(\.id), ids)
         XCTAssertEqual(model.sequenceClips, trims)
         XCTAssertEqual(model.historyEntryIDs, history)
-        XCTAssertEqual(Set(model.mediaClipReview.keys), Set(ids))
+        XCTAssertTrue(model.timelineClips.first?.isStill == true)
+        XCTAssertEqual(Set(model.mediaClipReview.keys), Set(sourceIDs))
         XCTAssertThrowsError(try model.mcpExportInput(selection: false)) { error in
             XCTAssertEqual((error as? MCPCommandError)?.code, "source_needs_review")
         }

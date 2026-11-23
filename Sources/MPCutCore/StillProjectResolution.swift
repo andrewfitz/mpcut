@@ -103,7 +103,7 @@ extension CutProject {
         return try resolveStillsUnchecked()
     }
 
-    func validateStillTimelineDuration() throws {
+    func stillTimelineDuration() throws -> RationalTime {
         var duration = RationalTime.zero
         func add(_ range: MulticamRange) throws {
             duration = try duration.adding(range.to.subtracting(range.from))
@@ -111,7 +111,7 @@ extension CutProject {
         if case .multicam(let project) = self {
             for item in project.assemblyItems ?? [.group(project.range)] {
                 switch item {
-                case .group(let range): try add(range)
+                case .group(let range, _): try add(range)
                 case .still(let insert): duration = try duration.adding(insert.duration)
                 }
             }
@@ -123,6 +123,7 @@ extension CutProject {
                 }
             }
         }
+        return duration
     }
 
     /// Verify authored handles when the media is online. Each value is the available source-time domain.
@@ -185,7 +186,7 @@ extension CutProject {
         case .multicam(let project):
             for (index, item) in (project.assemblyItems ?? [.group(project.range)]).enumerated() {
                 switch item {
-                case .group(let range):
+                case .group(let range, _):
                     try appendSource(range, key: "") { .group(assemblyIndex: index, range: $0) }
                 case .still(let insert):
                     try append(duration: insert.duration, origin: .insert, placementID: insert.id)

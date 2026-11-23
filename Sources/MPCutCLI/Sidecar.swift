@@ -11,6 +11,9 @@ struct SidecarInventory: Encodable {
         let thresholdMode: SilenceThresholdMode
         let thresholdDB: Double?
         let minimumPause: Double
+        private enum CodingKeys: String, CodingKey {
+            case stream = "audio_stream_index", thresholdMode, thresholdDB, minimumPause = "min_pause_seconds"
+        }
     }
 
     let hasIndex: Bool
@@ -30,7 +33,7 @@ struct SidecarInventory: Encodable {
         waveformStreams = sections.compactMap(AnalysisSidecar.savedWaveformStream(forKey:)).sorted()
         let envelopes = sections.compactMap(AnalysisSidecar.savedEnvelopeStream(forKey:)).sorted()
         envelopeStreams = envelopes.isEmpty ? nil : envelopes
-        thumbnailCount = sections.lazy.filter { $0.hasPrefix("filmstrip.v1.") }.count
+        thumbnailCount = sections.lazy.filter { $0.hasPrefix("timeline_filmstrip.v1.") }.count
         silence = sections.compactMap { key -> Silence? in
             guard let settings = AnalysisSidecar.savedSilenceSettings(forKey: key) else { return nil }
             return Silence(stream: settings.stream, thresholdMode: settings.thresholdDB == nil ? .auto : .manual,
@@ -84,7 +87,7 @@ struct SidecarOptions {
     let threshold: Double?
     let audioStream: Int?
 
-    init(_ arguments: [String]) throws {
+    init(_ arguments: [String], statusOnly: Bool) throws {
         var flags = Set<String>()
         var selected = Set(SidecarContent.allCases)
         var minimum = 1.5
@@ -109,20 +112,20 @@ struct SidecarOptions {
             }
             switch word {
             case "--": positional = true
-            case "--status", "--json": break
+            case "--json": break
             case "--only", "--only-file":
                 guard !flags.isSuperset(of: ["--only", "--only-file"]) else { throw invalid("Choose one section list.") }
                 let raw = try value()
-                let list = word == "--only-file" || ListFile.isListPath(raw) ? try ListFile.scalars(raw, header: "section") : raw.components(separatedBy: ",")
+                let list = word == "--only-file" ? try ListFile.scalars(raw, header: "section") : raw.components(separatedBy: ",")
                 selected.removeAll()
                 for token in list {
                     guard let section = SidecarContent(rawValue: String(token)), selected.insert(section).inserted else {
                         throw invalid("--only accepts a comma-separated selection of index, scenes, and audio.")
                     }
                 }
-            case "--min-pause":
+            case "--min-pause-seconds":
                 guard let number = Double(try value()), number.isFinite, number > 0 else {
-                    throw invalid("--min-pause requires a positive number of seconds.")
+                    throw invalid("--min-pause-seconds requires a positive number of seconds.")
                 }
                 minimum = number
             case "--stream":
@@ -140,14 +143,14 @@ struct SidecarOptions {
             }
         }
         guard let source else { throw invalid("Sidecar requires a source media file.") }
-        if flags.contains("--status"), !flags.isDisjoint(with: ["--only", "--only-file", "--min-pause", "--threshold-db", "--stream"]) {
+        if statusOnly, !flags.isDisjoint(with: ["--only", "--only-file", "--min-pause-seconds", "--threshold-db", "--stream"]) {
             throw invalid("Analysis settings apply when saving a sidecar.")
         }
-        if !selected.contains(.audio), !flags.isDisjoint(with: ["--min-pause", "--threshold-db", "--stream"]) {
+        if !selected.contains(.audio), !flags.isDisjoint(with: ["--min-pause-seconds", "--threshold-db", "--stream"]) {
             throw invalid("Silence settings require the audio section.")
         }
         self.file = source
-        self.statusOnly = flags.contains("--status")
+        self.statusOnly = statusOnly
         self.contents = selected
         self.explicitSections = (flags.contains("--only") || flags.contains("--only-file"))
         self.minimum = minimum

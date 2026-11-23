@@ -3,6 +3,38 @@ import XCTest
 @testable import MPCutCore
 
 final class AudioSidecarTests: XCTestCase {
+    func testOpusPrerollWithoutAudibleSamplesHasNoTrimWindow() throws {
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures/Standalone-Chirp.opus")
+        let media = try CutEngine(useSidecar: false).inspect(fixture, keyframes: true)
+        let audio = try XCTUnwrap(media.audio.first)
+        let first = try XCTUnwrap(audio.packets.first)
+        XCTAssertGreaterThan(first.skipSamples, 1)
+        let packet = AudioPacket(time: first.time, dts: first.time, duration: first.duration,
+                                 skipSamples: first.skipSamples, discardSamples: 0, decodedSamples: 1)
+        let truncated = AudioIndex(stream: audio.stream, packets: [packet], start: audio.start, end: audio.end,
+                                   hasPriming: true, pcmContinuity: false, presentationEdits: [])
+        XCTAssertNil(try opusTrimWindow(truncated, origin: media.origin))
+    }
+
+    func testConversionProgressCanCancelBeforePublishing() throws {
+        try XCTSkipUnless((try? ReencodeEngine.findHelper(override: nil)) != nil, "Requires an FFmpeg helper")
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures/Gapless-Crop.mp3")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appendingPathComponent("cancelled.wav")
+        let engine = AudioExportEngine(useSidecar: false)
+        let plan = try engine.resolve([ClipRequest(file: fixture)], output: output, audio: .pcm)
+        for limit in [0.0, 1.0] {
+            XCTAssertThrowsError(try engine.write(plan, to: output) { $0 < limit }) {
+                XCTAssertEqual(($0 as? CutError)?.code, "cancelled")
+            }
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+        }
+    }
+
     func testWaveformScanHonorsSwiftTaskCancellationByDefault() async throws {
         let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("MPCutAppTests/Fixtures/Standalone-Chirp.opus")
@@ -82,10 +114,10 @@ final class AudioSidecarTests: XCTestCase {
             let newMinimum = try AudioAnalysis.silence(cached, stream: stream, minimum: 0.3)
             XCTAssertEqual(newMinimum.automaticThresholdDB, prior.automaticThresholdDB)
         }
-        let calibrationKey = "calibration.v1.\(stream)"
+        let calibrationKey = "silence_automatic_threshold_db.v1.\(stream)"
         let bytes = try XCTUnwrap(store.read(calibrationKey))
         var legacy = try XCTUnwrap(PropertyListSerialization.propertyList(from: bytes, format: nil) as? [String: Any])
-        legacy.removeValue(forKey: "hasSourceCalibration")
+        legacy.removeValue(forKey: "clock")
         legacy["value"] = -120.0
         try store.save([calibrationKey: PropertyListSerialization.data(fromPropertyList: legacy, format: .binary, options: 0)])
         XCTAssertNil(store.automaticThresholdDB(for: cached, stream: stream))

@@ -3,32 +3,24 @@ import Foundation
 import XCTest
 
 final class SidecarManifestTests: XCTestCase {
-    func testReadOnlyLegacyInspectionAndFirstWriteMigration() throws {
+    func testUnsupportedVersionsPreserveAuthoredDataAndRejectWrites() throws {
         try withStore { store in
-            let empty = Data()
-            try store.save(["scenes.v2": empty])
-            do {
-                let db = try SidecarDatabase(store.url, writing: true)
-                try db.execute("""
-                    DROP TABLE scene_reports;
-                    DROP TABLE scene_markers;
-                    DROP TABLE scene_attempts;
-                    DROP TABLE archived_sections;
-                    DROP TABLE source_generations;
-                    PRAGMA user_version = 1;
-                    """)
+            try store.save([AnalysisSidecar.viewNameSectionKey: Data(#"{"1":"Wide shot"}"#.utf8)])
+            for version in [1, 2, 100] {
+                do {
+                    let db = try SidecarDatabase(store.url, writing: true)
+                    try db.execute("PRAGMA user_version = \(version)")
+                }
+                let before = try Data(contentsOf: store.url)
+                XCTAssertEqual(store.status(), "unsupported")
+                XCTAssertTrue(store.persistedGenerations().isEmpty)
+                XCTAssertNil(store.read(AnalysisSidecar.viewNameSectionKey))
+                store.saveAutomatically(["waveform_peaks.v1.0": Data([1])])
+                XCTAssertThrowsError(try store.save(["waveform_peaks.v1.0": Data([1])])) {
+                    XCTAssertEqual(($0 as? CutError)?.code, "unsupported_sidecar")
+                }
+                XCTAssertEqual(try Data(contentsOf: store.url), before)
             }
-            XCTAssertEqual(store.read("scenes.v2"), empty)
-            XCTAssertEqual(store.persistedGenerations().first?.reason, "legacy")
-            try store.save(["wave.v1.1": Data([1])])
-            XCTAssertEqual(store.read("scenes.v2"), empty)
-            XCTAssertEqual(store.persistedGenerations().first?.reason, "initial")
-            let db = try SidecarDatabase(store.url, writing: false)
-            XCTAssertEqual(try db.integer("PRAGMA user_version"), 2)
-            try db.execute("PRAGMA user_version = 100")
-            XCTAssertEqual(store.status(), "unsupported")
-            XCTAssertThrowsError(try store.save(["wave.v1.1": Data([2])]))
-            XCTAssertEqual(try db.integer("PRAGMA user_version"), 100)
         }
     }
 
@@ -62,21 +54,45 @@ final class SidecarManifestTests: XCTestCase {
             XCTAssertThrowsError(try store.commitSceneAttempt(first, checkpoint: Data(), markerBatch: Data([30]),
                                                                coveredThrough: 3, complete: true))
             try reopened.commitSceneAttempt(next, checkpoint: Data([2]), markerBatch: Data([20]), coveredThrough: 2,
-                                            complete: true, sections: ["scenes.v2": Data([2])])
+                                            complete: true, sections: ["scenes_boundaries.v1": Data([2])])
             XCTAssertEqual(reopened.sceneAttempt(scope: "full", completed: true)?.markerBatches, [Data([10]), Data([20])])
-            XCTAssertEqual(reopened.read("scenes.v2"), Data([2]))
+            XCTAssertEqual(reopened.read("scenes_boundaries.v1"), Data([2]))
+        }
+    }
+
+    func testCanonicalSceneRepairReplacesInvalidSectionAndRejectsStaleCheckpoint() throws {
+        try withStore { store in
+            let key = AnalysisSidecar.sceneSectionKey
+            let invalid = Data("{}".utf8)
+            let checkpoint = Data([1])
+            let claim = try XCTUnwrap(store.claimSceneAttempt(scope: "full", operationID: nil,
+                                                               restart: false, owner: "owner"))
+            try store.commitSceneAttempt(claim, checkpoint: checkpoint, markerBatch: nil,
+                                         coveredThrough: 2, complete: true, sections: [key: invalid])
+            let replacement = Data("""
+                {"origin":{"numerator":0,"denominator":1},"duration":{"numerator":2,"denominator":1},
+                 "time_base":{"numerator":1,"denominator":1},"markers":[{"pts":0,"view":1}]}
+                """.utf8)
+            XCTAssertNil(store.sceneReport())
+            XCTAssertThrowsError(try store.repairCanonicalSceneReport(scope: "full", expectedCheckpoint: Data([2]),
+                                                                      sections: [key: replacement]))
+            XCTAssertEqual(store.read(key), invalid)
+            try store.repairCanonicalSceneReport(scope: "full", expectedCheckpoint: checkpoint, sections: [key: replacement])
+            XCTAssertEqual(store.sceneReport()?.scenes.count, 1)
+            XCTAssertThrowsError(try store.repairCanonicalSceneReport(scope: "full", expectedCheckpoint: checkpoint,
+                                                                      sections: [key: replacement]))
         }
     }
 
     func testRestartReplayAndRefreshGenerationCompareAndSwap() throws {
         try withStore { store in
             let originalEvidence = Data([0])
-            try store.save(["source.evidence.v1": originalEvidence, "wave.v1.1": Data([1]),
-                            "wave.v1.2": Data([2]), "silence.v1.2": Data([2]),
-                            "thresholdOverrides.v1": JSONEncoder().encode([1: -45.0, 2: -50.0])])
+            try store.save(["media_refresh_evidence.v1": originalEvidence, "waveform_peaks.v1.1": Data([1]),
+                            "waveform_peaks.v1.2": Data([2]), "silence_pauses.v1.2": Data([2]),
+                            "silence_threshold_overrides_db.v1": JSONEncoder().encode([1: -45.0, 2: -50.0])])
             let first = try XCTUnwrap(store.claimSceneAttempt(scope: "full", operationID: nil, restart: false, owner: "a"))
             try store.commitSceneAttempt(first, checkpoint: Data([1]), markerBatch: nil, coveredThrough: 9,
-                                         complete: true, sections: ["scenes.v2": Data([3])])
+                                         complete: true, sections: ["scenes_boundaries.v1": Data([3])])
             let replacement = try XCTUnwrap(store.claimSceneAttempt(scope: "full", operationID: "replace", restart: true, owner: "b"))
             try store.commitSceneAttempt(replacement, checkpoint: Data([2]), markerBatch: Data([3]), coveredThrough: 1,
                                          complete: false, release: true)
@@ -85,7 +101,7 @@ final class SidecarManifestTests: XCTestCase {
             let replay = try XCTUnwrap(store.claimSceneAttempt(scope: "full", operationID: "replace", restart: true, owner: "c"))
             XCTAssertEqual(replay.attemptID, replacement.attemptID)
             let currentEvidence = Data([1])
-            try store.refreshGeneration(evidence: currentEvidence, preserving: ["wave.v1.1", "scenes.v2"],
+            try store.refreshGeneration(evidence: currentEvidence, preserving: ["waveform_peaks.v1.1", "scenes_boundaries.v1"],
                                         expectedEvidence: originalEvidence, force: true, preservingScenes: true,
                                         preservingThresholdStreams: [2])
             XCTAssertThrowsError(try store.commitSceneAttempt(replay, checkpoint: Data([3]), markerBatch: nil,
@@ -93,11 +109,11 @@ final class SidecarManifestTests: XCTestCase {
             XCTAssertThrowsError(try store.refreshGeneration(evidence: Data([2]), preserving: [],
                                                               expectedEvidence: originalEvidence, force: true))
             XCTAssertEqual(store.persistedGenerations().map(\.reason), ["content_changed", "initial"])
-            XCTAssertEqual(store.read("wave.v1.1"), Data([1]))
-            XCTAssertNil(store.read("wave.v1.2"))
-            XCTAssertNil(store.readArchived("wave.v1.2", generation: 1))
-            XCTAssertEqual(store.readArchived("silence.v1.2", generation: 1), Data([2]))
-            let overrides = try XCTUnwrap(store.read("thresholdOverrides.v1"))
+            XCTAssertEqual(store.read("waveform_peaks.v1.1"), Data([1]))
+            XCTAssertNil(store.read("waveform_peaks.v1.2"))
+            XCTAssertNil(store.readArchived("waveform_peaks.v1.2", generation: 1))
+            XCTAssertEqual(store.readArchived("silence_pauses.v1.2", generation: 1), Data([2]))
+            let overrides = try XCTUnwrap(store.read("silence_threshold_overrides_db.v1"))
             XCTAssertEqual(try JSONDecoder().decode([Int: Double].self, from: overrides), [2: -50.0])
             XCTAssertNil(store.sceneAttempt(scope: "full", completed: false))
             XCTAssertEqual(store.sceneAttempt(scope: "full", completed: true)?.checkpoint, Data([1]))
@@ -128,14 +144,14 @@ final class SidecarManifestTests: XCTestCase {
     func testRepeatedRefreshAndRestartReclaimPayloads() throws {
         try withStore { store in
             let bytes = Data(repeating: 1, count: 512 * 1024)
-            try store.save(["source.evidence.v1": Data([0]), "silence.v1.1": bytes, "wave.v1.1": bytes])
+            try store.save(["media_refresh_evidence.v1": Data([0]), "silence_pauses.v1.1": bytes, "waveform_peaks.v1.1": bytes])
             for i in UInt8(1)...6 {
                 try store.refreshGeneration(evidence: Data([i]), preserving: [], expectedEvidence: Data([i - 1]),
-                                            force: true, sections: ["silence.v1.1": bytes, "wave.v1.1": bytes])
+                                            force: true, sections: ["silence_pauses.v1.1": bytes, "waveform_peaks.v1.1": bytes])
             }
-            XCTAssertNil(store.readArchived("silence.v1.1", generation: 1))
-            XCTAssertEqual(store.readArchived("silence.v1.1", generation: 4), bytes)
-            XCTAssertNil(store.readArchived("wave.v1.1", generation: 4))
+            XCTAssertNil(store.readArchived("silence_pauses.v1.1", generation: 1))
+            XCTAssertEqual(store.readArchived("silence_pauses.v1.1", generation: 4), bytes)
+            XCTAssertNil(store.readArchived("waveform_peaks.v1.1", generation: 4))
             for i in 0..<6 {
                 let claim = try XCTUnwrap(store.claimSceneAttempt(scope: "full", operationID: "operation-\(i)",
                                                                   restart: true, owner: "owner"))
@@ -156,25 +172,25 @@ final class SidecarManifestTests: XCTestCase {
 
     func testExplicitSaveOfRefreshedIndexDoesNotBlessLegacySameStampAnalysis() throws {
         try withStore { store in
-            try store.save(["silence.v1.1": Data([42]), "index.v1": Data([1])])
+            try store.save(["silence_pauses.v1.1": Data([42]), "media_index.v1": Data([1])])
             var evidence = MediaRefreshEvidence(identity: store.identity, format: "mov", origin: .zero,
                                                 duration: RationalTime(numerator: 1), videoIndex: -1, streams: [],
                                                 audio: [], indexIssues: [],
                                                 native: UnsafeBufferPointer(start: nil, count: 0))
             evidence.reviewStreams = []
             evidence.pictureNeedsReview = true
-            try store.save(["index.v1": Data([2]), MediaRefreshEvidence.sectionKey: evidence.encoded()])
-            XCTAssertEqual(store.read("index.v1"), Data([2]))
-            XCTAssertNil(store.read("silence.v1.1"))
-            XCTAssertEqual(store.readArchived("silence.v1.1", generation: 1), Data([42]))
+            try store.save(["media_index.v1": Data([2]), MediaRefreshEvidence.sectionKey: evidence.encoded()])
+            XCTAssertEqual(store.read("media_index.v1"), Data([2]))
+            XCTAssertNil(store.read("silence_pauses.v1.1"))
+            XCTAssertEqual(store.readArchived("silence_pauses.v1.1", generation: 1), Data([42]))
             XCTAssertEqual(store.persistedGenerations().first?.reason, "content_changed")
             evidence.reviewStreams = nil
             evidence.pictureNeedsReview = nil
-            try store.save(["index.v1": Data([3]), MediaRefreshEvidence.sectionKey: evidence.encoded()])
+            try store.save(["media_index.v1": Data([3]), MediaRefreshEvidence.sectionKey: evidence.encoded()])
             XCTAssertEqual(MediaRefreshEvidence.decode(store.read(MediaRefreshEvidence.sectionKey))?.pictureNeedsReview, true)
             evidence.reviewStreams = []
             evidence.pictureNeedsReview = false
-            try store.save(["index.v1": Data([4]), MediaRefreshEvidence.sectionKey: evidence.encoded()])
+            try store.save(["media_index.v1": Data([4]), MediaRefreshEvidence.sectionKey: evidence.encoded()])
             XCTAssertEqual(MediaRefreshEvidence.decode(store.read(MediaRefreshEvidence.sectionKey))?.pictureNeedsReview, true)
             XCTAssertEqual(store.persistedGenerations().count, 2)
         }

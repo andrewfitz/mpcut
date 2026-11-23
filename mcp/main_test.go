@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -17,6 +18,14 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+func TestInvalidLaunchMode(t *testing.T) {
+	for _, args := range [][]string{{"--files-only", "extra"}, {"--file-only"}, {"--grok-http"}} {
+		if err := run(args); err == nil || !strings.Contains(err.Error(), "usage:") {
+			t.Fatalf("run(%q) returned %v", args, err)
+		}
+	}
+}
 
 func TestHelperSubprocess(t *testing.T) {
 	if os.Getenv("MPCUT_HELPER_TEST_PROCESS") != "1" {
@@ -86,7 +95,7 @@ func TestJulyCallsWithoutInitialize(t *testing.T) {
 	if res := exchange(1, "tools/list", map[string]any{}); len(res["tools"].([]any)) < 2 {
 		t.Fatal("missing tools")
 	}
-	if res := exchange(2, "tools/call", map[string]any{"name": "get_editor_state", "arguments": map[string]any{}}); res["isError"] != true {
+	if res := exchange(2, "tools/call", map[string]any{"name": "project_editor_state_read", "arguments": map[string]any{}}); res["isError"] != true {
 		t.Fatal("missing arguments accepted")
 	}
 	res := exchange(3, "server/discover", map[string]any{})
@@ -110,7 +119,7 @@ func TestSDKHostStdio(t *testing.T) {
 				}
 				tools[tool.Name] = tool
 			}
-			for _, name := range []string{"list_projects", "get_editor_state", "review_frame", "list_stills", "add_still", "update_still", "remove_still", "relink_still"} {
+			for _, name := range []string{"project_windows_list", "project_editor_state_read", "review_editor_frame_read", "still_editor_placements_list", "timeline_gap_insert", "still_editor_picture_replace", "still_editor_placement_insert", "still_editor_placement_update", "still_editor_placement_remove", "still_editor_asset_relink", "timeline_clips_space"} {
 				if tools[name] == nil {
 					t.Errorf("%s missing", name)
 				}
@@ -120,12 +129,13 @@ func TestSDKHostStdio(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(resources.Resources) != 2 {
+			if len(resources.Resources) != 3 {
 				t.Fatalf("got %d documentation resources", len(resources.Resources))
 			}
 			for uri, file := range map[string]string{
 				"mpcut://docs/agent-guide":    "MCP-AGENT-GUIDE.md",
 				"mpcut://docs/tool-reference": "MCP-REFERENCE.md",
+				"mpcut://docs/headless":       "HEADLESS.md",
 			} {
 				want, err := os.ReadFile(filepath.Join("..", "docs", file))
 				if err != nil {
@@ -141,7 +151,7 @@ func TestSDKHostStdio(t *testing.T) {
 				}
 			}
 
-			res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "list_projects"})
+			res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "project_windows_list"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -153,6 +163,92 @@ func TestSDKHostStdio(t *testing.T) {
 			if !ok || json.Unmarshal([]byte(text.Text), &failure) != nil || failure.Code != "app_unavailable" {
 				t.Fatalf("invalid app unavailable result: %+v", res)
 			}
+		})
+	}
+}
+
+func TestStillSchemaRejectsMixedPlacementFields(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	session := connectSDKHost(t, ctx, socketPath(t), "2026-07-28")
+	defer session.Close()
+	arguments := map[string]any{
+		"project_handle": "timeline", "expected_revision": 0, "operation_id": "still-schema",
+		"path": "/tmp/card.png", "space": "assembly", "at": "0", "duration": "1",
+	}
+	call := func() string {
+		t.Helper()
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "still_editor_placement_insert", Arguments: arguments})
+		if err != nil || !result.IsError || len(result.Content) != 1 {
+			t.Fatalf("expected one validation or bridge error: %+v (%v)", result, err)
+		}
+		content, ok := result.Content[0].(*mcp.TextContent)
+		if !ok {
+			t.Fatalf("expected a text error, got %T", result.Content[0])
+		}
+		return content.Text
+	}
+	if valid := call(); !strings.Contains(valid, `"code":"app_unavailable"`) {
+		t.Fatalf("valid insert did not reach the bridge: %s", valid)
+	}
+	arguments["from"] = "0"
+	if mixed := call(); !strings.HasPrefix(mixed, `validating "arguments":`) {
+		t.Fatalf("mixed insert was not rejected by the helper schema: %s", mixed)
+	}
+}
+
+func TestMulticamAudioSchemaReachesDesktop(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	session := connectSDKHost(t, ctx, socketPath(t), "2026-07-28")
+	defer session.Close()
+	lane := map[string]any{
+		"id": "camera-a", "label": "Camera A", "color_slot": 2,
+		"target": map[string]any{"kind": "camera", "angle_id": "a"},
+	}
+	selection := map[string]any{"source_id": "a", "audio_stream_index": 1}
+	for _, tc := range []struct {
+		tool   string
+		fields map[string]any
+		badKey string
+		badVal any
+	}{
+		{"multicam_program_audio_set", map[string]any{"mode": "mix", "lanes": []any{lane}}, "source_id", "a"},
+		{"multicam_program_audio_set", map[string]any{
+			"mode": "replace", "replacement": "/tmp/donor.wav", "reference_source_id": "a",
+			"relative_offset": "1/48000", "replacement_audio_stream_index": 0,
+		}, "mode", "fixed"},
+		{"multicam_track_audio_edit", map[string]any{
+			"action": "set", "id": "donor", "original": selection,
+			"path": "/tmp/donor.wav", "replacement_source_id": "donor-source", "replacement_stream_index": 0,
+			"relative_offset": "1/48000", "uncovered": "keep_original",
+		}, "replacement", selection},
+		{"multicam_track_audio_sync_suggest", map[string]any{
+			"program": true, "original": map[string]any{"source_id": "a"},
+			"path": "/tmp/donor.wav", "replacement_stream_index": 0,
+		}, "program", false},
+		{"export_editor_project_plan", map[string]any{
+			"output": "/tmp/downmix.mov", "mode": "copy", "audio": "pcm", "audio_output": "downmix_stereo",
+		}, "audio_output", "surround"},
+	} {
+		t.Run(tc.tool, func(t *testing.T) {
+			tc.fields["project_handle"] = "timeline"
+			tc.fields["expected_revision"] = 0
+			tc.fields["operation_id"] = "multicam-audio-schema"
+			check := func(want string) {
+				t.Helper()
+				reply, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tc.tool, Arguments: tc.fields})
+				if err != nil || !reply.IsError || len(reply.Content) != 1 {
+					t.Fatalf("expected one validation or bridge error: %+v (%v)", reply, err)
+				}
+				content, ok := reply.Content[0].(*mcp.TextContent)
+				if !ok || !strings.Contains(content.Text, want) {
+					t.Fatalf("expected %q in error, got %+v", want, reply.Content[0])
+				}
+			}
+			check(`"code":"app_unavailable"`)
+			tc.fields[tc.badKey] = tc.badVal
+			check(`validating "arguments":`)
 		})
 	}
 }
@@ -186,7 +282,7 @@ func TestSDKCancellationClosesEditorSocket(t *testing.T) {
 			defer cancelCall()
 			done := make(chan error, 1)
 			go func() {
-				_, err := session.CallTool(callCtx, &mcp.CallToolParams{Name: "list_projects"})
+				_, err := session.CallTool(callCtx, &mcp.CallToolParams{Name: "project_windows_list"})
 				done <- err
 			}()
 			conn, err := listener.AcceptUnix()
@@ -236,7 +332,7 @@ func TestEscapedToolResultFitsSDKFrame(t *testing.T) {
 		io.WriteString(conn, reply)
 	}()
 
-	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "list_projects"})
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "project_windows_list"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,12 +345,60 @@ func TestEscapedToolResultFitsSDKFrame(t *testing.T) {
 	}
 }
 
+// Schema keywords belong to JSON Schema. Field names inside properties belong to MPCut.
+func TestConfiguredServerReportsInvalidToolSchema(t *testing.T) {
+	contents := t.TempDir()
+	dir := filepath.Join(contents, "Resources", "MCPTools")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	descriptor := `[{"name":"invalid_tool","inputSchema":{"type":"object","properties":{"label":{"type":42}}}}]`
+	if err := os.WriteFile(filepath.Join(dir, "invalid.json"), []byte(descriptor), 0600); err != nil {
+		t.Fatal(err)
+	}
+	server, err := configuredServer(filepath.Join(contents, "Helpers", "mpcut-mcp"), "", false)
+	if server != nil || err == nil || !strings.Contains(err.Error(), "invalid_tool") {
+		t.Fatalf("got server %v, error %v", server, err)
+	}
+}
+
+func TestCatalogPropertyNames(t *testing.T) {
+	tools, err := readCatalog(filepath.Join("..", "Sources", "MPCutApp", "MCPResources"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	field := regexp.MustCompile(`^[a-z][a-z0-9]*(_[a-z0-9]+)*$`)
+	var check func(string, any)
+	check = func(path string, node any) {
+		switch value := node.(type) {
+		case map[string]any:
+			for key, child := range value {
+				if key == "properties" {
+					for name := range child.(map[string]any) {
+						if !field.MatchString(name) {
+							t.Errorf("%s contains noncanonical field %q", path, name)
+						}
+					}
+				}
+				check(path+"."+key, child)
+			}
+		case []any:
+			for _, child := range value {
+				check(path, child)
+			}
+		}
+	}
+	for _, tool := range tools {
+		check(tool.Name, tool.InputSchema)
+	}
+}
+
 func TestCatalogDirectoryContainingBrackets(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "MPCut [Test].app")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	data := []byte(`[{"name":"list_projects","inputSchema":{"type":"object"}}]`)
+	data := []byte(`[{"name":"project_windows_list","inputSchema":{"type":"object"}}]`)
 	if err := os.WriteFile(filepath.Join(dir, "projects.json"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +406,29 @@ func TestCatalogDirectoryContainingBrackets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools) != 1 || tools[0].Name != "list_projects" {
+	if len(tools) != 1 || tools[0].Name != "project_windows_list" {
 		t.Fatalf("unexpected catalog %+v", tools)
+	}
+}
+
+func TestCatalogPreservesSignedTimestampBounds(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.json")
+	schema := `{"type":"object","properties":{"value":{"type":"integer","minimum":-9223372036854775808,"maximum":9223372036854775807}}}`
+	if err := os.WriteFile(path, []byte(`[{"name":"transcript_editor_words_read","inputSchema":`+schema+`}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tools, err := readCatalog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(tools[0].InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bound := range []string{"-9223372036854775808", "9223372036854775807"} {
+		if !strings.Contains(string(encoded), bound) {
+			t.Fatalf("timestamp bound %s changed in %s", bound, encoded)
+		}
 	}
 }

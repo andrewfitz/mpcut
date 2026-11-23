@@ -23,7 +23,11 @@ struct StillReplacementRequest {
     func apply(to project: CutProject,
                snap: (RationalTime, String?, StillReplacementFragment?) throws -> RationalTime) throws -> CutProject {
         let fragment: StillReplacementFragment?
-        if let fragmentIndex, case .sequence(let fragments) = replacement.coverage {
+        if let fragmentIndex {
+            guard case .sequence(let fragments) = replacement.coverage,
+                  fragments.indices.contains(fragmentIndex) else {
+                throw CutError(code: "invalid_still", message: "The selected still fragment is unavailable.")
+            }
             fragment = fragments[fragmentIndex]
         } else {
             fragment = nil

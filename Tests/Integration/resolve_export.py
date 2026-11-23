@@ -27,7 +27,7 @@ class ResolveExportTests(unittest.TestCase):
     def check_source_start(self, source, expected):
         output = self.folder / (source.stem + ".fcpxml")
         request = dict(output=str(output), file=str(source), clips=[{"from": "0", "to": "0.5"}])
-        result = subprocess.run([CLI, "resolve", "--stdin", "--no-sidecar", "--json"],
+        result = subprocess.run([CLI, "project", "resolve", "export", "--stdin", "--no-sidecar", "--json"],
                                 input=json.dumps(request), text=True, capture_output=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(json.loads(result.stdout)["ok"])
@@ -53,17 +53,17 @@ class ResolveExportTests(unittest.TestCase):
         self.check_source_start(source, Fraction(172800001, 48000))
 
     def test_native_switches_in_assembly_order(self):
-        project = dict(format="mpcut", schemaVersion=1, kind="multicam", referenceAngle="a",
-                       range={"from": "0", "to": "3"},
+        project = dict(format="mpcut", schema_version=3, kind="multicam", reference_angle_id="a",
+                       group_range={"from": "0", "to": "3"},
                        angles=[dict(id="a", name="Wide", file=self.camera.name),
                                dict(id="b", name="Close", file=self.camera.name, offset="-1")],
                        audio={"mode": "none"},
-                       switches=[dict(at="0", angle="a"),
-                                 dict(at="1", angle="b", audio=dict(source="a", stream=2))],
+                       switches=[dict(group_time="0", angle_id="a"),
+                                 dict(group_time="1", angle_id="b", audio=dict(source_id="a", audio_stream_index=2))],
                        assembly=[{"from": "1", "to": "2"}, {"from": "0", "to": "1"},
                                  {"from": "1", "to": "2"}])
         output = self.folder / "Edit.fcpxml"
-        run([CLI, "resolve", "--project", "-", "--output", output, "--no-sidecar"],
+        run([CLI, "project", "resolve", "export", "--project", "-", "--output", output, "--no-sidecar"],
             input=json.dumps(project).encode(), cwd=self.folder)
         tree = ET.parse(output)
         self.assertEqual(tree.find(".//asset").get("start"), "3600s")
@@ -84,13 +84,13 @@ class ResolveExportTests(unittest.TestCase):
         ffmpeg("-f", "lavfi", "-i", "color=s=160x90:r=24:d=1", "-f", "lavfi", "-i",
                "sine=frequency=440:d=3", "-map", "0:v", "-map", "1:a", "-c:v", "prores_ks",
                "-c:a", "pcm_s16le", short_camera)
-        project = dict(format="mpcut", schemaVersion=1, kind="multicam", referenceAngle="a",
-                       range={"from": "0", "to": "3"},
+        project = dict(format="mpcut", schema_version=3, kind="multicam", reference_angle_id="a",
+                       group_range={"from": "0", "to": "3"},
                        angles=[dict(id="a", file=self.camera.name), dict(id="b", file=short_camera.name)],
-                       audio=dict(mode="fixed", source="b", stream=1),
-                       switches=[dict(at="0", angle="a")])
+                       audio=dict(mode="fixed", source_id="b", audio_stream_index=1),
+                       switches=[dict(group_time="0", angle_id="a")])
         output = self.folder / "long mic.fcpxml"
-        run([CLI, "resolve", "--project", "-", "--output", output, "--no-sidecar"],
+        run([CLI, "project", "resolve", "export", "--project", "-", "--output", output, "--no-sidecar"],
             input=json.dumps(project).encode(), cwd=self.folder)
         tree = ET.parse(output)
         selected = tree.find(".//mc-source[@srcEnable='audio']").get("angleID")
@@ -102,7 +102,7 @@ class ResolveExportTests(unittest.TestCase):
     def test_cumulative_frame_positions_and_tracks(self):
         output = self.folder / "Ordinary.fcpxml"
         request = dict(output=str(output), file=str(self.camera), clips=[{"from": "1", "to": "1.06"}], order=[1] * 8)
-        run([CLI, "resolve", "--stdin", "--no-sidecar"], input=json.dumps(request).encode())
+        run([CLI, "project", "resolve", "export", "--stdin", "--no-sidecar"], input=json.dumps(request).encode())
         sequence = ET.parse(output).find(".//sequence")
         cursor = Fraction(0)
         clips = sequence.findall("spine/clip")

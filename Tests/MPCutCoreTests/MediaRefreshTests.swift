@@ -13,8 +13,8 @@ final class MediaRefreshTests: XCTestCase {
         XCTAssertEqual(baseline.state, .refreshed)
         XCTAssertNil(baseline.persistenceError)
         let cache = AnalysisSidecar(media: initial)
-        let key = "calibration.v1.0"
-        let settingsKey = "thresholdOverrides.v1"
+        let key = "silence_automatic_threshold_db.v1.0"
+        let settingsKey = "silence_threshold_overrides_db.v1"
         let settings = try JSONEncoder().encode([0: -27.0])
         try cache.save([key: Data([1, 2, 3]), settingsKey: settings])
         let generation = try XCTUnwrap(cache.persistedGenerations().first?.id)
@@ -58,6 +58,44 @@ final class MediaRefreshTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: project), savedProject)
     }
 
+    func testProjectRefreshFlagsParticipantGeometryForAChangedRecording() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appendingPathComponent("recording.wav")
+        let url = folder.appendingPathComponent("edit.cut")
+        try wave(samples: 16_000, amplitude: 100).write(to: file)
+        let identity = try SourceIdentity(file)
+        var project = CutProject.sequence([
+            .init(id: "clip", file: file.lastPathComponent, from: .zero, to: RationalTime(numerator: 1))
+        ])
+        project.participants = .init(sources: [
+            .init(sourceID: file.lastPathComponent, analysisIdentity: "accepted",
+                  sourceStamp: SceneSourceStamp(identity: identity), sourceInode: identity.inode)
+        ])
+        try project.save(to: url)
+        XCTAssertTrue(try XCTUnwrap(MediaRefresh.project(at: url).first).referenceIssues.isEmpty)
+        try wave(samples: 16_000, amplitude: 300).write(to: file, options: .atomic)
+        let issue = MediaRefreshReferenceIssue(id: file.lastPathComponent, reason: .participantGeometryNeedsReview)
+        XCTAssertTrue(try XCTUnwrap(MediaRefresh.project(at: url).first).referenceIssues.contains(issue))
+        XCTAssertTrue(try XCTUnwrap(MediaRefresh.project(at: url).first).referenceIssues.contains(issue))
+    }
+
+    func testProjectRefreshChecksRangesWithAnEvidenceFreeSidecar() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appendingPathComponent("short.wav")
+        try wave(samples: 8_000, amplitude: 100).write(to: file)
+        let sidecar = try AnalysisSidecar(source: file)
+        try sidecar.save(["example": Data([1])])
+        let project = folder.appendingPathComponent("edit.cut")
+        try CutProject.sequence([
+            CutSequenceClip(id: "clip", file: file.lastPathComponent, from: .zero, to: RationalTime(numerator: 1))
+        ]).save(to: project)
+
+        let result = try XCTUnwrap(MediaRefresh.project(at: project).first)
+        XCTAssertEqual(result.referenceIssues, [.init(id: "clip", reason: .rangeOutsideMedia)])
+    }
+
     func testOptOutBypassesAValidSidecar() throws {
         let folder = try temporaryFolder()
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -80,7 +118,7 @@ final class MediaRefreshTests: XCTestCase {
         let file = folder.appendingPathComponent("recording.wav")
         try wave(samples: 16_000, amplitude: 100).write(to: file)
         let original = try XCTUnwrap(MediaRefresh.check(file).media)
-        let key = "calibration.v1.0"
+        let key = "silence_automatic_threshold_db.v1.0"
         try AnalysisSidecar(media: original).save([key: Data([1, 2, 3])])
 
         try rewritePreservingStamp(file, with: wave(samples: 16_000, amplitude: 300))

@@ -59,7 +59,9 @@ final class DisplayEnvelope: Sendable {
     }
 }
 
-enum WaveformSurface: Hashable { case viewer, timeline(UUID), multicam(RationalTime), cutPreview(Int) }
+enum WaveformSurface: Hashable {
+    case viewer, timeline(UUID), multicam(RationalTime, laneID: String? = nil), cutPreview(Int)
+}
 
 /// Least recently used order. Evicting a window that is still drawn would decode it again on every redraw.
 struct RecentKeys<Key: Hashable> {
@@ -143,18 +145,38 @@ final class WaveformEnvelopeStore<Source: Hashable & Sendable>: ObservableObject
                 (stream, Overview(key: AudioAnalysisCacheKey(media: media, stream: stream), envelope: item.envelope))
             }.reduce(into: [:]) { $0[$1.0] = $1.1 }
         }
-        windowRevision += 1
+        publishWindowChange()
     }
     private var overviewJobs: [Source: EditCancellation] = [:]
     private var overviews: [Source: [Int: Overview]] = [:]
     private var windows: [Key: DisplayEnvelope] = [:]
     // Keep the onscreen working set and a bounded history for scrolling back.
     private var visibleSurfaces = Set<WaveformSurface>()
+    private var timelineSurfacesByLane: [String?: Set<WaveformSurface>] = [:]
     private var recentWindows = RecentKeys<Key>(limit: 256)
     private var jobs: [Key: Job] = [:]
+    private var hasUnreportedTimelineJob = false
     private var failed: [Key: Request] = [:]
     var changed: (() -> Void)?
-    @Published private(set) var windowRevision = 0
+    private(set) var windowRevision = 0
+    // A media refresh invalidates all lanes; a completed window only affects its consumers.
+    private let changedMulticamLanes = PassthroughSubject<Set<String?>?, Never>()
+
+    func multicamWindowChanges(for laneID: String?) -> AnyPublisher<Int, Never> {
+        changedMulticamLanes
+            .filter { $0?.contains(laneID) ?? true }
+            .compactMap { [weak self] _ in self?.windowRevision }
+            .eraseToAnyPublisher()
+    }
+
+    private func publishWindowChange(consumers: Set<Key>? = nil) {
+        windowRevision &+= 1
+        changedMulticamLanes.send(consumers.map { keys in
+            keys.reduce(into: Set<String?>()) { lanes, key in
+                if case .multicam(_, let laneID) = key.surface { lanes.insert(laneID) }
+            }
+        })
+    }
 
     func update(sources: [Source: MediaInfo], track: Int, sourceTracks: [Source: Int] = [:], readSidecars: Bool, excludedSources: Set<URL> = []) {
         var selected: [Source: Int] = [:]
@@ -231,23 +253,41 @@ final class WaveformEnvelopeStore<Source: Hashable & Sendable>: ObservableObject
         secondsPerPixel > 0 && secondsPerPixel < 1 / Double(AudioWaveform.rate)
     }
 
-    func setVisibleTimelineSurfaces(_ visible: Set<WaveformSurface>) {
-        if visible != visibleSurfaces {
-            let hidden = visibleSurfaces.subtracting(visible)
-            visibleSurfaces = visible
-            recentWindows.removeAll { visible.contains($0.surface) }
-            if !hidden.isEmpty {
-                for key in Set(windows.keys).union(failed.keys) where hidden.contains(key.surface) {
-                    touchWindow(key)
+    func setVisibleTimelineSurfaces(_ surfaces: Set<WaveformSurface>, laneID: String? = nil) {
+        let before = timelineSurfacesByLane[laneID]
+        let changed = before.map { $0 != surfaces } ?? !surfaces.isEmpty
+        if changed {
+            timelineSurfacesByLane[laneID] = surfaces.isEmpty ? nil : surfaces
+            let visible = Set(timelineSurfacesByLane.values.joined())
+            if visible != visibleSurfaces {
+                let hidden = visibleSurfaces.subtracting(visible)
+                visibleSurfaces = visible
+                recentWindows.removeAll { visible.contains($0.surface) }
+                if !hidden.isEmpty {
+                    for key in Set(windows.keys).union(failed.keys) where hidden.contains(key.surface) {
+                        touchWindow(key)
+                    }
                 }
             }
         }
-        for key in jobs.keys where !visible.contains(key.surface) {
+        guard changed || hasUnreportedTimelineJob else { return }
+        hasUnreportedTimelineJob = false
+        for key in jobs.keys where !visibleSurfaces.contains(key.surface) {
             switch key.surface {
             case .timeline, .multicam:
                 releaseJob(for: key)
             case .viewer, .cutPreview: break
             }
+        }
+    }
+
+    private func registerJob(_ job: Job, for key: Key) {
+        jobs[key] = job
+        switch key.surface {
+        case .timeline, .multicam:
+            // Drawing can request a window before it reports the visible surfaces.
+            if !visibleSurfaces.contains(key.surface) { hasUnreportedTimelineJob = true }
+        case .viewer, .cutPreview: break
         }
     }
 
@@ -297,7 +337,7 @@ final class WaveformEnvelopeStore<Source: Hashable & Sendable>: ObservableObject
         }
         if let shared = jobs.first(where: { $0.key.id == id && $0.value.request.covers(start, end, bin) })?.value {
             shared.consumers.insert(key)
-            jobs[key] = shared
+            registerJob(shared, for: key)
             return covers ? window : overview
         }
         let span = end - start
@@ -315,7 +355,7 @@ final class WaveformEnvelopeStore<Source: Hashable & Sendable>: ObservableObject
         let request = Request(from: lower, to: upper, bin: (upper - lower) / Double(columns))
         let job = Job(request, for: key)
         let token = job.token
-        jobs[key] = job
+        registerJob(job, for: key)
         let operation = BlockOperation { [weak self] in
             guard !token.isCancelled else { return }
             let data = try? AudioAnalysis.envelope(input.media, stream: input.stream, from: lower, to: upper,
@@ -330,7 +370,7 @@ final class WaveformEnvelopeStore<Source: Hashable & Sendable>: ObservableObject
                     self.remember(result, for: consumer)
                     self.failed[consumer] = result == nil ? request : nil
                 }
-                self.windowRevision &+= 1
+                self.publishWindowChange(consumers: job.consumers)
                 self.changed?()
             }
         }
@@ -348,7 +388,7 @@ final class WaveformEnvelopeStore<Source: Hashable & Sendable>: ObservableObject
                             DispatchQueue.main.async { [weak self] in
                                 guard let self, !token.isCancelled else { return }
                                 job.sparse = sparse
-                                self.windowRevision &+= 1
+                                self.publishWindowChange(consumers: job.consumers)
                                 self.changed?()
                             }
                         }

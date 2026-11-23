@@ -81,7 +81,7 @@ final class ReplacementExportPanel: NSObject, ObservableObject, NSOpenSavePanelD
                     }
                 }
                 fileExtension = plan.container
-                summary = "Save the working copy as \(plan.container.uppercased()) · \(EditorExportPlan.seconds(plan.duration.seconds))"
+                summary = "Stream copy to \(plan.container.uppercased()) with replacement audio · \(EditorExportPlan.seconds(plan.duration.seconds))"
             case .failure(let error):
                 summary = error.localizedDescription
             }

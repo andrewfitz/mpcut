@@ -16,7 +16,7 @@ final class MulticamJPEGExportTests: XCTestCase {
         let manifest = try JPEGExport.writeMulticam(project, document: nil, at: [.zero, first.time],
             to: directory, preset: .review, useSidecar: false, indexedSources: ["camera": indexed],
             cancelled: { false })
-        XCTAssertNil(manifest.project)
+        XCTAssertNil(manifest.projectPath)
         XCTAssertNil(manifest.frames[0].file)
         XCTAssertEqual(manifest.frames[0].availability, .pictureGap)
         XCTAssertEqual(manifest.frames[1].frameTime, first.time)

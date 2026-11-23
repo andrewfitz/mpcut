@@ -51,11 +51,11 @@ class Waveform(unittest.TestCase):
                         "-c:a", "copy", cls.movie], check=True)
 
     def check_window(self, path, first, length, columns):
-        command = [CLI, "waveform", "--json", "--from", f"{first}/{self.rate}",
+        command = [CLI, "waveform", "envelope", "read", "--json", "--from", f"{first}/{self.rate}",
                    "--to", f"{first + length}/{self.rate}", "--columns", str(columns), path]
         report = json.loads(check_output(command))
         self.assertTrue(report["ok"])
-        self.assertEqual(report["sampleRate"], self.rate)
+        self.assertEqual(report["sample_rate"], self.rate)
         self.assertEqual(report["columns"], columns)
         self.assertAlmostEqual(report["envelope"]["from"], first / self.rate)
         self.assertAlmostEqual(report["envelope"]["to"], (first + length) / self.rate)
@@ -87,11 +87,11 @@ class Waveform(unittest.TestCase):
              "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "prores", "-c:a", "pcm_s16le", movie], check=True)
         for cached in (False, True):
             if cached:
-                check_output([CLI, "sidecar", "--only", "index", movie])
+                check_output([CLI, "analysis", "sidecar", "build", "--only", "index", movie])
             flags = [] if cached else ["--no-sidecar"]
             for stream, end, level in [(1, 2, 0.25), (2, 3, -0.5)]:
                 with self.subTest(cached=cached, stream=stream):
-                    command = [CLI, *flags, "waveform", "--json", "--columns", "2", "--stream", str(stream)]
+                    command = [CLI, *flags, "waveform", "envelope", "read", "--json", "--columns", "2", "--stream", str(stream)]
                     whole = json.loads(check_output([*command, movie]))["envelope"]
                     tail = json.loads(check_output([*command, "--from", "1", "--to", str(end), movie]))["envelope"]
                     self.assertEqual(whole["to"], end)
@@ -114,7 +114,7 @@ class Waveform(unittest.TestCase):
             for start, count in [(3, 11), (3 * self.rate + 17, 257), (5 * self.rate - 7, 7)]:
                 with self.subTest(codec=codec, start=start):
                     report = json.loads(check_output(
-                        [CLI, "--no-sidecar", "waveform", "--json", "--from", f"{start}/{self.rate}",
+                        [CLI, "--no-sidecar", "waveform", "envelope", "read", "--json", "--from", f"{start}/{self.rate}",
                          "--to", f"{start + count}/{self.rate}", "--columns", str(count), path]))
                     samples = [reference[i*2:i*2+2] for i in range(start, start + count)]
                     for extrema, reducer in (("low", min), ("high", max)):
@@ -140,22 +140,22 @@ class Waveform(unittest.TestCase):
             with self.subTest(encoder=encoder):
                 path = source.with_name(f"{encoder}-44100.mka")
                 run(["ffmpeg", "-loglevel", "error", "-i", source, "-c:a", encoder, path], check=True)
-                inspect = [CLI, "inspect", "--json", path]
+                inspect = [CLI, "media", "inspect", "--json", path]
                 self.assertEqual(json.loads(check_output(inspect))["media"]["duration"], duration)
-                check_output([CLI, "sidecar", "--json", "--only", "index", path])
+                check_output([CLI, "analysis", "sidecar", "build", "--json", "--only", "index", path])
                 self.assertEqual(json.loads(check_output(inspect))["media"]["duration"], duration)
                 with sqlite3.connect(path.with_suffix(".mka.cutdb")) as cache:
-                    key = "index.v1"
+                    key = "media_index.v1"
                     stamp = cache.execute("SELECT stamp FROM source WHERE id = 1").fetchone()[0]
                     saved = cache.execute("SELECT value FROM sections WHERE name = ?", (key,)).fetchone()[0]
                     header = plistlib.loads(saved)
-                    header.update(probeRevision=2, duration={"numerator": 1, "denominator": 1})
+                    header.update(probe_revision=2, duration={"numerator": 1, "denominator": 1})
                     saved = plistlib.dumps(header, fmt=plistlib.FMT_BINARY)
                     digest = hashlib.sha256(stamp.encode() + b"\0" + key.encode() + b"\0" + saved).digest()
                     cache.execute("UPDATE sections SET value = ?, digest = ? WHERE name = ?", (saved, digest, key))
                 self.assertEqual(json.loads(check_output(inspect))["media"]["duration"], duration)
                 envelope = json.loads(check_output(
-                    [CLI, "waveform", "--json", "--from", f"{samples - 10}/{rate}", "--to", f"{samples}/{rate}",
+                    [CLI, "waveform", "envelope", "read", "--json", "--from", f"{samples - 10}/{rate}", "--to", f"{samples}/{rate}",
                      "--columns", "10", path]
                 ))["envelope"]
                 for extrema in ["low", "high"]:
@@ -167,7 +167,7 @@ class Waveform(unittest.TestCase):
                         "-af", r"asetnsamples=n=1:p=0,aselect=not(eq(n\,100))", "-c:a", "pcm_s16le", gap],
                        check=True)
         envelope = json.loads(check_output(
-            [CLI, "waveform", "--json", "--from", "98/48000", "--to", "104/48000", "--columns", "6", gap]
+            [CLI, "waveform", "envelope", "read", "--json", "--from", "98/48000", "--to", "104/48000", "--columns", "6", gap]
         ))["envelope"]
         self.assertEqual(envelope["low"], [0.25, 0.25, 0, 0.25, 0.25, 0.25])
         self.assertEqual(envelope["high"], envelope["low"])
@@ -184,18 +184,18 @@ class Waveform(unittest.TestCase):
         sidecar = source.with_name(source.name + ".cutdb")
 
         def status():
-            return json.loads(check_output([CLI, "sidecar", "--json", "--status", source]))
+            return json.loads(check_output([CLI, "analysis", "sidecar", "inspect", "--json", source]))
 
         def window(*flags, span=()):
             return json.loads(check_output(
-                [CLI, *flags, "waveform", "--json", "--columns", "1024", *span, source]))
+                [CLI, *flags, "waveform", "envelope", "read", "--json", "--columns", "1024", *span, source]))
 
         self.assertEqual(status()["status"], "missing")
-        saved = json.loads(check_output([CLI, "sidecar", "--json", "--only", "index,audio", source]))
+        saved = json.loads(check_output([CLI, "analysis", "sidecar", "build", "--json", "--only", "index,audio", source]))
         self.assertEqual(saved["sidecar"], str(sidecar))
         self.assertEqual(status()["status"], "current")
-        self.assertEqual(status()["inventory"]["envelopeStreams"], [0])
-        self.assertIn("envelope.v2.0", status()["sections"])
+        self.assertEqual(status()["inventory"]["envelope_streams"], [0])
+        self.assertIn("waveform_envelope.v1.0", status()["sections"])
         spans = [[], ["--from", "5/4", "--to", "15/4"]]
         fresh = [window("--no-sidecar", span=span) for span in spans]
         for span, expected in zip(spans, fresh, strict=True):
@@ -205,7 +205,7 @@ class Waveform(unittest.TestCase):
         # Equal reports do not show which path produced them. Rewrite the start
         # of the stored minima with a valid digest: the cached overview must now
         # differ exactly there, while a fresh read ignores the neighbour.
-        key = "envelope.v2.0"
+        key = "waveform_envelope.v1.0"
         with sqlite3.connect(sidecar) as db:
             stamp = db.execute("SELECT stamp FROM source WHERE id=1").fetchone()[0]
             payload = bytearray(db.execute("SELECT value FROM sections WHERE name=?", (key,)).fetchone()[0])
@@ -232,7 +232,7 @@ class Waveform(unittest.TestCase):
         reference.frombytes(check_output(["ffmpeg", "-loglevel", "error", "-i", mp3, "-f", "f32le", "-"]))
         first = 151233
         envelope = json.loads(check_output(
-            [CLI, "waveform", "--json", "--from", f"{first}/48000", "--to", f"{first+701}/48000",
+            [CLI, "waveform", "envelope", "read", "--json", "--from", f"{first}/48000", "--to", f"{first+701}/48000",
              "--columns", "701", mp3]))["envelope"]
         self.assertEqual((len(envelope["low"]), len(envelope["high"])), (701, 701))
         for i, (lo, hi) in enumerate(zip(envelope["low"], envelope["high"], strict=True)):
@@ -248,13 +248,13 @@ class Waveform(unittest.TestCase):
                 track.writeframes(bytes([64, 128, 192, 160, 96]))
             truncated = Path(scratch) / "truncated.wav"
             truncated.write_bytes(self.wav.read_bytes()[:-4])
-            args = [CLI, "waveform", "--json", "--columns", "5", full]
+            args = [CLI, "waveform", "envelope", "read", "--json", "--columns", "5", full]
             envelope = json.loads(check_output(args))["envelope"]
             self.assertAlmostEqual(envelope["to"], 5 / self.rate)
             self.assertEqual(envelope["low"], [-0.5, 0, 0.5, 0.25, -0.25])
             self.assertEqual(envelope["high"], envelope["low"])
             self.check_window(truncated, 5 * self.rate - 4, 3, 3)
-            result = run([CLI, "waveform", "--json", "--to", "5", truncated], capture_output=True)
+            result = run([CLI, "waveform", "envelope", "read", "--json", "--to", "5", truncated], capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(json.loads(result.stdout)["error"]["code"], "invalid_range")
 
@@ -267,7 +267,7 @@ class Waveform(unittest.TestCase):
                 (["--from", "6"], 1, "invalid_range"),
                 (["--stream", "0"], 1, "no_audio")]:
             with self.subTest(flags=flags):
-                proc = run([CLI, "waveform", "--json", *flags, self.movie], capture_output=True)
+                proc = run([CLI, "waveform", "envelope", "read", "--json", *flags, self.movie], capture_output=True)
                 self.assertEqual(proc.returncode, status, proc.stdout)
                 report = json.loads(proc.stdout)
                 self.assertIs(report["ok"], False)

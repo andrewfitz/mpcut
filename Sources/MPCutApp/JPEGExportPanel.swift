@@ -38,6 +38,7 @@ struct EditorJPEGSource {
     let manualThreshold: Double?
     let effectiveThreshold: Double?
     let minimumPause: Double
+    let maxBlip: Double
 
     func selection(for mode: JPEGExportMode, analyzeScenes: () throws -> SceneReport,
                    analyzeSilence: (Int) throws -> SilenceAnalysisResult) throws -> JPEGSelection {
@@ -56,7 +57,7 @@ struct EditorJPEGSource {
                                       minimumPause: minimumPause)
             }
             let result = try analyzeSilence(audioStream)
-            return .audibleRanges(pauses: result.pauses, stream: audioStream, thresholdDB: result.thresholdDB,
+            return .audibleRanges(pauses: result.pauses(maxBlip: maxBlip), stream: audioStream, thresholdDB: result.thresholdDB,
                                   minimumPause: minimumPause)
         }
     }

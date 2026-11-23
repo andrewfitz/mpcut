@@ -23,7 +23,8 @@ struct MulticamEdgeSuggestion: Equatable {
 extension MulticamEditorModel {
     /// The edge suggestion of the last export, while the assembly still has that edge.
     var currentEdgeSuggestion: MulticamEdgeSuggestion? {
-        guard let suggestion = edgeSuggestion, let range = assemblyRange(at: suggestion.edge.range - 1),
+        guard let suggestion = edgeSuggestion, suggestion.edge.range > 0,
+              let range = assemblyRange(at: suggestion.edge.range - 1),
               suggestion.times.contains(where: { suggestion.moving(range, to: $0) != nil }) else { return nil }
         return suggestion
     }
@@ -34,7 +35,7 @@ extension MulticamEditorModel {
         let index = suggestion.edge.range - 1
         guard let range = assemblyRange(at: index), let moved = suggestion.moving(range, to: time) else { return false }
         var items = assemblyItems
-        items[index] = .group(moved)
+        items[index] = .group(moved, angle: items[index].angleOverride)
         preview.pause()
         guard edit("Move Range Edge", { $0.assemblyItems = items }) else { return false }
         edgeSuggestion = nil
@@ -45,13 +46,17 @@ extension MulticamEditorModel {
     /// Moves the unsafe edge of a queued range to a verified time. `issue` is the failure of the queue check, whose
     /// `segment` numbers the queued entry and whose edge numbers that entry's own single range.
     @discardableResult
-    func applyQueuedEdgeSuggestion(_ time: RationalTime, for issue: CutError) -> Bool {
-        guard !isExporting, let edge = issue.multicam?.edge, edge.range == 1, let number = issue.segment,
+    func applyQueuedEdgeSuggestion(_ time: RationalTime, for issue: CutError, contentID: UUID? = nil) -> Bool {
+        guard !isBusy, let edge = issue.multicam?.edge, edge.range == 1, let number = issue.segment, number > 0,
               queuedRanges.indices.contains(number - 1) else { return false }
-        let entry = queuedRanges[number - 1]
-        guard !entry.usesAssembly, let moved = MulticamEdgeSuggestion(edge: edge, times: issue.nearest ?? []).moving(entry.range, to: time),
+        var entry = queuedRanges[number - 1]
+        guard contentID == nil || entry.contentID == contentID,
+              !entry.usesAssembly,
+              let moved = MulticamEdgeSuggestion(edge: edge, times: issue.nearest ?? []).moving(entry.range, to: time),
               (try? entry.project.plan(ranges: [moved])) != nil else { return false }
-        queuedRanges[number - 1] = MulticamQueuedRange(name: entry.name, range: moved, project: entry.project, media: entry.media)
+        entry.range = moved
+        entry.contentID = UUID()
+        queuedRanges[number - 1] = entry
         return true
     }
 }

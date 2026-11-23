@@ -7,16 +7,26 @@ struct ProjectSilenceReport: Encodable {
         let file: String
         let stream: Int
         let thresholdDB: Double
+        private enum CodingKeys: String, CodingKey {
+            case source = "source_id", file, stream = "audio_stream_index", thresholdDB = "threshold_db"
+        }
     }
 
     struct Interval: Encodable {
         let assemblyIndex: Int
         let group: AudioSpan
         let output: AudioSpan
+        let id: String?
+        let requestedRetainedSeconds: Double?
+        let retainedSeconds: Double?
 
-        init(assemblyIndex: Int, group: AudioSpan, groupStart: RationalTime, outputStart: RationalTime) throws {
+        init(assemblyIndex: Int, group: AudioSpan, groupStart: RationalTime, outputStart: RationalTime,
+             id: String? = nil, requestedRetainedSeconds: Double? = nil, retainedSeconds: Double? = nil) throws {
             self.assemblyIndex = assemblyIndex
             self.group = group
+            self.id = id
+            self.requestedRetainedSeconds = requestedRetainedSeconds
+            self.retainedSeconds = retainedSeconds
             output = try AudioSpan(from: outputStart.adding(group.from.subtracting(groupStart)),
                                    to: outputStart.adding(group.to.subtracting(groupStart)))
         }
@@ -34,18 +44,21 @@ struct ProjectSilenceReport: Encodable {
     let duration: RationalTime
     let thresholdMode: SilenceThresholdMode
     let thresholds: [Threshold]
+    let maxBlip: Double
     let minimumPause: Double
-    let leave: Double
+    let padding: Double
     var mode: ExportMode
     let pauses: [Interval]
     let removals: [Interval]
     let clips: [Interval]
+    let takeCandidates: [AudioSpan]
     let skippedPauses: Int
     let removedDuration: RationalTime
     let retainedAssembly: [StillAssemblyItem]
     let retainedDuration: RationalTime
     let cards: [RetainedCard]?
     let indexedSources: [String: MediaInfo]
+    var outProject: String?
     var output: String?
     var dryRun: Bool?
     var preflight: MulticamExportPlan?
@@ -54,9 +67,11 @@ struct ProjectSilenceReport: Encodable {
     var tier: TierSummary?
 
     private enum CodingKeys: String, CodingKey {
-        case ok, project, duration, thresholdMode, thresholds, minimumPause, leave, mode
+        case ok, project = "project_path", duration, thresholdMode, thresholds, mode
+        case maxBlip = "max_blip_seconds", minimumPause = "min_pause_seconds", padding = "padding_per_side_seconds"
         case pauses, removals, clips, skippedPauses, removedDuration, output, dryRun, preflight, stillPreflight, tier
-        case cards, retainedDuration
+        case outProject = "out_project"
+        case cards, retainedDuration, takeCandidates
     }
 
     init(_ document: MulticamProject, at location: URL, options: SilenceOptions, container: String,
@@ -65,7 +80,7 @@ struct ProjectSilenceReport: Encodable {
         let indices = assembly.indices.filter { assembly[$0].group != nil }
         let ranges = assembly.compactMap(\.group)
         let mapping = try document.plan()
-        guard !mapping.audio.isEmpty else {
+        guard mapping.audioLanes.contains(where: { !$0.spans.isEmpty }) else {
             throw CutError(code: "no_audio", message: "The project assembly has no selected soundtrack.")
         }
         let files = Dictionary(uniqueKeysWithValues: document.sources.map {
@@ -74,7 +89,7 @@ struct ProjectSilenceReport: Encodable {
         let engine = CutEngine(cancelled: cancelled)
         var indexed: [URL: (ordinary: MediaInfo, multicam: MediaInfo)] = [:]
         var media: [String: MediaInfo] = [:]
-        for source in Set((mapping.picture + mapping.audio).map(\.source)).sorted() {
+        for source in Set(mapping.picture.map(\.source)).union(document.requiredAudioSelections(for: mapping).map(\.source)).sorted() {
             guard let file = files[source], !file.path.split(separator: "/").contains("..") else {
                 throw CutError(code: "missing_source", message: "Source \(source) has an unavailable parent directory.")
             }
@@ -93,14 +108,8 @@ struct ProjectSilenceReport: Encodable {
             }
             media[source] = info.multicam
         }
-        for span in mapping.audio {
-            guard media[span.source]?.audio.contains(where: { $0.stream.index == span.stream }) == true else {
-                throw CutError(code: "missing_audio",
-                               message: "Source \(span.source) has no audio stream \(span.stream.map(String.init) ?? "selected").",
-                               track: span.stream)
-            }
-        }
-        let routes = MulticamSilencePlanner.routes(plan: mapping, project: document, media: media)
+        let routing = try MulticamSilencePlanner.routing(plan: mapping, project: document, media: media)
+        let routes = routing.keys.sorted().flatMap { routing[$0]?.routes ?? [] }
         guard !routes.isEmpty else {
             throw CutError(code: "no_audio", message: "The selected soundtrack has no coverage in the project assembly.")
         }
@@ -120,7 +129,7 @@ struct ProjectSilenceReport: Encodable {
                 let level = options.thresholdDB ?? MulticamSilencePlanner.savedThreshold(
                     for: info, stream: selection.stream, cancelled: cancelled)
                 detection = try AudioAnalysis.silence(info, stream: selection.stream, thresholdDB: level,
-                                                      minimum: inputMinimum, requireRouting: true, cancelled: cancelled)
+                                                      minimum: inputMinimum, cancelled: cancelled)
                 analyses[file, default: [:]][selection.stream] = detection
             }
             results[selection] = detection
@@ -131,18 +140,37 @@ struct ProjectSilenceReport: Encodable {
         duration = mapping.duration
         thresholdMode = options.thresholdDB == nil ? .auto : .manual
         thresholds = levels
+        maxBlip = options.maxBlip
         minimumPause = options.minimum
-        let leave = options.leave ?? 0.4
-        self.leave = leave
+        let padding = options.padding ?? 0.2
+        self.padding = padding
         let stills = try CutProject.multicam(document).exportPlacementScope()
         let mode = options.mode ?? ExportRules.defaultStillMode(tracks: .all, placements: stills,
                                                                   otherwise: ExportRules.defaultMode(for: .multicam))
         self.mode = mode
         indexedSources = media
 
-        let edits = MulticamSilencePlanner.plan(project: document, media: media, ranges: ranges, silences: results,
-                                                scope: nil, minimum: options.minimum, leave: leave, protected: [],
-                                                keyframesOnly: mode == .copy, container: container, assemblyIndices: indices)
+        var protectionCache = TranscriptPauseProtectionCache()
+        let authored = protectionCache.resolve(document.transcripts, relativeTo: location)
+        let protected = try Set(authored.group(project: document,
+                                               sourceFingerprints: media.mapValues { $0.identity.transcriptFingerprint }))
+        func pauseName(occurrence: Int, span: AudioSpan) -> String {
+            "multicam:\(occurrence):\(span.from):\(span.to)"
+        }
+        let edits = MulticamSilencePlanner.plan(
+            project: document, media: media, ranges: ranges, silences: results,
+            scope: nil, minimum: options.minimum, padding: padding, protected: protected,
+            maxBlip: options.maxBlip, keyframesOnly: mode == .copy, container: container,
+            assemblyIndices: indices, mapping: mapping, analysisRouting: routing,
+            requireCopySound: (options.audioOutput ?? .separateTracks) == .separateTracks &&
+                (options.audio ?? .copyOriginal) == .copyOriginal
+        ) { id in
+            guard !options.retainedPauseSeconds.isEmpty else { return nil }
+            return options.retainedPauseSeconds[pauseName(occurrence: id.occurrence, span: id.span)]
+        }
+        guard edits.lazy.filter({ $0.requestedRetainedSeconds != nil }).count == options.retainedPauseSeconds.count else {
+            throw CLIError("invalid_arguments", "A pause ID is absent from this scan. Scan again with the same settings.")
+        }
         let retained = MulticamSilencePlanner.retainedOccurrences(ranges, pauses: edits)
         var cursor = RationalTime.zero
         var outputStarts: [RationalTime] = []
@@ -166,7 +194,7 @@ struct ProjectSilenceReport: Encodable {
                 retainedCursor = end
             } else if let occurrence = groupIndices[index] {
                 for retained in retainedByOccurrence[occurrence] ?? [] {
-                    retainedItems.append(.group(MulticamSilencePlanner.range(retained.span)))
+                    retainedItems.append(.group(MulticamSilencePlanner.range(retained.span), angle: item.angleOverride))
                     retainedCursor = try retainedCursor.adding(retained.span.to.subtracting(retained.span.from))
                 }
             }
@@ -185,11 +213,20 @@ struct ProjectSilenceReport: Encodable {
                          outputStart: outputStarts[indices[index]])
         }
 
-        pauses = try edits.map { try interval($0.id.occurrence, $0.visible) }
+        pauses = try edits.map { edit in
+            let index = edit.id.occurrence
+            return try Interval(assemblyIndex: indices[index], group: edit.visible, groupStart: ranges[index].from,
+                                outputStart: outputStarts[indices[index]],
+                                id: pauseName(occurrence: indices[index], span: edit.id.span),
+                                requestedRetainedSeconds: edit.requestedRetainedSeconds, retainedSeconds: edit.retainedSeconds)
+        }
         removals = try edits.compactMap { edit in
             try edit.removal.map { try interval(edit.id.occurrence, $0) }
         }
-        clips = try retained.map { try interval($0.occurrence, $0.span) }
+        let clips = try retained.map { try interval($0.occurrence, $0.span) }
+        self.clips = clips
+        let candidates = (clips.map(\.output) + retainedCards.map(\.output)).sorted { $0.from < $1.from }
+        takeCandidates = try options.splitTakeCandidates(candidates)
         skippedPauses = pauses.count - removals.count
         removedDuration = try removals.reduce(.zero) { try $0.adding($1.group.to.subtracting($1.group.from)) }
     }
@@ -198,7 +235,7 @@ struct ProjectSilenceReport: Encodable {
         var checked = Set<URL>()
         for (source, media) in indexedSources.sorted(by: { $0.key < $1.key }) where checked.insert(media.url).inserted {
             if cancelled() { throw CutError(code: "cancelled", message: "Operation cancelled.") }
-            guard (try? SourceIdentity(media.url)) == media.identity else {
+            guard media.identity.isCurrentSnapshot(at: media.url) else {
                 throw CutError(code: "source_changed", message: "Source \(source) (\(media.url.path)) changed during analysis.")
             }
         }

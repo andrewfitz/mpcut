@@ -149,7 +149,7 @@ final class SidecarEditorTests: XCTestCase {
         let stream = media.audio.map(\.stream.index)
         XCTAssertEqual(stream.count, 2)
         func savedThresholds() throws -> [Int: Double] {
-            try JSONDecoder().decode([Int: Double].self, from: XCTUnwrap(sidecar.read("thresholdOverrides.v1")))
+            try JSONDecoder().decode([Int: Double].self, from: XCTUnwrap(sidecar.read("silence_threshold_overrides_db.v1")))
         }
         XCTAssertEqual(try savedThresholds(), [stream[0]: -52, stream[1]: -35])
         let savedReport = try XCTUnwrap(sidecar.sceneReport(for: media))
@@ -182,7 +182,7 @@ final class SidecarEditorTests: XCTestCase {
         let media = try XCTUnwrap(CutEngine().cachedIndex(source))
         let stream = try XCTUnwrap(media.audio.first?.stream.index)
         let sidecar = AnalysisSidecar(media: media)
-        let section = "thresholdOverrides.v1"
+        let section = "silence_threshold_overrides_db.v1"
         func thresholds() throws -> [Int: Double] {
             try JSONDecoder().decode([Int: Double].self, from: XCTUnwrap(sidecar.read(section)))
         }
@@ -242,8 +242,8 @@ final class SidecarEditorTests: XCTestCase {
         let engine = CutEngine()
         let media = try engine.inspect(url, keyframes: true)
         let sidecar = AnalysisSidecar(media: media)
-        let malformed = try XCTUnwrap(sidecar.read("index.audio.v1")) + Data([0xff])
-        func corruptAudioSection() throws { try sidecar.save(["index.audio.v1": malformed]) }
+        let malformed = try XCTUnwrap(sidecar.read("media_index_audio.v1")) + Data([0xff])
+        func corruptAudioSection() throws { try sidecar.save(["media_index_audio.v1": malformed]) }
         try corruptAudioSection()
         var restored = 0.0
         XCTAssertNil(try engine.cachedIndex(url) { restored = max(restored, $0) })
@@ -286,7 +286,7 @@ final class SidecarEditorTests: XCTestCase {
         XCTAssertEqual(first.snapTarget, .off)
         first.snapTarget = .silence
         first.minimumPause = 2
-        first.leavePause = 0.25
+        first.padding = 0.125
         first.preview.isMuted = true
         first.preview.volume = 0.4
         first.preview.scrubSoundEnabled = false
@@ -299,7 +299,7 @@ final class SidecarEditorTests: XCTestCase {
         XCTAssertTrue(second.largeThumbnails)
         XCTAssertEqual(second.snapTarget, .silence)
         XCTAssertEqual(second.minimumPause, 2)
-        XCTAssertEqual(second.leavePause, 0.25)
+        XCTAssertEqual(second.padding, 0.125)
         XCTAssertTrue(second.preview.isMuted)
         XCTAssertEqual(second.preview.volume, 0.4)
         XCTAssertFalse(second.preview.scrubSoundEnabled)
@@ -307,13 +307,13 @@ final class SidecarEditorTests: XCTestCase {
     }
 
     @MainActor
-    func testExistingKeyframePreferenceMigratesToSnapTarget() throws {
+    func testRetiredKeyframePreferenceIsIgnored() throws {
         let name = "mpcut.snap-migration.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         defaults.set(true, forKey: "snapToKeyframes")
         let editor = EditorModel(defaults: defaults)
-        XCTAssertEqual(editor.snapTarget, .keyframes)
+        XCTAssertEqual(editor.snapTarget, .off)
         for target in [TimelineSnapTarget.scenes, .silence, .keyframes, .off] {
             editor.snapTarget = target
             let reopened = EditorModel(defaults: defaults)

@@ -2,8 +2,8 @@ import AppKit
 import MPCutCore
 import SwiftUI
 
-/// The question asked before an edit made by hand lowers the timeline tier.
-/// Tier and mode names come from ExportRules. This file holds the wording around them.
+/// The question asked before an edit made by hand lowers the timeline tier. The multicam editor asks it after the
+/// edit (MulticamTierGate). Tier and mode names come from ExportRules. This file holds the wording around them.
 struct TierPrompt {
     struct Choice {
         enum Answer { case nearest, proceed, cancel }
@@ -11,7 +11,7 @@ struct TierPrompt {
         var dontAskAgain = false
     }
 
-    static let settingTitle = "Warn when an edit lowers export quality"
+    static let settingTitle = "Warn when an edit lowers the export tier"
 
     /// The edit, as history names it.
     let action: String
@@ -22,20 +22,80 @@ struct TierPrompt {
     /// The same edit with its cuts moved to verified times, which keeps the tier.
     let nearest: [ClipRequest]?
     let soundOnly: Bool
+    /// The edits Cancel undoes when the question is asked after them, as the multicam editor asks it. Zero when
+    /// it is asked before the edit.
+    var applied = 0
+    /// The multicam editor's form of `nearest`: the switches and range edges to move to verified times, which
+    /// returns the program to its tier.
+    var moves: [MulticamTierGate.Move]? = nil
+    /// Names what a factor's message identifies by id, as the multicam editor names its sources.
+    var describe: (String) -> String = { $0 }
+
+    var movements: [CutMovement] = []
+
+    struct CutMovement: Equatable, Sendable {
+        let label: String
+        let requested: RationalTime
+        let resolved: RationalTime
+        var frameCount: Int? = nil
+        var edge: Edge? = nil
+        var exactTime = false
+
+        enum Edge: Sendable { case start, end }
+
+        var text: String {
+            let direction = resolved > requested ? "later" : "earlier"
+            let shift = try? max(resolved, requested).subtracting(min(resolved, requested))
+            let delta = shift?.seconds ?? abs(resolved.seconds - requested.seconds)
+            let approximate = delta < 0.001 ? "<1 ms" : String(format: "%.0f ms", delta * 1000)
+            let amount = exactTime ? shift.map { "\($0) s" } ?? approximate : approximate
+            let from = exactTime ? "\(requested) s" : timelineTime(requested.seconds, milliseconds: true)
+            let to = exactTime ? "\(resolved) s" : timelineTime(resolved.seconds, milliseconds: true)
+            var details = ["\(amount) \(direction)"]
+            if let frameCount { details.append("\(frameCount) \(frameCount == 1 ? "frame" : "frames")") }
+            if let edge {
+                let keepsMore = (edge == .end) == (resolved > requested)
+                details.append(keepsMore ? "keeps more material" : "removes material")
+            }
+            return "\(label): \(from) → \(to) (\(details.joined(separator: ", ")))"
+        }
+
+        static func indexedFrameCount(from a: RationalTime, to b: RationalTime, in media: MediaInfo?) -> Int? {
+            guard let media, media.hasVideo, media.hasFullEditIndex else { return nil }
+            let first = min(a, b), last = max(a, b)
+            let start = media.frames.lowerBound { $0.time >= first }
+            let end = media.frames.lowerBound { $0.time >= last }
+            guard start < end, media.frames[start].time == first,
+                  last == media.duration || (media.frames.indices.contains(end) && media.frames[end].time == last) else { return nil }
+            return end - start
+        }
+    }
+
+    private var offersNearest: Bool { nearest != nil || moves != nil }
+    /// True when every factor is a picture cut inside a group of pictures, which a keyframe replaces.
+    private var cutsPicture: Bool { !factors.isEmpty && factors.allSatisfy { $0.id == .cutVideoStart || $0.id == .cutVideoEnd } }
+    /// What the nearest choice moves a cut to.
+    private var nearestPoint: String {
+        if soundOnly { return "exact audio boundary" }
+        return moves != nil && !cutsPicture ? "verified time" : "keyframe"
+    }
 
     var title: String {
-        guard to.tier != nil else { return "“\(action)” would prevent export" }
-        if nearest != nil { return "Keep the cut here?" }
+        guard to.tier != nil else {
+            if applied > 1 { return "The last \(applied) edits prevent export" }
+            return "“\(action)” \(applied > 0 ? "prevents" : "would prevent") export"
+        }
+        if offersNearest { return "Keep the cut here?" }
         return "Change export quality from \(ExportRules.displayName(tier: from)) to \(to.name)?"
     }
 
     var message: String {
-        if nearest != nil, !soundOnly, from == .trueLossless, to.tier == .lossless,
-           !factors.isEmpty, factors.allSatisfy({ $0.id == .cutVideoStart || $0.id == .cutVideoEnd }) {
-            return "At this cut, \(ExportRules.displayName(mode: .smart)) re-encodes the surrounding video. Cut at the nearest keyframe for a \(ExportRules.displayName(tier: from)) copy."
+        if nearest != nil, !soundOnly, from == .trueLossless, to.tier == .lossless, cutsPicture {
+            let summary = "At this cut, \(ExportRules.displayName(mode: .smart)) re-encodes the surrounding video. Cut at the nearest keyframe for a \(ExportRules.displayName(tier: from)) copy."
+            return ([summary] + movements.map(\.text)).joined(separator: "\n\n")
         }
         var lines: [String] = []
-        if let first = factors.first { lines.append(ExportRules.displayMessage(first.message)) }
+        if let first = factors.first { lines.append(describe(ExportRules.displayMessage(first.message))) }
         if makesMixed {
             lines.append(ExportRules.mixedImportNote)
         } else if factors.contains(where: { $0.id == .placementPicture || $0.id == .placementSilence }),
@@ -44,23 +104,32 @@ struct TierPrompt {
         } else if let tier = to.tier {
             lines.append(ExportRules.summary(tier: tier, source: soundOnly ? .audio : .movie))
         } else if lines.isEmpty, case .unavailable(let issue) = to {
-            lines.append(ExportRules.displayMessage(issue.message))
+            lines.append(describe(ExportRules.displayMessage(issue.message)))
         }
-        if nearest != nil {
-            let point = soundOnly ? "exact audio boundary" : "keyframe"
-            lines.append("Move the cut to the nearest \(point) to keep \(ExportRules.displayName(tier: from)).")
+        if offersNearest {
+            let cuts = (moves?.count ?? 1) > 1 ? "cuts" : "cut"
+            lines.append("Move the \(cuts) to the nearest \(nearestPoint) to keep \(ExportRules.displayName(tier: from)).")
+            lines.append(contentsOf: movements.map(\.text))
         }
+        if applied > 0, let times = factors.first?.nearest, !times.isEmpty {
+            let listed = times.prefix(3).map { timelineTime($0.seconds, milliseconds: true) }.joined(separator: ", ")
+            lines.append("Verified times near this cut: \(listed).")
+        }
+        if applied > 1 { lines.append("Cancel undoes the last \(applied) edits.") }
         return lines.joined(separator: "\n\n")
     }
 
-    var nearestTitle: String { soundOnly ? "Cut at Nearest Exact Point" : "Cut at Nearest Keyframe" }
+    var nearestTitle: String {
+        if soundOnly { return "Cut at Nearest Exact Point" }
+        return moves != nil && !cutsPicture ? "Cut at Nearest Verified Time" : "Cut at Nearest Keyframe"
+    }
     /// True when the edit adds a clip in another format, which leaves only Re-encode for the whole project.
-    var makesMixed: Bool { to.tier != nil && factors.contains { $0.id == .joinStreamMismatch } }
-    var proceedTitle: String { makesMixed ? ExportRules.mixedImportProceedTitle : nearest == nil ? "Continue" : "Cut Here" }
+    var makesMixed: Bool { applied == 0 && to.tier != nil && factors.contains { $0.id == .joinStreamMismatch } }
+    var proceedTitle: String { makesMixed ? ExportRules.mixedImportProceedTitle : offersNearest ? "Cut Here" : "Continue" }
 
     /// The buttons in order. The first is the default.
     var buttons: [(title: String, answer: Choice.Answer)] {
-        (nearest == nil ? [] : [(nearestTitle, Choice.Answer.nearest)]) + [(proceedTitle, .proceed), ("Cancel", .cancel)]
+        (offersNearest ? [(nearestTitle, Choice.Answer.nearest)] : []) + [(proceedTitle, .proceed), ("Cancel", .cancel)]
     }
 
     /// Asks on the editor window. Without a visible window there is no one to ask, so the edit goes ahead.
@@ -75,8 +144,8 @@ struct TierPrompt {
             let control = alert.addButton(withTitle: button.title)
             switch button.answer {
             case .nearest: control.toolTip = "Use nearest compatible boundary"
-            case .proceed: control.toolTip = "Apply requested edit"
-            case .cancel: control.toolTip = "Cancel edit"
+            case .proceed: control.toolTip = prompt.applied > 0 ? "Keep edit" : "Apply requested edit"
+            case .cancel: control.toolTip = prompt.applied > 0 ? "Undo edit" : "Cancel edit"
             }
         }
         alert.buttons.last?.keyEquivalent = "\u{1b}"
@@ -93,7 +162,7 @@ struct TierPrompt {
 }
 
 extension EditorModel {
-    /// The tier of the timeline as a remote client reads it, in the shape `mpcut inspect` reports. Nil for an empty timeline.
+    /// The tier of the timeline as a remote client reads it, in the shape `mpcut project inspect` reports. Nil for an empty timeline.
     /// `current` is false while a newer timeline is still being checked.
     var tierReport: [String: Any]? {
         guard let state = tierState else { return nil }

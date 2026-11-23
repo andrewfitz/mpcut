@@ -37,6 +37,11 @@ final class ClipEditCSVTests: XCTestCase {
         fails(URL(fileURLWithPath: "/dev/null"), with: "csv_read_failed")
         let file = directory.appendingPathComponent("selects.csv")
         fails(file, with: "csv_read_failed")
+        try Data("from,to\n1,2\n".utf8).write(to: file)
+        for suffix in ["?query=1", "#fragment", "%00suffix"] {
+            let rejected = try XCTUnwrap(URL(string: file.absoluteString + suffix))
+            fails(rejected, with: "csv_read_failed")
+        }
         try Data([0xff, 0xfe, 0x30]).write(to: file)
         fails(file, with: "invalid_csv")
         let handle = try FileHandle(forWritingTo: file)

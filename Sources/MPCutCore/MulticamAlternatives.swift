@@ -3,23 +3,27 @@ import Foundation
 extension MulticamEngine {
     func pictureAlternatives(at seam: RationalTime, mapping: MulticamPlan,
                              media: [String: MediaInfo], mode: ExportMode, container: String,
-                             validateAudio: Bool, convertedAudio: ReencodeAudio?,
-                             settings: ReencodeSettings = .init()) throws -> [RationalTime] {
+                             settings: ReencodeSettings = .init(),
+                             replanning: ((RationalTime, RationalTime) throws -> MulticamPlan)? = nil,
+                             validatesCandidate: (MulticamPlan) throws -> Void) throws -> [RationalTime] {
         try switchAlternatives(at: seam, mapping: mapping, media: media, mode: mode, container: container,
-                               validateAudio: validateAudio, convertedAudio: convertedAudio, soundOnly: false, settings: settings)
+                               soundOnly: false, settings: settings, replanning: replanning, validatesCandidate: validatesCandidate)
     }
 
     func soundOnlyAlternatives(at seam: RationalTime, mapping: MulticamPlan, media: [String: MediaInfo],
-                               container: String) throws -> [RationalTime] {
+                               container: String, spans: [MulticamSpan],
+                               replanning: ((RationalTime, RationalTime) throws -> MulticamPlan)? = nil,
+                               validatesCandidate: (MulticamPlan) throws -> Void) throws -> [RationalTime] {
         try switchAlternatives(at: seam, mapping: mapping, media: media, mode: .copy, container: container,
-                               validateAudio: true, convertedAudio: nil, soundOnly: true, settings: .init())
+                               soundOnly: true, settings: .init(), soundSpans: spans, replanning: replanning, validatesCandidate: validatesCandidate)
     }
 
     private func switchAlternatives(at seam: RationalTime, mapping: MulticamPlan, media: [String: MediaInfo],
-                                    mode: ExportMode, container: String, validateAudio: Bool,
-                                    convertedAudio: ReencodeAudio?, soundOnly: Bool,
-                                    settings: ReencodeSettings) throws -> [RationalTime] {
-        let spans = soundOnly ? mapping.audio : mapping.picture
+                                    mode: ExportMode, container: String, soundOnly: Bool,
+                                    settings: ReencodeSettings, soundSpans: [MulticamSpan]? = nil,
+                                    replanning: ((RationalTime, RationalTime) throws -> MulticamPlan)?,
+                                    validatesCandidate: (MulticamPlan) throws -> Void) throws -> [RationalTime] {
+        let spans = soundSpans ?? mapping.picture
         guard let leftIndex = spans.firstIndex(where: { $0.output.to == seam }),
               spans.indices.contains(leftIndex + 1) else { return [] }
         let left = spans[leftIndex]
@@ -63,14 +67,9 @@ extension MulticamEngine {
                                                cancelled: cancelled ?? { false }) { candidate in
             guard candidate > lower, candidate < upper else { return false }
             do {
-                let candidateMapping = try movingMarker(from: opening, to: closing, at: candidate, in: mapping)
-                if validateAudio && candidateMapping.audio != mapping.audio {
-                    if let convertedAudio {
-                        _ = try resolveConvertedSound(candidateMapping, sources: media, container: container, action: convertedAudio)
-                    } else {
-                        _ = try resolveSound(candidateMapping, sources: media, container: container)
-                    }
-                }
+                let candidateMapping = try replanning?(opening.group.to, candidate)
+                    ?? movingMarker(from: opening, to: closing, at: candidate, in: mapping)
+                try validatesCandidate(candidateMapping)
                 if !soundOnly {
                     let engine = CutEngine(multicamSmartPicture: mode == .smart, cancelled: cancelled)
                     var cached: [URL: MediaInfo] = [:]
@@ -104,6 +103,8 @@ extension MulticamEngine {
     /// its fault. A fault at a later boundary is reported in turn once this edge has moved.
     func edgeAlternatives(_ edge: MulticamEdge, mapping: MulticamPlan, media: [String: MediaInfo],
                           mode: ExportMode, container: String, picture: Bool, sound: Bool,
+                          soundLaneID: String? = nil, strictCandidates: Bool = false,
+                          resolvedLanes: [MulticamPlannedAudioLane]? = nil,
                           adjusting: MulticamEdgePlanner,
                           failure: (MulticamPlan) throws -> CutError?) throws -> [RationalTime] {
         let starting = edge.boundary == "from"
@@ -136,12 +137,13 @@ extension MulticamEngine {
                                              first: starting && seam == .zero, last: !starting && seam == mapping.duration)
             grids.append(grid.including(try continuousInput(mapping.picture, with: span)))
         }
+        let soundSpans = (resolvedLanes ?? mapping.audioLanes).first { soundLaneID == nil || $0.id == soundLaneID }?.spans ?? []
         var checksSamples = false
-        if sound, let (span, offset) = try lane(mapping.audio), let source = media[span.source],
+        if sound, let (span, offset) = try lane(soundSpans), let source = media[span.source],
            let index = span.stream, let track = source.audio.first(where: { $0.stream.index == index }) {
             let selector = CutEngine(cancelled: cancelled, tracks: .audio, audioStream: index)
             let selected = try selector.selectedMedia(source)
-            let join = try continuousInput(mapping.audio, with: span)
+            let join = try continuousInput(soundSpans, with: span)
             let first = starting ? seam == .zero : span.output.from == .zero
             let last = starting ? span.output.to == mapping.duration : seam == mapping.duration
             let sampleCopy = track.stream.isPCM || selector.supportsAACEdits(track.stream, container: container)
@@ -154,7 +156,9 @@ extension MulticamEngine {
                 checksSamples = true
                 if grids.isEmpty {
                     let sample = try origin.adding(edge.at.subtracting(offset)).roundedToSamples(rate)
-                    let times = try [-1, 0, 1].compactMap { delta -> RationalTime? in
+                    // Different lane rates may meet only every several samples.
+                    let radius = strictCandidates ? max(1, rate / 100) : 1
+                    let times = try (-radius...radius).compactMap { delta -> RationalTime? in
                         let (moved, overflow) = sample.addingReportingOverflow(Int64(delta))
                         return overflow ? nil : try RationalTime(numerator: moved, denominator: Int64(rate)).subtracting(origin)
                     }
@@ -206,7 +210,7 @@ extension MulticamEngine {
                 decisions.append(interval)
             }
         }
-        let neighbor = mapping.audio.first {
+        let neighbor = soundSpans.first {
             starting ? $0.output.from < seam && seam <= $0.output.to : $0.output.from <= seam && seam < $0.output.to
         }
         let neighborTime = try neighbor.map { try $0.input.from.adding(seam.subtracting($0.output.from)) }
@@ -217,9 +221,10 @@ extension MulticamEngine {
             let decision = decisions[index]
             guard decision.group.from <= candidate, let selected = decision.audio, let source = media[selected.source],
                   let track = source.audio.first(where: { $0.stream.index == selected.stream }) else { return true }
-            let spanIndex = clockPlan.audio.lowerBound { $0.output.to > decision.output.from }
-            guard clockPlan.audio.indices.contains(spanIndex) else { return true }
-            let span = clockPlan.audio[spanIndex]
+            let spans = clockPlan.audioLanes.first { $0.id == MulticamPlan.programAudioLaneID }?.spans ?? []
+            let spanIndex = spans.lowerBound { $0.output.to > decision.output.from }
+            guard spans.indices.contains(spanIndex) else { return true }
+            let span = spans[spanIndex]
             let local = try span.input.from.adding(decision.output.from.subtracting(span.output.from))
                 .adding(candidate.subtracting(decision.group.from))
             if neighbor?.source == selected.source, neighbor?.stream == selected.stream, local == neighborTime { return true }
@@ -233,7 +238,7 @@ extension MulticamEngine {
 
         return try MulticamBoundary.search(near: edge.at, among: grids, within: lower...upper,
                                            cancelled: cancelled ?? { false }) { candidate in
-            if checksSamples, try !admitsSample(candidate) { return .skip }
+            if checksSamples, !strictCandidates, try !admitsSample(candidate) { return .skip }
             let plan: MulticamPlan
             do {
                 plan = try adjusting(edge.range, edge.boundary, candidate)
@@ -246,6 +251,7 @@ extension MulticamEngine {
             guard output(of: candidate, in: plan) != nil else { return .skip }
             guard let issue = try failure(plan) else { return .accept }
             if issue.code == "cancelled" || issue.code == "source_changed" { throw issue }
+            if strictCandidates { return .skip }
             // A located fault at another boundary leaves this edge acceptable.
             guard let context = issue.multicam, issue.boundary != nil else { return .skip }
             if let other = context.edge, other.range == edge.range, other.boundary == edge.boundary { return .skip }
@@ -253,8 +259,26 @@ extension MulticamEngine {
         }
     }
 
+    func markerPlanner(_ project: MulticamProject?) -> ((RationalTime, RationalTime) throws -> MulticamPlan)? {
+        guard let project else { return nil }
+        return { marker, candidate in
+            var updated = project
+            guard let index = updated.switches.firstIndex(where: { $0.at == marker }) else {
+                throw CutError(code: "invalid_range", message: "There is no camera switch at the proposed boundary.")
+            }
+            if index > 0, candidate <= updated.switches[index - 1].at {
+                throw CutError(code: "invalid_range", message: "The proposed switch crosses another switch.")
+            }
+            if updated.switches.indices.contains(index + 1), candidate >= updated.switches[index + 1].at {
+                throw CutError(code: "invalid_range", message: "The proposed switch crosses another switch.")
+            }
+            updated.switches[index].at = candidate
+            return try updated.plan()
+        }
+    }
+
     private func sameDecision(_ lhs: MulticamInterval, _ rhs: MulticamInterval) -> Bool {
-        lhs.angle == rhs.angle && lhs.audio == rhs.audio
+        lhs.angle == rhs.angle && lhs.pictureSourceID == rhs.pictureSourceID && lhs.audio == rhs.audio
     }
 
     private func movingMarker(from before: MulticamInterval, to after: MulticamInterval,
@@ -267,6 +291,7 @@ extension MulticamEngine {
         var intervals: [MulticamInterval] = []
         var picture: [MulticamSpan] = []
         var audio: [MulticamSpan] = []
+        let programSound = mapping.audioLanes.first { $0.id == MulticamPlan.programAudioLaneID }?.spans ?? []
 
         func span(_ lane: [MulticamSpan], for interval: MulticamInterval) -> MulticamSpan? {
             let index = lane.lowerBound { $0.output.to > interval.output.from }
@@ -277,19 +302,23 @@ extension MulticamEngine {
         func append(_ group: MulticamRange, in original: MulticamInterval, using decision: MulticamInterval) throws {
             let outputOffset = try original.output.from.subtracting(original.group.from)
             let output = try MulticamRange(from: group.from.adding(outputOffset), to: group.to.adding(outputOffset))
+            let startsAtSwitch = group.from == candidate && sameDecision(decision, after)
+                ? true : group.from == original.group.from && group.from != marker ? original.startsAtSwitch : false
             intervals.append(.init(group: group, output: output, angle: decision.angle,
-                                   audio: decision.audio, assemblyIndex: original.assemblyIndex))
+                                   pictureSourceID: decision.pictureSourceID, audio: decision.audio,
+                                   assemblyIndex: original.assemblyIndex, startsAtSwitch: startsAtSwitch))
 
             func appendSpan(_ originalLane: [MulticamSpan], to lane: inout [MulticamSpan]) throws {
                 guard let selected = span(originalLane, for: decision) else { return }
                 let sourceOffset = try selected.input.from.subtracting(selected.output.from)
                     .adding(decision.output.from).subtracting(decision.group.from)
                 let input = try MulticamRange(from: group.from.adding(sourceOffset), to: group.to.adding(sourceOffset))
-                MulticamSpan(source: selected.source, stream: selected.stream, input: input, output: output)
+                MulticamSpan(source: selected.source, stream: selected.stream, input: input, output: output,
+                             replacementBindingID: selected.replacementBindingID)
                     .appendCoalescing(to: &lane)
             }
             try appendSpan(mapping.picture, to: &picture)
-            try appendSpan(mapping.audio, to: &audio)
+            try appendSpan(programSound, to: &audio)
         }
 
         for interval in mapping.intervals {
@@ -309,7 +338,17 @@ extension MulticamEngine {
                 try append(.init(from: to, to: interval.group.to), in: interval, using: interval)
             }
         }
-        return MulticamPlan(intervals: intervals, picture: picture, audio: audio, duration: mapping.duration)
+        let lanes: [MulticamPlannedAudioLane]
+        if mapping.audioLanes.count == 1, var lane = mapping.audioLanes.first, lane.id == MulticamPlan.programAudioLaneID {
+            lane.spans = audio
+            lanes = [lane]
+        } else {
+            lanes = mapping.audioLanes
+        }
+        var moved = MulticamPlan(intervals: intervals, picture: picture, audioLanes: lanes, duration: mapping.duration)
+        moved.joinedAudioReplacements = mapping.joinedAudioReplacements
+        moved.joinedAudioSelections = mapping.joinedAudioSelections
+        return moved
     }
 
     private func audioGrid(_ span: MulticamSpan, media: MediaInfo, starting: Bool,

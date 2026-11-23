@@ -60,18 +60,18 @@ final class SceneScanHandoffTests: XCTestCase {
         XCTAssertNil(editor.sceneReport(clipID: selected.id))
 
         func attempts() async throws -> [[String: Any]] {
-            let object = try await json(cli, ["sidecar", "--json", "--status", source.path])
+            let object = try await json(cli, ["analysis", "sidecar", "inspect", "--json", source.path])
             let inventory = try XCTUnwrap(object["inventory"] as? [String: Any])
-            return try XCTUnwrap(inventory["sceneAttempts"] as? [[String: Any]])
+            return try XCTUnwrap(inventory["scene_attempts"] as? [[String: Any]])
         }
         let before = try await attempts()
         XCTAssertEqual(before.count, 1)
         let checkpoint = try XCTUnwrap(before.first)
         let attempt = try XCTUnwrap(checkpoint["id"] as? String)
         XCTAssertEqual(checkpoint["state"] as? String, "paused")
-        XCTAssertEqual(try XCTUnwrap(checkpoint["coveredThrough"] as? Double), durable.seconds, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(checkpoint["covered_through"] as? Double), durable.seconds, accuracy: 1e-9)
 
-        let resumed = try await json(cli, ["scenes", "--json", "--resume", "--project", project.path, "--clip-id", "selected"])
+        let resumed = try await json(cli, ["scenes", "scan", "--json", "--policy", "resume", "--project", project.path, "--clip-id", "selected"])
         let sources = try XCTUnwrap(resumed["sources"] as? [[String: Any]])
         XCTAssertEqual(sources.count, 1)
         let outcome = try XCTUnwrap(sources.first?["outcome"] as? [String: Any])
@@ -81,20 +81,20 @@ final class SceneScanHandoffTests: XCTestCase {
         XCTAssertEqual(after.count, 1)
         XCTAssertEqual(after.first?["id"] as? String, attempt)
         XCTAssertEqual(after.first?["state"] as? String, "completed")
-        XCTAssertEqual(after.first?["coveredThrough"] as? Double, to.seconds)
+        XCTAssertEqual(after.first?["covered_through"] as? Double, to.seconds)
 
         func call(_ tool: String, _ arguments: [String: Any]) async throws -> [String: Any] {
             try await sessions.handleMCPCommand(tool: tool, arguments: arguments, session: session) {}
         }
-        let job = try await call("file_scenes", [
-            "operationID": UUID().uuidString, "file": source.path, "from": from.description, "to": to.description
+        let job = try await call("scenes_file_scan", [
+            "operation_id": UUID().uuidString, "file": source.path, "source_from": from.description, "source_to": to.description
         ])
         let jobID = try XCTUnwrap(job["job_id"] as? String)
         let deadline = ContinuousClock.now + .seconds(30)
-        var received = try await call("file_job_status", ["job_id": jobID])
+        var received = try await call("file_job_status_read", ["job_id": jobID])
         while received["state"] as? String == "running", ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(10))
-            received = try await call("file_job_status", ["job_id": jobID])
+            received = try await call("file_job_status_read", ["job_id": jobID])
         }
         XCTAssertEqual(received["state"] as? String, "succeeded", String(describing: received))
         let mcpReport = try XCTUnwrap(received["result"] as? [String: Any])
@@ -103,8 +103,8 @@ final class SceneScanHandoffTests: XCTestCase {
         editor.scanForScenes(clipID: editor.sceneClipID)
         try await wait(for: "the editor to open the CLI's completed report") { editor.sceneProgress == nil }
         XCTAssertEqual(editor.sceneStatus, "Up to date")
-        let live = try await call("list_scenes", ["clip": id])
-        XCTAssertEqual(live["clip"] as? String, id)
+        let live = try await call("scenes_editor_boundaries_list", ["clip_id": id])
+        XCTAssertEqual(live["clip_id"] as? String, id)
         XCTAssertEqual(live["clock"] as? String, "source")
         let items = try XCTUnwrap(live["items"] as? [[String: Any]])
         let starts = try items.map { try RationalTime(parsing: XCTUnwrap($0["from"] as? String)).seconds }

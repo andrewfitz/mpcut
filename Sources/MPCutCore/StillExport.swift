@@ -2,7 +2,7 @@ import Foundation
 
 public struct StillPictureAction: Encodable, Sendable {
     public enum Action: String, Codable, Sendable {
-        case copy, encodeCamera, generateStill
+        case copy, encodeCamera = "encode_camera", generateStill = "generate_still"
     }
 
     public let action: Action
@@ -25,10 +25,18 @@ public struct StillExportReport: Encodable, Sendable {
     public let copiedVideoDuration: RationalTime
     public let encodedVideoDuration: RationalTime
     public let picture: [StillPictureAction]
+    public let cutMap: ExportCutMap
     public let placements: [StillTimelineSpan]
+    public let audioOutput: MulticamAudioOutput
     public let soundActions: [StillSoundAction]
     public let colorPolicy: StillProgramColorPolicy?
     public let warnings: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case mode, tracks, container, duration, copiedCameraDuration, encodedCameraDuration
+        case generatedStillDuration, copiedVideoDuration, encodedVideoDuration, picture, placements
+        case audioOutput, soundActions, colorPolicy, warnings
+    }
 }
 
 public struct StillExportPlan: Sendable {
@@ -41,17 +49,21 @@ public struct StillExportPlan: Sendable {
     let identities: [URL: SourceIdentity]
     let settings: ReencodeSettings
     let hdrMetadata: StillHDRMetadata?
+
+    func verifySources(using engine: CutEngine) throws {
+        for (file, identity) in identities {
+            try engine.checkCancellation()
+            try engine.verifyIdentity(file, identity: identity)
+        }
+        try sound?.verifySources()
+        try engine.checkCancellation()
+    }
 }
 
 struct StillExportPicture: Sendable {
     enum Content: Sendable {
         case camera(media: MediaInfo, input: MulticamRange, frames: Range<Int>, edges: [EncodedEdge])
         case still(file: URL, framing: StillImageFraming, reference: StreamInfo, schedule: StillSampleSchedule)
-
-        var needsExactVariableTiming: Bool {
-            if case .still(_, _, _, let schedule) = self { return schedule.requiresRetime(at: schedule.cadence) }
-            return false
-        }
     }
 
     let output: MulticamRange
@@ -82,31 +94,45 @@ public struct StillExportPlanner: Sendable {
                         tracks: ExportTracks = .all, audioStream: Int? = nil, audioTrackOrdinal: Int? = nil,
                         mode: ExportMode? = nil,
                         requireCameraCopy: Bool = false, container: String? = nil, output: URL? = nil,
-                        settings: ReencodeSettings = .init(), offerAlternatives: Bool = true) throws -> StillExportPlan {
+                        settings: ReencodeSettings = .init(), offerAlternatives: Bool = true,
+                        audioOutput: MulticamAudioOutput = .separateTracks,
+                        audioAction: ReencodeAudio? = nil) throws -> StillExportPlan {
         try resolve(.multicam(project), relativeTo: location, tracks: tracks, audioStream: audioStream,
                     audioTrackOrdinal: audioTrackOrdinal,
                     mode: mode, requireCameraCopy: requireCameraCopy, container: container, output: output,
-                    settings: settings, offerAlternatives: offerAlternatives)
+                    settings: settings, offerAlternatives: offerAlternatives, audioOutput: audioOutput, audioAction: audioAction)
     }
 
     public func resolve(_ project: CutProject, relativeTo location: URL? = nil,
                         tracks: ExportTracks = .all, audioStream: Int? = nil, audioTrackOrdinal: Int? = nil,
                         mode requestedMode: ExportMode? = nil,
                         requireCameraCopy: Bool = false, container requestedContainer: String? = nil, output: URL? = nil,
-                        settings requestedSettings: ReencodeSettings = .init(), offerAlternatives: Bool = true) throws -> StillExportPlan {
+                        settings requestedSettings: ReencodeSettings = .init(), offerAlternatives: Bool = true,
+                        audioOutput: MulticamAudioOutput = .separateTracks,
+                        audioAction: ReencodeAudio? = nil) throws -> StillExportPlan {
+        let engine = CutEngine(cancelled: cancelled)
+        try engine.checkCancellation()
+        guard project.participants.render == nil else { throw ParticipantProjectExport.unsupported("Still export") }
         let timeline = try project.resolveStills()
         let visible = timeline.spans.filter { $0.placementID != nil }
         let stillFormat = project.stillFormat
-        let settings: ReencodeSettings
-        if let stillFormat {
-            settings = ReencodeSettings(codec: stillFormat.codec,
-                                        quality: stillFormat.codec == requestedSettings.codec ? requestedSettings.quality : nil,
-                                        audio: requestedSettings.audio)
-        } else {
-            settings = requestedSettings
-        }
         let source: ExportSourceKind
-        if case .multicam = project { source = .multicam } else { source = .movie }
+        let usesMix: Bool
+        if case .multicam(let multicam) = project {
+            source = .multicam
+            usesMix = multicam.audio == .mix
+        } else {
+            source = .movie
+            usesMix = false
+        }
+        let independentAudio = usesMix || audioAction != nil || audioOutput != .separateTracks ||
+            (source == .multicam && requestedSettings.audio != .auto)
+        let defaultAudio = usesMix && audioOutput == .separateTracks && requestedSettings.audio == .auto
+            ? ReencodeAudio.copyOriginal : requestedSettings.audio
+        let codec = stillFormat?.codec ?? requestedSettings.codec
+        let settings = ReencodeSettings(codec: codec,
+                                        quality: codec == requestedSettings.codec ? requestedSettings.quality : nil,
+                                        audio: audioAction ?? defaultAudio)
         let ordinaryMode = ExportRules.defaultMode(for: source, tracks: tracks)
         let selectionMode = requestedMode ?? ExportRules.defaultStillMode(tracks: tracks, placements: timeline.exportPlacementScope,
                                                                           otherwise: ordinaryMode)
@@ -116,7 +142,7 @@ public struct StillExportPlanner: Sendable {
         let container = requestedContainer?.lowercased() ?? (ext.isEmpty ?
             (tracks == .audio ? "m4a" : project.stillFormat?.container ??
                 (mode == .encode ? ExportRules.defaultReencodeContainer(settings.codec) : "mov")) : ext)
-        if let output { try CutEngine(cancelled: cancelled).checkDestination(output) }
+        if let output { try engine.checkDestination(output) }
         guard ext.isEmpty || container == ext else {
             throw CutError(code: "invalid_output", message: "The destination extension must match the selected container.")
         }
@@ -132,13 +158,17 @@ public struct StillExportPlanner: Sendable {
               tracks != .audio || settings.audio != .removeAudio else {
             throw CutError(code: "invalid_arguments", message: "Choose an audio-only output and a nonnegative stream index.")
         }
+        guard ExportRules.movieAudioActions.contains(settings.audio) else {
+            throw CutError(code: "unsupported_audio", message: "Still timeline exports convert sound to PCM or AAC.")
+        }
         let document = location ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
             .appendingPathComponent("Untitled.cut")
         do {
             return try plan(project, document: document, timeline: timeline, visible: visible, tracks: tracks,
                             audioStream: audioStream, audioTrackOrdinal: audioTrackOrdinal,
                             mode: mode, requireCameraCopy: requireCameraCopy,
-                            container: container, settings: settings)
+                            container: container, settings: settings,
+                            audioOutput: audioOutput, independentAudio: independentAudio)
         } catch {
             let join = error as? StillUnsafeJoin
             guard var failure = join?.issue ?? (error as? CutError) else { throw error }
@@ -152,7 +182,8 @@ public struct StillExportPlanner: Sendable {
                         _ = try plan(adjusted, document: document, timeline: adjustedTimeline,
                                      visible: adjustedTimeline.spans.filter { $0.placementID != nil },
                                      tracks: tracks, audioStream: audioStream, audioTrackOrdinal: audioTrackOrdinal, mode: mode,
-                                     requireCameraCopy: requireCameraCopy, container: container, settings: settings)
+                                     requireCameraCopy: requireCameraCopy, container: container, settings: settings,
+                                     audioOutput: audioOutput, independentAudio: independentAudio)
                         adjustments.append(proposal)
                     } catch let issue as CutError where issue.code == "cancelled" || issue.code == "source_changed" {
                         throw issue
@@ -164,24 +195,44 @@ public struct StillExportPlanner: Sendable {
             }
             let defaultContainer = tracks == .audio ? "m4a" : stillFormat?.container ??
                 ExportRules.defaultReencodeContainer(settings.codec)
-            let candidates = container == defaultContainer ? [container] : [container, defaultContainer]
+            var candidates = container == defaultContainer ? [container] : [container, defaultContainer]
+            let containerFailure = failure.code == "unsupported_container" ||
+                failure.code == "still_generation_unavailable" || failure.factor == .outputContainer
+            if containerFailure, stillFormat == nil || tracks == .audio {
+                let actions = tracks == .audio && settings.audio == .auto ? ExportRules.stillSoundConversions : [settings.audio]
+                let supported = actions.flatMap {
+                    ExportRules.stillContainers(mode: mode, tracks: tracks, codec: settings.codec, audio: $0)
+                }
+                for option in supported where !candidates.contains(option) { candidates.append(option) }
+            }
             var modes: [(mode: ExportMode, requireCopy: Bool)] = []
             if tracks != .audio && !visible.isEmpty &&
-                (mode == .copy || (mode == .smart && failure.track != nil) ||
+                (mode == .copy || (mode == .smart && (failure.track != nil || containerFailure)) ||
                     (mode == .encode && requireCameraCopy && failure.code == "camera_copy_required")) {
                 modes.append((.smart, requireCameraCopy))
             }
             if mode == .smart && requireCameraCopy && failure.code == "camera_copy_required" {
                 modes.append((.smart, false))
             }
-            if mode != .encode { modes.append((.encode, stillFormat != nil && requireCameraCopy)) }
+            if mode != .encode {
+                modes.append((.encode, stillFormat != nil && requireCameraCopy))
+            } else if containerFailure || independentAudio {
+                modes.append((.encode, requireCameraCopy))
+            }
+            if independentAudio && tracks != .video && settings.audio != .removeAudio &&
+                !modes.contains(where: { $0.mode == mode && $0.requireCopy == requireCameraCopy }) {
+                modes.insert((mode, requireCameraCopy), at: 0)
+            }
             var alternatives: [ExportAlternative] = []
             for (alternateMode, alternateCopy) in modes {
                 var soundActions = [settings.audio]
-                if tracks != .video && settings.audio != .removeAudio {
-                    soundActions += [ReencodeAudio.aac, .pcm].filter { $0 != settings.audio }
+                if tracks != .video && settings.audio != .removeAudio &&
+                    (independentAudio || alternateMode != mode || !containerFailure) {
+                    let deliverable: [ReencodeAudio] = independentAudio ? [.auto, .aac, .pcm] : [.aac, .pcm]
+                    soundActions += deliverable.filter { $0 != settings.audio }
                 }
-                let codecs: [ReencodeCodec] = alternateMode == .encode && tracks != .audio && stillFormat == nil
+                if !independentAudio, tracks == .audio, settings.audio == .auto { soundActions = [.aac, .pcm] }
+                let codecs: [ReencodeCodec] = alternateMode == .encode && alternateMode != mode && tracks != .audio && stillFormat == nil
                     && settings.codec != .hevc ? [settings.codec, .hevc] : [settings.codec]
                 var found = false
                 for candidate in candidates where !found {
@@ -196,10 +247,11 @@ public struct StillExportPlanner: Sendable {
                                                            tracks: tracks, audioStream: audioStream, audioTrackOrdinal: audioTrackOrdinal,
                                                            mode: alternateMode,
                                                            requireCameraCopy: alternateCopy, container: candidate,
-                                                           settings: options)
+                                                           settings: options, audioOutput: audioOutput,
+                                                           independentAudio: independentAudio)
                                 alternatives.append(offer(alternative.report, settings: options, requireCameraCopy: alternateCopy,
                                                           relaxesCameraCopy: requireCameraCopy && !alternateCopy,
-                                                          audioStream: audioStream))
+                                                          audioStream: audioStream, independentAudio: independentAudio))
                                 found = true
                                 break
                             } catch let issue as CutError where issue.code == "cancelled" || issue.code == "source_changed" {
@@ -217,13 +269,15 @@ public struct StillExportPlanner: Sendable {
     }
 
     private func offer(_ report: StillExportReport, settings: ReencodeSettings, requireCameraCopy: Bool,
-                       relaxesCameraCopy: Bool, audioStream: Int?) -> ExportAlternative {
+                       relaxesCameraCopy: Bool, audioStream: Int?, independentAudio: Bool) -> ExportAlternative {
         let mode = report.mode
-        let audio = report.soundActions.first(where: { $0.audio != .copyOriginal })?.audio ??
-            report.soundActions.first?.audio
+        let audio = settings.audio == .removeAudio && report.tracks != .video ? .removeAudio :
+            report.soundActions.first(where: { $0.audio != .copyOriginal })?.audio ?? report.soundActions.first?.audio
         var label = mode == .smart ? "Generate stills with Smart Trim" :
             (report.tracks == .audio ? "Convert the soundtrack and generate silence" : "Re-encode the program")
-        if mode == .smart, let audio, audio != .copyOriginal {
+        if audio == .removeAudio {
+            label += " and omit audio"
+        } else if mode == .smart, let audio, audio != .copyOriginal {
             label += " and convert affected audio to \(audio.rawValue.uppercased())"
         }
         if relaxesCameraCopy && report.encodedCameraDuration > .zero { label += " (allows camera encoding)" }
@@ -231,20 +285,25 @@ public struct StillExportPlanner: Sendable {
         var arguments = ["--mode", mode.rawValue]
         if report.tracks != .all { arguments += ["--tracks", report.tracks.rawValue] }
         if let audioStream { arguments += ["--audio-stream", String(audioStream)] }
-        if let audio, audio != .copyOriginal { arguments += ["--audio", audio.rawValue] }
+        if report.tracks != .video {
+            arguments += ["--audio", settings.audio.rawValue]
+            if report.audioOutput != .separateTracks { arguments += ["--audio-output", report.audioOutput.rawValue] }
+        }
         if mode == .encode && report.tracks != .audio {
             arguments += ["--video", settings.codec.rawValue, "--quality", settings.quality.rawValue]
         }
         if requireCameraCopy { arguments.append("--require-camera-copy") }
         return ExportAlternative(id: "still-\(mode.rawValue)-\(report.container)", rung: rung, label: label,
-                                 mode: mode, tracks: report.tracks, container: report.container, audio: audio,
+                                 mode: mode, tracks: report.tracks, container: report.container,
+                                 audio: independentAudio && report.tracks != .video ? settings.audio : audio,
                                  codec: mode == .encode && report.tracks != .audio ? settings.codec.rawValue : nil,
                                  bitRate: nil, quality: nil, lossless: false, warnings: [], arguments: arguments, clips: nil)
     }
 
     private func plan(_ project: CutProject, document: URL, timeline: StillTimelinePlan,
                       visible: [StillTimelineSpan], tracks: ExportTracks, audioStream: Int?, audioTrackOrdinal: Int?, mode: ExportMode,
-                      requireCameraCopy: Bool, container: String, settings: ReencodeSettings) throws -> StillExportPlan {
+                      requireCameraCopy: Bool, container: String, settings: ReencodeSettings,
+                      audioOutput: MulticamAudioOutput, independentAudio: Bool) throws -> StillExportPlan {
         if tracks != .audio {
             guard ExportRules.stillMovieContainers.contains(container) else {
                 throw CutError(code: "unsupported_container", message: "Still-bearing movie export requires MOV, MP4 or M4V.")
@@ -268,7 +327,8 @@ public struct StillExportPlanner: Sendable {
             try StillSoundPlanner(cancelled: cancelled).resolve(project, relativeTo: document, timeline: timeline,
                                                                tracks: tracks, audioStream: audioStream, audioTrackOrdinal: audioTrackOrdinal,
                                                                mode: mode,
-                                                               audio: settings.audio, container: container)
+                                                               audio: settings.audio, container: container,
+                                                               audioOutput: audioOutput, independentAudio: independentAudio)
         let actions = try pictureActions(picture?.pictures ?? [])
         func total(_ action: StillPictureAction.Action) throws -> RationalTime {
             try actions.lazy.filter { $0.action == action }.reduce(.zero) {
@@ -282,15 +342,18 @@ public struct StillExportPlanner: Sendable {
         if tracks != .audio, try copied.adding(encodedTotal) != timeline.duration {
             throw CutError(code: "uncovered_picture", message: "The resolved picture spans do not cover the program duration.")
         }
-        let report = StillExportReport(mode: mode, tracks: tracks, container: container, duration: timeline.duration,
+        let report = try StillExportReport(mode: mode, tracks: tracks, container: container, duration: timeline.duration,
                                        copiedCameraDuration: copied, encodedCameraDuration: encoded,
                                        generatedStillDuration: generated, copiedVideoDuration: copied,
                                        encodedVideoDuration: encodedTotal, picture: actions,
-                                       placements: visible, soundActions: sound?.actions ?? [],
+                                       cutMap: ExportCutMap(stills: project, relativeTo: document),
+                                       placements: visible, audioOutput: audioOutput, soundActions: sound?.actions ?? [],
                                        colorPolicy: picture?.colorPolicy,
                                        warnings: (picture?.warnings ?? []) + (sound?.actions.flatMap(\.warnings) ?? []))
-        return StillExportPlan(report: report, pictures: picture?.pictures ?? [], sound: sound,
-                               identities: picture?.identities ?? [:], settings: settings, hdrMetadata: picture?.hdrMetadata)
+        let resolved = StillExportPlan(report: report, pictures: picture?.pictures ?? [], sound: sound,
+                                       identities: picture?.identities ?? [:], settings: settings, hdrMetadata: picture?.hdrMetadata)
+        try resolved.verifySources(using: engine)
+        return resolved
     }
 
     private func pictureActions(_ pictures: [StillExportPicture]) throws -> [StillPictureAction] {

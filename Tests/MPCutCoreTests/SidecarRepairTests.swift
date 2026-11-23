@@ -50,7 +50,7 @@ final class SidecarRepairTests: XCTestCase {
         rows("SELECT name, value FROM sections") { sections.append((String(cString: sqlite3_column_text($0, 0)), data($0, 1))) }
         for (name, saved) in sections {
             var value = saved
-            if name == "index.v1" {
+            if name == "media_index.v1" {
                 var format = PropertyListSerialization.PropertyListFormat.binary
                 var header = try XCTUnwrap(PropertyListSerialization.propertyList(from: value, format: &format) as? [String: Any])
                 var identity = try XCTUnwrap(header["identity"] as? [String: Any])
@@ -68,17 +68,17 @@ final class SidecarRepairTests: XCTestCase {
     func testRemountedVolumeKeepsUserSections() throws {
         let sidecar = try makeSidecar()
         let names = Data(#"{"1":"Wide"}"#.utf8)
-        try sidecar.save([AnalysisSidecar.viewNameSectionKey: names, "thresholdOverrides.v1": Data([4])])
+        try sidecar.save([AnalysisSidecar.viewNameSectionKey: names, "silence_threshold_overrides_db.v1": Data([4])])
         try changeStoredDevice(sidecar)
         XCTAssertEqual(sidecar.status(), "current")
-        XCTAssertEqual(sidecar.keys(), ["thresholdOverrides.v1", AnalysisSidecar.viewNameSectionKey])
+        XCTAssertEqual(sidecar.keys(), [AnalysisSidecar.viewNameSectionKey, "silence_threshold_overrides_db.v1"])
         XCTAssertEqual(sidecar.read(AnalysisSidecar.viewNameSectionKey), names)
         var seen: Data?
-        try sidecar.save(["wave": Data([9])], updating: ["thresholdOverrides.v1": { seen = $0; return Data([5]) }])
+        try sidecar.save(["wave": Data([9])], updating: ["silence_threshold_overrides_db.v1": { seen = $0; return Data([5]) }])
         XCTAssertEqual(seen, Data([4]))
         XCTAssertEqual(sidecar.read(AnalysisSidecar.viewNameSectionKey), names)
         XCTAssertEqual(sidecar.read("wave"), Data([9]))
-        XCTAssertEqual(sidecar.read("thresholdOverrides.v1"), Data([5]))
+        XCTAssertEqual(sidecar.read("silence_threshold_overrides_db.v1"), Data([5]))
         // A changed file is still stale.
         try Data([7, 8, 9, 10]).write(to: sidecar.source)
         let changed = try AnalysisSidecar(source: sidecar.source)
@@ -171,17 +171,15 @@ final class SidecarRepairTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: store.url), original)
     }
 
-    func testTruncatedSidecarIsReplaced() throws {
+    func testTruncatedSidecarIsPreserved() throws {
         let sidecar = try makeSidecar()
         try sidecar.save(["a": Data(repeating: 6, count: 64 << 10)])
         let whole = try Data(contentsOf: sidecar.url)
         for length in [100, 1000, 4096, 5000, whole.count / 2, whole.count - 4096] {
             try whole.prefix(length).write(to: sidecar.url)
             XCTAssertNil(sidecar.read("a"), "\(length)")
-            try sidecar.save(["b": Data([2])])
-            XCTAssertEqual(sidecar.status(), "current", "\(length)")
-            XCTAssertEqual(sidecar.keys(), ["b"], "\(length)")
-            XCTAssertEqual(sidecar.read("b"), Data([2]))
+            XCTAssertThrowsError(try sidecar.save(["b": Data([2])]), "\(length)")
+            XCTAssertEqual(try Data(contentsOf: sidecar.url), whole.prefix(length))
         }
     }
 
@@ -208,13 +206,18 @@ final class SidecarRepairTests: XCTestCase {
         try sidecar.save(["a": Data([1])])
         var info = stat()
         XCTAssertEqual(stat(sidecar.url.path, &info), 0)
-        XCTAssertEqual(info.st_mode & 0o7777, 0o666 & ~creationMask)
-        XCTAssertNotEqual(info.st_mode & 0o7777, 0o600)
+        let ordinary = sidecar.url.deletingLastPathComponent().appendingPathComponent("ordinary")
+        let fd = open(ordinary.path, O_CREAT | O_EXCL | O_WRONLY, 0o666)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { if fd >= 0 { close(fd) } }
+        var expected = stat()
+        XCTAssertEqual(fstat(fd, &expected), 0)
+        XCTAssertEqual(info.st_mode & 0o7777, expected.st_mode & 0o7777)
         // A rebuilt sidecar is also readable by the usual audience.
         try Data().write(to: sidecar.url)
         XCTAssertEqual(chmod(sidecar.url.path, 0o600), 0)
         try sidecar.save(["a": Data([1])])
         XCTAssertEqual(stat(sidecar.url.path, &info), 0)
-        XCTAssertEqual(info.st_mode & 0o7777, 0o666 & ~creationMask)
+        XCTAssertEqual(info.st_mode & 0o7777, expected.st_mode & 0o7777)
     }
 }

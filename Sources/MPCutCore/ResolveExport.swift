@@ -40,6 +40,7 @@ public final class ResolveExport {
     private var committed = false
     private var clipMetadata = [FCPClipMetadata]()
     private var fcpDocument = false
+    private var preserveMulticamEditing = true
     private var isolateSequenceAudio = true
     private var allowLoss = true
     private var warnings = [String]()
@@ -65,15 +66,15 @@ public final class ResolveExport {
         if !committed, let audioDirectory { try? FileManager.default.removeItem(at: audioDirectory) }
     }
 
-    public static func rejectUnsupportedStills(_ project: CutProject) throws {
-        _ = try ProjectConverter.prepareStills(project, for: "DaVinci Resolve timeline handoff", allowLoss: false)
+    public static func validateTimelineHandoff(_ project: CutProject) throws {
+        _ = try ProjectConverter.prepareForInterchange(project, for: "DaVinci Resolve timeline handoff", allowLoss: false)
     }
 
     public static func write(_ project: MulticamProject, relativeTo location: URL, to output: URL,
                              useSidecar: Bool = true, matching imported: [String: MediaInfo] = [:],
                              auxiliaryOutput: ((URL) -> Void)? = nil,
                              cancelled: (@Sendable () -> Bool)? = nil) throws {
-        try rejectUnsupportedStills(.multicam(project))
+        try validateTimelineHandoff(.multicam(project))
         let writer = try ResolveExport(output, useSidecar: useSidecar, cancelled: cancelled)
         try writer.multicam(project, location: location, imported: imported)
         if let audio = writer.audioDirectory { auxiliaryOutput?(audio) }
@@ -90,11 +91,14 @@ public final class ResolveExport {
 
     static func writeFCP(_ project: CutProject, relativeTo location: URL, to xml: URL,
                          package: URL?, allowLoss: Bool, isolateSequenceAudio: Bool = false,
+                         preserveMulticamEditing: Bool = true,
                          auxiliaryOutput: ((URL) -> Void)? = nil,
                          cancelled: @escaping @Sendable () -> Bool = { false }) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled)
+        try project.validate()
         let writer = try ResolveExport(xml, useSidecar: false, cancelled: cancelled)
         writer.fcpDocument = true
+        writer.preserveMulticamEditing = preserveMulticamEditing
         writer.isolateSequenceAudio = isolateSequenceAudio
         writer.allowLoss = allowLoss
         writer.bundleDestination = package
@@ -244,14 +248,17 @@ public final class ResolveExport {
             fields["audioSources"] = String(audio.count)
             fields["audioChannels"] = String(audio.reduce(0) { $0 + $1.channels })
         }
-        var source = media.url.absoluteString
-        if bundleDestination != nil, let audioDirectory,
-           media.url.deletingLastPathComponent().standardizedFileURL.path == audioDirectory.standardizedFileURL.path {
-            source = URL(fileURLWithPath: "/" + audioDirectory.lastPathComponent + "/" + media.url.lastPathComponent).path(percentEncoded: true)
-            source.removeFirst()
-        }
-        resources.child("asset", fields).child("media-rep", ["kind": "original-media", "src": source])
+        resources.child("asset", fields).child("media-rep", ["kind": "original-media", "src": assetLink(media.url)])
         return id
+    }
+
+    private func assetLink(_ url: URL) -> String {
+        if bundleDestination != nil, let audioDirectory,
+           url.deletingLastPathComponent().standardizedFileURL.path == audioDirectory.standardizedFileURL.path {
+            let relative = URL(fileURLWithPath: "/" + audioDirectory.lastPathComponent + "/" + url.lastPathComponent)
+            return String(relative.path(percentEncoded: true).dropFirst())
+        }
+        return url.absoluteString
     }
 
     // Resolve may mix embedded streams when importing FCPXML channel selections.
@@ -277,7 +284,11 @@ public final class ResolveExport {
 
     private func multicam(_ project: MulticamProject, location: URL, imported: [String: MediaInfo]) throws {
         let plan = try project.plan()
-        if fcpDocument, let ranges = project.assembly {
+        let preservesEditing = project.angles.contains { $0.coverage != nil || !$0.additionalRecordings.isEmpty }
+            || project.assemblyItems?.contains { $0.angleOverride != nil } == true
+            || project.assembly?.isEmpty == true
+        let writesEditing = fcpDocument && preserveMulticamEditing && preservesEditing
+        if fcpDocument, !writesEditing, let ranges = project.assembly {
             var end = RationalTime.zero, incomplete = false
             for range in ranges.sorted(by: { $0.from < $1.from }) {
                 if range.from > end { incomplete = true }
@@ -322,52 +333,116 @@ public final class ResolveExport {
         let groupName = try displayName(name) + " Multicam"
         let group = resources.child("media", ["id": "group", "name": groupName, "uid": UUID().uuidString])
             .child("multicam", ["format": formatID, "tcStart": "0s", "tcFormat": "NDF"])
-        var coverage = [String: MulticamRange]()
-        func addAngle(_ label: String, _ info: MediaInfo, _ offset: RationalTime) throws -> String {
-            let id = "angle\(group.childCount + 1)"
-            let angle = group.child("mc-angle", ["angleID": id, "name": try displayName(label)])
-            let raw = try offset.subtracting(base)
-            let at = try info.hasVideo ? sourceFrame(raw, rate: rate) : raw
-            let start = try max(.zero, RationalTime.zero.subtracting(at))
-            let duration = try assetDuration(info)
-            guard start < duration else { throw CutError(code: "uncovered_source", message: "Empty angle \(label).") }
-            if at > .zero { angle.child("gap", ["offset": "0s", "start": "0s", "duration": at.fcpxTime]) }
-            angle.child("asset-clip", ["ref": try asset(info), "name": try displayName(info.url.lastPathComponent),
-                                       "offset": max(.zero, at).fcpxTime, "start": try sourceTime(info, start).fcpxTime,
-                                       "duration": try duration.subtracting(start).fcpxTime])
-            coverage[id] = try .init(from: max(.zero, at), to: at.adding(duration))
-            return id
+        var coverage = [String: [MulticamRange]]()
+        var recordedIDs = [String: [String]]()
+        var extractedAudio = [String: MulticamAudioSelection]()
+        var audioLinks = [String: FCPMulticamEditing.AudioLink]()
+        let sourceIDs = Set(project.sources.map(\.id))
+        var allocated = Set<String>()
+        var nextID = 1
+
+        func newAngle(_ label: String, sourceID: String? = nil) throws -> (String, XMLElement) {
+            var id: String
+            if preservesEditing, let sourceID {
+                id = try displayName(sourceID)
+                guard id == sourceID else { throw CutError(code: "invalid_angle_id", message: "Camera ID cannot be represented in FCPXML.") }
+            } else {
+                repeat {
+                    id = "angle\(nextID)"
+                    nextID += 1
+                } while allocated.contains(id) || (preservesEditing && sourceIDs.contains(id))
+            }
+            allocated.insert(id)
+            return (id, group.child("mc-angle", ["angleID": id, "name": try displayName(label)]))
         }
+
+        func appendRecording(_ info: MediaInfo, offset: RationalTime, visible: MulticamRange?,
+                             angle: XMLElement, id: String) throws {
+            let duration = try assetDuration(info)
+            let origin = try offset.subtracting(base)
+            let rawFrom = try visible.map { try $0.from.subtracting(base) } ?? max(.zero, origin)
+            let rawTo = try visible.map { try $0.to.subtracting(base) } ?? origin.adding(duration)
+            let at = try info.hasVideo ? sourceFrame(rawFrom, rate: rate) : rawFrom
+            let end = try visible != nil && info.hasVideo ? sourceFrame(rawTo, rate: rate) : at.adding(rawTo.subtracting(rawFrom))
+            let start = try rawFrom.subtracting(origin)
+            let length = try end.subtracting(at)
+            let previous = coverage[id]?.last?.to ?? .zero
+            guard at >= previous, length > .zero, start >= .zero, try start.adding(length) <= duration else {
+                throw CutError(code: "uncovered_source", message: "Invalid visible extent for \(info.url.lastPathComponent) on angle \(id).")
+            }
+            if at > previous {
+                angle.child("gap", ["offset": previous.fcpxTime, "start": "0s", "duration": try at.subtracting(previous).fcpxTime])
+            }
+            angle.child("asset-clip", ["ref": try asset(info), "name": try displayName(info.url.lastPathComponent),
+                                       "offset": at.fcpxTime, "start": try sourceTime(info, start).fcpxTime,
+                                       "duration": length.fcpxTime])
+            coverage[id, default: []].append(.init(from: at, to: end))
+        }
+
         var settings: [String: FCPAngleMetadata] = [:]
         var pictures: [String: String] = [:]
         var microphones: [MulticamAudioSelection: String] = [:]
         var selected = Set(try project.groupIntervals().compactMap(\.audio))
+        selected.formUnion(plan.intervals.compactMap(\.audio))
         if case .fixed(let master) = project.audio { selected.insert(master) }
-        let cameraIDs = Set(project.angles.map(\.id))
+        for camera in project.angles {
+            let recordings = camera.recordings.sorted { ($0.coverage?.from ?? .zero) < ($1.coverage?.from ?? .zero) }
+            let (id, angle) = try newAngle(camera.name ?? media[camera.id]!.url.lastPathComponent, sourceID: camera.id)
+            recordedIDs[id] = recordings.map(\.id)
+            pictures[camera.id] = id
+            settings[id] = .init(audioOnly: false, audioStream: camera.audioStream)
+            for recording in recordings {
+                let info = media[recording.id]!
+                guard info.hasVideo else { throw CutError(code: "no_video", message: "Camera recording \(recording.id) has no video.") }
+                try appendRecording(info, offset: offsets[recording.id]!, visible: recording.coverage, angle: angle, id: id)
+                let streams = info.streams.filter { $0.kind == "audio" }
+                if recording.coverage == nil, streams.count == 1 {
+                    microphones[.init(source: recording.id, stream: streams[0].index)] = id
+                }
+            }
+        }
+        let external = Set(project.audioSources.map(\.id))
         for source in project.sources {
             let info = media[source.id]!, offset = offsets[source.id]!
             let label = source.name ?? info.url.lastPathComponent
-            let isCamera = cameraIDs.contains(source.id)
-            guard !isCamera || info.hasVideo else {
-                throw CutError(code: "no_video", message: "Camera \(label) has no video.")
-            }
             let streams = info.streams.filter { $0.kind == "audio" }
-            if isCamera || streams.count == 1 {
-                let id = try addAngle(label, info, offset)
-                settings[id] = .init(audioOnly: !isCamera, audioStream: source.audioStream)
-                if isCamera { pictures[source.id] = id }
+            if external.contains(source.id), preservesEditing || streams.count == 1 {
+                let (id, angle) = try newAngle(label, sourceID: source.id)
+                try appendRecording(info, offset: offset, visible: nil, angle: angle, id: id)
+                settings[id] = .init(audioOnly: true, audioStream: source.audioStream)
+                recordedIDs[id] = [source.id]
                 if streams.count == 1 { microphones[.init(source: source.id, stream: streams[0].index)] = id }
             }
-            for stream in streams where streams.count > 1 {
+            for stream in streams {
                 let selection = MulticamAudioSelection(source: source.id, stream: stream.index)
-                if !isCamera || selected.contains(selection) {
-                    let sound = try soundFile(info, stream: stream)
-                    microphones[selection] = try addAngle("\(label) · stream \(stream.index)", sound, offset.adding(stream.start))
-                }
+                guard microphones[selection] == nil, selected.contains(selection) || external.contains(source.id) else { continue }
+                let isolate = streams.count > 1 || info.hasVideo
+                let sound = try isolate ? soundFile(info, stream: stream) : info
+                let (id, angle) = try newAngle("\(label) · stream \(stream.index)")
+                let soundOffset = try isolate ? offset.adding(stream.start) : offset
+                try appendRecording(sound, offset: soundOffset, visible: nil, angle: angle, id: id)
+                settings[id] = .init(audioOnly: true, audioStream: sound.streams.first { $0.kind == "audio" }?.index)
+                microphones[selection] = id
+                extractedAudio[id] = selection
+                audioLinks[id] = .init(path: assetLink(sound.url), offset: try soundOffset.subtracting(sound.multicamSourceOffset),
+                                       originalPath: assetLink(info.url), originalOffset: source.offset)
             }
         }
         if fcpDocument {
             let metadata = group.child("metadata")
+            if writesEditing {
+                let sourceCoverage = Dictionary(uniqueKeysWithValues: project.sources.compactMap { source in
+                    source.coverage.map { (source.id, $0) }
+                })
+                let sourceSettings = Dictionary(uniqueKeysWithValues: project.sources.map {
+                    ($0.id, FCPAngleMetadata(audioOnly: external.contains($0.id), audioStream: $0.audioStream, name: $0.name))
+                })
+                let editing = FCPMulticamEditing(range: project.range, switches: project.switches, audio: project.audio,
+                                                 assemblyItems: project.assemblyItems, recordings: recordedIDs,
+                                                 extractedAudio: extractedAudio, sourceCoverage: sourceCoverage, sourceSettings: sourceSettings,
+                                                 audioLinks: audioLinks)
+                metadata.child("md", ["key": FCPGroupMetadata.editing, "value": String(decoding: try JSONEncoder().encode(editing), as: UTF8.self)])
+            }
             if base != .zero {
                 metadata.child("md", ["key": FCPGroupMetadata.base, "value": base.description])
             }
@@ -379,6 +454,8 @@ public final class ResolveExport {
             case .none: mode = "none"
             case .follow: mode = "follow"
             case .fixed(let selection): mode = microphones[selection].map { "fixed:" + $0 }
+            case .mix:
+                throw CutError(code: "unsupported_multicam_audio", message: "This timeline cannot represent simultaneous Mix lanes.")
             }
             if let mode { metadata.child("md", ["key": FCPGroupMetadata.audio, "value": mode]) }
         }
@@ -424,10 +501,14 @@ public final class ResolveExport {
             try requireFrame(length)
             let sourceStart = try sourceFrame(interval.group.from.subtracting(base), rate: rate)
             let mic = interval.audio.flatMap { microphones[$0] }
+            let sourceEnd = try sourceStart.adding(length)
+            if interval.pictureSourceID == nil,
+               coverage[angle]?.contains(where: { $0.from < sourceEnd && sourceStart < $0.to }) == true {
+                throw CutError(code: "uncovered_source", message: "Rounding this camera gap would expose a recorded frame.")
+            }
             if fcpDocument {
-                let sourceEnd = try sourceStart.adding(length)
-                for id in [angle, mic].compactMap({ $0 }) {
-                    guard let range = coverage[id], range.from <= sourceStart, sourceEnd <= range.to else {
+                for id in [interval.pictureSourceID == nil ? nil : angle, mic].compactMap({ $0 }) {
+                    guard coverage[id]?.contains(where: { $0.from <= sourceStart && sourceEnd <= $0.to }) == true else {
                         throw CutError(code: "uncovered_source", message: "The rounded timeline cut exceeds its selected angle. Shorten the range by a frame.")
                     }
                 }
@@ -537,7 +618,11 @@ public final class ResolveExport {
             ordinal += 1
         }
         try checkStillLoss()
-        guard position > .zero else { throw CutError(code: "empty_sequence", message: "Add clips to the timeline first.") }
+        guard position > .zero else {
+            let message = warnings.isEmpty ? "Add clips to the timeline first." :
+                (["The conversion leaves no timeline material."] + warnings).joined(separator: "\n")
+            throw CutError(code: "empty_sequence", message: message)
+        }
         let formatID = try standalone.map { try format(width: $0.width, height: $0.height, rate: rate) } ?? format(video)
         try finish(format: formatID, duration: framePosition(position, rate: rate))
     }
@@ -553,7 +638,7 @@ public final class ResolveExport {
             guard let identity = try? SourceIdentity(url) else {
                 throw CutError(code: "still_offline", message: "Relink \(image.displayName) for Insert Still placement \(insert.id).")
             }
-            media = (try StillImage.inspect(url), try StillImage.fingerprint(url, cancelled: cancelled))
+            media = try StillImage.inspectAndFingerprint(url, expectedIdentity: identity, cancelled: cancelled)
             identities[url] = identity
             stillMedia[url] = media
         }

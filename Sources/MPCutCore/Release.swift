@@ -1,3 +1,3 @@
 package enum MPCutRelease {
-    package static let version = "1.2.0"
+    package static let version = "2.0.0"
 }

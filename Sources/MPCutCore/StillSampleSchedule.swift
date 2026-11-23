@@ -11,14 +11,14 @@ struct StillSampleSchedule: Encodable, Sendable {
     let duration: RationalTime
     let cadence: RationalTime
 
-    init(duration: RationalTime, cadence: RationalTime, allowShortFinalSample: Bool) throws {
+    init(duration: RationalTime, cadence: RationalTime, allowShortFinalSample: @autoclosure () throws -> Bool) throws {
         guard duration > .zero, cadence >= Self.minimumCadence,
               cadence.numerator <= Int32.max, cadence.denominator <= Int32.max else { throw Self.unsupported }
         let samples = try duration.multiplied(by: .init(numerator: cadence.denominator, denominator: cadence.numerator))
         let whole = samples.numerator / samples.denominator
         let hasShortSample = samples.denominator != 1
         guard whole < Int32.max || (whole == Int32.max && !hasShortSample) else { throw Self.unsupported }
-        guard !hasShortSample || allowShortFinalSample else {
+        if hasShortSample, try !allowShortFinalSample() {
             throw CutError(code: "unsupported_still_timing",
                            message: "The insert duration must contain an integral number of samples on a constant-rate timeline.")
         }

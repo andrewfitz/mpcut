@@ -19,6 +19,7 @@ func registerDocumentation(server *mcp.Server, executable string) {
 	}
 	for _, doc := range []struct{ name, slug, file string }{
 		{"MPCut agent guide", "agent-guide", "MCP-AGENT-GUIDE.md"},
+		{"Headless editing", "headless", "HEADLESS.md"},
 		{"MPCut tool reference", "tool-reference", "MCP-REFERENCE.md"},
 	} {
 		uri := "mpcut://docs/" + doc.slug

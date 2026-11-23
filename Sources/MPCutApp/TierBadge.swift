@@ -42,6 +42,8 @@ struct TierDetails<Footer: View>: View {
     let segmentName: String
     let canGo: Bool
     let go: (TierFactor) -> Void
+    /// Names what a factor's message identifies by id.
+    var describe: (String) -> String = { $0 }
     @ViewBuilder let footer: () -> Footer
 
     private struct Group: Identifiable {
@@ -81,7 +83,7 @@ struct TierDetails<Footer: View>: View {
                                 ForEach(Array(group.factors.enumerated()), id: \.offset) { _, factor in
                                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                                         VStack(alignment: .leading, spacing: 1) {
-                                            Text(ExportRules.displayMessage(factor.message)).fixedSize(horizontal: false, vertical: true)
+                                            Text(describe(ExportRules.displayMessage(factor.message))).fixedSize(horizontal: false, vertical: true)
                                             Text(caption(factor)).font(.caption).foregroundStyle(.secondary)
                                         }
                                         Spacer(minLength: 8)

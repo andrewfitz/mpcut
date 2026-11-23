@@ -78,7 +78,7 @@ func opusTrimWindow(_ audio: AudioIndex, origin: RationalTime, checkCancellation
         if packet.discardSamples != 0 { break }
         expected = next
     }
-    guard let firstPacketEnd else { return nil }
+    guard let firstPacketEnd, end > start else { return nil }
     return OpusTrimWindow(start: start, firstPacketEnd: firstPacketEnd, end: end,
                             initialPadding: padding, complete: packetStarts.count == audio.packets.count,
                             packetStarts: packetStarts)

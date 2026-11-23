@@ -28,7 +28,7 @@ final class SidecarAnalysisTests: XCTestCase {
         XCTAssertEqual(SceneAnalysis.lookup(media, useSidecar: false, session: session)?.state, .upToDate)
     }
 
-    func testLegacyRoundedPeaksAreRecomputedWhileSignedEnvelopeIsReused() throws {
+    func testMissingAudioClocksAreRecomputedWhileSignedEnvelopeIsReused() throws {
         let fixture = try XCTUnwrap(Bundle.module.url(forResource: "Standalone-Multitrack", withExtension: "mka",
                                                       subdirectory: "Fixtures"))
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -42,12 +42,12 @@ final class SidecarAnalysisTests: XCTestCase {
         let store = AnalysisSidecar(media: media)
         _ = try AudioAnalysis.silence(media, stream: stream, minimum: 0.2)
         _ = try AudioAnalysis.envelope(media, stream: stream, from: 0, to: media.duration.seconds, columns: 32)
-        let peakKeys = store.keys().filter { $0.hasPrefix("wave.") || $0.hasPrefix("silence.") || $0.hasPrefix("calibration.") }
+        let peakKeys = store.keys().filter { $0.hasPrefix("waveform_peaks.") || $0.hasPrefix("silence_pauses.") || $0.hasPrefix("silence_automatic_threshold_db.") }
         XCTAssertEqual(peakKeys.count, 3)
         for key in peakKeys {
             let data = try XCTUnwrap(store.read(key))
             var record = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
-            XCTAssertEqual(record.removeValue(forKey: "sampleAlignedPeaks") as? Bool, true)
+            XCTAssertNotNil(record.removeValue(forKey: "clock"))
             try store.save([key: PropertyListSerialization.data(fromPropertyList: record, format: .binary, options: 0)])
         }
         XCTAssertNil(store.waveform(for: media, stream: stream))
@@ -110,7 +110,8 @@ final class SidecarAnalysisTests: XCTestCase {
                              to: RationalTime(numerator: start + 1, denominator: 100_000))
         }
         let many = SilenceAnalysisResult(media: media, stream: stream, requestedThresholdDB: nil,
-                                         minimum: minimum, automaticThresholdDB: -40, pauses: manySpans)
+                                         minimum: minimum, automaticThresholdDB: -40, pauses: manySpans,
+                                         runs: SilenceRuns(quiet: manySpans, covered: manySpans))
         try store.save(AnalysisSidecar.sections(media: media, silence: [many]))
         XCTAssertEqual(try AudioAnalysis.silence(media, stream: stream, minimum: minimum).pauses.count, manySpans.count)
         var polls = 0
@@ -123,7 +124,7 @@ final class SidecarAnalysisTests: XCTestCase {
 
         // Replacing one section with bytes of the wrong type leaves other
         // persisted results usable and falls back to a real waveform scan.
-        try store.save(["wave.v1.\(stream)": Data([0xff])])
+        try store.save(["waveform_peaks.v1.\(stream)": Data([0xff])])
         XCTAssertNil(store.waveform(for: media, stream: stream))
         XCTAssertEqual(try AudioAnalysis.scan(media, stream: stream).count, wave.count)
         XCTAssertEqual(try AudioAnalysis.silence(media, stream: stream, minimum: 0.45).pauses, silence.pauses)

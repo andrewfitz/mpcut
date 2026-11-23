@@ -114,21 +114,86 @@ final class AudioEditorTests: XCTestCase {
         try await wait { !model.isImporting }
         XCTAssertNil(model.alert, model.alert?.message ?? "")
         model.minimumPause = 0.5
-        model.leavePause = 0.2
+        model.padding = 0.1
         model.snapTarget = .silence
         try await wait { model.pauseAnalysisReady }
         XCTAssertEqual(model.shortenedPauseCount, 1)
+        XCTAssertEqual(model.timelinePadding.count, 2)
+        for edge in model.timelinePadding {
+            XCTAssertEqual(edge.to.seconds - edge.from.seconds, 0.1, accuracy: 0.001)
+        }
+        model.padding = 0
+        XCTAssertTrue(model.timelinePadding.isEmpty)
+        model.padding = 0.1
         model.seek(1.12)
         model.setIn()
         XCTAssertEqual(try XCTUnwrap(model.markIn), 1, accuracy: 0.021)
         model.clearMarks()
-        model.applyPauses(queueTakes: false)
+        let originalID = try XCTUnwrap(model.sequenceClips.first?.id)
+        XCTAssertTrue(model.applyPauses(queueTakes: false))
         XCTAssertEqual(model.duration, 2.2, accuracy: 0.041)
+        XCTAssertNil(model.alert, model.alert?.message ?? "")
+        XCTAssertEqual(model.sequenceClips.first?.id, originalID)
+        XCTAssertEqual(Set(model.sequenceClips.map(\.id)).count, 2)
         let pieces = model.timelineClips
         XCTAssertEqual(pieces.count, 2)
         XCTAssertEqual(pieces[0].sourceEnd * 48_000, (pieces[0].sourceEnd * 48_000).rounded(), accuracy: 1e-8)
         model.undo()
         XCTAssertEqual(model.duration, 3, accuracy: 1e-9)
+    }
+
+    @MainActor
+    func testShortenedAudioRecoveryAndSavedHistoryReopenWithUniqueClipIDs() async throws {
+        let source = try recording()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let saved = directory.appendingPathComponent("Shortened.cut")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let draft = ProjectDraft(directory: directory.appendingPathComponent("Recovery"))
+        let model = EditorModel(preferences: EditorPreferences(), draft: draft)
+        let reopened = EditorModel()
+        defer {
+            model.endSession()
+            reopened.endSession()
+            try? FileManager.default.removeItem(at: directory)
+            try? FileManager.default.removeItem(at: source)
+        }
+        model.useAnalysisSidecars = false
+        reopened.useAnalysisSidecars = false
+        model.minimumPause = 0.5
+        model.padding = 0.1
+        model.importFiles([source])
+        try await wait { model.canEdit }
+        let original = try XCTUnwrap(model.sequenceClips.first)
+        model.scanForSilence()
+        try await wait { model.pauseAnalysisReady }
+        XCTAssertTrue(model.applyPauses(queueTakes: false))
+        try await wait { !draft.hasScheduledWrites }
+        XCTAssertNil(model.alert)
+        let expected = model.sequenceClips
+        XCTAssertEqual(expected.count, 2)
+        XCTAssertEqual(expected.first?.id, original.id)
+        XCTAssertEqual(Set(expected.map(\.id)).count, 2)
+        let left = try XCTUnwrap(expected.first)
+        let right = try XCTUnwrap(expected.last)
+        XCTAssertEqual(left.from, original.from)
+        XCTAssertLessThan(left.to, right.from)
+        XCTAssertEqual(right.to, original.to)
+        let recovery = try CutProject.loadDocument(from: XCTUnwrap(draft.url), limit: 10)
+        XCTAssertEqual(recovery.project.sequenceClips?.map(\.id), expected.map(\.id))
+        XCTAssertEqual(recovery.undo.last?.project.sequenceClips?.map(\.id), [original.id])
+
+        try model.writeProject(to: saved)
+        try reopened.openProject(try XCTUnwrap(CutProject.load(from: saved).sequenceClips), at: saved)
+        try await wait { reopened.canEdit }
+        XCTAssertEqual(reopened.sequenceClips, expected)
+        reopened.undo()
+        try await wait { reopened.sequenceClips == [original] || reopened.alert != nil }
+        XCTAssertEqual(reopened.sequenceClips, [original])
+        XCTAssertNil(reopened.alert)
+        reopened.redo()
+        try await wait { reopened.sequenceClips == expected || reopened.alert != nil }
+        XCTAssertEqual(reopened.sequenceClips, expected)
+        XCTAssertNil(reopened.alert)
     }
 
     @MainActor
@@ -209,6 +274,153 @@ final class AudioEditorTests: XCTestCase {
         model.endSession()
         XCTAssertEqual(model.shortenedPauseCount, 0)
         XCTAssertEqual(model.removedPauseSeconds, 0)
+    }
+
+    @MainActor
+    func testPauseDurationOverrideFollowsOnlyTheSelectedOccurrence() async throws {
+        let url = try recording()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let model = EditorModel()
+        defer { model.endSession() }
+        model.useAnalysisSidecars = false
+        model.minimumPause = 0.5
+        model.padding = 0.1
+        model.importFiles([url, url])
+        try await wait { model.canEdit }
+        model.scanForSilence()
+        try await wait { model.pauseAnalysisReady }
+        XCTAssertEqual(model.pausePlan.count, 2)
+        let first = try XCTUnwrap(model.pausePlan.first)
+        XCTAssertTrue(model.setPauseRetainedDuration(0.6, for: first.key))
+        XCTAssertFalse(model.setPauseRetainedDuration(-0.1, for: first.key))
+        XCTAssertEqual(model.pausePlan[0].retainedSeconds, 0.6, accuracy: 0.001)
+        XCTAssertEqual(model.pausePlan[1].retainedSeconds, 0.2, accuracy: 0.001)
+
+        let repeated = try XCTUnwrap(model.timelineClips.last)
+        model.move(repeated.id, to: 0)
+        XCTAssertNil(model.pausePlan[0].requestedRetainedSeconds)
+        XCTAssertEqual(model.pausePlan[1].requestedRetainedSeconds, 0.6)
+        model.seek(4.5)
+        model.protectCurrentPause()
+        XCTAssertNil(model.pausePlan[1].removal)
+        model.protectCurrentPause()
+
+        model.minimumPause = 1.5
+        try await wait { model.pauseAnalysisReady }
+        XCTAssertTrue(model.pausePlan.isEmpty)
+        model.minimumPause = 0.5
+        try await wait { model.pauseAnalysisReady }
+        XCTAssertEqual(model.pausePlan[1].requestedRetainedSeconds, 0.6)
+
+        XCTAssertTrue(model.applyPauses(queueTakes: false))
+        XCTAssertEqual(model.duration, 4.8, accuracy: 0.05)
+    }
+
+    @MainActor
+    func testManualTakeBoundaryDoesNotCutTheSequenceAndQueuesExactPieces() async throws {
+        let url = try recording()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let model = EditorModel()
+        defer { model.endSession() }
+        model.useAnalysisSidecars = false
+        model.minimumPause = 0.5
+        model.padding = 0
+        model.importFiles([url])
+        try await wait { model.canEdit }
+        model.scanForSilence()
+        try await wait { model.pauseAnalysisReady }
+        XCTAssertEqual(model.takeCandidates.count, 2)
+        XCTAssertFalse(model.addTakeBoundary(at: 1.5))
+        XCTAssertTrue(model.addTakeBoundary(at: 0.5))
+        XCTAssertFalse(model.addTakeBoundary(at: 0.5))
+        let manual = try XCTUnwrap(model.takeCandidates.first(where: \.hasManualStart))
+        XCTAssertEqual(manual.range.from, RationalTime(numerator: 1, denominator: 2))
+        XCTAssertTrue(model.removeTakeBoundary(at: manual.range.from))
+        XCTAssertEqual(model.takeCandidates.count, 2)
+        XCTAssertTrue(model.addTakeBoundary(at: 0.5))
+        model.seek(1.5)
+        model.protectCurrentPause()
+        XCTAssertEqual(model.shortenedPauseCount, 0)
+        XCTAssertTrue(model.applyPauses(queueTakes: true))
+        XCTAssertEqual(model.queuedRanges.count, 2)
+        XCTAssertEqual(model.queuedRanges.map(\.start), [.zero, manual.range.from])
+        XCTAssertEqual(model.queuedRanges.map(\.end), [manual.range.from, .init(numerator: 3)])
+        XCTAssertEqual(model.timelineClips.count, 1)
+        XCTAssertEqual(model.duration, 3)
+    }
+
+    @MainActor
+    func testExistingJoinPreviewNeedsNoSilenceScanAndPreservesEdit() async throws {
+        let url = try recording()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let model = EditorModel()
+        defer { model.endSession() }
+        model.useAnalysisSidecars = false
+        model.importFiles([url])
+        try await wait { model.canEdit }
+        model.seek(0.5)
+        model.split()
+        let clips = model.timelineClips.map(\.id)
+        XCTAssertEqual(clips.count, 2)
+        XCTAssertFalse(model.previewExistingJoin(before: clips[0]))
+        XCTAssertTrue(model.previewExistingJoin(before: clips[1]))
+        let cut = try XCTUnwrap(model.cutPreview)
+        XCTAssertNil(cut.pauseKey)
+        XCTAssertEqual(cut.position, RationalTime(numerator: 1, denominator: 2))
+        XCTAssertEqual(cut.ranges.map(\.start), [0, 0.5])
+        XCTAssertEqual(cut.ranges.map(\.end), [0.5, 1.5])
+        model.advanceCutPreview(keepingCurrent: true)
+        XCTAssertEqual(model.cutPreview?.id, cut.id)
+        model.cutPreview = nil
+        XCTAssertEqual(model.timelineClips.map(\.id), clips)
+        XCTAssertEqual(model.duration, 3)
+    }
+
+    @MainActor
+    func testJoinPreviewAcceptsSavedSequenceItemID() async throws {
+        let url = try recording()
+        let project = url.deletingPathExtension().appendingPathExtension("cut")
+        defer {
+            try? FileManager.default.removeItem(at: project)
+            try? FileManager.default.removeItem(at: url)
+        }
+        let half = RationalTime(numerator: 1, denominator: 2)
+        let clips = [
+            CutSequenceClip(id: "left", file: url.path, from: .zero, to: half),
+            CutSequenceClip(id: "right", file: url.path, from: half, to: .init(numerator: 3))
+        ]
+        try CutProject.sequence(clips).save(to: project)
+        let model = EditorModel()
+        model.useAnalysisSidecars = false
+        defer { model.endSession() }
+        try model.openProject(clips, at: project)
+        try await wait { model.canEdit }
+        XCTAssertTrue(model.previewExistingJoin(beforeTimelineItem: "right"))
+        XCTAssertEqual(model.cutPreview?.position, half)
+        model.cutPreview = nil
+        XCTAssertTrue(model.previewExistingJoin(beforeTimelineItem: try XCTUnwrap(model.mcpClipIDs.last).uuidString))
+        XCTAssertEqual(model.cutPreview?.position, half)
+    }
+
+    @MainActor
+    func testRangeInsertionPreservesPauseOverrideOnRetainedFragmentOnly() async throws {
+        let url = try recording()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let model = EditorModel()
+        model.useAnalysisSidecars = false
+        model.minimumPause = 0.5
+        defer { model.endSession() }
+        model.importFiles([url])
+        try await wait { model.canEdit }
+        model.scanForSilence()
+        try await wait { model.pauseAnalysisReady }
+        XCTAssertTrue(model.setPauseRetainedDuration(0.6, for: try XCTUnwrap(model.pausePlan.first).key))
+        let half = RationalTime(numerator: 1, denominator: 2)
+        let range = try SequenceSourceRange(file: url.path, from: .zero, to: .init(numerator: 3))
+        try await model.applySourceRanges([range], destination: .init(from: half, to: half), expectedRevision: model.mcpRevision)
+        try await wait { model.pauseAnalysisReady && model.pausePlan.count == 2 }
+        XCTAssertNil(model.pausePlan.first?.requestedRetainedSeconds)
+        XCTAssertEqual(model.pausePlan.last?.requestedRetainedSeconds, 0.6)
     }
 
     @MainActor

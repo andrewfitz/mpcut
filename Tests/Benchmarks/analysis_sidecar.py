@@ -40,23 +40,23 @@ def compare(cli, source, arguments, runs):
 def benchmark(cli, file, directory, runs):
     source = directory / file.name
     shutil.copy2(file, source)
-    _, build = report(cli, source, "sidecar")
-    info, _ = report(cli, source, "inspect")
+    _, build = report(cli, source, "analysis", "sidecar", "build")
+    info, _ = report(cli, source, "media", "inspect")
     duration = info["media"]["duration"]
     end = min(1, Fraction(duration["numerator"], duration["denominator"]))
-    operations = {"inspection": ["inspect"]}
-    if info["media"]["hasVideo"]:
-        operations["scenes"] = ["scenes"]
-        operations["firstSecondOfIndex"] = ["inspect", "--frames", "--from", "0", "--to", str(end)]
+    operations = {"inspection": ["media", "inspect"]}
+    if info["media"]["has_video"]:
+        operations["scenes"] = ["scenes", "scan"]
+        operations["firstSecondOfIndex"] = ["media", "inspect", "--frames", "--from", "0", "--to", str(end)]
     if any(stream["kind"] == "audio" for stream in info["media"]["streams"]):
-        operations["silence"] = ["silence"]
-        operations["waveform"] = ["silence", "--waveform", "512"]
-        if not info["media"]["hasVideo"]:
+        operations["silence"] = ["silence", "scan"]
+        operations["waveform"] = ["silence", "scan", "--waveform", "512"]
+        if not info["media"]["has_video"]:
             # Compare one complete, saved overview and an on-demand detail window.
-            operations["signedOverview"] = ["waveform", "--columns", "65536"]
-            operations["displayOverview"] = ["waveform", "--columns", "1024"]
+            operations["signedOverview"] = ["waveform", "envelope", "read", "--columns", "65536"]
+            operations["displayOverview"] = ["waveform", "envelope", "read", "--columns", "1024"]
             middle = Fraction(duration["numerator"], duration["denominator"]) / 2
-            operations["signedDetail"] = ["waveform", "--columns", "1024", "--from", str(middle),
+            operations["signedDetail"] = ["waveform", "envelope", "read", "--columns", "1024", "--from", str(middle),
                                           "--to", str(middle + min(middle, Fraction(1, 10)))]
     return {
         "source": file.name, "sourceBytes": source.stat().st_size,

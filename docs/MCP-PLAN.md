@@ -31,11 +31,11 @@ The first tools below establish the live editing path. The [operation coverage m
 
 | Tool | Inputs and result |
 | --- | --- |
-| `list_projects` | Return handles, display names, editor kinds, and focus as a hint. An open app with no projects returns an empty list. |
-| `get_editor_state` | Given a handle, return revision, dirty/busy state, available operations, playhead, selection and a bounded timeline page. Include clip IDs, angle IDs, or revision-scoped occurrence references as appropriate. Pin subsequent pages to the same revision. |
-| `seek`, `set_playback` | Give the target handle, coordinate space and position for seek, or the desired playing/paused state for transport. Return the accepted state. Frame delivery and playback timing belong to the app. |
-| `split_at` | Give the handle, expected revision, operation ID, occurrence, coordinate space and rational timestamp. Return the native action, applied revision, resulting references, and actual boundary in the requested space. |
-| `set_camera_at` | Give the handle, expected revision, operation ID, angle ID and multicam group time. Return the switch, affected group interval, and applied revision. Preserve the native switch’s audio behavior. |
+| `project_windows_list` | Return handles, display names, editor kinds, and focus as a hint. An open app with no projects returns an empty list. |
+| `project_editor_state_read` | Given a handle, return revision, dirty/busy state, available operations, playhead, selection and a bounded timeline page. Include clip IDs, angle IDs, or revision-scoped occurrence references as appropriate. Pin subsequent pages to the same revision. |
+| `timeline_playhead_seek`, `playback_transport_play` / `playback_transport_pause` | Give the target handle, coordinate space and position for seek, or the desired playing/paused state for transport. Return the accepted state. Frame delivery and playback timing belong to the app. |
+| `timeline_item_split` | Give the handle, expected revision, operation ID, occurrence, coordinate space and rational timestamp. Return the native action, applied revision, resulting references, and actual boundary in the requested space. |
+| `multicam_camera_take` | Give the handle, expected revision, operation ID, angle ID and multicam group time. Return the switch, affected group interval, and applied revision. Preserve the native switch’s audio behavior. |
 
 Use MPCut rational time strings such as `1001/30000`. Distinguish source, sequence, group, and assembly coordinates. The existing ordinary segment UUID identifies a particular use of a source. For multicam ranges, a revision plus assembly index identifies repeated occurrences without changing the project format. Resolve both the occurrence and time, rejecting incompatible pairs, out-of-range targets, and uneditable boundaries. Snapshot the effective native snap policy when preparing an edit, and report the actual boundary after native validation.
 

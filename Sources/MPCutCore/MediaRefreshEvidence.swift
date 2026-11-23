@@ -4,9 +4,36 @@ import Foundation
 import MediaProbe
 
 struct MediaRefreshEvidence: Codable, Sendable {
-    static let sectionKey = "source.evidence.v1"
+    private enum CodingKeys: String, CodingKey {
+        case identity, format, origin, duration, streams
+        case videoIndex = "video_index"
+        case indexIssues = "index_issues"
+        case reviewStreams = "review_streams"
+        case pictureNeedsReview = "picture_needs_review"
+    }
+
+    static let sectionKey = "media_refresh_evidence.v1"
 
     struct Stream: Codable, Equatable, Sendable {
+        private enum CodingKeys: String, CodingKey {
+            case kind, codec, payload, timing, color, language, disposition, configuration, channels, start, duration, display
+            case trackID = "track_id"
+            case packetLayout = "packet_layout"
+            case codecTag = "codec_tag"
+            case nativeMetadata = "native_metadata"
+            case sceneMetadata = "scene_metadata"
+            case indexTraits = "index_traits"
+            case insertedPresentationEdits = "inserted_presentation_edits"
+            case channelLayout = "channel_layout"
+            case sampleRate = "sample_rate"
+            case initialPadding = "initial_padding"
+            case trailingPadding = "trailing_padding"
+            case seekPreroll = "seek_preroll"
+            case timeBase = "time_base"
+            case audioStart = "audio_start"
+            case audioEnd = "audio_end"
+        }
+
         let kind: String
         let trackID: Int
         let codec: String
@@ -174,21 +201,43 @@ struct MediaRefreshEvidence: Codable, Sendable {
                 if key == AnalysisSidecar.sceneSectionKey || key == AnalysisSidecar.viewNameSectionKey {
                     return scenes
                 }
-                if key.hasPrefix("filmstrip.v1.") { return !displayChanged }
+                if key.hasPrefix("timeline_filmstrip.v1.") { return !displayChanged }
                 let stream = AnalysisSidecar.savedWaveformStream(forKey: key)
                     ?? AnalysisSidecar.savedEnvelopeStream(forKey: key)
                     ?? AnalysisSidecar.savedSilenceSettings(forKey: key)?.stream
                     ?? Self.calibrationStream(key)
+                    ?? AnalysisSidecar.savedTranscriptStream(forKey: key)
                 return stream.map(audio.contains) ?? false
             })
         }
 
         private static func calibrationStream(_ key: String) -> Int? {
-            let prefix = "calibration.v1."
+            let prefix = "silence_automatic_threshold_db.v1."
             guard key.hasPrefix(prefix), let stream = Int(key.dropFirst(prefix.count)), stream >= 0,
                   key == "\(prefix)\(stream)" else { return nil }
             return stream
         }
+    }
+
+    private struct PayloadKey: Hashable {
+        let kind: String
+        let configuration: Data
+        let digest: Data
+
+        init?(_ stream: Stream) {
+            guard let digest = stream.payload else { return nil }
+            self.digest = digest
+            kind = stream.kind
+            configuration = stream.configuration
+        }
+    }
+
+    private func positionsByPayload() -> [PayloadKey: Set<Int>] {
+        var positions: [PayloadKey: Set<Int>] = [:]
+        for (index, stream) in streams.enumerated() {
+            if let key = PayloadKey(stream) { positions[key, default: []].insert(index) }
+        }
+        return positions
     }
 
     func compare(to old: Self) -> Comparison {
@@ -199,8 +248,12 @@ struct MediaRefreshEvidence: Codable, Sendable {
         if old.videoIndex >= 0, videoIndex >= 0, old.videoIndex != videoIndex {
             result.review.insert(videoIndex)
         }
+        let oldPositions = old.positionsByPayload()
+        let newPositions = positionsByPayload()
+        let countsByKind = streams.reduce(into: [String: Int]()) { $0[$1.kind, default: 0] += 1 }
         for (index, previous) in old.streams.enumerated() where previous.kind == "audio" || index == old.videoIndex {
-            let matchingPositions = streams.indices.filter { streams[$0].hasSamePayload(as: previous) }
+            let previousKey = PayloadKey(previous)
+            let matchingPositions = previousKey.flatMap { newPositions[$0] } ?? []
             guard streams.indices.contains(index), streams[index].kind == previous.kind else {
                 result.review.insert(index)
                 result.review.formUnion(matchingPositions)
@@ -208,10 +261,10 @@ struct MediaRefreshEvidence: Codable, Sendable {
             }
             let current = streams[index]
             let requiresStableTrackID = format == old.format && previous.trackID > 0
-            let previousCopies = old.streams.filter { $0.hasSamePayload(as: previous) }.count
-            let currentMatchesOtherEarlierTrack = !current.hasSamePayload(as: previous) &&
-                old.streams.indices.contains { $0 != index && old.streams[$0].hasSamePayload(as: current) }
-            let hasCompetingTrack = streams.indices.contains { $0 != index && streams[$0].kind == previous.kind }
+            let previousCopies = previousKey.flatMap { oldPositions[$0]?.count } ?? 0
+            let currentMatchesOtherEarlierTrack = !matchingPositions.contains(index) &&
+                PayloadKey(current).map { oldPositions[$0] != nil } == true
+            let hasCompetingTrack = (countsByKind[previous.kind] ?? 0) > 1
             let ambiguous = hasCompetingTrack && !exactlySameFile &&
                 (matchingPositions.count > 1 || previousCopies > 1 ||
                  (!requiresStableTrackID && !matchingPositions.contains(index)))

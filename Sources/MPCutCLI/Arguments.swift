@@ -18,8 +18,8 @@ struct SourceSoundtrack: Equatable {
 }
 
 struct InputClip: Decodable {
-    var legacyCSV = false
-    var csv: String?
+    var occurrenceID: String?  // Internal provenance when expanding a saved sequence.
+    var rangesFile: String?
     var soundtrack: SourceSoundtrack?
     var file: String?
     var project: String?
@@ -27,7 +27,8 @@ struct InputClip: Decodable {
     var to: String?
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case file, project, from, to, replaceAudio, replaceTrack, replacementStream
+        case file, project = "project_path", from, to, rangesFile = "ranges_file",
+             replaceAudio = "replace_audio", replaceTrack = "replace_track", replacementStream = "replacement_stream"
     }
 
     init(file: String) {
@@ -38,15 +39,19 @@ struct InputClip: Decodable {
         let fields = try decoder.requestFields(CodingKeys.self, in: "Clip")
         file = try fields.decodeIfPresent(String.self, forKey: .file)
         project = try fields.decodeIfPresent(String.self, forKey: .project)
+        rangesFile = try fields.decodeIfPresent(String.self, forKey: .rangesFile)
         guard file == nil || project == nil else {
-            throw CLIError("invalid_json", "A clip must select either a file or a project.")
+            throw CLIError("invalid_json", "A clip must select either file or project_path.")
+        }
+        guard project == nil || rangesFile == nil else {
+            throw CLIError("invalid_json", "A range list requires a file clip.")
         }
         let donor = try fields.decodeIfPresent(String.self, forKey: .replaceAudio)
         let target = try fields.decodeIfPresent(Int.self, forKey: .replaceTrack)
         let stream = try fields.decodeIfPresent(Int.self, forKey: .replacementStream)
         guard (target ?? 0) >= 0, (stream ?? 0) >= 0,
               donor != nil || (target == nil && stream == nil), project == nil || donor == nil else {
-            throw CLIError("invalid_json", "Source replacement requires a file clip, replaceAudio and nonnegative stream indices.")
+            throw CLIError("invalid_json", "Source replacement requires a file clip, replace_audio and nonnegative stream indices.")
         }
         soundtrack = donor.map { SourceSoundtrack(file: $0, target: target, stream: stream) }
         from = try fields.inputTime(.from, in: "Clip")
@@ -63,7 +68,7 @@ struct InputEdit: Decodable {
     var options = ExportOptions()
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case output, clips, file, project, order, mode, video, quality, audio, snap, tracks, audioStream, replaceAudio, replaceTrack, replacementStream, requireCameraCopy
+        case output, clips, file, project = "project_path", order, mode, video, quality, audio, audioOutput = "audio_output", snap, tracks, audioStream = "audio_stream", replaceAudio = "replace_audio", replaceTrack = "replace_track", replacementStream = "replacement_stream", requireCameraCopy = "require_camera_copy", spaceClips = "space_clips"
     }
 
     init(output: String, clips: [InputClip]) {
@@ -79,17 +84,23 @@ struct InputEdit: Decodable {
             clips = try fields.decode([InputClip].self, forKey: .clips)
         } else {
             guard !fields.contains(.clips), !fields.contains(.file), !fields.contains(.order) else {
-                throw CLIError("invalid_json", "A saved project export accepts project in place of clips, file and order.")
+                throw CLIError("invalid_json", "A saved project export takes project_path and output. Clip selection and ordering belong to export clips join.")
             }
             clips = []
         }
         options.requireCameraCopy = try fields.decodeIfPresent(Bool.self, forKey: .requireCameraCopy)
+        if let value = try fields.inputTime(.spaceClips, in: "Export request") {
+            try options.set("space-clips", to: value, code: "invalid_json")
+        }
         file = try fields.decodeIfPresent(String.self, forKey: .file)
         order = try fields.decodeIfPresent([Int].self, forKey: .order)
         for key in [CodingKeys.mode, .video, .quality, .audio, .snap, .tracks] {
             if let value = try fields.decodeIfPresent(String.self, forKey: key) {
                 try options.set(key.rawValue, to: value, code: "invalid_json")
             }
+        }
+        if let value = try fields.decodeIfPresent(String.self, forKey: .audioOutput) {
+            try options.set("audio-output", to: value, code: "invalid_json")
         }
         options.audioStream = try fields.decodeIfPresent(Int.self, forKey: .audioStream)
         options.replaceAudio = try fields.decodeIfPresent(String.self, forKey: .replaceAudio)
@@ -112,11 +123,17 @@ struct InputEdit: Decodable {
     }
 }
 
+enum ClipSpacing: Equatable {
+    case source
+    case duration(RationalTime)
+}
+
 struct ExportOptions {
     var mode: ExportMode?
     var video: ReencodeCodec?
     var quality: ReencodeQuality?
     var audio: ReencodeAudio?
+    var audioOutput: MulticamAudioOutput?
     var snap: SnapMode?
     var tracks: ExportTracks?
     var audioStream: Int?
@@ -126,6 +143,7 @@ struct ExportOptions {
     var subfolder: String?
     var baseName: String?
     var requireCameraCopy: Bool?
+    var spaceClips: ClipSpacing?
 
     var organization: ExportOrganization { .init(subfolder: subfolder ?? "", baseName: baseName ?? "") }
 
@@ -150,6 +168,16 @@ struct ExportOptions {
         case "quality": quality = try checked(ReencodeQuality.self)
         case "snap": snap = try checked(SnapMode.self)
         case "audio": audio = try checked(ReencodeAudio.self)
+        case "audio-output": audioOutput = try checked(MulticamAudioOutput.self)
+        case "space-clips":
+            if value == "source" {
+                spaceClips = .source
+            } else {
+                guard let duration = try? RationalTime(parsing: value), duration >= .zero else {
+                    throw CLIError(code, "--space-clips requires source or a nonnegative duration.")
+                }
+                spaceClips = .duration(duration)
+            }
         default: preconditionFailure("Unknown export setting")
         }
     }
@@ -177,15 +205,17 @@ struct ExportOptions {
             video: resolve("video", video, request.video),
             quality: resolve("quality", quality, request.quality),
             audio: resolve("audio", audio, request.audio),
+            audioOutput: resolve("audio-output", audioOutput, request.audioOutput, jsonKey: "audio_output"),
             snap: resolve("snap", snap, request.snap),
             tracks: resolve("tracks", tracks, request.tracks),
-            audioStream: resolve("audio-stream", audioStream, request.audioStream, jsonKey: "audioStream"),
-            replaceAudio: resolve("replace-audio", replaceAudio, request.replaceAudio, jsonKey: "replaceAudio"),
-            replaceTrack: resolve("replace-track", replaceTrack, request.replaceTrack, jsonKey: "replaceTrack"),
-            replacementStream: resolve("replacement-stream", replacementStream, request.replacementStream, jsonKey: "replacementStream"),
+            audioStream: resolve("audio-stream", audioStream, request.audioStream, jsonKey: "audio_stream"),
+            replaceAudio: resolve("replace-audio", replaceAudio, request.replaceAudio, jsonKey: "replace_audio"),
+            replaceTrack: resolve("replace-track", replaceTrack, request.replaceTrack, jsonKey: "replace_track"),
+            replacementStream: resolve("replacement-stream", replacementStream, request.replacementStream, jsonKey: "replacement_stream"),
             subfolder: resolve("subfolder", subfolder, request.subfolder),
-            baseName: resolve("base-name", baseName, request.baseName, jsonKey: "baseName"),
-            requireCameraCopy: resolve("require-camera-copy", requireCameraCopy, request.requireCameraCopy, jsonKey: "requireCameraCopy")
+            baseName: resolve("base-name", baseName, request.baseName, jsonKey: "base_name"),
+            requireCameraCopy: resolve("require-camera-copy", requireCameraCopy, request.requireCameraCopy, jsonKey: "require_camera_copy"),
+            spaceClips: resolve("space-clips", spaceClips, request.spaceClips, jsonKey: "space_clips")
         )
     }
 }
@@ -219,7 +249,12 @@ enum CLICommand {
     case version
     case waveform(WaveformOptions)
     case frames(FrameExportOptions)
+    case authorProject(creating: Bool)
+    case timelineReview(TimelineReviewOptions)
+    case multicamSwitchCoverage
     case still(StillOptions)
+    case transcript(TranscriptCLI)
+    case participants(ParticipantCLI)
     case stillCreate(StillCreateOptions)
     case silence(SilenceOptions)
     case scenes(SceneScanOptions)
@@ -229,6 +264,7 @@ enum CLICommand {
     case convert(input: String, output: String, allowLoss: Bool, flattenMulticam: Bool)
     case resolve(project: String, output: String, open: Bool)
     case inspectProject(String)
+    case multicamSync(MulticamSyncOptions)
     case exportProject(project: String, output: String, dryRun: Bool, options: ExportOptions)
     case bulk(dryRun: Bool, options: ExportOptions, list: BulkList?)
     case export(input: InputEdit?, dryRun: Bool, options: ExportOptions, order: [Int]?, resolveOpen: Bool? = nil)
@@ -267,142 +303,172 @@ struct Arguments {
         Arguments(command: replacement, json: json, useSidecar: useSidecar)
     }
 
+    private(set) var operation: String?
+
     static func parse(_ tokens: [String]) throws -> Arguments {
         let end = tokens.firstIndex(of: "--") ?? tokens.endIndex
-        if let index = tokens[..<end].firstIndex(of: "--input") {
-            guard index + 1 < end, !tokens[index + 1].hasPrefix("--"),
-                  tokens[..<end].filter({ $0 == "--input" }).count == 1,
-                  !tokens[..<end].contains("--stdin"),
-                  let command = tokens[..<end].first(where: { !["--json", "--no-sidecar"].contains($0) }),
-                  ["bulk", "export", "resolve", "silence", "scenes"].contains(command) else {
+        let prefix = tokens[..<end]
+        let json = prefix.contains("--json")
+        let sidecar = !prefix.contains("--no-sidecar")
+        for flag in ["--json", "--no-sidecar"] where prefix.filter({ $0 == flag }).count > 1 {
+            throw CLIError("invalid_arguments", "Duplicate " + flag)
+        }
+        let words = Array(prefix.filter { !["--json", "--no-sidecar"].contains($0) }) + Array(tokens[end...])
+        if words == ["--help"] { return Arguments(command: .help(nil), json: json) }
+        if words.first == "help" {
+            let topic = words == ["help", "--help"] ? "help" : words.dropFirst().joined(separator: " ")
+            if topic == "manual" { return Arguments(command: .manual, json: json) }
+            return Arguments(command: .help(try topic.isEmpty ? nil : CommandHelp.topic(topic)), json: json)
+        }
+        if words == ["--version"] { return Arguments(command: .version, json: json) }
+        if words.last == "--help", !words.contains("--") {
+            return Arguments(command: .help(try CommandHelp.topic(words.dropLast().joined(separator: " "))), json: json)
+        }
+        guard let operation = CommandPath.match(words) else {
+            throw CLIError("invalid_arguments", "Unknown command. Use mpcut help to list command paths.")
+        }
+        var options = Array(words.dropFirst(operation.split(separator: " ").count))
+        let flags = options.prefix { $0 != "--" }
+        var requestFile: String?
+        if !operation.hasPrefix("transcript "), CommandPath.participants[operation] == nil, let index = flags.firstIndex(of: "--input") {
+            guard index + 1 < flags.endIndex, !options[index + 1].hasPrefix("--"),
+                  flags.filter({ $0 == "--input" }).count == 1, !flags.contains("--stdin"),
+                  ["project create", "project edit", "multicam switch coverage", "export clips join", "export project render", "export soundtrack replace", "export ranges separate",
+                   "project resolve import", "project resolve export", "silence plan", "silence export", "scenes export"].contains(operation) else {
                 throw CLIError("invalid_arguments", "Supply one JSON request with --input FILE on a command that accepts --stdin.")
             }
-            var normalized = tokens
-            normalized.replaceSubrange(index...index + 1, with: ["--stdin"])
-            if ["export", "bulk"].contains(command), !requestsJSON(normalized) { normalized.insert("--json", at: 0) }
-            let result = try parse(normalized)
-            return Arguments(command: result.command, json: requestsJSON(tokens), useSidecar: result.useSidecar, requestFile: tokens[index + 1])
+            requestFile = options[index + 1]
+            options.replaceSubrange(index...index + 1, with: ["--stdin"])
         }
-        let flags = tokens[..<end].filter { $0 == "--no-sidecar" }
-        guard flags.count <= 1 else { throw CLIError("invalid_arguments", "Duplicate --no-sidecar.") }
-        if !flags.isEmpty {
-            let filtered = tokens[..<end].filter { $0 != "--no-sidecar" } + tokens[end...]
-            var result = try parseCommand(Array(filtered))
-            if case let .sidecar(options) = result.command, options.statusOnly {
-                throw CLIError("invalid_arguments", "--status reads the sidecar and cannot be combined with --no-sidecar.")
-            }
-            result.useSidecar = false
-            return result
+        if json || requestFile != nil && operation.hasPrefix("export ") { options.insert("--json", at: 0) }
+        let parsed = try parseCommand(operation, options: options, json: json || requestFile != nil)
+        if !sidecar, case let .sidecar(settings) = parsed.command, settings.statusOnly {
+            throw CLIError("invalid_arguments", "Inspecting a sidecar requires sidecar access.")
         }
-        return try parseCommand(tokens)
+        return Arguments(command: parsed.command, json: json, useSidecar: sidecar,
+                         requestFile: requestFile, operation: operation)
     }
 
-    private static func parseCommand(_ tokens: [String]) throws -> Arguments {
-        // A leading --json belongs to the command that follows: `mpcut --json --help` is `mpcut help --json`.
-        if tokens.first == "--json", tokens.count > 1, tokens[1] != "--json", tokens[1] != "--" {
-            return try parseCommand([tokens[1], "--json"] + tokens.dropFirst(2))
+    private static func parseCommand(_ path: String, options: [String], json: Bool) throws -> Arguments {
+        if let operation = CommandPath.participants[path] {
+            return Arguments(command: .participants(try ParticipantCLI(operation: operation, arguments: options)), json: json)
         }
-        guard let verb = tokens.first else {
-            throw CLIError("invalid_arguments", "Missing command. Use mpcut --help for usage.")
+        if let operation = CommandPath.transcript[path] {
+            return Arguments(command: .transcript(try TranscriptCLI([operation.rawValue] + options)), json: json)
         }
-
-        let options = Array(tokens.dropFirst())
-        let json = requestsJSON(tokens)
-        let helpOptions = options.filter { $0 != "--json" }
-        if ["--help", "-h", "help"].contains(verb) {
-            guard helpOptions.count <= 1 else {
-                throw CLIError("invalid_arguments", "Use mpcut help [COMMAND] [--json].")
-            }
-            if helpOptions == ["--help"] || helpOptions == ["-h"] {
-                return Arguments(command: .help(try CommandHelp.topic("help")), json: json)
-            }
-            if helpOptions == ["manual"] { return Arguments(command: .manual, json: json) }
-            return Arguments(command: .help(try helpOptions.first.map(CommandHelp.topic)), json: json)
+        if let operation = CommandPath.stills[path] {
+            return Arguments(command: .still(try StillOptions(operation: operation, arguments: options,
+                                                              gap: path == "timeline gap insert",
+                                                              replace: path == "still picture replace")), json: json)
         }
-        if helpOptions == ["--help"] || helpOptions == ["-h"] {
-            return Arguments(command: .help(try CommandHelp.topic(verb)), json: json)
-        }
-        switch verb {
-        case "convert":
+        switch path {
+        case "timeline range map", "history compare":
+            return Arguments(command: .timelineReview(try TimelineReviewOptions(path: path, arguments: options)), json: json)
+        case "multicam sync suggest":
+            return Arguments(command: .multicamSync(try MulticamSyncOptions(options)), json: json)
+        case "multicam switch coverage":
+            guard options.filter({ $0 != "--json" }) == ["--stdin"] else { throw CLIError("invalid_arguments", "Supply --input FILE or --stdin.") }
+            return Arguments(command: .multicamSwitchCoverage, json: json)
+        case "project create", "project edit":
+            guard options.filter({ $0 != "--json" }) == ["--stdin"] else { throw CLIError("invalid_arguments", "Supply --input FILE or --stdin.") }
+            return Arguments(command: .authorProject(creating: path == "project create"), json: json)
+        case "project convert":
             return Arguments(command: try convert(options), json: json)
-        case "resolve":
+        case "project resolve export", "project resolve import":
+            let importing = path == "project resolve import"
             if options.contains("--clips") {
-                let command = try export(options, json: json, forResolve: true)
+                let command = try export(options, json: json, forResolve: true, openResolve: importing)
                 guard case .export(.some, false, _, _, .some) = command else {
-                    throw CLIError("invalid_arguments", "Use resolve --clips LIST --output FILE.fcpxml.")
+                    throw CLIError("invalid_arguments", "Use project resolve export --clips LIST --output FILE.fcpxml.")
                 }
                 return Arguments(command: command, json: json)
             }
             if options.contains("--stdin") {
-                guard Set(options).isSubset(of: ["--stdin", "--open", "--json"]), Set(options).count == options.count else {
-                    throw CLIError("invalid_arguments", "Use resolve --stdin [--open] [--json] with an edit request.")
+                guard Set(options).isSubset(of: ["--stdin", "--json"]), Set(options).count == options.count else {
+                    throw CLIError("invalid_arguments", "Supply an edit request with --stdin [--json].")
                 }
                 return Arguments(command: .export(input: nil, dryRun: false, options: ExportOptions(), order: nil,
-                                                  resolveOpen: options.contains("--open")), json: json)
+                                                  resolveOpen: importing), json: json)
             }
             var values: [String: String] = [:]
             var flags = Set<String>()
             var iterator = options.makeIterator()
             while let option = iterator.next() {
                 guard flags.insert(option).inserted else { throw CLIError("invalid_arguments", "Duplicate " + option) }
-                if option == "--open" || option == "--json" { continue }
+                if option == "--json" { continue }
                 guard ["--project", "--output"].contains(option), let value = iterator.next(),
                       !value.isEmpty, !value.hasPrefix("--") else {
-                    throw CLIError("invalid_arguments", "Expected --project PROJECT --output FILE.fcpxml [--open].")
+                    throw CLIError("invalid_arguments", "Expected --project PROJECT --output FILE.fcpxml.")
                 }
                 values[option] = value
             }
             guard let project = values["--project"], let output = values["--output"] else {
                 throw CLIError("invalid_arguments", "Specify both --project and --output.")
             }
-            return Arguments(command: .resolve(project: project, output: output, open: flags.contains("--open")), json: json)
-        case "sidecar":
-            return Arguments(command: .sidecar(try SidecarOptions(options)), json: json)
-        case "--version" where options.isEmpty || options == ["--json"]:
-            return Arguments(command: .version, json: json)
-        case "still":
-            let stillOptions = options.filter { $0 != "--json" }
-            if stillOptions.first == "create", !stillOptions.contains("--help"), !stillOptions.contains("-h") {
-                return Arguments(command: .stillCreate(try StillCreateOptions(Array(stillOptions.dropFirst()))), json: json)
+            return Arguments(command: .resolve(project: project, output: output, open: importing), json: json)
+        case "analysis sidecar inspect", "analysis sidecar build":
+            return Arguments(command: .sidecar(try SidecarOptions(options, statusOnly: path == "analysis sidecar inspect")), json: json)
+        case "still project create":
+            return Arguments(command: .stillCreate(try StillCreateOptions(options.filter { $0 != "--json" })), json: json)
+        case "silence scan", "silence plan", "silence export", "silence shorten":
+            var settings = try SilenceOptions(options)
+            guard (path == "silence shorten") == (settings.outProject != nil),
+                  settings.outProject == nil || (settings.project != nil && settings.output == nil && !settings.dryRun),
+                  (settings.protectedPauses.isEmpty && settings.retainedPauseSeconds.isEmpty && settings.takeBoundaries.isEmpty) || settings.project != nil else {
+                throw CLIError("invalid_arguments", "Use silence shorten --project FILE --out-project NEW.cut. Pause IDs and take boundaries require a project.")
             }
-            if helpOptions == ["create", "--help"] || helpOptions == ["create", "-h"] {
-                return Arguments(command: .help(try CommandHelp.topic(verb)), json: json)
+            if !settings.takeBoundaries.isEmpty && (settings.output != nil || settings.outProject != nil) {
+                throw CLIError("invalid_arguments", "--take-boundary edits the take candidates in a project scan or plan report.")
             }
-            if helpOptions.count == 2, ["--help", "-h"].contains(helpOptions[1]),
-               StillOptions.Operation(rawValue: helpOptions[0]) != nil {
-                return Arguments(command: .help(try CommandHelp.topic(verb)), json: json)
+            switch path {
+            case "silence scan" where settings.stdin || settings.pausesFile != nil || settings.output != nil:
+                throw CLIError("invalid_arguments", "Use silence scan with fresh media. Choose silence plan for saved reports or an export preview.")
+            case "silence export" where settings.dryRun || settings.output == nil:
+                throw CLIError("invalid_arguments", "Silence export requires an output. Use silence plan to preview the result.")
+            case "silence plan": settings.dryRun = settings.output != nil
+            default: break
             }
-            return Arguments(command: .still(try StillOptions(options)), json: json)
-        case "silence":
-            return Arguments(command: .silence(try SilenceOptions(options)), json: json)
-        case "scenes":
+            return Arguments(command: .silence(settings), json: json)
+        case "scenes scan":
+            return Arguments(command: .scenes(try SceneScanOptions(options)), json: json)
+        case "scenes export":
             return Arguments(command: try scenes(options), json: json)
-        case "refresh":
+        case "project media refresh":
             return Arguments(command: .refresh(try RefreshOptions(options)), json: json)
-        case "waveform":
+        case "waveform envelope read":
             return Arguments(command: .waveform(try WaveformOptions(options)), json: json)
-        case "frames":
+        case "review frames export":
             return Arguments(command: .frames(try FrameExportOptions(options)), json: json)
-        case "inspect":
-            return Arguments(command: try inspect(options), json: json)
-        case "bulk":
+        case "media inspect", "project inspect":
+            let command = try inspect(options)
+            if case .inspectProject = command {
+                guard path == "project inspect" else { throw CLIError("invalid_arguments", "Use project inspect for a project.") }
+            } else if path == "project inspect" {
+                throw CLIError("invalid_arguments", "Specify --project FILE.")
+            }
+            return Arguments(command: command, json: json)
+        case "export ranges separate":
             if !options.prefix(while: { $0 != "--" }).contains("--stdin") { return Arguments(command: try bulkList(options), json: json) }
             guard case let .export(nil, dryRun, flags, order, nil) = try export(options, json: json, forBulk: true) else {
-                throw CLIError("invalid_arguments", "Bulk requires --json --stdin.")
+                throw CLIError("invalid_arguments", "Export ranges separate requires --json with --stdin.")
             }
             guard flags.replaceAudio == nil, flags.replaceTrack == nil, flags.replacementStream == nil else {
-                throw CLIError("invalid_arguments", "Replace audio through export with one complete source file.")
+                throw CLIError("invalid_arguments", "Use export soundtrack replace to replace source audio.")
             }
             guard order == nil else {
-                throw CLIError("invalid_arguments", "--order belongs to export, which joins clips into one file.")
+                throw CLIError("invalid_arguments", "Use --order with export clips join.")
             }
             return Arguments(command: .bulk(dryRun: dryRun, options: flags, list: nil), json: true)
-        case "export":
-            return Arguments(command: try export(options, json: json), json: json)
-        case "rearrange":
+        case "export project render", "export clips join", "export soundtrack replace":
+            let command = try export(options, json: json)
+            if case .exportProject = command, path != "export project render" {
+                throw CLIError("invalid_arguments", "Use export project render with --project.")
+            }
+            return Arguments(command: command, json: json)
+        case "export ranges join":
             return Arguments(command: try rearrange(options), json: json)
         default:
-            throw CLIError("invalid_arguments", "Unknown command '\(verb)'. Use mpcut --help for usage.")
+            throw CLIError("invalid_arguments", "Unknown command '\(path)'.")
         }
     }
 
@@ -443,11 +509,11 @@ struct Arguments {
             }
         }
         guard let input, let output else {
-            throw CLIError("invalid_arguments", "Use convert INPUT [--to FORMAT] --output FILE [--allow-loss].")
+            throw CLIError("invalid_arguments", "Use project convert INPUT [--to FORMAT] --output FILE [--allow-loss].")
         }
         let destination = URL(fileURLWithPath: output)
         if let format, !ProjectConverter.accepts(format: format, for: destination) {
-            throw CLIError("invalid_arguments", "Output extension does not match --to " + format + ". Choose cut, resolve, premiere, fcp, or a specific format extension.")
+            throw CLIError("invalid_arguments", "Output extension does not match --to " + format + ". Choose cut, resolve, premiere, or fcp.")
         }
         let allowLoss = seen.contains("--allow-loss")
         let flattenMulticam = seen.contains("--flatten-multicam")
@@ -472,11 +538,11 @@ struct Arguments {
             }
             switch option {
             case "--ranges" where ranges == nil: ranges = try value()
-            case "--output", "--output-directory":
+            case "--output":
                 guard directory == nil else { throw CLIError("invalid_arguments", "Duplicate output directory.") }
                 directory = try value()
             case "--container" where container == nil: container = try value()
-            case "--json", "--dry-run", "--audio-only", "--video-only", "--smart-trim": flags.append(option)
+            case "--json", "--dry-run": flags.append(option)
             case "--mode", "--tracks", "--audio-stream", "--snap", "--audio", "--video", "--quality", "--subfolder", "--base-name":
                 flags += [option, try value()]
             case "--":
@@ -485,13 +551,13 @@ struct Arguments {
                 source = remaining[0]
                 iterator = [].makeIterator()
             default:
-                guard !option.hasPrefix("-"), source == nil else { throw CLIError("invalid_arguments", "Unexpected bulk argument '\(option)'.") }
+                guard !option.hasPrefix("-"), source == nil else { throw CLIError("invalid_arguments", "Unexpected export ranges separate argument '\(option)'.") }
                 source = option
             }
         }
         guard let source, let ranges, let directory,
               case let .export(nil, dryRun, settings, nil, nil) = try export(flags, json: true, forBulk: true) else {
-            throw CLIError("invalid_arguments", "Use bulk SOURCE --ranges LIST --output DIRECTORY, or supply a complete bulk request.")
+            throw CLIError("invalid_arguments", "Use export ranges separate SOURCE --ranges LIST --output DIRECTORY, or supply a complete range export request.")
         }
         return .bulk(dryRun: dryRun, options: settings, list: BulkList(source: source, ranges: ranges, directory: directory, container: container))
     }
@@ -511,10 +577,6 @@ struct Arguments {
                 case "--": positionalOnly = true; continue
                 case "--json": continue
                 case "--dry-run": dryRun = true; continue
-                case "--audio-only", "--video-only":
-                    guard settings.tracks == nil else { throw CLIError("invalid_arguments", "Choose one track selection.") }
-                    settings.tracks = argument == "--audio-only" ? .audio : .video
-                    continue
                 case "--output", "--ranges", "--snap", "--tracks", "--audio-stream":
                     guard seen.insert(argument).inserted, !(argument == "--tracks" && settings.tracks != nil) else {
                         throw CLIError("invalid_arguments", "\(argument) may be specified only once.")
@@ -528,21 +590,20 @@ struct Arguments {
                     continue
                 default:
                     if argument.hasPrefix("-") {
-                        throw CLIError("invalid_arguments", "Unknown rearrange option '\(argument)'.")
+                        throw CLIError("invalid_arguments", "Unknown export ranges join option '\(argument)'.")
                     }
                 }
             }
             positional.append(argument)
         }
-        if list == nil, positional.count == 2, ListFile.isListPath(positional[1]) { list = positional.removeLast() }
         if let list, let output, positional.count == 1 {
             var clip = InputClip(file: positional[0])
-            clip.csv = list
+            clip.rangesFile = list
             settings.snap = settings.snap ?? .nearest
             return .export(input: InputEdit(output: output, clips: [clip]), dryRun: dryRun, options: settings, order: nil)
         }
         guard list == nil, let output, positional.count == 2 else {
-            throw CLIError("invalid_arguments", "Use rearrange INPUT --output OUTPUT '23:01-26:12,03:02-4:03'.")
+            throw CLIError("invalid_arguments", "Use export ranges join INPUT --output OUTPUT '23:01-26:12,03:02-4:03'.")
         }
         let clips = try positional[1].split(separator: ",", omittingEmptySubsequences: false).enumerated().map { offset, range in
             let bounds = range.split(omittingEmptySubsequences: false) { $0 == "-" || $0 == "–" }
@@ -562,12 +623,6 @@ struct Arguments {
     }
 
     private static func scenes(_ options: [String]) throws -> CLICommand {
-        let flags = options.prefix(while: { $0 != "--" })
-        let exportFlags = ["--stdin", "--dry-run", "--export-to", "--scenes-file", "--group-by",
-                           "--subfolder", "--base-name", "--container", "--tracks", "--audio-stream"]
-        if flags.allSatisfy({ !exportFlags.contains($0) }) {
-            return .scenes(try SceneScanOptions(options))
-        }
         var file: String?
         var values: [String: String] = [:]
         var stdin = false
@@ -711,15 +766,13 @@ struct Arguments {
         return .inspect(file: file, keyframes: keyframes, allFrames: allFrames, audioPackets: audioPackets, packetStream: packetStream, from: from, to: to, tracks: settings.tracks ?? .all, audioStream: settings.audioStream)
     }
 
-    private static func export(_ options: [String], json: Bool, forResolve: Bool = false, forBulk: Bool = false) throws -> CLICommand {
+    private static func export(_ options: [String], json: Bool, forResolve: Bool = false, forBulk: Bool = false, openResolve: Bool = false) throws -> CLICommand {
         var arguments = options.makeIterator()
-        var openResolve = false
         var output: String?
         var project: String?
         var clips: [InputClip] = []
         var stdin = false
         var dryRun = false
-        var smartTrim = false
         var exportOptions = ExportOptions()
         var order: [Int]?
         var suppliedSettings: Set<String> = []
@@ -735,9 +788,6 @@ struct Arguments {
             switch argument {
             case "--json":
                 break
-            case "--open" where forResolve:
-                guard !openResolve else { throw CLIError("invalid_arguments", "Duplicate --open.") }
-                openResolve = true
             case "--stdin":
                 stdin = true
             case "--dry-run":
@@ -747,17 +797,12 @@ struct Arguments {
                     throw CLIError("invalid_arguments", "Duplicate --require-camera-copy.")
                 }
                 exportOptions.requireCameraCopy = true
-            case "--smart-trim":
-                guard !smartTrim else {
-                    throw CLIError("invalid_arguments", "--smart-trim may be specified only once.")
+            case "--space-clips" where !forResolve && !forBulk:
+                guard suppliedSettings.insert(argument).inserted else {
+                    throw CLIError("invalid_arguments", "--space-clips may be specified only once.")
                 }
-                smartTrim = true
-            case "--audio-only", "--video-only":
-                guard suppliedSettings.insert("--tracks").inserted else {
-                    throw CLIError("invalid_arguments", "Choose one track selection.")
-                }
-                exportOptions.tracks = argument == "--audio-only" ? .audio : .video
-            case "--mode", "--video", "--quality", "--audio", "--snap", "--tracks", "--audio-stream", "--replace-audio", "--replace-track", "--replacement-stream":
+                try exportOptions.set("space-clips", to: value(for: argument))
+            case "--mode", "--video", "--quality", "--audio", "--audio-output", "--snap", "--tracks", "--audio-stream", "--replace-audio", "--replace-track", "--replacement-stream":
                 guard suppliedSettings.insert(argument).inserted else {
                     throw CLIError("invalid_arguments", "\(argument) may be specified only once.")
                 }
@@ -777,7 +822,7 @@ struct Arguments {
                     throw CLIError("invalid_arguments", "--order may be specified only once.")
                 }
                 let raw = try value(for: argument)
-                let entries = argument == "--order-file" || ListFile.isListPath(raw) ? try ListFile.scalars(raw, header: "order")
+                let entries = argument == "--order-file" ? try ListFile.scalars(raw, header: "order")
                     : raw.components(separatedBy: ",")
                 order = try entries.map {
                     guard let index = Int($0.trimmingCharacters(in: .whitespaces)) else {
@@ -792,12 +837,11 @@ struct Arguments {
                 output = try value(for: argument)
             case "--clips":
                 clips += try ListFile.clips(value(for: argument))
-            case "--csv", "--ranges":
-                guard let index = clips.indices.last, clips[index].csv == nil, clips[index].project == nil else {
-                    throw CLIError("invalid_arguments", "--csv requires a preceding --clip and one CSV per clip.")
+            case "--ranges":
+                guard let index = clips.indices.last, clips[index].rangesFile == nil, clips[index].project == nil else {
+                    throw CLIError("invalid_arguments", "--ranges requires a preceding --clip and one range list per clip.")
                 }
-                clips[index].csv = try value(for: argument)
-                clips[index].legacyCSV = argument == "--csv"
+                clips[index].rangesFile = try value(for: argument)
             case "--clip":
                 clips.append(InputClip(file: try value(for: argument)))
             case "--project":
@@ -822,12 +866,6 @@ struct Arguments {
             }
         }
 
-        if smartTrim {
-            guard exportOptions.mode == nil || exportOptions.mode == .smart else {
-                throw CLIError("invalid_arguments", "--smart-trim conflicts with the selected --mode.")
-            }
-            exportOptions.mode = .smart
-        }
         if stdin {
             guard json, output == nil, clips.isEmpty, project == nil else {
                 throw CLIError("invalid_arguments", "--stdin requires --json and supplies the output and clips.")
@@ -891,7 +929,7 @@ struct BulkInput: Decodable {
         ranges = .parsed(spans)
     }
     private enum Fields: String, CodingKey, CaseIterable {
-        case file, outputDirectory, ranges, subfolder, baseName, container, mode, snap, video, quality, audio, tracks, audioStream
+        case file, outputDirectory = "output_directory", ranges, subfolder, baseName = "base_name", container, mode, snap, video, quality, audio, tracks, audioStream = "audio_stream"
     }
     init(from decoder: Decoder) throws {
         let fields = try decoder.requestFields(Fields.self, in: "Bulk request")

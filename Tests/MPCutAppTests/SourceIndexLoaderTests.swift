@@ -4,6 +4,51 @@ import XCTest
 
 final class SourceIndexLoaderTests: XCTestCase {
     @MainActor
+    func testOpeningUsesCompleteSidecarForSequenceAndMulticam() async throws {
+        let (directory, fixture) = try fixtureDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("cached.mov")
+        try FileManager.default.copyItem(at: fixture, to: file)
+        let original = try CutEngine(useSidecar: false).inspect(file, keyframes: true)
+        let sidecar = AnalysisSidecar(media: original)
+        try sidecar.save(AnalysisSidecar.indexSections(for: original))
+        let key = SourceIndexLoader.Key(url: file, sidecars: true, preview: true, preferCompleted: true)
+        let loader = SourceIndexLoader()
+        let opened = try await read(key, using: loader)
+        XCTAssertTrue(opened.ordinary.hasFullEditIndex)
+        XCTAssertEqual(opened.ordinary.frames.map(\.time), original.frames.map(\.time))
+        let full = try await read(.init(url: file, sidecars: true, preview: false), using: loader)
+        XCTAssertTrue(opened === full)
+
+        let multicam = try await admit(.init(url: file, sidecars: true, preview: true), using: SourceIndexLoader())
+        XCTAssertTrue(multicam.ordinary.hasFullEditIndex)
+        XCTAssertTrue(multicam.multicam.hasFullEditIndex)
+    }
+
+    @MainActor
+    func testOpeningFallsBackToProvisionalMediaForIncompleteSidecar() async throws {
+        let (directory, fixture) = try fixtureDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let loader = SourceIndexLoader()
+        for (name, audio) in [("partial", nil), ("corrupt", Data([0xff]))] as [(String, Data?)] {
+            let file = directory.appendingPathComponent("\(name).mov")
+            try FileManager.default.copyItem(at: fixture, to: file)
+            let original = try CutEngine(useSidecar: false).inspect(file, keyframes: true)
+            let sidecar = AnalysisSidecar(media: original)
+            var sections = try AnalysisSidecar.indexSections(for: original)
+            sections["media_index_audio.v1"] = audio
+            try sidecar.save(sections)
+            let preview = try await read(.init(url: file, sidecars: true, preview: true, preferCompleted: true), using: loader)
+            XCTAssertFalse(preview.ordinary.hasFullEditIndex, name)
+            let key = SourceIndexLoader.Key(url: file, sidecars: true, preview: false, identity: preview.ordinary.identity)
+            let full = try await read(key, using: loader)
+            XCTAssertTrue(full.ordinary.hasFullEditIndex, name)
+            XCTAssertEqual(full.ordinary.frames.map(\.time), original.frames.map(\.time), name)
+            XCTAssertNotNil(try CutEngine().cachedIndex(file), name)
+        }
+    }
+
+    @MainActor
     func testDelayedMovieFitsOrdinaryCacheAndConvertsOnMulticamAdmission() async throws {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "Multicam-Delayed-ProRes", withExtension: "mov",
                                                   subdirectory: "Fixtures"))

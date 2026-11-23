@@ -1,14 +1,14 @@
 [
   {
-    "name": "file_inspect",
-    "description": "Inspect one file, saved project, or inline .cut document. Choose a half-open window for frame or packet queries. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "name": "media_file_inspect",
+    "description": "Inspect recording metadata or a bounded window of frames or packets. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
@@ -20,15 +20,6 @@
           "pattern": "^/",
           "description": "Absolute path to the source file."
         },
-        "project": {
-          "type": "string",
-          "pattern": "^/",
-          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
-        },
-        "project_data": {
-          "type": "object",
-          "description": "Inline .cut document. Use absolute media paths, or set working_directory for relative assets."
-        },
         "detail": {
           "type": "string",
           "enum": [
@@ -38,19 +29,20 @@
             "audio_packets"
           ]
         },
-        "from": {
+        "source_from": {
           "type": "string",
           "minLength": 1,
-          "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."
+          "description": "Inclusive start in source time."
         },
-        "to": {
+        "source_to": {
           "type": "string",
           "minLength": 1,
-          "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."
+          "description": "Exclusive end in source time."
         },
-        "stream": {
+        "packet_audio_stream_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based absolute stream index of the audio to analyze."
         },
         "tracks": {
           "type": "string",
@@ -60,9 +52,10 @@
             "audio"
           ]
         },
-        "audio_stream": {
+        "audio_stream_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based absolute stream index for the requested audio track."
         },
         "no_sidecar": {
           "type": "boolean"
@@ -70,19 +63,50 @@
       },
       "additionalProperties": false,
       "required": [
-        "operationID"
+        "operation_id",
+        "file"
+      ]
+    }
+  },
+  {
+    "name": "project_file_inspect",
+    "description": "Inspect a saved or inline project. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "project_data": {
+          "type": "object",
+          "description": "Inline .cut document. Use absolute media paths, or set working_directory for relative assets."
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operation_id"
       ],
       "allOf": [
         {
           "oneOf": [
             {
               "required": [
-                "file"
-              ]
-            },
-            {
-              "required": [
-                "project"
+                "project_path"
               ]
             },
             {
@@ -96,15 +120,15 @@
     }
   },
   {
-    "name": "file_waveform",
-    "description": "Query a signed audio amplitude envelope. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "name": "waveform_file_envelope_read",
+    "description": "Query a signed audio amplitude envelope. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
@@ -116,19 +140,20 @@
           "pattern": "^/",
           "description": "Absolute path to the source file."
         },
-        "stream": {
+        "audio_stream_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based absolute stream index of the audio to analyze."
         },
-        "from": {
+        "source_from": {
           "type": "string",
           "minLength": 1,
-          "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."
+          "description": "Inclusive start in source time."
         },
-        "to": {
+        "source_to": {
           "type": "string",
           "minLength": 1,
-          "description": "Time in seconds, timecode, or exact rational seconds such as 1001/30000."
+          "description": "Exclusive end in source time."
         },
         "columns": {
           "type": "integer",
@@ -141,21 +166,21 @@
       },
       "additionalProperties": false,
       "required": [
-        "operationID",
+        "operation_id",
         "file"
       ]
     }
   },
   {
-    "name": "file_silence",
-    "description": "Analyze a recording or a project soundtrack, replay a saved silence report, or write shortened media. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "name": "silence_file_scan",
+    "description": "Scan a recording or project for pauses. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
@@ -167,7 +192,139 @@
           "pattern": "^/",
           "description": "Absolute path to the source file."
         },
-        "project": {
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "project_data": {
+          "type": "object",
+          "description": "Inline .cut document. Use absolute media paths, or set working_directory for relative assets."
+        },
+        "silence_audio_stream_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based absolute stream index of the audio to analyze."
+        },
+        "silence_threshold_db": {
+          "type": "number",
+          "minimum": -120,
+          "maximum": 0
+        },
+        "silence_max_blip_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.06,
+          "description": "Longest measured sound in seconds to join across quiet stretches during a new scan. Zero disables joining."
+        },
+        "silence_min_pause_seconds": {
+          "type": "number",
+          "description": "Positive minimum detected pause duration in seconds."
+        },
+        "silence_padding_per_side_seconds": {
+          "description": "Seconds of silence to keep on each side of a cut (default 0.2).",
+          "type": "number",
+          "minimum": 0
+        },
+        "waveform": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8192
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "retain_pauses": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Override the total retained seconds of detected project pauses.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pause_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "retained_seconds": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "pause_id",
+              "retained_seconds"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "take_boundaries": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Exact sequence or assembly split times for take candidates in a project report without an output movie.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "protect_pauses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Sequence pause IDs to retain, from a scan with matching settings."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operation_id"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "file"
+              ]
+            },
+            {
+              "required": [
+                "project_path"
+              ]
+            },
+            {
+              "required": [
+                "project_data"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "silence_file_plan",
+    "description": "Plan shortened media from a recording, project or saved pause report. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "project_path": {
           "type": "string",
           "pattern": "^/",
           "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
@@ -180,19 +337,29 @@
           "type": "object",
           "description": "Existing native CLI JSON report; retain its file, source stamp, and indices."
         },
-        "stream": {
+        "silence_audio_stream_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based absolute stream index of the audio to analyze."
         },
-        "threshold_db": {
+        "silence_threshold_db": {
           "type": "number",
           "minimum": -120,
           "maximum": 0
         },
-        "min_pause": {
-          "type": "number"
+        "silence_max_blip_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.06,
+          "description": "Longest measured sound in seconds to join across quiet stretches during a new scan. Zero disables joining."
         },
-        "leave": {
+        "silence_min_pause_seconds": {
+          "type": "number",
+          "description": "Positive minimum detected pause duration in seconds."
+        },
+        "silence_padding_per_side_seconds": {
+          "description": "Seconds of silence to keep on each side of a cut (default 0.2).",
           "type": "number",
           "minimum": 0
         },
@@ -209,9 +376,10 @@
             "audio"
           ]
         },
-        "audio_stream": {
+        "audio_stream_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based absolute stream index for the requested audio track."
         },
         "mode": {
           "type": "string",
@@ -225,9 +393,6 @@
           "pattern": "^/",
           "description": "Absolute destination path. Existing media outputs are protected."
         },
-        "dry_run": {
-          "type": "boolean"
-        },
         "no_sidecar": {
           "type": "boolean"
         },
@@ -240,11 +405,71 @@
           "type": "string",
           "pattern": "^/",
           "description": "Absolute path to a native CLI input/list file."
+        },
+        "retain_pauses": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Override the total retained seconds of detected project pauses.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pause_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "retained_seconds": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "pause_id",
+              "retained_seconds"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "take_boundaries": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Exact sequence or assembly split times for take candidates in a project report without an output movie.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "protect_pauses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Sequence pause IDs to retain, from a scan with matching settings."
+        },
+        "audio": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "copy",
+            "aac",
+            "pcm",
+            "remove"
+          ],
+          "description": "Audio action for project output. For multicam, independent of picture mode."
+        },
+        "audio_output": {
+          "type": "string",
+          "enum": [
+            "separate_tracks",
+            "downmix_mono",
+            "downmix_stereo"
+          ],
+          "description": "Audio delivery for a retained multicam project output."
         }
       },
       "additionalProperties": false,
       "required": [
-        "operationID"
+        "operation_id"
       ],
       "allOf": [
         {
@@ -256,7 +481,7 @@
             },
             {
               "required": [
-                "project"
+                "project_path"
               ]
             },
             {
@@ -275,20 +500,374 @@
               ]
             }
           ]
+        },
+        {
+          "if": {
+            "not": {
+              "allOf": [
+                {
+                  "not": {
+                    "required": [
+                      "audio"
+                    ]
+                  }
+                },
+                {
+                  "not": {
+                    "required": [
+                      "audio_output"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "then": {
+            "required": [
+              "output"
+            ],
+            "oneOf": [
+              {
+                "required": [
+                  "project_path"
+                ]
+              },
+              {
+                "required": [
+                  "project_data"
+                ]
+              }
+            ]
+          }
         }
       ]
     }
   },
   {
-    "name": "file_scenes",
-    "description": "Detect scenes in a file, file range or saved project, or export grouped scenes or views from a saved report. Poll file_job_status for progress and the CLI result. Supply the same operationID when retrying.",
+    "name": "silence_file_export",
+    "description": "Write shortened media from a recording, project or pause report. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "project_data": {
+          "type": "object",
+          "description": "Inline .cut document. Use absolute media paths, or set working_directory for relative assets."
+        },
+        "report": {
+          "type": "object",
+          "description": "Existing native CLI JSON report; retain its file, source stamp, and indices."
+        },
+        "silence_audio_stream_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based absolute stream index of the audio to analyze."
+        },
+        "silence_threshold_db": {
+          "type": "number",
+          "minimum": -120,
+          "maximum": 0
+        },
+        "silence_max_blip_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.06,
+          "description": "Longest measured sound in seconds to join across quiet stretches during a new scan. Zero disables joining."
+        },
+        "silence_min_pause_seconds": {
+          "type": "number",
+          "description": "Positive minimum detected pause duration in seconds."
+        },
+        "silence_padding_per_side_seconds": {
+          "description": "Seconds of silence to keep on each side of a cut (default 0.2).",
+          "type": "number",
+          "minimum": 0
+        },
+        "waveform": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8192
+        },
+        "tracks": {
+          "type": "string",
+          "enum": [
+            "all",
+            "video",
+            "audio"
+          ]
+        },
+        "audio_stream_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based absolute stream index for the requested audio track."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "smart",
+            "copy"
+          ]
+        },
+        "output": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute destination path. Existing media outputs are protected."
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "input_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "pauses_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "retain_pauses": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Override the total retained seconds of detected project pauses.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pause_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "retained_seconds": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "pause_id",
+              "retained_seconds"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "protect_pauses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Sequence pause IDs to retain, from a scan with matching settings."
+        },
+        "audio": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "copy",
+            "aac",
+            "pcm",
+            "remove"
+          ],
+          "description": "Audio action for project output. For multicam, independent of picture mode."
+        },
+        "audio_output": {
+          "type": "string",
+          "enum": [
+            "separate_tracks",
+            "downmix_mono",
+            "downmix_stereo"
+          ],
+          "description": "Audio delivery for a retained multicam project output."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "output"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "file"
+              ]
+            },
+            {
+              "required": [
+                "project_path"
+              ]
+            },
+            {
+              "required": [
+                "project_data"
+              ]
+            },
+            {
+              "required": [
+                "report"
+              ]
+            },
+            {
+              "required": [
+                "input_file"
+              ]
+            }
+          ]
+        },
+        {
+          "if": {
+            "not": {
+              "allOf": [
+                {
+                  "not": {
+                    "required": [
+                      "audio"
+                    ]
+                  }
+                },
+                {
+                  "not": {
+                    "required": [
+                      "audio_output"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "then": {
+            "required": [
+              "output"
+            ],
+            "oneOf": [
+              {
+                "required": [
+                  "project_path"
+                ]
+              },
+              {
+                "required": [
+                  "project_data"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "scenes_file_scan",
+    "description": "Scan a recording or project for scene boundaries. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "source_to": {
+          "type": "string",
+          "description": "Exclusive end in source time."
+        },
+        "clip_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Stable sequence occurrence ID in the saved project."
+        },
+        "camera_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable camera ID in the saved multicam project."
+        },
+        "all_sources": {
+          "type": "boolean",
+          "description": "Scan all referenced video sources in the saved project. This is the default project scope."
+        },
+        "policy": {
+          "type": "string",
+          "enum": [
+            "reuse",
+            "resume",
+            "restart"
+          ],
+          "description": "Reuse returns current results or resumes unfinished analysis. Resume prefers a saved replacement attempt. Restart begins a replacement identified by operation_id."
+        },
+        "source_from": {
+          "type": "string",
+          "description": "Inclusive start in source time."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operation_id"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "file"
+              ]
+            },
+            {
+              "required": [
+                "project_path"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "scenes_file_export",
+    "description": "Export grouped footage using fresh or saved scene boundaries. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
@@ -329,9 +908,10 @@
             "audio"
           ]
         },
-        "audio_stream": {
+        "audio_stream_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based absolute stream index for the requested audio track."
         },
         "dry_run": {
           "type": "boolean"
@@ -349,46 +929,21 @@
           "pattern": "^/",
           "description": "Absolute path to a native CLI input/list file."
         },
-        "project": {
-          "type": "string",
-          "pattern": "^/",
-          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
-        },
-        "to": {
-          "type": "string",
-          "description": "Exclusive source timestamp for a file range. Supply from as well."
-        },
-        "clip_id": {
-          "type": "string",
-          "format": "uuid",
-          "description": "Stable sequence occurrence ID in the saved project."
-        },
-        "camera_id": {
+        "subfolder": {
           "type": "string",
           "minLength": 1,
-          "description": "Stable camera ID in the saved multicam project."
+          "description": "Optional single directory name beneath the chosen output directory. Path separators and control characters are forbidden."
         },
-        "all_sources": {
-          "type": "boolean",
-          "description": "Scan all referenced video sources in the saved project. This is the default project scope."
-        },
-        "policy": {
+        "base_name": {
           "type": "string",
-          "enum": [
-            "reuse",
-            "resume",
-            "restart"
-          ],
-          "description": "Reuse returns current results or resumes unfinished analysis. Resume prefers a saved replacement attempt. Restart begins a replacement identified by operationID."
-        },
-        "from": {
-          "type": "string",
-          "description": "Inclusive source timestamp for a file range. Supply to as well."
+          "minLength": 1,
+          "description": "Optional single filename prefix. Path separators and control characters are forbidden."
         }
       },
       "additionalProperties": false,
       "required": [
-        "operationID"
+        "operation_id",
+        "export_to"
       ],
       "allOf": [
         {
@@ -407,55 +962,29 @@
               "required": [
                 "input_file"
               ]
-            },
-            {
-              "required": [
-                "project"
-              ]
             }
           ]
-        },
-        {
-          "if": {
-            "oneOf": [
-              {
-                "required": [
-                  "report"
-                ]
-              },
-              {
-                "required": [
-                  "input_file"
-                ]
-              }
-            ]
-          },
-          "then": {
-            "required": [
-              "export_to"
-            ]
-          }
         }
       ]
     }
   },
   {
-    "name": "file_refresh",
-    "description": "Check recordings referenced by a saved project and refresh eligible analysis sidecars. The project file stays untouched.",
+    "name": "project_file_media_refresh",
+    "description": "Check recordings referenced by a saved project and refresh eligible analysis sidecars. The project file stays untouched. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
           "pattern": "^/",
           "description": "Existing base directory for relative paths embedded in reports or project documents."
         },
-        "project": {
+        "project_path": {
           "type": "string",
           "pattern": "^/",
           "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
@@ -470,22 +999,22 @@
         }
       },
       "required": [
-        "operationID",
-        "project"
+        "operation_id",
+        "project_path"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "file_frames",
-    "description": "Write JPEG review images and a manifest for a source or every angle at group times. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "name": "review_file_frames_export",
+    "description": "Write JPEG review images and a manifest for a source or every angle at group times. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
@@ -497,7 +1026,7 @@
           "pattern": "^/",
           "description": "Absolute path to the source file."
         },
-        "project": {
+        "project_path": {
           "type": "string",
           "pattern": "^/",
           "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
@@ -531,7 +1060,7 @@
           "type": "string",
           "enum": [
             "scenes",
-            "non-silent"
+            "non_silent"
           ]
         },
         "sample": {
@@ -545,16 +1074,17 @@
           "type": "integer",
           "minimum": 1
         },
-        "stream": {
+        "silence_audio_stream_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based absolute stream index of the audio to analyze."
         },
-        "threshold_db": {
+        "silence_threshold_db": {
           "type": "number",
           "minimum": -120,
           "maximum": 0
         },
-        "min_pause": {
+        "silence_min_pause_seconds": {
           "type": "number"
         },
         "no_sidecar": {
@@ -564,11 +1094,20 @@
           "type": "string",
           "pattern": "^/",
           "description": "Absolute path to a native CLI input/list file."
+        },
+        "clock": {
+          "type": "string",
+          "enum": [
+            "sequence",
+            "assembly",
+            "group"
+          ],
+          "description": "Project timebase. Sequence projects use sequence time. Multicam defaults to group time for angle comparisons. Select assembly for the edited program. Project frame exports require at or at_file."
         }
       },
       "additionalProperties": false,
       "required": [
-        "operationID",
+        "operation_id",
         "output"
       ],
       "allOf": [
@@ -581,7 +1120,7 @@
             },
             {
               "required": [
-                "project"
+                "project_path"
               ]
             },
             {
@@ -595,15 +1134,15 @@
     }
   },
   {
-    "name": "file_sidecar",
-    "description": "Read the sidecar inventory or build and merge selected analysis sections. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "name": "analysis_file_sidecar_inspect",
+    "description": "Inspect the analysis sections saved beside a recording. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
@@ -615,9 +1154,37 @@
           "pattern": "^/",
           "description": "Absolute path to the source file."
         },
-        "status": {
-          "type": "boolean",
-          "description": "Inspect persisted sections, scene attempts and stale reasons without writing."
+        "no_sidecar": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "file"
+      ]
+    }
+  },
+  {
+    "name": "analysis_file_sidecar_build",
+    "description": "Build selected analysis sections beside a recording. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the source file."
         },
         "only": {
           "type": "array",
@@ -631,16 +1198,17 @@
           },
           "minItems": 1
         },
-        "stream": {
+        "silence_audio_stream_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based absolute stream index of the audio to analyze."
         },
-        "threshold_db": {
+        "silence_threshold_db": {
           "type": "number",
           "minimum": -120,
           "maximum": 0
         },
-        "min_pause": {
+        "silence_min_pause_seconds": {
           "type": "number"
         },
         "no_sidecar": {
@@ -654,28 +1222,28 @@
       },
       "additionalProperties": false,
       "required": [
-        "operationID",
+        "operation_id",
         "file"
       ]
     }
   },
   {
-    "name": "file_export",
-    "description": "Render an ordered edit, replace a soundtrack, or export a saved project. Use mode copy to remux compatible streams. For a project provide output. For an edit supply edit.output. Poll file_job_status for the native CLI result. Reuse the operationID for an identical retry.",
+    "name": "export_file_project_render",
+    "description": "Render a saved or inline project. The completed CLI result can include an occurrence-level cut map. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
           "pattern": "^/",
           "description": "Existing base directory for relative paths embedded in reports or project documents."
         },
-        "project": {
+        "project_path": {
           "type": "string",
           "pattern": "^/",
           "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
@@ -683,6 +1251,140 @@
         "project_data": {
           "type": "object",
           "description": "Inline .cut document. Use absolute media paths, or set working_directory for relative assets."
+        },
+        "space_clips": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Set gaps between picture items for this render. Use source for source timing or a nonnegative gap duration in exact rational seconds. Applies to project timelines and ordered ranges from picture files. Saved project documents are preserved."
+        },
+        "require_camera_copy": {
+          "type": "boolean",
+          "description": "Require zero encoded camera duration when rendering a saved or inline project."
+        },
+        "output": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute destination path. Existing media outputs are protected."
+        },
+        "tracks": {
+          "type": "string",
+          "enum": [
+            "all",
+            "video",
+            "audio"
+          ]
+        },
+        "audio_stream_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based absolute stream index for the requested audio track."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "copy",
+            "smart",
+            "encode"
+          ]
+        },
+        "video": {
+          "type": "string",
+          "enum": [
+            "h264",
+            "hevc",
+            "prores"
+          ]
+        },
+        "quality": {
+          "type": "string",
+          "enum": [
+            "smaller",
+            "balanced",
+            "high",
+            "422-lt",
+            "422",
+            "422-hq"
+          ]
+        },
+        "audio": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "copy",
+            "aac",
+            "pcm",
+            "remove",
+            "mp3",
+            "flac",
+            "opus"
+          ]
+        },
+        "snap": {
+          "type": "string",
+          "enum": [
+            "exact",
+            "nearest"
+          ]
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "audio_output": {
+          "type": "string",
+          "enum": [
+            "separate_tracks",
+            "downmix_mono",
+            "downmix_stereo"
+          ],
+          "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "output"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "project_path"
+              ]
+            },
+            {
+              "required": [
+                "project_data"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "export_file_clips_join",
+    "description": "Join ordered clips into one output and report the occurrence-level cut map when available. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry. Group ranges from one Mix project preserve lane IDs and bindings. Use video-only or remove audio to join a Mix project with other sources.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "space_clips": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Set gaps between picture items for this render. Use source for source timing or a nonnegative gap duration in exact rational seconds. Applies to project timelines and ordered ranges from picture files. Saved project documents are preserved."
         },
         "edit": {
           "type": "object",
@@ -697,7 +1399,7 @@
                     "pattern": "^/",
                     "description": "Absolute path to the source file."
                   },
-                  "project": {
+                  "project_path": {
                     "type": "string",
                     "pattern": "^/",
                     "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
@@ -754,28 +1456,10 @@
                       }
                     ]
                   },
-                  "csv": {
-                    "type": "string",
-                    "pattern": "^/",
-                    "description": "CSV split points or keep ranges. For file-based exports."
-                  },
-                  "rangesFile": {
+                  "ranges_file": {
                     "type": "string",
                     "pattern": "^/",
                     "description": "Native CSV/JSON ranges file. For file-based exports."
-                  },
-                  "replaceAudio": {
-                    "type": "string",
-                    "pattern": "^/",
-                    "description": "Absolute path to the source file."
-                  },
-                  "replaceTrack": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "replacementStream": {
-                    "type": "integer",
-                    "minimum": 0
                   }
                 },
                 "additionalProperties": false
@@ -799,19 +1483,6 @@
                 "minimum": 1
               },
               "minItems": 1
-            },
-            "replaceAudio": {
-              "type": "string",
-              "pattern": "^/",
-              "description": "Absolute path to the source file."
-            },
-            "replaceTrack": {
-              "type": "integer",
-              "minimum": 0
-            },
-            "replacementStream": {
-              "type": "integer",
-              "minimum": 0
             }
           },
           "additionalProperties": false,
@@ -819,10 +1490,6 @@
             "clips",
             "output"
           ]
-        },
-        "require_camera_copy": {
-          "type": "boolean",
-          "description": "Require zero encoded camera duration when rendering a saved or inline project."
         },
         "output": {
           "type": "string",
@@ -837,9 +1504,10 @@
             "audio"
           ]
         },
-        "audio_stream": {
+        "audio_stream_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based absolute stream index for the requested audio track."
         },
         "mode": {
           "type": "string",
@@ -877,7 +1545,8 @@
             "pcm",
             "remove",
             "mp3",
-            "flac"
+            "flac",
+            "opus"
           ]
         },
         "snap": {
@@ -907,30 +1576,24 @@
           "type": "string",
           "pattern": "^/",
           "description": "Absolute path to a native CLI input/list file."
+        },
+        "audio_output": {
+          "type": "string",
+          "enum": [
+            "separate_tracks",
+            "downmix_mono",
+            "downmix_stereo"
+          ],
+          "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track."
         }
       },
       "additionalProperties": false,
       "required": [
-        "operationID"
+        "operation_id"
       ],
       "allOf": [
         {
           "oneOf": [
-            {
-              "required": [
-                "project"
-              ]
-            },
-            {
-              "required": [
-                "project_data"
-              ]
-            },
-            {
-              "required": [
-                "clips_file"
-              ]
-            },
             {
               "required": [
                 "edit"
@@ -940,27 +1603,18 @@
               "required": [
                 "input_file"
               ]
+            },
+            {
+              "required": [
+                "clips_file"
+              ]
             }
           ]
         },
         {
           "if": {
-            "oneOf": [
-              {
-                "required": [
-                  "project"
-                ]
-              },
-              {
-                "required": [
-                  "project_data"
-                ]
-              },
-              {
-                "required": [
-                  "clips_file"
-                ]
-              }
+            "required": [
+              "clips_file"
             ]
           },
           "then": {
@@ -973,15 +1627,272 @@
     }
   },
   {
-    "name": "file_rearrange",
-    "description": "Render ordered or repeated ranges of a single recording. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "name": "export_file_soundtrack_replace",
+    "description": "Write media with a replacement soundtrack. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "space_clips": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Set gaps between picture items for this render. Use source for source timing or a nonnegative gap duration in exact rational seconds. Applies to project timelines and ordered ranges from picture files. Saved project documents are preserved."
+        },
+        "edit": {
+          "type": "object",
+          "properties": {
+            "clips": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Absolute path to the source file."
+                  },
+                  "project_path": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+                  },
+                  "from": {
+                    "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "numerator": {
+                            "type": "integer"
+                          },
+                          "denominator": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
+                        },
+                        "required": [
+                          "numerator",
+                          "denominator"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "to": {
+                    "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "numerator": {
+                            "type": "integer"
+                          },
+                          "denominator": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
+                        },
+                        "required": [
+                          "numerator",
+                          "denominator"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "ranges_file": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Native CSV/JSON ranges file. For file-based exports."
+                  },
+                  "replace_audio": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Absolute path to the source file."
+                  },
+                  "replace_track": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "replacement_stream": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              },
+              "minItems": 1
+            },
+            "file": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute path to the source file."
+            },
+            "output": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute destination path. Existing media outputs are protected."
+            },
+            "order": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "minItems": 1
+            },
+            "replace_audio": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute path to the source file."
+            },
+            "replace_track": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "replacement_stream": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "clips",
+            "output"
+          ],
+          "description": "Supply replace_audio for the full edit or for one or more file clips."
+        },
+        "output": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute destination path. Existing media outputs are protected."
+        },
+        "tracks": {
+          "type": "string",
+          "enum": [
+            "all",
+            "video",
+            "audio"
+          ]
+        },
+        "audio_stream_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based absolute stream index for the requested audio track."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "copy",
+            "smart",
+            "encode"
+          ]
+        },
+        "video": {
+          "type": "string",
+          "enum": [
+            "h264",
+            "hevc",
+            "prores"
+          ]
+        },
+        "quality": {
+          "type": "string",
+          "enum": [
+            "smaller",
+            "balanced",
+            "high",
+            "422-lt",
+            "422",
+            "422-hq"
+          ]
+        },
+        "audio": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "copy",
+            "aac",
+            "pcm",
+            "remove",
+            "mp3",
+            "flac",
+            "opus"
+          ]
+        },
+        "snap": {
+          "type": "string",
+          "enum": [
+            "exact",
+            "nearest"
+          ]
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "input_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "order_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operation_id"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "edit"
+              ]
+            },
+            {
+              "required": [
+                "input_file"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "export_file_ranges_join",
+    "description": "Render ordered or repeated ranges of a single recording. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
@@ -1079,9 +1990,10 @@
             "audio"
           ]
         },
-        "audio_stream": {
+        "audio_stream_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based absolute stream index for the requested audio track."
         },
         "dry_run": {
           "type": "boolean"
@@ -1097,7 +2009,7 @@
       },
       "additionalProperties": false,
       "required": [
-        "operationID",
+        "operation_id",
         "file",
         "output"
       ],
@@ -1120,15 +2032,15 @@
     }
   },
   {
-    "name": "file_bulk",
-    "description": "Write separate numbered outputs for ranges of one recording. Results include completed outputs on a partial failure. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "name": "export_file_ranges_separate",
+    "description": "Write separate numbered outputs for ranges of one recording. Results include completed outputs on a partial failure. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
@@ -1224,9 +2136,10 @@
             "audio"
           ]
         },
-        "audio_stream": {
+        "audio_stream_index": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Zero-based absolute stream index for the requested audio track."
         },
         "mode": {
           "type": "string",
@@ -1264,7 +2177,8 @@
             "pcm",
             "remove",
             "mp3",
-            "flac"
+            "flac",
+            "opus"
           ]
         },
         "snap": {
@@ -1289,11 +2203,21 @@
           "type": "string",
           "pattern": "^/",
           "description": "Absolute path to a native CLI input/list file."
+        },
+        "subfolder": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional single directory name beneath the chosen output directory. Path separators and control characters are forbidden."
+        },
+        "base_name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional single filename prefix. Path separators and control characters are forbidden."
         }
       },
       "additionalProperties": false,
       "required": [
-        "operationID"
+        "operation_id"
       ],
       "allOf": [
         {
@@ -1323,15 +2247,15 @@
     }
   },
   {
-    "name": "file_convert",
-    "description": "Convert between editable MPCut, Resolve, Premiere and Final Cut Pro projects. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "name": "project_file_convert",
+    "description": "Convert between editable MPCut, Resolve, Premiere and Final Cut Pro projects. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
@@ -1348,10 +2272,15 @@
           "pattern": "^/",
           "description": "Absolute destination path. Existing media outputs are protected."
         },
-        "to": {
+        "destination_format": {
           "type": "string",
-          "minLength": 1,
-          "description": "Destination format name or extension."
+          "enum": [
+            "cut",
+            "resolve",
+            "premiere",
+            "fcp"
+          ],
+          "description": "Destination editor format. Its value must match the output filename extension."
         },
         "allow_loss": {
           "type": "boolean"
@@ -1362,29 +2291,29 @@
       },
       "additionalProperties": false,
       "required": [
-        "operationID",
+        "operation_id",
         "file",
         "output"
       ]
     }
   },
   {
-    "name": "file_resolve",
-    "description": "Write an editable Resolve timeline with optional import into the currently open Resolve project. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "name": "project_file_resolve_export",
+    "description": "Write an editable Resolve timeline. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
           "pattern": "^/",
           "description": "Existing base directory for relative paths embedded in reports or project documents."
         },
-        "project": {
+        "project_path": {
           "type": "string",
           "pattern": "^/",
           "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
@@ -1463,16 +2392,16 @@
                       }
                     ]
                   },
-                  "replaceAudio": {
+                  "replace_audio": {
                     "type": "string",
                     "pattern": "^/",
                     "description": "Absolute path to the source file."
                   },
-                  "replaceTrack": {
+                  "replace_track": {
                     "type": "integer",
                     "minimum": 0
                   },
-                  "replacementStream": {
+                  "replacement_stream": {
                     "type": "integer",
                     "minimum": 0
                   }
@@ -1499,16 +2428,16 @@
               },
               "minItems": 1
             },
-            "replaceAudio": {
+            "replace_audio": {
               "type": "string",
               "pattern": "^/",
               "description": "Absolute path to the source file."
             },
-            "replaceTrack": {
+            "replace_track": {
               "type": "integer",
               "minimum": 0
             },
-            "replacementStream": {
+            "replacement_stream": {
               "type": "integer",
               "minimum": 0
             }
@@ -1518,9 +2447,6 @@
             "clips",
             "output"
           ]
-        },
-        "open": {
-          "type": "boolean"
         },
         "input_file": {
           "type": "string",
@@ -1538,14 +2464,14 @@
       },
       "additionalProperties": false,
       "required": [
-        "operationID"
+        "operation_id"
       ],
       "allOf": [
         {
           "oneOf": [
             {
               "required": [
-                "project"
+                "project_path"
               ]
             },
             {
@@ -1575,7 +2501,7 @@
             "oneOf": [
               {
                 "required": [
-                  "project"
+                  "project_path"
                 ]
               },
               {
@@ -1600,15 +2526,243 @@
     }
   },
   {
-    "name": "file_help",
-    "description": "Read native help, manual, examples, or the multicam project template. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "name": "project_file_resolve_import",
+    "description": "Write a Resolve timeline and import it into the open Resolve project. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "project_data": {
+          "type": "object",
+          "description": "Inline .cut document. Use absolute media paths, or set working_directory for relative assets."
+        },
+        "output": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute destination path. Existing media outputs are protected."
+        },
+        "edit": {
+          "type": "object",
+          "properties": {
+            "clips": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Absolute path to the source file."
+                  },
+                  "from": {
+                    "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "numerator": {
+                            "type": "integer"
+                          },
+                          "denominator": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
+                        },
+                        "required": [
+                          "numerator",
+                          "denominator"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "to": {
+                    "description": "Time in seconds, timecode, exact rational string such as 1001/30000, or a rational object.",
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "numerator": {
+                            "type": "integer"
+                          },
+                          "denominator": {
+                            "type": "integer",
+                            "minimum": 1
+                          }
+                        },
+                        "required": [
+                          "numerator",
+                          "denominator"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "replace_audio": {
+                    "type": "string",
+                    "pattern": "^/",
+                    "description": "Absolute path to the source file."
+                  },
+                  "replace_track": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "replacement_stream": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              },
+              "minItems": 1
+            },
+            "file": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute path to the source file."
+            },
+            "output": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute destination path. Existing media outputs are protected."
+            },
+            "order": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "minItems": 1
+            },
+            "replace_audio": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Absolute path to the source file."
+            },
+            "replace_track": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "replacement_stream": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "clips",
+            "output"
+          ]
+        },
+        "input_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "clips_file": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a native CLI input/list file."
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operation_id"
+      ],
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "project_path"
+              ]
+            },
+            {
+              "required": [
+                "project_data"
+              ]
+            },
+            {
+              "required": [
+                "clips_file"
+              ]
+            },
+            {
+              "required": [
+                "edit"
+              ]
+            },
+            {
+              "required": [
+                "input_file"
+              ]
+            }
+          ]
+        },
+        {
+          "if": {
+            "oneOf": [
+              {
+                "required": [
+                  "project_path"
+                ]
+              },
+              {
+                "required": [
+                  "project_data"
+                ]
+              },
+              {
+                "required": [
+                  "clips_file"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "required": [
+              "output"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "cli_help_read",
+    "description": "Read native help, manual, examples, or the multicam project template. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
@@ -1617,41 +2771,26 @@
         },
         "topic": {
           "type": "string",
-          "enum": [
-            "help",
-            "manual",
-            "version",
-            "inspect",
-            "convert",
-            "resolve",
-            "multicam",
-            "waveform",
-            "silence",
-            "scenes",
-            "frames",
-            "sidecar",
-            "export",
-            "rearrange",
-            "bulk"
-          ]
+          "minLength": 1,
+          "description": "Canonical CLI help topic, such as silence plan or transcript words search. Omit to list commands."
         }
       },
       "additionalProperties": false,
       "required": [
-        "operationID"
+        "operation_id"
       ]
     }
   },
   {
-    "name": "file_version",
-    "description": "Identify the bundled file CLI build. Starts a file job; poll file_job_status for its native CLI result. Supply the same operationID when retrying.",
+    "name": "cli_version_read",
+    "description": "Identify the bundled file CLI build. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "format": "uuid",
-          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while local control stays enabled."
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
         },
         "working_directory": {
           "type": "string",
@@ -1661,13 +2800,13 @@
       },
       "additionalProperties": false,
       "required": [
-        "operationID"
+        "operation_id"
       ]
     }
   },
   {
-    "name": "file_job_status",
-    "description": "Get state, native progress and the terminal JSON result. Scene scans and refreshes include the latest available progress event. For large results, read result_bytes using file_job_result.",
+    "name": "file_job_status_read",
+    "description": "Get state, native progress and the terminal JSON result. Scene scans and refreshes include the latest available progress event. For large results, read result_bytes using file_job_result_read.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1684,7 +2823,7 @@
     }
   },
   {
-    "name": "file_job_result",
+    "name": "file_job_result_read",
     "description": "Read an exact byte range from the terminal CLI JSON document as base64; concatenate decoded chunks.",
     "inputSchema": {
       "type": "object",
@@ -1726,6 +2865,1606 @@
       "required": [
         "job_id"
       ]
+    }
+  },
+  {
+    "name": "still_file_project_create",
+    "description": "Run still project create on a saved project. See cli_help_read for timing and destination options.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "out_project": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "gap": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "codec": {
+          "type": "string",
+          "enum": [
+            "h264",
+            "hevc",
+            "prores"
+          ]
+        },
+        "container": {
+          "type": "string",
+          "enum": [
+            "mp4",
+            "mov"
+          ]
+        },
+        "background": {
+          "type": "string"
+        },
+        "color": {
+          "type": "string",
+          "enum": [
+            "sdr",
+            "pq",
+            "hlg"
+          ]
+        },
+        "duration": {
+          "type": "string"
+        },
+        "frames": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rate": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id",
+        "out_project",
+        "width",
+        "height",
+        "rate",
+        "codec",
+        "container"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "image"
+              ]
+            },
+            {
+              "required": [
+                "gap"
+              ]
+            }
+          ]
+        },
+        {
+          "oneOf": [
+            {
+              "required": [
+                "duration"
+              ]
+            },
+            {
+              "required": [
+                "frames"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "still_file_placement_insert",
+    "description": "Run still placement insert on a saved project. See cli_help_read for timing and destination options.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "image": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "clock": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "fit": {
+          "type": "string",
+          "enum": [
+            "fit",
+            "fill"
+          ]
+        },
+        "crop_x": {
+          "type": "string"
+        },
+        "crop_y": {
+          "type": "string"
+        },
+        "crop_width": {
+          "type": "string"
+        },
+        "crop_height": {
+          "type": "string"
+        },
+        "background": {
+          "type": "string"
+        },
+        "color": {
+          "type": "string",
+          "enum": [
+            "sdr",
+            "pq",
+            "hlg"
+          ]
+        },
+        "duration": {
+          "type": "string"
+        },
+        "frames": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rate": {
+          "type": "string"
+        },
+        "project_path": {
+          "type": "string"
+        },
+        "out_project": {
+          "type": "string"
+        },
+        "in_place": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path",
+        "clock",
+        "at"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "out_project"
+              ]
+            },
+            {
+              "required": [
+                "in_place"
+              ]
+            }
+          ]
+        },
+        {
+          "oneOf": [
+            {
+              "required": [
+                "image"
+              ]
+            },
+            {
+              "required": [
+                "asset"
+              ]
+            }
+          ]
+        },
+        {
+          "oneOf": [
+            {
+              "required": [
+                "duration"
+              ]
+            },
+            {
+              "required": [
+                "frames",
+                "rate"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "still_file_picture_replace",
+    "description": "Run still picture replace on a saved project. See cli_help_read for timing and destination options.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "image": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "clock": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "fit": {
+          "type": "string",
+          "enum": [
+            "fit",
+            "fill"
+          ]
+        },
+        "crop_x": {
+          "type": "string"
+        },
+        "crop_y": {
+          "type": "string"
+        },
+        "crop_width": {
+          "type": "string"
+        },
+        "crop_height": {
+          "type": "string"
+        },
+        "background": {
+          "type": "string"
+        },
+        "color": {
+          "type": "string",
+          "enum": [
+            "sdr",
+            "pq",
+            "hlg"
+          ]
+        },
+        "project_path": {
+          "type": "string"
+        },
+        "out_project": {
+          "type": "string"
+        },
+        "in_place": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path",
+        "clock",
+        "from",
+        "to"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "out_project"
+              ]
+            },
+            {
+              "required": [
+                "in_place"
+              ]
+            }
+          ]
+        },
+        {
+          "oneOf": [
+            {
+              "required": [
+                "image"
+              ]
+            },
+            {
+              "required": [
+                "asset"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "timeline_file_gap_insert",
+    "description": "Run timeline gap insert on a saved project. See cli_help_read for timing and destination options.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "clock": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "background": {
+          "type": "string"
+        },
+        "color": {
+          "type": "string",
+          "enum": [
+            "sdr",
+            "pq",
+            "hlg"
+          ]
+        },
+        "duration": {
+          "type": "string"
+        },
+        "frames": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rate": {
+          "type": "string"
+        },
+        "project_path": {
+          "type": "string"
+        },
+        "out_project": {
+          "type": "string"
+        },
+        "in_place": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path",
+        "clock",
+        "at"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "out_project"
+              ]
+            },
+            {
+              "required": [
+                "in_place"
+              ]
+            }
+          ]
+        },
+        {
+          "oneOf": [
+            {
+              "required": [
+                "duration"
+              ]
+            },
+            {
+              "required": [
+                "frames",
+                "rate"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "still_file_placement_update",
+    "description": "Run still placement update on a saved project. See cli_help_read for timing and destination options.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "placement": {
+          "type": "string"
+        },
+        "asset": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "clock": {
+          "type": "string"
+        },
+        "fragment_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "duplicate_id": {
+          "type": "string"
+        },
+        "detach_id": {
+          "type": "string"
+        },
+        "fit": {
+          "type": "string",
+          "enum": [
+            "fit",
+            "fill"
+          ]
+        },
+        "crop_x": {
+          "type": "string"
+        },
+        "crop_y": {
+          "type": "string"
+        },
+        "crop_width": {
+          "type": "string"
+        },
+        "crop_height": {
+          "type": "string"
+        },
+        "background": {
+          "type": "string"
+        },
+        "color": {
+          "type": "string",
+          "enum": [
+            "sdr",
+            "pq",
+            "hlg"
+          ]
+        },
+        "duration": {
+          "type": "string"
+        },
+        "frames": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rate": {
+          "type": "string"
+        },
+        "project_path": {
+          "type": "string"
+        },
+        "out_project": {
+          "type": "string"
+        },
+        "in_place": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path",
+        "placement"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "out_project"
+              ]
+            },
+            {
+              "required": [
+                "in_place"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "still_file_placement_remove",
+    "description": "Run still placement remove on a saved project. See cli_help_read for timing and destination options.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "placement": {
+          "type": "string"
+        },
+        "project_path": {
+          "type": "string"
+        },
+        "out_project": {
+          "type": "string"
+        },
+        "in_place": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path",
+        "placement"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "out_project"
+              ]
+            },
+            {
+              "required": [
+                "in_place"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "still_file_asset_relink",
+    "description": "Run still asset relink on a saved project. See cli_help_read for timing and destination options.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "asset": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "project_path": {
+          "type": "string"
+        },
+        "out_project": {
+          "type": "string"
+        },
+        "in_place": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path",
+        "asset",
+        "image"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "out_project"
+              ]
+            },
+            {
+              "required": [
+                "in_place"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "still_file_placements_list",
+    "description": "Run still placement list on a saved project. See cli_help_read for timing and destination options.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "placement": {
+          "type": "string"
+        },
+        "project_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "timeline_file_clips_space",
+    "description": "Run timeline clips space on a saved project. See cli_help_read for timing and destination options.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "source_timing": {
+          "type": "boolean"
+        },
+        "background": {
+          "type": "string"
+        },
+        "color": {
+          "type": "string",
+          "enum": [
+            "sdr",
+            "pq",
+            "hlg"
+          ]
+        },
+        "duration": {
+          "type": "string"
+        },
+        "frames": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "rate": {
+          "type": "string"
+        },
+        "project_path": {
+          "type": "string"
+        },
+        "out_project": {
+          "type": "string"
+        },
+        "in_place": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": [
+                "out_project"
+              ]
+            },
+            {
+              "required": [
+                "in_place"
+              ]
+            }
+          ]
+        },
+        {
+          "oneOf": [
+            {
+              "required": [
+                "source_timing"
+              ]
+            },
+            {
+              "required": [
+                "duration"
+              ]
+            },
+            {
+              "required": [
+                "frames",
+                "rate"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "silence_file_shorten",
+    "description": "Write a new editable project with reviewed pauses shortened.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to a saved project. Unsaved GUI changes are excluded."
+        },
+        "silence_threshold_db": {
+          "type": "number",
+          "minimum": -120,
+          "maximum": 0
+        },
+        "silence_max_blip_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.06,
+          "description": "Longest measured sound in seconds to join across quiet stretches during a new scan. Zero disables joining."
+        },
+        "silence_min_pause_seconds": {
+          "type": "number",
+          "description": "Positive minimum detected pause duration in seconds."
+        },
+        "silence_padding_per_side_seconds": {
+          "description": "Seconds of silence to keep on each side of a cut (default 0.2).",
+          "type": "number",
+          "minimum": 0
+        },
+        "no_sidecar": {
+          "type": "boolean"
+        },
+        "retain_pauses": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Override the total retained seconds of detected project pauses.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pause_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "retained_seconds": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "pause_id",
+              "retained_seconds"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "protect_pauses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Sequence pause IDs to retain, from a scan with matching settings."
+        },
+        "out_project": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "project_path",
+        "out_project"
+      ]
+    }
+  },
+  {
+    "name": "project_file_create",
+    "description": "Write an editable timeline to a new .cut destination. Operations execute in order.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "request": {
+          "type": "object",
+          "properties": {
+            "out_project": {
+              "type": "string",
+              "pattern": "^/"
+            },
+            "operations": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "action": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "to_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "at": {
+                    "type": "string"
+                  },
+                  "from": {
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  },
+                  "file": {
+                    "type": "string"
+                  },
+                  "new_id": {
+                    "type": "string"
+                  },
+                  "angle_id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "ranges": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "file": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "from": {
+                              "type": "string",
+                              "minLength": 1,
+                              "description": "Exact time in seconds as a decimal, timecode or fraction."
+                            },
+                            "to": {
+                              "type": "string",
+                              "minLength": 1,
+                              "description": "Exact time in seconds as a decimal, timecode or fraction."
+                            }
+                          },
+                          "required": [
+                            "file",
+                            "from",
+                            "to"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "select_id": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "select_id"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Media path for add_recording or audio_replacement_set, relative to working_directory if needed."
+                  },
+                  "group_start": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Exact time in the multicam group for the start of the added recording."
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "fixed",
+                      "follow",
+                      "none",
+                      "mix",
+                      "replace"
+                    ]
+                  },
+                  "source_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "audio_stream_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "lanes": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "label": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "color_slot": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 7
+                        },
+                        "target": {
+                          "oneOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "camera"
+                                  ]
+                                },
+                                "angle_id": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              },
+                              "required": [
+                                "kind",
+                                "angle_id"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "recording"
+                                  ]
+                                },
+                                "source_id": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "audio_stream_index": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                }
+                              },
+                              "required": [
+                                "kind",
+                                "source_id",
+                                "audio_stream_index"
+                              ],
+                              "additionalProperties": false
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "label",
+                        "color_slot",
+                        "target"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "original": {
+                    "type": "object",
+                    "properties": {
+                      "source_id": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "audio_stream_index": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "source_id",
+                      "audio_stream_index"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "replacement": {
+                    "type": "object",
+                    "properties": {
+                      "source_id": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "audio_stream_index": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "source_id",
+                      "audio_stream_index"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "replacement_stream_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "replacement_source_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "relative_offset": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uncovered": {
+                    "type": "string",
+                    "enum": [
+                      "keep_original",
+                      "leave_uncovered"
+                    ]
+                  },
+                  "reference_source_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Camera recording ID for an aligned program replacement."
+                  }
+                },
+                "required": [
+                  "action"
+                ],
+                "additionalProperties": false,
+                "if": {
+                  "properties": {
+                    "action": {
+                      "const": "add_recording"
+                    }
+                  },
+                  "required": [
+                    "action"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "angle_id",
+                    "path",
+                    "group_start"
+                  ]
+                }
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "sequence",
+                "multicam"
+              ]
+            },
+            "angles": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "file": {
+                    "type": "string"
+                  },
+                  "offset": {
+                    "type": "string"
+                  },
+                  "audio_stream_index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional absolute audio stream index for this camera's default lane."
+                  }
+                },
+                "required": [
+                  "id",
+                  "file"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 1
+            },
+            "group_end": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "out_project",
+            "operations",
+            "kind"
+          ],
+          "additionalProperties": false,
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "multicam"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "angles",
+              "group_end"
+            ]
+          }
+        }
+      },
+      "required": [
+        "operation_id",
+        "request"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "project_file_edit",
+    "description": "Write an editable timeline to a new .cut destination. Operations execute in order.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "request": {
+          "type": "object",
+          "properties": {
+            "out_project": {
+              "type": "string",
+              "pattern": "^/"
+            },
+            "operations": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "action": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "to_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "at": {
+                    "type": "string"
+                  },
+                  "from": {
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  },
+                  "file": {
+                    "type": "string"
+                  },
+                  "new_id": {
+                    "type": "string"
+                  },
+                  "angle_id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "ranges": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "file": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "from": {
+                              "type": "string",
+                              "minLength": 1,
+                              "description": "Exact time in seconds as a decimal, timecode or fraction."
+                            },
+                            "to": {
+                              "type": "string",
+                              "minLength": 1,
+                              "description": "Exact time in seconds as a decimal, timecode or fraction."
+                            }
+                          },
+                          "required": [
+                            "file",
+                            "from",
+                            "to"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "select_id": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          },
+                          "required": [
+                            "select_id"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Media path for add_recording or audio_replacement_set, relative to working_directory if needed."
+                  },
+                  "group_start": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Exact time in the multicam group for the start of the added recording."
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "fixed",
+                      "follow",
+                      "none",
+                      "mix",
+                      "replace"
+                    ]
+                  },
+                  "source_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "audio_stream_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "lanes": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "label": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "color_slot": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 7
+                        },
+                        "target": {
+                          "oneOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "camera"
+                                  ]
+                                },
+                                "angle_id": {
+                                  "type": "string",
+                                  "minLength": 1
+                                }
+                              },
+                              "required": [
+                                "kind",
+                                "angle_id"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "recording"
+                                  ]
+                                },
+                                "source_id": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "audio_stream_index": {
+                                  "type": "integer",
+                                  "minimum": 0
+                                }
+                              },
+                              "required": [
+                                "kind",
+                                "source_id",
+                                "audio_stream_index"
+                              ],
+                              "additionalProperties": false
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "label",
+                        "color_slot",
+                        "target"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "original": {
+                    "type": "object",
+                    "properties": {
+                      "source_id": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "audio_stream_index": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "source_id",
+                      "audio_stream_index"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "replacement": {
+                    "type": "object",
+                    "properties": {
+                      "source_id": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "audio_stream_index": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "source_id",
+                      "audio_stream_index"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "replacement_stream_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "replacement_source_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "relative_offset": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "uncovered": {
+                    "type": "string",
+                    "enum": [
+                      "keep_original",
+                      "leave_uncovered"
+                    ]
+                  },
+                  "reference_source_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Camera recording ID for an aligned program replacement."
+                  }
+                },
+                "required": [
+                  "action"
+                ],
+                "additionalProperties": false,
+                "if": {
+                  "properties": {
+                    "action": {
+                      "const": "add_recording"
+                    }
+                  },
+                  "required": [
+                    "action"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "angle_id",
+                    "path",
+                    "group_start"
+                  ]
+                }
+              }
+            },
+            "project_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "out_project",
+            "operations",
+            "project_path"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "operation_id",
+        "request"
+      ],
+      "additionalProperties": false
     }
   }
 ]

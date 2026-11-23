@@ -69,30 +69,31 @@ extension EditorModel {
         if let issue = queuedMediaRefreshIssue() { return issue }
         let ranges = queuedRanges
         let useSidecar = useAnalysisSidecars
-        if ranges.contains(where: { $0.stillProject != nil }) {
-            return await Task.detached(priority: .userInitiated) {
-                let scratch = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("mpcut-queue-check-\(UUID())", isDirectory: true)
-                do {
-                    try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: false)
-                    defer { try? FileManager.default.removeItem(at: scratch) }
-                    _ = try SequenceQueuePlan(ranges, directory: scratch, options: options, useSidecar: useSidecar,
-                                              cancelled: { Task.isCancelled })
-                    return nil
-                } catch let issue as CutError {
-                    return issue
-                } catch {
-                    return CutError(code: "export_failed", message: error.localizedDescription)
+        let excludedSources = sidecarExclusions
+        let task = Task.detached(priority: .userInitiated) { () -> CutError? in
+            let scratch = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mpcut-queue-check-\(UUID())", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: false)
+                defer { try? FileManager.default.removeItem(at: scratch) }
+                try AnalysisSidecar.$excludedSources.withValue(excludedSources) {
+                    try AnalysisSidecar.$readsEnabled.withValue(useSidecar) {
+                        _ = try SequenceQueuePlan(ranges, directory: scratch, options: options, useSidecar: useSidecar,
+                                                  cancelled: { Task.isCancelled })
+                    }
                 }
-            }.value
+                return nil
+            } catch let issue as CutError {
+                return issue
+            } catch {
+                return CutError(code: "export_failed", message: error.localizedDescription)
+            }
         }
-        let groups = ranges.map(\.clips)
-        var media: [URL: MediaInfo] = [:]
-        for range in queuedRanges { media.merge(range.media) { first, _ in first } }
-        let indexed = media
-        return await Task.detached(priority: .userInitiated) {
-            ExportQueueChoices.check(groups, media: indexed, options: options)
-        }.value
+        return await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 }
 
@@ -175,55 +176,90 @@ struct SequenceQueuePlan: Sendable {
         let stem = ranges.first?.clips.first?.file.deletingPathExtension().lastPathComponent ?? "Stills"
         let destinationCheck = CutEngine(cancelled: cancelled)
         let plannedSubfolder = organization.subfolder.isEmpty ? nil : folder
+        let mode = ordinaryModeWhenUnspecified ?? options.effectiveMode
+        let container = options.container.isEmpty ? nil : options.container
+        var indexed: [URL: MediaInfo] = [:]
+        for range in ranges {
+            if cancelled() { throw CutError(code: "cancelled", message: "Operation cancelled.") }
+            guard range.stillProject?.participants.render == nil else {
+                throw ParticipantProjectExport.unsupported("A queued range export")
+            }
+            for (url, media) in range.media {
+                if let previous = indexed[url], !previous.identity.matchesSnapshot(media.identity) {
+                    throw CutError(code: "source_changed", message: "Queued ranges refer to different versions of \(url.lastPathComponent).")
+                }
+                indexed[url] = media
+            }
+        }
+        if !ranges.contains(where: { $0.stillProject != nil }) {
+            let batch = try BulkExport(groups: ranges.map(\.clips), directory: directory,
+                                       outputStems: ranges.map { $0.name ?? stem }, organization: organization, mode: mode,
+                                       tracks: options.tracks, audioTrackOrdinal: options.audioTrackOrdinal,
+                                       container: container, settings: options.batchSettings, media: indexed,
+                                       useSidecar: useSidecar, cancelled: cancelled)
+            items = try batch.items.enumerated().map { index, planned in
+                do {
+                    try Self.checkCameraCopy(planned.plan, options: options)
+                    return Item(output: planned.output, payload: .ordinary(planned))
+                } catch let issue as CutError {
+                    throw Self.rangeError(issue, index: index)
+                }
+            }
+            return
+        }
         var result: [Item] = []
         for (index, range) in ranges.enumerated() {
             let suffix = String(format: "%03ld", index + 1)
+            let entryStem = range.name ?? stem
             do {
                 if let project = range.stillProject {
-                    for media in range.media.values where !media.identity.isCurrentSnapshot(at: media.url) {
-                        throw CutError(code: "source_changed", message: "\(media.url.lastPathComponent) changed after the range was queued.")
-                    }
+                    try verifyQueuedStillSources(range.media.values)
                     var requested = options
                     requested.placements = range.placements
                     let plan = try requested.planStills(project, useSidecar: useSidecar, cancelled: cancelled)
-                    let name = organization.filename(stem: stem, suffix: suffix, container: plan.container)
-                    let output = folder.appendingPathComponent(name, isDirectory: false)
+                    try verifyQueuedStillSources(range.media.values)
+                    let output = try organization.destination(in: folder, stem: entryStem, suffix: suffix, container: plan.container)
                     try destinationCheck.checkDestination(output, plannedSubfolder: plannedSubfolder)
                     result.append(.init(output: output, payload: .still(plan)))
                 } else {
                     let batch = try BulkExport(groups: [range.clips], directory: directory, outputSuffixes: [suffix],
-                                               organization: organization,
-                                               mode: ordinaryModeWhenUnspecified ?? options.effectiveMode, tracks: options.tracks,
-                                               audioTrackOrdinal: options.audioTrackOrdinal,
-                                               container: options.container.isEmpty ? nil : options.container,
-                                               settings: options.batchSettings, media: range.media, cancelled: cancelled)
+                                               outputStems: [entryStem], organization: organization, mode: mode,
+                                               tracks: options.tracks, audioTrackOrdinal: options.audioTrackOrdinal,
+                                               container: container, settings: options.batchSettings, media: range.media,
+                                               useSidecar: useSidecar, cancelled: cancelled)
                     let planned = batch.items[0]
-                    if options.requireCameraCopy && options.tracks != .audio {
-                        switch planned.plan {
-                        case .conversion:
-                            throw CutError(code: "camera_copy_required", message: "Re-encode changes retained camera picture.")
-                        case .packets(let edit, .smart, _):
-                            if try edit.encodedVideoDuration(for: .smart) > .zero {
-                                throw CutError(code: "camera_copy_required", message: "This range has a camera edge that must be encoded.")
-                            }
-                        default: break
-                        }
-                    }
-                    let name = organization.filename(stem: stem, suffix: suffix, container: planned.plan.edit.container)
-                    let output = folder.appendingPathComponent(name, isDirectory: false)
-                    try destinationCheck.checkDestination(output, plannedSubfolder: plannedSubfolder)
-                    result.append(.init(output: output, payload: .ordinary(planned)))
+                    try Self.checkCameraCopy(planned.plan, options: options)
+                    result.append(.init(output: planned.output, payload: .ordinary(planned)))
                 }
             } catch let issue as CutError {
-                let message = issue.message.hasPrefix("Range 1: ") ? String(issue.message.dropFirst(9)) : issue.message
-                var failure = CutError(code: issue.code, message: "Range \(index + 1): \(message)",
-                                       segment: index + 1, boundary: issue.boundary, nearest: issue.nearest, track: issue.track)
-                failure.alternatives = issue.alternatives
-                failure.reason = issue.factor
-                throw failure
+                throw Self.rangeError(issue, index: index)
             }
         }
         items = result
+    }
+
+    private static func checkCameraCopy(_ plan: ExportPlan, options: ExportSheetOptions) throws {
+        guard options.requireCameraCopy, options.tracks != .audio else { return }
+        switch plan {
+        case .conversion:
+            throw CutError(code: "camera_copy_required", message: "Re-encode changes retained camera picture.")
+        case .packets(let edit, .smart, _):
+            if try edit.encodedVideoDuration(for: .smart) > .zero {
+                throw CutError(code: "camera_copy_required", message: "This range has a camera edge that must be encoded.")
+            }
+        default: break
+        }
+    }
+
+    private static func rangeError(_ issue: CutError, index: Int) -> CutError {
+        let message = issue.message.hasPrefix("Range 1: ") ? String(issue.message.dropFirst(9)) : issue.message
+        var failure = CutError(code: issue.code, message: "Range \(index + 1): \(message)",
+                               segment: index + 1, boundary: issue.boundary, nearest: issue.nearest,
+                               track: issue.track, placementIDs: issue.placementIDs)
+        failure.alternatives = issue.alternatives
+        failure.stillBoundaryAdjustments = issue.stillBoundaryAdjustments
+        failure.reason = issue.factor
+        return failure
     }
 
     func write(_ item: Item, progress: @escaping @Sendable (Double) -> Bool) throws {
@@ -234,5 +270,11 @@ struct SequenceQueuePlan: Sendable {
         case .still(let plan):
             try StillExportPlanner(useSidecar: useSidecar, cancelled: cancelled).write(plan, to: item.output, progress: progress)
         }
+    }
+}
+
+func verifyQueuedStillSources(_ sources: some Sequence<MediaInfo>) throws {
+    for source in sources where !source.identity.isCurrentSnapshot(at: source.url) {
+        throw CutError(code: "source_changed", message: "\(source.url.lastPathComponent) changed after the range was queued.")
     }
 }

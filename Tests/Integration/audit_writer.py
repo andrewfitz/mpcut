@@ -21,8 +21,8 @@ class WriterRegression(unittest.TestCase):
 
     def export(self, source, destination, *range_args, dry_run=False, ok=True):
         # The writer audit is about the packet copy. The CLI default is Smart Trim, so the mode is named.
-        named = any(flag in ("--mode", "--smart-trim") for flag in range_args)
-        args = [CLI, "export", "--json", *([] if named else ["--mode", "copy"]), "--output", destination, "--clip", source, *range_args]
+        named = any(flag in ("--mode", "--mode", "smart") for flag in range_args)
+        args = [CLI, "export", "clips", "join", "--json", *([] if named else ["--mode", "copy"]), "--output", destination, "--clip", source, *range_args]
         if dry_run:
             args.append("--dry-run")
         process = subprocess.run(args, capture_output=True, text=True, timeout=30)
@@ -44,7 +44,7 @@ class WriterRegression(unittest.TestCase):
                 self.assertIn("audible range", report["error"]["message"])
                 self.assertFalse(out.exists())
         report = self.export(cropped, out, "--mode", "encode", "--audio", "auto")
-        self.assertEqual(report["audioActions"][0]["action"], "aac")
+        self.assertEqual(report["audio_actions"][0]["action"], "aac")
         audio_stream = probe(out, "-select_streams", "a:0", "-show_streams")["streams"][0]
         self.assertEqual(audio_stream["codec_name"], "aac")
         self.assertEqual(int(audio_stream["duration_ts"]) * Fraction(audio_stream["time_base"]), 2)
@@ -61,13 +61,13 @@ class WriterRegression(unittest.TestCase):
                 report = self.export(source, output, dry_run=True)
                 segment = report["segments"][0]
                 video, linked_audio = segment["tracks"]
-                self.assertEqual(ratio(segment["outputStart"]), Fraction(1, 5))
-                self.assertEqual(ratio(video["outputStart"]), Fraction(1, 5))
-                self.assertEqual(ratio(video["outputEnd"]), Fraction(6, 5))
-                self.assertEqual(ratio(linked_audio["sourceStart"]), Fraction(-1, 5))
-                self.assertEqual(ratio(linked_audio["sourceEnd"]), Fraction(11, 10))
-                self.assertEqual(ratio(linked_audio["outputStart"]), 0)
-                self.assertEqual(ratio(linked_audio["outputEnd"]), Fraction(13, 10))
+                self.assertEqual(ratio(segment["output_start"]), Fraction(1, 5))
+                self.assertEqual(ratio(video["output_start"]), Fraction(1, 5))
+                self.assertEqual(ratio(video["output_end"]), Fraction(6, 5))
+                self.assertEqual(ratio(linked_audio["source_start"]), Fraction(-1, 5))
+                self.assertEqual(ratio(linked_audio["source_end"]), Fraction(11, 10))
+                self.assertEqual(ratio(linked_audio["output_start"]), 0)
+                self.assertEqual(ratio(linked_audio["output_end"]), Fraction(13, 10))
                 self.export(source, output)
                 self.assertEqual(frames(output), frames(source))
                 self.assertEqual(audio(output), audio(source))
@@ -191,7 +191,7 @@ class WriterRegression(unittest.TestCase):
         ffmpeg("-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=3", "-vf", "setsar=16/15",
                "-c:v", "libx264", "-x264-params", "keyint=25:min-keyint=25:scenecut=0:open-gop=0",
                "-pix_fmt", "yuv420p", source)
-        for label, options in [("copy", []), ("smart", ["--smart-trim", "--from", "0.4", "--to", "2.6"])]:
+        for label, options in [("copy", []), ("smart", ["--mode", "smart", "--from", "0.4", "--to", "2.6"])]:
             with self.subTest(label=label):
                 output = self.root / (label + ".mp4")
                 self.export(source, output, *options)

@@ -58,6 +58,9 @@ struct WaveformOptions {
         let stream: Int
         let sampleRate: Int
         let columns: Int
+        private enum CodingKeys: String, CodingKey {
+            case ok, file, stream = "audio_stream_index", sampleRate = "sample_rate", columns, envelope
+        }
         let envelope: AudioEnvelope
     }
 

@@ -4,7 +4,30 @@ import XCTest
 
 final class MulticamAnalysisAuditTests: XCTestCase {
     @MainActor
-    func testRenamingOneViewKeepsOtherNamesFromAnEarlierSidecarFormat() async throws {
+    func testKeyframeNavigationUsesThePictureOfEachRepeatedOccurrence() throws {
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
+                                                      subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(fixture)
+        let keyframes = media.frames.filter(\.keyframe)
+        let opening = try XCTUnwrap(keyframes.first)
+        let next = try XCTUnwrap(keyframes.dropFirst().first)
+        let offset = try next.time.subtracting(opening.time).multiplied(by: .init(numerator: 1, denominator: 2))
+        let range = MulticamRange(from: opening.time, to: next.time)
+        let project = MulticamProject(referenceAngle: "wide", range: .init(from: .zero, to: media.duration),
+            angles: [.init(id: "wide", file: fixture.path), .init(id: "close", file: fixture.path, offset: offset)],
+            audio: .none, switches: [.init(at: .zero, angle: "wide")],
+            assemblyItems: [.group(range), .group(range, angle: "close")])
+        let analysis = MulticamAnalysisStore()
+        let indexed = ["wide": media, "close": media]
+        analysis.update(project: project, media: indexed, ordinary: indexed, useSidecars: false)
+        let expectedReplayMarker = try range.to.subtracting(range.from).adding(offset)
+        XCTAssertEqual(analysis.pictureOutputMarkers(.keyframes, in: try project.plan()), [.zero, expectedReplayMarker])
+        XCTAssertEqual(analysis.pictureSnapMarkers(.keyframes, angle: "close", project: project,
+                                                   near: range.from, within: range, includeEnd: false), [offset])
+    }
+
+    @MainActor
+    func testRenamingOneViewKeepsOtherAuthoredNames() async throws {
         let fixture = try XCTUnwrap(Bundle.module.url(forResource: "Scene-Cadence-Change", withExtension: "mov",
                                                       subdirectory: "Fixtures"))
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -17,11 +40,11 @@ final class MulticamAnalysisAuditTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(report.viewCount, 2)
         let first = report.scenes[0].view
         let other = try XCTUnwrap(report.scenes.map(\.view).first { $0 != first })
-        // MPCut 1.0 stored names beside its first marker format.
-        let markers = try XCTUnwrap(AnalysisSidecar.sceneSections(for: report)[AnalysisSidecar.sceneSectionKey])
         let sidecar = AnalysisSidecar(media: source)
-        try sidecar.save(["scenes.v1": markers,
-                          "viewNames.v1": try JSONEncoder().encode([first: "Room", other: "Stage"])])
+        var sections = try AnalysisSidecar.sceneSections(for: report)
+        sections[AnalysisSidecar.viewNameSectionKey] = try AnalysisSidecar.viewNameData(
+            [first: "Room", other: "Stage"], for: report)
+        try sidecar.save(sections)
 
         let project = MulticamProject(referenceAngle: "camera", range: .init(from: .zero, to: source.duration),
                                       angles: [.init(id: "camera", file: url.path)],

@@ -7,6 +7,10 @@ public struct MulticamEdge: Codable, Equatable, Sendable {
     public let boundary: String
     public let at: RationalTime
 
+    private enum CodingKeys: String, CodingKey {
+        case range = "range_number", boundary, at = "group_time"
+    }
+
     package init(range: Int, boundary: String, at: RationalTime) {
         self.range = range
         self.boundary = boundary
@@ -23,6 +27,12 @@ public struct MulticamDiagnostic: Codable, Sendable {
     public let at: RationalTime?
     /// The assembly range edge that the error's `nearest` times can replace. Absent at a switch.
     public let edge: MulticamEdge?
+    public var laneID: String? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case source = "source_id", group = "group_range", sourceTime = "source_range"
+        case output = "assembly_range", at = "switch_group_time", edge, laneID = "lane_id"
+    }
 }
 
 extension CutError {
@@ -32,11 +42,13 @@ extension CutError {
             MulticamDiagnostic(source: context.source, group: context.group, sourceTime: context.sourceTime,
                                output: context.output, at: context.at, edge: context.edge.map {
                                    MulticamEdge(range: number, boundary: $0.boundary, at: $0.at)
-                               })
+                               }, laneID: context.laneID)
         }
         var issue = CutError(code: code, message: message, segment: number, boundary: boundary,
-                             nearest: nearest, track: track, multicam: context)
+                             nearest: nearest, track: track, multicam: context, placementIDs: placementIDs,
+                             laneID: laneID).because(reason)
         issue.alternatives = alternatives
+        issue.stillBoundaryAdjustments = stillBoundaryAdjustments
         return issue
     }
 }
@@ -61,33 +73,45 @@ public struct MulticamInspectedSource: Encodable, Sendable {
     }
 }
 
+public struct MulticamInspectedAudioBinding: Encodable, Sendable {
+    public let id: String
+    public let original: MulticamAudioSelection
+    public let replacement: MulticamAudioSelection
+    public let coverage: MulticamRange?
+}
+
 public struct MulticamInspection: Encodable, Sendable {
     public let mapping: MulticamPlan
     public let sources: [MulticamInspectedSource]
     public let issues: [CutError]
+    public let audioBindings: [MulticamInspectedAudioBinding]
 }
 
 public struct MulticamExportPlan: Encodable, Sendable {
     public let mapping: MulticamPlan
     public let picture: [ResolvedSegment]
-    public let audio: [ResolvedSegment]
+    public let audioLanes: [MulticamExportAudioLane]
+    public let audioOutput: MulticamAudioOutput
     public let container: String
     public let duration: RationalTime
     public let mode: ExportMode
     public let tracks: ExportTracks
     public let warnings: [String]
-    public let audioAction: ReencodeAudio?
     public let encodedVideoDuration: RationalTime
     public let copiedVideoDuration: RationalTime
+    public let generatedPictureGaps: [MulticamRange]?
 
     let pictureCopy: ResolvedEdit?
     let pictureEncode: ReencodePlan?
-    let soundCopy: ResolvedEdit?
-    let soundEncode: MulticamAudioConversionPlan?
+    let sounds: [MulticamExportSound]
+    let recordingGapExport: StillExportPlan?
+    let participantExport: ParticipantProjectExport?
+    public let participantRender: ParticipantRenderReport?
+    package var participantRenderTier: TierState? { participantExport?.tier(container: container) }
 
     enum CodingKeys: String, CodingKey {
-        case mapping, picture, audio, container, duration, mode, tracks, warnings
-        case encodedVideoDuration, copiedVideoDuration, audioAction
+        case mapping, picture, audioLanes, audioOutput, container, duration, mode, tracks, warnings
+        case encodedVideoDuration, copiedVideoDuration, generatedPictureGaps, participantRender
     }
 }
 
@@ -127,7 +151,7 @@ public struct MulticamEngine: Sendable {
         let mapping = try project.plan()
         let engine = CutEngine(cancelled: cancelled)
         var indexed: [URL: MediaInfo] = [:]
-        let sources = try (project.angles + project.audioSources).map { source in
+        let sources = try project.sources.map { source in
             let file = sourceURL(source, project: project, location: location)
             let media = try index(source.id, file: file, using: engine, cached: &indexed)
             let coverage = try groupCoverage(of: media, source: source.id, offset: source.offset)
@@ -135,10 +159,9 @@ public struct MulticamEngine: Sendable {
                                            audioCoverage: coverage.audio)
         }
         let bySource = Dictionary(uniqueKeysWithValues: sources.map { ($0.source.id, $0) })
-        let requiresSoundtrack = project.audio != .none || !mapping.audio.isEmpty
         var issues: [CutError] = []
         for interval in mapping.intervals {
-            let picture = bySource[interval.angle]
+            let picture = interval.pictureSourceID.flatMap { bySource[$0] }
             // An issue names its assembly range, as an export error does, and locates the interval.
             let number = interval.assemblyIndex + 1
             func context(_ source: String) -> MulticamDiagnostic? {
@@ -152,35 +175,61 @@ public struct MulticamEngine: Sendable {
                 issues.append(CutError(code: "uncovered_picture",
                                        message: "Angle \(interval.angle) has incomplete picture coverage at group \(interval.group.from)–\(interval.group.to).",
                                        segment: number, track: picture?.media.videoStream?.index,
-                                       multicam: context(interval.angle)))
-            }
-            if let audio = interval.audio {
-                if let coverage = bySource[audio.source]?.audioCoverage[audio.stream] {
-                    if interval.group.from < coverage.from || interval.group.to > coverage.to {
-                        issues.append(CutError(code: "uncovered_audio",
-                                               message: "Source \(audio.source) stream \(audio.stream) has incomplete sound coverage at group \(interval.group.from)–\(interval.group.to).",
-                                               segment: number, track: audio.stream, multicam: context(audio.source)))
-                    }
-                } else {
-                    issues.append(CutError(code: "missing_audio",
-                                           message: "Source \(audio.source) has no audio stream \(audio.stream).",
-                                           segment: number, track: audio.stream, multicam: context(audio.source)))
-                }
-            } else if requiresSoundtrack {
-                issues.append(CutError(code: "missing_audio",
-                                       message: "Angle \(interval.angle) has no selected soundtrack at group \(interval.group.from)–\(interval.group.to).",
-                                       segment: number, multicam: context(interval.angle)))
+                                       multicam: interval.pictureSourceID.flatMap(context)))
             }
         }
-        return MulticamInspection(mapping: mapping, sources: sources, issues: issues)
+        let indexedSources = bySource.mapValues(\.media)
+        var resolved: [MulticamPlannedAudioLane] = []
+        for lane in mapping.audioLanes {
+            let oneLane = MulticamPlan(intervals: mapping.intervals, picture: mapping.picture, audioLanes: [lane], duration: mapping.duration)
+            do {
+                let audio = try project.resolveAudioLanes(plan: oneLane, indexedSources: indexedSources)
+                for resolvedLane in audio {
+                    try CutEngine(cancelled: cancelled).checkCancellation()
+                    for gap in resolvedLane.gaps {
+                        let issue = CutError(code: lane.gaps.contains(gap) && !mapping.isMix ? "missing_audio" : "uncovered_audio",
+                            message: "The selected soundtrack has incomplete coverage at output \(gap.from)–\(gap.to).")
+                        let error = try conversionIssue(issue, at: gap, lane: resolvedLane, mapping: mapping, original: lane)
+                        issues.append(CutError(code: error.code, message: error.message,
+                                               segment: error.multicam.flatMap { rangeNumber($0, boundary: nil, in: mapping) },
+                                               track: error.track, multicam: error.multicam, laneID: error.laneID))
+                    }
+                }
+                resolved += audio
+            } catch let issue as CutError where issue.code != "cancelled" && issue.code != "source_changed" {
+                if let context = issue.multicam, let segment = rangeNumber(context, boundary: issue.boundary, in: mapping) {
+                    issues.append(CutError(code: issue.code, message: issue.message, segment: segment,
+                                           boundary: issue.boundary, nearest: issue.nearest, track: issue.track,
+                                           multicam: context, laneID: issue.laneID).because(issue.reason))
+                } else {
+                    issues.append(issue)
+                }
+                resolved.append(lane)
+            }
+        }
+        let bindings = try project.audioReplacements.map { binding -> MulticamInspectedAudioBinding in
+            var coverage: MulticamRange?
+            if let original = bySource[binding.original.source],
+               let media = indexedSources[binding.replacement.source],
+               let track = media.audio.first(where: { $0.stream.index == binding.replacement.stream }) {
+                let offset = try original.source.offset.adding(binding.relativeOffset)
+                coverage = try .init(from: offset.adding(track.start), to: offset.adding(track.end))
+            }
+            return .init(id: binding.id, original: binding.original, replacement: binding.replacement, coverage: coverage)
+        }
+        let inspectedMapping = MulticamPlan(intervals: mapping.intervals, picture: mapping.picture,
+                                           audioLanes: resolved, duration: mapping.duration)
+        return MulticamInspection(mapping: inspectedMapping, sources: sources, issues: issues, audioBindings: bindings)
     }
 
     public func resolve(_ project: MulticamProject, relativeTo location: URL? = nil, output: URL,
                         mode: ExportMode = .smart, tracks: ExportTracks = .all,
                         assembly: [MulticamRange]? = nil,
-                        settings: ReencodeSettings = .init()) throws -> MulticamExportPlan {
+                        settings: ReencodeSettings = .init(), audioOutput: MulticamAudioOutput = .separateTracks,
+                        audioAction: ReencodeAudio? = nil) throws -> MulticamExportPlan {
         try resolve(project, relativeTo: location, output: output, mode: mode, tracks: tracks,
-                    assembly: assembly, settings: settings, indexedSources: [:])
+                    assembly: assembly, settings: settings, indexedSources: [:],
+                    audioOutput: audioOutput, audioAction: audioAction)
     }
 
     /// The desktop can supply indexes from inspectMulticamSource to export the
@@ -188,30 +237,51 @@ public struct MulticamEngine: Sendable {
     package func resolve(_ project: MulticamProject, relativeTo location: URL? = nil, output: URL,
                          mode: ExportMode = .smart, tracks: ExportTracks = .all,
                          assembly: [MulticamRange]? = nil, settings: ReencodeSettings = .init(),
-                         indexedSources: [String: MediaInfo]) throws -> MulticamExportPlan {
+                         indexedSources: [String: MediaInfo], audioOutput: MulticamAudioOutput = .separateTracks,
+                         audioAction: ReencodeAudio? = nil) throws -> MulticamExportPlan {
         var media = indexedSources
         return try resolve(project, relativeTo: location, output: output, mode: mode, tracks: tracks,
-                           assembly: assembly, settings: settings, media: &media)
+                           assembly: assembly, settings: settings, media: &media, audioOutput: audioOutput, audioAction: audioAction)
     }
 
     func resolve(_ project: MulticamProject, relativeTo location: URL?, output: URL,
                  mode: ExportMode, tracks: ExportTracks, assembly: [MulticamRange]?,
-                 settings: ReencodeSettings, media: inout [String: MediaInfo]) throws -> MulticamExportPlan {
+                 settings: ReencodeSettings, media: inout [String: MediaInfo],
+                 audioOutput: MulticamAudioOutput = .separateTracks, audioAction: ReencodeAudio? = nil) throws -> MulticamExportPlan {
+        if project.participants.render != nil {
+            guard assembly == nil else { throw ParticipantProjectExport.unsupported("A range export") }
+            let export = try ParticipantProjectExport(.multicam(project), relativeTo: location, output: output, mode: mode,
+                                                      tracks: tracks, settings: settings, audioOutput: audioOutput,
+                                                      audioAction: audioAction, plannedSubfolder: plannedSubfolder, cancelled: cancelled)
+            let mapping = try project.plan()
+            return MulticamExportPlan(mapping: mapping, picture: [], audioLanes: [], audioOutput: audioOutput,
+                                      container: output.pathExtension.lowercased(), duration: export.report.duration,
+                                      mode: mode, tracks: tracks, warnings: [], encodedVideoDuration: export.report.duration,
+                                      copiedVideoDuration: .zero, generatedPictureGaps: nil,
+                                      pictureCopy: nil, pictureEncode: nil, sounds: [], recordingGapExport: nil,
+                                      participantExport: export, participantRender: export.report)
+        }
         let mapping = try project.plan(ranges: assembly)
-        let sources = Dictionary(uniqueKeysWithValues: (project.angles + project.audioSources).map {
+        let sources = Dictionary(uniqueKeysWithValues: project.sources.map {
             ($0.id, sourceURL($0, project: project, location: location))
         })
-        let ranges = assembly ?? project.assembly ?? [project.range]
+        let items = assembly.map { $0.map { StillAssemblyItem.group($0) } } ?? project.assemblyItems ?? [.group(project.range)]
+        var plannedProject = project
+        plannedProject.assemblyItems = items
         return try resolve(mapping, sources: sources, output: output, mode: mode, tracks: tracks,
-                           settings: settings, requireAudio: project.audio != .none || !mapping.audio.isEmpty,
+                           settings: settings, requireAudio: project.audio != .none || !mapping.audioLanes.isEmpty,
                            media: &media, adjusting: { number, boundary, time in
-            var moved = ranges
-            guard moved.indices.contains(number - 1) else {
+            let index = number - 1
+            var moved = items
+            guard moved.indices.contains(index), var range = moved[index].group else {
                 throw CutError(code: "invalid_range", message: "The project has no assembly range \(number).")
             }
-            if boundary == "from" { moved[number - 1].from = time } else { moved[number - 1].to = time }
-            return try project.plan(ranges: moved)
-        }, offerBoundaries: true)
+            if boundary == "from" { range.from = time } else { range.to = time }
+            moved[index] = .group(range, angle: moved[index].angleOverride)
+            var updated = project
+            updated.assemblyItems = moved
+            return try updated.plan()
+        }, offerBoundaries: true, project: plannedProject, audioOutput: audioOutput, audioAction: audioAction)
     }
 
     /// `adjusting` replans the request with one range edge moved. With it, an unsafe range
@@ -220,11 +290,12 @@ public struct MulticamEngine: Sendable {
                         mode: ExportMode = .smart, tracks: ExportTracks = .all,
                         settings: ReencodeSettings = .init(),
                         requireAudio: Bool = true,
-                        adjusting: MulticamEdgePlanner? = nil) throws -> MulticamExportPlan {
+                        adjusting: MulticamEdgePlanner? = nil, audioOutput: MulticamAudioOutput = .separateTracks,
+                        audioAction: ReencodeAudio? = nil) throws -> MulticamExportPlan {
         var media: [String: MediaInfo] = [:]
         return try resolve(mapping, sources: sources, output: output, mode: mode, tracks: tracks,
                            settings: settings, requireAudio: requireAudio, media: &media,
-                           adjusting: adjusting, offerBoundaries: true)
+                           adjusting: adjusting, offerBoundaries: true, audioOutput: audioOutput, audioAction: audioAction)
     }
 
     /// Reports each located fault against its one-based assembly range, which for an edit
@@ -232,27 +303,37 @@ public struct MulticamEngine: Sendable {
     func resolve(_ mapping: MulticamPlan, sources: [String: URL], output: URL,
                  mode: ExportMode, tracks: ExportTracks, settings: ReencodeSettings,
                  requireAudio: Bool, media: inout [String: MediaInfo],
-                 adjusting: MulticamEdgePlanner?, offerBoundaries: Bool) throws -> MulticamExportPlan {
+                 adjusting: MulticamEdgePlanner?, offerBoundaries: Bool, project: MulticamProject? = nil,
+                 audioOutput: MulticamAudioOutput = .separateTracks, audioAction: ReencodeAudio? = nil) throws -> MulticamExportPlan {
+        let requestedAudio = audioAction ?? (settings.audio == .auto
+            ? (audioOutput == .separateTracks ? .copyOriginal : .auto) : settings.audio)
         do {
             return try resolveLanes(mapping, sources: sources, output: output, mode: mode, tracks: tracks,
                                     settings: settings, requireAudio: requireAudio,
-                                    media: &media, offerBoundaries: offerBoundaries)
+                                    media: &media, offerBoundaries: offerBoundaries, project: project,
+                                    audioOutput: audioOutput, audioAction: requestedAudio)
         } catch let issue as CutError {
             guard let context = issue.multicam else { throw issue }
             var nearest = issue.nearest
             if offerBoundaries, let edge = context.edge, let adjusting,
                issue.code == "unsafe_boundary" || issue.code == "invalid_frame_boundary" {
                 var candidateMedia = media
+                let lanes = try? (project?.resolveAudioLanes(plan: mapping, indexedSources: media)
+                                  ?? mapping.resolveAudioLanes(indexedSources: media))
                 nearest = try edgeAlternatives(edge, mapping: mapping, media: media, mode: mode,
                                                container: destinationContainer(output),
                                                picture: tracks != .audio,
-                                               sound: tracks != .video && !mapping.audio.isEmpty
-                                                   && !(mode == .encode && [.aac, .pcm, .removeAudio].contains(settings.audio)),
+                                               sound: tracks != .video && !mapping.audioLanes.isEmpty
+                                                   && requestedAudio == .copyOriginal,
+                                               soundLaneID: issue.laneID,
+                                               strictCandidates: mapping.isMix || !(project?.audioReplacements ?? mapping.joinedAudioReplacements).isEmpty,
+                                               resolvedLanes: lanes,
                                                adjusting: adjusting) { candidate in
                     do {
                         _ = try resolveLanes(candidate, sources: sources, output: output, mode: mode, tracks: tracks,
                                              settings: settings, requireAudio: requireAudio,
-                                             media: &candidateMedia, offerBoundaries: false)
+                                             media: &candidateMedia, offerBoundaries: false, project: project,
+                                             audioOutput: audioOutput, audioAction: requestedAudio)
                         return nil
                     } catch let failure as CutError {
                         return failure
@@ -261,7 +342,7 @@ public struct MulticamEngine: Sendable {
             }
             throw CutError(code: issue.code, message: issue.message,
                            segment: rangeNumber(context, boundary: issue.boundary, in: mapping) ?? issue.segment,
-                           boundary: issue.boundary, nearest: nearest, track: issue.track, multicam: context).because(issue.reason)
+                           boundary: issue.boundary, nearest: nearest, track: issue.track, multicam: context, laneID: issue.laneID).because(issue.reason)
         }
     }
 
@@ -277,36 +358,32 @@ public struct MulticamEngine: Sendable {
     private func resolveLanes(_ mapping: MulticamPlan, sources: [String: URL], output: URL,
                               mode: ExportMode, tracks: ExportTracks, settings: ReencodeSettings,
                               requireAudio: Bool, media indexedMedia: inout [String: MediaInfo],
-                              offerBoundaries: Bool) throws -> MulticamExportPlan {
+                              offerBoundaries: Bool, project: MulticamProject?,
+                              audioOutput: MulticamAudioOutput, audioAction: ReencodeAudio) throws -> MulticamExportPlan {
         let engine = CutEngine(cancelled: cancelled)
         try engine.checkCancellation()
         try engine.checkDestination(output, plannedSubfolder: plannedSubfolder)
         let destinationContainer = output.pathExtension.lowercased()
         let container = try self.destinationContainer(output)
-        // The matrix decides which modes a selection can be written with, here for every front end.
-        let cell = ExportRules.cell(source: .multicam, tracks: tracks, mode: mode)
-        if let refusal = cell.refusal { throw refusal }
         let wantPicture = tracks != .audio
-        let wantAudio = tracks != .video && (mode != .encode || settings.audio != .removeAudio)
-        if wantAudio && (requireAudio || !mapping.audio.isEmpty || tracks == .audio),
-           let missing = mapping.intervals.first(where: { $0.audio == nil }) {
-            // Inspection lists the same interval in its issues.
-            let picture = mapping.picture.first { $0.output.from <= missing.output.from && missing.output.from < $0.output.to }
-            let context = try picture.map { span -> MulticamDiagnostic in
-                let from = try span.input.from.adding(missing.output.from.subtracting(span.output.from))
-                let to = try from.adding(missing.output.to.subtracting(missing.output.from))
-                return MulticamDiagnostic(source: missing.angle, group: missing.group, sourceTime: .init(from: from, to: to),
-                                          output: missing.output, at: nil, edge: nil)
-            }
-            throw CutError(code: "missing_audio", message: "Angle \(missing.angle) has no selected soundtrack at group \(missing.group.from)–\(missing.group.to), output \(missing.output.from)–\(missing.output.to).",
-                           segment: missing.assemblyIndex + 1, multicam: context)
+        let wantAudio = tracks != .video && audioAction != .removeAudio
+        let pictureGaps = wantPicture ? mapping.recordingGaps : []
+        let hasPictureGaps = !pictureGaps.isEmpty
+        if wantPicture { try validatePicture(mapping, gaps: pictureGaps) }
+        if mode != .encode, let gap = pictureGaps.first {
+            throw CutError(code: "recording_gap_requires_encoding",
+                           message: "The selected camera has a recording gap at output \(gap.from)–\(gap.to). Re-encode to fill it with black.")
+                .because(.placementPicture)
         }
-        let useAudio = wantAudio && !mapping.audio.isEmpty
+        let cell = ExportRules.cell(source: .multicam, tracks: tracks, mode: mode)
+        if let refusal = cell.refusal, !hasPictureGaps { throw refusal }
+        if wantAudio && mapping.audioLanes.isEmpty && (requireAudio || tracks == .audio) {
+            throw CutError(code: "missing_audio", message: "There is no soundtrack selected for export.")
+        }
+        let useAudio = wantAudio && !mapping.audioLanes.isEmpty
         guard wantPicture || useAudio else {
             throw CutError(code: "missing_audio", message: "There is no soundtrack selected for export.")
         }
-        if wantPicture { try validateLane(mapping.picture, duration: mapping.duration, kind: "picture") }
-        if useAudio { try validateLane(mapping.audio, duration: mapping.duration, kind: "soundtrack") }
         if wantPicture && useAudio { try MulticamMux(cancelled: cancelled).check(container: container) }
         if MulticamMux.movieContainers.contains(container), 705_600_000 % mapping.duration.denominator != 0 {
             throw CutError(code: "unsupported_container", message: "The MOV movie clock cannot represent the exact program duration.")
@@ -314,61 +391,109 @@ public struct MulticamEngine: Sendable {
 
         var indexed: [URL: MediaInfo] = [:]
         var bySource: [String: MediaInfo] = [:]
-        let selected = (wantPicture ? mapping.picture : []) + (useAudio ? mapping.audio : [])
-        for span in selected where bySource[span.source] == nil {
-            let file = sources[span.source]
-            let previous = indexedMedia[span.source].flatMap { $0.url == file?.standardizedFileURL ? $0 : nil }
-            if let previous, previous.hasFullEditIndex, let file, !file.path.split(separator: "/").contains("..") {
-                try engine.checkCancellation()
-                try engine.verifyIdentity(file, identity: previous.identity)
-                indexed[previous.url] = previous
-                bySource[span.source] = previous
-            } else {
-                // Queues can snapshot a camera while its editing index is still loading.
-                bySource[span.source] = try index(span.source, file: file, using: engine, cached: &indexed,
-                                                  expectedIdentity: previous?.identity)
+        let pictureSpans = wantPicture ? mapping.picture : []
+        let bindings = Dictionary(uniqueKeysWithValues: (project?.audioReplacements ?? mapping.joinedAudioReplacements).map { ($0.original, $0) })
+        var indexContexts: [String: (lane: MulticamPlannedAudioLane, span: MulticamSpan)] = [:]
+        var fallbacks: [(lane: MulticamPlannedAudioLane, original: MulticamSpan, replacement: MulticamSpan)] = []
+        if useAudio {
+            for lane in mapping.audioLanes {
+                for span in lane.spans {
+                    let selection = span.stream.map { MulticamAudioSelection(source: span.source, stream: $0) }
+                    if let binding = selection.flatMap({ bindings[$0] }) {
+                        let replacement = try MulticamSpan(source: binding.replacement.source, stream: binding.replacement.stream,
+                            input: .init(from: span.input.from.subtracting(binding.relativeOffset),
+                                         to: span.input.to.subtracting(binding.relativeOffset)),
+                            output: span.output, replacementBindingID: binding.id)
+                        if indexContexts[replacement.source] == nil { indexContexts[replacement.source] = (lane, replacement) }
+                        if binding.uncovered == .keepOriginal { fallbacks.append((lane, span, replacement)) }
+                    } else if indexContexts[span.source] == nil {
+                        indexContexts[span.source] = (lane, span)
+                    }
+                }
+                if lane.spans.isEmpty, audioOutput == .separateTracks, audioAction != .copyOriginal,
+                   let selection = project?.configuredSelection(for: lane) ?? mapping.joinedAudioSelections[lane.id],
+                   indexContexts[selection.source] == nil {
+                    let output = MulticamRange(from: .zero, to: mapping.duration)
+                    indexContexts[selection.source] = (lane, .init(source: selection.source, stream: selection.stream,
+                                                                   input: output, output: output))
+                }
             }
         }
 
+        func indexSource(_ id: String, lane: MulticamPlannedAudioLane?, span: MulticamSpan?) throws {
+            guard bySource[id] == nil else { return }
+            let file = sources[id]
+            let previous = indexedMedia[id].flatMap { $0.url == file?.standardizedFileURL ? $0 : nil }
+            do {
+                if let previous, previous.hasFullEditIndex, let file, !file.path.split(separator: "/").contains("..") {
+                    try engine.checkCancellation()
+                    try engine.verifyIdentity(file, identity: previous.identity)
+                    let media = try engine.multicamClock(previous)
+                    indexed[media.url] = media
+                    bySource[id] = media
+                } else {
+                    // Queues can snapshot a camera while its editing index is loading.
+                    bySource[id] = try index(id, file: file, using: engine, cached: &indexed, expectedIdentity: previous?.identity)
+                }
+            } catch let issue as CutError where issue.code != "cancelled" && issue.code != "source_changed" {
+                guard let lane, let span else { throw issue }
+                throw try contextual(issue, span: span, mapping: mapping, index: 1, laneID: lane.id)
+            }
+        }
+
+        var sourceIDs = Set(pictureSpans.map(\.source)).union(indexContexts.keys)
+        if hasPictureGaps, pictureSpans.isEmpty, let referenceID = mapping.intervals.first?.angle {
+            sourceIDs.insert(referenceID)
+        }
+        for id in sourceIDs.sorted() {
+            try indexSource(id, lane: indexContexts[id]?.lane, span: indexContexts[id]?.span)
+        }
+        // Scratch audio is optional unless a selected replacement really needs it.
+        for (lane, span, replacement) in fallbacks where bySource[span.source] == nil {
+            guard let media = bySource[replacement.source],
+                  let audio = media.audio.first(where: { $0.stream.index == replacement.stream }) else { continue }
+            let sound = try MulticamPlan.audibleParts(of: replacement, track: audio)
+            if let gap = MulticamPlan.uncovered(in: span.output, sound: sound).first {
+                let start = try span.input.from.adding(gap.from.subtracting(span.output.from))
+                let end = try start.adding(gap.to.subtracting(gap.from))
+                try indexSource(span.source, lane: lane, span: .init(source: span.source, stream: span.stream,
+                                                                     input: .init(from: start, to: end), output: gap))
+            }
+        }
         indexedMedia.merge(bySource) { _, current in current }
-        // Inspection places each recording on the group clock. Do the same here, so an
-        // offset beyond the rational range is one fault in both commands.
+        let resolvedLanes = try useAudio
+            ? (project?.resolveAudioLanes(plan: mapping, indexedSources: bySource)
+                ?? mapping.resolveAudioLanes(indexedSources: bySource))
+            : mapping.audioLanes
+        // A physical track can occur at different group offsets through replacement bindings.
+        // Validate the clocks of the resolved routes and of the underlying picture recordings.
         var checkedOffsets: [String: Set<RationalTime>] = [:]
-        for span in selected {
+        let usedSpans = pictureSpans + (useAudio ? resolvedLanes.flatMap(\.spans) : [])
+        for span in usedSpans {
             try engine.checkCancellation()
             let offset = try groupStart(for: span, in: mapping).subtracting(span.input.from)
-            guard checkedOffsets[span.source, default: []].insert(offset).inserted else { continue }
-            _ = try groupCoverage(of: bySource[span.source]!, source: span.source, offset: offset)
+            guard checkedOffsets[span.source, default: []].insert(offset).inserted,
+                  let media = bySource[span.source] else { continue }
+            _ = try groupCoverage(of: media, source: span.source, offset: offset)
         }
 
-        guard mode != .encode || cell.audioActions.contains(ExportRules.multicamAudio(settings.audio)) else {
-            throw ExportRules.audioActionRefusal(settings.audio, source: .multicam)
+        let sounds: [MulticamExportSound]
+        if useAudio {
+            sounds = try resolveAudioOutput(mapping, resolvedLanes: resolvedLanes, project: project, sources: bySource, container: container,
+                                            output: audioOutput, action: audioAction, offerBoundaries: offerBoundaries,
+                                            mode: mode, wantPicture: wantPicture, settings: settings)
+        } else {
+            sounds = []
         }
-        let convertAudio = useAudio && mode == .encode && [.aac, .pcm].contains(settings.audio)
-        var sound: ResolvedEdit?
-        if useAudio && !convertAudio {
-            do {
-                sound = try resolveSound(mapping, sources: bySource, container: container)
-            } catch let issue as CutError where offerBoundaries && issue.code == "unsafe_boundary" {
-                guard let segment = issue.segment, mapping.audio.indices.contains(segment - 1),
-                      let boundary = issue.boundary else { throw issue }
-                let audio = mapping.audio[segment - 1]
-                let output = boundary == "from" ? audio.output.from : audio.output.to
-                let pictureSwitch = wantPicture && mapping.picture.dropLast().contains { $0.output.to == output }
-                let offered = try pictureSwitch
-                    ? pictureAlternatives(at: output, mapping: mapping, media: bySource, mode: mode,
-                                          container: container, validateAudio: true, convertedAudio: nil, settings: settings)
-                    : soundOnlyAlternatives(at: output, mapping: mapping, media: bySource, container: container)
-                throw CutError(code: issue.code, message: issue.message, segment: issue.segment,
-                               boundary: issue.boundary, nearest: offered, track: issue.track, multicam: issue.multicam)
-                    .because(issue.reason)
-            }
+        let gapPicture = hasPictureGaps
+            ? try resolveRecordingGaps(mapping, sources: sources, container: destinationContainer, settings: settings)
+            : nil
+        if gapPicture != nil {
+            for media in bySource.values { try engine.verifyIdentity(media.url, identity: media.identity) }
         }
-        let soundEncode = convertAudio
-            ? try resolveConvertedSound(mapping, sources: bySource, container: container, action: settings.audio) : nil
         var pictureCopy: ResolvedEdit?
         var pictureEncode: ReencodePlan?
-        if wantPicture {
+        if wantPicture && gapPicture == nil {
             let pictureEngine = CutEngine(multicamSmartPicture: mode == .smart, cancelled: cancelled)
             var media: [URL: MediaInfo] = [:]
             var requests: [ClipRequest] = []
@@ -405,22 +530,32 @@ public struct MulticamEngine: Sendable {
                    let boundary = issue.boundary {
                     offered = try pictureAlternatives(at: boundary == "from" ? span.output.from : span.output.to,
                                                      mapping: mapping, media: bySource, mode: mode, container: container,
-                                                     validateAudio: useAudio, convertedAudio: soundEncode?.action,
-                                                     settings: settings)
+                                                     settings: settings,
+                                                     replanning: markerPlanner(project),
+                                                     validatesCandidate: { candidate in
+                                                         try validateCandidateAudio(candidate, project: project, sources: bySource,
+                                                                                    container: container, output: audioOutput,
+                                                                                    action: audioAction, useAudio: useAudio)
+                                                     })
                 }
                 throw try contextual(issue, span: span, mapping: mapping, index: segment, nearest: offered,
                                      track: bySource[span.source]?.videoStream?.index)
             }
         }
-        let picture = pictureCopy?.segments ?? pictureEncode?.edit.segments ?? []
-        let encoded = try pictureCopy?.encodedVideoDuration(for: mode) ?? pictureEncode?.edit.duration ?? .zero
-        return MulticamExportPlan(mapping: mapping, picture: picture, audio: sound?.segments ?? soundEncode?.edit.segments ?? [],
-                                  container: destinationContainer, duration: mapping.duration, mode: mode, tracks: tracks,
-                                  warnings: (pictureEncode?.warnings ?? []) + (soundEncode?.warnings ?? []),
-                                  audioAction: soundEncode?.action ?? (sound == nil ? nil : .copyOriginal),
+        let picture = pictureCopy?.segments ?? pictureEncode?.edit.segments ?? gapPicture?.segments ?? []
+        let encoded = try pictureCopy?.encodedVideoDuration(for: mode) ?? pictureEncode?.edit.duration
+            ?? gapPicture?.plan.report.encodedVideoDuration ?? .zero
+        let resolvedMapping = MulticamPlan(intervals: mapping.intervals, picture: mapping.picture,
+                                          audioLanes: resolvedLanes, duration: mapping.duration)
+        return MulticamExportPlan(mapping: resolvedMapping, picture: picture, audioLanes: sounds.map(\.report),
+                                  audioOutput: audioOutput, container: destinationContainer, duration: mapping.duration,
+                                  mode: mode, tracks: tracks,
+                                  warnings: (pictureEncode?.warnings ?? gapPicture?.plan.report.warnings ?? []) + sounds.flatMap { $0.report.warnings },
                                   encodedVideoDuration: encoded,
                                   copiedVideoDuration: wantPicture ? try mapping.duration.subtracting(encoded) : .zero,
-                                  pictureCopy: pictureCopy, pictureEncode: pictureEncode, soundCopy: sound, soundEncode: soundEncode)
+                                  generatedPictureGaps: gapPicture == nil ? nil : pictureGaps,
+                                  pictureCopy: pictureCopy, pictureEncode: pictureEncode, sounds: sounds,
+                                  recordingGapExport: gapPicture?.plan, participantExport: nil, participantRender: nil)
     }
 
     public func write(_ plan: MulticamExportPlan, to output: URL,
@@ -430,6 +565,13 @@ public struct MulticamEngine: Sendable {
         try engine.checkDestination(output)
         guard output.pathExtension.lowercased() == plan.container else {
             throw CutError(code: "invalid_output", message: "The destination must match the resolved multicam container.")
+        }
+        if let export = plan.participantExport {
+            try export.write(to: output, cancelled: cancelled) { fraction in
+                progress?(fraction)
+                return cancelled?() != true
+            }
+            return
         }
         let destination = output.standardizedFileURL
         let staging = destination.deletingLastPathComponent()
@@ -443,17 +585,16 @@ public struct MulticamEngine: Sendable {
         defer { try? FileManager.default.removeItem(at: staging) }
         let picture = staging.appendingPathComponent("picture")
             .appendingPathExtension(plan.pictureCopy?.container ?? plan.pictureEncode?.edit.container ?? plan.container)
-        let sound = staging.appendingPathComponent("sound")
-            .appendingPathExtension(plan.soundCopy?.container ?? plan.soundEncode?.edit.container ?? plan.container)
-        let hasPicture = plan.pictureCopy != nil || plan.pictureEncode != nil
-        let hasSound = plan.soundCopy != nil || plan.soundEncode != nil
-        let both = hasPicture && hasSound
-        let pictureFraction = both ? 0.45 : 0.98
+        let hasPicture = plan.pictureCopy != nil || plan.pictureEncode != nil || plan.recordingGapExport != nil
+        let needsMux = plan.sounds.count > 1 || (hasPicture && !plan.sounds.isEmpty)
+        let pictureFraction = plan.sounds.isEmpty ? 0.98 : 0.45
         func verifySources() throws {
-            for edit in [plan.pictureCopy, plan.pictureEncode?.edit, plan.soundCopy, plan.soundEncode?.edit].compactMap({ $0 }) {
-                for (file, identity) in edit.identities {
-                    try engine.verifyIdentity(file, identity: identity)
-                }
+            for edit in [plan.pictureCopy, plan.pictureEncode?.edit].compactMap({ $0 }) {
+                for (file, identity) in edit.identities { try engine.verifyIdentity(file, identity: identity) }
+            }
+            for sound in plan.sounds { try sound.verifySources(using: engine) }
+            if let still = plan.recordingGapExport {
+                try still.verifySources(using: engine)
             }
             try engine.checkCancellation()
         }
@@ -464,26 +605,36 @@ public struct MulticamEngine: Sendable {
             try ReencodeEngine(cancelled: cancelled).write(encoded, to: picture) { fraction in
                 progress?(fraction * pictureFraction)
             }
-        }
-        if let audio = plan.soundCopy {
-            try engine.export(audio, to: sound, audioOnly: true, programAudio: plan.container != "flac") { fraction in
-                progress?(both ? pictureFraction + fraction * 0.35 : fraction * 0.98)
+        } else if let still = plan.recordingGapExport {
+            try StillExportPlanner(cancelled: cancelled).write(still, to: picture) { fraction in
+                progress?(fraction * pictureFraction)
                 return true
             }
         }
-        if let encoded = plan.soundEncode {
-            try writeConvertedSound(encoded, to: sound) { fraction in
-                progress?(both ? pictureFraction + fraction * 0.35 : fraction * 0.98)
+        let audioStart = hasPicture ? pictureFraction : 0
+        let audioEnd = needsMux ? 0.8 : 0.98
+        let sounds = try plan.sounds.enumerated().map { index, sound in
+            let staged = staging.appendingPathComponent("sound-\(index)").appendingPathExtension(sound.container)
+            do {
+                try writeSound(sound, to: staged) { fraction in
+                    progress?(audioStart + (Double(index) + fraction) / Double(plan.sounds.count) * (audioEnd - audioStart))
+                }
+            } catch let issue as CutError where issue.code != "cancelled" && issue.code != "source_changed" && issue.laneID == nil {
+                let lane = sound.report
+                throw CutError(code: issue.code, message: "Audio lane \(lane.label) (\(lane.id)): \(issue.message)",
+                               segment: issue.segment, boundary: issue.boundary, nearest: issue.nearest,
+                               track: issue.track, multicam: issue.multicam, laneID: lane.id).because(issue.reason)
             }
+            return staged
         }
-        if both {
-            try MulticamMux(cancelled: cancelled).export(picture: picture, sound: sound, to: destination,
-                                                         container: plan.container, duration: plan.duration,
+        if needsMux {
+            try MulticamMux(cancelled: cancelled).export(picture: hasPicture ? picture : nil, sounds: sounds, to: destination,
+                                                         container: plan.container, duration: plan.duration, audio: plan.audioLanes,
                                                          progress: { fraction in progress?(0.8 + fraction * 0.19); return true },
                                                          verifySources: verifySources)
         } else {
             try verifySources()
-            let failure = publishExclusively(from: hasPicture ? picture : sound, to: destination)
+            let failure = publishExclusively(from: hasPicture ? picture : sounds[0], to: destination)
             if failure == EEXIST { throw CutError(code: "output_exists", message: "A file already exists at the destination.") }
             if failure != 0 { throw CutError(code: "write_failed", message: String(cString: strerror(failure))) }
         }
@@ -505,7 +656,7 @@ public struct MulticamEngine: Sendable {
         }
     }
 
-    private func validateLane(_ spans: [MulticamSpan], duration: RationalTime, kind: String) throws {
+    func validateLane(_ spans: [MulticamSpan], duration: RationalTime, kind: String) throws {
         var end = RationalTime.zero
         for span in spans {
             guard span.output.from == end, span.output.from < span.output.to,
@@ -533,7 +684,7 @@ public struct MulticamEngine: Sendable {
         }
         let fileURL = file.standardizedFileURL
         if let current = cached[fileURL] {
-            if let expectedIdentity, current.identity != expectedIdentity {
+            if let expectedIdentity, !expectedIdentity.matchesSnapshot(current.identity) {
                 throw CutError(code: "source_changed", message: "Source \(source) changed after it was added to the project.")
             }
             return current
@@ -544,6 +695,7 @@ public struct MulticamEngine: Sendable {
             return media
         } catch let issue as CutError where issue.code != "cancelled" {
             throw CutError(code: issue.code, message: "Source \(source) (\(fileURL.path)): \(issue.message)")
+                .because(issue.reason)
         }
     }
 
@@ -564,11 +716,14 @@ public struct MulticamEngine: Sendable {
     }
 
     func contextual(_ issue: CutError, span: MulticamSpan, mapping: MulticamPlan,
-                    index: Int, nearest: [RationalTime]? = nil, track: Int? = nil) throws -> CutError {
+                    index: Int, nearest: [RationalTime]? = nil, track: Int? = nil,
+                    laneID: String? = nil) throws -> CutError {
         guard issue.code != "cancelled" && issue.code != "source_changed" else { return issue }
         let group = try groupRange(span, in: mapping)
         let stream = span.stream ?? issue.track ?? track
-        let description = stream.map { "stream \($0)" } ?? "picture"
+        let sourceDescription = stream.map { "stream \($0)" } ?? "picture"
+        let description = laneID.flatMap { id in mapping.audioLanes.first { $0.id == id } }
+            .map { "lane \($0.label) (\($0.id)), \(sourceDescription)" } ?? sourceDescription
         let alternatives = try nearest ?? issue.nearest?.map { try group.from.adding($0.subtracting(span.input.from)) }
         // A boundary is a switch when one assembly range continues across it. Any other
         // boundary is a range edge, where a suggested time moves the range and no switch.
@@ -581,16 +736,16 @@ public struct MulticamEngine: Sendable {
             let before = mapping.intervals.last { $0.output.to == seam }
             let after = mapping.intervals.first { $0.output.from == seam }
             if let before, let after, before.assemblyIndex == after.assemblyIndex, before.group.to == after.group.from {
-                anchor = time
+                if after.startsAtSwitch != false { anchor = time }
             } else if let interval = starting ? after : before {
                 edge = MulticamEdge(range: interval.assemblyIndex + 1, boundary: boundary, at: time)
             }
         }
         let context = MulticamDiagnostic(source: span.source, group: group, sourceTime: span.input,
-                                         output: span.output, at: anchor, edge: edge)
+                                         output: span.output, at: anchor, edge: edge, laneID: laneID)
         return CutError(code: issue.code,
                         message: "Source \(span.source) \(description), group \(group.from)–\(group.to), source \(span.input.from)–\(span.input.to), output \(span.output.from)–\(span.output.to): \(issue.message)",
-                        segment: index, boundary: issue.boundary, nearest: alternatives, track: stream, multicam: context)
+                        segment: index, boundary: issue.boundary, nearest: anchor == nil && edge == nil ? nil : alternatives, track: stream, multicam: context)
             .because(issue.reason)
     }
 }

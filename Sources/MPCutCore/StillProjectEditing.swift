@@ -1,12 +1,13 @@
 import Foundation
 
 extension CutProject {
-    func editingStills(sequence: (inout StillSequenceProject) throws -> Void,
+    package func editingStills(sequence: (inout StillSequenceProject) throws -> Void,
                                multicam: (inout MulticamProject) throws -> Void) throws -> CutProject {
         let result: CutProject
         if var project = stillSequenceValue {
             try sequence(&project)
-            result = project.requiresV2 ? .stillSequence(project) : .sequence(project.items.compactMap(\.source))
+            result = project.hasStillContent || !project.transcripts.isEmpty || !project.sourceSelects.isEmpty || !project.participants.isEmpty
+                ? .stillSequence(project) : .sequence(project.items.compactMap(\.source))
         } else if case .multicam(var project) = self {
             try multicam(&project)
             result = .multicam(project)
@@ -20,6 +21,137 @@ extension CutProject {
     public func addingStillAsset(_ asset: StillAsset) throws -> CutProject {
         if stillAssets.contains(asset) { return self }
         return try editingStills(sequence: { $0.stillAssets.append(asset) }, multicam: { $0.stillAssets.append(asset) })
+    }
+
+    package var hasSpacingBoundaries: Bool {
+        let gaps = Set(stillAssets.filter(\.isGap).map(\.id))
+        switch self {
+        case .sequence(let clips): return clips.count >= 2
+        case .stillSequence(let project):
+            return project.items.lazy.filter { $0.still.map { !gaps.contains($0.assetID) } ?? true }.prefix(2).count == 2
+        case .multicam(let project):
+            return (project.assemblyItems ?? [.group(project.range)]).lazy.filter { $0.still.map { !gaps.contains($0.assetID) } ?? true }.prefix(2).count == 2
+        }
+    }
+
+    package var hasInteriorSpacingGaps: Bool {
+        let gaps = Set(stillAssets.filter(\.isGap).map(\.id))
+        guard !gaps.isEmpty else { return false }
+        func hasInteriorGap<Item>(_ items: [Item], insert: KeyPath<Item, StillInsert?>) -> Bool {
+            let isGap: (Item) -> Bool = { item in
+                item[keyPath: insert].map { gaps.contains($0.assetID) } ?? false
+            }
+            guard let first = items.firstIndex(where: { !isGap($0) }),
+                  let last = items.lastIndex(where: { !isGap($0) }), first < last else { return false }
+            return items[(first + 1)..<last].contains(where: isGap)
+        }
+        switch self {
+        case .sequence: return false
+        case .stillSequence(let project): return hasInteriorGap(project.items, insert: \.still)
+        case .multicam(let project): return hasInteriorGap(project.assemblyItems ?? [], insert: \.still)
+        }
+    }
+
+    /// Set the pauses between consecutive picture items in one history entry.
+    /// Keep leading and trailing gaps, and retain the first gap ID at each join.
+    public func spacingClips(duration: RationalTime, cadence: RationalTime, background: String) throws -> CutProject {
+        guard duration >= .zero, cadence > .zero else { throw stillError("Enter a nonnegative spacing and a positive frame rate") }
+        return try spacingClips(cadence: cadence, background: background,
+                                sequenceSpacing: { _, _ in duration }, groupSpacing: { _, _ in duration })
+    }
+
+    /// Set the pauses between adjacent ranges on the same source or multicam group clock.
+    public func spacingClipsUsingSourceTiming(cadence: RationalTime, background: String,
+                                             relativeTo projectURL: URL? = nil) throws -> CutProject {
+        guard cadence > .zero else { throw stillError("Enter a positive frame rate") }
+        let directory = projectURL.map { ProjectFile.directory(of: $0) }
+
+        func sharesSource(_ left: String, _ right: String) throws -> Bool {
+            if left == right { return true }
+            guard let directory else { return false }
+            let leftURL = try ProjectFile.checkedSourceURL(file: left, in: directory)
+            let rightURL = try ProjectFile.checkedSourceURL(file: right, in: directory)
+            return ProjectFile.canonicalFileURL(leftURL) == ProjectFile.canonicalFileURL(rightURL)
+        }
+
+        func hole(from end: RationalTime, to start: RationalTime) throws -> RationalTime {
+            guard start >= end else {
+                throw stillError("Source timing requires consecutive ranges in chronological order without overlaps")
+            }
+            return try start.subtracting(end)
+        }
+
+        func untimedStill() -> CutError {
+            stillError("Source timing cannot determine spacing next to a photo still. Use uniform spacing for those joins.")
+        }
+
+        return try spacingClips(cadence: cadence, background: background,
+                                sequenceSpacing: { previous, next in
+            guard let left = previous.source, let right = next.source else { throw untimedStill() }
+            guard try sharesSource(left.file, right.file) else {
+                throw stillError("Source timing requires consecutive clips to use the same media file")
+            }
+            return try hole(from: left.to, to: right.from)
+        }, groupSpacing: { previous, next in
+            guard let left = previous.group, let right = next.group else { throw untimedStill() }
+            return try hole(from: left.to, to: right.from)
+        })
+    }
+
+    private func spacingClips(
+        cadence: RationalTime, background: String,
+        sequenceSpacing: (StillSequenceItem, StillSequenceItem) throws -> RationalTime,
+        groupSpacing: (StillAssemblyItem, StillAssemblyItem) throws -> RationalTime
+    ) throws -> CutProject {
+        let framing = StillImageFraming(mode: .fit, background: background)
+        try framing.validate()
+        let gapIDs = Set(stillAssets.filter(\.isGap).map(\.id))
+        let asset = stillAssets.first(where: \.isGap) ?? StillAsset(gapID: UUID().uuidString)
+        let previousAssets = Set(stillInserts.map(\.assetID))
+        var addedGap = false
+        func spaced<Item>(_ items: [Item], insert: KeyPath<Item, StillInsert?>, make: (StillInsert) -> Item,
+                          spacing: (Item, Item) throws -> RationalTime) throws -> [Item] {
+            let pictures = items.indices.filter { index in
+                guard let card = items[index][keyPath: insert] else { return true }
+                return !gapIDs.contains(card.assetID)
+            }
+            guard let first = pictures.first, let last = pictures.last, first < last else {
+                throw stillError("Space Clips requires at least two clips or still pictures")
+            }
+            var result = Array(items[...first])
+            for (left, right) in zip(pictures, pictures.dropFirst()) {
+                let duration = try spacing(items[left], items[right])
+                if duration > .zero {
+                    let existing = items[(left + 1)..<right].first?[keyPath: insert]
+                    result.append(make(StillInsert(id: existing?.id ?? UUID().uuidString, assetID: existing?.assetID ?? asset.id,
+                                                   duration: duration, cadence: cadence, framing: framing)))
+                    addedGap = true
+                }
+                result.append(items[right])
+            }
+            result.append(contentsOf: items.suffix(from: last + 1))
+            return result
+        }
+        return try editingStills(sequence: { project in
+            project.items = try spaced(project.items, insert: \.still, make: StillSequenceItem.still,
+                                       spacing: sequenceSpacing)
+            if addedGap && !gapIDs.contains(asset.id) { project.stillAssets.append(asset) }
+            Self.pruneUnusedGapAssets(&project.stillAssets, previouslyUsed: previousAssets,
+                                     inserts: project.items.compactMap(\.still))
+        }, multicam: { project in
+            let items = try spaced(project.assemblyItems ?? [.group(project.range)], insert: \.still,
+                                   make: StillAssemblyItem.still, spacing: groupSpacing)
+            project.assemblyItems = items
+            if addedGap && !gapIDs.contains(asset.id) { project.stillAssets.append(asset) }
+            Self.pruneUnusedGapAssets(&project.stillAssets, previouslyUsed: previousAssets,
+                                     inserts: items.compactMap(\.still))
+        })
+    }
+
+    private static func pruneUnusedGapAssets(_ assets: inout [StillAsset], previouslyUsed: Set<String>,
+                                             inserts: [StillInsert]) {
+        let unused = previouslyUsed.subtracting(inserts.map(\.assetID))
+        assets.removeAll { $0.isGap && unused.contains($0.id) }
     }
 
     public func addingStillReplacement(_ replacement: StillReplacement) throws -> CutProject {
@@ -39,6 +171,7 @@ extension CutProject {
     public func relinkingStillAsset(_ id: String, file: String, fingerprint: String) throws -> CutProject {
         func relink(_ assets: inout [StillAsset]) throws {
             guard let index = assets.firstIndex(where: { $0.id == id }) else { throw unknownStill(id) }
+            guard !assets[index].isGap else { throw stillError("A color gap has no linked image.") }
             assets[index].file = file
             assets[index].fingerprint = fingerprint
         }
@@ -91,17 +224,26 @@ extension CutProject {
         }
     }
 
-    private func editingInsert(id: String, edit: (StillInsert) throws -> [StillInsert]) throws -> CutProject {
+    private func editingInsert(id: String, preserveGapAsset: Bool = false,
+                               edit: (StillInsert) throws -> [StillInsert]) throws -> CutProject {
         try editingStills(sequence: { project in
             guard let index = project.items.firstIndex(where: { $0.still?.id == id }),
                   let insert = project.items[index].still else { throw unknownStill(id) }
             project.items.replaceSubrange(index...index, with: try edit(insert).map(StillSequenceItem.still))
+            if !preserveGapAsset {
+                Self.pruneUnusedGapAssets(&project.stillAssets, previouslyUsed: [insert.assetID],
+                                         inserts: project.items.compactMap(\.still))
+            }
         }, multicam: { project in
             guard var items = project.assemblyItems,
                   let index = items.firstIndex(where: { $0.still?.id == id }),
                   let insert = items[index].still else { throw unknownStill(id) }
             items.replaceSubrange(index...index, with: try edit(insert).map(StillAssemblyItem.still))
             project.assemblyItems = items.isEmpty ? nil : items
+            if !preserveGapAsset {
+                Self.pruneUnusedGapAssets(&project.stillAssets, previouslyUsed: [insert.assetID],
+                                         inserts: items.compactMap(\.still))
+            }
         })
     }
 
@@ -112,7 +254,7 @@ extension CutProject {
         guard destination >= .zero, destination <= plan.duration else { throw stillError("Still move lies outside the timeline") }
         guard destination < span.output.from || destination > span.output.to else { return self }
         let target = destination < span.output.from ? destination : try destination.subtracting(insert.duration)
-        return try removingStill(id: id).insertingStill(insert, at: target)
+        return try editingInsert(id: id, preserveGapAsset: true) { _ in [] }.insertingStill(insert, at: target)
     }
 
     public func insertingStill(_ insert: StillInsert, at position: RationalTime) throws -> CutProject {
@@ -143,8 +285,8 @@ extension CutProject {
                     guard let range = item.group else { throw insertConflict(item.still!.id) }
                     let split = try range.from.adding(position.subtracting(start))
                     items.replaceSubrange(index...index, with: [
-                        .group(.init(from: range.from, to: split)), .still(insert),
-                        .group(.init(from: split, to: range.to))
+                        .group(.init(from: range.from, to: split), angle: item.angleOverride), .still(insert),
+                        .group(.init(from: split, to: range.to), angle: item.angleOverride)
                     ])
                     project.assemblyItems = items
                     return
@@ -189,6 +331,55 @@ extension CutProject {
                 return edited
             }
         }
+    }
+
+    /// Remove sorted, disjoint source ranges from each occurrence in one edit.
+    package func removingSequencePauses(_ removals: [String: [AudioSpan]],
+                                        checkCancellation: () throws -> Void) throws -> CutProject {
+        guard !removals.isEmpty else { return self }
+        return try editingStills(sequence: { project in
+            var fragmentPieces: [String: [(id: String, from: RationalTime?, to: RationalTime?)]] = [:]
+            project.items = try project.items.flatMap { item -> [StillSequenceItem] in
+                try checkCancellation()
+                guard let original = item.source, let cuts = removals[original.id] else { return [item] }
+                let retained = AudioAnalysis.retained(in: .init(from: original.from, to: original.to), removing: cuts)
+                let pieces = retained.map { span -> CutSequenceClip in
+                    var clip = original
+                    if span.from != original.from { clip.id = UUID().uuidString }
+                    clip.from = span.from
+                    clip.to = span.to
+                    return clip
+                }
+                // Split replacement coverage at the same boundaries as normal clip
+                // splitting, retaining hidden coverage when a clip is trimmed.
+                fragmentPieces[original.id] = pieces.enumerated().map { index, piece in
+                    let from = piece.id == original.id ? nil : piece.from
+                    let to = index + 1 < pieces.count ? pieces[index + 1].from : nil
+                    return (piece.id, from, to)
+                }
+                return pieces.map(StillSequenceItem.source)
+            }
+            guard !project.items.isEmpty else {
+                throw CutError(code: "empty_edit", message: "The selected pauses cover the entire sequence. Increase --padding-per-side-seconds to retain footage.")
+            }
+            project.stillReplacements = try project.stillReplacements.compactMap { replacement in
+                try checkCancellation()
+                guard case .sequence(let fragments) = replacement.coverage else { return replacement }
+                let retained = fragments.flatMap { fragment -> [StillReplacementFragment] in
+                    guard let pieces = fragmentPieces[fragment.clipID] else { return [fragment] }
+                    return pieces.compactMap { piece in
+                        let from = max(fragment.range.from, piece.from ?? fragment.range.from)
+                        let to = min(fragment.range.to, piece.to ?? fragment.range.to)
+                        guard from < to else { return nil }
+                        return .init(clipID: piece.id, range: .init(from: from, to: to))
+                    }
+                }
+                guard !retained.isEmpty else { return nil }
+                var edited = replacement
+                edited.coverage = .sequence(retained)
+                return edited
+            }
+        }, multicam: { _ in throw stillError("Sequence pause removal requires a sequence") })
     }
 
     public func duplicatingSequenceClip(id: String, newID: String = UUID().uuidString) throws -> CutProject {
@@ -259,7 +450,7 @@ private extension StillSequenceItem {
 private extension StillAssemblyItem {
     func duration() throws -> RationalTime {
         switch self {
-        case .group(let range): try range.to.subtracting(range.from)
+        case .group(let range, _): try range.to.subtracting(range.from)
         case .still(let insert): insert.duration
         }
     }

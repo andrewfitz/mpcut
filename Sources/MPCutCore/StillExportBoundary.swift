@@ -9,6 +9,15 @@ public struct StillBoundaryAdjustment: Codable, Equatable, Sendable {
     public let requestedTime: RationalTime
     public let adjustedTime: RationalTime
     public let durationChange: RationalTime
+
+    private enum CodingKeys: String, CodingKey {
+        case placementID = "placement_id"
+        case boundary, clock
+        case occurrenceID = "occurrence_id"
+        case requestedTime = "requested_time"
+        case adjustedTime = "adjusted_time"
+        case durationChange = "duration_change"
+    }
 }
 
 struct StillUnsafeJoin: Error {
@@ -22,6 +31,9 @@ extension CutProject {
         let id = adjustment.placementID
         let stale = CutError(code: "invalid_still_boundary", message: "The reviewed boundary of still placement \(id) no longer matches the project.")
         if adjustment.boundary == .insertion {
+            let clock: String
+            if case .multicam = self { clock = "assembly" } else { clock = "sequence" }
+            guard adjustment.clock == clock, adjustment.occurrenceID == nil else { throw stale }
             guard let span = try resolveStills().spans.first(where: {
                 $0.placementID == id && $0.output.from == adjustment.requestedTime && $0.origin == .insert
             }) else { throw stale }
@@ -41,13 +53,14 @@ extension CutProject {
         }
         switch replacement.coverage {
         case .sequence(var fragments):
-            guard let index = fragments.firstIndex(where: {
+            guard adjustment.clock == "sequence", let index = fragments.firstIndex(where: {
                 $0.clipID == adjustment.occurrenceID &&
                     (adjustment.boundary == .start ? $0.range.from : $0.range.to) == adjustment.requestedTime
             }) else { throw stale }
             fragments[index].range = try change(fragments[index].range)
             replacement.coverage = .sequence(fragments)
         case .group(let range):
+            guard adjustment.clock == "group", adjustment.occurrenceID == nil else { throw stale }
             replacement.coverage = .group(try change(range))
         }
         return try removingStill(id: id).addingStillReplacement(replacement)

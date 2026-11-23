@@ -83,8 +83,32 @@ struct ScrubGrain {
     }
 }
 
+private enum ScrubSoundRequest {
+    case source(ScrubAudioRequest)
+    case program(MulticamMixedAudioTimeline, Range<Double>, reverse: Bool)
+
+    func continues(_ previous: Self) -> Bool {
+        switch (self, previous) {
+        case (.source(let next), .source(let prior)):
+            return next.source == prior.source && next.reverse == prior.reverse
+        case (.program(_, _, let next), .program(_, _, let prior)):
+            return next == prior
+        default:
+            return false
+        }
+    }
+}
+
 actor ScrubAudioReader {
     private let fallback = FFPreviewReader(audioOnly: true)
+
+    fileprivate func grain(_ request: ScrubSoundRequest) -> ScrubGrain? {
+        switch request {
+        case .source(let source): return grain(source)
+        case .program(let timeline, let window, let reverse):
+            return timeline.grain(window: window, reverse: reverse, fadeEdges: true)
+        }
+    }
 
     func grain(_ request: ScrubAudioRequest) -> ScrubGrain? {
         read(source: request.source, composition: request.composition, window: request.window,
@@ -150,7 +174,7 @@ final class ScrubAudioPlayer {
     private var engine: AVAudioEngine?
     private var format: AVAudioFormat?
     private var task: Task<Void, Never>?
-    private var pending: ScrubAudioRequest?
+    private var pending: ScrubSoundRequest?
     var gain: Float = 1
 
     init(engine: AVAudioEngine? = nil) {
@@ -159,6 +183,14 @@ final class ScrubAudioPlayer {
     }
 
     func submit(_ request: ScrubAudioRequest) {
+        submit(.source(request))
+    }
+
+    func submit(_ timeline: MulticamMixedAudioTimeline, window: Range<Double>, reverse: Bool) {
+        submit(.program(timeline, window, reverse: reverse))
+    }
+
+    private func submit(_ request: ScrubSoundRequest) {
         pending = request
         guard task == nil else { return }
         task = Task { [weak self] in
@@ -166,7 +198,7 @@ final class ScrubAudioPlayer {
                 self.pending = nil
                 let grain = await self.reader.grain(next)
                 guard !Task.isCancelled else { return }
-                if let grain, self.pending.map({ $0.source == next.source && $0.reverse == next.reverse }) ?? true {
+                if let grain, self.pending.map({ $0.continues(next) }) ?? true {
                     self.play(grain)
                     try? await Task.sleep(for: .milliseconds(55))
                 }

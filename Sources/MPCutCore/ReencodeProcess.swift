@@ -35,6 +35,7 @@ extension ReencodeEngine {
         }
         var buffer = [UInt8](repeating: 0, count: 8192)
         var pending = Data()
+        var discardingProgressLine = false
         var diagnostic = Data()
         var reported = 0.0
         let deadline = timeout.map { ContinuousClock.now + $0 }
@@ -69,8 +70,9 @@ extension ReencodeEngine {
                     } else if let duration, duration > .zero, let progress {
                         pending.append(contentsOf: buffer.prefix(count))
                         while let newline = pending.firstIndex(of: 10) {
-                            let line = String(decoding: pending[..<newline], as: UTF8.self)
+                            let line = discardingProgressLine ? "" : String(decoding: pending[..<newline], as: UTF8.self)
                             pending.removeSubrange(...newline)
+                            discardingProgressLine = false
                             guard line.hasPrefix("out_time_us="),
                                   let micros = Int64(line.dropFirst("out_time_us=".count)) else { continue }
                             let fraction = min(1, Double(micros) / 1_000_000 / duration.seconds)
@@ -78,6 +80,12 @@ extension ReencodeEngine {
                                 reported = fraction
                                 progress(fraction)
                             }
+                        }
+                        // Progress records are short. Drain arbitrary stdout without retaining an unbounded line
+                        // or interpreting the tail of a discarded line as a new progress record.
+                        if discardingProgressLine || pending.count > buffer.count {
+                            discardingProgressLine = true
+                            pending.removeAll(keepingCapacity: true)
                         }
                     }
                 }

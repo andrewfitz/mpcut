@@ -24,6 +24,7 @@ extension StillExportPlanner {
         let placementID: String?
         let camera: CameraSpan?
         let authoredClockRange: MulticamRange?
+        var recordingGap = false
     }
 
     func planPicture(_ project: CutProject, document: URL, timeline: StillTimelinePlan, mode: ExportMode,
@@ -31,6 +32,8 @@ extension StillExportPlanner {
                      tracks: ExportTracks) throws -> StillPicturePlan {
         let engine = CutEngine(cancelled: cancelled, useSidecar: useSidecar, tracks: .video)
         let windows = try pictureWindows(project, document: document, timeline: timeline)
+        let isMulticam: Bool
+        if case .multicam = project { isMulticam = true } else { isMulticam = false }
         var indexed: [URL: MediaInfo] = [:]
         var identities: [URL: SourceIdentity] = [:]
         var sourceExtents: [String: MulticamRange] = [:]
@@ -39,7 +42,7 @@ extension StillExportPlanner {
         for window in windows {
             guard let camera = window.camera else { continue }
             if indexed[camera.file] == nil {
-                let original = try engine.inspect(camera.file, keyframes: true)
+                let original = try isMulticam ? engine.inspectMulticamSource(camera.file) : engine.inspect(camera.file, keyframes: true)
                 if tracks == .all, let extra = original.streams.first(where: {
                     $0.kind != "audio" && $0.index != original.videoStream?.index
                 }) {
@@ -137,15 +140,33 @@ extension StillExportPlanner {
         let inserts = Dictionary(uniqueKeysWithValues: project.stillInserts.map { ($0.id, $0) })
         let replacements = Dictionary(uniqueKeysWithValues: project.stillReplacements.map { ($0.id, $0) })
         var opened: [String: URL] = [:]
+        func assetFile(_ asset: StillAsset, placementID: String) throws -> URL {
+            if let cached = opened[asset.id] { return cached }
+            let file = try openAsset(asset, placementID: placementID, document: document, engine: engine, identities: &identities)
+            opened[asset.id] = file
+            return file
+        }
         var pictures: [StillExportPicture] = []
         var allConversionInputs: [ClipRequest] = []
         let timescale = mode != .encode ? Int(exactly: reference.timeBase.denominator) : nil
 
-        let cameraCadence = indexed.values.lazy.compactMap { $0.frames.first?.duration }.first
-        let variableTimeline = !inserts.isEmpty && ["mov", "mp4", "m4v"].contains(container) &&
-            indexed.values.contains { media in
-                media.frames.contains { $0.duration != cameraCadence }
+        var variableTimeline: Bool?
+        func allowsShortFinalSample() throws -> Bool {
+            guard ["mov", "mp4", "m4v"].contains(container) else { return false }
+            if let variableTimeline { return variableTimeline }
+            let cadence = indexed.values.lazy.compactMap { $0.frames.first?.duration }.first
+            for media in indexed.values {
+                for (index, frame) in media.frames.enumerated() {
+                    if index.isMultiple(of: 1_024) { try engine.checkCancellation() }
+                    if frame.duration != cadence {
+                        variableTimeline = true
+                        return true
+                    }
+                }
             }
+            variableTimeline = false
+            return false
+        }
 
         for (index, window) in windows.enumerated() {
             try engine.checkCancellation()
@@ -161,7 +182,30 @@ extension StillExportPlanner {
                 frames = nil
             }
             let content: StillExportPicture.Content
-            if let id = window.placementID {
+            if window.recordingGap {
+                guard mode == .encode else {
+                    throw CutError(code: "recording_gap_requires_encoding",
+                                   message: "The selected camera has a recording gap at output \(window.output.from)–\(window.output.to). Re-encode to fill it with black.")
+                        .because(.placementPicture)
+                }
+                let rate = reference.frameRate
+                let cadence = rate > .zero ? RationalTime(numerator: rate.denominator, denominator: rate.numerator) :
+                    RationalTime(numerator: 1, denominator: 30)
+                let duration = try window.output.to.subtracting(window.output.from)
+                let schedule = try StillSampleSchedule(duration: duration, cadence: cadence, allowShortFinalSample: true)
+                let file: URL
+                let framing: StillImageFraming
+                if let id = window.placementID, let replacement = replacements[id], let asset = assets[replacement.assetID] {
+                    file = try assetFile(asset, placementID: id)
+                    framing = replacement.framing
+                } else {
+                    file = StillAsset.gapImage
+                    if identities[file] == nil { identities[file] = try SourceIdentity(file) }
+                    framing = .fit
+                }
+                try generator.checkLossless(reference: reference, schedule: schedule)
+                content = .still(file: file, framing: framing, reference: reference, schedule: schedule)
+            } else if let id = window.placementID {
                 let assetID: String
                 let framing: StillImageFraming
                 let duration = try window.output.to.subtracting(window.output.from)
@@ -170,7 +214,7 @@ extension StillExportPlanner {
                     assetID = insert.assetID
                     framing = insert.framing
                     schedule = try .init(duration: duration, cadence: insert.cadence,
-                                         allowShortFinalSample: variableTimeline)
+                                         allowShortFinalSample: try allowsShortFinalSample())
                 } else if let replacement = replacements[id], let media, let frames {
                     assetID = replacement.assetID
                     framing = replacement.framing
@@ -181,13 +225,7 @@ extension StillExportPlanner {
                 guard let asset = assets[assetID] else {
                     throw CutError(code: "missing_still_asset", message: "Still placement \(id) references missing asset \(assetID).")
                 }
-                let file: URL
-                if let cached = opened[assetID] {
-                    file = cached
-                } else {
-                    file = try openAsset(asset, placementID: id, document: document, engine: engine, identities: &identities)
-                    opened[assetID] = file
-                }
+                let file = try assetFile(asset, placementID: id)
                 if mode == .encode {
                     try generator.checkLossless(reference: reference, schedule: schedule)
                 } else {
@@ -232,18 +270,28 @@ extension StillExportPlanner {
             warnings.append("Content-light statistics will be omitted because the still-bearing program has different content.")
         }
         if mode == .encode {
-            if pictures.contains(where: { $0.content.needsExactVariableTiming }) {
-                let sourceClocks: [Int64] = try pictures.map {
-                    switch $0.content {
-                    case .camera(let media, _, _, _): return media.video.timeBase.denominator
-                    case .still(_, _, _, let schedule): return try schedule.exactTimescale()
+            let sourceClocks: [Int64] = try pictures.map {
+                switch $0.content {
+                case .camera(let media, _, _, _): return media.video.timeBase.denominator
+                case .still(_, _, _, let schedule): return try schedule.exactTimescale()
+                }
+            }
+            let clock = Int64(conversionTimeScale(for: sourceClocks))
+            for (picture, sourceClock) in zip(pictures, sourceClocks) {
+                guard clock.isMultiple(of: picture.output.from.denominator),
+                      clock.isMultiple(of: picture.output.to.denominator) else { throw StillSampleSchedule.unsupported }
+                if clock.isMultiple(of: sourceClock) { continue }
+                guard case .camera(let media, _, let frames, _) = picture.content else {
+                    throw StillSampleSchedule.unsupported
+                }
+                // A finer source clock is safe when every retained frame duration
+                // still falls exactly on the output clock.
+                for index in frames {
+                    if index.isMultiple(of: 1_024) { try engine.checkCancellation() }
+                    guard clock.isMultiple(of: media.frames[index].duration.denominator) else {
+                        throw StillSampleSchedule.unsupported
                     }
                 }
-                let clock = Int64(conversionTimeScale(for: sourceClocks))
-                guard zip(pictures, sourceClocks).allSatisfy({ picture, sourceClock in
-                    clock.isMultiple(of: sourceClock) && clock.isMultiple(of: picture.output.from.denominator) &&
-                        clock.isMultiple(of: picture.output.to.denominator)
-                }) else { throw StillSampleSchedule.unsupported }
             }
             let videoSettings = ReencodeSettings(codec: settings.codec, quality: settings.quality, audio: .removeAudio)
             let conversionContainer = ExportRules.multicamMuxContainer(container)
@@ -267,10 +315,20 @@ extension StillExportPlanner {
         let clips = Dictionary(uniqueKeysWithValues: (project.sequenceClips ?? []).map { ($0.id, $0) })
         let multicam: MulticamProject?
         if case .multicam(let program) = project { multicam = program } else { multicam = nil }
-        let programPicture = try multicam?.plan().picture ?? []
-        let anglePaths = try Dictionary(uniqueKeysWithValues: (multicam?.angles ?? []).map {
-            ($0.id, try CutProject.checkedMediaURL($0.file, relativeTo: document))
+        let program = try multicam?.plan()
+        let programPicture = program?.picture ?? []
+        let gaps = program?.recordingGaps ?? []
+        let recordings = Dictionary(uniqueKeysWithValues: (multicam?.pictureSources ?? []).map {
+            ($0.id, $0.file)
         })
+        var anglePaths: [String: URL] = [:]
+        func anglePath(_ id: String) throws -> URL? {
+            if let known = anglePaths[id] { return known }
+            guard let path = recordings[id] else { return nil }
+            let file = try CutProject.checkedMediaURL(path, relativeTo: document)
+            anglePaths[id] = file
+            return file
+        }
         var windows: [PictureWindow] = []
         var cameraIndex = 0
         for span in timeline.spans {
@@ -289,8 +347,9 @@ extension StillExportPlanner {
             case .group(_, let group):
                 if let placementID = span.placementID,
                    let referenceID = replacementReferenceAngles[placementID] ?? multicam?.referenceAngle,
-                   let reference = multicam?.angles.first(where: { $0.id == referenceID }),
-                   let file = anglePaths[reference.id] {
+                   let reference = multicam?.pictureSource(for: referenceID, at: group.from),
+                   reference.coverage.map({ group.to <= $0.to }) ?? true,
+                   let file = try anglePath(reference.id) {
                     let input = MulticamRange(from: try group.from.subtracting(reference.offset),
                                               to: try group.to.subtracting(reference.offset))
                     windows.append(.init(output: span.output, clock: "group", placementID: placementID,
@@ -303,11 +362,20 @@ extension StillExportPlanner {
                 }
                 var cursor = span.output.from
                 while cursor < span.output.to {
+                    let gapIndex = gaps.lowerBound { $0.to > cursor }
+                    if gaps.indices.contains(gapIndex), gaps[gapIndex].contains(cursor) {
+                        let upper = min(span.output.to, gaps[gapIndex].to)
+                        let output = MulticamRange(from: cursor, to: upper)
+                        windows.append(.init(output: output, clock: span.placementID == nil ? "assembly" : "group", placementID: span.placementID,
+                                             camera: nil, authoredClockRange: nil, recordingGap: true))
+                        cursor = upper
+                        continue
+                    }
                     guard cameraIndex < programPicture.count else { throw uncovered(cursor) }
                     let camera = programPicture[cameraIndex]
                     let upper = min(camera.output.to, span.output.to)
                     guard camera.output.from <= cursor, upper > cursor,
-                          let file = anglePaths[camera.source] else { throw uncovered(cursor) }
+                          let file = try anglePath(camera.source) else { throw uncovered(cursor) }
                     let offset = try camera.input.from.subtracting(camera.output.from)
                     let output = MulticamRange(from: cursor, to: upper)
                     let input = MulticamRange(from: try cursor.adding(offset), to: try upper.adding(offset))
@@ -372,7 +440,8 @@ extension StillExportPlanner {
             let time = start ? input.from : input.to
             throw CutError(code: "unsafe_boundary",
                            message: "\(whereText) needs exact picture presentation boundaries at \(time).",
-                           segment: segment, boundary: start ? "from" : "to")
+                           segment: segment, boundary: start ? "from" : "to",
+                           placementIDs: placementID.map { [$0] }).because(.cutOffFrame)
         }
         var cursor = input.from
         for index in lower..<upper {
@@ -414,7 +483,8 @@ extension StillExportPlanner {
         let context = location.map { "Still placement \($0) has an unsafe camera \(edge)" } ?? "Camera span \(index + 1) has an unsafe \(edge)"
         let issue = CutError(code: requireCameraCopy ? "camera_copy_required" : "unsafe_boundary",
                              message: "\(context) at source \(at).", segment: index + 1,
-                             boundary: start ? "from" : "to").because(start ? .cutVideoStart : .cutVideoEnd)
+                             boundary: start ? "from" : "to",
+                             placementIDs: location.map { [$0] }).because(start ? .cutVideoStart : .cutVideoEnd)
         guard let adjacent, let location else { throw issue }
         let proposals = try nearest.map { candidate in
             let shift = try candidate.subtracting(at)
@@ -438,11 +508,13 @@ extension StillExportPlanner {
         do {
             let file = try CutProject.checkedMediaURL(asset.file, relativeTo: document)
             let identity = try SourceIdentity(file)
-            let fingerprint = try StillImage.fingerprint(file, cancelled: cancelled)
+            guard identities[file]?.matchesSnapshot(identity) != false else {
+                throw CutError(code: "source_changed", message: "The image changed during preflight.")
+            }
+            let fingerprint = try StillImage.inspectAndFingerprint(file, expectedIdentity: identity, cancelled: cancelled).fingerprint
             guard asset.fingerprint == fingerprint else {
                 throw CutError(code: "source_changed", message: "The image fingerprint differs from the saved asset. Relink it to accept the new image.")
             }
-            _ = try StillImage.inspect(file)
             try engine.checkCancellation()
             guard identity.isCurrentSnapshot(at: file) else {
                 throw CutError(code: "source_changed", message: "The image changed during preflight.")

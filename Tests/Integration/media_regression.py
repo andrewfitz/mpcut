@@ -17,11 +17,14 @@ RATE = 48000
 CLI = None
 
 
-def run(command, *, allow_diagnostics=False, **kwargs):
-    result = subprocess.run(command, capture_output=True, timeout=60, **kwargs)
+def run(command, *, allow_diagnostics=False, timeout=60, **kwargs):
+    result = subprocess.run(command, capture_output=True, timeout=timeout, **kwargs)
     if result.returncode or (result.stderr and not allow_diagnostics):
+        diagnostics = result.stderr or result.stdout[:1024]
+        if isinstance(diagnostics, bytes):
+            diagnostics = diagnostics.decode(errors="replace")
         raise AssertionError(
-            f"{command} exited {result.returncode}: {result.stderr.decode()}"
+            f"{command} exited {result.returncode}: {diagnostics}"
         )
     return result.stdout
 
@@ -78,7 +81,10 @@ class MediaRegression(unittest.TestCase):
     def cli(self, *args, request=None, ok=True, env=None):
         result = subprocess.run([CLI, *args], input=None if request is None else json.dumps(request),
                                 capture_output=True, text=True, timeout=60, cwd=self.root, env=env)
-        self.assertEqual(result.returncode == 0, ok, result.stderr + result.stdout)
+        if ok:
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        else:
+            self.assertIn(result.returncode, (1, 2), result.stderr + result.stdout)
         report = json.loads(result.stdout)
         self.assertIsInstance(report, dict)
         self.assertIs(report.get("ok"), ok, report)
@@ -87,7 +93,7 @@ class MediaRegression(unittest.TestCase):
         return report
 
     def export(self, output, clips, *, dry_run=False, ok=True, snap=False):
-        args = ["export", "--json", "--stdin"]
+        args = ["export", "clips", "join", "--json", "--stdin"]
         if dry_run:
             args.append("--dry-run")
         if snap:
@@ -152,6 +158,7 @@ class MediaRegression(unittest.TestCase):
         original_hashes = []
         expected = []
         for file, start, end in ranges:
+            self.assertTrue(0 <= start < end <= len(original_frames[file]), (file, start, end))
             expected.extend(original_frames[file][start:end])
             original_hashes.extend(
                 payload for pts, payload in packet_tables[file]
@@ -310,21 +317,32 @@ class MediaRegression(unittest.TestCase):
                "sine=frequency=997:sample_rate=48000:duration=0.8",
                "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "pcm_s16le", source)
         output = self.root / "offset-join.mov"
-        clips = [self.edit(source, stop="1/2"), self.edit(source, "1/2")]
-        report = self.export(output, clips, dry_run=True)
-        windows = []
-        for segment in report["segments"]:
-            pcm = next(track for track in segment["tracks"] if track["kind"] == "audio")
-            windows.append((ratio(pcm["outputStart"]), ratio(pcm["outputEnd"])))
-        self.assertEqual(windows, [(Fraction(1, 10), Fraction(1, 2)),
-                                   (Fraction(1, 2), Fraction(9, 10))])
+        # Two pieces of one file that meet are planned as the one range they make, so the join is made between the
+        # recording and a second file with the same bytes. That is a join of two clips, as this test means it.
+        twin = self.root / "offset-twin.mov"
+        twin.write_bytes(source.read_bytes())
 
-        self.export(output, clips)
-        self.assertEqual(audio(output), audio(source))
-        self.assertEqual(frames(output), frames(source))
-        stream = probe(output, "-select_streams", "a:0", "-show_streams")["streams"][0]
-        self.assertEqual(stream["start_pts"], 4800)
-        self.assertEqual(stream["duration_ts"], 38400)
+        def windows(clips):
+            found = []
+            for segment in self.export(output, clips, dry_run=True)["segments"]:
+                pcm = next(track for track in segment["tracks"] if track["kind"] == "audio")
+                found.append((ratio(pcm["output_start"]), ratio(pcm["output_end"])))
+            return found
+        clips = [self.edit(source, stop="1/2"), self.edit(twin, "1/2")]
+        self.assertEqual(windows(clips), [(Fraction(1, 10), Fraction(1, 2)),
+                                          (Fraction(1, 2), Fraction(9, 10))])
+        split = [self.edit(source, stop="1/2"), self.edit(source, "1/2")]
+        self.assertEqual(windows(split), [(Fraction(1, 10), Fraction(9, 10))], "a split that removes nothing is one range")
+
+        for name, edits in (("join", clips), ("split", split)):
+            with self.subTest(edit=name):
+                output.unlink(missing_ok=True)
+                self.export(output, edits)
+                self.assertEqual(audio(output), audio(source))
+                self.assertEqual(frames(output), frames(source))
+                stream = probe(output, "-select_streams", "a:0", "-show_streams")["streams"][0]
+                self.assertEqual(stream["start_pts"], 4800)
+                self.assertEqual(stream["duration_ts"], 38400)
 
     def test_closed_gop_exact_cut_and_argument_equivalence(self):
         a, b, c = [self.h264(f"{label}.mp4", hue=hue)
@@ -335,7 +353,7 @@ class MediaRegression(unittest.TestCase):
         self.export(output, edits)
         self.assert_assembly(output, ranges)
 
-        args = ["export", "--json", "--mode", "copy", "--output", "argv.mp4"]
+        args = ["export", "clips", "join", "--json", "--mode", "copy", "--output", "argv.mp4"]
         for edit in edits:
             args += ["--clip", edit["file"], "--from", edit["from"], "--to", edit["to"]]
         self.cli(*args)
@@ -397,7 +415,7 @@ class MediaRegression(unittest.TestCase):
         scanned = self.root / "scanned.mov"
         # The extra root atom opts out of the simple MOV fast path without changing any samples.
         scanned.write_bytes(indexed.read_bytes() + b"\x00\x00\x00\x18uuidMPCut scan test\x00")
-        reports = [self.cli("inspect", "--json", "--keyframes", str(source))
+        reports = [self.cli("media", "inspect", "--json", "--keyframes", str(source))
                    for source in (indexed, scanned)]
         for report, source in zip(reports, (indexed, scanned)):
             self.assertEqual(Path(report.pop("file")).resolve(), source.resolve())
@@ -423,51 +441,51 @@ class MediaRegression(unittest.TestCase):
             position = int(picture_packets[1]["pos"]) + 24
             payload[position] = 6 if payload[position] == 1 else 1
             changed.write_bytes(payload)
-            issue = self.cli("inspect", "--json", str(changed))["media"]["copyIssue"]
+            issue = self.cli("media", "inspect", "--json", str(changed))["media"]["copy_issue"]
             self.assertIn("color description", issue)
         with indexed.open("r+b") as movie:
             movie.seek(int(picture_packets[1]["pos"]) + 25)
             flag = movie.read(1)[0]
             movie.seek(-1, os.SEEK_CUR)
             movie.write(bytes([flag & 0xf0]))
-        damaged = self.cli("inspect", "--json", "--keyframes", str(indexed))
+        damaged = self.cli("media", "inspect", "--json", "--keyframes", str(indexed))
         self.assertFalse(damaged["copy"]["eligible"])
-        self.assertIn("alpha", damaged["media"]["copyIssue"])
+        self.assertIn("alpha", damaged["media"]["copy_issue"])
 
     def test_webm_uses_video_track_end_for_fractional_packet_cadence(self):
         source = self.root / "fractional.webm"
         ffmpeg("-f", "lavfi", "-i", "color=s=64x96:r=24:d=8", "-f", "lavfi", "-i",
                "anullsrc=r=48000:cl=mono:d=9", "-c:v", "libvpx-vp9", "-deadline", "realtime",
                "-g", "24", "-c:a", "libopus", source)
-        inspected = self.cli("inspect", "--json", "--keyframes", str(source))["media"]
+        inspected = self.cli("media", "inspect", "--json", "--keyframes", str(source))["media"]
         self.assertEqual(ratio(inspected["duration"]), 8)
         # Audio runs longer than the picture. The video track's own tag
         # resolves the final 7.958 + 0.041 second block to exactly eight seconds.
         output = self.root / "whole.webm"
         self.export(output, [self.edit(source, 0, 8)])
-        self.assertEqual(ratio(self.cli("inspect", "--json", str(output))["media"]["duration"]), 8)
+        self.assertEqual(ratio(self.cli("media", "inspect", "--json", str(output))["media"]["duration"]), 8)
         self.assertEqual(sample_hashes(output), sample_hashes(source))
         silent = self.root / "silent.webm"
         ffmpeg("-f", "lavfi", "-i", "color=s=64x96:r=24:d=8", "-c:v", "libvpx-vp9",
                "-deadline", "realtime", "-g", "24", silent)
         tail = self.root / "tail.webm"
         self.export(tail, [self.edit(silent, 1, 8)])
-        self.assertEqual(ratio(self.cli("inspect", "--json", str(tail))["media"]["duration"]), 7)
+        self.assertEqual(ratio(self.cli("media", "inspect", "--json", str(tail))["media"]["duration"]), 7)
         self.assertEqual(sample_hashes(tail), sample_hashes(silent)[24:])
         stale = self.root / "stale.webm"
         data = source.read_bytes()
         self.assertIn(b"00:00:08.000000000", data)
         stale.write_bytes(data.replace(b"00:00:08.000000000", b"00:00:18.000000000"))
-        self.assertEqual(ratio(self.cli("inspect", "--json", str(stale))["media"]["duration"]), Fraction(7999, 1000))
+        self.assertEqual(ratio(self.cli("media", "inspect", "--json", str(stale))["media"]["duration"]), Fraction(7999, 1000))
 
     def test_interlaced_avc_preserves_copy_only_cut_boundaries(self):
         source = self.fixture("fields.mp4", ["-c:v", "libx264", "-x264-params",
                               "tff=1:keyint=25:scenecut=0", "-flags", "+ilme+ildct"],
                               width=320, rate="25", frame_count=100)
-        report = self.cli("inspect", "--json", str(source))
-        self.assertEqual(report["media"]["streams"][0]["fieldOrder"], "tt")
+        report = self.cli("media", "inspect", "--json", str(source))
+        self.assertEqual(report["media"]["streams"][0]["field_order"], "tt")
         output = self.root / "fields-cut.mp4"
-        result = self.cli("export", "--json", "--smart-trim", "--dry-run", "--clip", str(source),
+        result = self.cli("export", "clips", "join", "--json", "--mode", "smart", "--dry-run", "--clip", str(source),
                           "--from", "0.16", "--to", "2.8", "--output", str(output), ok=False)
         self.assertEqual(result["error"]["code"], "unsafe_boundary")
         self.export(output, [self.edit(source)], dry_run=True)
@@ -483,7 +501,7 @@ class MediaRegression(unittest.TestCase):
             track = probe(path, "-select_streams", "v:0", "-show_streams")["streams"][0]
             return int(track["duration_ts"]) * Fraction(track["time_base"])
 
-        report = self.cli("inspect", "--json", "--keyframes", str(source))["media"]
+        report = self.cli("media", "inspect", "--json", "--keyframes", str(source))["media"]
         self.assertEqual(ratio(report["duration"]), presentation_duration(source))
         source_packets = timestamped_hashes(source)
         presentation_times = sorted(time for time, _ in source_packets)
@@ -503,7 +521,7 @@ class MediaRegression(unittest.TestCase):
         self.assertEqual(frames(matroska), frames(source))
 
         cuts = [ratio(point["time"]) for point in report["frames"]
-                if point["canStart"] and point["canEnd"] and ratio(point["time"]) > 0]
+                if point["can_start"] and point["can_end"] and ratio(point["time"]) > 0]
         self.assertEqual(cuts, [Fraction(2, 3), Fraction(4, 3), Fraction(2)])
         source_frames = frames(source)
         for index, end in enumerate(cuts):
@@ -527,10 +545,10 @@ class MediaRegression(unittest.TestCase):
         ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=30,format=yuva420p,colorchannelmixer=aa=0.5",
                "-frames:v", "30", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
                "-g", "15", "-lag-in-frames", "0", source)
-        report = self.cli("inspect", "--json", "--keyframes", str(source))["media"]
-        self.assertEqual(report["streams"][0]["alphaBits"], 8)
-        self.assertTrue(report["sourceStartSafe"])
-        self.assertTrue(any(point["canStart"] and ratio(point["time"]) == Fraction(1, 2)
+        report = self.cli("media", "inspect", "--json", "--keyframes", str(source))["media"]
+        self.assertEqual(report["streams"][0]["alpha_bits"], 8)
+        self.assertTrue(report["source_start_safe"])
+        self.assertTrue(any(point["can_start"] and ratio(point["time"]) == Fraction(1, 2)
                             for point in report["frames"]))
 
         def alpha_frames(path):
@@ -545,10 +563,10 @@ class MediaRegression(unittest.TestCase):
         source = self.root / "rgb.mp4"
         ffmpeg("-f", "lavfi", "-i", "testsrc=s=160x96:r=30",
                "-frames:v", "4", "-c:v", "libx264rgb", "-colorspace", "rgb", "-color_range", "pc", source)
-        stream = self.cli("inspect", "--json", str(source))["media"]["streams"][0]
-        self.assertEqual(stream["pixelFormat"], "gbrp")
-        self.assertEqual(stream["colorMatrix"], "gbr")
-        self.assertEqual(stream["colorRange"], "pc")
+        stream = self.cli("media", "inspect", "--json", str(source))["media"]["streams"][0]
+        self.assertEqual(stream["pixel_format"], "gbrp")
+        self.assertEqual(stream["color_matrix"], "gbr")
+        self.assertEqual(stream["color_range"], "pc")
 
     def test_raw_video_is_excluded_after_content_probe(self):
         source = self.root / "raw.avi"
@@ -556,9 +574,9 @@ class MediaRegression(unittest.TestCase):
                "-frames:v", "4", "-c:v", "rawvideo", "-threads", "1", source)
         renamed = source.with_suffix(".mov")
         source.rename(renamed)
-        result = self.cli("inspect", "--json", str(renamed))
+        result = self.cli("media", "inspect", "--json", str(renamed))
         self.assertEqual(result["media"]["format"], "avi")
-        self.assertIn("RAW video", result["media"]["copyIssue"])
+        self.assertIn("RAW video", result["media"]["copy_issue"])
         output = self.root / "raw-copy.mkv"
         report = self.export(output, [{"file": str(renamed)}], ok=False)
         self.assertEqual(report["error"]["code"], "unsupported_tracks", report)
@@ -578,9 +596,9 @@ class MediaRegression(unittest.TestCase):
         for codec, encoder in encoders.items():
             with self.subTest(codec=codec):
                 source = encoder()
-                inspected = self.cli("inspect", "--json", "--keyframes", source.name)["media"]
+                inspected = self.cli("media", "inspect", "--json", "--keyframes", source.name)["media"]
                 self.assertEqual(ratio(inspected["duration"]), 90 * FRAME)
-                self.assertGreater(ratio(inspected["streams"][0]["timeBase"]), 0)
+                self.assertGreater(ratio(inspected["streams"][0]["time_base"]), 0)
                 self.assertEqual(inspected["streams"][0]["codec"], codec)
                 access_points = [ratio(frame["time"]) for frame in inspected["frames"] if frame["keyframe"]]
                 self.assertIn(Fraction(0), access_points)
@@ -597,11 +615,11 @@ class MediaRegression(unittest.TestCase):
                 # the same cut is Smart Trim's to answer: every picture group of the HEVC source is open, so it has no
                 # keyframe to resume copying at and says unsafe_smart_join. A copy request never reports that code.
                 for named in ({"mode": "smart"}, {}):
-                    smart = self.cli("export", "--json", "--stdin", "--dry-run", ok=False,
+                    smart = self.cli("export", "clips", "join", "--json", "--stdin", "--dry-run", ok=False,
                                      request={"output": str(output), "clips": [self.edit(source, FRAME)], **named})["error"]
                     self.assertEqual((smart["code"], smart["reason"]),
-                                     {"h264": ("unsafe_boundary", "cut.videoStart"),
-                                      "hevc": ("unsafe_smart_join", "join.smartOpenGOP")}[codec], smart)
+                                     {"h264": ("unsafe_boundary", "cut_video_start"),
+                                      "hevc": ("unsafe_smart_join", "join_smart_open_gop")}[codec], smart)
                 for index, nearest in enumerate(rejected["nearest"]):
                     start = ratio(nearest)
                     alternative = self.root / f"{codec}-alternative-{index}.mp4"
@@ -623,11 +641,13 @@ class MediaRegression(unittest.TestCase):
                     target = self.root / f"{codec}-{position}.mp4"
                     request = {"output": str(target), "clips": [edit], "mode": "copy"}
                     result = subprocess.run(
-                        [CLI, "export", "--json", "--stdin"], input=json.dumps(request),
+                        [CLI, "export", "clips", "join", "--json", "--stdin"], input=json.dumps(request),
                         capture_output=True, text=True, timeout=60, cwd=self.root
                     )
                     report = json.loads(result.stdout)
                     if result.returncode:
+                        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+                        self.assertIs(report["ok"], False)
                         self.assertFalse(target.exists())
                         self.assertEqual(report["error"]["code"], "unsafe_boundary", report)
                         self.assertTrue(report["error"]["nearest"], report)
@@ -641,6 +661,7 @@ class MediaRegression(unittest.TestCase):
                             span = (frame_index, 90) if position == "start" else (0, frame_index)
                             self.assert_assembly(alternate_target, [(source, *span)])
                     else:
+                        self.assertIs(report["ok"], True)
                         frame_index = int(cue / FRAME)
                         index = (frame_index, 90) if position == "start" else (0, frame_index)
                         self.assert_assembly(target, [(source, *index)])
@@ -723,7 +744,7 @@ class MediaRegression(unittest.TestCase):
             double(elst + 8 + i * (2 * width + 4) + width, width)
         scaled.write_bytes(data)
 
-        info = self.cli("inspect", "--json", scaled)
+        info = self.cli("media", "inspect", "--json", scaled)
         self.assertEqual(ratio(info["media"]["duration"]), Fraction(8, 5))
         decode = self.native_audio_decoder()
         expected = decode(control)
@@ -788,7 +809,7 @@ class MediaRegression(unittest.TestCase):
         # Hidden AAC decoder history in each empty edit must not appear as a
         # second copy of the tone. Compare every 20 ms waveform bin against
         # the native presentation, including the explicitly silent bins.
-        wave = self.cli("silence", "--json", "--waveform", "400", joined)["waveformPeakDBFS"]
+        wave = self.cli("silence", "scan", "--json", "--waveform", "400", joined)["waveform_peak_dbfs"]
         presented = memoryview(decoded * 4).cast("h")
         self.assertEqual(len(wave), 400)
         for bin_index, level in enumerate(wave):
@@ -799,7 +820,7 @@ class MediaRegression(unittest.TestCase):
 
         # Zoom through a MOV empty edit into the following tone. The signed
         # envelope uses the same source clock as both movie playback and trimming.
-        detail = self.cli("waveform", "--json", "--from", "1.5", "--to", "4", "--columns", "2500", joined)["envelope"]
+        detail = self.cli("waveform", "envelope", "read", "--json", "--from", "1.5", "--to", "4", "--columns", "2500", joined)["envelope"]
         start = 3 * RATE // 2
         self.assertEqual((len(detail["low"]), len(detail["high"])), (2500, 2500))
         for i, (low, high) in enumerate(zip(detail["low"], detail["high"], strict=True)):
@@ -953,16 +974,16 @@ class MediaRegression(unittest.TestCase):
     def test_smart_export_offers_packet_copy_in_another_container(self):
         source = self.h264("recording.mov", width=320, rate="25", audio_encoder="aac")
         rejected = self.root / "recording.webm"
-        problem = self.cli("export", "--json", "--mode", "smart", "--clip", source,
+        problem = self.cli("export", "clips", "join", "--json", "--mode", "smart", "--clip", source,
                            "--output", rejected, ok=False)
         self.assertFalse(rejected.exists())
         offers = problem["error"]["alternatives"]
-        self.assertEqual(offers[0]["rung"], "copyOtherContainer")
-        remux = next(offer for offer in offers if offer["id"] == "copyOtherContainer:mp4")
+        self.assertEqual(offers[0]["rung"], "copy_other_container")
+        remux = next(offer for offer in offers if offer["id"] == "copy_other_container:mp4")
         self.assertEqual(remux["mode"], "copy")
         output = self.root / "remux.mp4"
-        report = self.cli("export", "--json", *remux["arguments"], "--clip", source, "--output", output)
-        self.assertEqual(ratio(report["encodedDuration"]), 0)
+        report = self.cli("export", "clips", "join", "--json", *remux["arguments"], "--clip", source, "--output", output)
+        self.assertEqual(ratio(report["encoded_duration"]), 0)
         for track in ["v:0", "a:0"]:
             original = sample_hashes(source, track)
             self.assertTrue(original)
@@ -972,19 +993,19 @@ class MediaRegression(unittest.TestCase):
         source = self.h264("angle.mov", width=320, rate="25", frame_count=50)
         project = self.root / "switches.cut"
         project.write_text(json.dumps({
-            "format": "mpcut", "schemaVersion": 1, "kind": "multicam",
-            "angles": [{"id": "a", "file": source.name}], "referenceAngle": "a",
-            "range": {"from": "0", "to": "2"}, "audio": {"mode": "none"},
-            "switches": [{"at": "0", "angle": "a"}],
+            "format": "mpcut", "schema_version": 3, "kind": "multicam",
+            "angles": [{"id": "a", "file": source.name}], "reference_angle_id": "a",
+            "group_range": {"from": "0", "to": "2"}, "audio": {"mode": "none"},
+            "switches": [{"group_time": "0", "angle_id": "a"}],
         }))
-        command = ["export", "--project", project, "--json"]
+        command = ["export", "project", "render", "--project", project, "--json"]
         problem = self.cli(*command, "--mode", "smart", "--output", "program.webm", ok=False)
         offers = problem["error"]["alternatives"]
-        remux = next(offer for offer in offers if offer["id"] == "copyOtherContainer:mp4")
+        remux = next(offer for offer in offers if offer["id"] == "copy_other_container:mp4")
         self.assertEqual(remux["mode"], "copy")
         output = self.root / "program.mp4"
         report = self.cli(*command, *remux["arguments"], "--output", output)
-        self.assertEqual(ratio(report["encodedVideoDuration"]), 0)
+        self.assertEqual(ratio(report["encoded_video_duration"]), 0)
         self.assertEqual(sample_hashes(output), sample_hashes(source))
 
         edit = json.loads(project.read_text())
@@ -992,8 +1013,8 @@ class MediaRegression(unittest.TestCase):
         project.write_text(json.dumps(edit))
         cut = self.cli(*command, "--mode", "smart", "--output", "program.webm", ok=False)
         ids = [offer["id"] for offer in cut["error"].get("alternatives", [])]
-        self.assertNotIn("copyOtherContainer:mp4", ids)
-        self.assertIn("smartTrim:mp4", ids)
+        self.assertNotIn("copy_other_container:mp4", ids)
+        self.assertIn("smart_trim:mp4", ids)
 
     def test_other_containers_and_probe_by_content(self):
         source = self.h264("source.mp4")
@@ -1003,7 +1024,7 @@ class MediaRegression(unittest.TestCase):
                 ffmpeg("-i", source, "-c", "copy", wrapped)
                 unknown = self.root / f"{extension}.unknown"
                 wrapped.rename(unknown)
-                self.cli("inspect", "--json", unknown.name)
+                self.cli("media", "inspect", "--json", unknown.name)
                 output = self.root / f"round-trip.{extension}"
                 self.export(output, [self.edit(unknown)])
                 self.assertEqual(frames(output), frames(unknown))
@@ -1017,9 +1038,9 @@ class MediaRegression(unittest.TestCase):
         source = self.fixture("clock.mov", ["-c:v", "prores_ks", "-profile:v", "3",
                                             "-pix_fmt", "yuv422p10le"], rate="25")
         env = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"]}
-        inspected = self.cli("inspect", "--json", source.name, env=env)
+        inspected = self.cli("media", "inspect", "--json", source.name, env=env)
         self.assertEqual(inspected["preview"], "unchecked")
-        args = ["export", "--json", "--mode", "copy", "--output", "clock-cut.mov", "--clip", source.name,
+        args = ["export", "clips", "join", "--json", "--mode", "copy", "--output", "clock-cut.mov", "--clip", source.name,
                 "--from", "00:00:00.04", "--to", "0.08"]
         dry_run = self.cli(*args, "--dry-run", env=env)
         self.assertEqual(ratio(dry_run["duration"]), Fraction(1, 25))
@@ -1030,7 +1051,7 @@ class MediaRegression(unittest.TestCase):
 
     def test_json_rejects_unknown_request_fields(self):
         source = self.prores("source.mov")
-        args = ("export", "--json", "--stdin")
+        args = ("export", "clips", "join", "--json", "--stdin")
         request = {"output": "output.mov", "clips": [self.edit(source)]}
         for invalid, field, location in [
             ({**request, "dry_run": True}, "dry_run", "Export request"),
@@ -1053,14 +1074,14 @@ class MediaRegression(unittest.TestCase):
             ("mode", '{"output": "out.mov", "mode": "copy", "mo\\u0064e": "smart", "clips": [%s]}' % clip),
         ]:
             with self.subTest(field=field):
-                result = subprocess.run([CLI, "export", "--json", "--stdin", "--dry-run"], input=text,
+                result = subprocess.run([CLI, "export", "clips", "join", "--json", "--stdin", "--dry-run"], input=text,
                                         capture_output=True, text=True, timeout=60, cwd=self.root)
                 self.assertEqual(result.returncode, 2, result.stdout)
                 error = json.loads(result.stdout)["error"]
                 self.assertEqual(error["code"], "invalid_json")
                 self.assertIn(f"'{field}'", error["message"])
         text = '{"output": "o {\\"a\\", \\"a\\"}.mov", "clips": [%s, %s]}' % (clip, clip)
-        result = subprocess.run([CLI, "export", "--json", "--stdin", "--dry-run"], input=text,
+        result = subprocess.run([CLI, "export", "clips", "join", "--json", "--stdin", "--dry-run"], input=text,
                                 capture_output=True, text=True, timeout=60, cwd=self.root)
         self.assertEqual(result.returncode, 0, result.stdout)
 
@@ -1069,10 +1090,10 @@ class MediaRegression(unittest.TestCase):
         for args, code in [(["--from", "-1"], "invalid_time"), (["--from", "-1", "--snap", "nearest"], "invalid_time"),
                            (["--to", "100"], "invalid_range"), (["--to", "100", "--snap", "nearest"], "invalid_range")]:
             with self.subTest(args=args):
-                report = self.cli("export", "--json", "--dry-run", "--output", "out.mov",
+                report = self.cli("export", "clips", "join", "--json", "--dry-run", "--output", "out.mov",
                                   "--clip", source.name, *args, ok=False)
                 self.assertEqual(report["error"]["code"], code)
-        report = self.cli("export", "--json", "--dry-run", "--output", "out.mov", "--clip", source.name,
+        report = self.cli("export", "clips", "join", "--json", "--dry-run", "--output", "out.mov", "--clip", source.name,
                           "--from", "-0", "--to", "1001/30000")
         self.assertEqual(ratio(report["duration"]), Fraction(1001, 30000))
 
@@ -1082,7 +1103,7 @@ class MediaRegression(unittest.TestCase):
         inner.mkdir(parents=True)
         source.rename(self.root / "real" / source.name)
         (self.root / "link").symlink_to(inner, target_is_directory=True)
-        report = self.cli("export", "--json", "--output", "link/../out.mov", "--clip", f"link/../{source.name}")
+        report = self.cli("export", "clips", "join", "--json", "--output", "link/../out.mov", "--clip", f"link/../{source.name}")
         written = Path(report["output"])
         self.assertEqual(written.resolve(), (self.root / "real" / "out.mov").resolve())
         self.assertTrue((self.root / "real" / "out.mov").exists())
@@ -1127,11 +1148,11 @@ class MediaRegression(unittest.TestCase):
         source = self.prores("intra.mov", rate="25", frame_count=12)
         long = self.root / "many-frames.mov"
         ffmpeg("-stream_loop", "399", "-i", source, "-map", "0:v", "-c", "copy", long)
-        args = ["inspect", "--json", "--keyframes", str(long)]
+        args = ["media", "inspect", "--json", "--keyframes", str(long)]
         report = self.cli(*args)
         indexed = report["media"]["frames"]
         self.assertEqual(len(indexed), 4800)
-        self.assertTrue(all(f["keyframe"] and f["canStart"] for f in indexed))
+        self.assertTrue(all(f["keyframe"] and f["can_start"] for f in indexed))
         self.assertEqual([ratio(f["time"]) for f in indexed], [Fraction(i, 25) for i in range(4800)])
         # Leave stdout open and unread once the result starts filling the pipe.
         with subprocess.Popen([CLI, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
@@ -1153,10 +1174,11 @@ class MediaRegression(unittest.TestCase):
                 while True:
                     os.write(write_end, b"x" * 512)
             os.set_blocking(write_end, True)
-            result = subprocess.run([CLI, "export", "--json", "--output", output, "--clip", source],
+            result = subprocess.run([CLI, "export", "clips", "join", "--json", "--output", output, "--clip", source],
                                     stdout=subprocess.PIPE, stderr=write_end, timeout=5)
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertTrue(json.loads(result.stdout)["ok"])
+            self.assertTrue(os.get_blocking(write_end))
             self.assertEqual(frames(output), frames(source))
         finally:
             os.close(read_end)
@@ -1166,20 +1188,20 @@ class MediaRegression(unittest.TestCase):
         request = json.dumps({"output": "unexpected.mov", "clips": [self.edit(self.prores("clip.mov"))]})
         for encoding in ["utf-16-le", "utf-32-be"]:
             with self.subTest(encoding=encoding):
-                result = subprocess.run([CLI, "export", "--stdin", "--json"], input=request.encode(encoding),
+                result = subprocess.run([CLI, "export", "clips", "join", "--stdin", "--json"], input=request.encode(encoding),
                                         capture_output=True, timeout=60, cwd=self.root)
                 self.assertEqual(result.returncode, 2, result.stdout)
                 self.assertEqual(json.loads(result.stdout)["error"]["code"], "invalid_json")
                 self.assertFalse((self.root / "unexpected.mov").exists())
 
     def test_cli_missing_input_and_literal_inspect_paths(self):
-        absent = self.cli("inspect", "--json", ok=False)
+        absent = self.cli("media", "inspect", "--json", ok=False)
         self.assertEqual(absent["error"]["code"], "invalid_arguments")
-        empty = self.cli("inspect", "--json", "", ok=False)
+        empty = self.cli("media", "inspect", "--json", "", ok=False)
         self.assertEqual(empty["error"]["code"], "invalid_path")
         literal = self.prores("literal.mov")
         literal.rename(self.root / "--help")
-        report = self.cli("inspect", "--json", "--", "--help")
+        report = self.cli("media", "inspect", "--json", "--", "--help")
         self.assertEqual(report["media"]["streams"][0]["codec"], "prores")
 
     def test_cancellation_cleans_destination(self):
@@ -1191,7 +1213,7 @@ class MediaRegression(unittest.TestCase):
         # Watch for a staging file to send SIGINT during the writer, after the
         # process has installed its handler and passed argument validation.
         with request_file.open() as request_input, tempfile.TemporaryFile() as progress:
-            process = subprocess.Popen([CLI, "--no-sidecar", "export", "--json", "--stdin"],
+            process = subprocess.Popen([CLI, "--no-sidecar", "export", "clips", "join", "--json", "--stdin"],
                                        stdin=request_input, stdout=subprocess.PIPE,
                                        stderr=progress, cwd=self.root)
             try:

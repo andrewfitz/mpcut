@@ -3,6 +3,18 @@ import XCTest
 @testable import MPCutCore
 
 final class PremiereTimelineTests: XCTestCase {
+    func testPremiereSequenceExternalDTDIsRejected() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("xml")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try """
+        <!DOCTYPE xmeml SYSTEM "file:///tmp/external.dtd">
+        <xmeml><sequence><media/></sequence></xmeml>
+        """.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try PremiereTimeline.read(url, allowLoss: false)) {
+            XCTAssertTrue($0.localizedDescription.contains("external DTD"))
+        }
+    }
+
     func testStereoReorderedSequenceXMLRoundTrip() throws {
         let folder = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let file = folder.appendingPathComponent("MPCutAppTests/Fixtures/Shuttle-Chirp.mov").standardizedFileURL.path
@@ -20,6 +32,19 @@ final class PremiereTimelineTests: XCTestCase {
         let links = try document.nodes(forXPath: "/xmeml/sequence/media/video/track/clipitem[2]/link/clipindex")
         XCTAssertEqual(links.compactMap(\.stringValue), ["2", "2", "2"])
         XCTAssertEqual(try PremiereTimeline.read(xml, allowLoss: false).0, project)
+    }
+
+    func testSequenceAlternatingAudioOnlyAndVideoSourcesRoundTrips() throws {
+        let fixtures = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures").standardizedFileURL
+        let clips = ["Gapless-Crop.mp3", "Shuttle-Chirp.mov", "Gapless-Crop.mp3"].enumerated().map { index, name in
+            CutSequenceClip(id: "clip-\(index + 1)", file: fixtures.appendingPathComponent(name).path,
+                            from: .zero, to: .init(numerator: 1, denominator: 5))
+        }
+        let xml = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("xml")
+        defer { try? FileManager.default.removeItem(at: xml) }
+        _ = try PremiereTimeline.write(.sequence(clips), relativeTo: xml, to: xml, name: "Sequence", allowLoss: false)
+        XCTAssertEqual(try PremiereTimeline.read(xml, allowLoss: false).0, .sequence(clips))
     }
 
     func testNativeInputRequiresExplicitLossPermission() throws {
@@ -90,6 +115,36 @@ final class PremiereTimelineTests: XCTestCase {
         }
     }
 
+    func testFlattenedRecordingsKeepPictureGapsAndIndependentAudio() throws {
+        let fixtures = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures").standardizedFileURL
+        let xml = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID()).xml")
+        defer { try? FileManager.default.removeItem(at: xml) }
+        let first = fixtures.appendingPathComponent("Pause-Quiet.mov").path
+        let second = fixtures.appendingPathComponent("Pause-Noisy.mov").path
+        let one = RationalTime(numerator: 1), two = RationalTime(numerator: 2), three = RationalTime(numerator: 3)
+        let camera = MulticamSource(id: "a", file: first, coverage: .init(from: .zero, to: one),
+                                   additionalRecordings: [.init(id: "later", file: second, offset: two,
+                                                               coverage: .init(from: two, to: three))])
+        let project = CutProject.multicam(.init(referenceAngle: "a", range: .init(from: .zero, to: three),
+                                                angles: [camera], audioSources: [.init(id: "mic", file: first)],
+                                                audio: .fixed(.init(source: "mic", stream: 2)),
+                                                switches: [.init(at: .zero, angle: "a")]))
+        XCTAssertThrowsError(try PremiereTimeline.write(project, relativeTo: xml, to: xml, name: "Gap", allowLoss: false)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "premiere_conversion_loss")
+        }
+        _ = try PremiereTimeline.write(project, relativeTo: xml, to: xml, name: "Gap", allowLoss: true)
+        guard case .multicam(let imported) = try PremiereTimeline.read(xml, allowLoss: true).0 else {
+            return XCTFail("Expected picture coverage and independent audio")
+        }
+        let plan = try imported.plan()
+        XCTAssertEqual(imported.angles.first?.recordings.map(\.file), [first, second])
+        XCTAssertEqual(plan.intervals.map(\.pictureSourceID), ["camera-1", nil, "camera-2"])
+        XCTAssertEqual(plan.intervals.map { $0.output.from }, [.zero, one, two])
+        XCTAssertEqual(plan.audio.map(\.stream), [2])
+        XCTAssertEqual(plan.duration, three)
+    }
+
     func testDisjointPictureTracksCanShareOneTimeline() throws {
         try withStereoEdit { xml, doc in
             let video = try XCTUnwrap(doc.nodes(forXPath: "/xmeml/sequence/media/video").first as? XMLElement)
@@ -117,6 +172,22 @@ final class PremiereTimelineTests: XCTestCase {
             }
             try doc.xmlData.write(to: xml)
             XCTAssertThrowsError(try PremiereTimeline.read(xml, allowLoss: true))
+        }
+    }
+
+    func testIndependentAudioTrimMustFitItsStream() throws {
+        try withStereoEdit { xml, doc in
+            for case let item as XMLElement in try doc.nodes(forXPath: "//audio/track/clipitem") {
+                for key in ["in", "out"] {
+                    let field = try XCTUnwrap(item.elements(forName: key).first)
+                    let frame = try XCTUnwrap(Int(field.stringValue ?? ""))
+                    field.stringValue = String(100_000 + frame)
+                }
+            }
+            try doc.xmlData.write(to: xml)
+            XCTAssertThrowsError(try PremiereTimeline.read(xml, allowLoss: true)) {
+                XCTAssertTrue($0.localizedDescription.contains("audio trim"))
+            }
         }
     }
 

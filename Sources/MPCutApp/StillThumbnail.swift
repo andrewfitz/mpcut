@@ -8,16 +8,19 @@ struct StillThumbnail: View {
 
     private struct Request: Equatable {
         let identity: SourceIdentity
+        let changeTime: SourceIdentity.ChangeTime?
         let asset: StillAsset
         let framing: StillImageFraming
         let maximumDimension, width, height: Int
+        let displayAspect: Double
     }
 
     @State private var loaded: (request: Request, image: CGImage)?
 
     var body: some View {
-        let request = Request(identity: frame.identity, asset: frame.asset, framing: frame.framing,
-                              maximumDimension: maximumDimension, width: frame.width, height: frame.height)
+        let request = Request(identity: frame.identity, changeTime: frame.identity.changeTime,
+                              asset: frame.asset, framing: frame.framing, maximumDimension: maximumDimension,
+                              width: frame.width, height: frame.height, displayAspect: frame.displayAspect)
         Color.black
             .overlay {
                 if let loaded, loaded.request == request {

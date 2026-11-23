@@ -30,7 +30,7 @@ final class MixedTimelineAppTests: XCTestCase {
     private func editor(_ files: [URL]) async throws -> (model: EditorModel, asked: Asked, cleanUp: () -> Void) {
         let suite = "MPCut.Mixed.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defaults.set("keyframes", forKey: "timelineSnapTarget")
+        defaults.set("keyframes", forKey: "timeline_snap_target")
         let model = EditorModel(defaults: defaults)
         model.useAnalysisSidecars = false
         let asked = Asked()

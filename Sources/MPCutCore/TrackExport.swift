@@ -21,6 +21,14 @@ func commonAudioSampleRate(_ rates: [Int]) -> Int {
     }
 }
 
+/// Matroska's PCM track metadata records a channel count without speaker positions.
+func matroskaPCMLayoutIssue(_ layout: String, channels: Int, container: String) -> String? {
+    guard ["mkv", "mka", "matroska"].contains(container),
+          StreamInfo.canonicalChannelLayout(layout, channels: channels) !=
+            StreamInfo.canonicalChannelLayout("\(channels) channels", channels: channels) else { return nil }
+    return "\(container.uppercased()) cannot preserve the \(layout) PCM channel layout. Choose MOV or downmix."
+}
+
 extension CutEngine {
     func supportsAACEdits(_ track: StreamInfo, container: String) -> Bool {
         track.codec == "aac" && ["mov", "mp4", "m4v", "m4a"].contains(container)
@@ -135,6 +143,11 @@ extension CutEngine {
         if media.streams.count > 1 && ["wav", "wave", "aif", "aiff", "mp3", "flac", "aac", "caf", "ac3", "eac3"].contains(container) {
             return "Select one audio stream for \(container.uppercased()), or choose a multitrack audio container."
         }
+        for stream in media.streams where stream.isPCM {
+            if let issue = matroskaPCMLayoutIssue(stream.channelLayout, channels: stream.channels, container: container) {
+                return issue
+            }
+        }
         if container != "mp3", media.audio.contains(where: { $0.stream.codec == "mp3" && $0.hasPriming }) {
             return "Use MP3 to preserve this soundtrack’s encoder delay and trailing padding."
         }
@@ -238,7 +251,8 @@ extension CutEngine {
                 }
                 segments.append(ResolvedSegment(file: media.url, from: first, to: last, outputStart: .zero, tracks: normalized,
                                                 sourceOrigin: media.origin, wholeAudioOrigin: try media.origin.adding(first),
-                                                reachesEnd: true))
+                                                reachesEnd: true, sourceClipIndex: group.first - 1,
+                                                sourceClipSeams: requests[(group.first - 1)..<(group.last - 1)].compactMap(\.to)))
                 continue
             }
             let spans = try media.audio.map { try $0.audibleBounds(origin: media.origin) }
@@ -263,7 +277,8 @@ extension CutEngine {
                                           silentAACSegments: &silentAAC, audibleAACTracks: &audibleAAC)
             segments.append(ResolvedSegment(file: media.url, from: from, to: to, outputStart: duration,
                                             tracks: tracks, sourceOrigin: media.origin,
-                                            reachesEnd: to == media.duration && preservesAudioEnd(media)))
+                                            reachesEnd: to == media.duration && preservesAudioEnd(media),
+                                            sourceClipIndex: group.first - 1, sourceClipSeams: requests[(group.first - 1)..<(group.last - 1)].compactMap(\.to)))
             duration = end
         }
         if let position = silentAAC.keys.sorted().first(where: { !audibleAAC.contains($0) }),

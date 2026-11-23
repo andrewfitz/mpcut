@@ -30,7 +30,7 @@ struct SceneScanOptions {
         let parsed = try MediaAnalysisArguments(
             arguments, values: ["--project", "--from", "--to", "--clip-id", "--camera-id",
                                 "--policy", "--operation-id", "--progress"],
-            switches: ["--all-sources", "--resume", "--restart"], acceptsFile: true)
+            switches: ["--all-sources"], acceptsFile: true)
         let values = parsed.values
         let hasRange = values["--from"] != nil || values["--to"] != nil
         let selections = [values["--clip-id"] != nil, values["--camera-id"] != nil,
@@ -66,13 +66,7 @@ struct SceneScanOptions {
             input = .file(file, scope)
         }
 
-        let policyOptions = [values["--policy"],
-                             parsed.switches.contains("--resume") ? "resume" : nil,
-                             parsed.switches.contains("--restart") ? "restart" : nil].compactMap { $0 }
-        guard policyOptions.count <= 1 else {
-            throw CLIError("invalid_arguments", "Choose one scene scan policy.")
-        }
-        let requestedPolicy = policyOptions.first ?? "reuse"
+        let requestedPolicy = values["--policy"] ?? "reuse"
         if values["--operation-id"] != nil && requestedPolicy != "restart" {
             throw CLIError("invalid_arguments", "--operation-id requires a restart.")
         }

@@ -16,6 +16,9 @@ svt_digest=9223ce06e6172ad41357ed23b3b00f036e03794b86b0e20ea9ccb3f648b8955d
 lame_name=lame-3.100
 lame_archive="$build_dir/$lame_name.tar.gz"
 lame_digest=ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e
+opus_name=opus-1.6.1
+opus_archive="$build_dir/$opus_name.tar.gz"
+opus_digest=6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1
 prefix="$build_dir/install"
 
 mkdir -p "$build_dir"
@@ -62,6 +65,7 @@ fetch_source() (
 fetch_source "$archive" "$digest" "https://ffmpeg.org/releases/$source_name.tar.xz"
 fetch_source "$svt_archive" "$svt_digest" "https://gitlab.com/AOMediaCodec/SVT-AV1/-/archive/v4.3.0/$svt_name.tar.bz2"
 fetch_source "$lame_archive" "$lame_digest" "https://downloads.sourceforge.net/project/lame/lame/3.100/$lame_name.tar.gz"
+fetch_source "$opus_archive" "$opus_digest" "https://downloads.xiph.org/releases/opus/$opus_name.tar.gz"
 
 # Only a successful install marks the recipe and its outputs valid.
 hardware_patch="$root/packaging/ffmpeg-require-hardware.patch"
@@ -92,6 +96,7 @@ if [[ -f "$build_dir/.recipe" && $(cat "$build_dir/.recipe") == "$recipe" &&
       -f "$prefix/SVT-AV1/LICENSE-BSD2.md" && -f "$prefix/SVT-AV1/fastfeat-LICENSE" &&
       -f "$prefix/SVT-AV1/safestringlib-LICENSE" && -f "$prefix/include/libswscale/swscale.h" &&
       -f "$prefix/lame-source-name" && -f "$prefix/LAME/COPYING" && -f "$prefix/LAME/LICENSE" &&
+      -f "$prefix/opus-source-name" && -f "$prefix/Opus/COPYING" &&
       -f "$prefix/COPYING.LGPLv2.1" && -f "$prefix/LICENSE.md" &&
       -f "$prefix/include/libavformat/avformat.h" &&
       -f "$prefix/include/libavcodec/avcodec.h" &&
@@ -138,6 +143,21 @@ tar -xf "$lame_archive" -C "$stage"
 mkdir -p "$stage/lame/include/lame" "$stage/lame/lib"
 install -m 644 "$stage/$lame_name/include/lame.h" "$stage/lame/include/lame/"
 install -m 644 "$stage/$lame_name/libmp3lame/.libs/libmp3lame.a" "$stage/lame/lib/"
+# libopus supplies the Opus encoder as a static library inside libavcodec too.
+# FFmpeg accepts it only through pkg-config, so its opus.pc is copied as well.
+tar -xf "$opus_archive" -C "$stage"
+(
+    cd "$stage/$opus_name"
+    ./configure --host=aarch64-apple-darwin --build=aarch64-apple-darwin CC="$compiler" \
+        CFLAGS="-O3 -arch arm64 -isysroot $SDKROOT -mmacosx-version-min=14.0" \
+        --disable-shared --enable-static --with-pic \
+        --disable-extra-programs --disable-doc --disable-dependency-tracking
+    make -j "$jobs"
+)
+mkdir -p "$stage/opus/include/opus" "$stage/opus/lib/pkgconfig"
+install -m 644 "$stage/$opus_name"/include/opus*.h "$stage/opus/include/opus/"
+install -m 644 "$stage/$opus_name/.libs/libopus.a" "$stage/opus/lib/"
+install -m 644 "$stage/$opus_name/opus.pc" "$stage/opus/lib/pkgconfig/"
 mkdir "$stage/objects"
 
 cd "$stage/objects"
@@ -146,10 +166,12 @@ cd "$stage/objects"
 ln -s "../$source_name" src
 ln -s ../svt svt
 ln -s ../lame lame
+ln -s ../opus opus
 # FFmpeg expands pkg-config flags as shell words. Keep dependency paths
 # relative so that configure and make also work in a checkout with spaces.
 sed -i '' 's|^prefix=.*|prefix=./svt|' svt/lib/pkgconfig/SvtAv1Enc.pc
-export PKG_CONFIG_LIBDIR=./svt/lib/pkgconfig
+sed -i '' 's|^prefix=.*|prefix=./opus|' opus/lib/pkgconfig/opus.pc
+export PKG_CONFIG_LIBDIR=./svt/lib/pkgconfig:./opus/lib/pkgconfig
 export PKG_CONFIG_PATH=
 src/configure \
     --prefix="$prefix" \
@@ -164,7 +186,8 @@ src/configure \
     --disable-indevs --disable-outdevs --enable-indev=lavfi \
     --disable-network --disable-encoders --enable-zlib --enable-bzlib \
     --enable-videotoolbox --enable-libsvtav1 --enable-libmp3lame --pkg-config-flags=--static \
-    --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox,libsvtav1,aac,libmp3lame,flac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,wrapped_avframe,rawvideo
+    --enable-libopus --disable-decoder=libopus \
+    --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox,libsvtav1,aac,libmp3lame,flac,libopus,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,wrapped_avframe,rawvideo
 make -j "$jobs" DESTDIR="$stage" install
 cd "$build_dir"
 install -m 644 "$stage/$source_name"/{COPYING.LGPLv2.1,LICENSE.md} "$stage$prefix/"
@@ -174,6 +197,9 @@ install -m 644 "$stage/$svt_name/third_party/fastfeat/LICENSE" "$stage$prefix/SV
 install -m 644 "$stage/$svt_name/third_party/safestringlib/LICENSE" "$stage$prefix/SVT-AV1/safestringlib-LICENSE"
 mkdir -p "$stage$prefix/LAME"
 install -m 644 "$stage/$lame_name"/{COPYING,LICENSE} "$stage$prefix/LAME/"
+mkdir -p "$stage$prefix/Opus"
+install -m 644 "$stage/$opus_name/COPYING" "$stage$prefix/Opus/"
+printf '%s\n' "$opus_name" > "$stage$prefix/opus-source-name"
 printf '%s\n' "$lame_name" > "$stage$prefix/lame-source-name"
 printf '%s\n' "$svt_name" > "$stage$prefix/svt-source-name"
 printf '%s\n' "$source_name" > "$stage$prefix/ffmpeg-source-name"

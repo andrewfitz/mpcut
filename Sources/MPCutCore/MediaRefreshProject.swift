@@ -13,21 +13,20 @@ private struct MediaRefreshReference: Hashable {
     var multicam = false
     var validatesPriorPicture = false
     var mayStartWithSilence = false
+    var participantStamp: SceneSourceStamp?
+    var participantInode: UInt64?
 
-    func issues(in result: MediaRefreshResult) throws -> [MediaRefreshReferenceIssue] {
-        if result.state == .offline { return [.init(id: id, reason: .offline)] }
-        guard let evidence = result.referenceEvidence else { return [] }
-        var issues: [MediaRefreshReferenceIssue] = []
+    func collectIssues(in evidence: MediaRefreshEvidence, audioIndices: [Int], multicamOffset: RationalTime,
+                       reviewStreams: Set<Int>, into issues: inout Set<MediaRefreshReferenceIssue>) throws {
         var start = RationalTime.zero
         var end = evidence.duration
         var hasDeclaredPCMStart = false
-        let audioIndices = evidence.streams.indices.filter { evidence.streams[$0].kind == "audio" }
         let stream: Int?
         switch track {
         case .video:
             stream = evidence.videoIndex >= 0 ? evidence.videoIndex : nil
         case .audioStream(let index):
-            stream = audioIndices.contains(index) ? index : nil
+            stream = evidence.streams.indices.contains(index) && evidence.streams[index].kind == "audio" ? index : nil
         case .audioOrdinal(let ordinal):
             stream = audioIndices.indices.contains(ordinal) ? audioIndices[ordinal] : nil
         case nil:
@@ -40,20 +39,18 @@ private struct MediaRefreshReference: Hashable {
             hasDeclaredPCMStart = descriptor.hasDeclaredPCMStart
         }
         if let range {
-            let offset = multicam && evidence.origin > .zero && evidence.format.split(separator: ",").contains("mov")
-                ? evidence.origin : .zero
+            let offset = multicam ? multicamOffset : .zero
             let first = try start.adding(offset)
             let last = try end.adding(offset)
             let startsWithSilence = mayStartWithSilence && hasDeclaredPCMStart && range.lowerBound >= .zero
             if (!startsWithSilence && range.lowerBound < first) || range.lowerBound >= last || range.upperBound > last {
-                issues.append(.init(id: id, reason: .rangeOutsideMedia))
+                issues.insert(.init(id: id, reason: .rangeOutsideMedia))
             }
         }
-        if (track != nil && stream.map({ !result.reviewStreams.contains($0) }) != true) ||
-            (validatesPriorPicture && result.pictureNeedsReview) {
-            issues.append(.init(id: id, reason: .trackNeedsReview))
+        if (track != nil && stream.map({ !reviewStreams.contains($0) }) != true) ||
+            (validatesPriorPicture && evidence.pictureNeedsReview == true) {
+            issues.insert(.init(id: id, reason: .trackNeedsReview))
         }
-        return issues
     }
 }
 
@@ -100,12 +97,46 @@ extension MediaRefresh {
                 for source in project.sources {
                     add(source.file, .init(id: source.id, track: source.audioStream.map(MediaRefreshReference.Track.audioStream)))
                 }
+                for geometry in project.participants.sources {
+                    if let source = sources[geometry.sourceID] {
+                        add(source.file, .init(id: geometry.sourceID, participantStamp: geometry.sourceStamp,
+                                              participantInode: geometry.sourceInode))
+                    }
+                }
+                let selections = project.switches.compactMap(\.audio) + [project.fixedAudio].compactMap { $0 }
+                    + project.mixLanes.compactMap { lane -> MulticamAudioSelection? in
+                        if case .recording(let selection) = lane.target { return selection }
+                        return nil
+                    }
+                    + project.audioReplacements.flatMap { [$0.original, $0.replacement] }
+                    + project.participants.people.compactMap { $0.audio?.selection }
+                for selection in selections {
+                    guard let source = sources[selection.source] else { continue }
+                    add(source.file, .init(id: source.id, track: .audioStream(selection.stream)))
+                }
                 let plan = try project.plan()
-                for span in plan.picture + plan.audio {
+                for span in plan.picture {
                     guard let source = sources[span.source] else { continue }
                     add(source.file, .init(id: source.id, range: span.input.from..<span.input.to,
-                                           track: span.stream.map(MediaRefreshReference.Track.audioStream) ?? .video,
-                                           multicam: true, mayStartWithSilence: span == plan.audio.first))
+                                           track: .video, multicam: true))
+                }
+                for lane in plan.audioLanes {
+                    for (index, span) in lane.spans.enumerated() {
+                        guard let source = sources[span.source], let stream = span.stream else { continue }
+                        add(source.file, .init(id: source.id, range: span.input.from..<span.input.to,
+                                               track: .audioStream(stream), multicam: true, mayStartWithSilence: index == 0))
+                    }
+                }
+            }
+            if project.sequenceItems != nil {
+                for geometry in project.participants.sources {
+                    add(geometry.sourceID, .init(id: geometry.sourceID, participantStamp: geometry.sourceStamp,
+                                                 participantInode: geometry.sourceInode))
+                }
+                for person in project.participants.people {
+                    if let selection = person.audio?.selection {
+                        add(selection.source, .init(id: person.id, track: .audioStream(selection.stream)))
+                    }
                 }
             }
         }
@@ -127,8 +158,26 @@ extension MediaRefresh {
             }
             var result = try check(group.url, identity: group.identity, previous: nil, verification: verification,
                                    persist: persist, exclusions: exclusions, progress: sourceProgress, cancelled: cancelled)
-            result.referenceIssues = Set(try group.refs.flatMap { try $0.issues(in: result) })
-                .sorted { ($0.id, $0.reason.rawValue) < ($1.id, $1.reason.rawValue) }
+            var issues: Set<MediaRefreshReferenceIssue> = []
+            if result.state == .offline {
+                for reference in group.refs {
+                    issues.insert(.init(id: reference.id, reason: .offline))
+                }
+            } else if let evidence = result.referenceEvidence {
+                let audioIndices = evidence.streams.indices.filter { evidence.streams[$0].kind == "audio" }
+                let multicamOffset = evidence.origin > .zero && evidence.format.split(separator: ",").contains("mov")
+                    ? evidence.origin : .zero
+                for reference in group.refs {
+                    try reference.collectIssues(in: evidence, audioIndices: audioIndices, multicamOffset: multicamOffset,
+                                                reviewStreams: result.reviewStreams, into: &issues)
+                    if let stamp = reference.participantStamp, let identity = group.identity,
+                       stamp != SceneSourceStamp(identity: identity)
+                           || reference.participantInode.map({ $0 != identity.inode }) == true {
+                        issues.insert(.init(id: reference.id, reason: .participantGeometryNeedsReview))
+                    }
+                }
+            }
+            result.referenceIssues = issues.sorted { ($0.id, $0.reason.rawValue) < ($1.id, $1.reason.rawValue) }
             return result
         }
     }

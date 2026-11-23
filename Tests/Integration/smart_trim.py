@@ -80,7 +80,10 @@ def vcl_hashes(path, codec):
             cursor += size
         if not count:
             raise AssertionError(f"picture without VCL payload in {path}")
-        hashes[(int(item["pts"]) - origin) * scale] = payload.digest()
+        timestamp = (int(item["pts"]) - origin) * scale
+        if timestamp in hashes:
+            raise AssertionError(f"duplicate picture timestamp {timestamp} in {path}")
+        hashes[timestamp] = payload.digest()
     return hashes
 
 
@@ -102,17 +105,17 @@ class SmartTrimTests(unittest.TestCase):
         self.root = Path(directory.name)
 
     def export(self, output, ranges, *, smart=True, dry=False, ok=True):
-        args = [CLI, "export", "--json", "--output", output]
+        args = [CLI, "export", "clips", "join", "--json", "--output", output]
         # Smart Trim is the default, so the tests of Lossless Copy name it.
-        args += ["--smart-trim"] if smart else ["--mode", "copy"]
+        args += ["--mode", "smart"] if smart else ["--mode", "copy"]
         if dry:
             args.append("--dry-run")
         for source, start, end in ranges:
             args.extend(["--clip", source, "--from", str(Fraction(start, FPS)), "--to", str(Fraction(end, FPS))])
         result = subprocess.run(args, capture_output=True, text=True, timeout=90)
-        self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0 if ok else 1, result.stdout + result.stderr)
         report = json.loads(result.stdout)
-        self.assertEqual(report["ok"], ok, report)
+        self.assertIs(report["ok"], ok, report)
         if dry or not ok:
             self.assertFalse(output.exists())
         return report
@@ -129,15 +132,15 @@ class SmartTrimTests(unittest.TestCase):
                       for start, end in ranges],
             "order": order,
         }
-        command = [CLI, "export", "--json", "--stdin"]
+        command = [CLI, "export", "clips", "join", "--json", "--stdin"]
         dry = subprocess.run([*command, "--dry-run"], input=json.dumps(request), capture_output=True,
                              text=True, check=True, timeout=90)
         plan = json.loads(dry.stdout)
         self.assertFalse(output.exists())
         self.assertEqual(plan["mode"], "smart")
         self.assertEqual(plan["order"], order)
-        self.assertGreater(ratio(plan["copiedDuration"]), 0)
-        self.assertGreater(ratio(plan["encodedDuration"]), 0)
+        self.assertGreater(ratio(plan["copied_duration"]), 0)
+        self.assertGreater(ratio(plan["encoded_duration"]), 0)
         result = subprocess.run(command, input=json.dumps(request), capture_output=True, text=True,
                                 check=True, timeout=90)
         self.assertEqual(json.loads(result.stdout)["segments"], plan["segments"])
@@ -146,17 +149,17 @@ class SmartTrimTests(unittest.TestCase):
         self.assertEqual(run([self.fixtures / "DecodeFrameIDs", output]), expected)
         source_hashes, output_hashes = vcl_hashes(source, "h264"), vcl_hashes(output, "h264")
         copied_frames = 0
-        for segment, index in zip(plan["segments"], order):
+        for segment, index in zip(plan["segments"], order, strict=True):
             start, end = ranges[index - 1]
-            edges = [(ratio(edge["from"]), ratio(edge["to"])) for edge in segment.get("encodedEdges", [])]
+            edges = [(ratio(edge["from"]), ratio(edge["to"])) for edge in segment.get("encoded_edges", [])]
             for frame in range(start, end):
                 source_time = Fraction(frame, FPS)
                 if any(left <= source_time < right for left, right in edges):
                     continue
-                output_time = ratio(segment["outputStart"]) + Fraction(frame - start, FPS)
+                output_time = ratio(segment["output_start"]) + Fraction(frame - start, FPS)
                 self.assertEqual(output_hashes[output_time], source_hashes[source_time])
                 copied_frames += 1
-        self.assertEqual(copied_frames, ratio(plan["copiedDuration"]) * FPS)
+        self.assertEqual(copied_frames, ratio(plan["copied_duration"]) * FPS)
 
     def check_trim(self, codec, ranges, edges):
         source = self.sources[codec]
@@ -166,8 +169,8 @@ class SmartTrimTests(unittest.TestCase):
         dry = self.export(output, requests, dry=True)
         self.assertEqual(len(dry["segments"]), len(edges))
         for segment, expected in zip(dry["segments"], edges):
-            actual = [(ratio(edge["from"]) * FPS, ratio(edge["to"]) * FPS, edge["frameCount"])
-                      for edge in segment.get("encodedEdges", [])]
+            actual = [(ratio(edge["from"]) * FPS, ratio(edge["to"]) * FPS, edge["frame_count"])
+                      for edge in segment.get("encoded_edges", [])]
             self.assertEqual(actual, [(start, end, end-start) for start, end in expected])
         total = sum(end - start for start, end in ranges)
         self.assertEqual(ratio(dry["duration"]), Fraction(total, FPS))
@@ -197,7 +200,7 @@ class SmartTrimTests(unittest.TestCase):
         for field in stream_keys:
             self.assertEqual(metadata[0].get(field), metadata[1].get(field), field)
         out_index = 0
-        for (start, end), encoded in zip(ranges, edges):
+        for (start, end), encoded in zip(ranges, edges, strict=True):
             for index in range(start, end):
                 if all(index < lo or index >= hi for lo, hi in encoded):
                     self.assertEqual(dst_frames[out_index], src_frames[index], f"copied picture {index}")
@@ -227,10 +230,10 @@ class SmartTrimTests(unittest.TestCase):
                 packets = probe(source, "-select_streams", "v:0", "-show_packets",
                                 "-show_entries", "packet=pts_time,size")["packets"]
                 report = self.export(self.root / ("rate" + source.suffix), [(source, 7, 88)], dry=True)
-                for edge, second in zip(report["segments"][0]["encodedEdges"], [0, 3], strict=True):
+                for edge, second in zip(report["segments"][0]["encoded_edges"], [0, 3], strict=True):
                     # These fixtures have one-second closed GOPs and a separate audio track.
                     size = sum(int(p["size"]) for p in packets if second <= Fraction(p["pts_time"]) < second + 1)
-                    self.assertEqual(edge["targetBitRate"], size * 8)
+                    self.assertEqual(edge["target_bit_rate"], size * 8)
 
     def test_low_bitrate_av1_trim_stays_smaller_than_the_source(self):
         source = self.root / "low-bitrate.webm"
@@ -239,7 +242,7 @@ class SmartTrimTests(unittest.TestCase):
                "-svtav1-params", "lp=2", source, allow_diagnostics=True)
         output = self.root / "trim.webm"
         report = self.export(output, [(source, 10, 190)])
-        self.assertEqual([edge["frameCount"] for edge in report["segments"][0]["encodedEdges"]], [40, 40])
+        self.assertEqual([edge["frame_count"] for edge in report["segments"][0]["encoded_edges"]], [40, 40])
         self.assertLess(output.stat().st_size, source.stat().st_size)
 
     def test_only_the_unsafe_end_is_encoded(self):
@@ -262,7 +265,7 @@ class SmartTrimTests(unittest.TestCase):
                 output = self.root / ("continuous-" + codec + source.suffix)
                 report = self.export(output, [(source, 25, 53), (source, 53, 75)])
                 self.assertEqual(len(report["segments"]), 1)
-                self.assertFalse(report["segments"][0].get("encodedEdges"))
+                self.assertFalse(report["segments"][0].get("encoded_edges"))
                 expected = {t - 1: data for t, data in timestamped_hashes(source) if 1 <= t < 3}
                 self.assertEqual(dict(timestamped_hashes(output)), expected)
                 self.assertEqual(picture_ids(output), bytes(range(25, 75)))
@@ -287,14 +290,14 @@ class SmartTrimTests(unittest.TestCase):
                 source = self.sources[codec]
                 mixed = self.root / ("mixed-" + codec + source.suffix)
                 self.export(mixed, [(source, 7, 88)])
-                info = json.loads(run([CLI, "inspect", "--json", "--keyframes", mixed]))
+                info = json.loads(run([CLI, "media", "inspect", "--json", "--keyframes", mixed]))
                 self.assertTrue(info["ok"], info)
-                self.assertFalse(info["media"].get("copyIssue"), info.get("copy"))
+                self.assertFalse(info["media"].get("copy_issue"), info.get("copy"))
                 # Start at each description: head encoder, original camera, tail encoder.
                 for offset in [0, 18, 68]:
                     reopened = self.root / (f"reopen-{codec}-{offset}" + source.suffix)
                     result = self.export(reopened, [(mixed, offset, 81)], smart=False)
-                    self.assertFalse(result["segments"][0].get("encodedEdges"))
+                    self.assertFalse(result["segments"][0].get("encoded_edges"))
                     self.assertEqual(run([self.fixtures / "DecodeFrameIDs", reopened]), bytes(range(7 + offset, 88)))
                     expected = {t - Fraction(offset, FPS): data for t, data in timestamped_hashes(mixed)
                                 if t >= Fraction(offset, FPS)}
@@ -346,7 +349,7 @@ class SmartTrimTests(unittest.TestCase):
                        "-threads", "1", *settings, source, allow_diagnostics=True)
                 output = self.root / f"edge-{codec}.mp4"
                 plan = self.export(output, [(source, 5, 75)])
-                self.assertEqual([edge["frameCount"] for edge in plan["segments"][0]["encodedEdges"]], [70])
+                self.assertEqual([edge["frame_count"] for edge in plan["segments"][0]["encoded_edges"]], [70])
                 packets = probe(output, "-select_streams", "v:0", "-show_packets",
                                 "-show_entries", "packet=pts_time,flags")["packets"]
                 self.assertEqual(len(packets), 70)
@@ -361,7 +364,7 @@ class SmartTrimTests(unittest.TestCase):
         # FFmpeg decodes such a mixed stream even when AVFoundation cannot.
         source = movie(self.root / "narrow.mp4", "h264", width=160)
         output = self.root / "narrow-cut.mp4"
-        process = subprocess.run([CLI, "export", "--json", "--smart-trim", "--clip", source,
+        process = subprocess.run([CLI, "export", "clips", "join", "--json", "--mode", "smart", "--clip", source,
                                   "--from", "7/25", "--to", "88/25", "--output", output],
                                  capture_output=True, text=True, timeout=60)
         report = json.loads(process.stdout)
@@ -371,7 +374,8 @@ class SmartTrimTests(unittest.TestCase):
         else:
             # Narrow AVC is ineligible for an encoded edge, so the request falls
             # back to copy boundaries: frame 7 is refused with both neighbours.
-            self.assertFalse(report["ok"], report)
+            self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+            self.assertIs(report["ok"], False, report)
             error = report["error"]
             self.assertEqual((error["code"], error["boundary"], error["segment"]),
                              ("unsafe_boundary", "from", 1), report)
@@ -389,7 +393,7 @@ class SmartTrimTests(unittest.TestCase):
 
     def test_cancel_during_staging(self):
         output = self.root / "cancel.webm"
-        command = [CLI, "export", "--json", "--smart-trim", "--clip", self.sources["av1"],
+        command = [CLI, "export", "clips", "join", "--json", "--mode", "smart", "--clip", self.sources["av1"],
                    "--from", "7/25", "--to", "88/25", "--output", output]
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
             try:

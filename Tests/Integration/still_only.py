@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from xml.etree import ElementTree
 
 from media_regression import ffmpeg, probe, run
 
@@ -14,6 +15,80 @@ CLI = None
 
 
 class StillOnlyTests(unittest.TestCase):
+    def test_single_gap_black_and_custom_color(self):
+        with tempfile.TemporaryDirectory(prefix="mpcut-color-gap-") as directory:
+            root = Path(directory)
+            cut = root / "background.cut"
+            report = json.loads(run([CLI, "still", "project", "create", "--gap", "--out-project", cut, "--width", "160",
+                                     "--height", "96", "--rate", "24", "--codec", "h264", "--container", "mov",
+                                     "--frames", "12", "--json"]))
+            for name, expected in [("black", (0, 0, 0)), ("red", (255, 0, 0))]:
+                if name == "red":
+                    run([CLI, "still", "placement", "update", "--project", cut, "--placement", report["placement_id"],
+                         "--background", "#FF0000", "--in-place"])
+                output = root / (name + ".mov")
+                run([CLI, "export", "project", "render", "--project", cut, "--output", output], allow_diagnostics=True)
+                pixels = ffmpeg("-i", output, "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-")
+                self.assertEqual(len(pixels), 160 * 96 * 3)
+                for channel, target in enumerate(expected):
+                    self.assertLess(max(abs(value - target) for value in pixels[channel::3]), 5)
+
+    def test_fcpxml_still_asset_clip_and_relative_media(self):
+        with tempfile.TemporaryDirectory(prefix="mpcut-fcpxml-still-") as directory:
+            root = Path(directory)
+            image = root / "Card #1.png"
+            ffmpeg("-f", "lavfi", "-i", "color=white:size=80x80", "-frames:v", "1", image)
+            cut = root / "Stills.cut"
+            xml = root / "Stills.fcpxml"
+            run([
+                CLI, "still", "project", "create", "--out-project", cut, "--image", image,
+                "--width", "320", "--height", "180", "--rate", "24",
+                "--codec", "h264", "--container", "mov", "--frames", "12",
+            ])
+            run([CLI, "project", "convert", cut, "--output", xml])
+            tree = ElementTree.parse(xml)
+            tree.find(".//spine/video").tag = "asset-clip"
+            tree.find(".//media-rep").set("src", "Card%20%231.png")
+            tree.write(xml, encoding="utf-8", xml_declaration=True)
+            sibling = root / "Sibling.cut"
+            run([CLI, "project", "convert", xml, "--output", sibling])
+            self.assertEqual(json.loads(sibling.read_text())["still_assets"][0]["file"], image.name)
+            nested = root / "nested"
+            nested.mkdir()
+            restored = nested / "Restored.cut"
+            run([CLI, "project", "convert", xml, "--output", restored])
+            original = json.loads(cut.read_text())
+            result = json.loads(restored.read_text())
+            self.assertEqual(result["clips"], original["clips"])
+            self.assertEqual(result["still_format"], original["still_format"])
+            self.assertEqual(result["still_assets"][0]["file"], "../Card #1.png")
+
+    def test_interchange_refuses_a_timeline_with_no_retained_material(self):
+        with tempfile.TemporaryDirectory(prefix="mpcut-still-conversion-") as directory:
+            root = Path(directory)
+            image = root / "Card.png"
+            cut = root / "Stills.cut"
+            ffmpeg("-f", "lavfi", "-i", "color=white:size=80x80", "-frames:v", "1", image)
+            create = [
+                CLI, "still", "project", "create", "--image", image,
+                "--width", "320", "--height", "180", "--rate", "24",
+                "--container", "mov", "--frames", "12",
+            ]
+            run([*create, "--out-project", cut, "--codec", "h264"])
+            hdr = root / "HDR.cut"
+            run([*create, "--out-project", hdr, "--codec", "hevc", "--color", "pq"])
+            for source, extension in [(cut, "drp"), (cut, "drt"), (cut, "prproj"), (hdr, "fcpxml")]:
+                output = root / f"Converted.{extension}"
+                command = [CLI, "project", "convert", source, "--output", output, "--json"]
+                for flags, code in [([], "conversion_loss"), (["--allow-loss"], "empty_sequence")]:
+                    with self.subTest(extension=extension, code=code):
+                        result = subprocess.run([*command, *flags], capture_output=True, timeout=60)
+                        self.assertNotEqual(result.returncode, 0)
+                        error = json.loads(result.stdout)["error"]
+                        self.assertEqual(error["code"], code)
+                        self.assertIn("Insert Still placement", error["message"])
+                        self.assertFalse(output.exists())
+
     def test_creation_rejects_fractional_frame_and_preserves_existing_destination(self):
         with tempfile.TemporaryDirectory(prefix="mpcut-still-invalid-") as directory:
             root = Path(directory)
@@ -21,7 +96,7 @@ class StillOnlyTests(unittest.TestCase):
             cut = root / "stills.cut"
             ffmpeg("-f", "lavfi", "-i", "color=white:size=80x80", "-frames:v", "1", image)
             command = [
-                CLI, "still", "create", "--out-project", cut, "--image", image,
+                CLI, "still", "project", "create", "--out-project", cut, "--image", image,
                 "--width", "320", "--height", "180", "--rate", "30000/1001",
                 "--codec", "h264", "--container", "mp4", "--duration",
             ]
@@ -59,25 +134,24 @@ class StillOnlyTests(unittest.TestCase):
                     cut = root / f"{name}.cut"
                     output = root / f"{name}.{extension}"
                     run([
-                        CLI, "still", "create", "--out-project", cut, "--image", image,
+                        CLI, "still", "project", "create", "--out-project", cut, "--image", image,
                         "--width", "320", "--height", "180", "--rate", "30000/1001",
                         "--codec", codec, "--container", extension, "--color", program_color, "--frames", "5",
                     ])
                     project = json.loads(cut.read_text())
-                    self.assertEqual(project["schemaVersion"], 2)
+                    self.assertEqual(project["schema_version"], 4)
                     self.assertEqual(project["clips"][0]["kind"], "still")
-                    self.assertEqual(project["stillAssets"][0]["file"], image.name)
-                    self.assertEqual(project["programColorPolicy"]["transfer"], transfer)
+                    self.assertEqual(project["still_assets"][0]["file"], image.name)
+                    self.assertEqual(project["program_color_policy"]["transfer"], transfer)
                     run([
-                        CLI, "still", "add", "--project", cut, "--image", last_image, "--insert",
-                        "--clock", "sequence", "--at", "1001/6000", "--duration", "1001/30000", "--in-place", "--json",
+                        CLI, "still", "placement", "insert", "--project", cut, "--image", last_image, "--clock", "sequence", "--at", "1001/6000", "--duration", "1001/30000", "--in-place", "--json",
                     ])
                     report = json.loads(run([
-                        CLI, "export", "--project", cut, "--require-camera-copy", "--output", output, "--json",
+                        CLI, "export", "project", "render", "--project", cut, "--require-camera-copy", "--output", output, "--json",
                     ], allow_diagnostics=True))
-                    self.assertEqual(report["copiedCameraDuration"], {"numerator": 0, "denominator": 1})
-                    self.assertEqual(report["encodedCameraDuration"], {"numerator": 0, "denominator": 1})
-                    self.assertEqual(report["generatedStillDuration"], {"numerator": 1001, "denominator": 5000})
+                    self.assertEqual(report["copied_camera_duration"], {"numerator": 0, "denominator": 1})
+                    self.assertEqual(report["encoded_camera_duration"], {"numerator": 0, "denominator": 1})
+                    self.assertEqual(report["generated_still_duration"], {"numerator": 1001, "denominator": 5000})
                     streams = probe(output, "-show_streams", "-count_frames")["streams"]
                     self.assertEqual(len(streams), 1)
                     stream = streams[0]
@@ -98,12 +172,12 @@ class StillOnlyTests(unittest.TestCase):
             output = root / "stills.mov"
             ffmpeg("-f", "lavfi", "-i", "color=white:size=80x80", "-frames:v", "1", image)
             run([
-                CLI, "still", "create", "--out-project", cut, "--image", image,
+                CLI, "still", "project", "create", "--out-project", cut, "--image", image,
                 "--width", "320", "--height", "180", "--rate", "30000/1001",
                 "--codec", "hevc", "--container", "mov", "--color", "pq", "--frames", "5", "--json",
             ])
             run([
-                CLI, "export", "--project", cut, "--mode", "encode", "--require-camera-copy", "--output", output, "--json",
+                CLI, "export", "project", "render", "--project", cut, "--mode", "encode", "--require-camera-copy", "--output", output, "--json",
             ], allow_diagnostics=True)
             streams = probe(output, "-show_streams", "-count_frames")["streams"]
             self.assertEqual(len(streams), 1)

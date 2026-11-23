@@ -35,7 +35,7 @@ extension ExportRules {
         for (label, tracks, scope) in selections {
             let answers = [ExportMode.copy, .smart, .encode].map {
                 let answer = cell(source: .multicam, tracks: tracks, mode: $0, placements: scope)
-                return answer.isAllowed ? answer.displayName : "Refused (`\(answer.refusal?.factor.rawValue ?? "writer.other")`)"
+                return answer.isAllowed ? answer.displayName : "Refused (`\(answer.refusal?.factor.rawValue ?? "writer_other")`)"
             }
             lines.append("| \(label) | \(answers.joined(separator: " | ")) |")
         }
@@ -47,6 +47,7 @@ extension ExportRules {
 extension StillExportPlanner {
     /// Plans the complete program to determine its tier and report the actions responsible.
     public func tier(_ project: CutProject, relativeTo location: URL? = nil, preferredContainer: String? = nil) -> TierState {
+        if cancelled?() == true { return .checking }
         var factors: [TierFactor] = []
         var last = CutError(code: "export_failed", message: "No still export mode is available.")
         let preferred = project.stillFormat?.container ?? preferredContainer.flatMap {
@@ -89,6 +90,7 @@ extension StillExportPlanner {
                         return .known(tier: report.fidelityTier, factors: factors + sounds, container: plan.container, warnings: warnings)
                     } catch let issue as CutError {
                         if issue.code == "cancelled" { return .checking }
+                        if issue.code == "source_changed" { return .unavailable(issue) }
                         if modeFailure == nil { modeFailure = issue }
                         last = issue
                     } catch {
@@ -124,7 +126,8 @@ extension StillTimelinePlan {
 extension StillExportReport {
     /// Fidelity of this selected plan. A full-program tier may plan a different mode or container.
     public var fidelityTier: FidelityTier {
-        if mode == .encode && (tracks != .audio || soundActions.contains(where: { $0.audio == .aac })) {
+        if (mode == .encode && tracks != .audio) || soundActions.contains(where: { $0.audio == .aac }) ||
+            (audioOutput != .separateTracks && !soundActions.isEmpty) {
             return .reencode
         }
         if generatedStillDuration > .zero || encodedCameraDuration > .zero ||

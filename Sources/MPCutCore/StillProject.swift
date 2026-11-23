@@ -94,7 +94,10 @@ public struct StillProgramColorPolicy: Codable, Hashable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, transfer, primaries, matrix, range, viewingConditions, diffuseWhiteNits, renditionPolicyVersion
+        case version, transfer, primaries, matrix, range
+        case viewingConditions = "viewing_conditions"
+        case diffuseWhiteNits = "diffuse_white_nits"
+        case renditionPolicyVersion = "rendition_policy_version"
     }
 
     public init(from decoder: Decoder) throws {
@@ -115,26 +118,94 @@ public struct StillProgramColorPolicy: Codable, Hashable, Sendable {
     }
 }
 
+private final class StillResourceBundleAnchor {}
+
 public struct StillAsset: Codable, Hashable, Sendable, Identifiable {
     public var id: String
-    public var file: String
+    private var linkedFile: String?
     public var displayName: String
     public var fingerprint: String
+    public var isGap: Bool { linkedFile == nil }
+
+    /// A gap uses the placement's background for every pixel. Only linked images
+    /// participate in path rebasing. The built-in transparent pixel stays local.
+    public var file: String {
+        get { linkedFile ?? Self.gapImage.path }
+        set { if linkedFile != nil { linkedFile = newValue } }
+    }
+
+    static let gapImage: URL = {
+        if let bin = Bundle.main.executableURL?.resolvingSymlinksInPath().deletingLastPathComponent(),
+           ["Helpers", "MacOS"].contains(bin.lastPathComponent),
+           bin.deletingLastPathComponent().lastPathComponent == "Contents",
+           FileManager.default.fileExists(atPath: bin.deletingLastPathComponent().appendingPathComponent("Resources/Gap.png").path) {
+            return bin.deletingLastPathComponent().appendingPathComponent("Resources/Gap.png")
+        }
+        // Bundle.module traps when its resource bundle is missing. Check both the
+        // Xcode resource layout and SwiftPM's flat bundle before using the fallback.
+        let roots = [Bundle.main.resourceURL, Bundle(for: StillResourceBundleAnchor.self).resourceURL,
+                     Bundle.main.bundleURL]
+        for root in roots.compactMap({ $0 }) {
+            let bundle = root.appendingPathComponent("MPCut_MPCutCore.bundle", isDirectory: true)
+            for path in ["Contents/Resources/Gap.png", "Gap.png"] {
+                let resource = bundle.appendingPathComponent(path)
+                if FileManager.default.fileExists(atPath: resource.path) { return resource }
+            }
+        }
+        // An executable on its own writes the pixel to a file named as the still renderer expects.
+        let pixel = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=")!
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("mpcut-gap-\(getuid())")
+        let written = folder.appendingPathComponent("Gap.png")
+        if (try? Data(contentsOf: written)) != pixel {
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
+                                                     attributes: [.posixPermissions: 0o700])
+            try? pixel.write(to: written, options: .atomic)
+        }
+        return written
+    }()
 
     public init(id: String, file: String, displayName: String, fingerprint: String) {
         self.id = id
-        self.file = file
+        linkedFile = file
         self.displayName = displayName
         self.fingerprint = fingerprint
     }
 
-    private enum CodingKeys: String, CodingKey { case id, file, displayName, fingerprint }
+    public init(gapID: String) {
+        id = gapID
+        linkedFile = nil
+        displayName = "Color Gap"
+        fingerprint = "43739c566e26fd7cb88f69d3864ea34740372f5ee99acac169e090beffbce5c6"
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, kind, file, displayName = "display_name", fingerprint }
 
     public init(from decoder: Decoder) throws {
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
         let v = try decoder.container(keyedBy: CodingKeys.self)
-        try self.init(id: v.decode(String.self, forKey: .id), file: v.decode(String.self, forKey: .file),
-                      displayName: v.decode(String.self, forKey: .displayName), fingerprint: v.decode(String.self, forKey: .fingerprint))
+        let id = try v.decode(String.self, forKey: .id)
+        if v.contains(.kind) {
+            guard try v.decode(String.self, forKey: .kind) == "gap",
+                  !v.contains(.file), !v.contains(.displayName), !v.contains(.fingerprint) else {
+                throw stillError("Invalid color gap asset")
+            }
+            self.init(gapID: id)
+        } else {
+            try self.init(id: id, file: v.decode(String.self, forKey: .file),
+                          displayName: v.decode(String.self, forKey: .displayName), fingerprint: v.decode(String.self, forKey: .fingerprint))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var v = encoder.container(keyedBy: CodingKeys.self)
+        try v.encode(id, forKey: .id)
+        if let linkedFile {
+            try v.encode(linkedFile, forKey: .file)
+            try v.encode(displayName, forKey: .displayName)
+            try v.encode(fingerprint, forKey: .fingerprint)
+        } else {
+            try v.encode("gap", forKey: .kind)
+        }
     }
 }
 
@@ -155,7 +226,7 @@ public struct StillInsert: Codable, Hashable, Sendable, Identifiable {
         self.framing = framing
     }
 
-    private enum CodingKeys: String, CodingKey { case id, assetID, duration, cadence, framing }
+    private enum CodingKeys: String, CodingKey { case id, assetID = "asset_id", duration, cadence, framing }
 
     public init(from decoder: Decoder) throws {
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
@@ -195,7 +266,7 @@ public struct StillReplacementFragment: Codable, Hashable, Sendable {
         self.range = range
     }
 
-    private enum CodingKeys: String, CodingKey { case clipID, range }
+    private enum CodingKeys: String, CodingKey { case clipID = "clip_id", range }
 
     public init(from decoder: Decoder) throws {
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
@@ -222,7 +293,7 @@ public struct StillReplacement: Codable, Hashable, Sendable, Identifiable {
         self.coverage = coverage
     }
 
-    private enum CodingKeys: String, CodingKey { case id, assetID, framing, fragments, group }
+    private enum CodingKeys: String, CodingKey { case id, assetID = "asset_id", framing, fragments, group }
 
     public init(from decoder: Decoder) throws {
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
@@ -249,29 +320,31 @@ public struct StillReplacement: Codable, Hashable, Sendable, Identifiable {
     }
 }
 
-private enum StillItemKey: String, CodingKey { case kind, source, group, still }
+private enum StillItemKey: String, CodingKey { case kind, still }
 
 public enum StillSequenceItem: Codable, Hashable, Sendable {
     case source(CutSequenceClip)
     case still(StillInsert)
 
     public init(from decoder: Decoder) throws {
-        try ProjectField.rejectUnknown(StillItemKey.self, in: decoder)
         let v = try decoder.container(keyedBy: StillItemKey.self)
+        guard v.contains(.kind) else {
+            self = .source(try CutSequenceClip(from: decoder))
+            return
+        }
+        try ProjectField.rejectUnknown(StillItemKey.self, in: decoder)
         switch try v.decode(String.self, forKey: .kind) {
-        case "source" where v.allKeys.count == 2: self = .source(try v.decode(CutSequenceClip.self, forKey: .source))
         case "still" where v.allKeys.count == 2: self = .still(try v.decode(StillInsert.self, forKey: .still))
         default: throw stillError("Invalid typed sequence item")
         }
     }
 
     public func encode(to encoder: Encoder) throws {
-        var v = encoder.container(keyedBy: StillItemKey.self)
         switch self {
         case .source(let clip):
-            try v.encode("source", forKey: .kind)
-            try v.encode(clip, forKey: .source)
+            try clip.encode(to: encoder)
         case .still(let insert):
+            var v = encoder.container(keyedBy: StillItemKey.self)
             try v.encode("still", forKey: .kind)
             try v.encode(insert, forKey: .still)
         }
@@ -289,33 +362,59 @@ public enum StillSequenceItem: Codable, Hashable, Sendable {
 }
 
 public enum StillAssemblyItem: Codable, Hashable, Sendable {
-    case group(MulticamRange)
+    case group(MulticamRange, angle: String? = nil)
     case still(StillInsert)
 
+    private enum GroupKey: String, CodingKey { case kind, from, to, angle = "angle_id" }
+
     public init(from decoder: Decoder) throws {
-        try ProjectField.rejectUnknown(StillItemKey.self, in: decoder)
         let v = try decoder.container(keyedBy: StillItemKey.self)
-        switch try v.decode(String.self, forKey: .kind) {
-        case "group" where v.allKeys.count == 2: self = .group(try v.decode(MulticamRange.self, forKey: .group))
+        guard v.contains(.kind) else {
+            self = .group(try MulticamRange(from: decoder))
+            return
+        }
+        let kind = try v.decode(String.self, forKey: .kind)
+        if kind == "group" {
+            try ProjectField.rejectUnknown(GroupKey.self, in: decoder)
+            let group = try decoder.container(keyedBy: GroupKey.self)
+            self = .group(.init(from: try ProjectField.time(group, .from),
+                                to: try ProjectField.time(group, .to)),
+                          angle: try group.decode(String.self, forKey: .angle))
+            return
+        }
+        try ProjectField.rejectUnknown(StillItemKey.self, in: decoder)
+        switch kind {
         case "still" where v.allKeys.count == 2: self = .still(try v.decode(StillInsert.self, forKey: .still))
         default: throw stillError("Invalid typed assembly item")
         }
     }
 
     public func encode(to encoder: Encoder) throws {
-        var v = encoder.container(keyedBy: StillItemKey.self)
         switch self {
-        case .group(let range):
-            try v.encode("group", forKey: .kind)
-            try v.encode(range, forKey: .group)
+        case .group(let range, let angle):
+            if let angle {
+                var v = encoder.container(keyedBy: GroupKey.self)
+                try v.encode("group", forKey: .kind)
+                try v.encode(range.from.description, forKey: .from)
+                try v.encode(range.to.description, forKey: .to)
+                try v.encode(angle, forKey: .angle)
+            } else {
+                try range.encode(to: encoder)
+            }
         case .still(let insert):
+            var v = encoder.container(keyedBy: StillItemKey.self)
             try v.encode("still", forKey: .kind)
             try v.encode(insert, forKey: .still)
         }
     }
 
     public var group: MulticamRange? {
-        if case .group(let range) = self { return range }
+        if case .group(let range, _) = self { return range }
+        return nil
+    }
+
+    public var angleOverride: String? {
+        if case .group(_, let angle) = self { return angle }
         return nil
     }
 
@@ -331,20 +430,28 @@ public struct StillSequenceProject: Equatable, Sendable {
     public var stillReplacements: [StillReplacement]
     public var programColorPolicy: StillProgramColorPolicy?
     public var stillFormat: StillTimelineFormat?
+    public var transcripts: ProjectTranscripts
+    public var sourceSelects: [NamedSourceSelect]
+    public var participants: ParticipantProject
     // A selection consisting only of inserts still has its parent program's
     // silent sound lanes. This recording supplies their layout, not samples.
     package var stillAudioReference: CutSequenceClip?
 
     public init(items: [StillSequenceItem], stillAssets: [StillAsset] = [], stillReplacements: [StillReplacement] = [],
-                programColorPolicy: StillProgramColorPolicy? = nil, stillFormat: StillTimelineFormat? = nil) {
+                programColorPolicy: StillProgramColorPolicy? = nil, stillFormat: StillTimelineFormat? = nil,
+                transcripts: ProjectTranscripts = .init(), sourceSelects: [NamedSourceSelect] = [],
+                participants: ParticipantProject = .init()) {
         self.items = items
         self.stillAssets = stillAssets
         self.stillReplacements = stillReplacements
         self.programColorPolicy = programColorPolicy
         self.stillFormat = stillFormat
+        self.transcripts = transcripts
+        self.sourceSelects = sourceSelects
+        self.participants = participants
     }
 
-    var requiresV2: Bool {
+    var hasStillContent: Bool {
         !stillAssets.isEmpty || !stillReplacements.isEmpty || programColorPolicy != nil || stillFormat != nil
             || items.contains { $0.still != nil }
     }
@@ -363,7 +470,8 @@ func validateStillCollections(assets: [StillAsset], inserts: [StillInsert], repl
                               group: MulticamRange? = nil) throws {
     var assetIDs = Set<String>()
     for asset in assets {
-        guard validStillID(asset.id), assetIDs.insert(asset.id).inserted, ProjectFile.validMediaPath(asset.file),
+        guard validStillID(asset.id), assetIDs.insert(asset.id).inserted,
+              asset.isGap || ProjectFile.validMediaPath(asset.file),
               validStillID(asset.displayName), validStillID(asset.fingerprint) else {
             throw stillError("Invalid or repeated still asset ‘\(asset.id)’")
         }
@@ -386,7 +494,9 @@ func validateStillCollections(assets: [StillAsset], inserts: [StillInsert], repl
         }
     }
     var intervals: [String: [(MulticamRange, String)]] = [:]
+    let gapIDs = Set(assets.filter(\.isGap).map(\.id))
     for replacement in replacements {
+        guard !gapIDs.contains(replacement.assetID) else { throw stillError("A color gap must be an insert") }
         try validatePlacement(id: replacement.id, assetID: replacement.assetID, framing: replacement.framing)
         switch replacement.coverage {
         case .sequence(let fragments):

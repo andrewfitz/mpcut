@@ -1,3 +1,4 @@
+import AVFoundation
 import MPCutCore
 import XCTest
 @testable import MPCutApp
@@ -51,6 +52,24 @@ final class MulticamQueueAndAudioTests: XCTestCase {
         XCTAssertEqual(model.queuedRanges.count, 1)
         model.reset()
         XCTAssertTrue(model.queuedRanges.isEmpty)
+    }
+
+    @MainActor
+    func testPauseTakeKeepsEveryOverlappingAssemblyRange() throws {
+        let camera = try fixture("ProRes-2997", extension: "mov")
+        let info = try CutEngine(useSidecar: false).inspectMulticamSource(camera)
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [.init(source: .init(id: "wide", file: camera.path), media: info)],
+                           opening: "wide", audio: .none)
+        let ranges = [MulticamRange(from: .zero, to: info.frames[2].time),
+                      MulticamRange(from: info.frames[4].time, to: info.frames[6].time)]
+        XCTAssertTrue(model.edit { $0.assembly = ranges })
+        let duration = try XCTUnwrap(model.project).plan().duration
+        XCTAssertTrue(model.enqueuePauseTakes([.init(from: .zero, to: duration)]))
+        let queued = try XCTUnwrap(model.queuedRanges.first)
+        XCTAssertEqual(queued.snapshot.assembly, ranges)
+        XCTAssertEqual(try queued.snapshot.plan().duration, duration)
     }
 
     @MainActor
@@ -203,7 +222,7 @@ final class MulticamQueueAndAudioTests: XCTestCase {
         let project = try XCTUnwrap(reopened.project)
         XCTAssertEqual(project.angles.map(\.id), ["wide"])
         XCTAssertEqual(project.audio, .fixed(selection))
-        let audio = try XCTUnwrap(project.plan().audio.first)
+        let audio = try XCTUnwrap(project.plan().audioLanes.first?.spans.first)
         let preview = try XCTUnwrap(MulticamPreviewAudioSpan(span: audio, media: reopened.media))
         XCTAssertEqual(preview.url, donor.standardizedFileURL)
         XCTAssertEqual(preview.ordinal, 1)
@@ -211,8 +230,8 @@ final class MulticamQueueAndAudioTests: XCTestCase {
         let output = directory.appendingPathComponent("sound.mov")
         let exporter = MulticamEngine()
         let resolved = try exporter.resolve(project, output: output, mode: .copy, tracks: .audio)
-        XCTAssertEqual(resolved.mapping.audio, [audio])
-        XCTAssertEqual(resolved.audio.first?.tracks.map(\.index), [selection.stream])
+        XCTAssertEqual(resolved.mapping.audioLanes.first?.spans, [audio])
+        XCTAssertEqual(resolved.audioLanes.first?.segments.first?.tracks.map(\.index), [selection.stream])
         try exporter.write(resolved, to: output)
         XCTAssertEqual(try engine.inspect(output).audio.count, 1)
 
@@ -230,6 +249,106 @@ final class MulticamQueueAndAudioTests: XCTestCase {
         let first = MulticamAudioSelection(source: selection.source, stream: 1)
         XCTAssertTrue(reopened.replaceProgramAudio(with: first))
         XCTAssertEqual(reopened.project?.audio, .fixed(first))
+    }
+
+    @MainActor
+    func testAlignedAuditionUsesSelectedStreamAndExactRelativeOffset() async throws {
+        let url = try fixture("Pause-Noisy", extension: "mov")
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(url)
+        let selected = try XCTUnwrap(media.audio.dropFirst().first)
+        let offset = RationalTime(numerator: 48_001, denominator: 48_000)
+        let point = try RationalTime(numerator: 2).adding(offset)
+        let preview = try replacementAuditionClip(media: media, stream: selected.stream.index,
+                                                   point: point, relativeOffset: offset)
+        XCTAssertEqual(preview.audioTrack, 1)
+        XCTAssertEqual(preview.audioTrackIDs?[1], selected.stream.trackID)
+        XCTAssertEqual(preview.exactStart, .init(numerator: 3, denominator: 2))
+        XCTAssertEqual(preview.exactEnd, .init(numerator: 7, denominator: 2))
+        XCTAssertEqual(preview.audioOrigin, media.origin)
+        XCTAssertTrue(preview.isAudioOnly)
+        XCTAssertThrowsError(try replacementAuditionClip(media: media, stream: -1, point: point, relativeOffset: offset))
+        let composition = try await SequencePreview.makeAudioComposition([preview])
+        let audio = try await composition.loadTracks(withMediaType: .audio)
+        let segment = try XCTUnwrap(audio.first?.segments.first { !$0.isEmpty })
+        XCTAssertEqual(segment.sourceTrackID, selected.stream.trackID)
+        XCTAssertEqual(segment.timeMapping.source.start.seconds, 1.5, accuracy: 0.000_001)
+        XCTAssertEqual(segment.timeMapping.source.duration.seconds, 2, accuracy: 0.000_001)
+    }
+
+    @MainActor
+    func testExistingProgramSoundtrackMustCoverEntireCut() throws {
+        let url = try fixture("Multicam-Delayed-PCM", extension: "mov")
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(url)
+        let audio = try XCTUnwrap(media.audio.first)
+        let source = MulticamSource(id: "camera", file: url.path, audioStream: audio.stream.index)
+        let selection = MulticamAudioSelection(source: source.id, stream: audio.stream.index)
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [.init(source: source, media: media)], opening: source.id, audio: .none)
+        XCTAssertNotNil(model.programAudioCoverageIssue(with: selection))
+        XCTAssertThrowsError(try replacementAuditionClip(media: media, stream: audio.stream.index, point: .zero))
+        XCTAssertTrue(model.edit { $0.assembly = [.init(from: audio.start, to: audio.end)] })
+        XCTAssertNil(model.programAudioCoverageIssue(with: selection))
+    }
+
+    @MainActor
+    func testApplyingTrackReplacementCommitsDraftAndAlignmentAsOneEdit() throws {
+        let camera = try fixture("Pause-Noisy", extension: "mov")
+        let donor = try fixture("Multicam-Delayed-PCM", extension: "mov")
+        let engine = CutEngine(useSidecar: false)
+        let cameraInfo = try engine.inspectMulticamSource(camera)
+        let donorInfo = try engine.inspectMulticamSource(donor)
+        let original = MulticamAudioSelection(source: "close", stream: 2)
+        let external = MulticamEditorModel.SourceDraft(source: .init(id: "incoming", file: donor.path), media: donorInfo)
+        let incoming = MulticamAudioSelection(source: external.id, stream: try XCTUnwrap(donorInfo.audio.first?.stream.index))
+        let relative = RationalTime(numerator: 113, denominator: 48_000)
+
+        let preferences = EditorPreferences()
+        let historyLimit = preferences.historyLimit
+        preferences.historyLimit = 10
+        let model = MulticamEditorModel(preferences: preferences)
+        defer { model.reset(); preferences.historyLimit = historyLimit }
+        model.useAnalysisSidecars = false
+        model.confirmSetup(drafts: [
+            .init(source: .init(id: "wide", file: camera.path), media: cameraInfo),
+            .init(source: .init(id: "close", file: camera.path, audioStream: 2), media: cameraInfo)
+        ], opening: "wide", audio: .fixed(original))
+        model.chooseTrackReplacementAudio(original)
+        XCTAssertEqual(model.trackReplacementTarget, original)
+        XCTAssertTrue(model.project?.audioSources.isEmpty == true)
+
+        XCTAssertTrue(model.byHand {
+            model.replaceTrackAudio(original, with: incoming, external: external,
+                                    relativeOffset: relative, uncovered: .keepOriginal)
+        })
+        let applied = try XCTUnwrap(model.project)
+        let binding = try XCTUnwrap(applied.audioReplacements.first)
+        XCTAssertEqual(applied.audio, .fixed(original))
+        XCTAssertEqual(applied.switches.map(\.angle), ["wide"])
+        XCTAssertEqual(applied.audioSources.map(\.id), [incoming.source])
+        XCTAssertEqual(binding.original, original)
+        XCTAssertEqual(binding.replacement, incoming)
+        XCTAssertEqual(binding.relativeOffset, relative)
+        XCTAssertEqual(binding.uncovered, .keepOriginal)
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = directory.appendingPathComponent("edit.cut")
+        XCTAssertTrue(model.saveProject(to: document))
+        XCTAssertEqual(try MulticamProject.load(from: document).audioReplacements, [binding])
+        model.undo()
+        XCTAssertTrue(model.project?.audioSources.isEmpty == true)
+        XCTAssertTrue(model.project?.audioReplacements.isEmpty == true)
+        model.redo()
+        XCTAssertEqual(model.project?.audioReplacements, [binding])
+        let adjusted = try relative.adding(.init(numerator: 1, denominator: Int64(donorInfo.audio[0].stream.sampleRate)))
+        XCTAssertTrue(model.byHand {
+            model.replaceTrackAudio(original, with: incoming, external: external,
+                                    relativeOffset: adjusted, uncovered: .keepOriginal)
+        })
+        XCTAssertEqual(model.project?.audioReplacements.first?.id, binding.id)
+        XCTAssertEqual(model.project?.audioReplacements.first?.relativeOffset, adjusted)
     }
 
     @MainActor

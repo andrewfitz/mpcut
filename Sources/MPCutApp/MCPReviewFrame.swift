@@ -58,12 +58,12 @@ private struct ReviewPosition: Sendable {
         var result: [String: Any] = ["space": clock, "width": image.width, "height": image.height,
                                     "duration": image.duration.description]
         result["time"] = time?.description
-        result["groupTime"] = group?.description
-        result["playheadSeconds"] = playheadSeconds
-        result["sourceTime"] = image.sourceTime?.description
+        result["group_time"] = group?.description
+        result["playhead_seconds"] = playheadSeconds
+        result["source_time"] = image.sourceTime?.description
         result["occurrence"] = occurrence
-        result["source"] = source
-        result["angle"] = angle
+        result["source_id"] = source
+        result["angle_id"] = angle
         if let still = picture.still {
             result["asset"] = still.asset.id
             result["placement"] = still.placementID
@@ -87,9 +87,17 @@ private struct ProgramReviewManifest: Encodable {
         let from, to: RationalTime?
         let occurrence, source, angle, asset, placement: String?
         let width, height: Int
+
+        private enum CodingKeys: String, CodingKey {
+            case file, space, time, duration, from, to, occurrence, asset, placement, width, height
+            case source = "source_id", angle = "angle_id"
+            case playheadSeconds = "playhead_seconds"
+            case groupTime = "group_time"
+            case sourceTime = "source_time"
+        }
     }
 
-    let version = 1
+    let schemaVersion = 2
     let selection = "program"
     let preset: JPEGPreset
     let frames: [Frame]
@@ -101,6 +109,12 @@ private enum ReviewDecoders {
     static var active = 0
 }
 
+/// A single synchronous position lookup pass uses one project and clock.
+private struct ReviewPlans {
+    var stills: StillTimelinePlan?
+    var assembly: MulticamPlan?
+}
+
 extension ProjectSessions {
     func mcpReviewFrame(arguments: [String: Any], session: ProjectSession,
                         checkAccess: @escaping @MainActor () throws -> Void) async throws -> [String: Any] {
@@ -110,6 +124,11 @@ extension ProjectSessions {
         }
         let time = try (arguments["time"] as? String).map { try RationalTime(parsing: $0) }
         let space = arguments["space"] as? String
+        let project = session.isMulticam ? session.multicam.project.map(CutProject.multicam) : session.editor.stillProject
+        let angle = arguments["angle_id"] as? String
+        if project?.participants.render != nil, angle == nil {
+            throw ParticipantProjectExport.unsupported("Program frame review")
+        }
         guard (time == nil) == (space == nil) else {
             throw MCPCommandError("invalid_arguments", "Supply time and space together, or omit both for the playhead.")
         }
@@ -118,16 +137,21 @@ extension ProjectSessions {
         defer { ReviewDecoders.active -= 1 }
         let revision = session.mcpRevision
         let handle = session.mcpHandle
+        var plans = ReviewPlans()
         let position: ReviewPosition
         if session.isMulticam {
-            position = try multicamReview(session.multicam, time: time, space: space, angle: arguments["angle"] as? String)
+            position = try multicamReview(session.multicam, time: time, space: space,
+                                          angle: angle, plans: &plans)
         } else {
-            guard arguments["angle"] == nil else { throw MCPCommandError("invalid_target", "Angles apply to multicam projects.") }
-            position = try sequenceReview(session.editor, time: time, space: space)
+            guard arguments["angle_id"] == nil else { throw MCPCommandError("invalid_target", "Angles apply to multicam projects.") }
+            position = try sequenceReview(session.editor, time: time, space: space, plans: &plans)
         }
         let picture = position.picture
-        let work = Task.detached(priority: .userInitiated) { try picture.render(preset: .review) }
-        let image = try await withTaskCancellationHandler {
+        let work = Task.detached(priority: .userInitiated) {
+            let image = try picture.render(preset: .review)
+            return (image, image.data.base64EncodedString())
+        }
+        let (image, jpeg) = try await withTaskCancellationHandler {
             try await work.value
         } onCancel: { work.cancel() }
         try checkAccess()
@@ -136,14 +160,16 @@ extension ProjectSessions {
         }
         try picture.validateIdentity()
         var result = position.metadata(for: image)
-        result["jpeg"] = image.data.base64EncodedString()
+        result["jpeg"] = jpeg
         return result
     }
 
-    private func sequenceReview(_ editor: EditorModel, time: RationalTime?, space: String?) throws -> ReviewPosition {
+    private func sequenceReview(_ editor: EditorModel, time: RationalTime?, space: String?,
+                                plans: inout ReviewPlans) throws -> ReviewPosition {
         let project = editor.stillProject
         if project.hasReviewStills {
-            let plan = try project.resolveStills()
+            let plan = try plans.stills ?? project.resolveStills()
+            plans.stills = plan
             let at = time ?? editor.stillReviewTime(in: plan)
             guard space == nil || space == "sequence", let index = plan.pictureIndex(at: at) else {
                 throw MCPCommandError("invalid_target", "Choose a position on the open sequence.")
@@ -154,7 +180,7 @@ extension ProjectSessions {
                                                          document: editor.projectURL, canvas: editor.stillReviewCanvas)
                 let occurrence: String?
                 if case let .source(clipID, _) = span.origin {
-                    occurrence = try editor.stillReviewOccurrence(clipID).id.uuidString
+                    occurrence = try editor.stillReviewOccurrenceID(clipID).uuidString
                 } else {
                     occurrence = nil
                 }
@@ -196,19 +222,23 @@ extension ProjectSessions {
     }
 
     private func multicamReview(_ model: MulticamEditorModel, time: RationalTime?, space: String?,
-                                angle: String?) throws -> ReviewPosition {
+                                angle: String?, plans: inout ReviewPlans) throws -> ReviewPosition {
         guard let project = model.project else { throw MCPCommandError("no_frame", "Open a multicam project.") }
         let clock = space ?? (model.assemblyPreview ? "assembly" : "group")
         if CutProject.multicam(project).hasReviewStills {
-            let context = try model.stillReviewContext(clock: clock, time: time)
+            let context = try model.stillReviewContext(clock: clock, time: time, resolvedPlan: plans.stills)
+            plans.stills = context.plan
             let span = context.plan.spans[context.index]
             let atEnd = context.time == context.plan.duration
             let group: RationalTime?
             let groupRange: MulticamRange?
-            if case let .group(_, range) = span.origin {
+            let occurrence: Int?
+            if case let .group(index, range) = span.origin {
+                occurrence = clock == "assembly" ? index : nil
                 groupRange = range
                 group = try range.from.adding(context.time.subtracting(span.output.from))
             } else {
+                occurrence = nil
                 groupRange = nil
                 group = nil
             }
@@ -217,27 +247,32 @@ extension ProjectSessions {
                 let frame = try context.project.stillReviewFrame(placementID: placement, interval: span.output,
                                                                  document: model.projectURL, canvas: model.stillReviewCanvas)
                 return ReviewPosition(picture: .still(frame), clock: clock, time: addressedTime, group: group,
+                                      occurrence: occurrence.map(String.init),
                                       interval: clock == "group" ? groupRange : span.output)
             }
             guard let group else {
                 throw MCPCommandError("invalid_target", "This insert has no camera or group time.")
             }
-            let selected = angle ?? (atEnd ? project.switches.last(where: { $0.at < group }) : project.selection(at: group))?.angle
-            if let selected, let issue = model.refreshPictureIssue(sourceID: selected) {
+            let selected = angle ?? project.pictureAngle(at: group, in: occurrence, exclusiveEnd: atEnd)
+            guard let selected, let camera = project.pictureSource(for: selected, at: group, exclusiveEnd: atEnd) else {
+                throw MCPCommandError("no_frame", "No camera recording covers this time.")
+            }
+            if let issue = model.refreshPictureIssue(sourceID: camera.id) {
                 throw MCPCommandError("source_needs_review", issue)
             }
-            guard let camera = project.angles.first(where: { $0.id == selected }),
-                  let media = model.media[camera.id], media.hasFullEditIndex else {
+            guard let media = model.media[camera.id], media.hasFullEditIndex else {
                 throw MCPCommandError("no_frame", "Choose an indexed camera in this project.")
             }
             let time = try group.subtracting(camera.offset)
             return ReviewPosition(picture: .video(media, time, exclusiveEnd: atEnd), clock: clock,
-                                  time: addressedTime, group: group, angle: camera.id)
+                                  time: addressedTime, group: group, occurrence: occurrence.map(String.init),
+                                  source: camera.id, angle: selected)
         }
         let group: RationalTime
         let clockTime: RationalTime
         let exclusiveEnd: Bool
         let programAngle: String
+        var occurrence: String?
         if clock == "group", let time {
             guard project.range.contains(time), let selected = project.selection(at: time) else {
                 throw MCPCommandError("invalid_target", "Choose a time within the multicam group.")
@@ -249,39 +284,51 @@ extension ProjectSessions {
         } else {
             guard time == nil || clock == "assembly" else { throw MCPCommandError("invalid_target", "Choose group or assembly time.") }
             let plan: MulticamPlan
-            if time != nil { plan = try project.plan() }
-            else if let current = model.mapping { plan = current }
-            else { throw MCPCommandError("no_frame", "The program preview is unavailable.") }
+            if time != nil {
+                plan = try plans.assembly ?? project.plan()
+                plans.assembly = plan
+            } else if let current = model.mapping {
+                plan = current
+            } else {
+                throw MCPCommandError("no_frame", "The program preview is unavailable.")
+            }
             let at = time ?? model.preview.currentTime()
-            let position = try MulticamStillPosition.at(at, in: plan)
-            guard let active = project.angles.first(where: { $0.id == position.angle }) else {
+            let atEnd = at == plan.duration
+            let index = plan.intervals.lowerBound { $0.output.to > at } - (atEnd ? 1 : 0)
+            guard plan.intervals.indices.contains(index), plan.intervals[index].output.from <= at else {
                 throw MCPCommandError("no_frame", "No active camera at this time.")
             }
-            group = try position.sourceTime.adding(active.offset)
+            let interval = plan.intervals[index]
+            group = try interval.group.from.adding(at.subtracting(interval.output.from))
             clockTime = clock == "group" ? group : at
-            exclusiveEnd = position.exclusiveEnd
-            programAngle = position.angle
+            exclusiveEnd = atEnd
+            programAngle = interval.angle
+            if clock == "assembly" { occurrence = String(interval.assemblyIndex) }
         }
         let selected = angle ?? programAngle
-        if let issue = model.refreshPictureIssue(sourceID: selected) {
+        guard let source = project.pictureSource(for: selected, at: group, exclusiveEnd: exclusiveEnd) else {
+            throw MCPCommandError("no_frame", "No camera recording covers this time.")
+        }
+        if let issue = model.refreshPictureIssue(sourceID: source.id) {
             throw MCPCommandError("source_needs_review", issue)
         }
-        guard let source = project.angles.first(where: { $0.id == selected }),
-              let media = model.media[source.id], media.hasFullEditIndex else {
+        guard let media = model.media[source.id], media.hasFullEditIndex else {
             throw MCPCommandError("no_frame", "Choose an indexed camera in this project.")
         }
         return try ReviewPosition(picture: .video(media, group.subtracting(source.offset), exclusiveEnd: exclusiveEnd),
-                                  clock: clock, time: clockTime, group: group, angle: source.id)
+                                  clock: clock, time: clockTime, group: group, occurrence: occurrence,
+                                  source: source.id, angle: selected)
     }
 }
 
 extension ProjectSessions {
     nonisolated static func writeStill(_ media: MediaInfo, time: RationalTime, exclusiveEnd: Bool = false,
-                                       to output: URL, progress: MCPLiveOutputProgress) throws -> [String: Any] {
+                                       preset: JPEGPreset, to output: URL, progress: MCPLiveOutputProgress) throws -> [String: Any] {
         let frame = try JPEGExport.stillFrameTime(in: media, at: time, exclusiveEnd: exclusiveEnd)
-        try JPEGExport.writeStill(media, at: time, to: output, replacing: nil, exclusiveEnd: exclusiveEnd, cancelled: { Task.isCancelled })
+        try JPEGExport.writeStill(media, at: time, to: output, replacing: nil, exclusiveEnd: exclusiveEnd,
+                                  preset: preset, cancelled: { Task.isCancelled })
         progress.published(output)
-        return ["sourceTime": frame.description, "frames": 1]
+        return ["source_time": frame.description, "frames": 1]
     }
 
     func mcpProgramFrameExport(session: ProjectSession, output: URL, args: [String: Any],
@@ -299,22 +346,23 @@ extension ProjectSessions {
             }
         }
         let requests = mode == "times" ? times.map(Optional.some) : [nil]
+        var plans = ReviewPlans()
         let positions = try requests.map { time in
             if session.isMulticam {
-                return try multicamReview(session.multicam, time: time, space: clock, angle: nil)
+                return try multicamReview(session.multicam, time: time, space: clock, angle: nil, plans: &plans)
             }
-            return try sequenceReview(session.editor, time: time, space: clock)
+            return try sequenceReview(session.editor, time: time, space: clock, plans: &plans)
         }
         let cancelled: @Sendable () -> Bool = { Task.isCancelled }
         if mode == "still", let position = positions.first {
             return { progress in
                 switch position.picture {
                 case .still(let frame):
-                    try frame.write(to: output, cancelled: cancelled)
+                    try frame.write(to: output, preset: preset, cancelled: cancelled)
                     progress.published(output)
                     return ["frames": 1, "placement": frame.placementID, "asset": frame.asset.id]
                 case .video(let media, let time, let end):
-                    return try Self.writeStill(media, time: time, exclusiveEnd: end, to: output, progress: progress)
+                    return try Self.writeStill(media, time: time, exclusiveEnd: end, preset: preset, to: output, progress: progress)
                 }
             }
         }

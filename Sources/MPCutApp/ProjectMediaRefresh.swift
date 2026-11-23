@@ -101,8 +101,11 @@ final class ProjectMediaRefresh {
                 do {
                     let (result, aligned) = try await task.value
                     guard !token.isCancelled, self.token === token else { break }
-                    if let media = result.media,
-                       recording.aliases.contains(where: { !media.identity.isCurrentSnapshot(at: $0) }) {
+                    let expected = result.media?.identity ?? recording.identity
+                    if recording.aliases.contains(where: { url in
+                        if let expected { return !expected.isCurrentSnapshot(at: url) }
+                        return (try? SourceIdentity(url)) != nil
+                    }) {
                         throw CutError(code: "source_changed", message: "The recording changed again during refresh.")
                     }
                     publish(result, recording.aliases, aligned)

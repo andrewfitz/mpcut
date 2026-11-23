@@ -14,10 +14,14 @@ extension EditorModel {
         return selectedID.uuidString
     }
 
+    var historyToken: String {
+        let identity = [mcpGeneration.uuidString, String(historyCursor)] + historyEntryIDs.map(\.uuidString)
+        return Data(SHA256.hash(data: Data(identity.joined(separator: "/").utf8))).base64EncodedString()
+    }
+
     private func mcpHistory() -> [String: Any] {
-        let identity = [String(historyCursor)] + historyEntryIDs.map(\.uuidString)
-        let token = Data(SHA256.hash(data: Data(identity.joined(separator: "/").utf8))).base64EncodedString()
-        return ["actions": historyActions, "cursor": historyCursor, "historyToken": token,
+        let history = projectHistory
+        return ["actions": history.map(\.name), "origins": history.map(\.origin.rawValue), "cursor": historyCursor, "history_token": historyToken,
                 "limit": mcpHistoryLimit, "revision": mcpRevision]
     }
 
@@ -43,11 +47,11 @@ extension EditorModel {
                 throw MCPFailure(code: "editor_busy", message: "Close the sheet in this project window.")
             }
         }
-        if tool != "get_history" { try checkLiveAccess() }
+        if tool != "history_read" { try checkLiveAccess() }
         switch tool {
-        case "get_history":
+        case "history_read":
             return mcpHistory()
-        case "split_at":
+        case "timeline_item_split":
             guard canEdit, !mcpHasActiveTrim else { throw input.busy() }
             let id = try input.occurrence(in: self)
             let sourceTime = try input.sourcePosition(in: self, occurrence: id)
@@ -59,17 +63,17 @@ extension EditorModel {
             }
             let boundary = arguments["space"] as? String == "source" ? outcome.sourceTime : outcome.sequenceTime
             return ["action": "Split Clip", "boundary": boundary.description,
-                    "sequenceTime": outcome.sequenceTime.description, "sourceTime": outcome.sourceTime.description,
+                    "sequence_time": outcome.sequenceTime.description, "source_time": outcome.sourceTime.description,
                     "left": outcome.left.uuidString, "right": outcome.right.uuidString,
-                    "historyRetained": outcome.historyRetained, "revision": outcome.revision]
-        case "undo", "redo", "restore_history":
+                    "history_retained": outcome.historyRetained, "revision": outcome.revision]
+        case "history_undo", "history_redo", "history_state_restore":
             guard !isBusy, alert == nil, !mcpHasActiveTrim else { throw input.busy() }
             let index: Int
             switch tool {
-            case "undo": index = historyCursor - 1
-            case "redo": index = historyCursor + 1
+            case "history_undo": index = historyCursor - 1
+            case "history_redo": index = historyCursor + 1
             default:
-                guard arguments["historyToken"] as? String == mcpHistory()["historyToken"] as? String else {
+                guard arguments["history_token"] as? String == mcpHistory()["history_token"] as? String else {
                     throw MCPFailure(code: "stale_history", message: "Read the current history and select its state again.")
                 }
                 index = try input.integer("index")
@@ -79,7 +83,7 @@ extension EditorModel {
                 moveToHistoryState(index, requestCancellation: cancellation, beforeRestore: checkLiveAccess,
                                    completion: { result in continuation.resume(with: result.map { _ in self.mcpHistory() }) })
             }
-        case "seek":
+        case "timeline_playhead_seek":
             guard canNavigate, !mcpHasActiveTrim else { throw input.busy() }
             if let id = arguments["occurrence"] as? String,
                let still = try stillProject.mcpStillOccurrences().first(where: { $0.insert.id == id }) {
@@ -94,31 +98,31 @@ extension EditorModel {
                 let position = try input.position(in: self, occurrence: occurrence)
                 seek(position.seconds)
             }
-        case "set_playback":
+        case "playback_transport_play", "playback_transport_pause":
             guard canNavigate, !mcpHasActiveTrim else { throw input.busy() }
-            let playing = try input.bool("playing")
+            let playing = tool == "playback_transport_play"
             guard !playing || !preview.hasBlockingIssue else { throw input.invalid("The preview is unavailable.") }
             if preview.isPlaying != playing { preview.togglePlayback() }
-        case "sequence_control":
+        case "sequence_clip_edit", "sequence_range_edit", "timeline_selection_set", "playback_transport_control":
             if let result = try await mcpControl(input, cancellation: cancellation, validateCommit: checkLiveAccess) { return result }
         default:
             return nil
         }
         try mcpCheckNotice()
-        var result: [String: Any] = ["revision": mcpRevision, "playheadSeconds": playhead, "playing": preview.isPlaying,
-                                     "rate": preview.playbackRate, "forwardSpeed": preview.forwardSpeed.rawValue,
-                                     "timelineZoom": timelineZoom, "snap": effectiveSnapTarget.rawValue, "rangeTool": rangeTool]
+        var result: [String: Any] = ["revision": mcpRevision, "playhead_seconds": playhead, "playing": preview.isPlaying,
+                                     "rate": preview.playbackRate, "forward_speed": preview.forwardSpeed.rawValue,
+                                     "timeline_zoom": timelineZoom, "snap": effectiveSnapTarget.rawValue, "range_tool": rangeTool]
         if let mcpTrimPreview, let mcpTrimBoundary {
-            result["trimPreview"] = mcpTrimPreview.uuidString
-            result["sourceTime"] = mcpTrimBoundary.description
-        } else if ["trim", "restoreEdge"].contains(arguments["action"] as? String ?? ""),
+            result["trim_preview"] = mcpTrimPreview.uuidString
+            result["source_time"] = mcpTrimBoundary.description
+        } else if ["trim", "restore_edge"].contains(arguments["action"] as? String ?? ""),
                   let id = (arguments["occurrence"] as? String).flatMap(UUID.init(uuidString:)),
                   let clip = mcpOccurrence(id) {
-            result["sourceTime"] = (arguments["edge"] as? String == "start" ? clip.start : clip.end).description
+            result["source_time"] = (arguments["edge"] as? String == "start" ? clip.start : clip.end).description
         }
-        result["selectedOccurrence"] = mcpSelectedItemID
-        if let markIn { result["markInSeconds"] = markIn }
-        if let markOut { result["markOutSeconds"] = markOut }
+        result["selected_occurrence"] = mcpSelectedItemID
+        if let markIn { result["mark_in_seconds"] = markIn }
+        if let markOut { result["mark_out_seconds"] = markOut }
         return result
     }
 
@@ -131,10 +135,10 @@ extension EditorModel {
 
     private func mcpControl(_ input: SequenceInput, cancellation: EditCancellation, validateCommit: @escaping @MainActor () throws -> Void) async throws -> [String: Any]? {
         let action = try input.string("action")
-        let continuingTrim = ["previewTrim", "trim", "cancelTrim"].contains(action) && mcpTrimPreview != nil &&
-            (input.fields["trimPreview"] as? String).flatMap(UUID.init(uuidString:)) == mcpTrimPreview
+        let continuingTrim = ["preview_trim", "trim", "cancel_trim"].contains(action) && mcpTrimPreview != nil &&
+            (input.fields["trim_preview"] as? String).flatMap(UUID.init(uuidString:)) == mcpTrimPreview
         guard canEdit, !mcpHasActiveTrim || continuingTrim else { throw input.busy() }
-        if input.fields["trimPreview"] != nil && !continuingTrim { throw input.invalid("This trim preview has ended.") }
+        if input.fields["trim_preview"] != nil && !continuingTrim { throw input.invalid("This trim preview has ended.") }
         switch action {
         case "select":
             if let id = input.fields["occurrence"] as? String,
@@ -144,29 +148,29 @@ extension EditorModel {
             } else {
                 select(try input.occurrence(in: self))
             }
-        case "selectRange", "splitRange", "deleteRange":
+        case "select_range", "split_range", "delete_range":
             let from = try input.time("from"), to = try input.time("to")
             guard from >= .zero, to > from, to <= mcpDuration else { throw input.invalid("Supply a nonempty sequence range.") }
             selectRange(from.seconds, to.seconds)
             try mcpCheckNotice()
-            if action == "splitRange" {
+            if action == "split_range" {
                 guard canSplitSelectedRange else { throw input.invalid("Both selection edges are already cuts.") }
                 splitSelectedRange()
-            } else if action == "deleteRange" {
+            } else if action == "delete_range" {
                 guard canActOnRange else { throw input.invalid("The selected range is unavailable.") }
                 deleteSelection()
             }
-        case "markIn", "markOut":
+        case "mark_in", "mark_out":
             let position = try input.position(in: self, occurrence: nil)
             seek(position.seconds)
-            if action == "markIn" { setIn() } else { setOut() }
-        case "clearMarks": clearMarks()
-        case "rangeTool": rangeTool = try input.bool("enabled")
+            if action == "mark_in" { setIn() } else { setOut() }
+        case "clear_marks": clearMarks()
+        case "range_tool": rangeTool = try input.bool("enabled")
         case "snap":
             guard let target = TimelineSnapTarget(rawValue: try input.string("value")),
                   !isAudioOnly || target == .off || target == .silence else { throw input.invalid("Unsupported snap target.") }
             chooseSnapTarget(target)
-        case "copyContainer":
+        case "copy_container":
             let container = try input.string("value")
             let choices = mcpCopyContainers
             guard choices.contains(container) else {
@@ -178,28 +182,28 @@ extension EditorModel {
             let slot = try input.integer("slot")
             guard (0...timelineClips.count).contains(slot) else { throw input.invalid("Invalid insertion slot.") }
             move(try input.occurrence(in: self), to: slot)
-        case "cancelTrim":
+        case "cancel_trim":
             guard continuingTrim else { throw input.invalid("Supply the active trim preview token.") }
             cancelMCPTrimPreview()
-        case "trim", "previewTrim", "restoreEdge":
+        case "trim", "preview_trim", "restore_edge":
             let id = try input.occurrence(in: self)
             guard let clip = mcpOccurrence(id) else { throw input.invalid("Unknown clip.") }
             let edge = try input.edge()
             guard !continuingTrim || mcpTrimMatches(id, edge: edge) else {
                 throw input.invalid("Continue the trim on the same clip occurrence and edge.")
             }
-            let time = action == "restoreEdge" ? (edge == .start ? .zero : clip.sourceDuration) : try input.time("time")
+            let time = action == "restore_edge" ? (edge == .start ? .zero : clip.sourceDuration) : try input.time("time")
             guard time >= .zero, time <= clip.sourceDuration else { throw input.invalid("Trim time is outside this source.") }
-            let preview = action == "previewTrim" ? mcpTrimPreview ?? UUID() : nil
+            let preview = action == "preview_trim" ? mcpTrimPreview ?? UUID() : nil
             guard try await mcpTrim(id, edge: edge, time: time.seconds, preview: preview,
                                     cancellation: cancellation, check: validateCommit) != nil else {
                 if continuingTrim { cancelTrim() }
                 try mcpCheckNotice()
                 throw input.invalid("No valid trim boundary.")
             }
-        case "deleteClip":
+        case "delete_clip":
             deleteClip(try input.occurrence(in: self))
-        case "applyCSV":
+        case "apply_csv":
             let path = try input.string("path")
             guard path.hasPrefix("/"), !path.utf8.contains(0) else { throw input.invalid("Supply an absolute CSV path.") }
             let id = try input.occurrence(in: self)
@@ -228,20 +232,14 @@ extension EditorModel {
             preview.selectPlaybackSpeed(speed)
         case "scrub":
             scrub(try input.position(in: self, occurrence: nil).seconds)
-        case "endScrub": preview.endScrub()
-        case "zoom":
-            let value = try input.number("zoom")
-            guard (0...SequenceTimeline.maximumZoom).contains(value) else { throw input.invalid("Unsupported timeline zoom.") }
-            timelineZoom = value
-        case "fit": timelineZoom = timelineZoom > 0 ? 0 : previousTimelineZoom
-        case "thumbnails": largeThumbnails = try input.bool("enabled")
+        case "end_scrub": preview.endScrub()
         default: throw input.invalid("Unknown sequence action.")
         }
         return nil
     }
 }
 
-private struct SequenceInput {
+struct SequenceInput {
     let fields: [String: Any]
 
     func invalid(_ message: String) -> MCPFailure { MCPFailure(code: "invalid_argument", message: message) }
@@ -257,7 +255,7 @@ private struct SequenceInput {
         return value.doubleValue
     }
     func integer(_ key: String) throws -> Int {
-        guard let value = Int(exactly: try number(key)) else { throw invalid("Supply an integer for \(key).") }
+        guard let value = fields[key].flatMap(mcpInteger) else { throw invalid("Supply an integer for \(key).") }
         return value
     }
     func direction() throws -> Int {

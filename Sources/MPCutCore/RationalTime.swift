@@ -120,7 +120,8 @@ public struct RationalTime: Hashable, Comparable, Codable, Sendable, CustomStrin
     }
 
     public func adding(_ other: Self) throws -> Self {
-        try combining(other, subtract: false)
+        if numerator == 0 { return other }
+        return try combining(other, subtract: false)
     }
 
     public func subtracting(_ other: Self) throws -> Self {
@@ -180,12 +181,14 @@ public struct RationalTime: Hashable, Comparable, Codable, Sendable, CustomStrin
         return Self.product(before, UInt64(later.denominator)) <= Self.product(after, UInt64(earlier.denominator))
     }
 
-    func roundedToSamples(_ sampleRate: Int) throws -> Int64 {
+    package func roundedToSamples(_ sampleRate: Int) throws -> Int64 {
         let scaled = numerator.multipliedFullWidth(by: Int64(sampleRate))
         let magnitude = Self.magnitude(scaled)
         let divisor = UInt64(denominator)
         guard magnitude.high < divisor else { throw Self.overflow }
-        let (whole, remainder) = divisor.dividingFullWidth(magnitude)
+        let (whole, remainder) = magnitude.high == 0
+            ? magnitude.low.quotientAndRemainder(dividingBy: divisor)
+            : divisor.dividingFullWidth(magnitude)
         let (rounded, overflow) = whole.addingReportingOverflow(remainder >= divisor - remainder ? 1 : 0)
         guard !overflow, let result = Self.signed(rounded, negative: scaled.high < 0) else { throw Self.overflow }
         return result

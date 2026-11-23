@@ -32,6 +32,21 @@ final class StillTimelineFormatTests: XCTestCase {
         }
     }
 
+    func testStandaloneEditsValidateTotalFrameCount() throws {
+        let format = StillTimelineFormat(width: 640, height: 480, cadence: .init(numerator: 1),
+                                         codec: .h264, container: "mov")
+        let asset = StillAsset(id: "photo", file: "offline.png", displayName: "Photo", fingerprint: "example")
+        let duration = RationalTime(numerator: Int64(Int32.max))
+        let project = try CutProject.makeStillTimeline(format: format, asset: asset,
+                                                      placementID: "first", duration: duration)
+        let second = StillInsert(id: "second", assetID: asset.id, duration: .init(numerator: 1),
+                                 cadence: format.cadence)
+        XCTAssertThrowsError(try project.insertingStill(second, at: duration)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "invalid_still_time")
+        }
+        XCTAssertEqual(try project.resolveStills().duration, duration)
+    }
+
     func testStandaloneProjectRoundTripPreservesFormatAndColor() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)

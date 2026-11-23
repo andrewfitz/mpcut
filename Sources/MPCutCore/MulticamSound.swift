@@ -2,7 +2,7 @@ import Foundation
 
 extension MulticamEngine {
     func resolveSound(_ mapping: MulticamPlan, sources: [String: MediaInfo],
-                      container: String) throws -> ResolvedEdit {
+                      container: String, spans supplied: [MulticamSpan]? = nil, laneID: String? = nil) throws -> ResolvedEdit {
         let engine = CutEngine(cancelled: cancelled, tracks: .audio)
         var identities: [URL: SourceIdentity] = [:]
         var reference: MediaInfo?
@@ -10,7 +10,7 @@ extension MulticamEngine {
         var segments: [ResolvedSegment] = []
         var silentAAC: [Int: Int] = [:]
         var audibleAAC = Set<Int>()
-        let spans = mapping.audio
+        let spans = supplied ?? mapping.audioLanes.first { $0.id == MulticamPlan.programAudioLaneID }?.spans ?? []
         segments.reserveCapacity(spans.count)
         for (index, span) in spans.enumerated() {
             try engine.checkCancellation()
@@ -95,14 +95,14 @@ extension MulticamEngine {
                                                 tracks: windows, sourceOrigin: selected.origin, reachesEnd: container == "flac" && whole))
                 identities[selected.url] = selected.identity
             } catch let issue as CutError {
-                throw try contextual(issue, span: span, mapping: mapping, index: segment, nearest: [])
+                throw try contextual(issue, span: span, mapping: mapping, index: segment, nearest: [], laneID: laneID)
             }
         }
         // Track index is local to a source. Check for at least one audible
         // presentation across the lane regardless of the source's stream index.
         if audibleAAC.isEmpty, let first = silentAAC.values.min() {
             let issue = CutError(code: "unsafe_boundary", message: "The entire selected AAC program is an empty presentation edit.")
-            throw try contextual(issue, span: spans[first - 1], mapping: mapping, index: first)
+            throw try contextual(issue, span: spans[first - 1], mapping: mapping, index: first, laneID: laneID)
         }
         for (file, identity) in identities { try engine.verifyIdentity(file, identity: identity) }
         return ResolvedEdit(segments: segments, duration: mapping.duration, container: container,

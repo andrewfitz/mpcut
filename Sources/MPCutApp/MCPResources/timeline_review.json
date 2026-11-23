@@ -1,0 +1,122 @@
+[
+  {
+    "name": "timeline_editor_range_map",
+    "description": "Map an exact half-open interval between source and sequence time, or between group and assembly time. Returns all matching pieces in output order, including repeats. Supply a history token and index together to query a retained review state.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "description": "Opaque live document handle from project_windows_list."
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Current live document revision. Pins the request and subsequent pages."
+        },
+        "history_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based state index in the retained history returned by history_read. The cursor selects the current state."
+        },
+        "history_token": {
+          "type": "string",
+          "description": "History token from a fresh history_read."
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Start at this result row. Use next_offset from the previous page."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Maximum result rows per page. Defaults to 100."
+        },
+        "space": {
+          "type": "string",
+          "enum": [
+            "source",
+            "sequence",
+            "group",
+            "assembly"
+          ],
+          "description": "Clock of the queried range."
+        },
+        "from": {
+          "type": "string",
+          "description": "Inclusive rational start time."
+        },
+        "to": {
+          "type": "string",
+          "description": "Exclusive rational end time."
+        },
+        "file": {
+          "type": "string",
+          "description": "Exact playable or original sequence source path. Omit to match every source."
+        },
+        "occurrence_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Limit to one zero-based timeline occurrence in the selected revision."
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "space",
+        "from",
+        "to"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "history_editor_compare",
+    "description": "Compare a retained undo or redo state with the current timeline without moving the history cursor. Reports affected occurrences and their ranges.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "description": "Opaque live document handle from project_windows_list."
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Current live document revision. Pins the request and subsequent pages."
+        },
+        "history_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based state index in the retained history returned by history_read. The cursor selects the current state."
+        },
+        "history_token": {
+          "type": "string",
+          "description": "History token from a fresh history_read."
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Start at this result row. Use next_offset from the previous page."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Maximum result rows per page. Defaults to 100."
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "history_index",
+        "history_token"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

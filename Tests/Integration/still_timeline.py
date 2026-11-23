@@ -3,7 +3,7 @@
 
 Run against the built or packaged CLI with
     python3 Tests/Integration/still_timeline.py /path/to/mpcut
-Fixture creation uses FFmpeg with VideoToolbox and SVT-AV1. The checks also use ffprobe and
+Fixture creation uses FFmpeg with x264, x265, VideoToolbox and SVT-AV1. The checks also use ffprobe and
 AVFoundation readers built by swiftc. Fixtures and exports live in temporary directories.
 """
 import argparse
@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 import unittest
 
-from media_regression import ffmpeg, frames, probe, ratio, run, sample_hashes, timestamped_hashes
+from media_regression import ffmpeg, frames, packets, probe, ratio, run, sample_hashes, timestamped_hashes
 
 CLI = None
 FPS = 24
@@ -57,21 +57,20 @@ class MediaRow:
 
 ROWS = (
     MediaRow("avc", "mp4", "h264", "aac", "bt709",
-             ("-c:v", "h264_videotoolbox", "-profile:v", "high", "-g", "24", "-bf", "0", "-tag:v", "avc1")),
+             ("-c:v", "libx264", "-profile:v", "high", "-g", "24", "-sc_threshold", "0",
+              "-bf", "0", "-tag:v", "avc1")),
     MediaRow("prores", "mov", "prores", "pcm_s16le", "bt709",
              ("-c:v", "prores_videotoolbox", "-profile:v", "standard", "-tag:v", "apcn")),
     *(
         MediaRow(name, "mov", "hevc", "pcm_s16le", transfer,
-                 ("-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-tag:v", "hvc1", "-g", "24", "-bf", "0")
-                 # This fixture represents plain HLG. VideoToolbox can automatically add
-                 # Dolby Vision RPU units when fed HLG.
-                 + (("-bsf:v", "filter_units=remove_types=62|63") if name == "hlg" else ()))
+                 ("-c:v", "libx265", "-profile:v", "main10", "-tag:v", "hvc1",
+                  "-x265-params", "keyint=24:scenecut=0:open-gop=0:bframes=0:pools=none:log-level=error"))
         for name, transfer in (("pq", "smpte2084"), ("hlg", "arib-std-b67"))
     ),
 )
 
 
-def camera(path, row, angle=0, extra_track=False, fps=FPS, seconds=LENGTH):
+def camera(path, row, angle=0, extra_track=False, fps=FPS, seconds=LENGTH, *, dolby_vision=False):
     width, height = SIZE
     marker = "lime" if angle else "red"
     video = f"testsrc2=s={width}x{height}:r={fps}:d={seconds},drawbox=x=0:y=0:w=40:h=30:color={marker}:t=fill"
@@ -84,11 +83,23 @@ def camera(path, row, angle=0, extra_track=False, fps=FPS, seconds=LENGTH):
     args += ["-map", "0:v", "-map", "1:a"]
     if extra_track:
         args += ["-map", "2:a"]
-    pixel_format = {"h264": "nv12", "hevc": "p010le", "prores": "p210le"}[row.codec]
-    ffmpeg(*args, "-vf", row.color_filter, *row.video_flags, "-pix_fmt", pixel_format, *row.color_flags,
+    video_flags = row.video_flags
+    pixel_format = "p210le" if row.codec == "prores" else row.picture_format
+    if dolby_vision:
+        video_flags = ("-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-tag:v", "hvc1", "-g", "24", "-bf", "0")
+        pixel_format = "p010le"
+    ffmpeg(*args, "-vf", row.color_filter, *video_flags, "-pix_fmt", pixel_format, *row.color_flags,
            "-threads", "1", "-c:a", row.sound, "-ar", str(SAMPLE_RATE),
            "-video_track_timescale", str(Fraction(fps).numerator * 1000), "-movflags", "+write_colr", path,
            allow_diagnostics=row.codec == "hevc")
+    # Copy cases cut on a fixed GOP grid and mid-GOP cases need to miss it.
+    if row.codec != "prores" and not dolby_vision:
+        stream = stream_info(path, "v:0")
+        scale = Fraction(stream["time_base"])
+        sync_times = {int(packet["pts"]) * scale for packet in packets(path) if "K" in packet["flags"]}
+        expected = {Fraction(frame, fps) for frame in range(0, int(stream["nb_frames"]), 24)}
+        if sync_times != expected:
+            raise AssertionError(f"Expected sync samples at {sorted(expected)} in {path}, got {sorted(sync_times)}")
 
 
 
@@ -188,20 +199,20 @@ class StillTimelineAcceptance(unittest.TestCase):
 
     def project(self, row, kind, *, sources=None, assembly=None, repeated=False, length=LENGTH, label=None):
         wide, close = self.sources[row.name] if sources is None else sources
-        document = {"format": "mpcut", "schemaVersion": 1, "kind": kind}
+        document = {"format": "mpcut", "schema_version": 3, "kind": kind}
         if kind == "sequence":
             document["clips"] = [{"id": "a", "file": str(wide), "from": "0", "to": str(length)}]
             if repeated:
                 document["clips"].append({**document["clips"][0], "id": "b"})
         else:
             document.update({
-                "referenceAngle": "wide", "range": {"from": "0", "to": str(length)},
+                "reference_angle_id": "wide", "group_range": {"from": "0", "to": str(length)},
                 "angles": [
-                    {"id": "wide", "file": str(wide), "offset": "0", "audioStream": 1},
-                    {"id": "close", "file": str(close), "offset": "0", "audioStream": 1},
+                    {"id": "wide", "file": str(wide), "offset": "0", "audio_stream_index": 1},
+                    {"id": "close", "file": str(close), "offset": "0", "audio_stream_index": 1},
                 ],
-                "audio": {"mode": "fixed", "source": "wide", "stream": 1},
-                "switches": [{"at": "0", "angle": "wide"}, {"at": "3", "angle": "close"}],
+                "audio": {"mode": "fixed", "source_id": "wide", "audio_stream_index": 1},
+                "switches": [{"group_time": "0", "angle_id": "wide"}, {"group_time": "3", "angle_id": "close"}],
             })
             if assembly is not None:
                 document["assembly"] = [{"from": str(lo), "to": str(hi)} for lo, hi in assembly]
@@ -212,22 +223,64 @@ class StillTimelineAcceptance(unittest.TestCase):
 
     def replace(self, base, kind, start, end, *, image=None):
         target = base.with_stem(base.stem + "-replaced")
-        self.cli("still", "add", "--project", base, "--image", image or self.sdr_card, "--replace",
-                 "--clock", "sequence" if kind == "sequence" else "group", "--from", start,
+        self.cli("still", "picture", "replace", "--project", base, "--image", image or self.sdr_card, "--clock", "sequence" if kind == "sequence" else "group", "--from", start,
                  "--to", end, "--out-project", target)
-        self.assertEqual(json.loads(target.read_text())["schemaVersion"], 2)
+        self.assertEqual(json.loads(target.read_text())["schema_version"], 4)
         return target
 
     def insert(self, base, kind, at, *, image=None, count=24, rate=FPS):
         target = base.with_stem(base.stem + "-inserted")
-        self.cli("still", "add", "--project", base, "--image", image or self.sdr_card, "--insert",
-                 "--clock", "sequence" if kind == "sequence" else "assembly", "--at", at,
+        self.cli("still", "placement", "insert", "--project", base, "--image", image or self.sdr_card, "--clock", "sequence" if kind == "sequence" else "assembly", "--at", at,
                  "--frames", count, "--rate", rate, "--out-project", target)
-        self.assertEqual(json.loads(target.read_text())["schemaVersion"], 2)
+        self.assertEqual(json.loads(target.read_text())["schema_version"], 4)
         return target
 
     def export(self, project, output, *args, **options):
-        return self.cli("export", "--project", project, "--output", output, *args, **options)
+        return self.cli("export", "project", "render", "--project", project, "--output", output, *args, **options)
+
+    def test_space_clips_sets_portable_silent_sdr_and_hdr_gaps(self):
+        for row in (r for r in ROWS if r.sound == "pcm_s16le"):
+            for kind in ("sequence", "multicam"):
+                with self.subTest(profile=row.name, timeline=kind):
+                    base = self.project(row, kind, repeated=True, assembly=[(0, 1), (2, 3)])
+                    join = LENGTH if kind == "sequence" else 1
+                    target = base.with_stem(base.stem + "-spaced")
+                    self.cli("timeline", "clips", "space", "--project", base, "--duration", 2, "--background", "#000000",
+                             "--out-project", target)
+                    saved = json.loads(target.read_text())
+                    self.assertEqual(len(saved["still_assets"]), 1)
+                    self.assertEqual(set(saved["still_assets"][0]), {"kind", "id"})
+                    def spacing():
+                        return self.cli("still", "placement", "list", "--project", target)["placements"]
+                    before = spacing()
+                    self.assertEqual(len(before), 1)
+                    self.assertEqual(fraction(before[0]["duration"]), 2)
+                    self.cli("timeline", "clips", "space", "--project", target, "--duration", 1, "--background", "#FFFFFF", "--in-place")
+                    after = spacing()
+                    self.assertEqual([item["id"] for item in after], [before[0]["id"]])
+                    self.assertEqual(fraction(after[0]["authored_range"]["from"]), join)
+                    self.assertEqual(after[0]["framing"]["background"], "#FFFFFF")
+                    output = target.with_suffix(".mov")
+                    report = self.export(target, output, "--require-camera-copy")
+                    self.assertEqual(fraction(report["generated_still_duration"]), 1)
+                    self.assertEqual(fraction(report["encoded_camera_duration"]), 0)
+                    self.assertEqual(stream_info(output, "v:0")["color_transfer"], row.transfer)
+                    # Decode the movie on its presentation clock. Verify seeking
+                    # independently using the native reader used by the desktop app.
+                    values = ffmpeg("-i", output, "-ss", str(join + 0.5), "-frames:v", "1", "-vf", "extractplanes=y",
+                                    "-pix_fmt", "gray10le" if row.hdr else "gray", "-f", "rawvideo", "-")
+                    luma = array("H", values) if row.hdr else values
+                    self.assertEqual(len(luma), SIZE[0] * SIZE[1])
+                    white = {"prores": 235, "pq": 572, "hlg": 721}[row.name]
+                    self.assertLess(max(abs(value - white) for value in luma), 10)
+                    native = self.fixtures / "DecodeFrameIDs"
+                    self.assertEqual(run([native, output, str(join * 25)]), run([native, output])[join * FPS:])
+                    audio = decoded_audio(output)
+                    start, end = join * SAMPLE_RATE * 4, (join + 1) * SAMPLE_RATE * 4
+                    self.assertEqual(audio[start:end], bytes(end - start))
+                    self.assertTrue(any(audio[:start]) and any(audio[end:]))
+                    self.cli("timeline", "clips", "space", "--project", target, "--duration", 0, "--in-place")
+                    self.assertEqual(spacing(), [])
 
     def test_vfr_replacement_and_short_final_insert_sample(self):
         row = next(row for row in ROWS if row.name == "prores")
@@ -240,8 +293,7 @@ class StillTimelineAcceptance(unittest.TestCase):
         start, end = Fraction(3, 25), Fraction(9, 25)
         replaced = self.replace(base, "sequence", start, end)
         inserted = self.root / "inserted.cut"
-        self.cli("still", "add", "--project", replaced, "--image", self.sdr_card, "--insert",
-                 "--clock", "sequence", "--at", end, "--duration", "3/50", "--rate", 25,
+        self.cli("still", "placement", "insert", "--project", replaced, "--image", self.sdr_card, "--clock", "sequence", "--at", end, "--duration", "3/50", "--rate", 25,
                  "--out-project", inserted)
 
         def samples(file):
@@ -276,6 +328,23 @@ class StillTimelineAcceptance(unittest.TestCase):
                     self.assertEqual(len(native), len(expected))
                     self.assertEqual(run([decoder, output, "3"]), native[2:])
 
+    def test_nested_replacement_uses_the_reference_recording_covering_its_range(self):
+        row = next(row for row in ROWS if row.name == "prores")
+        base = self.project(row, "multicam")
+        document = json.loads(base.read_bytes())
+        primary = document["angles"][0]
+        primary["additional_recordings"] = [{"id": "second", "file": primary["file"], "offset": "4",
+                                            "group_coverage": {"from": "4", "to": "6"}}]
+        primary.update(file="offline-first-part.mov", group_coverage={"from": "0", "to": "4"})
+        document["audio"] = {"mode": "none"}
+        base.write_text(json.dumps(document))
+        replaced = self.replace(base, "multicam", 4, 5)
+        request = {"output": str(self.root / "nested.mov"), "tracks": "video",
+                   "clips": [{"project_path": str(replaced), "from": "4", "to": "6"}]}
+        plan = self.cli("export", "clips", "join", "--dry-run", "--stdin", stdin=json.dumps(request))
+        self.assertEqual(fraction(plan["generated_still_duration"]), 1)
+        self.assertEqual(fraction(plan["copied_camera_duration"]), 1)
+
     def test_nested_multicam_group_clip_excludes_assembly_insert(self):
         row = next(row for row in ROWS if row.name == "prores")
         base = self.project(row, "multicam", assembly=[(2, 4), (2, 4)])
@@ -283,23 +352,23 @@ class StillTimelineAcceptance(unittest.TestCase):
         assembled = self.insert(group, "multicam", 2)
         direct = self.export(assembled, self.root / "assembled.mov", "--dry-run")
         self.assertEqual(fraction(direct["duration"]), 5)
-        self.assertEqual(fraction(direct["generatedStillDuration"]), 3)
+        self.assertEqual(fraction(direct["generated_still_duration"]), 3)
 
         recording = self.sources[row.name][0]
         request = {"output": str(self.root / "nested.mov"), "clips": [
             {"file": str(recording), "to": "1"},
-            {"project": str(assembled), "from": "2", "to": "4"},
+            {"project_path": str(assembled), "from": "2", "to": "4"},
         ], "order": [2, 1, 2, 2]}
-        nested = self.cli("export", "--dry-run", "--stdin", stdin=json.dumps(request))
+        nested = self.cli("export", "clips", "join", "--dry-run", "--stdin", stdin=json.dumps(request))
         self.assertEqual(nested["mode"], "smart")
         self.assertEqual(fraction(nested["duration"]), 7)
-        self.assertEqual(fraction(nested["generatedStillDuration"]), 3)
-        rendered = self.cli("export", "--stdin", stdin=json.dumps(request))
+        self.assertEqual(fraction(nested["generated_still_duration"]), 3)
+        rendered = self.cli("export", "clips", "join", "--stdin", stdin=json.dumps(request))
         self.assertEqual(rendered["picture"], nested["picture"])
         output = Path(request["output"])
         self.assertEqual(duration(stream_info(output, "v:0")), 7)
-        self.assertEqual(fraction(rendered["copiedCameraDuration"]), 4)
-        self.assertEqual(fraction(rendered["encodedCameraDuration"]), 0)
+        self.assertEqual(fraction(rendered["copied_camera_duration"]), 4)
+        self.assertEqual(fraction(rendered["encoded_camera_duration"]), 0)
         close = self.sources[row.name][1]
         expected_packets = {
             offset + time - start: digest
@@ -318,28 +387,27 @@ class StillTimelineAcceptance(unittest.TestCase):
         base = self.project(row, "multicam", assembly=[(0, 1), (0, 1)])
         assembled = self.insert(base, "multicam", 1)
         output = self.root / "retained.mov"
-        options = ("silence", "--project", assembled, "--threshold-db", "-40",
-                   "--min-pause", "0.07", "--leave", "0", "--output", output)
+        options = ("silence", "plan", "--project", assembled, "--threshold-db", "-40",
+                   "--min-pause-seconds", "0.07", "--padding-per-side-seconds", "0", "--output", output)
         report = self.cli(*options, "--dry-run")
         self.assertEqual(fraction(report["duration"]), 3)
         self.assertEqual(len(report["cards"]), 1)
         card = report["cards"][0]
-        self.assertEqual(card["assemblyIndex"], 1)
+        self.assertEqual(card["assembly_index"], 1)
         self.assertEqual(fraction(card["output"]["from"]), 1)
-        self.assertEqual(fraction(card["retainedOutput"]["to"]) - fraction(card["retainedOutput"]["from"]), 1)
-        removed = fraction(report["removedDuration"])
+        self.assertEqual(fraction(card["retained_output"]["to"]) - fraction(card["retained_output"]["from"]), 1)
+        removed = fraction(report["removed_duration"])
         self.assertGreater(removed, 0)
-        self.assertLess(fraction(card["retainedOutput"]["from"]), 1)
-        self.assertEqual(fraction(report["retainedDuration"]), 3 - removed)
-        self.assertTrue(all(item["assemblyIndex"] != 1 for item in report["pauses"]))
-        self.assertEqual(fraction(report["stillPreflight"]["generatedStillDuration"]), 1)
+        self.assertLess(fraction(card["retained_output"]["from"]), 1)
+        self.assertEqual(fraction(report["retained_duration"]), 3 - removed)
+        self.assertTrue(all(item["assembly_index"] != 1 for item in report["pauses"]))
+        self.assertEqual(fraction(report["still_preflight"]["generated_still_duration"]), 1)
 
     def test_constant_rate_rejects_fractional_insert_frame(self):
         row = next(row for row in ROWS if row.name == "prores")
         base = self.project(row, "sequence")
         inserted = self.root / "fractional.cut"
-        self.cli("still", "add", "--project", base, "--image", self.sdr_card, "--insert",
-                 "--clock", "sequence", "--at", 1, "--duration", "1/16", "--rate", 24,
+        self.cli("still", "placement", "insert", "--project", base, "--image", self.sdr_card, "--clock", "sequence", "--at", 1, "--duration", "1/16", "--rate", 24,
                  "--out-project", inserted)
         output = self.root / "unsupported.mov"
         failure = self.export(inserted, output, "--tracks", "video", "--dry-run", ok=False)
@@ -401,12 +469,12 @@ class StillTimelineAcceptance(unittest.TestCase):
 
     def assert_report(self, report, copied, generated):
         self.assertEqual(report["mode"], "smart")
-        self.assertEqual(fraction(report["copiedCameraDuration"]), copied)
-        self.assertEqual(fraction(report["encodedCameraDuration"]), 0)
-        self.assertEqual(fraction(report["generatedStillDuration"]), generated)
+        self.assertEqual(fraction(report["copied_camera_duration"]), copied)
+        self.assertEqual(fraction(report["encoded_camera_duration"]), 0)
+        self.assertEqual(fraction(report["generated_still_duration"]), generated)
         self.assertEqual(fraction(report["duration"]), copied + generated)
-        self.assertEqual(fraction(report["copiedVideoDuration"]), copied)
-        self.assertEqual(fraction(report["encodedVideoDuration"]), generated)
+        self.assertEqual(fraction(report["copied_video_duration"]), copied)
+        self.assertEqual(fraction(report["encoded_video_duration"]), generated)
 
     def assert_card(self, output, row, at, hdr=False):
         steps = luma_at(output, at, high_depth=row.hdr)
@@ -485,22 +553,22 @@ class StillTimelineAcceptance(unittest.TestCase):
         copied = LENGTH - generated if operation == "replace" else LENGTH
         for report in (planned, written):
             self.assert_report(report, copied, generated)
-        self.assertEqual({**planned, "dryRun": False}, written)
+        self.assertEqual({**planned, "dry_run": False}, written)
         self.assert_picture(output, row, reference, parts)
         self.assert_card(output, row, at + Fraction(1, 2), hdr=row.hdr and operation != "replace")
         if video_only:
             self.assertEqual(probe(output, "-select_streams", "a", "-show_streams").get("streams", []), [])
         elif operation == "replace":
-            self.assertEqual(written["soundActions"][0]["audio"], "copy")
+            self.assertEqual(written["sound_actions"][0]["audio"], "copy")
             self.assertEqual(decoded_audio(output), decoded_audio(reference))
             native_audio = self.fixtures / "DecodeAudio"
             self.assertEqual(run([native_audio, output]), run([native_audio, reference]))
             if row.sound == "aac":
                 self.assertEqual(sample_hashes(output, "a:0"), sample_hashes(reference, "a:0"))
         else:
-            action = written["soundActions"][0]
+            action = written["sound_actions"][0]
             self.assertEqual(action["audio"], "aac" if row.sound == "aac" else "pcm")
-            self.assertTrue(action["generatedSilence"])
+            self.assertTrue(action["generated_silence"])
             self.assert_inserted_sound(reference, output, row, at)
 
     def check_media_matrix(self, row):
@@ -563,6 +631,8 @@ class StillTimelineAcceptance(unittest.TestCase):
                 self.assertEqual(info["side_data_list"], [display])
                 if mode == "smart":
                     self.assertEqual(sample_hashes(output)[FPS:], sample_hashes(camera_path))
+                    inspected = self.cli("media", "inspect", "--keyframes", output)["media"]
+                    self.assertIsNone(inspected.get("copy_issue"))
 
     def test_hdr10_embedded_content_light_requires_conversion(self):
         row = ROWS[2]
@@ -587,8 +657,8 @@ class StillTimelineAcceptance(unittest.TestCase):
     def test_dynamic_dolby_vision_without_a_verified_alternative(self):
         row = ROWS[3]
         source = self.root / "dolby-vision.mov"
-        dynamic_row = MediaRow(row.name, row.extension, row.codec, row.sound, row.transfer, row.video_flags[:-2])
-        camera(source, dynamic_row)
+        # VideoToolbox automatically adds Dolby Vision RPU units to this HLG input.
+        camera(source, row, dolby_vision=True)
         base = self.project(row, "sequence", sources=(source, source))
         project = self.insert(base, "sequence", 0)
         output = self.root / "dynamic-hlg.mov"
@@ -624,6 +694,20 @@ class StillTimelineAcceptance(unittest.TestCase):
                 self.assertFalse(result["error"].get("alternatives"))
         self.assertFalse(output.exists())
 
+    def test_unregistered_hevc_sei_can_contain_hdr10plus_identifier(self):
+        row = ROWS[2]
+        camera = self.sources[row.name][0]
+        source = self.root / "unregistered-sei.mov"
+        # Use the registered HDR10+ identifier as the prefix of a type 5
+        # user_data_unregistered UUID.
+        payload = bytes.fromhex("b5003c000104123456789abcdef01234") + b"camera note"
+        camera_with_hevc_sei(camera, source, 5, payload)
+        base = self.project(row, "sequence", sources=(source, source))
+        project = self.insert(base, "sequence", 0)
+        output = self.root / "unregistered-sei-title.mov"
+        self.export(project, output, "--require-camera-copy", "--tracks", "video")
+        self.assertEqual(sample_hashes(output)[FPS:], sample_hashes(source))
+
     def test_mid_gop_requires_camera_boundary_review(self):
         row = ROWS[0]
         base = self.project(row, "sequence")
@@ -631,21 +715,25 @@ class StillTimelineAcceptance(unittest.TestCase):
         output = self.root / "mid-gop.mp4"
         refused = self.export(project, output, "--require-camera-copy", "--tracks", "video", "--dry-run", ok=False)
         self.assertEqual(refused["error"]["code"], "camera_copy_required")
-        adjustments = refused["error"]["stillBoundaryAdjustments"]
+        adjustments = refused["error"]["still_boundary_adjustments"]
         self.assertTrue(adjustments)
         for adjustment in adjustments:
             self.assertEqual(adjustment["boundary"], "end")
-            self.assertEqual(fraction(adjustment["requestedTime"]), Fraction(7, 2))
-            self.assertEqual(fraction(adjustment["adjustedTime"]) - Fraction(7, 2),
-                             fraction(adjustment["durationChange"]))
+            self.assertEqual(fraction(adjustment["requested_time"]), Fraction(7, 2))
+            self.assertEqual(fraction(adjustment["adjusted_time"]) - Fraction(7, 2),
+                             fraction(adjustment["duration_change"]))
         self.assertFalse(output.exists())
         report = self.export(project, output, "--mode", "smart", "--tracks", "video")
-        self.assertGreater(fraction(report["encodedCameraDuration"]), 0)
-        self.assertEqual(fraction(report["generatedStillDuration"]), Fraction(3, 2))
+        self.assertGreater(fraction(report["encoded_camera_duration"]), 0)
+        self.assertEqual(fraction(report["generated_still_duration"]), Fraction(3, 2))
         self.assertEqual(duration(stream_info(output, "v:0")), LENGTH)
         decoded = frames(output)
         self.assertEqual(len(decoded), LENGTH * FPS)
         self.assert_card(output, row, 3)
+        retained = {at: digest for at, digest in timestamped_hashes(self.sources[row.name][0])
+                    if at < 2 or at >= 4}
+        actual = dict(timestamped_hashes(output))
+        self.assertEqual({at: actual[at] for at in retained}, retained)
         for seam in (2, Fraction(7, 2)):
             self.assertEqual(frames(output, seek=float(seam - Fraction(1, 4 * FPS)))[0], decoded[int(seam * FPS)])
 
@@ -658,13 +746,13 @@ class StillTimelineAcceptance(unittest.TestCase):
                 flags = ["--tracks", "video", "--dry-run"]
                 strict = self.export(project, output, "--require-camera-copy", *flags, ok=False)["error"]
                 self.assertEqual(strict["code"], "camera_copy_required")
-                self.assertTrue(strict["stillBoundaryAdjustments"])
+                self.assertTrue(strict["still_boundary_adjustments"])
                 smart = self.export(project, output, "--mode", "smart", *flags, ok=False)["error"]
-                self.assertTrue(smart["stillBoundaryAdjustments"])
+                self.assertTrue(smart["still_boundary_adjustments"])
                 self.assertFalse(output.exists())
                 written = self.export(project, output, "--mode", "encode", "--video", "hevc", "--tracks", "video")
-                self.assertEqual(fraction(written["encodedCameraDuration"]), Fraction(9, 2))
-                self.assertEqual(fraction(written["generatedStillDuration"]), Fraction(3, 2))
+                self.assertEqual(fraction(written["encoded_camera_duration"]), Fraction(9, 2))
+                self.assertEqual(fraction(written["generated_still_duration"]), Fraction(3, 2))
                 self.assertEqual(duration(stream_info(output, "v:0")), LENGTH)
                 self.assertEqual(len(frames(output)), LENGTH * FPS)
 
@@ -681,8 +769,8 @@ class StillTimelineAcceptance(unittest.TestCase):
                 base = self.project(row, "sequence", sources=(source, source), label=label)
                 if source == replacement:
                     document = json.loads(base.read_text())
-                    document["clips"][0].update(originalFile=str(two_tracks), audioTrack=1,
-                                                replacementNames={"1": "Close microphone"})
+                    document["clips"][0].update(original_file=str(two_tracks), track_ordinal=1,
+                                                replacement_names={"1": "Close microphone"})
                     base.write_text(json.dumps(document))
                 covered = self.replace(base, "sequence", 2, 4)
                 reference = self.root / f"{label}-reference.mp4"
@@ -800,8 +888,8 @@ class StillTimelineAcceptance(unittest.TestCase):
         self.assertLess(max(outside_left, outside_right), 30)
         self.assertGreater(center, 220)
 
-        report = self.cli("still", "list", "--project", project)
-        self.cli("still", "update", "--project", project, "--placement", report["placements"][0]["id"],
+        report = self.cli("still", "placement", "list", "--project", project)
+        self.cli("still", "placement", "update", "--project", project, "--placement", report["placements"][0]["id"],
                  "--fit", "fill", "--crop-x", "1/10", "--crop-y", "1/10", "--in-place")
         output = self.root / "fill.mov"
         self.export(project, output, "--require-camera-copy", "--tracks", "video")
@@ -815,17 +903,17 @@ class StillTimelineAcceptance(unittest.TestCase):
         # Retain the exact authored placement and occurrence ID while changing its
         # current trim, as a sequence editor does.
         document.pop("history", None)
-        document["clips"][0]["source"]["to"] = "3"
+        document["clips"][0]["to"] = "3"
         trimmed = self.root / "trimmed.cut"
         trimmed.write_text(json.dumps(document))
-        listed = self.cli("still", "list", "--project", trimmed)["placements"][0]
-        self.assertEqual(fraction(listed["visibleDuration"]), 0)
-        self.assertEqual(len(listed["authoredFragments"]), 1)
+        listed = self.cli("still", "placement", "list", "--project", trimmed)["placements"][0]
+        self.assertEqual(fraction(listed["visible_duration"]), 0)
+        self.assertEqual(len(listed["authored_fragments"]), 1)
         trimmed_output = self.root / "trimmed.mov"
         hidden = self.export(trimmed, trimmed_output, "--tracks", "video")
         self.assertEqual(fraction(hidden["duration"]), 3)
         self.assert_picture(trimmed_output, row, self.sources[row.name][0], [(0, 3)])
-        document["clips"][0]["source"]["to"] = str(LENGTH)
+        document["clips"][0]["to"] = str(LENGTH)
         widened = self.root / "widened.cut"
         widened.write_text(json.dumps(document))
         widened_output = self.root / "widened.mov"
@@ -860,12 +948,64 @@ class StillTimelineAcceptance(unittest.TestCase):
         planned = self.export(project, output, *arguments, "--dry-run")
         self.assert_report(planned, copied=4, generated=2)
         from_document = self.export("-", output, *arguments, "--dry-run", stdin=project.read_text())
-        from_request = self.cli("export", "--stdin", "--dry-run",
-                                stdin=json.dumps({"project": str(project), "output": str(output),
+        from_request = self.cli("export", "project", "render", "--stdin", "--dry-run",
+                                stdin=json.dumps({"project_path": str(project), "output": str(output),
                                                   "mode": "smart", "tracks": "video"}))
         self.assertEqual(planned, from_document)
         self.assertEqual(planned, from_request)
         self.assertFalse(output.exists())
+
+    def test_smart_prores_offers_mov_when_mp4_cannot_preserve_camera(self):
+        row = next(row for row in ROWS if row.name == "prores")
+        project = self.replace(self.project(row, "sequence"), "sequence", 2, 4)
+        output = self.root / "camera-copy.mp4"
+        failure = self.export(project, output, "--mode", "smart", "--audio", "remove",
+                              "--require-camera-copy", "--dry-run", ok=False)["error"]
+        alternate = next(item for item in failure["alternatives"] if item["mode"] == "smart")
+        self.assertEqual(alternate["container"], "mov")
+        self.assertIn("--require-camera-copy", alternate["arguments"])
+        planned = self.export(project, output.with_suffix(".mov"), *alternate["arguments"], "--dry-run")
+        self.assert_report(planned, copied=4, generated=2)
+        self.assertEqual(planned["sound_actions"], [])
+
+    def test_prores_encode_offers_mov_for_an_incompatible_container(self):
+        row = next(row for row in ROWS if row.name == "prores")
+        project = self.replace(self.project(row, "sequence"), "sequence", 2, 4)
+        output = self.root / "conversion.mp4"
+        failure = self.export(project, output, "--mode", "encode", "--video", "prores", "--tracks", "video",
+                              "--dry-run", ok=False)["error"]
+        alternate = next(item for item in failure["alternatives"] if item["mode"] == "encode")
+        self.assertEqual(alternate["container"], "mov")
+        self.assertEqual(alternate["codec"], "prores")
+        planned = self.export(project, output.with_suffix(".mov"), *alternate["arguments"], "--dry-run")
+        self.assertEqual(fraction(planned["copied_camera_duration"]), 0)
+        self.assertEqual(fraction(planned["encoded_camera_duration"]), 4)
+        self.assertEqual(fraction(planned["generated_still_duration"]), 2)
+
+    def test_encode_preflight_rejects_inexact_constant_rate_still_clock(self):
+        row = next(row for row in ROWS if row.name == "prores")
+        project = self.insert(self.project(row, "sequence"), "sequence", 2, count=3, rate="30001/1000")
+        output = self.root / "inexact-clock.mov"
+        failure = self.export(project, output, "--mode", "encode", "--tracks", "video",
+                              "--video", "prores", "--dry-run", ok=False)["error"]
+        self.assertEqual(failure["code"], "unsupported_still_timing")
+        self.assertFalse(output.exists())
+
+    def test_still_export_refuses_unsupported_sound_formats(self):
+        row = next(row for row in ROWS if row.name == "prores")
+        mixed = self.replace(self.project(row, "sequence"), "sequence", 2, 4)
+        standalone = self.root / "standalone.cut"
+        self.cli("still", "project", "create", "--out-project", standalone, "--image", self.sdr_card,
+                 "--width", SIZE[0], "--height", SIZE[1], "--rate", FPS,
+                 "--codec", "prores", "--container", "mov", "--color", "sdr", "--frames", FPS)
+        output = self.root / "unsupported-sound.mov"
+        for project in (mixed, standalone):
+            for audio in ("mp3", "flac"):
+                with self.subTest(project=project.name, audio=audio):
+                    failure = self.export(project, output, "--mode", "smart", "--audio", audio,
+                                          "--dry-run", ok=False)["error"]
+                    self.assertEqual(failure["code"], "unsupported_audio")
+                    self.assertFalse(output.exists())
 
     def test_hdr_full_conversion(self):
         for row in (row for row in ROWS if row.hdr):
@@ -876,9 +1016,9 @@ class StillTimelineAcceptance(unittest.TestCase):
                     project = self.insert(project, kind, 0, image=self.hdr_cards[row.name])
                     output = self.root / f"{row.name}-{kind}-converted.mov"
                     report = self.export(project, output, "--mode", "encode", "--video", "hevc", "--tracks", "video")
-                    self.assertEqual(fraction(report["copiedCameraDuration"]), 0)
-                    self.assertEqual(fraction(report["encodedCameraDuration"]), 4)
-                    self.assertEqual(fraction(report["generatedStillDuration"]), 3)
+                    self.assertEqual(fraction(report["copied_camera_duration"]), 0)
+                    self.assertEqual(fraction(report["encoded_camera_duration"]), 4)
+                    self.assertEqual(fraction(report["generated_still_duration"]), 3)
                     picture = stream_info(output, "v:0")
                     self.assertEqual((picture["pix_fmt"], picture.get("color_transfer")), ("yuv420p10le", row.transfer))
                     self.assertEqual(duration(picture), 7)

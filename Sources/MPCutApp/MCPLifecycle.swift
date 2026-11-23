@@ -27,19 +27,19 @@ extension ProjectSessions {
             }
         }
         switch tool {
-        case "get_native_operations", "cancel_native_operation":
+        case "project_operations_list", "project_operation_cancel":
             return try mcpNativeOperations(tool: tool, arguments: arguments, session: session)
-        case "get_preferences":
+        case "preferences_read":
             return preferences.mcpValues
-        case "set_preference":
+        case "preferences_set":
             try preferences.mcpSet(arguments)
             return preferences.mcpValues
-        case "list_drafts":
+        case "project_drafts_list":
             return ["drafts": try ProjectDraft.recoverable().map { url -> [String: Any] in
                 let date = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-                return ["path": url.path, "modified": date?.ISO8601Format() as Any? ?? NSNull()]
+                return ["draft_path": url.path, "modified": date?.ISO8601Format() as Any? ?? NSNull()]
             }]
-        case "new_project":
+        case "project_create":
             let kind = arguments["kind"] as? String ?? "sequence"
             guard ["sequence", "multicam"].contains(kind) else { throw lifecycleInvalid("Unknown editor kind.") }
             let urls = try inputMedia(arguments, required: kind == "multicam")
@@ -51,18 +51,17 @@ extension ProjectSessions {
             }
             if let accessError { throw accessError }
             return lifecycleState(target)
-        case "open_project", "recover_project":
-            let url = try Self.resolvedProjectURL(projectPath(arguments))
-            if tool == "recover_project" {
+        case "project_open", "project_draft_recover":
+            let url = try Self.resolvedProjectURL(localPath(arguments[tool == "project_draft_recover" ? "draft_path" : "project_path"]))
+            if tool == "project_draft_recover" {
                 guard try ProjectDraft.recoverable().contains(where: { Self.sameFile($0, url) }) else {
                     throw MCPFailure("draft_unavailable", "List recoverable drafts and use a returned draft path.")
                 }
             }
-            let existing = project(at: url)
-            let target = try openProjectAtURL(url, in: nil, commitCheck: commitCheck)
+            let (target, reused) = try openResolvedProject(url, in: nil, commitCheck: commitCheck)
             let opening = target.isMulticam ? target.multicam.openingProjectURL : target.editor.openingProjectURL
             if opening != nil {
-                try await waitForLoad(target, worker: target.activeMCPWorker, owned: existing == nil, checkAccess: checkAccess)
+                try await waitForLoad(target, worker: target.activeMCPWorker, owned: !reused, checkAccess: checkAccess)
             }
             if let accessError { throw accessError }
             let installed = target.isMulticam ? target.multicam.projectURL ?? target.multicam.draft.url
@@ -72,14 +71,14 @@ extension ProjectSessions {
                                  ?? "The project did not finish opening.")
             }
             return lifecycleState(target)
-        case "add_media", "save_project", "close_project", "focus_project", "show_history",
-             "set_video_monitor", "get_multicam_setup", "multicam_setup", "dismiss_notice":
+        case "project_media_add", "project_save", "project_close", "project_window_focus", "history_panel_show",
+             "playback_monitor_visibility_set", "multicam_setup_read", "multicam_setup_confirm", "multicam_setup_dismiss", "workspace_notice_dismiss":
             guard let session else { throw lifecycleInvalid("Supply a project handle.") }
-            if ["multicam_setup", "get_multicam_setup"].contains(tool) {
-                return try setupMCPMulticam(session, arguments: arguments, inspect: tool == "get_multicam_setup")
+            if ["multicam_setup_confirm", "multicam_setup_dismiss", "multicam_setup_read"].contains(tool) {
+                return try setupMCPMulticam(session, arguments: arguments, tool: tool)
             }
             switch tool {
-            case "add_media":
+            case "project_media_add":
                 guard !session.hasLifecycleModal else { throw lifecycleBusy() }
                 let urls = try inputMedia(arguments, required: true)
                 let index = try arguments["index"].map { try lifecycleInteger($0, "index") }
@@ -88,22 +87,21 @@ extension ProjectSessions {
                 }
                 catch { throw accessError ?? error }
                 if let accessError { throw accessError }
-            case "save_project":
+            case "project_save":
                 try writeMCPProject(session, arguments: arguments)
-            case "close_project":
+            case "project_close":
                 return try closeMCPProject(session, arguments: arguments)
-            case "dismiss_notice":
+            case "workspace_notice_dismiss":
                 let message = session.isMulticam ? session.multicam.notice?.message : session.editor.alert?.message
                 guard let message, message == arguments["message"] as? String else {
                     throw MCPFailure("notice_changed", "Read the current notice from editor state.")
                 }
                 if session.isMulticam { session.multicam.notice = nil }
                 else { session.editor.dismissNotice() }
-            case "focus_project":
+            case "project_window_focus":
                 guard let window = session.window else { throw lifecycleBusy() }
-                if window.isMiniaturized { window.deminiaturize(nil) }
-                window.makeKeyAndOrderFront(nil)
-            case "set_video_monitor":
+                focusProjectWindow(window)
+            case "playback_monitor_visibility_set":
                 guard let visible = lifecycleBool(arguments["visible"]) else { throw lifecycleInvalid("Supply visible.") }
                 if visible { session.showMonitor() } else { session.monitor?.close() }
             default:
@@ -120,10 +118,10 @@ extension ProjectSessions {
 
     private func lifecycleState(_ session: ProjectSession) -> [String: Any] {
         let url = session.isMulticam ? session.multicam.projectURL : session.editor.projectURL
-        return ["project": session.mcpHandle, "revision": session.mcpRevision,
+        return ["project_handle": session.mcpHandle, "revision": session.mcpRevision,
                 "kind": session.isMulticam ? "multicam" : "sequence",
-                "dirty": session.hasUnsavedDocument, "path": url?.path as Any? ?? NSNull(),
-                "setupPending": !session.multicam.setup.isEmpty, "monitorVisible": session.monitor?.isVisible == true]
+                "dirty": session.hasUnsavedDocument, "project_path": url?.path as Any? ?? NSNull(),
+                "setup_pending": !session.multicam.setup.isEmpty, "monitor_visible": session.monitor?.isVisible == true]
     }
 
     private func waitForLoad(_ session: ProjectSession, worker: MCPNativeOperation?, owned: Bool,
@@ -174,7 +172,7 @@ extension ProjectSessions {
         guard !session.hasLifecycleModal else { throw lifecycleBusy() }
         let current = session.isMulticam ? session.multicam.projectURL : session.editor.projectURL
         let url: URL
-        if arguments["path"] != nil { url = try projectPath(arguments) }
+        if let path = arguments["project_path"] { url = try localPath(path) }
         else if let current { url = current }
         else { throw lifecycleInvalid("Supply a destination path for this untitled project.") }
         guard url.pathExtension.lowercased() == "cut" else { throw lifecycleInvalid("Choose a .cut destination.") }
@@ -183,7 +181,7 @@ extension ProjectSessions {
         }
         // A distinct hard link or symbolic link can be a Save As destination.
         // Only the current pathname grants implicit replacement.
-        let replacing = current?.standardizedFileURL == url || lifecycleBool(arguments["replaceExisting"]) == true
+        let replacing = current?.standardizedFileURL == url || lifecycleBool(arguments["replace_existing"]) == true
         do {
             if session.isMulticam { try session.multicam.writeProject(to: url, replacingExisting: replacing) }
             else { try session.editor.writeProject(to: url, replacingExisting: replacing) }
@@ -211,10 +209,10 @@ extension ProjectSessions {
         return ["closed": true]
     }
 
-    private func setupMCPMulticam(_ session: ProjectSession, arguments: [String: Any], inspect: Bool) throws -> [String: Any] {
+    private func setupMCPMulticam(_ session: ProjectSession, arguments: [String: Any], tool: String) throws -> [String: Any] {
         let model = session.multicam
         guard session.isMulticam, !model.setup.isEmpty else { throw MCPFailure("no_setup", "Add multicam sources to start setup.") }
-        if inspect {
+        if tool == "multicam_setup_read" {
             let rows = model.setup.map { draft -> [String: Any] in
                 ["id": draft.id, "path": draft.source.file, "video": draft.media.hasVideo,
                  "name": draft.source.name as Any? ?? NSNull(), "streams": draft.media.audio.map { $0.stream.index }]
@@ -222,7 +220,7 @@ extension ProjectSessions {
             return ["sources": rows, "adding": model.project != nil,
                     "opening": model.pendingSetupProject?.referenceAngle as Any? ?? NSNull(),
                     "audio": try (model.pendingSetupProject?.audio ?? model.project?.audio).map {
-                        try JSONSerialization.jsonObject(with: JSONEncoder().encode($0))
+                        try JSONSerialization.jsonObject(with: MCPSchemas.encodeResult($0))
                     } ?? NSNull()]
         }
         guard !model.isBusy, model.notice == nil, !session.isHistoryPresented,
@@ -230,19 +228,19 @@ extension ProjectSessions {
               session.window?.attachedSheet == nil || session.window?.attachedSheet === model.setupWindow else {
             throw lifecycleBusy()
         }
-        switch arguments["action"] as? String {
-        case "dismiss": model.dismissSetup()
-        case "confirm":
+        switch tool {
+        case "multicam_setup_dismiss": model.dismissSetup()
+        case "multicam_setup_confirm":
             var drafts = model.setup
-            if let ids = arguments["sourceOrder"] as? [String] {
+            if let ids = arguments["source_order"] as? [String] {
                 guard ids.count == drafts.count, Set(ids) == Set(drafts.map(\.id)) else {
-                    throw lifecycleInvalid("List every pending source ID once in sourceOrder.")
+                    throw lifecycleInvalid("List every pending source ID once in source_order.")
                 }
                 let byID = Dictionary(uniqueKeysWithValues: drafts.map { ($0.id, $0) })
                 drafts = ids.compactMap { byID[$0] }
             }
             let names = arguments["names"] as? [String: String] ?? [:]
-            let streams = arguments["audioStreams"] as? [String: Any] ?? [:]
+            let streams = arguments["audio_streams"] as? [String: Any] ?? [:]
             let known = Set(drafts.map(\.id))
             guard Set(names.keys).isSubset(of: known), Set(streams.keys).isSubset(of: known) else {
                 throw lifecycleInvalid("The setup contains an unknown source ID.")
@@ -271,7 +269,7 @@ extension ProjectSessions {
                 guard let value = raw as? [String: Any],
                       let data = try? JSONSerialization.data(withJSONObject: value),
                       let policy = try? JSONDecoder().decode(MulticamAudioPolicy.self, from: data) else {
-                    throw lifecycleInvalid("Choose follow, none or a fixed source and stream for program audio.")
+                    throw lifecycleInvalid("Choose Follow, Mix, None or a Fixed source and stream for program audio.")
                 }
                 audio = policy
                 if case let .fixed(track) = audio,
@@ -293,8 +291,8 @@ extension ProjectSessions {
 private func lifecycleBusy() -> MCPFailure { MCPFailure("busy", "Finish the current editor operation or close its sheet.") }
 private func lifecycleInvalid(_ message: String) -> MCPFailure { MCPFailure("invalid_arguments", message) }
 
-private func projectPath(_ arguments: [String: Any]) throws -> URL {
-    guard let path = arguments["path"] as? String, path.hasPrefix("/"), !path.utf8.contains(0) else {
+private func localPath(_ value: Any?) throws -> URL {
+    guard let path = value as? String, path.hasPrefix("/"), !path.utf8.contains(0) else {
         throw lifecycleInvalid("Supply an absolute local file path.")
     }
     return URL(fileURLWithPath: path).standardizedFileURL
@@ -305,7 +303,7 @@ private func inputMedia(_ arguments: [String: Any], required: Bool) throws -> [U
     guard let paths = arguments["paths"] as? [String], !paths.isEmpty,
           paths.count <= 512 else { throw lifecycleInvalid("Supply 1 to 512 local media paths.") }
     return try paths.map { path in
-        let url = try projectPath(["path": path])
+        let url = try localPath(path)
         guard FileManager.default.isReadableFile(atPath: url.path),
               (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
             throw lifecycleInvalid("The recording is unavailable at \(url.path).")
@@ -327,18 +325,30 @@ private func lifecycleNumber(_ value: Any?, _ key: String) throws -> Double {
 }
 
 private func lifecycleInteger(_ value: Any?, _ key: String) throws -> Int {
-    guard let integer = Int(exactly: try lifecycleNumber(value, key)) else { throw lifecycleInvalid("Supply an integer for \(key).") }
+    guard let value, let integer = mcpInteger(value) else { throw lifecycleInvalid("Supply an integer for \(key).") }
     return integer
 }
 
 @MainActor
 private extension EditorPreferences {
     var mcpValues: [String: Any] {
-        ["historyLimit": historyLimit, "useAnalysisSidecars": useAnalysisSidecars,
-         "defaultExportMode": defaultExportMode.rawValue, "snapTarget": snapTarget.rawValue,
-         "largeThumbnails": largeThumbnails, "minimumPause": minimumPause, "leavePause": leavePause,
-         "volume": volume, "isMuted": isMuted, "scrubSoundEnabled": scrubSoundEnabled, "jpegPreset": jpegPreset.rawValue,
-         "localMCPEnabled": localMCPEnabled]
+        [
+            Key.automationLocalMcpEnabled.rawValue: localMCPEnabled,
+            Key.mediaAutoRefreshEnabled.rawValue: automaticallyRefreshMedia,
+            Key.analysisSidecarReuseEnabled.rawValue: useAnalysisSidecars,
+            Key.historyMaxSteps.rawValue: historyLimit,
+            Key.timelineSnapTarget.rawValue: snapTarget.rawValue,
+            Key.timelineLargePreviewsEnabled.rawValue: largeThumbnails,
+            Key.playbackPreviewVolumeFraction.rawValue: volume,
+            Key.playbackPreviewMuted.rawValue: isMuted,
+            Key.playbackScrubAudioEnabled.rawValue: scrubSoundEnabled,
+            Key.exportMovieDefaultMode.rawValue: defaultExportMode.rawValue,
+            Key.exportJpegDefaultPreset.rawValue: jpegPreset.rawValue,
+            Key.exportTierDowngradeWarningEnabled.rawValue: warnBeforeLoweringExportTier,
+            Key.silenceMinPauseSeconds.rawValue: minimumPause,
+            Key.silenceMaxBlipSeconds.rawValue: maxBlip,
+            Key.silencePaddingPerSideSeconds.rawValue: padding
+        ]
     }
 
     func mcpSet(_ arguments: [String: Any]) throws {
@@ -347,34 +357,41 @@ private extension EditorPreferences {
             guard let b = lifecycleBool(value) else { throw lifecycleInvalid("Supply a Boolean for \(key).") }
             return b
         }
-        switch key {
-        case "useAnalysisSidecars": useAnalysisSidecars = try flag()
-        case "largeThumbnails": largeThumbnails = try flag()
-        case "scrubSoundEnabled": scrubSoundEnabled = try flag()
-        case "isMuted": isMuted = try flag()
-        case "historyLimit":
+        guard let preference = Key(rawValue: key) else { throw lifecycleInvalid("Unknown preference \(key).") }
+        switch preference {
+        case .mediaAutoRefreshEnabled: automaticallyRefreshMedia = try flag()
+        case .exportTierDowngradeWarningEnabled: warnBeforeLoweringExportTier = try flag()
+        case .analysisSidecarReuseEnabled: useAnalysisSidecars = try flag()
+        case .timelineLargePreviewsEnabled: largeThumbnails = try flag()
+        case .playbackScrubAudioEnabled: scrubSoundEnabled = try flag()
+        case .playbackPreviewMuted: isMuted = try flag()
+        case .historyMaxSteps:
             let limit = try lifecycleInteger(value, key)
             guard Self.historyStepRange.contains(limit) else { throw lifecycleInvalid("History limit must be between 0 and 500.") }
             historyLimit = limit
-        case "volume":
+        case .playbackPreviewVolumeFraction:
             let v = try lifecycleNumber(value, key)
             guard (0...1).contains(v) else { throw lifecycleInvalid("Volume must be between 0 and 1.") }
             volume = Float(v)
-        case "minimumPause", "leavePause":
+        case .silenceMaxBlipSeconds:
             let v = try lifecycleNumber(value, key)
-            let minimum = key == "minimumPause" ? 1.0 / Double(AudioWaveform.rate) : 0
+            guard (0...1).contains(v) else { throw lifecycleInvalid("Maximum blip duration must be between 0 and 1 second.") }
+            maxBlip = v
+        case .silenceMinPauseSeconds, .silencePaddingPerSideSeconds:
+            let v = try lifecycleNumber(value, key)
+            let minimum = preference == .silenceMinPauseSeconds ? 1.0 / Double(AudioWaveform.rate) : 0
             guard v >= minimum else { throw lifecycleInvalid("The pause duration is too short.") }
-            if key == "minimumPause" { minimumPause = v } else { leavePause = v }
-        case "defaultExportMode":
+            if preference == .silenceMinPauseSeconds { minimumPause = v } else { padding = v }
+        case .exportMovieDefaultMode:
             guard let s = value as? String, let v = ExportMode(rawValue: s) else { throw lifecycleInvalid("Choose copy, smart, or encode.") }
             defaultExportMode = v
-        case "snapTarget":
+        case .timelineSnapTarget:
             guard let s = value as? String, let v = TimelineSnapTarget(rawValue: s) else { throw lifecycleInvalid("Choose off, keyframes, scenes, or silence.") }
             snapTarget = v
-        case "jpegPreset":
+        case .exportJpegDefaultPreset:
             guard let s = value as? String, let v = JPEGPreset(rawValue: s) else { throw lifecycleInvalid("Choose review or full.") }
             jpegPreset = v
-        default: throw lifecycleInvalid("Unknown or read-only preference: \(key).")
+        case .automationLocalMcpEnabled: throw lifecycleInvalid("Local MCP access is controlled in Settings.")
         }
     }
 }

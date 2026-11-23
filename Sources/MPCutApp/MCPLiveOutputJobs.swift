@@ -20,6 +20,11 @@ final class MCPLiveOutputProgress: @unchecked Sendable {
 @MainActor
 final class MCPLiveOutputJobs {
     typealias Work = @Sendable (MCPLiveOutputProgress) throws -> [String: Any]
+    private enum Outcome {
+        case success([String: Any])
+        case failure([String: Any])
+    }
+
     private final class Job {
         let id = UUID().uuidString
         let owner: String
@@ -28,7 +33,7 @@ final class MCPLiveOutputJobs {
         let progress = MCPLiveOutputProgress()
         var visible = true
         var state = "running"
-        var task: Task<[String: Any], Error>?
+        var task: Task<Outcome, Never>?
         var detail: [String: Any] = [:]
         init(owner: String, revision: Int, nativeCancellation: EditCancellation?) {
             self.owner = owner
@@ -42,9 +47,9 @@ final class MCPLiveOutputJobs {
         }
         var status: [String: Any] {
             var result = progress.snapshot
-            result["job"] = id
+            result["job_id"] = id
             result["state"] = task?.isCancelled == true ? "cancelling" : state
-            result["inputRevision"] = revision
+            result["input_revision"] = revision
             return result.merging(detail) { _, value in value }
         }
     }
@@ -63,18 +68,25 @@ final class MCPLiveOutputJobs {
         if jobs.count >= 32, let i = jobs.firstIndex(where: { $0.task == nil }) { jobs.remove(at: i) }
         let job = Job(owner: owner, revision: revision, nativeCancellation: nativeCancellation)
         let progress = job.progress
-        let task = Task.detached(priority: .userInitiated) { try Task.checkCancellation(); return try work(progress) }
+        let task = Task.detached(priority: .userInitiated) { () -> Outcome in
+            do {
+                try Task.checkCancellation()
+                return .success(try work(progress))
+            } catch {
+                // Large export diagnostics need JSON conversion before they can be returned over MCP.
+                return .failure(Self.errorFields(error))
+            }
+        }
         let handler = nativeCancellation?.onCancel { task.cancel() }
         job.task = task
         jobs.append(job)
         Task {
-            switch await task.result {
+            switch await task.value {
             case .success(let value):
                 job.progress.update(1)
                 job.state = "succeeded"
                 job.detail = ["result": value]
-            case .failure(let error):
-                let fields = Self.errorFields(error)
+            case .failure(let fields):
                 job.state = fields["code"] as? String == "cancelled" ? "cancelled" : "failed"
                 job.detail = ["error": fields]
             }
@@ -92,7 +104,7 @@ final class MCPLiveOutputJobs {
     }
 
     nonisolated static func errorFields(_ error: Error) -> [String: Any] {
-        if let issue = error as? CutError, let data = try? JSONEncoder().encode(issue), data.count <= 750_000,
+        if let issue = error as? CutError, let data = try? MCPSchemas.encodeResult(issue), data.count <= 750_000,
            let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { return fields }
         let code = (error as? CutError)?.code ?? (error as? MCPCommandError)?.code
             ?? (error is CancellationError ? "cancelled" : "output_failed")

@@ -15,6 +15,7 @@ struct ReverseAudioTimeline {
 
     let regions: [Region]
     let composition: AVAsset?
+    let mixedAudio: MulticamMixedAudioTimeline?
 
     init(ranges: [PreviewRange], offsets: [Double], composition: AVAsset?) {
         let starts = offsets.map(Self.frame)
@@ -27,11 +28,19 @@ struct ReverseAudioTimeline {
                           origin: range.audioOrigin, track: range.audioTrack, presentationTrackID: nil)
         }
         self.composition = composition
+        mixedAudio = nil
     }
 
     init(regions: [Region]) {
         self.regions = regions
         composition = nil
+        mixedAudio = nil
+    }
+
+    init(mixedAudio: MulticamMixedAudioTimeline) {
+        regions = []
+        composition = nil
+        self.mixedAudio = mixedAudio
     }
 
     static func frame(_ seconds: Double) -> Int64 {
@@ -66,7 +75,10 @@ extension ScrubAudioReader {
         }
 
         let rate = Double(ReverseAudioTimeline.rate)
-        if let composition = timeline.composition, let first = timeline.regions.first {
+        if let mixedAudio = timeline.mixedAudio {
+            let window = Double(lower) / rate..<Double(upper) / rate
+            copy(mixedAudio.grain(window: window, reverse: false, fadeEdges: false), to: 0, count: count)
+        } else if let composition = timeline.composition, let first = timeline.regions.first {
             let window = Double(lower) / rate..<Double(upper) / rate
             // The native composition already maps all edits and mixes the linked tracks.
             copy(read(source: first.url, composition: composition, window: window,

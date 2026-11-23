@@ -80,7 +80,7 @@ struct DesktopAnalysisSnapshot: Sendable {
             }
         }
         if !thresholdOverrides.isEmpty || !edits.thresholds.isEmpty {
-            updates["thresholdOverrides.v1"] = { old in
+            updates[AnalysisSidecar.silenceThresholdOverridesKey] = { old in
                 try JSONEncoder().encode(EditorMetadataEdits.merged(old, seed: thresholdOverrides, edits: edits.thresholds))
             }
         }

@@ -49,10 +49,29 @@ public struct StreamInfo: Encodable, Sendable {
     let reconstructedDTS: Bool
 
     enum CodingKeys: String, CodingKey {
-        case index, kind, codec, codecTag, profile, width, height, displayWidth, displayHeight
-        case rotation, bitDepth, pixelFormat, alphaBits, hasAdditionalVideoLayers, frameRate, sampleAspectRatio, timeBase
-        case start, duration, sampleRate, channels, channelLayout, isPCM, initialPadding, trailingPadding
-        case seekPreroll, language, disposition, colorPrimaries, colorTransfer, colorMatrix, colorRange, fieldOrder, chromaLocation
+        case index, kind, codec, profile, width, height, rotation, start, duration, channels, language, disposition
+        case codecTag = "codec_tag"
+        case displayWidth = "display_width"
+        case displayHeight = "display_height"
+        case bitDepth = "bit_depth"
+        case pixelFormat = "pixel_format"
+        case alphaBits = "alpha_bits"
+        case hasAdditionalVideoLayers = "has_additional_video_layers"
+        case frameRate = "frame_rate"
+        case sampleAspectRatio = "sample_aspect_ratio"
+        case timeBase = "time_base"
+        case sampleRate = "sample_rate"
+        case channelLayout = "channel_layout"
+        case isPCM = "is_pcm"
+        case initialPadding = "initial_padding"
+        case trailingPadding = "trailing_padding"
+        case seekPreroll = "seek_preroll"
+        case colorPrimaries = "color_primaries"
+        case colorTransfer = "color_transfer"
+        case colorMatrix = "color_matrix"
+        case colorRange = "color_range"
+        case fieldOrder = "field_order"
+        case chromaLocation = "chroma_location"
     }
 }
 
@@ -67,6 +86,12 @@ extension StreamInfo {
         var text = [CChar](repeating: 0, count: 128)
         guard mp_canonical_channel_layout(layout, Int32(channels), &text, text.count) != 0 else { return layout }
         return String(cString: text)
+    }
+
+    /// The layout an Opus stream of channel mapping family 1 states for its channel count, which the index reads back.
+    static func opusSurroundLayout(channels: Int) -> String? {
+        guard let name = mp_vorbis_order_layout(Int32(clamping: channels)) else { return nil }
+        return String(cString: name)
     }
 }
 
@@ -114,6 +139,17 @@ public struct AudioIndex: Encodable, Sendable {
     let presentationEdits: [AACPresentationEdit]
     var mp3Anchors: [MP3Anchor] = []
     var opusWindow: OpusTrimWindow? = nil
+    /// Timestamp holes on the compact PCM index, which does not retain packet rows.
+    var pcmGaps: [MulticamRange] = []
+    /// The size of the track's compressed packets. Nil for PCM, and for an index that does not record it.
+    var codedBytes: Int64? = nil
+
+    /// The average rate of the compressed track over its audible span, in bits per second.
+    var averageBitRate: Int? {
+        guard let codedBytes, codedBytes > 0,
+              let duration = try? end.subtracting(start), duration > .zero else { return nil }
+        return Int(exactly: (Double(codedBytes) * 8 / duration.seconds).rounded(.towardZero))
+    }
 
     package var hasDeclaredPCMStart: Bool {
         stream.isPCM && stream.hasDeclaredStart && stream.start == start
@@ -172,6 +208,7 @@ public struct MediaInfo: Encodable, Sendable {
                 + $1.packets.count * MemoryLayout<AudioPacket>.stride
                 + $1.mp3Anchors.count * MemoryLayout<MP3Anchor>.stride
                 + $1.presentationEdits.count * MemoryLayout<AACPresentationEdit>.stride
+                + $1.pcmGaps.count * MemoryLayout<MulticamRange>.stride
                 + ($1.opusWindow?.packetStarts.count ?? 0) * MemoryLayout<Int64>.stride
         }
         return frames.count * MemoryLayout<FrameInfo>.stride + streamBytes + audioBytes
@@ -274,7 +311,9 @@ package struct SourceIdentity: Codable, Hashable, Sendable {
     package private(set) var changeTime: ChangeTime?
 
     private enum CodingKeys: String, CodingKey {
-        case device, inode, size, modifiedSeconds, modifiedNanoseconds
+        case device, inode, size
+        case modifiedSeconds = "modified_seconds"
+        case modifiedNanoseconds = "modified_nanoseconds"
     }
 
     package static func == (lhs: SourceIdentity, rhs: SourceIdentity) -> Bool {
@@ -313,6 +352,16 @@ package struct SourceIdentity: Codable, Hashable, Sendable {
             guard let path else { return Int32(-1) }
             return stat(path, &info)
         }
+        try self.init(status: status, info: info)
+    }
+
+    init(file: FileHandle) throws {
+        var info = stat()
+        let status = fstat(file.fileDescriptor, &info)
+        try self.init(status: status, info: info)
+    }
+
+    private init(status: Int32, info: stat) throws {
         guard status == 0, info.st_mode & S_IFMT == S_IFREG else {
             throw CutError(code: "invalid_input", message: "The source is unavailable or is not a regular local file.")
         }
@@ -333,10 +382,35 @@ package struct SourceIdentity: Codable, Hashable, Sendable {
 }
 
 enum Probe {
+    /// The file's change time moved during inspection while its inode, size and modification time held.
+    private struct MetadataChanged: Error {}
+
     static func read(_ url: URL, keyframes: Bool = true, conversion: Bool = false, previewOnly: Bool = false,
                      audioAnalysis: Bool = false, forcePayload: Bool = false,
                      expectedIdentity: SourceIdentity? = nil,
                      progress: ((Double) -> Void)? = nil, cancelled: (() -> Bool)? = nil) throws -> MediaInfo {
+        do {
+            return try readOnce(url, keyframes: keyframes, conversion: conversion, previewOnly: previewOnly,
+                                audioAnalysis: audioAnalysis, forcePayload: forcePayload,
+                                expectedIdentity: expectedIdentity, progress: progress, cancelled: cancelled)
+        } catch is MetadataChanged {
+            // macOS writes access metadata, such as the com.apple.macl attribute after an Open panel
+            // or a drop, which advances ctime without touching the media. Inspect once more against
+            // the new snapshot. A second change during that read is reported.
+            do {
+                return try readOnce(url, keyframes: keyframes, conversion: conversion, previewOnly: previewOnly,
+                                    audioAnalysis: audioAnalysis, forcePayload: forcePayload,
+                                    expectedIdentity: expectedIdentity?.forPreviewHandoff(),
+                                    progress: progress, cancelled: cancelled)
+            } catch is MetadataChanged {
+                throw CutError(code: "source_changed", message: "The source changed during inspection.")
+            }
+        }
+    }
+
+    private static func readOnce(_ url: URL, keyframes: Bool, conversion: Bool, previewOnly: Bool,
+                                 audioAnalysis: Bool, forcePayload: Bool, expectedIdentity: SourceIdentity?,
+                                 progress: ((Double) -> Void)?, cancelled: (() -> Bool)?) throws -> MediaInfo {
         let before = try SourceIdentity(url)
         if let expectedIdentity, !expectedIdentity.matchesSnapshot(before) {
             throw CutError(code: "source_changed", message: "The source changed while opening the clip.")
@@ -369,6 +443,8 @@ enum Probe {
         let media = try makeMedia(pointer.pointee, url: url, identity: before,
                                   keyframes: keyframes, previewOnly: previewOnly, progress: progress, cancelled: cancelled)
         guard before.isCurrentSnapshot(at: url) else {
+            // Equality ignores ctime, so a match here means only metadata moved.
+            if let after = try? SourceIdentity(url), after == before { throw MetadataChanged() }
             throw CutError(code: "source_changed", message: "The source changed during inspection.")
         }
         progress?(1)
@@ -542,7 +618,8 @@ private extension Probe {
                     let end = try RationalTime(numerator: edits[edits.count - 1].samples.upperBound, denominator: sampleRate)
                         .subtracting(origin)
                     audio.append(AudioIndex(stream: stream, packets: [], start: start, end: end,
-                                            hasPriming: true, pcmContinuity: false, presentationEdits: edits))
+                                            hasPriming: true, pcmContinuity: false, presentationEdits: edits,
+                                            codedBytes: value.coded_bytes > 0 ? value.coded_bytes : nil))
                 } else {
                     if value.deferred_aac_issue == 1 {
                         audioIssue(index, "AAC track \(index) has non-increasing presentation timestamps without a supported edit list.")
@@ -566,6 +643,7 @@ private extension Probe {
                         }
                         index.opusWindow = window
                     }
+                    index.codedBytes = value.coded_bytes > 0 ? value.coded_bytes : nil
                     audio.append(index)
                 }
             }
@@ -620,6 +698,8 @@ private extension Probe {
         let sampleRate = Int64(max(1, stream.sampleRate))
         let samplePeriod = RationalTime(numerator: 1, denominator: sampleRate)
         let useSampleClock = standalone && (stream.isPCM || stream.codec == "flac") && stream.timeBase > samplePeriod
+        let pcmGapTolerance = stream.isPCM && !useSampleClock && stream.timeBase > samplePeriod
+            ? try stream.timeBase.adding(RationalTime(numerator: 1, denominator: sampleRate * 2)) : .zero
         var start: RationalTime?
         var end: RationalTime?
         var indexed: [AudioPacket] = []
@@ -630,6 +710,9 @@ private extension Probe {
         var priorPCMEnd: RationalTime?
         var priorSampleEnd: RationalTime?
         var pcmContinuity = true
+        var pcmAudibleEnd: RationalTime?
+        var priorPCMDiscard = 0
+        var pcmGaps: [MulticamRange] = []
         if !stream.isPCM { indexed.reserveCapacity(packets.count) }
         for (index, packet) in packets.enumerated() {
             if index.isMultiple(of: 1_024) {
@@ -687,6 +770,16 @@ private extension Probe {
             if index == 0 && skip > 0 { firstAudibleSample = audibleStart }
             if index == packets.count - 1 && discard > 0 { lastAudibleSample = audibleEnd }
             if audibleStart < audibleEnd && !(index == 0 && stream.codec == "vorbis") {
+                if stream.isPCM {
+                    if let previous = pcmAudibleEnd, previous < audibleStart {
+                        let gap = try audibleStart.subtracting(previous)
+                        if skip > 0 || priorPCMDiscard > 0 || gap > pcmGapTolerance {
+                            pcmGaps.append(.init(from: previous, to: audibleStart))
+                        }
+                    }
+                    pcmAudibleEnd = max(pcmAudibleEnd ?? audibleEnd, audibleEnd)
+                    priorPCMDiscard = discard
+                }
                 start = min(start ?? audibleStart, audibleStart)
                 end = max(end ?? audibleEnd, audibleEnd)
             }
@@ -703,7 +796,11 @@ private extension Probe {
         if let lastAudibleSample { trackEnd = min(trackEnd, lastAudibleSample) }
         return AudioIndex(stream: stream, packets: indexed, start: trackStart,
                           end: max(trackStart, trackEnd), hasPriming: hasPriming,
-                          pcmContinuity: pcmContinuity, presentationEdits: [])
+                          pcmContinuity: pcmContinuity, presentationEdits: [],
+                          pcmGaps: pcmGaps.compactMap { gap in
+                              let from = max(trackStart, gap.from), to = min(trackEnd, gap.to)
+                              return from < to ? MulticamRange(from: from, to: to) : nil
+                          })
     }
 
     static func describe(_ value: MPProbeStream, index: Int, base: RationalTime,

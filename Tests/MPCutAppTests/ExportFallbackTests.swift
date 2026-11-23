@@ -254,11 +254,14 @@ final class ExportFallbackTests: XCTestCase {
         XCTAssertEqual(encoded.options.audioFormat, .flac)
         XCTAssertEqual(encoded.options.container, "flac")
 
-        // Opus has no encoder in the helper: the first conversion that works is PCM.
+        // No container joins copied Opus packets. Encoding Opus again keeps the format, in the container the sheet names.
         let opus = try fixture("Standalone-Chirp", "opus")
-        let wave = try XCTUnwrap(try offer(opus, "opus"))
-        XCTAssertEqual(wave.title, "Convert to WAV (no further quality loss)")
-        XCTAssertEqual(wave.options.audioFormat, .pcm)
-        XCTAssertEqual(wave.options.container, "wav")
+        let same = try XCTUnwrap(try offer(opus, "opus"))
+        XCTAssertEqual(same.title, "Convert to Opus (same format)")
+        XCTAssertEqual(same.options.audioFormat, .opus)
+        XCTAssertEqual(same.options.container, "opus")
+        let matroska = try XCTUnwrap(try offer(opus, "mka"))
+        XCTAssertEqual(matroska.title, "Convert to Opus (same format)")
+        XCTAssertEqual(matroska.options.container, "mka")
     }
 }

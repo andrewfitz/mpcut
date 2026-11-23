@@ -121,7 +121,7 @@ final class EditorSceneScan {
             }
             return (request.id, cached ?? SceneScanProgress(requested: request.scope))
         })
-        status = "Finding scenes in \(requests[0].name)…"
+        status = "Scanning for scenes in \(requests[0].name)…"
         let endWork = receipt?.cleanup.begin()
         let groups = Dictionary(grouping: requests, by: SceneRecording.init)
         var seen = Set<SceneRecording>()
@@ -303,6 +303,8 @@ extension EditorSceneScan {
         let recordings = Set(requests.map(SceneRecording.init))
         let states = recordings.map { inspections[$0] }
         if let pending = states.compactMap({ $0?.pending }).first {
+            // Multiple recordings have independent source clocks.
+            guard recordings.count == 1 else { return .partial(position: nil, saved: false) }
             return .partial(position: pending.durable ?? pending.decoded, saved: pending.durable != nil)
         }
         if !states.isEmpty, states.allSatisfy({ $0?.completed != nil }) { return .current }

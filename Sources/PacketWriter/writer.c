@@ -1,4 +1,5 @@
 #include "PacketWriter.h"
+#include "MediaProbe.h"
 #include "timecode.h"
 #include "aac_edits.h"
 #include "mp3_crop.h"
@@ -272,6 +273,20 @@ static int primary_video(const AVStream *stream) {
         !(stream->disposition & AV_DISPOSITION_ATTACHED_PIC);
 }
 
+static int track_selection(int tracks) {
+    switch (tracks) {
+        case MPCUT_TRACKS_ALL:
+        case MPCUT_TRACKS_VIDEO:
+        case MPCUT_TRACKS_AUDIO:
+            return tracks;
+        case MPCUT_TRACKS_LINKED_AUDIO:
+        case MPCUT_TRACKS_PROGRAM_AUDIO:
+            return MPCUT_TRACKS_AUDIO;
+        default:
+            return -1;
+    }
+}
+
 static int selected_stream(const Writer *writer, const AVStream *stream) {
     switch (writer->tracks) {
         case MPCUT_TRACKS_AUDIO:
@@ -412,6 +427,11 @@ static int prepare_output(Writer *writer) {
 
 static int check_mux(Writer *writer, AVFormatContext **input, const char *input_path, int padded_opus_track)
 {
+    if (!input_path || !writer->output_path)
+        return fail(writer, "Input and output paths are required");
+    writer->tracks = track_selection(writer->tracks);
+    if (writer->tracks < 0)
+        return fail(writer, "Invalid track selection");
     int result = prepare_output(writer);
     if (!result && writer->tracks != MPCUT_TRACKS_VIDEO && padded_opus_track >= 0 &&
         (writer->tracks != MPCUT_TRACKS_AUDIO || writer->audio_stream < 0 || writer->audio_stream == padded_opus_track) &&
@@ -446,6 +466,8 @@ int mpcut_check_mux(const char *input_path, const char *output_path, int padded_
 void mpcut_check_muxes(const char *input_path, const char *const *output_paths, size_t count,
                       int padded_opus_track, int tracks, int audio_stream, uint8_t *supported)
 {
+    if (!output_paths || !supported)
+        return;
     AVFormatContext *input = NULL;
     for (size_t i = 0; i < count; i++) {
         Writer writer = {.output_path = output_paths[i], .tracks = tracks, .audio_stream = audio_stream};
@@ -819,6 +841,11 @@ static MPCutTime mov_audio_lead(const MPCutSegment *segment) {
     return lead.denominator > 0 && lead.numerator > 0 ? lead : (MPCutTime){0, 1};
 }
 
+static int valid_segment_range(const MPCutSegment *segment) {
+    return segment->path && segment->start.denominator > 0 && segment->end.denominator > 0
+        && segment->start.numerator >= 0 && time_compare(segment->end, segment->start) > 0;
+}
+
 static int check_timecode_range(Writer *writer, const AVFormatContext *input, int timecode_index,
                                 const MPCutTimecode *timecode, size_t index, MPCutTime duration,
                                 MPCutTime start, MPCutTime output_start, MPCutTime total,
@@ -828,7 +855,7 @@ static int check_timecode_range(Writer *writer, const AVFormatContext *input, in
     }
     Wide frame_count = (Wide)duration.numerator * timecode->rate.num;
     Wide frame_denominator = (Wide)duration.denominator * timecode->rate.den;
-    if (!frame_denominator || frame_count % frame_denominator) {
+    if (frame_count <= 0 || frame_denominator <= 0 || frame_count % frame_denominator) {
         return fail(writer, "Segment %zu does not cover a whole number of timecode frames", index + 1);
     }
     if (index != 0) {
@@ -853,6 +880,12 @@ int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime d
                          MPCutProgress progress, void *context, char *error, size_t error_capacity) {
     Writer writer = {.output_path = output_path, .progress = progress, .progress_context = context,
                      .error = error, .error_capacity = error_capacity};
+    if (failed_segment)
+        *failed_segment = 0;
+    if (!segments || !count || !output_path)
+        return fail(&writer, "An output path and at least one segment are required");
+    if (duration.numerator <= 0 || duration.denominator <= 0)
+        return fail(&writer, "A positive duration is required for timecode");
     AVFormatContext *input = NULL;
     int result = prepare_output(&writer);
     if (result) {
@@ -872,6 +905,10 @@ int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime d
             break;
         }
         const MPCutSegment *segment = &segments[index];
+        if (!valid_segment_range(segment)) {
+            result = fail(&writer, "Segment %zu has an invalid range", index + 1);
+            break;
+        }
         int timecode_index;
         MPCutTimecode timecode;
         result = input_open(&writer, &input, segment->path);
@@ -895,6 +932,10 @@ int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime d
                 break;
             }
             source_start = time_add(origin, segment->start, 1);
+            if (!source_start.denominator) {
+                result = fail(&writer, "Segment %zu timestamp cannot be represented", index + 1);
+                break;
+            }
             if (count == 1 && segment->start.numerator == 0 && segment->reaches_end && is_mov(writer.output->oformat)) {
                 output_start = mov_audio_lead(segment);
             }
@@ -912,6 +953,8 @@ int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime d
     }
 
 cleanup:
+    if (!result && failed_segment)
+        *failed_segment = 0;
     avformat_close_input(&input);
     av_packet_free(&writer.packet);
     avformat_free_context(writer.output);
@@ -1687,7 +1730,7 @@ static int splice_video(Writer *writer, const AVFormatContext *input, const AVSt
             return ff_error(writer, code, "Invalid copied video sample or configuration in", input->url);
     }
     if (writer->generated_stills && video->codecpar->codec_id == AV_CODEC_ID_HEVC) {
-        int code = mpcut_splice_check_still_hdr(packet, extra, size);
+        int code = mp_probe_check_still_hevc(packet->data, packet->size, extra, size);
         if (code == AVERROR(ENOTSUP))
             return fail(writer, "Generated stills require HEVC without Dolby Vision, HDR10+ or additional picture layers in %s", input->url);
         if (code < 0)
@@ -1892,6 +1935,63 @@ static int validate_layout(Writer *writer, const AVFormatContext *input, int tim
     return 0;
 }
 
+typedef struct {
+    const char *path;
+    MPCutAACTrackClock *clocks;
+    unsigned track_count;
+    MPCutAACSource *source;
+} AACSourceCache;
+
+static int selected_aac(const Writer *writer, const AVStream *stream) {
+    return selected_stream(writer, stream) && stream->codecpar->codec_id == AV_CODEC_ID_AAC;
+}
+
+static int load_aac_source(Writer *writer, const AVFormatContext *input, const char *path,
+                           AACSourceCache *cache) {
+    writer->aac_source = NULL;
+    if (writer->tracks == MPCUT_TRACKS_VIDEO || !av_match_name("mov", input->iformat->name))
+        return 0;
+
+    int matches = cache->path && !strcmp(cache->path, path);
+    unsigned count = 0;
+    for (unsigned index = 0; index < input->nb_streams; index++) {
+        const AVStream *stream = input->streams[index];
+        if (!selected_aac(writer, stream))
+            continue;
+        matches = matches && count < cache->track_count &&
+            cache->clocks[count].track_id == stream->id &&
+            cache->clocks[count].sample_rate == stream->codecpar->sample_rate;
+        count++;
+    }
+    if (!count)
+        return 0;
+
+    if (!matches || count != cache->track_count) {
+        av_freep(&cache->clocks);
+        mpcut_aac_source_free(cache->source);
+        *cache = (AACSourceCache){0};
+        cache->clocks = av_calloc(count, sizeof(*cache->clocks));
+        if (!cache->clocks)
+            return fail(writer, "Cannot allocate AAC track clocks");
+        unsigned track = 0;
+        for (unsigned index = 0; index < input->nb_streams; index++) {
+            const AVStream *stream = input->streams[index];
+            if (selected_aac(writer, stream))
+                cache->clocks[track++] = (MPCutAACTrackClock){stream->id, stream->codecpar->sample_rate};
+        }
+        int result = mpcut_aac_source_open(path, cache->clocks, count, &cache->source,
+                                          writer->error, writer->error_capacity);
+        if (result)
+            return result;
+        cache->path = path;
+        cache->track_count = count;
+    }
+    writer->aac_source = cache->source;
+    if (writer->aac_source && !is_mov(writer->output->oformat))
+        return fail(writer, "Multiple AAC media edits in %s require MOV or MP4 output", path);
+    return 0;
+}
+
 int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_path, int tracks, int audio_stream,
                 const uint32_t *still_mastering_display,
                 MPCutProgress progress, void *context, char *error, size_t error_capacity) {
@@ -1905,22 +2005,30 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
     };
     const int program_audio = tracks == MPCUT_TRACKS_PROGRAM_AUDIO;
     const int linked_movie_clock = tracks == MPCUT_TRACKS_ALL || tracks == MPCUT_TRACKS_LINKED_AUDIO || program_audio;
-    if (tracks == MPCUT_TRACKS_LINKED_AUDIO || program_audio)
-        tracks = MPCUT_TRACKS_AUDIO;
+    tracks = track_selection(tracks);
     writer.tracks = tracks;
     writer.audio_stream = audio_stream;
     AVFormatContext *input = NULL;
+    // Cache the last selected AAC track set, including movies with no special edit list.
+    AACSourceCache aac_cache = {0};
     int result;
 
     if (!segments || !count || !output_path) {
         return fail(&writer, "An output path and at least one segment are required");
     }
+    if (tracks < 0)
+        return fail(&writer, "Invalid track selection");
     MPCutTime total = {0, 1};
     for (size_t index = 0; index < count; index++) {
         const MPCutSegment *segment = &segments[index];
-        if (!segment->path || segment->start.denominator <= 0 || segment->end.denominator <= 0
-            || segment->start.numerator < 0 || time_compare(segment->end, segment->start) <= 0) {
+        if (!valid_segment_range(segment)) {
             return fail(&writer, "Segment %zu has an invalid range", index + 1);
+        }
+        if ((segment->opus_track_count && !segment->opus_pre_skip)
+            || (segment->video_dts_count && !segment->video_dts)
+            || (tracks == MPCUT_TRACKS_AUDIO && segment->audio_stream_override &&
+                segment->audio_stream_override - 1 > INT_MAX)) {
+            return fail(&writer, "Segment %zu has invalid track timing or selection", index + 1);
         }
         writer.track_video_config |= segment->multiple_descriptions;
         writer.generated_stills |= segment->generated_still;
@@ -1971,34 +2079,9 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
         if (result) {
             goto cleanup;
         }
-        unsigned aac_count = 0;
-        if (tracks != MPCUT_TRACKS_VIDEO && av_match_name("mov", input->iformat->name)) {
-            for (unsigned track = 0; track < input->nb_streams; track++) {
-                aac_count += selected_stream(&writer, input->streams[track]) && input->streams[track]->codecpar->codec_id == AV_CODEC_ID_AAC;
-            }
-        }
-        if (aac_count) {
-            MPCutAACTrackClock *clocks = av_calloc(aac_count, sizeof(*clocks));
-            if (!clocks) {
-                result = fail(&writer, "Cannot allocate AAC track clocks");
-                goto cleanup;
-            }
-            size_t n = 0;
-            for (unsigned i = 0; i < input->nb_streams; i++) {
-                AVStream *stream = input->streams[i];
-                if (selected_stream(&writer, stream) && stream->codecpar->codec_id == AV_CODEC_ID_AAC)
-                    clocks[n++] = (MPCutAACTrackClock){stream->id, stream->codecpar->sample_rate};
-            }
-            result = mpcut_aac_source_open(segment->path, clocks, n, &writer.aac_source, error, error_capacity);
-            av_free(clocks);
-            if (result) {
-                goto cleanup;
-            }
-            if (writer.aac_source && !is_mov(writer.output->oformat)) {
-                result = fail(&writer, "Multiple AAC media edits in %s require MOV or MP4 output", segment->path);
-                goto cleanup;
-            }
-        }
+        result = load_aac_source(&writer, input, segment->path, &aac_cache);
+        if (result)
+            goto cleanup;
         int timecode_index;
         MPCutTimecode timecode;
         result = validate_streams(&writer, input, &timecode_index, &timecode);
@@ -2034,7 +2117,8 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
         if (range.whole_file && linked_movie_clock && is_mov(writer.output->oformat)) {
             range.shift = time_add(range.shift, mov_audio_lead(segment), 1);
         }
-        if (!range.shift.denominator || !range.source_end.denominator || !range.output_end.denominator) {
+        if (!range.shift.denominator || !range.source_start.denominator ||
+            !range.source_end.denominator || !range.output_end.denominator) {
             result = fail(&writer, "Segment %zu timestamp cannot be represented", index + 1);
             goto cleanup;
         }
@@ -2119,8 +2203,6 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
         }
 
         avformat_close_input(&input);
-        mpcut_aac_source_free(writer.aac_source);
-        writer.aac_source = NULL;
         cursor = range.output_end;
     }
 
@@ -2163,7 +2245,8 @@ cleanup:
     av_free(writer.picture_config);
     avformat_close_input(&input);
     av_packet_free(&writer.packet);
-    mpcut_aac_source_free(writer.aac_source);
+    av_free(aac_cache.clocks);
+    mpcut_aac_source_free(aac_cache.source);
     mpcut_aac_free(writer.aac_edits);
     av_free(writer.last_dts);
     av_free(writer.opus_trim);

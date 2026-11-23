@@ -15,7 +15,7 @@ CLI = None
 
 class StillFormatTests(unittest.TestCase):
     def inspect(self, source, *options, expected_success=True):
-        result = subprocess.run([CLI, "inspect", "--json", *options, source],
+        result = subprocess.run([CLI, "media", "inspect", "--json", *options, source],
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode == 0, expected_success, result.stdout + result.stderr)
         report = json.loads(result.stdout)
@@ -30,20 +30,20 @@ class StillFormatTests(unittest.TestCase):
                 self.assertEqual((image["width"], image["height"]), (32, 32))
                 self.assertEqual(image["rendition"], "sdr")
                 if codec in ("png", "webp"):
-                    self.assertTrue(image["hasAlpha"])
+                    self.assertTrue(image["has_alpha"])
 
     def test_explicit_gain_map_rendition(self):
         for codec in ("jpeg", "heic"):
             with self.subTest(codec=codec):
                 image = self.inspect(FIXTURES / f"gain-map.{codec}")["image"]
-                self.assertEqual(image["rendition"], "gainMap")
-                self.assertIn("isoGainMap", image["auxiliaryImages"])
+                self.assertEqual(image["rendition"], "gain_map")
+                self.assertIn("iso_gain_map", image["auxiliary_images"])
 
     def test_jxl_high_precision_pq(self):
         image = self.inspect(FIXTURES / "pq_gradient.jxl")["image"]
         self.assertEqual((image["codec"], image["width"], image["height"]), ("jxl", 1088, 64))
-        self.assertGreaterEqual(image["bitsPerComponent"], 10)
-        self.assertIn(image["rendition"], ("pq", "linearHDR"))
+        self.assertGreaterEqual(image["bits_per_component"], 10)
+        self.assertIn(image["rendition"], ("pq", "linear_hdr"))
 
     def test_jxl_container_is_sdr(self):
         image = self.inspect(FIXTURES / "square-extended-size-container.jxl")["image"]

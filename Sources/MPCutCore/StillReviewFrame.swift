@@ -11,9 +11,10 @@ package struct StillReviewFrame: Sendable {
     package let identity: SourceIdentity
     package let width: Int
     package let height: Int
+    package let displayAspect: Double
 
     package init(asset: StillAsset, placementID: String, framing: StillImageFraming,
-                 interval: MulticamRange, document: URL?, width: Int, height: Int) throws {
+                 interval: MulticamRange, document: URL?, width: Int, height: Int, displayAspect: Double) throws {
         self.asset = asset
         self.placementID = placementID
         self.framing = framing
@@ -31,6 +32,7 @@ package struct StillReviewFrame: Sendable {
         }
         self.width = width
         self.height = height
+        self.displayAspect = displayAspect
         guard width > 0, height > 0 else {
             throw CutError(code: "invalid_canvas", message: "No program picture dimensions are available.")
         }
@@ -46,19 +48,22 @@ package struct StillReviewFrame: Sendable {
         }
     }
 
-    package func image(maximumDimension: Int?, cancelled: @escaping () -> Bool) throws -> CGImage {
+    package func validateAsset(cancelled: @escaping () -> Bool) throws {
         try checkCancellation(cancelled)
         try validateIdentity()
-        guard try StillImage.fingerprint(url, cancelled: cancelled) == asset.fingerprint else {
+        guard try StillImage.fingerprint(url, expectedIdentity: identity, cancelled: cancelled) == asset.fingerprint else {
             throw CutError(code: "source_changed", message: "Relink the changed image \(asset.displayName).")
         }
         try checkCancellation(cancelled)
-        let aspect = Double(width) / Double(height)
+    }
+
+    package func image(maximumDimension: Int?, cancelled: @escaping () -> Bool) throws -> CGImage {
+        try validateAsset(cancelled: cancelled)
         let scale = maximumDimension.map { min(1, Double($0) / Double(max(width, height))) } ?? 1
         let renderWidth = max(1, Int((Double(width) * scale).rounded()))
         let renderHeight = max(1, Int((Double(height) * scale).rounded()))
-        let image = try StillImage.render(url, canvas: StillImageCanvas(width: renderWidth, height: renderHeight, displayAspect: aspect),
-                                          framing: framing, forceSDR: true, preview: maximumDimension != nil,
+        let image = try StillImage.render(url, canvas: StillImageCanvas(width: renderWidth, height: renderHeight, displayAspect: displayAspect),
+                                          framing: framing, forceSDR: true, preview: maximumDimension != nil, expectedIdentity: identity,
                                           cancelled: cancelled).sdrImage()
         try checkCancellation(cancelled)
         try validateIdentity()
@@ -80,6 +85,7 @@ package struct StillReviewFrame: Sendable {
         guard preset != .review || data.length <= 1_048_576 else {
             throw CutError(code: "image_too_large", message: "The review JPEG exceeds 1 MiB.")
         }
+        try validateIdentity()
         return (data as Data, image.width, image.height)
     }
 
@@ -110,6 +116,19 @@ extension StillTimelinePlan {
 }
 
 extension CutProject {
+    package func stillReviewGeometry(reference: MediaInfo?) -> (width: Int, height: Int, aspect: Double)? {
+        if let format = stillFormat, format.width > 0, format.height > 0 {
+            return (format.width, format.height, Double(format.width) / Double(format.height))
+        }
+        guard let video = reference?.videoStream, video.width > 0, video.height > 0 else { return nil }
+        let rotated = !video.rotation.isMultiple(of: 180)
+        let sar = video.sampleAspectRatio > .zero ? video.sampleAspectRatio.seconds : 1
+        let codedAspect = Double(video.width) * sar / Double(video.height)
+        let width = video.displayWidth > 0 ? video.displayWidth : rotated ? video.height : video.width
+        let height = video.displayHeight > 0 ? video.displayHeight : rotated ? video.width : video.height
+        return (width, height, rotated ? 1 / codedAspect : codedAspect)
+    }
+
     package func stillReviewFrame(placementID: String, interval: MulticamRange,
                                   document: URL?, canvas: MediaInfo?) throws -> StillReviewFrame {
         let assetID: String
@@ -126,18 +145,12 @@ extension CutProject {
         guard let asset = stillAssets.first(where: { $0.id == assetID }) else {
             throw CutError(code: "invalid_target", message: "No image asset has ID \(assetID).")
         }
-        let width: Int
-        let height: Int
-        if let format = stillFormat {
-            (width, height) = (format.width, format.height)
-        } else if let geometry = canvas?.videoStream {
-            width = geometry.displayWidth > 0 ? geometry.displayWidth : geometry.width
-            height = geometry.displayHeight > 0 ? geometry.displayHeight : geometry.height
-        } else {
+        guard let geometry = stillReviewGeometry(reference: canvas) else {
             throw CutError(code: "invalid_canvas", message: "The program needs a video reference for image dimensions.")
         }
         return try StillReviewFrame(asset: asset, placementID: placementID, framing: framing, interval: interval,
-                                    document: document, width: width, height: height)
+                                    document: document, width: geometry.width, height: geometry.height,
+                                    displayAspect: geometry.aspect)
     }
 }
 
@@ -149,7 +162,7 @@ extension StillReviewFrame {
             let from, to: RationalTime
             let width, height: Int
         }
-        let version = 1
+        let schemaVersion = 2
         let selection = "program"
         let preset: JPEGPreset
         let frames: [Frame]

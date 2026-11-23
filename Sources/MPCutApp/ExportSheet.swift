@@ -81,10 +81,34 @@ struct ExportSheetOptions: Sendable, Equatable {
 
     /// The selection that an alternative reported by a batch stands for.
     func applying(_ alternative: ExportAlternative) -> ExportSheetOptions {
-        var result = applying(ExportRequest(clips: [], mode: alternative.mode, tracks: alternative.tracks,
-                                            audio: alternative.audio ?? (placements == .none ? .auto : audio)), container: alternative.container)
+        var current = self
+        if let video = alternative.stillVideoSettings {
+            current.codec = video.codec
+            if video.codec == .prores { current.proResQuality = video.quality }
+            else { current.standardQuality = video.quality }
+        }
+        let action = alternative.requestedStillAudio ?? alternative.audio ?? (placements == .none ? .auto : audio)
+        var result = current.applying(ExportRequest(clips: [], mode: alternative.mode, tracks: alternative.tracks,
+                                                    audio: action), container: alternative.container)
         if placements != .none { result.requireCameraCopy = alternative.arguments.contains("--require-camera-copy") }
         return result
+    }
+}
+
+extension ExportAlternative {
+    var requestedStillAudio: ReencodeAudio? {
+        guard id.hasPrefix("still-") else { return nil }
+        return argument("--audio").flatMap(ReencodeAudio.init(rawValue:))
+    }
+
+    var stillVideoSettings: ReencodeSettings? {
+        guard id.hasPrefix("still-"), let codec = argument("--video").flatMap(ReencodeCodec.init(rawValue:)) else { return nil }
+        return ReencodeSettings(codec: codec, quality: argument("--quality").flatMap(ReencodeQuality.init(rawValue:)))
+    }
+
+    func argument(_ flag: String) -> String? {
+        guard let index = arguments.firstIndex(of: flag), index + 1 < arguments.count else { return nil }
+        return arguments[index + 1]
     }
 }
 
@@ -130,7 +154,7 @@ extension ExportPlan {
         switch self {
         case .audio(let plan):
             let size = plan.estimatedBytes.map { " · about " + ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? ""
-            let fidelity = plan.isLossless ? "\nThe exported audio has the same samples as the source."
+            let fidelity = plan.isLossless ? "\nLossless conversion preserves the decoded audio samples."
                 : plan.action == .pcm ? "\nPCM preserves the decoded audio but uses more disk space." : ""
             let first = "Convert \(Self.seconds(plan.edit.duration.seconds)) of audio to \(plan.formatDescription) "
                 + "(.\(plan.edit.container))\(size)\(fidelity)"
@@ -355,7 +379,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     }
     private let videoCheck = NSButton(checkboxWithTitle: "Video", target: nil, action: nil)
     private let audioCheck = NSButton(checkboxWithTitle: "Audio", target: nil, action: nil)
-    private let preserveCamera = NSButton(checkboxWithTitle: "Preserve camera picture", target: nil, action: nil)
+    private let preserveCamera = NSButton(checkboxWithTitle: "Require Camera Video Copy", target: nil, action: nil)
     private let modePicker = NSPopUpButton()
     private let containerPicker = NSPopUpButton()
     private let codecPicker = NSPopUpButton()
@@ -417,6 +441,8 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private let reviewScroll = NSScrollView()
     private let reviewText = NSTextView(frame: NSRect(x: 0, y: 0, width: 470, height: 124))
     private let accessory = NSStackView()
+    private let saveExportResult = ExportResultFile.checkbox()
+    var savesExportResult: Bool { saveExportResult.state == .on }
 
     init(panel: NSSavePanel, options: ExportSheetOptions, copyContainers: ExportContainerChoices,
          clips: [ClipRequest], media: [URL: MediaInfo], useSidecar: Bool = true, excludedSources: Set<URL> = [],
@@ -450,7 +476,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         audioCheck.toolTip = "Include audio"
         preserveCamera.target = self
         preserveCamera.action = #selector(selectPreserveCamera)
-        preserveCamera.toolTip = "Copy camera footage"
+        preserveCamera.toolTip = "Require stream copy for retained camera video"
         configure(audioTrackPicker, label: "Audio tracks", action: #selector(selectAudioTrack))
         audioTrackPicker.toolTip = "Choose audio tracks"
         trackRow.addArrangedSubview(row("Tracks", audioTrackPicker))
@@ -531,7 +557,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         audioTrackNote.maximumNumberOfLines = 0
         audioTrackNote.setAccessibilityLabel("Audio tracks of the clips")
         [paired(videoCheck, audioCheck), trackRow, audioTrackNote, paired(row("Mode", modePicker), row("Container", containerPicker)), preserveCamera, settings, result,
-         reviewButton, stillReview, offerRow, reviewScroll, applyButton].forEach(accessory.addArrangedSubview)
+         reviewButton, stillReview, offerRow, reviewScroll, applyButton, saveExportResult].forEach(accessory.addArrangedSubview)
         summary.widthAnchor.constraint(equalToConstant: 446).isActive = true
         updatePickers()
         checkAvailability()
@@ -919,7 +945,8 @@ extension StreamInfo {
 
     var audioFormatLabel: String {
         let lang = language.isEmpty || language == "und" ? "" : " · " + language
-        let layout = channelLayout.isEmpty ? "" : " · " + channelLayout
+        // FFmpeg names an unlabelled layout by its count, which the channel count already says.
+        let layout = channelLayout.isEmpty || channelLayout.hasSuffix(" channels") ? "" : " · " + channelLayout
         return "\(codec.uppercased()) · \(channels) ch" + layout + lang
     }
 }

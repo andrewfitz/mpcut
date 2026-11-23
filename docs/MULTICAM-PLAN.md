@@ -14,11 +14,21 @@ This document records the original design for start-aligned recordings, hard cam
 
 ## Time and sound
 
-- Use a single group clock expressed in exact rational seconds. Source zero means the beginning of the recording’s presentation timeline. Embedded picture offsets, audio delays, priming, and variable frame timestamps still matter. Provide a manual offset per source for cameras started a few frames apart. A positive offset places source zero later on the group ruler. Waveform-based automatic sync and drift correction can follow in a later release.
+- Use a single group clock expressed in exact rational seconds. Source zero means the beginning of the recording’s presentation timeline. Embedded picture offsets, audio delays, priming, and variable frame timestamps still matter. Provide a manual offset per source for cameras started a few frames apart. A positive offset places source zero later on the group ruler. Sync suggestions provide metadata and waveform evidence for manual offset changes.
 - At creation, persist a reference angle and a group range from zero to the opening camera’s duration. Changing the first switch or reordering camera rows leaves both intact. Changing a source offset moves its coverage under the existing markers. Frame nudges use that source’s indexed presentation times. Keep group zero fixed. Show the full extent of all angles, allow the group end to be extended, and use assembly ranges to trim the program’s in and out points. A shorter unused angle never shortens the group. If selected picture or sound runs out, show the uncovered interval and offer a switch, another audio source, or a shorter range. Export requires coverage for the selected streams.
 - **Fixed master** is the proposed default when the opening camera has sound. Pick any camera track or external recording. Its samples run continuously through picture-only switches. On setup, show the selected source and absolute stream index. If the opening camera has no sound, offer the next available source or an explicit video-only output.
 - **Audio follows camera** switches to each angle’s assigned microphone. Assign streams by source, because stream index 1 can mean different things on different cameras. A marker may override the policy for its interval, for example camera B’s picture over camera A’s lav. The next marker resumes the group policy unless it has its own override. Missing sound generates a visible coverage issue. Distinguish a missing source or a recorder ending early from a valid presentation edit that contains silence. Preserve declared delays and intentional silent intervals when the destination can represent them. Report the affected interval if it cannot.
 - Group-time switches and output assembly are separate. A highlight reel can use 30–40 seconds, then 5–10 seconds, from the same group. Start times are inclusive and end times exclusive. A switch exactly at the start of a retained range takes effect on its first frame. Picture and master audio both follow those ranges. The master stays continuous through camera changes within a range and makes a real audio edit at an assembly jump. Preview, export, and the JSON plan must agree on both mappings.
+
+## Sync suggestions
+
+In the multicam **Sources** inspector, choose **Suggest Sync…** to compare other sources with the reference camera. **Analyze** reads embedded camera timecode or Broadcast Wave sample references. Enable **Compare audio waveforms and check drift** when the sources recorded the same sound. Review each offset and click its **Apply** button to make an undoable edit. The reference camera keeps its current offset.
+
+`mpcut multicam sync suggest --project FILE --json` analyzes all other sources. Use `--source-id ID` to limit the report or `--metadata-only` to skip audio analysis. In a live editor, `multicam_sync_suggest` returns the evidence and the project revision. Apply a reviewed value with the existing source offset edit.
+
+- Confirm that devices shared a clock and the timestamps refer to the same recording day. A comparison between camera timecode and a Broadcast Wave time-reference assumes both use the same time-of-day clock. Missing timestamps have no numeric fallback, while a recorded timestamp of zero is valid. Metadata does not establish drift or resolve date rollover.
+- Waveform matching compares up to five windows per baseline at 20 ms resolution. It searches within 30 seconds of the current or metadata-based alignment and uses the assigned audio stream or the first usable stream. Silence, repetitive audio, and weak matches may yield no result.
+- The waveform suggestion uses the earliest reliable window. Drift is the measured offset change between the earliest and latest reliable windows if they are at least 30 seconds apart. A zero reports agreement at waveform resolution. Offset edits shift source starts and preserve playback speed.
 
 ## Export contract
 
@@ -43,19 +53,19 @@ Proposed CLI entry points reuse familiar commands. The project contains the angl
 ```json
 {
   "format": "mpcut",
-  "schemaVersion": 1,
+  "schema_version": 3,
   "kind": "multicam",
-  "referenceAngle": "wide",
-  "range": {"from": "0", "to": "40"},
+  "reference_angle_id": "wide",
+  "group_range": {"from": "0", "to": "40"},
   "angles": [
     {"id": "wide", "file": "wide.mov", "offset": "0"},
     {"id": "close", "file": "close.mov", "offset": "0"}
   ],
-  "audio": {"mode": "fixed", "source": "wide", "stream": 1},
+  "audio": {"mode": "fixed", "source_id": "wide", "audio_stream_index": 1},
   "switches": [
-    {"at": "0", "angle": "wide"},
-    {"at": "12", "angle": "close"},
-    {"at": "20", "angle": "wide"}
+    {"group_time": "0", "angle_id": "wide"},
+    {"group_time": "12", "angle_id": "close"},
+    {"group_time": "20", "angle_id": "wide"}
   ],
   "assembly": [{"from":"30","to":"40"},{"from":"5","to":"10"}]
 }
@@ -63,13 +73,13 @@ Proposed CLI entry points reuse familiar commands. The project contains the angl
 
 This 40-second group saves a 15-second highlight reel. Export uses the ordered `assembly` when present, otherwise the full group range. Stream 1 is the wide camera’s microphone. Twelve and twenty seconds are example switch times. The source index and preflight determine whether they are usable on a particular recording.
 
-For a follow-camera edit, set the project’s `audio` to `{"mode":"follow"}` and assign each angle its preferred `audioStream`. An individual switch can hold a microphone while changing picture.
+For a follow-camera edit, set the project’s `audio` to `{"mode":"follow"}` and assign each angle its preferred `audio_stream_index`. An individual switch can hold a microphone while changing picture.
 
 ```json
-{"at":"12","angle":"close","audio":{"source":"wide","stream":1}}
+{"group_time":"12","angle_id":"close","audio":{"source_id":"wide","audio_stream_index":1}}
 ```
 
-For a separate recorder, declare `"audioSources":[{"id":"lav","file":"lav.wav","offset":"0"}]` and choose `{"mode":"fixed","source":"lav","stream":0}`. A source ID must be unique across both lists. The app should write these same records when a user makes the equivalent choices in the GUI.
+For a separate recorder, declare `"audio_sources":[{"id":"lav","file":"lav.wav","offset":"0"}]` and choose `{"mode":"fixed","source_id":"lav","audio_stream_index":0}`. A source ID must be unique across both lists. The app should write these same records when a user makes the equivalent choices in the GUI.
 
 ```sh
 mpcut help multicam --json

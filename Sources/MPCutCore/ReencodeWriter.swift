@@ -7,10 +7,27 @@ private struct DecoderInput: Hashable {
     let seek: Int64?
     // A long branch may need its own decoder so later trims cannot queue its frames.
     var independentSegment: Int?
+    /// One input supplies picture and sound. The render after a damaged picture splits them.
+    enum Part: Hashable {
+        case all
+        /// Sound only. Its pictures are never decoded.
+        case sound
+        /// Picture only, for ranges whose single input sought to `anchor`.
+        case picture(anchor: Int64?)
+    }
+    var part = Part.all
+}
+
+/// A decoder rejected one coded picture of a source that it can otherwise decode.
+private struct DamagedPicture: Error {
+    let error: CutError
+    let hardware: Bool
 }
 
 private struct ReencodeInput {
     var decoder: DecoderInput
+    /// The input that supplies sound when the picture input seeks past the sound warm-up.
+    var sound: DecoderInput?
     let segment: Int
     let media: MediaInfo
     var file: URL { decoder.file }
@@ -88,12 +105,24 @@ extension ReencodeEngine {
         progress?(1)
     }
 
+    /// The number of demuxers and edited-AAC intermediates that one helper run may hold open.
+    private var inputBudget: Int {
+        var limit = rlimit()
+        let available = getrlimit(RLIMIT_NOFILE, &limit) == 0 ? Int(clamping: limit.rlim_cur) : 256
+        return min(32, max(1, available - 12))
+    }
+
+    /// The edited-AAC intermediates that a range stages.
+    private func stagedSound(_ input: ReencodeInput, plan: ReencodePlan) -> Int {
+        zip(input.media.audio, plan.audioActions).filter {
+            !$0.0.presentationEdits.isEmpty && plan.filtersAudio($0.1)
+        }.count
+    }
+
     /// Bound the helper's simultaneously open demuxers, edited-AAC intermediates and
     /// filter branches. Repeated uses of one source at the same seek anchor share a decoder.
     private func inputBatches(_ inputs: [ReencodeInput], plan: ReencodePlan) throws -> [[ReencodeInput]] {
-        var limit = rlimit()
-        let available = getrlimit(RLIMIT_NOFILE, &limit) == 0 ? Int(clamping: limit.rlim_cur) : 256
-        let budget = min(32, max(1, available - 12))
+        let budget = inputBudget
         var batches: [[ReencodeInput]] = []
         var batch: [ReencodeInput] = []
         var decoderBytes: [DecoderInput: Double] = [:]
@@ -101,9 +130,7 @@ extension ReencodeEngine {
         var stagedAudio = 0
         for var input in inputs {
             try checkCancellation()
-            let edits = zip(input.media.audio, plan.audioActions).filter {
-                !$0.0.presentationEdits.isEmpty && plan.filtersAudio($0.1)
-            }.count
+            let edits = stagedSound(input, plan: plan)
             let lower = input.media.frames.lowerBound { $0.time >= input.from }
             let upper = input.media.frames.lowerBound { $0.time >= input.to }
             let video = input.media.video
@@ -209,15 +236,80 @@ extension ReencodeEngine {
         }
     }
 
+    /// An input that supplies decoded sound seeks far enough back for the sound decoder to warm up.
+    /// When hardware decoding rejects a picture there, the render runs once more with picture
+    /// inputs at the nearest restart points and separate sound inputs that keep the warm-up.
     private func render(_ plan: ReencodePlan, inputs: [ReencodeInput], in staging: URL, to partial: URL,
                         intermediate: Bool, copiedAudio: [String], progress: ((Double) -> Void)?) throws {
+        let kept = Set((try? FileManager.default.contentsOfDirectory(atPath: staging.path)) ?? [])
+        var reported = 0.0
+        let forward: ((Double) -> Void)? = progress.map { callback in
+            { value in
+                if value > reported {
+                    reported = value
+                    callback(value)
+                }
+            }
+        }
+        do {
+            try renderOnce(plan, inputs: inputs, in: staging, to: partial, intermediate: intermediate,
+                           copiedAudio: copiedAudio, again: false, progress: forward)
+        } catch let damage as DamagedPicture {
+            guard damage.hardware, let moved = try restartInputs(inputs, plan: plan) else { throw damage.error }
+            try checkCancellation()
+            try? FileManager.default.removeItem(at: partial)
+            for name in (try? FileManager.default.contentsOfDirectory(atPath: staging.path)) ?? [] where !kept.contains(name) {
+                try? FileManager.default.removeItem(at: staging.appendingPathComponent(name))
+            }
+            do {
+                try renderOnce(plan, inputs: moved, in: staging, to: partial, intermediate: intermediate,
+                               copiedAudio: copiedAudio, again: true, progress: forward)
+            } catch let error as CutError where error.code == "cancelled" {
+                throw error
+            } catch {
+                throw damage.error
+            }
+        }
+    }
+
+    /// The inputs of a second render, or nil when no picture input can start later.
+    private func restartInputs(_ inputs: [ReencodeInput], plan: ReencodePlan) throws -> [ReencodeInput]? {
+        var moved = inputs
+        var demuxers: Set<DecoderInput> = []
+        var staged = 0
+        for (index, input) in inputs.enumerated() {
+            try checkCancellation()
+            staged += stagedSound(input, plan: plan)
+            if let restart = try seekAnchor(input.from, media: input.media, preroll: .zero),
+               input.decoder.seek.map({ restart > $0 }) ?? true {
+                let anchor = input.decoder
+                moved[index].decoder = DecoderInput(file: input.file, seek: restart,
+                                                    independentSegment: anchor.independentSegment,
+                                                    part: .picture(anchor: anchor.seek))
+                if plan.decodesSound(from: input.media) {
+                    moved[index].sound = DecoderInput(file: input.file, seek: anchor.seek,
+                                                      independentSegment: anchor.independentSegment, part: .sound)
+                }
+            }
+            demuxers.insert(moved[index].decoder)
+            if let sound = moved[index].sound { demuxers.insert(sound) }
+        }
+        guard moved.contains(where: { $0.decoder.part != .all }), demuxers.count + staged <= inputBudget else { return nil }
+        return moved
+    }
+
+    private func renderOnce(_ plan: ReencodePlan, inputs: [ReencodeInput], in staging: URL, to partial: URL,
+                            intermediate: Bool, copiedAudio: [String], again: Bool,
+                            progress: ((Double) -> Void)?) throws {
         let firstInput = inputs[0]
         let base = try firstInput.outputStart.roundedToSamples(plan.timeScale)
         var decoders: [DecoderInput] = []
         var decoderIndexes: [DecoderInput: Int] = [:]
-        for input in inputs where decoderIndexes[input.decoder] == nil {
-            decoderIndexes[input.decoder] = decoders.count
-            decoders.append(input.decoder)
+        for input in inputs {
+            for decoder in [input.decoder, input.sound].compactMap({ $0 }) where decoderIndexes[decoder] == nil {
+                decoderIndexes[decoder] = decoders.count
+                decoders.append(decoder)
+            }
         }
         var extraInputs = copiedAudio
         let graph = try filterGraph(plan, inputs: inputs, decoders: decoderIndexes, base: base,
@@ -293,7 +385,7 @@ extension ReencodeEngine {
                 guard let media = plan.media[input.file] else {
                     throw CutError(code: "invalid_input", message: "A source is missing from the export plan.")
                 }
-                sources += ["-threads", "2"] + route.options(for: media.video)
+                sources += ["-threads", "2"] + (input.part == .sound ? ["-vn"] : route.options(for: media.video))
                 if let seek = input.seek {
                     sources += ["-seek_timestamp", "1", "-noaccurate_seek", "-ss", "\(seek)us"]
                 }
@@ -322,7 +414,11 @@ extension ReencodeEngine {
         do {
             try encode(preferred)
         } catch let error as CutError where error.code == "encode_failed" {
-            if let damage = try damagedPicture(error, inputs: decoders, plan: plan) { throw damage }
+            // The second render uses the hardware decoder only. Its caller reports the first failure.
+            if again { throw error }
+            if let damage = try damagedPicture(error, inputs: decoders, plan: plan) {
+                throw DamagedPicture(error: damage, hardware: preferred != .compatible)
+            }
             // Hardware support varies by profile and Mac. Retry decoder/filter
             // failures using the compatibility path, reusing the staged audio.
             let reason = error.message.lowercased()
@@ -376,7 +472,8 @@ extension ReencodeEngine {
                     if let seek { probe += ["-seek_timestamp", "1", "-noaccurate_seek", "-ss", "\(seek)us"] }
                     probe += ["-i", file.path, "-map", "0:\(media.video.index)", "-frames:v", "1", "-f", "null", "-"]
                     do {
-                        try runHelper(plan.helper, arguments: probe, in: FileManager.default.temporaryDirectory)
+                        try runHelper(plan.helper, arguments: probe, in: FileManager.default.temporaryDirectory,
+                                      timeout: .seconds(20))
                         decodes = true
                     } catch let failure as CutError where failure.code == "encode_failed" {
                         continue
@@ -404,7 +501,9 @@ extension ReencodeEngine {
                Int64(plan.timeScale) % media.video.timeBase.denominator == 0 {
                 inputs[inputs.count - 1].to = segment.to
             } else {
-                let decoder = DecoderInput(file: segment.file, seek: try seekAnchor(segment.from, media: media))
+                let preroll = plan.decodesSound(from: media) ? RationalTime(numerator: 2) : .zero
+                let decoder = DecoderInput(file: segment.file,
+                                           seek: try seekAnchor(segment.from, media: media, preroll: preroll))
                 inputs.append(ReencodeInput(decoder: decoder, segment: index + 1, media: media, from: segment.from,
                                             to: segment.to, outputStart: segment.outputStart))
             }
@@ -412,15 +511,16 @@ extension ReencodeEngine {
         return inputs
     }
 
-    private func seekAnchor(_ from: RationalTime, media: MediaInfo) throws -> Int64? {
-        let preroll = RationalTime(numerator: 2)
+    /// The seek position of the latest verified restart point at least `preroll` before `from`.
+    /// The demuxer starts every track there, and a sound decoder is cold at a seek: HE-AAC decoded
+    /// 0.4 s after one differs from a full decode. Pictures need no history before a restart point.
+    private func seekAnchor(_ from: RationalTime, media: MediaInfo, preroll: RationalTime) throws -> Int64? {
         guard from > preroll, media.format.split(separator: ",").contains("mov"),
               !media.video.multipleDescriptions,
               media.audio.allSatisfy({ $0.presentationEdits.isEmpty }) else { return nil }
         let target = try from.subtracting(preroll)
         let end = media.frames.lowerBound { $0.time > target }
-        // This is a seek optimization only. Leave sufficient decode history
-        // before the cut, and allow the filters to trim on the original clock.
+        // The seek only skips input. The filters trim on the original clock.
         guard let frame = media.frames[..<end].last(where: { $0.canStart }),
               frame.time > .zero else { return nil }
         let absolute = try media.origin.adding(frame.time).roundedToSamples(1_000_000)
@@ -443,6 +543,7 @@ extension ReencodeEngine {
             let end = try absoluteEnd.roundedToSamples(scale)
             let offset = try segment.outputStart.roundedToSamples(scale) - base
             let decoder = decoders[segment.decoder]!
+            let soundDecoder = decoders[segment.sound ?? segment.decoder]!
             let videoInput = "[\(decoder):\(media.video.index)]"
             let range = "settb=1/\(scale),trim=start_pts=\(start):end_pts=\(end)"
             let pictureOutput = inputs.count == 1 ? "[picture]" : "[p\(index)]"
@@ -488,7 +589,7 @@ extension ReencodeEngine {
                     filters.append("[\(nextInput):a:0]aformat=channel_layouts=\(try audioLayout(track)),asetpts=N/SR/TB,\(conform)")
                     nextInput += 1
                 } else {
-                    filters.append("[\(decoder):\(track.index)]asettb=1/\(track.sampleRate),"
+                    filters.append("[\(soundDecoder):\(track.index)]asettb=1/\(track.sampleRate),"
                         + "atrim=start_pts=\(inputStart):end_pts=\(inputEnd),asetpts=PTS-(\(inputStart)),"
                         + "aresample=\(track.sampleRate):async=1:first_pts=0:min_hard_comp=0,\(conform)")
                 }
@@ -506,7 +607,7 @@ extension ReencodeEngine {
                     throw CutError(code: "unsupported_audio", message: "The selected range is shorter than one audio sample.",
                                    segment: segment.segment, track: track.index)
                 }
-                let input = "[\(decoder):\(track.index)]"
+                let input = "[\(soundDecoder):\(track.index)]"
                 let label = inputs.count == 1 ? "[sound\(position)]" : "[s\(position)_\(index)]"
                 let trim = "\(input)asettb=1/\(rate),atrim=start_pts=\(inputStart):end_pts=\(inputEnd)"
                 if !audio.presentationEdits.isEmpty {
@@ -544,6 +645,13 @@ extension ReencodeEngine {
 }
 
 private extension ReencodePlan {
+    func decodesSound(from media: MediaInfo) -> Bool {
+        if let canvas {
+            return !canvas.audio.isEmpty && !media.audio.isEmpty
+        }
+        return audioActions.contains(where: filtersAudio)
+    }
+
     func filtersAudio(_ action: ReencodeAudioAction) -> Bool {
         [.aac, .pcm].contains(action.action) || exactPCM.contains(action.track)
     }

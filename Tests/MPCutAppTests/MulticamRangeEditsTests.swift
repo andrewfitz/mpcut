@@ -15,7 +15,7 @@ final class MulticamRangeEditsTests: XCTestCase {
         let marked = AudioSpan(from: frames[5], to: frames[11])
         func plan(protecting protected: Set<AudioSpan>) -> [MulticamPauseEdit] {
             MulticamSilencePlanner.plan(project: project, media: ["wide": media], ranges: ranges,
-                                   pauses: [pause], scope: marked, minimum: 0, leave: 0, protected: protected)
+                                   pauses: [pause], scope: marked, minimum: 0, padding: 0, protected: protected)
         }
         let edits = plan(protecting: [])
         XCTAssertEqual(edits.map(\.id.occurrence), [0, 2])
@@ -39,7 +39,7 @@ final class MulticamRangeEditsTests: XCTestCase {
         let pause = AudioSpan(from: frames[3], to: frames[10])
         let plan = MulticamSilencePlanner.plan(project: project, media: ["wide": media, "close": media],
                                            ranges: [project.range], pauses: [pause], scope: nil,
-                                           minimum: 0, leave: 0, protected: [])
+                                           minimum: 0, padding: 0, protected: [])
         XCTAssertEqual(plan.compactMap(\.removal), [
             .init(from: frames[3], to: try frames[9].adding(offset))
         ])
@@ -67,6 +67,15 @@ final class MulticamRangeEditsTests: XCTestCase {
         let pauses = model.multicamPausePlan
         let cut = try XCTUnwrap(pauses.first?.removal)
         XCTAssertLessThan(cut.from, cut.to)
+        let groupPadding = model.paddingSpans(assembly: false)
+        let visible = try XCTUnwrap(pauses.first?.visible)
+        XCTAssertEqual(groupPadding, [AudioSpan(from: visible.from, to: cut.from),
+                                      AudioSpan(from: cut.to, to: visible.to)])
+        XCTAssertEqual(model.paddingSpans(assembly: true), groupPadding)
+        XCTAssertTrue(timelineRulerDescription(at: visible.from.seconds, padding: groupPadding)
+            .contains("retained silence padding"))
+        XCTAssertFalse(timelineRulerDescription(at: cut.from.seconds, padding: groupPadding)
+            .contains("retained silence padding"))
 
         model.applyMulticamPauses(queueTakes: true, plan: pauses)
         XCTAssertEqual(model.project, original)
@@ -75,6 +84,12 @@ final class MulticamRangeEditsTests: XCTestCase {
         ])
         model.reviewMulticamPause(try XCTUnwrap(pauses.first))
         XCTAssertEqual(model.pauseEdits.review?.plan.intervals.count, 2)
+        guard case .multicam(let reviewed)? = model.pauseEdits.review?.project else {
+            return XCTFail("The pause review needs its assembly snapshot for replacement pictures and color.")
+        }
+        let reviewRanges = try XCTUnwrap(reviewed.assemblyItems?.compactMap(\.group))
+        XCTAssertEqual(reviewRanges.first?.to, cut.from)
+        XCTAssertEqual(reviewRanges.last?.from, cut.to)
         model.pauseEdits.review = nil
 
         model.applyMulticamPauses(queueTakes: false, plan: pauses)
@@ -82,6 +97,68 @@ final class MulticamRangeEditsTests: XCTestCase {
         XCTAssertTrue(model.assemblyPreview)
         model.undo()
         XCTAssertEqual(model.project, original)
+    }
+
+    @MainActor
+    func testOccurrencePauseOverridesTakeDividersAndJoinPreview() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(url)
+        let stream = try XCTUnwrap(media.audio.first?.stream.index)
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.useAnalysisSidecars = false
+        model.confirmSetup(drafts: [.init(source: .init(id: "wide", file: url.path, audioStream: stream), media: media)],
+                           opening: "wide", audio: .fixed(.init(source: "wide", stream: stream)))
+        let original = try XCTUnwrap(model.project?.range)
+        let switchTime = try XCTUnwrap(media.frames.dropFirst().first?.time)
+        XCTAssertTrue(model.edit {
+            $0.assembly = [original, original]
+            $0.switches.append(.init(at: switchTime, angle: "wide"))
+        })
+        XCTAssertTrue(model.previewMulticamAssemblyJoin(before: 1))
+        XCTAssertEqual(model.pauseEdits.review?.position, try original.to.subtracting(original.from))
+        XCTAssertNil(model.pauseEdits.review?.id)
+        guard case .multicam(let join)? = model.pauseEdits.review?.project else { return XCTFail("Missing multicam preview project") }
+        XCTAssertEqual(join.assemblyItems?.count, 2)
+        model.pauseEdits.review = nil
+        XCTAssertTrue(model.previewMulticamSwitch(at: switchTime))
+        XCTAssertEqual(model.pauseEdits.review?.position, switchTime)
+        model.pauseEdits.review = nil
+
+        model.configureSilenceAnalysis(minimum: 1, threshold: -45)
+        model.scanAnalysis(.silence)
+        let deadline = ContinuousClock.now + .seconds(4)
+        while !model.canApplyPauses && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(model.canApplyPauses)
+        let pauses = model.multicamPausePlan
+        XCTAssertEqual(pauses.map { $0.id.occurrence }, [0, 1])
+        XCTAssertTrue(model.setPauseRetainedDuration(0.9, for: try XCTUnwrap(pauses.first)))
+        let updated = model.multicamPausePlan
+        XCTAssertEqual(updated.first?.requestedRetainedSeconds, 0.9)
+        XCTAssertNil(updated.last?.requestedRetainedSeconds)
+        XCTAssertGreaterThan(try XCTUnwrap(updated.first).retainedSeconds, try XCTUnwrap(updated.last).retainedSeconds)
+
+        let initial = model.multicamTakeCandidates(plan: updated)
+        let first = try XCTUnwrap(initial.first?.range)
+        let middle = try first.from.adding(first.to.subtracting(first.from).multiplied(by: .init(numerator: 1, denominator: 2)))
+        XCTAssertTrue(model.editMulticamTakeBoundary(at: middle, add: true))
+        let corrected = model.multicamTakeCandidates(plan: updated)
+        XCTAssertEqual(corrected.count, initial.count + 1)
+        let divider = try XCTUnwrap(corrected.first(where: \.hasManualStart)?.range.from)
+        XCTAssertLessThan(divider, model.assemblyStart(at: 1))
+        XCTAssertTrue(model.applyMulticamPauses(queueTakes: true, plan: updated))
+        XCTAssertEqual(model.queuedRanges.count, corrected.count)
+        model.reorderAssemblyOccurrence(0, before: 2)
+        let reordered = model.multicamPausePlan
+        XCTAssertNil(reordered.first?.requestedRetainedSeconds)
+        XCTAssertEqual(reordered.last?.requestedRetainedSeconds, 0.9)
+        let movedDivider = try model.assemblyStart(at: 1).adding(divider)
+        XCTAssertTrue(model.multicamTakeCandidates(plan: reordered).contains { $0.hasManualStart && $0.range.from == movedDivider })
+        XCTAssertTrue(model.editMulticamTakeBoundary(at: movedDivider, add: false))
+        XCTAssertEqual(model.multicamTakeCandidates(plan: reordered).count, initial.count)
+        XCTAssertEqual(model.ranges, [original, original])
     }
 
     @MainActor
@@ -360,6 +437,8 @@ final class MulticamRangeEditsTests: XCTestCase {
         model.undo()
         model.undo()
         model.selectAssemblyRange(start, start)
+        XCTAssertNil(model.assemblySelection)
+        XCTAssertFalse(model.canEnqueueMarkedRange)
         XCTAssertFalse(model.canDeleteSelection)
         model.deleteSelection()
         XCTAssertEqual(model.ranges, [clip, clip, clip])

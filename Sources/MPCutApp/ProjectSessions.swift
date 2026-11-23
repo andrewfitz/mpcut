@@ -11,11 +11,15 @@ final class ProjectSession: ObservableObject {
     let editor: EditorModel
     let multicam: MulticamEditorModel
     let presentation = EditorPresentation()
+    let transcriptBasket = TranscriptPaneBasket()
+    let transcriptPaneMemory = TranscriptPaneMemory()
+    lazy var transcript = LiveTranscriptController(session: self)
     private(set) var mcpModeGeneration = UUID()
     @Published var isMulticam = false {
         didSet { if oldValue != isMulticam { mcpModeGeneration = UUID() } }
     }
     @Published var isHistoryPresented = false
+    @Published var isTimelineMapPresented = false
     weak var window: NSWindow? {
         didSet { applyCloseState() }
     }
@@ -41,6 +45,7 @@ final class ProjectSession: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.applyCloseState() }
             .store(in: &closeStateObservers)
+        _ = transcript
     }
 
     func canStartMulticam(accepting panel: NSWindow? = nil) -> Bool {
@@ -61,7 +66,7 @@ final class ProjectSession: ObservableObject {
     var isExporting: Bool { editor.isExporting || multicam.isExporting }
 
     var hasLifecycleModal: Bool {
-        window?.attachedSheet != nil || isHistoryPresented || (isMulticam
+        window?.attachedSheet != nil || isHistoryPresented || isTimelineMapPresented || (isMulticam
             ? !multicam.setup.isEmpty || multicam.isBulkQueuePresented || multicam.isReplacementAudioPresented || multicam.report != nil
             : editor.isBulkQueuePresented || editor.cutPreview != nil)
     }
@@ -77,13 +82,14 @@ final class ProjectSession: ObservableObject {
             return .multicam(multicam.projectURL ?? multicam.draft.url, multicam.project ?? multicam.pendingSetupProject,
                              multicam.setup.map(\.source), multicam.historyRevision, multicam.historyCursor)
         }
-        return .sequence(editor.projectURL ?? editor.draft.url, editor.stillProject, editor.historyEntryIDs,
+        return .sequence(editor.projectURL ?? editor.draft.url, editor.transcriptProject, editor.historyEntryIDs,
                          editor.historyCursor)
     }
 
     var hasUnsavedDocument: Bool { isMulticam ? multicam.isChanged : editor.isProjectChanged }
 
     func preserveAfterUnconfirmedClose() {
+        transcript.prepareForWindowEnd(preservingDraft: true)
         if isMulticam { multicam.preserveAfterUnconfirmedClose() }
         else { editor.preserveAfterUnconfirmedClose() }
     }
@@ -154,6 +160,7 @@ final class ProjectSession: ObservableObject {
     }
 
     func end() {
+        transcript.prepareForWindowEnd()
         windowDelegate?.detach()
         windowDelegate = nil
         monitor?.close()
@@ -222,6 +229,7 @@ final class ProjectSessions: ObservableObject {
     lazy var mcpBridge = MCPLocalControl(sessions: self)
     lazy var mcpFileJobs = MCPFileJobs()
     let mcpAnalysisJobs = MCPAnalysisJobs()
+    let mcpTranscriptPlans = MCPTranscriptPlans()
     let mcpOutputJobs = MCPLiveOutputJobs()
     private(set) var isDrainingMCPForQuit = false
     private var hasActiveMCPJobs: Bool {
@@ -233,7 +241,13 @@ final class ProjectSessions: ObservableObject {
     private var openWindow: ((UUID) -> Void)?
     /// Front to back. Finder can deliver an open event before any window is key.
     var orderedWindows: () -> [NSWindow] = { NSApp?.orderedWindows ?? [] }
-    private var pendingFiles: [URL] = []
+    private struct OpenRequest {
+        let files: [URL]
+        let fromFinder: Bool
+        let sessionID: UUID?
+    }
+    private var pendingFiles: [OpenRequest] = []
+    private var isPresentingFinderChoice = false
     private var addClipsOnOpen: Set<UUID> = []
     private weak var reopeningSession: ProjectSession?
     private var approvedQuitStates: [UUID: ProjectSession.DocumentState] = [:]
@@ -265,8 +279,12 @@ final class ProjectSessions: ObservableObject {
             }
             .store(in: &focusObservers)
         notifications.publisher(for: NSWindow.didEndSheetNotification)
-            .sink { [weak self] _ in
-                Task { [weak self] in self?.setCommandWindow(NSApp?.keyWindow) }
+            .sink { [weak self] event in
+                guard let parent = event.object as? NSWindow else { return }
+                Task { [weak self, weak parent] in
+                    guard let self, let app = NSApp, app.isActive else { return }
+                    self.restoreCommandsAfterSheet(on: parent, keyWindow: app.keyWindow, mainWindow: app.mainWindow)
+                }
             }
             .store(in: &focusObservers)
         notifications.publisher(for: NSApplication.didBecomeActiveNotification)
@@ -275,6 +293,19 @@ final class ProjectSessions: ObservableObject {
         notifications.publisher(for: NSApplication.didResignActiveNotification)
             .sink { [weak self] _ in self?.setCommandWindow(nil) }
             .store(in: &focusObservers)
+    }
+
+    func restoreCommandsAfterSheet(on parent: NSWindow?, keyWindow: NSWindow?, mainWindow: NSWindow?) {
+        // The sheet can end before AppKit returns key status to its parent. While
+        // that parent is still main, it owns the commands during the transition.
+        setCommandWindow(keyWindow ?? (parent === mainWindow ? parent : nil))
+    }
+
+    func focusProjectWindow(_ window: NSWindow) {
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        // Making an already-key window frontmost emits no key-window notification.
+        if window.isKeyWindow { setCommandWindow(window) }
     }
 
     /// A popover takes key status from its editor and still belongs to that editor's commands.
@@ -354,10 +385,17 @@ final class ProjectSessions: ObservableObject {
         Task { [weak self, weak session] in
             guard let self else { return }
             let attached = session.flatMap { self.sessions[$0.id] === $0 && $0.window != nil ? $0 : nil }
-            let files = self.pendingFiles
-            self.pendingFiles = []
-            self.route(files, in: attached ?? self.frontSession)
+            self.openPendingFiles(in: attached)
             if chooseClips { attached?.editor.chooseFiles() }
+        }
+    }
+
+    private func openPendingFiles(in session: ProjectSession?) {
+        guard openWindow != nil else { return }
+        while !isPresentingFinderChoice && !pendingFiles.isEmpty {
+            let request = pendingFiles.removeFirst()
+            let target = request.sessionID.flatMap { sessions[$0] } ?? session ?? focusedSession ?? frontSession
+            route(request, in: target)
         }
     }
 
@@ -376,6 +414,7 @@ final class ProjectSessions: ObservableObject {
         guard sessions[id] === session else { return }
         mcpOutputJobs.close(owner: session.mcpHandle)
         mcpAnalysisJobs.close(owner: session.mcpHandle)
+        mcpTranscriptPlans.remove(owner: session.mcpHandle)
         if commandContext?.session === session { setCommandWindow(nil) }
         // Reset abandons the operation's result. Subscribe while the model can
         // still cancel it so a subsequent Quit can await its file cleanup.
@@ -482,14 +521,16 @@ final class ProjectSessions: ObservableObject {
         }
     }
 
-    func openFiles(_ urls: [URL], in session: ProjectSession? = nil) {
+    func openFiles(_ urls: [URL], in session: ProjectSession? = nil, fromFinder: Bool = false) {
         let files = urls.filter(\.isFileURL)
-        guard launchState == .ready, openWindow != nil, pendingFiles.isEmpty else {
-            pendingFiles.append(contentsOf: files)
+        guard !files.isEmpty else { return }
+        let request = OpenRequest(files: files, fromFinder: fromFinder, sessionID: session?.id)
+        guard launchState == .ready, openWindow != nil, pendingFiles.isEmpty, !isPresentingFinderChoice else {
+            pendingFiles.append(request)
             return
         }
         let pendingReopen = reopeningSession.flatMap { $0.window == nil && sessions[$0.id] === $0 ? $0 : nil }
-        route(files, in: session ?? focusedSession ?? frontSession ?? pendingReopen)
+        route(request, in: session ?? focusedSession ?? frontSession ?? pendingReopen)
     }
 
     /// The editor that Add Clips uses when no editor has the menu commands, such
@@ -508,14 +549,14 @@ final class ProjectSessions: ObservableObject {
         target.editor.chooseFiles()
     }
 
-    /// Opens the multicam projects among files dropped on `session`, as File → Open
+    /// Opens the projects among files dropped on `session`, as File → Open
     /// would, and returns the remaining files for the editor to import.
     func openDroppedProjects(_ urls: [URL], in session: ProjectSession?) -> [URL] {
         var media: [URL] = []
         var projects: [URL] = []
         for url in urls where url.isFileURL {
             let resolved = Self.resolveAlias(url)
-            if Self.isProject(resolved) { projects.append(resolved) } else { media.append(url) }
+            if Self.isProject(resolved) { projects.append(resolved) } else { media.append(resolved) }
         }
         guard !projects.isEmpty else { return media }
         // SwiftUI does not open a window from inside the drop callback, so a project
@@ -535,37 +576,92 @@ final class ProjectSessions: ObservableObject {
         isCutDocument(resolved) || isCutDocument(resolved.resolvingSymlinksInPath())
     }
 
-    private func route(_ files: [URL], in source: ProjectSession?) {
+    private func route(_ request: OpenRequest, in source: ProjectSession?) {
         guard let openWindow else { return }
         var media: [URL] = []
         var projects: [URL] = []
-        for file in files {
+        for file in request.files {
             let resolved = Self.resolveAlias(file)
             if Self.isProject(resolved) {
                 projects.append(resolved)
             } else { media.append(resolved) }
         }
-        if !media.isEmpty {
-            if let source, source.isMulticam, source.multicam.project != nil,
-               !source.multicam.isBusy, source.window?.attachedSheet == nil,
-               media.allSatisfy(StillImage.isImageInput) {
-                source.multicam.insertMulticamStills(media)
-                source.window?.makeKeyAndOrderFront(nil)
-            } else {
-                let target = source.flatMap { $0.canReceiveMedia ? $0 : nil } ?? newWindow(openWindow)
-                target.editor.openFiles(media)
-                target.window?.makeKeyAndOrderFront(nil)
-            }
+        if request.fromFinder, media.count > 1, !media.contains(where: StillImage.isImageInput),
+           media.contains(where: Self.isVideo) {
+            chooseFinderImport(media, in: source)
+        } else if !media.isEmpty {
+            openMedia(media, in: source, using: openWindow)
         }
         for file in projects { openProject(file, in: source) }
     }
 
+    private static func isVideo(_ url: URL) -> Bool {
+        guard let type = UTType(filenameExtension: url.resolvingSymlinksInPath().pathExtension) else { return false }
+        return type.conforms(to: .movie) || type.conforms(to: .video)
+    }
+
+    private func openMedia(_ media: [URL], in source: ProjectSession?, using openWindow: (UUID) -> Void) {
+        if let source, source.isMulticam, source.multicam.project != nil,
+           !source.multicam.isBusy, source.window?.attachedSheet == nil, media.allSatisfy(StillImage.isImageInput) {
+            source.multicam.insertMulticamStills(media)
+            source.window?.makeKeyAndOrderFront(nil)
+        } else {
+            let target = source.flatMap { $0.canReceiveMedia ? $0 : nil } ?? newWindow(openWindow)
+            target.editor.openFiles(media)
+            target.window?.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    private func chooseFinderImport(_ media: [URL], in source: ProjectSession?) {
+        isPresentingFinderChoice = true
+        let alert = NSAlert()
+        alert.messageText = "Open \(media.count) files in MPCut"
+        alert.informativeText = "Join Clips adds the files to one timeline in order. Open as Multicam loads the videos as camera angles and any audio files as separate recordings."
+        alert.addButton(withTitle: "Join Clips")
+        alert.addButton(withTitle: "Open as Multicam")
+        alert.addButton(withTitle: "Cancel")
+        let finish: (NSApplication.ModalResponse) -> Void = { [weak self, weak source] response in
+            Task { @MainActor in
+                guard let self, let openWindow = self.openWindow else { return }
+                let source = source.flatMap { self.sessions[$0.id] === $0 ? $0 : nil }
+                if response == .alertFirstButtonReturn {
+                    self.openMedia(media, in: source, using: openWindow)
+                } else if response == .alertSecondButtonReturn,
+                          let target = self.multicamTarget(in: source, accepting: nil) {
+                    target.multicam.importSources(media, startAutomatically: true)
+                    target.window?.makeKeyAndOrderFront(nil)
+                }
+                self.isPresentingFinderChoice = false
+                self.openPendingFiles(in: source)
+            }
+        }
+        if let window = source?.window, window.attachedSheet == nil {
+            window.makeKeyAndOrderFront(nil)
+            alert.beginSheetModal(for: window, completionHandler: finish)
+        } else {
+            finish(alert.runModal())
+        }
+    }
+
     func project(at url: URL, excluding excluded: ProjectSession? = nil) -> ProjectSession? {
-        sessions.values.first { session in
-            guard session !== excluded else { return false }
-            let urls = [session.multicam.openingProjectURL, session.multicam.projectURL, session.multicam.draft.url,
-                        session.editor.openingProjectURL, session.editor.projectURL, session.editor.draft.url].compactMap { $0 }
-            return urls.contains { Self.sameFile($0, url) }
+        func project(matching matches: (URL) -> Bool) -> ProjectSession? {
+            sessions.values.first { session in
+                guard session !== excluded else { return false }
+                let urls = [session.multicam.openingProjectURL, session.multicam.projectURL, session.multicam.draft.url,
+                            session.editor.openingProjectURL, session.editor.projectURL, session.editor.draft.url]
+                return urls.compactMap { $0 }.contains(where: matches)
+            }
+        }
+        // Check every open project for an exact URL before consulting the filesystem.
+        if let existing = project(matching: { $0 == url }) { return existing }
+        let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+        lazy var identifier = try? url.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
+        return project { candidate in
+            if candidate.standardizedFileURL.resolvingSymlinksInPath() == resolved { return true }
+            guard let identifier,
+                  let candidateIdentifier = try? candidate.resourceValues(forKeys: [.fileResourceIdentifierKey])
+                    .fileResourceIdentifier else { return false }
+            return candidateIdentifier.isEqual(identifier)
         }
     }
 
@@ -586,16 +682,20 @@ final class ProjectSessions: ObservableObject {
     }
 
     func openProject(_ url: URL, in source: ProjectSession?, accepting panel: NSWindow? = nil) {
-        do { _ = try openProjectAtURL(url, in: source, accepting: panel) }
+        do { _ = try openResolvedProject(Self.resolvedProjectURL(url), in: source, accepting: panel) }
         catch { ProjectPanels.present(NSAlert(error: error), in: source?.window) }
     }
 
-    func openProjectAtURL(_ url: URL, in source: ProjectSession?, accepting panel: NSWindow? = nil,
-                          commitCheck: ((ProjectSession) -> (() -> Bool))? = nil) throws -> ProjectSession {
-        let url = Self.resolvedProjectURL(url)
+    func openResolvedProject(_ url: URL, in source: ProjectSession?, accepting panel: NSWindow? = nil,
+                             commitCheck: ((ProjectSession) -> (() -> Bool))? = nil)
+        throws -> (session: ProjectSession, reused: Bool) {
         if let existing = project(at: url) {
-            existing.window?.makeKeyAndOrderFront(nil)
-            return existing
+            if let named = [existing.editor.projectURL, existing.multicam.projectURL].compactMap({ $0 })
+                .first(where: { Self.sameFile($0, url) }) {
+                preferences.recentFiles.record([named])
+            }
+            if let window = existing.window { focusProjectWindow(window) }
+            return (existing, true)
         }
         let reservation = try ProjectDraft.reserveIfRecoverable(url)
         let document = try CutProject.loadEditorDocument(from: url, limit: preferences.historyLimit)
@@ -624,7 +724,7 @@ final class ProjectSessions: ObservableObject {
             target.multicam.openProject(url, document: project, history: history, reservation: reservation,
                                         archiveMedia: document.media, allowCommit: commitCheck?(target))
         }
-        return target
+        return (target, false)
     }
 
     private func multicamTarget(in source: ProjectSession?, accepting panel: NSWindow?) -> ProjectSession? {
@@ -687,23 +787,31 @@ private struct ProjectWorkspace: View {
         }
         .sheet(isPresented: $session.isHistoryPresented) {
             if session.isMulticam {
-                ProjectHistoryView(actions: multicam.historyActions, cursor: multicam.historyCursor,
-                                   disabled: multicam.isBusy, restore: multicam.moveToHistoryState)
+                ProjectHistoryView(actions: multicam.projectHistory, cursor: multicam.historyCursor,
+                                   disabled: multicam.isBusy, timeline: session.retainedTimeline,
+                                   restore: multicam.moveToHistoryState)
             } else {
-                ProjectHistoryView(actions: editor.historyActions, cursor: editor.historyCursor,
-                                   disabled: editor.isBusy, restore: editor.moveToHistoryState)
+                ProjectHistoryView(actions: editor.projectHistory, cursor: editor.historyCursor,
+                                   disabled: editor.isBusy, timeline: session.retainedTimeline,
+                                   restore: editor.moveToHistoryState)
+            }
+        }
+        .sheet(isPresented: $session.isTimelineMapPresented) {
+            if let timeline = session.currentTimeline {
+                TimelineRangeMapView(timeline: timeline)
             }
         }
         .background(ProjectWindowBinding(session: session, sessions: sessions, openWindow: openWindow,
                                          documentURL: session.isMulticam ? multicam.projectURL : editor.projectURL,
                                          isEdited: session.isMulticam ? multicam.isChanged : editor.isProjectChanged))
+        .environment(\.transcriptSession, session)
         .environment(\.openDroppedProjects) { [weak sessions, weak session] urls in
             sessions?.openDroppedProjects(urls, in: session) ?? urls
         }
     }
 }
 
-/// Opens dropped multicam projects and returns the files that are media.
+/// Opens dropped projects and returns the files that are media.
 private struct OpenDroppedProjectsKey: EnvironmentKey {
     static let defaultValue: @MainActor ([URL]) -> [URL] = { $0 }
 }
@@ -822,7 +930,7 @@ private final class ProjectWindowDelegate: NSObject, NSWindowDelegate {
 
 @MainActor
 final class EditorApplication: NSObject, NSApplicationDelegate {
-    let sessions = ProjectSessions(preferences: EditorPreferences(defaults: .standard), launching: true)
+    let sessions = ProjectSessions(preferences: EditorPreferences(defaults: EditorPreferences.applicationDefaults), launching: true)
     private var isQuitting = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -832,10 +940,11 @@ final class EditorApplication: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         sessions.finishLaunching()
         sessions.mcpBridge.observeSetting()
+        LiveTranscriptController.pruneAbandonedWork()
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        sessions.openFiles(urls)
+        sessions.openFiles(urls, fromFinder: true)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -855,12 +964,12 @@ final class EditorApplication: NSObject, NSApplicationDelegate {
         let decision = sessions.prepareToQuit(stopExports: {
             let alert = NSAlert()
             alert.messageText = "Stop ongoing work and quit?"
-            alert.informativeText = "MPCut will cancel active exports, conversions, and MCP jobs before it quits."
+            alert.informativeText = "MPCut will stop active exports, conversions, and jobs before it quits. Transcript jobs can be resumed when you reopen the project."
             alert.addButton(withTitle: "Continue Working").toolTip = "Keep MPCut open"
             let quit = alert.addButton(withTitle: "Stop and Quit")
             quit.hasDestructiveAction = true
             quit.toolTip = "Stop work and quit"
-            return alert.runModal() != .alertFirstButtonReturn
+            return alert.runModal() == .alertSecondButtonReturn
         }, reply: { [weak self] allowed in
             self?.isQuitting = false
             sender.reply(toApplicationShouldTerminate: allowed)
@@ -890,6 +999,7 @@ extension ProjectSessions {
         }
         func hasWorkToStop() -> Bool {
             isConvertingProject || sessions.values.contains(where: \.isExporting) || hasActiveMCPJobs
+                || LiveTranscriptController.hasActiveJobs
         }
         let askedToStop = hasWorkToStop()
         if askedToStop, !stopExports() { return .cancel }
@@ -942,6 +1052,13 @@ extension ProjectSessions {
                 cleaned()
             }
         }
+        if LiveTranscriptController.hasActiveJobs {
+            pending += 1
+            Task { @MainActor in
+                await LiveTranscriptController.interruptActiveJobs()
+                cleaned()
+            }
+        }
         if isConvertingProject {
             pending += 1
             conversionDidFinish = cleaned
@@ -965,6 +1082,7 @@ extension ProjectSessions {
     func finishTermination() {
         for session in sessions.values {
             if approvedQuitStates[session.id] == session.documentState {
+                session.transcript.prepareForWindowEnd()
                 session.editor.draft.discard()
                 session.multicam.draft.discard()
             } else {

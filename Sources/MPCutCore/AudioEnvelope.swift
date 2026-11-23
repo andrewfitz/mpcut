@@ -32,7 +32,8 @@ public struct AudioEnvelope: Codable, Sendable {
     /// Reusing an overview is exact when both ends and every requested column
     /// edge land on its grid. Finer zooms decode just the requested window.
     func coarsened(from start: Double, to end: Double, columns: Int, sampleRate: Int) -> AudioEnvelope? {
-        guard !low.isEmpty, high.count == low.count, to > from, start >= from, end <= to else { return nil }
+        guard columns > 0, !low.isEmpty, high.count == low.count,
+              from.isFinite, to.isFinite, from <= start, start < end, end <= to else { return nil }
         if start == from, end == to, columns == low.count { return self }
         // Sub-sample display columns can hold the preceding value. Aggregating
         // them into larger bins could import a sample outside the requested bin.
@@ -42,7 +43,7 @@ public struct AudioEnvelope: Codable, Sendable {
             let point = (time - from) * binsPerSecond
             let nearest = point.rounded()
             guard abs(nearest - point) <= max(1e-10, point.ulp * 4) else { return nil }
-            return Int(nearest)
+            return Int(exactly: nearest)
         }
         guard let first = aligned(start), let last = aligned(end), first >= 0, last <= low.count,
               last - first >= columns, (last - first).isMultiple(of: columns) else { return nil }

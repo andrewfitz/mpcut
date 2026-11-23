@@ -35,16 +35,30 @@ extension MulticamEditorModel {
     func mcpCommand(tool: String, arguments: [String: Any],
                     validateCommit: @escaping @MainActor () throws -> Void) async throws -> [String: Any]? {
         let args = MulticamArguments(values: arguments)
-        guard ["split_at", "set_camera_at", "seek", "set_playback", "get_history", "undo", "redo",
-               "restore_history", "multicam_switch", "multicam_source", "multicam_assembly",
-               "multicam_audio", "multicam_group", "multicam_select", "multicam_preview", "get_multicam"].contains(tool)
+        guard ["timeline_item_split", "multicam_camera_take", "timeline_playhead_seek", "playback_transport_play", "playback_transport_pause", "history_read", "history_undo", "history_redo",
+               "history_state_restore", "multicam_switch_edit", "multicam_source_edit", "multicam_assembly_edit",
+               "multicam_program_audio_set", "multicam_group_end_set", "multicam_selection_set", "multicam_preview_control", "multicam_state_read", "multicam_sync_suggest"].contains(tool)
         else { return nil }
         try validateCommit()
         guard let original = project else { throw args.invalid("Open a multicam project.") }
-        if tool == "get_history" { return mcpHistory }
-        if tool == "get_multicam" { return try multicamState(args, project: original) }
-        if (tool == "seek" || tool == "multicam_select"), arguments["occurrence"] != nil,
-           original.assemblyItems?.contains(where: { $0.still != nil }) == true, arguments["expectedRevision"] == nil {
+        if tool == "history_read" { return mcpHistory }
+        if tool == "multicam_sync_suggest" {
+            let revision = mcpRevision
+            let generation = mcpGeneration
+            let mediaRevision = transcriptMediaRevision
+            let report = try await syncSuggestions(for: original, sourceID: arguments["source_id"] as? String,
+                                                   referenceSourceID: arguments["reference_source_id"] as? String,
+                                                   waveform: !(arguments["metadata_only"] as? Bool ?? false))
+            try validateCommit()
+            guard revision == mcpRevision, generation == mcpGeneration, mediaRevision == transcriptMediaRevision else {
+                throw MCPCommandError("stale_revision", "The multicam project or its media changed during sync analysis.")
+            }
+            let result = try JSONSerialization.jsonObject(with: MCPSchemas.encodeResult(report))
+            return ["revision": revision, "report": result]
+        }
+        if tool == "multicam_state_read" { return try multicamState(args, project: original) }
+        if (tool == "timeline_playhead_seek" || tool == "multicam_selection_set"), arguments["occurrence"] != nil,
+           original.assemblyItems?.contains(where: { $0.still != nil }) == true, arguments["expected_revision"] == nil {
             throw MCPCommandError("invalid_arguments", "Supply the revision for this typed assembly occurrence.")
         }
         guard !isBusy, window?.attachedSheet == nil, setup.isEmpty, notice == nil else {
@@ -53,7 +67,7 @@ extension MulticamEditorModel {
         let revisionBeforeCommand = mcpRevision
         var result: [String: Any] = [:]
         switch tool {
-        case "split_at":
+        case "timeline_item_split":
             let index = try occurrence(args)
             let requested = try args.time()
             let space = try args.string("space")
@@ -75,10 +89,10 @@ extension MulticamEditorModel {
             let actual = space == "group" ? boundary : try start.adding(boundary.subtracting(range.from))
             guard commitOccurrenceSplit(index: index, at: boundary) else { throw nativeEditError }
             result = ["action": "Split Assembly Range", "space": space, "time": actual.description, "boundary": actual.description,
-                      "left": index, "right": index + 1, "historyRetained": preferences.historyLimit > 0,
-                      "groupTime": boundary.description, "occurrences": [index, index + 1]]
-        case "set_camera_at":
-            let target = try args.time()
+                      "left": index, "right": index + 1, "history_retained": preferences.historyLimit > 0,
+                      "group_time": boundary.description, "occurrences": [index, index + 1]]
+        case "multicam_camera_take":
+            let target = try args.time("group_time")
             if arguments["occurrence"] != nil {
                 let index = try occurrence(args)
                 guard let range = assemblyRange(at: index), range.contains(target) else {
@@ -86,22 +100,22 @@ extension MulticamEditorModel {
                 }
             }
             let angle: String
-            if args.values["number"] != nil {
-                let number = try args.integer("number")
-                guard args.values["angle"] == nil, number > 0, original.angles.indices.contains(number - 1) else {
+            if args.values["camera_number"] != nil {
+                let number = try args.integer("camera_number")
+                guard args.values["angle_id"] == nil, number > 0, original.angles.indices.contains(number - 1) else {
                     throw args.invalid("Supply one valid camera number or angle ID.")
                 }
                 angle = original.angles[number - 1].id
             } else {
-                angle = try args.string("angle")
+                angle = try args.string("angle_id")
             }
             guard let actual = take(angle, at: target) else {
                 if notice != nil { throw nativeEditError }
                 throw args.invalid("Use an existing camera and an interior group time or the opening time.")
             }
-            result = ["action": "Switch Camera", "space": "group", "angle": angle, "time": actual.description,
-                      "until": (project?.switches.first { $0.at > actual }?.at ?? original.range.to).description]
-        case "seek":
+            result = ["action": "Take Camera", "space": "group", "angle_id": angle, "group_time": actual.description,
+                      "group_until": (project?.switches.first { $0.at > actual }?.at ?? original.range.to).description]
+        case "timeline_playhead_seek":
             let target = try args.time()
             let index = try args.values["occurrence"].map { _ in try occurrence(args) }
             switch try args.string("space") {
@@ -129,44 +143,78 @@ extension MulticamEditorModel {
             default: throw args.invalid("Choose assembly or group time.")
             }
             result = previewPosition
-        case "set_playback":
-            guard let playing = arguments["playing"] as? Bool else { throw args.invalid("Supply playing.") }
+        case "playback_transport_play", "playback_transport_pause":
+            let playing = tool == "playback_transport_play"
             if playing != preview.isPlaying { preview.togglePlayback() }
             result = previewPosition
-        case "undo", "redo", "restore_history":
+        case "history_undo", "history_redo", "history_state_restore":
             let destination: Int
-            if tool == "restore_history" {
-                guard try args.string("historyToken") == historyToken else {
+            if tool == "history_state_restore" {
+                guard try args.string("history_token") == historyToken else {
                     throw MCPCommandError("stale_history", "Read the retained history again.")
                 }
                 destination = try args.integer("index")
-            } else { destination = historyCursor + (tool == "undo" ? -1 : 1) }
+            } else { destination = historyCursor + (tool == "history_undo" ? -1 : 1) }
             guard (0...historyActions.count).contains(destination) else { throw args.invalid("The requested history state is unavailable.") }
             moveToHistoryState(destination)
             result = mcpHistory
-        case "multicam_preview": result = try changePreview(args, project: original)
-        case "multicam_select": result = try changeSelection(args, project: original)
-        case "multicam_switch": try editSwitch(args, project: original)
-        case "multicam_source":
+        case "multicam_preview_control": result = try changePreview(args, project: original)
+        case "multicam_selection_set": result = try changeSelection(args, project: original)
+        case "multicam_switch_edit": try editSwitch(args, project: original)
+        case "multicam_source_edit":
             if try args.string("action") == "relink" {
                 let receipt = try await relinkSource(args, project: original, validateCommit: validateCommit)
-                result = ["revision": receipt.revision, "changed": receipt.changed, "historyRetained": receipt.historyRetained,
-                          "source": try args.string("source")]
+                result = ["revision": receipt.revision, "changed": receipt.changed, "history_retained": receipt.historyRetained,
+                          "source_id": try args.string("source_id")]
                 if receipt.changed { result["action"] = "Relink Source" }
                 result["warning"] = receipt.warning
                 return result
             }
-            result = try editSource(args, project: original)
-        case "multicam_audio":
+            if try args.string("action") == "add_recording" {
+                let angle = try args.string("angle_id")
+                let path = try args.string("path")
+                guard path.hasPrefix("/"), !path.contains("\0") else { throw args.invalid("Supply an absolute recording path.") }
+                let start = try args.time("group_start")
+                result["source_id"] = try await addRecording(to: angle, from: URL(fileURLWithPath: path), at: start,
+                                                               validateCommit: validateCommit)
+                result["angle_id"] = angle
+            } else {
+                result = try editSource(args, project: original)
+            }
+        case "multicam_program_audio_set":
+            let mode = try args.string("mode")
             let policy: MulticamAudioPolicy
-            switch try args.string("mode") {
-            case "fixed": policy = try .fixed(audioSelection(args, project: original))
+            let lanes: [MulticamAudioLane]?
+            if let list = arguments["lanes"] {
+                lanes = try JSONDecoder().decode([MulticamAudioLane].self, from: JSONSerialization.data(withJSONObject: list))
+                for lane in lanes ?? [] {
+                    if case .recording(let selection) = lane.target {
+                        guard media[selection.source]?.audio.contains(where: { $0.stream.index == selection.stream }) == true else {
+                            throw args.invalid("Choose an available recording and absolute audio stream index.")
+                        }
+                    }
+                }
+            } else { lanes = nil }
+            switch mode {
+            case "fixed":
+                if arguments["source_id"] != nil {
+                    policy = try .fixed(audioSelection(args, project: original))
+                } else if let saved = original.fixedAudio {
+                    policy = .fixed(saved)
+                } else {
+                    throw args.invalid("Choose a Fixed source and stream.")
+                }
             case "follow": policy = .follow
             case "none": policy = .none
-            default: throw args.invalid("Choose fixed, follow or none.")
+            case "mix": policy = .mix
+            default: throw args.invalid("Choose fixed, follow, none or mix.")
             }
-            guard edit(nil, { $0.audio = policy }) else { throw nativeEditError }
-        case "multicam_group":
+            guard edit("Change Program Audio", { project in
+                if let lanes { project.mixLanes = lanes }
+                else if policy == .mix, project.mixLanes.isEmpty { project.mixLanes = project.defaultMixLanes }
+                project.audio = policy
+            }) else { throw nativeEditError }
+        case "multicam_group_end_set":
             let end: RationalTime
             switch try args.string("action") {
             case "set_end": end = try args.time()
@@ -176,8 +224,8 @@ extension MulticamEditorModel {
             default: throw args.invalid("Choose set_end or extend.")
             }
             guard edit(nil, { $0.range.to = end }) else { throw nativeEditError }
-            result["groupTo"] = project?.range.to.description
-        case "multicam_assembly": result = try editAssembly(args, project: original)
+            result["group_to"] = project?.range.to.description
+        case "multicam_assembly_edit": result = try editAssembly(args, project: original)
         default: return nil
         }
         let changed = revisionBeforeCommand != mcpRevision
@@ -189,32 +237,37 @@ extension MulticamEditorModel {
         }
         result["changed"] = changed
         result["revision"] = mcpRevision
-        if !["undo", "redo", "restore_history", "seek", "set_playback", "multicam_preview", "multicam_select"].contains(tool) {
-            result["historyRetained"] = changed && preferences.historyLimit > 0
+        if !["history_undo", "history_redo", "history_state_restore", "timeline_playhead_seek", "playback_transport_play", "playback_transport_pause", "multicam_preview_control", "multicam_selection_set"].contains(tool) {
+            result["history_retained"] = changed && preferences.historyLimit > 0
             if changed, result["action"] == nil { result["action"] = lastEditAction }
         }
         return result
     }
 
-    private var historyToken: String { "\(mcpGeneration.uuidString)/\(mcpRevision)/\(historyRevision)/\(historyCursor)" }
+    var historyToken: String { "\(mcpGeneration.uuidString)/\(mcpRevision)/\(historyRevision)/\(historyCursor)" }
     private var mcpHistory: [String: Any] {
-        ["actions": historyActions, "cursor": historyCursor, "historyToken": historyToken,
+        let history = projectHistory
+        return ["actions": history.map(\.name), "origins": history.map(\.origin.rawValue), "cursor": historyCursor, "history_token": historyToken,
          "limit": preferences.historyLimit, "revision": mcpRevision]
     }
     private var previewPosition: [String: Any] {
         let output = preview.currentTime()
         let group = groupTime(at: output)
         var value: [String: Any] = ["space": assemblyPreview ? "assembly" : "group", "time": output.description,
-                                    "groupTime": group.description, "playing": preview.isPlaying,
+                                    "group_time": group.description, "playing": preview.isPlaying,
                                     "rate": preview.playbackRate, "speed": preview.forwardSpeed.rawValue,
                                     "auditioning": preview.isAuditioning]
-        if assemblyPreview { value["occurrence"] = occurrenceIndex(at: output) }
-        if assemblyPreview, let still = assemblyStill(at: occurrenceIndex(at: output)) {
-            value["groupTime"] = nil
+        let occurrence = assemblyPreview ? occurrenceIndex(at: output) : nil
+        value["occurrence"] = occurrence
+        if let occurrence, let still = assemblyStill(at: occurrence) {
+            value["group_time"] = nil
             value["placement"] = still.id
             value["asset"] = still.assetID
+        } else if let interval = interval(at: output) {
+            value["angle_id"] = interval.angle
+            value["picture_source_id"] = interval.pictureSourceID
         } else {
-            value["angle"] = project?.selection(at: group)?.angle
+            value["angle_id"] = project?.selection(at: group)?.angle
         }
         return value
     }
@@ -230,8 +283,8 @@ extension MulticamEditorModel {
         return index
     }
     private func audioSelection(_ args: MulticamArguments, project: MulticamProject) throws -> MulticamAudioSelection {
-        let id = try args.string("source")
-        let stream = try args.integer("stream")
+        let id = try args.string("source_id")
+        let stream = try args.integer("audio_stream_index")
         guard project.sources.contains(where: { $0.id == id }),
               media[id]?.audio.contains(where: { $0.stream.index == stream }) == true else {
             throw args.invalid("Choose an available audio source and absolute stream index.")
@@ -243,13 +296,14 @@ extension MulticamEditorModel {
         let ends = assemblyRangeEnds
         return indices.map { index in
             let start = index == 0 ? RationalTime.zero : ends[index - 1]
-            var row: [String: Any] = ["index": index, "assemblyFrom": start.description,
-                                      "assemblyTo": ends[index].description]
+            var row: [String: Any] = ["index": index, "assembly_from": start.description,
+                                      "assembly_to": ends[index].description]
             switch items[index] {
-            case .group(let range):
+            case .group(let range, let angle):
+                row["angle_id"] = angle
                 row["type"] = "group"
-                row["groupFrom"] = range.from.description
-                row["groupTo"] = range.to.description
+                row["group_from"] = range.from.description
+                row["group_to"] = range.to.description
             case .still(let still):
                 row["type"] = "still"
                 row["placement"] = still.id
@@ -268,24 +322,64 @@ extension MulticamEditorModel {
             return start..<(start + min(limit, total - start))
         }
         let audio = try JSONSerialization.jsonObject(with: JSONEncoder().encode(project.audio))
-        var state: [String: Any] = ["referenceAngle": project.referenceAngle, "audio": audio,
-                                    "groupFrom": project.range.from.description, "groupTo": project.range.to.description,
+        var state: [String: Any] = ["reference_angle_id": project.referenceAngle, "audio": audio,
+                                    "group_from": project.range.from.description, "group_to": project.range.to.description,
                                     "revision": mcpRevision, "offset": offset]
         switch try args.string("section") {
+        case "audio":
+            let planned = try project.plan()
+            let lanes = try project.resolveAudioLanes(plan: planned,
+                                                          indexedSources: media.filter { $0.value.hasFullEditIndex },
+                                                          unavailableAsGap: true)
+            let encode = JSONEncoder()
+            state["mix_lanes"] = try JSONSerialization.jsonObject(with: encode.encode(project.mixLanes))
+            state["audio_replacements"] = try JSONSerialization.jsonObject(with: encode.encode(project.audioReplacements))
+            state["binding_coverage"] = try project.audioReplacements.map { binding -> [String: Any] in
+                var entry: [String: Any] = ["id": binding.id]
+                if let donor = media[binding.replacement.source], donor.hasFullEditIndex,
+                   let track = donor.audio.first(where: { $0.stream.index == binding.replacement.stream }) {
+                    let ranges = try MulticamSync.usedReferenceRanges(project: project, reference: binding.original)
+                    let coverage = try MulticamSync.replacementCoverage(in: ranges, track: track,
+                                                                       relativeOffset: binding.relativeOffset)
+                    entry["coverage"] = try JSONSerialization.jsonObject(with: encode.encode(coverage))
+                }
+                return entry
+            }
+            state["audio_lanes"] = try JSONSerialization.jsonObject(with: encode.encode(Array(lanes[page(lanes.count)])))
+            state["total"] = lanes.count
+            if let fixed = project.fixedAudio {
+                state["fixed_audio"] = try JSONSerialization.jsonObject(with: encode.encode(fixed))
+            }
+        case "switch_coverage":
+            let report = try cameraCoverage(args.string("angle_id"), at: args.time("group_time"))
+            state["switch_coverage"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(report))
         case "sources":
             let sources = project.sources
+            let angleIndices = Dictionary(uniqueKeysWithValues: project.angles.enumerated().flatMap { i, angle in
+                angle.recordings.map { ($0.id, i) }
+            })
             state["total"] = sources.count
             state["sources"] = page(sources.count).map { i -> [String: Any] in
                 let source = sources[i]
                 let info = media[source.id]
                 var item: [String: Any] = ["id": source.id, "file": source.file, "name": source.displayName,
-                                           "kind": i < project.angles.count ? "camera" : "audio", "offset": source.offset.description,
+                                           "kind": angleIndices[source.id] == nil ? "audio" : "camera", "offset": source.offset.description,
                                            "available": info != nil, "indexed": info?.hasFullEditIndex == true]
-                if i < project.angles.count { item["number"] = i + 1 }
-                item["audioStream"] = source.audioStream
-                item["audioStreams"] = info?.audio.map { $0.stream.index } ?? []
+                if let index = angleIndices[source.id] {
+                    item["camera_number"] = index + 1
+                    item["angle_id"] = project.angles[index].id
+                }
+                if let coverage = source.coverage {
+                    item["group_coverage"] = ["from": coverage.from.description, "to": coverage.to.description]
+                }
+                item["audio_stream_index"] = source.audioStream
+                item["audio_stream_indices"] = info?.audio.map { $0.stream.index } ?? []
+                item["audio_streams"] = info?.audio.map { track in
+                    ["index": track.stream.index, "label": track.stream.exportLabel,
+                     "channel_layout": track.stream.channelLayout, "sample_rate": track.stream.sampleRate] as [String: Any]
+                } ?? []
                 item["duration"] = info?.duration.description
-                item["indexProgress"] = sourceIndexProgress[source.id]
+                item["index_progress"] = latestSourceIndexProgress(source)
                 item["issue"] = sourceIssues[source.id] ?? sourceIndexIssues[source.id]
                 return item
             }
@@ -304,10 +398,14 @@ extension MulticamEditorModel {
             state["total"] = suggestions.count
             state["anchor"] = suggestionAnchor?.description
             state["suggestions"] = suggestions[page(suggestions.count)].map(\.description)
-        default: throw args.invalid("Choose sources, switches, suggestions, assembly or stills.")
+            if let suggestion = currentEdgeSuggestion {
+                state["edge"] = ["range_number": suggestion.edge.range, "boundary": suggestion.edge.boundary,
+                                 "group_time": suggestion.edge.at.description, "times": suggestion.times.map(\.description)]
+            }
+        default: throw args.invalid("Choose sources, switches, switch coverage, suggestions, assembly, stills or audio.")
         }
         if let policy = project.programColorPolicy {
-            state["programColorPolicy"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(policy))
+            state["program_color_policy"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(policy))
         }
         return state
     }
@@ -327,7 +425,7 @@ extension MulticamEditorModel {
             guard at != project.range.from else { throw args.invalid("The opening switch must remain.") }
             deleteSwitch(at)
         case "angle":
-            let id = try args.string("angle")
+            let id = try args.string("angle_id")
             guard project.angles.contains(where: { $0.id == id }) else { throw args.invalid("Unknown camera.") }
             changeSwitch(at, angle: id)
         case "audio": try changeSwitch(at, audio: audioSelection(args, project: project))
@@ -337,7 +435,7 @@ extension MulticamEditorModel {
     }
 
     private func editSource(_ args: MulticamArguments, project: MulticamProject) throws -> [String: Any] {
-        let id = try args.string("source")
+        let id = try args.string("source_id")
         guard project.sources.contains(where: { $0.id == id }) else { throw args.invalid("Unknown multicam source.") }
         switch try args.string("action") {
         case "rename":
@@ -352,25 +450,25 @@ extension MulticamEditorModel {
                 if notice != nil { throw nativeEditError }
                 throw args.invalid("A frame or audio sample interval is unavailable at this source position.")
             }
-            return ["source": id, "groupTime": clock.description, "offset": offset.description]
+            return ["source_id": id, "group_time": clock.description, "offset": offset.description]
         case "move":
             let direction = try args.direction()
             guard let index = project.angles.firstIndex(where: { $0.id == id }), project.angles.indices.contains(index + direction)
             else { throw args.invalid("Choose a camera that can move in that direction.") }
             moveSource(id, by: direction)
         case "microphone":
-            guard project.angles.contains(where: { $0.id == id }) else { throw args.invalid("Select a camera.") }
-            let stream = args.values["stream"] == nil ? nil : try audioSelection(args, project: project).stream
+            guard project.pictureSources.contains(where: { $0.id == id }) else { throw args.invalid("Select a camera recording.") }
+            let stream = args.values["audio_stream_index"] == nil ? nil : try audioSelection(args, project: project).stream
             updateSource(id) { $0.audioStream = stream }
         default: throw args.invalid("Unknown source action.")
         }
-        return ["source": id]
+        return ["source_id": id]
     }
 
     private func relinkSource(_ args: MulticamArguments, project: MulticamProject,
                               validateCommit: @escaping @MainActor () throws -> Void) async throws
         -> (revision: Int, changed: Bool, historyRetained: Bool, warning: String?) {
-        let id = try args.string("source")
+        let id = try args.string("source_id")
         guard project.sources.contains(where: { $0.id == id }) else { throw args.invalid("Unknown multicam source.") }
         let path = try args.string("path")
         guard path.hasPrefix("/"), !path.contains("\0") else { throw args.invalid("Supply an absolute replacement file path.") }
@@ -391,6 +489,12 @@ extension MulticamEditorModel {
 
     private func editAssembly(_ args: MulticamArguments, project: MulticamProject) throws -> [String: Any] {
         switch try args.string("action") {
+        case "angle_set", "angle_clear":
+            let index = try occurrence(args)
+            let angle = try args.string("action") == "angle_set" ? args.string("angle_id") : nil
+            guard assemblyRange(at: index) != nil else { throw args.invalid("Choose a source-backed assembly occurrence.") }
+            if let angle, !project.angles.contains(where: { $0.id == angle }) { throw args.invalid("Unknown camera.") }
+            guard setOccurrenceAngle(index, angle: angle) else { throw nativeEditError }
         case "append":
             let from = try args.time("from"), to = try args.time("to")
             guard project.range.from <= from, from < to, to <= project.range.to else { throw args.invalid("Choose a nonempty group range.") }
@@ -400,7 +504,7 @@ extension MulticamEditorModel {
             guard args.values["from"] != nil || args.values["to"] != nil else {
                 throw args.invalid("Supply a group in or out time to trim.")
             }
-            guard let range = assemblyRange(at: index) else { throw args.invalid("Use update_still to resize an inserted still.") }
+            guard let range = assemblyRange(at: index) else { throw args.invalid("Use still_editor_placement_update to resize an inserted still.") }
             let from = args.values["from"] == nil ? range.from : try args.time("from")
             let to = args.values["to"] == nil ? range.to : try args.time("to")
             guard project.range.from <= from, from < to, to <= project.range.to else { throw args.invalid("Choose a nonempty group range.") }
@@ -422,7 +526,7 @@ extension MulticamEditorModel {
                 throw args.invalid("No valid trim boundary was available for the requested edge.")
             }
             if commit { return ["boundary": boundary.description] }
-            return ["proposedSeconds": boundary.seconds, "boundary": boundary.description]
+            return ["proposed_seconds": boundary.seconds, "boundary": boundary.description]
         case "move":
             let index = try occurrence(args), slot = try args.integer("before")
             guard (0...assemblyItems.count).contains(slot) else { throw args.invalid("Choose an insertion slot in the assembly.") }
@@ -439,6 +543,10 @@ extension MulticamEditorModel {
             try requireMarkedRange(args)
             guard canDeleteSelectedRange else { throw args.invalid("Select a removable range that leaves some program material.") }
             deleteSelectedRange()
+        case "apply_edge_suggestion":
+            guard try applyEdgeSuggestion(args.time("to")) else {
+                throw args.invalid("That edge suggestion is no longer available.")
+            }
         default: throw args.invalid("Unknown assembly action.")
         }
         return [:]
@@ -486,9 +594,9 @@ extension MulticamEditorModel {
         }
         var state = previewPosition
         state["occurrence"] = selectedOccurrence
-        state["markSpace"] = assemblySelection == nil ? "group" : "assembly"
-        state["markIn"] = displayedMarkIn?.description
-        state["markOut"] = displayedMarkOut?.description
+        state["mark_space"] = assemblySelection == nil ? "group" : "assembly"
+        state["mark_in"] = displayedMarkIn?.description
+        state["mark_out"] = displayedMarkOut?.description
         return state
     }
 
@@ -497,8 +605,10 @@ extension MulticamEditorModel {
         case "group": setAssemblyPreview(false)
         case "assembly": setAssemblyPreview(true)
         case "audition":
-            let angle = try args.string("angle")
-            guard project.angles.contains(where: { $0.id == angle }), media[angle] != nil else { throw args.invalid("Choose an available camera.") }
+            let angle = try args.string("angle_id")
+            guard let source = project.pictureSource(for: angle, at: currentGroupTime()), media[source.id] != nil else {
+                throw args.invalid("Choose an available camera with a recording at the playhead.")
+            }
             guard !preview.isPlaying else { throw MCPCommandError("editor_busy", "Pause playback to audition a camera.") }
             audition(angle)
         case "program": preview.endAudition()

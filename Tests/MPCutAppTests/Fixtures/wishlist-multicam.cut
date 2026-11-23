@@ -1,0 +1,44 @@
+{
+  "format": "mpcut",
+  "schema_version": 3,
+  "kind": "multicam",
+  "reference_angle_id": "A",
+  "group_range": {"from": "0", "to": "10"},
+  "angles": [
+    {
+      "id": "A",
+      "file": "wide.mov",
+      "group_coverage": {"from": "0", "to": "3"},
+      "additional_recordings": [
+        {"id": "A2", "file": "wide-part-2.mov", "offset": "4", "group_coverage": {"from": "4", "to": "10"}}
+      ]
+    },
+    {"id": "B", "file": "close.mov"}
+  ],
+  "audio": {"mode": "follow"},
+  "switches": [{"group_time": "0", "angle_id": "A"}],
+  "assembly": [
+    {"from": "4", "to": "6"},
+    {"kind": "group", "from": "4", "to": "6", "angle_id": "B"}
+  ],
+  "history": {
+    "undo": [{
+      "action": "Relink Camera Recording",
+      "angles": [
+        {
+          "id": "A",
+          "file": "wide.mov",
+          "group_coverage": {"from": "0", "to": "3"},
+          "additional_recordings": [
+            {"id": "A2", "file": "original-part-2.mov", "offset": "4", "group_coverage": {"from": "4", "to": "10"}}
+          ]
+        },
+        [1, 1]
+      ]
+    }],
+    "redo": [{
+      "action": "Clear Replay Angle",
+      "assembly": [[0, 1], {"from": "4", "to": "6"}]
+    }]
+  }
+}

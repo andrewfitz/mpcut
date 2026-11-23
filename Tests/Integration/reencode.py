@@ -64,7 +64,7 @@ class ReencodeTests(unittest.TestCase):
         self.root = Path(directory.name)
 
     def export(self, output, clips, *, video="h264", audio="remove", quality=None, dry=False, ok=True):
-        args = [CLI, "export", "--json", "--mode", "encode", "--video", video, "--audio", audio,
+        args = [CLI, "export", "clips", "join", "--json", "--mode", "encode", "--video", video, "--audio", audio,
                 "--output", output]
         if quality is not None:
             args += ["--quality", quality]
@@ -146,8 +146,8 @@ class ReencodeTests(unittest.TestCase):
                 self.assertEqual(dry["video"], codec)
                 self.assertEqual(dry["quality"], quality)
                 self.assertEqual(ratio(dry["duration"]), duration)
-                self.assertEqual(ratio(dry["encodedDuration"]), duration)
-                self.assertEqual(ratio(dry["copiedDuration"]), 0)
+                self.assertEqual(ratio(dry["encoded_duration"]), duration)
+                self.assertEqual(ratio(dry["copied_duration"]), 0)
                 report = self.export(output, clips, video=codec, quality=quality)
                 self.assertEqual(ratio(report["duration"]), duration)
                 metadata = stream(output, "v:0")
@@ -192,7 +192,7 @@ class ReencodeTests(unittest.TestCase):
         for label, files in [("shared", [self.stereo] * len(frames)), ("distinct", sources)]:
             with self.subTest(inputs=label):
                 output = self.root / f"{label}.mov"
-                args = [CLI, "--no-sidecar", "export", "--mode", "encode", "--audio", "copy",
+                args = [CLI, "--no-sidecar", "export", "clips", "join", "--mode", "encode", "--audio", "copy",
                         "--output", output, "--json"]
                 for source, frame in zip(files, frames):
                     args += ["--clip", source, "--from", str(Fraction(frame, FPS)),
@@ -241,7 +241,7 @@ class ReencodeTests(unittest.TestCase):
             with self.subTest(audio=format_name):
                 output = self.root / (format_name + suffix)
                 report = self.export(output, clips, audio=format_name)
-                self.assertEqual([track["action"] for track in report["audioActions"]], [format_name] * 2)
+                self.assertEqual([track["action"] for track in report["audio_actions"]], [format_name] * 2)
                 streams = probe(output, "-select_streams", "a", "-show_streams")["streams"]
                 self.assertEqual([track["channels"] for track in streams], [2, 1])
                 self.assertEqual([int(track["sample_rate"]) for track in streams], [44100, 48000])
@@ -277,7 +277,7 @@ class ReencodeTests(unittest.TestCase):
         clips = [(self.stereo, Fraction(1), Fraction(2))]
         output = self.root / "auto-copy.mov"
         dry = self.export(output, clips, audio="auto", dry=True)
-        self.assertEqual([track["action"] for track in dry["audioActions"]], ["copy", "copy"])
+        self.assertEqual([track["action"] for track in dry["audio_actions"]], ["copy", "copy"])
         self.export(output, clips, audio="auto")
         for index, rate in enumerate([44100, 48000]):
             channels = 2 - index
@@ -286,8 +286,8 @@ class ReencodeTests(unittest.TestCase):
 
         output = self.root / "auto-convert.mp4"
         dry = self.export(output, clips, audio="auto", dry=True)
-        self.assertEqual([track["action"] for track in dry["audioActions"]], ["aac", "aac"])
-        self.assertTrue(all(track.get("reason") for track in dry["audioActions"]))
+        self.assertEqual([track["action"] for track in dry["audio_actions"]], ["aac", "aac"])
+        self.assertTrue(all(track.get("reason") for track in dry["audio_actions"]))
         report = self.export(output, clips, audio="copy", dry=True, ok=False)
         self.assertEqual(report["error"]["code"], "audio_copy_unavailable")
 
@@ -298,7 +298,7 @@ class ReencodeTests(unittest.TestCase):
                "-map", "0:v:0", "-map", "1:a:0", "-t", "2", "-c:v", "libx264", "-g", "25",
                "-c:a", "aac", "-aac_pns", "0", source)
         joined = self.root / "joined.mov"
-        run([CLI, "export", "--json", "--output", joined, *(["--clip", source] * 4)], allow_diagnostics=True)
+        run([CLI, "export", "clips", "join", "--json", "--output", joined, *(["--clip", source] * 4)], allow_diagnostics=True)
         decoded = run([self.decode_audio_native, joined])
         self.assertEqual(len(decoded), 8 * 48000 * 2)
         self.assertEqual(decoded[2 * 48000 * 2:3 * 48000 * 2], bytes(48000 * 2))
@@ -308,7 +308,7 @@ class ReencodeTests(unittest.TestCase):
                   (Fraction(13, 5), Fraction(16, 5))]
         output = self.root / "converted.mov"
         report = self.export(output, [(joined, start, end) for start, end in ranges], audio="pcm")
-        self.assertEqual([track["action"] for track in report["audioActions"]], ["pcm"])
+        self.assertEqual([track["action"] for track in report["audio_actions"]], ["pcm"])
         expected = b"".join(decoded[int(start * 48000) * 2:int(end * 48000) * 2] for start, end in ranges)
         self.assertEqual(run([self.decode_audio_native, output]), expected)
 
@@ -340,7 +340,7 @@ class ReencodeTests(unittest.TestCase):
         clips = [(shifted, Fraction(start, FPS), Fraction(end, FPS)) for start, end in ranges]
         output = self.root / "copy-pcm.mov"
         report = self.export(output, clips, audio="copy")
-        self.assertEqual([track["action"] for track in report["audioActions"]], ["copy", "copy"])
+        self.assertEqual([track["action"] for track in report["audio_actions"]], ["copy", "copy"])
         self.assertEqual(picture_ids(output), bytes(i for start, end in ranges for i in range(start, end)))
         for index, rate in enumerate([44100, 48000]):
             channels = 2 - index
@@ -359,7 +359,7 @@ class ReencodeTests(unittest.TestCase):
             with self.subTest(video=video, audio=audio):
                 output = self.root / f"big-endian-{video}.mov"
                 report = self.export(output, [(source, 0, 5)], video=video, audio=audio)
-                self.assertEqual([track["action"] for track in report["audioActions"]], ["copy"])
+                self.assertEqual([track["action"] for track in report["audio_actions"]], ["copy"])
                 self.assertEqual(stream(output, "a:0")["codec_name"], "pcm_s24le")
                 self.assertEqual(pcm(output, 44100), pcm(source, 44100))
 
@@ -408,7 +408,7 @@ class ReencodeTests(unittest.TestCase):
         clips = [(source, Fraction(start, FPS), Fraction(end, FPS)) for start, end in ranges]
         output = self.root / "portrait-av1.mp4"
         report = self.export(output, clips, audio="auto")
-        self.assertEqual([action["action"] for action in report["audioActions"]], ["aac"])
+        self.assertEqual([action["action"] for action in report["audio_actions"]], ["aac"])
         metadata = stream(output, "v:0")
         self.assertEqual((metadata["width"], metadata["height"]), (180, 320))
         sound = stream(output, "a:0")
@@ -511,13 +511,13 @@ class ReencodeTests(unittest.TestCase):
         ffmpeg("-i", self.video, "-f", "lavfi", "-i", "sine=f=997:r=48000:d=4",
                "-map", "1:a", "-map", "0:v", "-c:v", "copy", "-c:a", "libopus", source)
         cropped = self.root / "cropped.mkv"
-        run([CLI, "export", "--output", cropped, "--clip", source, "--from", "1", "--to", "3"],
+        run([CLI, "export", "clips", "join", "--output", cropped, "--clip", source, "--from", "1", "--to", "3"],
             allow_diagnostics=True)
         for name, original, picture_end, sound_end in [("whole", source, 5, 4), ("crop", cropped, 2, 2)]:
             with self.subTest(edit=name):
                 output = self.root / f"{name}.mkv"
                 report = self.export(output, [(original, 0, picture_end)], audio="copy")
-                self.assertEqual(report["audioActions"][0]["action"], "copy")
+                self.assertEqual(report["audio_actions"][0]["action"], "copy")
                 self.assertEqual(pcm(output, 48000), pcm(original, 48000))
                 self.assertEqual(stream(output, "a:0")["tags"]["DURATION"], f"00:00:0{sound_end}.000000000")
                 self.assertEqual(stream(output, "v:0")["tags"]["DURATION"], f"00:00:0{picture_end}.000000000")
@@ -534,25 +534,25 @@ class ReencodeTests(unittest.TestCase):
             with self.subTest(audio=audio):
                 output = self.root / f"split-{audio}.mkv"
                 report = self.export(output, [(source, 0, seam), (source, seam, 5)], audio=audio)
-                self.assertEqual(report["audioActions"], [{"action": "copy", "track": 1}])
+                self.assertEqual(report["audio_actions"], [{"action": "copy", "track": 1}])
                 self.assertEqual([[t["kind"] for t in s["tracks"]] for s in report["segments"]],
                                  [["video", "audio"], ["video", "audio"]])
-                self.assertEqual(ratio(report["segments"][1]["tracks"][1]["outputStart"]), seam)
+                self.assertEqual(ratio(report["segments"][1]["tracks"][1]["output_start"]), seam)
                 self.assertEqual(pcm(output, 48000), pcm(whole, 48000))
 
     def test_hevc_alpha_layers_survive_copy_and_exclude_picture_encoding(self):
         source = self.root / "hevc-alpha.mov"
         ffmpeg("-f", "lavfi", "-i", "color=red@0.4:s=320x180:r=25:d=1,format=bgra",
                "-c:v", "hevc_videotoolbox", "-alpha_quality", "0.8", "-tag:v", "hvc1", source)
-        info = json.loads(run([CLI, "inspect", "--json", source], allow_diagnostics=True))
-        self.assertTrue(info["media"]["streams"][0]["hasAdditionalVideoLayers"])
+        info = json.loads(run([CLI, "media", "inspect", "--json", source], allow_diagnostics=True))
+        self.assertTrue(info["media"]["streams"][0]["has_additional_video_layers"])
         copied = self.root / "whole.mov"
-        run([CLI, "export", "--mode", "smart", "--output", copied, "--clip", source], allow_diagnostics=True)
+        run([CLI, "export", "clips", "join", "--mode", "smart", "--output", copied, "--clip", source], allow_diagnostics=True)
         self.assertEqual(timestamped_hashes(source), timestamped_hashes(copied))
         report = self.export(self.root / "opaque.mp4", [(source, 0, 1)], ok=False)
         self.assertIn("HEVC layers", report["error"]["message"])
         cut = self.root / "edge.mov"
-        result = subprocess.run([CLI, "export", "--json", "--mode", "smart", "--output", cut,
+        result = subprocess.run([CLI, "export", "clips", "join", "--json", "--mode", "smart", "--output", cut,
                                  "--clip", source, "--from", "1/25", "--to", "12/25"],
                                 capture_output=True, timeout=90)
         self.assertNotEqual(result.returncode, 0)
@@ -578,15 +578,15 @@ class ReencodeTests(unittest.TestCase):
         webm.write_bytes(data.replace(mode, bytes.fromhex("53c08100")))
         for source in [mixed, webm]:
             with self.subTest(source=source.name):
-                info = json.loads(run([CLI, "inspect", "--json", source], allow_diagnostics=True))
-                self.assertGreater(info["media"]["streams"][0]["alphaBits"], 0)
-                self.assertIn("alpha", info["media"]["copyIssue"].lower())
+                info = json.loads(run([CLI, "media", "inspect", "--json", source], allow_diagnostics=True))
+                self.assertGreater(info["media"]["streams"][0]["alpha_bits"], 0)
+                self.assertIn("alpha", info["media"]["copy_issue"].lower())
                 result = self.export(self.root / (source.stem + ".mp4"), [(source, 0, Fraction(10, 25))], ok=False)
                 self.assertIn("alpha", result["error"]["message"].lower())
 
     def test_cancel_during_conversion_removes_staged_files(self):
         output = self.root / "cancelled.mp4"
-        args = [CLI, "export", "--json", "--mode", "encode", "--audio", "remove", "--output", output]
+        args = [CLI, "export", "clips", "join", "--json", "--mode", "encode", "--audio", "remove", "--output", output]
         for _ in range(8):
             args += ["--clip", self.video, "--from", "7/25", "--to", "88/25"]
         with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
@@ -624,7 +624,7 @@ class ReencodeTests(unittest.TestCase):
         helper.chmod(0o755)
         env = {key: value for key, value in os.environ.items() if key != "MPCUT_FFMPEG_HELPER"}
         output = self.root / "unavailable.mp4"
-        process = subprocess.run([copied_cli, "export", "--json", "--dry-run", "--mode", "encode",
+        process = subprocess.run([copied_cli, "export", "clips", "join", "--json", "--dry-run", "--mode", "encode",
                                   "--audio", "remove", "--output", output, "--clip", self.video],
                                  capture_output=True, text=True, timeout=30, env=env)
         self.assertNotEqual(process.returncode, 0, process.stdout + process.stderr)

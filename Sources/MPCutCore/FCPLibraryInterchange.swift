@@ -39,7 +39,7 @@ public enum FCPLibraryInterchange {
                              allowLoss: Bool, cancelled: @escaping @Sendable () -> Bool = { false }) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled)
         try project.validateDestination(output, relativeTo: location, includesContents: true)
-        let conversion = try ProjectConverter.prepareStills(project, for: "Final Cut Pro .fcpbundle", allowLoss: allowLoss,
+        let conversion = try ProjectConverter.prepareForInterchange(project, for: "Final Cut Pro .fcpbundle", allowLoss: allowLoss,
                                                             supportsStillInserts: true)
         let app = try finalCut()
         let destination = output.standardizedFileURL

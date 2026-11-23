@@ -38,12 +38,12 @@ class CopyEdges(unittest.TestCase):
         for first, end in slices:
             flags += ["--clip", source, "--from", f"{packets[first]['pts']}/44100", "--to", f"{packets[end]['pts']}/44100"]
         bad = self.root / "edit.flac"
-        error = self.run_cli("export", "--dry-run", "--output", bad, *flags, success=False)
+        error = self.run_cli("export", "clips", "join", "--dry-run", "--output", bad, *flags, success=False)
         self.assertEqual(error["error"]["code"], "unsupported_container")
         self.assertIn("mka", error["error"]["message"])
         self.assertFalse(bad.exists())
         output = self.root / "edit.mka"
-        report = self.run_cli("export", "--output", output, *flags)
+        report = self.run_cli("export", "clips", "join", "--output", output, *flags)
         expected_packets = [p for first, end in slices for p in packets[first:end]]
         self.assertEqual(hashes(output, "a:0"), [p["data_hash"] for p in expected_packets])
         source_pcm = pcm(source)
@@ -52,10 +52,10 @@ class CopyEdges(unittest.TestCase):
         self.assertEqual(time(report["duration"]), Fraction(len(expected_pcm), 2 * 44100))
         output_info = probe(output, "-show_format", "-show_entries", "format=duration")
         self.assertLess(abs(Fraction(output_info["format"]["duration"]) - time(report["duration"])), Fraction(1, 1000))
-        restored = self.run_cli("inspect", output)
+        restored = self.run_cli("media", "inspect", output)
         self.assertLess(abs(time(restored["media"]["duration"]) - time(report["duration"])), Fraction(1, 1000))
         last_sample = packets[-1]["pts"] + packets[-1]["duration"]
-        near_end = self.run_cli("export", "--dry-run", "--output", self.root / "tail.mka", "--snap", "nearest",
+        near_end = self.run_cli("export", "clips", "join", "--dry-run", "--output", self.root / "tail.mka", "--snap", "nearest",
                                 "--clip", source, "--from", f"{packets[5]['pts']}/44100", "--to", f"{last_sample - 1}/44100")
         self.assertEqual(time(near_end["segments"][0]["to"]), Fraction(last_sample, 44100))
 
@@ -64,13 +64,13 @@ class CopyEdges(unittest.TestCase):
         ffmpeg("-i", self.wave, "-c:a", "flac", first)
         ffmpeg("-i", self.wave, "-af", "volume=0.5", "-sample_fmt", "s16", "-c:a", "flac", second)
         output = self.root / "joined.mka"
-        self.run_cli("export", "--output", output, "--clip", second, "--clip", first)
+        self.run_cli("export", "clips", "join", "--output", output, "--clip", second, "--clip", first)
         self.assertEqual(hashes(output, "a:0"), hashes(second, "a:0") + hashes(first, "a:0"))
         self.assertEqual(pcm(output), pcm(second) + pcm(first))
 
         other_depth = self.root / "24bit.flac"
         ffmpeg("-i", self.wave, "-sample_fmt", "s32", "-c:a", "flac", other_depth)
-        result = self.run_cli("export", "--dry-run", "--output", self.root / "mismatch.mka",
+        result = self.run_cli("export", "clips", "join", "--dry-run", "--output", self.root / "mismatch.mka",
                               "--clip", first, "--clip", other_depth, success=False)
         self.assertEqual(result["error"]["code"], "incompatible_clip")
 
@@ -78,14 +78,14 @@ class CopyEdges(unittest.TestCase):
         source = self.root / "input.mp3"
         output = self.root / "copy.mp3"
         ffmpeg("-i", self.wave, "-c:a", "libmp3lame", "-q:a", "2", source)
-        report = self.run_cli("export", "--output", output, "--clip", source)
+        report = self.run_cli("export", "clips", "join", "--output", output, "--clip", source)
         self.assertEqual(hashes(output, "a:0"), hashes(source, "a:0"))
         decoded = pcm(source)
         self.assertEqual(pcm(output), decoded)
         self.assertEqual(time(report["duration"]), Fraction(len(decoded), 2 * 44100))
-        error = self.run_cli("export", "--dry-run", "--clip", source, "--output", self.root / "bad.mka", success=False)
+        error = self.run_cli("export", "clips", "join", "--dry-run", "--clip", source, "--output", self.root / "bad.mka", success=False)
         self.assertEqual(error["error"]["code"], "unsupported_container")
-        error = self.run_cli("export", "--dry-run", "--snap", "nearest", "--clip", source, "--to", "0.7",
+        error = self.run_cli("export", "clips", "join", "--dry-run", "--snap", "nearest", "--clip", source, "--to", "0.7",
                              "--clip", source, "--from", "1", "--output", self.root / "join.mp3", success=False)
         self.assertEqual(error["error"]["code"], "unsafe_boundary")
 
@@ -101,7 +101,7 @@ class CopyEdges(unittest.TestCase):
             for start, end in ranges:
                 with self.subTest(name=name, start=start, end=end):
                     output = self.root / f"{name}-{start}.mp3"
-                    report = self.run_cli("export", "--clip", source, "--from", f"{start}/44100",
+                    report = self.run_cli("export", "clips", "join", "--clip", source, "--from", f"{start}/44100",
                                           "--to", f"{end}/44100", "--output", output)
                     self.assertEqual(time(report["duration"]), Fraction(end - start, 44100))
                     self.assertEqual(ffmpeg("-i", output, "-f", "f32le", "-"), original[4 * start:4 * end])
@@ -111,7 +111,7 @@ class CopyEdges(unittest.TestCase):
                     # The hidden decoder history or tail padding can span several frames.
                     # Reopening the crop should advertise and retain only its audible samples.
                     saved = self.root / f"{name}-{start}-saved.mp3"
-                    again = self.run_cli("export", "--clip", output, "--output", saved)
+                    again = self.run_cli("export", "clips", "join", "--clip", output, "--output", saved)
                     self.assertEqual(time(again["duration"]), Fraction(end - start, 44100))
                     self.assertEqual(time(again["segments"][0]["from"]), 0)
                     self.assertEqual(ffmpeg("-i", saved, "-f", "f32le", "-"), original[4 * start:4 * end])
@@ -119,7 +119,7 @@ class CopyEdges(unittest.TestCase):
         # This tonal VBR stream uses more reservoir history than Xing delay can hide.
         output = self.root / "unsafe.mp3"
         for start, end in [(44223, 47556), (93001, 93998)]:
-            error = self.run_cli("export", "--clip", self.root / "vbr.mp3", "--from", f"{start}/44100",
+            error = self.run_cli("export", "clips", "join", "--clip", self.root / "vbr.mp3", "--from", f"{start}/44100",
                                  "--to", f"{end}/44100", "--output", output, success=False)
             self.assertEqual(error["error"]["code"], "unsafe_boundary")
             self.assertFalse(output.exists())
@@ -130,26 +130,26 @@ class CopyEdges(unittest.TestCase):
             ffmpeg("-i", self.wave, "-c:a", "libmp3lame", "-reservoir", "0", *options, source)
             start, end = 103123, 129057
             expected = ffmpeg("-i", source, "-f", "f32le", "-")[4 * start:4 * end]
-            self.run_cli("sidecar", "--only", "index", source)
+            self.run_cli("analysis", "sidecar", "build", "--only", "index", source)
             for mode in ["indexed", "bad_checksum", "legacy"]:
                 with self.subTest(name=name, mode=mode):
                     if mode != "indexed":
                         with sqlite3.connect(str(source) + ".cutdb") as db:
-                            value, = db.execute("SELECT value FROM sections WHERE name='index.v1'").fetchone()
+                            value, = db.execute("SELECT value FROM sections WHERE name='media_index.v1'").fetchone()
                             stamp, = db.execute("SELECT stamp FROM source").fetchone()
                             header = plistlib.loads(value)
-                            anchors = header["audio"][0]["mp3Anchors"]
+                            anchors = header["audio"][0]["mp3_anchors"]
                             self.assertGreater(len(anchors), 1)
                             if mode == "bad_checksum":
                                 for anchor in anchors:
                                     anchor["checksum"] ^= 1
                             else:
-                                del header["audio"][0]["mp3Anchors"]
+                                del header["audio"][0]["mp3_anchors"]
                             value = plistlib.dumps(header, fmt=plistlib.FMT_BINARY)
-                            digest = hashlib.sha256(stamp.encode() + b"\0index.v1\0" + value).digest()
-                            db.execute("UPDATE sections SET value=?, digest=? WHERE name='index.v1'", (value, digest))
+                            digest = hashlib.sha256(stamp.encode() + b"\0media_index.v1\0" + value).digest()
+                            db.execute("UPDATE sections SET value=?, digest=? WHERE name='media_index.v1'", (value, digest))
                     output = self.root / f"{name}-{mode}.mp3"
-                    self.run_cli("export", "--clip", source, "--from", f"{start}/44100",
+                    self.run_cli("export", "clips", "join", "--clip", source, "--from", f"{start}/44100",
                                  "--to", f"{end}/44100", "--output", output)
                     self.assertEqual(ffmpeg("-i", output, "-f", "f32le", "-"), expected)
 
@@ -157,7 +157,7 @@ class CopyEdges(unittest.TestCase):
         source = self.root / "untagged.mp3"
         output = self.root / "copy.mp3"
         ffmpeg("-i", self.wave, "-c:a", "libmp3lame", "-b:a", "128k", "-write_xing", "0", source)
-        report = self.run_cli("export", "--output", output, "--clip", source)
+        report = self.run_cli("export", "clips", "join", "--output", output, "--clip", source)
         decoded = ffmpeg("-i", source, "-f", "f32le", "-")
         self.assertEqual(hashes(output, "a:0"), hashes(source, "a:0"))
         self.assertEqual(time(report["duration"]), Fraction(len(decoded), 4 * 44100))
@@ -175,13 +175,13 @@ class CopyEdges(unittest.TestCase):
         ]):
             with self.subTest(args=args):
                 output = self.root / f"extracted-{i}.wav"
-                report = self.run_cli("export", "--tracks", "audio", "--audio-stream", "1",
+                report = self.run_cli("export", "clips", "join", "--tracks", "audio", "--audio-stream", "1",
                                       "--output", output, "--clip", movie, *args)
                 self.assertEqual(time(report["duration"]), Fraction(end - start, 44100))
                 self.assertEqual(pcm(output), source_bytes[2 * start:2 * end])
                 track = report["segments"][0]["tracks"][0]
-                self.assertEqual(time(track["outputStart"]), 0)
-                self.assertEqual(time(track["outputEnd"]), time(report["duration"]))
+                self.assertEqual(time(track["output_start"]), 0)
+                self.assertEqual(time(track["output_end"]), time(report["duration"]))
 
     def test_delayed_aac_extract_preserves_short_last_packet(self):
         audio = self.root / "audio.m4a"
@@ -194,7 +194,7 @@ class CopyEdges(unittest.TestCase):
         original = probe(movie, *fields)["streams"][0]
         self.assertGreater(original["start_pts"], 0)
         self.assertNotEqual(original["duration_ts"] % 1024, 0)
-        result = self.run_cli("export", "--tracks", "audio", "--audio-stream", "1", "--clip", movie, "--output", output)
+        result = self.run_cli("export", "clips", "join", "--tracks", "audio", "--audio-stream", "1", "--clip", movie, "--output", output)
         extracted = probe(output, *fields)["streams"][0]
         self.assertEqual(extracted["start_pts"], 0)
         self.assertEqual(extracted["duration_ts"], original["duration_ts"])
@@ -206,16 +206,16 @@ class CopyEdges(unittest.TestCase):
         ffmpeg("-f", "lavfi", "-i", "sine=sample_rate=48000:duration=0.005", "-c:a", "libopus", source)
         decoded = pcm(source)
         self.assertEqual(len(decoded), 240 * 2)
-        info = self.run_cli("inspect", source)
+        info = self.run_cli("media", "inspect", source)
         self.assertEqual(time(info["media"]["duration"]), Fraction(240, 48000))
         for ext in ["mka", "webm"]:
             output = self.root / f"short.{ext}"
-            result = self.run_cli("export", "--clip", source, "--output", output, success=False)
+            result = self.run_cli("export", "clips", "join", "--clip", source, "--output", output, success=False)
             self.assertEqual(result["error"]["code"], "unsupported_container")
             self.assertFalse(output.exists())
 
         output = self.root / "copy.opus"
-        self.run_cli("export", "--clip", source, "--output", output)
+        self.run_cli("export", "clips", "join", "--clip", source, "--output", output)
         self.assertEqual(pcm(output), decoded)
         self.assertEqual(hashes(output, "a:0"), hashes(source, "a:0"))
 
@@ -224,7 +224,7 @@ class CopyEdges(unittest.TestCase):
         output = self.root / "trim.mka"
         ffmpeg("-i", self.wave, "-ar", "48000", "-c:a", "libopus", source)
         start, end = 101904, 132557
-        report = self.run_cli("export", "--output", output, "--clip", source,
+        report = self.run_cli("export", "clips", "join", "--output", output, "--clip", source,
                               "--from", f"{start}/48000", "--to", f"{end}/48000")
         self.assertEqual(time(report["duration"]), Fraction(end - start, 48000))
         self.assertEqual(pcm(output), pcm(source)[2 * start:2 * end])
@@ -241,7 +241,7 @@ class CopyEdges(unittest.TestCase):
         ffmpeg("-i", picture, "-i", subtitle, "-map", "0:v", "-map", "1:s",
                "-c:v", "copy", "-c:s", "mov_text", source)
         output = self.root / "video.mov"
-        command = ("export", "--dry-run", "--tracks", "video", "--clip", source, "--output", output)
+        command = ("export", "clips", "join", "--dry-run", "--tracks", "video", "--clip", source, "--output", output)
         self.run_cli(*command)
         packets = probe(source, "-select_streams", "v:0", "-show_packets",
                         "-show_entries", "packet=pos")["packets"]
@@ -258,15 +258,15 @@ class CopyEdges(unittest.TestCase):
         output = self.root / "prefix.ogg"
         ffmpeg("-i", self.wave, "-ac", "2", "-c:a", "vorbis", "-strict", "experimental", source)
         original = pcm(source)
-        info = self.run_cli("inspect", source)
+        info = self.run_cli("media", "inspect", source)
         self.assertEqual(time(info["media"]["duration"]), Fraction(len(original), 4 * 44100))
-        report = self.run_cli("export", "--clip", source, "--to", "2.01", "--snap", "nearest", "--output", output)
+        report = self.run_cli("export", "clips", "join", "--clip", source, "--to", "2.01", "--snap", "nearest", "--output", output)
         samples = time(report["duration"]) * 44100
         self.assertEqual(samples.denominator, 1)
         self.assertEqual(pcm(output), original[:4 * int(samples)])
         track = report["segments"][0]["tracks"][0]
-        self.assertEqual(time(track["outputStart"]), 0)
-        self.assertEqual(time(track["outputEnd"]), time(report["duration"]))
+        self.assertEqual(time(track["output_start"]), 0)
+        self.assertEqual(time(track["output_end"]), time(report["duration"]))
 
 
 if __name__ == "__main__":

@@ -93,6 +93,7 @@ final class ProjectDraft {
         } catch {
             if lease.ownsFolder {
                 unlinkat(lease.descriptor, document.lastPathComponent, 0)
+                TranscriptStore.discardDraft(relativeTo: document)
                 rmdir(folder.path)
             }
             throw error
@@ -192,6 +193,7 @@ final class ProjectDraft {
         reservation = nil
         guard lease.ownsFolder else { return }
         let folder = lease.url.deletingLastPathComponent()
+        TranscriptStore.discardDraft(relativeTo: lease.url)
         unlinkat(lease.descriptor, lease.url.lastPathComponent, 0)
         for name in (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
             where name.hasPrefix(".pending-") && name.hasSuffix(".cut")

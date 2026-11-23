@@ -11,7 +11,7 @@ public enum JPEGSample: String, CaseIterable, Sendable, Encodable { case first, 
 public enum JPEGSelection: Sendable {
     case scenes
     case sceneReport(SceneReport)
-    case nonSilent(stream: Int?, thresholdDB: Double?, minimumPause: Double)
+    case nonSilent(stream: Int?, thresholdDB: Double?, minimumPause: Double, maxBlip: Double = AudioWaveform.defaultMaxBlip)
     case audibleRanges(pauses: [AudioSpan], stream: Int, thresholdDB: Double, minimumPause: Double)
     case times([RationalTime])
 }
@@ -33,7 +33,7 @@ public struct JPEGFrame: Encodable, Sendable {
 
 public struct JPEGManifest: Encodable, Sendable {
     public let ok = true
-    public let version = 1
+    public let schemaVersion = 2
     public let file, outputDirectory, selection: String
     public let sourceStamp: SceneSourceStamp
     public let timeBase, origin, duration: RationalTime
@@ -43,13 +43,19 @@ public struct JPEGManifest: Encodable, Sendable {
     public let thresholdDB, minimumPause: Double?
     public let rangeCount: Int
     public let frames: [JPEGFrame]
+
+    private enum CodingKeys: String, CodingKey {
+        case ok, schemaVersion, file, outputDirectory, selection, sourceStamp, timeBase, origin, duration
+        case preset, sample, stream = "detection_audio_stream_index", thresholdDB, rangeCount, frames
+        case minimumPause = "min_pause_seconds"
+    }
 }
 
 public struct MulticamJPEGManifest: Encodable, Sendable {
     public let ok = true
-    public let version = 1
+    public let schemaVersion = 2
     public let selection = "multicam"
-    public let project: String?
+    public let projectPath: String?
     public let outputDirectory: String
     public let preset: JPEGPreset
     public let angles: [MulticamJPEGAngle]
@@ -64,16 +70,18 @@ public struct MulticamJPEGAngle: Encodable, Sendable {
     public let origin, timeBase: RationalTime?
     public let videoStream: Int?
     public let error: CutError?
+    public var additionalRecordings: [MulticamJPEGAngle]? = nil
 }
 
 public struct MulticamJPEGFrame: Encodable, Sendable {
     public enum Availability: String, Encodable, Sendable {
-        case available, beforeSource, afterSource, pictureGap, missingSource, sourceError
+        case available, beforeSource = "before_source", afterSource = "after_source", pictureGap = "picture_gap", missingSource = "missing_source", sourceError = "source_error"
     }
 
     public let requestNumber: Int
     public let groupTime: RationalTime
     public let angleID: String
+    public let recordingID: String?
     public let sourceTime: RationalTime
     public let availability: Availability
     public let groupCoverage: AudioSpan?
@@ -99,11 +107,11 @@ private struct JPEGPlan {
     var minimumPause: Double?
 }
 
-private final class JPEGControl {
-    let cancelled: () -> Bool
-    init(_ cancelled: @escaping () -> Bool) { self.cancelled = cancelled }
+final class JPEGControl {
+    let cancelled: @Sendable () -> Bool
+    init(_ cancelled: @escaping @Sendable () -> Bool) { self.cancelled = cancelled }
     func check() throws {
-        if cancelled() { throw CutError(code: "cancelled", message: "Frame export was cancelled.") }
+        if Task.isCancelled || cancelled() { throw CutError(code: "cancelled", message: "Frame export was cancelled.") }
     }
 }
 
@@ -133,21 +141,32 @@ public enum JPEGExport {
 
     package static func writeStill(_ media: MediaInfo, at time: RationalTime, to output: URL,
                                    replacing confirmed: SourceIdentity?, exclusiveEnd: Bool = false,
+                                   preset: JPEGPreset = .full,
                                    cancelled: @escaping @Sendable () -> Bool) throws {
         let control = JPEGControl(cancelled)
         try control.check()
-        // The index can precede permission changes or new hard links. Pin
-        // the current snapshot before rendering and revalidate at publication.
         guard let sourceIdentity = try? SourceIdentity(media.url), sourceIdentity == media.identity else {
             throw CutError(code: "source_changed", message: "The source changed after indexing.")
         }
         try validateStillDestination(output, source: media.url, sourceIdentity: sourceIdentity, replacing: confirmed)
+        if !media.identity.matchesSnapshot(sourceIdentity) {
+            // Permissions and hard links can also advance ctime. Reuse the
+            // index only if the current stream evidence verifies its inputs.
+            let evidence = media.refreshEvidence
+            let current = evidence?.hasCompleteProof == true
+                ? try? Probe.read(media.url, forcePayload: true, expectedIdentity: sourceIdentity, cancelled: cancelled)
+                : nil
+            try control.check()
+            guard let evidence, current?.refreshEvidence?.verifiesSameFileContents(as: evidence) == true else {
+                throw CutError(code: "source_changed", message: "The source changed after indexing.")
+            }
+        }
         guard media.hasVideo, !media.frames.isEmpty, media.video.timeBase > .zero else {
             throw CutError(code: "no_frame", message: "No indexed picture is available at the playhead.")
         }
         let frameTime = try stillFrameTime(in: media, at: time, exclusiveEnd: exclusiveEnd)
         let plan = try plan(media, .times([frameTime]), useSidecar: false, cancelled: cancelled)
-        _ = try render(media, ranges: plan.ranges, sample: .first, preset: .full, control: control,
+        _ = try render(media, ranges: plan.ranges, sample: .first, preset: preset, control: control,
                        fileName: { _ in output.lastPathComponent }, progress: { _, _ in }) { jpeg, _ in
             try publishStillJPEG(jpeg, source: media.url, sourceIdentity: sourceIdentity,
                                  to: output, replacing: confirmed, cancelled: cancelled) {
@@ -195,7 +214,7 @@ public enum JPEGExport {
                   let identity = try? SourceIdentity(output), identity != sourceIdentity else {
                 throw CutError(code: "invalid_output", message: "Choose a separate, regular JPEG file.")
             }
-            guard identity == confirmed else {
+            guard confirmed?.matchesSnapshot(identity) == true else {
                 throw CutError(code: "output_exists", message: "The destination exists and was not confirmed for replacement.")
             }
         } else if errno != ENOENT {
@@ -273,7 +292,11 @@ public enum JPEGExport {
                                       cancelled: @escaping @Sendable () -> Bool) throws -> MulticamJPEGManifest {
         let control = JPEGControl(cancelled)
         try control.check()
+        guard project.participants.render == nil else {
+            throw ParticipantProjectExport.unsupported("Program frame export")
+        }
         guard !times.isEmpty else { throw CutError(code: "invalid_range", message: "Supply at least one group time.") }
+        try project.validate()
         for time in times where !project.range.contains(time) {
             throw CutError(code: "invalid_range", message: "Frame time \(time) is outside the group range.")
         }
@@ -295,87 +318,105 @@ public enum JPEGExport {
             }
             var angles: [MulticamJPEGAngle] = []
             var byAngle: [[MulticamJPEGFrame]] = []
-            for (angleIndex, angle) in project.angles.enumerated() {
-                try control.check()
-                let url = project.sourceURL(for: angle, in: sourceDirectory)
-                let sourceTimes = try times.map { time in
+            for (angleIndex, camera) in project.angles.enumerated() {
+                let recordings = camera.recordings
+                var rows: [Int: MulticamJPEGFrame] = [:]
+                var metadata: [MulticamJPEGAngle] = []
+                for angle in recordings {
                     try control.check()
-                    return try time.subtracting(angle.offset)
-                }
-                let media: MediaInfo?
-                let error: CutError?
-                let unavailable: MulticamJPEGFrame.Availability
-                var fileStatus = stat()
-                if stat(url.path, &fileStatus) != 0, errno == ENOENT || errno == ENOTDIR {
-                    media = nil
-                    error = CutError(code: "missing_source", message: "Camera recording is missing: \(url.path).")
-                    unavailable = .missingSource
-                } else {
-                    do {
-                        let indexed: MediaInfo
-                        if let cached = indexedSources[angle.id], cached.url == url {
-                            try engine.verifyIdentity(url, identity: cached.identity)
-                            indexed = cached.hasFullEditIndex ? cached : try engine.inspectMulticamSource(url)
-                        } else {
-                            indexed = try engine.inspectMulticamSource(url)
-                        }
-                        guard indexed.hasVideo, !indexed.frames.isEmpty, indexed.video.timeBase > .zero else {
-                            throw CutError(code: "no_video", message: "Camera recording has no indexed pictures.")
-                        }
-                        media = indexed
-                        error = nil
-                    } catch let problem as CutError where problem.code != "cancelled" && problem.code != "source_changed" {
+                    let url = project.sourceURL(for: angle, in: sourceDirectory)
+                    let sourceTimes = try times.map { time in
                         try control.check()
+                        return try time.subtracting(angle.offset)
+                    }
+                    let media: MediaInfo?
+                    let error: CutError?
+                    let unavailable: MulticamJPEGFrame.Availability
+                    var fileStatus = stat()
+                    if stat(url.path, &fileStatus) != 0, errno == ENOENT || errno == ENOTDIR {
                         media = nil
-                        error = problem
+                        error = CutError(code: "missing_source", message: "Camera recording is missing: \(url.path).")
+                        unavailable = .missingSource
+                    } else {
+                        do {
+                            let indexed: MediaInfo
+                            if let cached = indexedSources[angle.id], cached.url == url {
+                                try engine.verifyIdentity(url, identity: cached.identity)
+                                indexed = cached.hasFullEditIndex ? cached : try engine.inspectMulticamSource(url)
+                            } else {
+                                indexed = try engine.inspectMulticamSource(url)
+                            }
+                            guard indexed.hasVideo, !indexed.frames.isEmpty, indexed.video.timeBase > .zero else {
+                                throw CutError(code: "no_video", message: "Camera recording has no indexed pictures.")
+                            }
+                            media = indexed
+                            error = nil
+                        } catch let problem as CutError where problem.code != "cancelled" && problem.code != "source_changed" {
+                            try control.check()
+                            media = nil
+                            error = problem
+                        }
+                        unavailable = .sourceError
                     }
-                    unavailable = .sourceError
-                }
-                angles.append(MulticamJPEGAngle(id: angle.id, name: angle.name, file: url.path, offset: angle.offset,
-                    origin: media?.origin, timeBase: media?.video.timeBase, videoStream: media?.video.index, error: error))
+                    metadata.append(MulticamJPEGAngle(id: angle.id, name: angle.name, file: url.path, offset: angle.offset,
+                        origin: media?.origin, timeBase: media?.video.timeBase, videoStream: media?.video.index, error: error))
 
-                var availableIndices: [Int] = []
-                let availability: [MulticamJPEGFrame.Availability]
-                if let media {
-                    try engine.verifyIdentity(url, identity: media.identity)
-                    identities[url] = media.identity
-                    availability = try sourceTimes.enumerated().map { index, sourceTime in
+                    var availableIndices: [Int] = []
+                    let availability: [MulticamJPEGFrame.Availability]
+                    if let media {
+                        try engine.verifyIdentity(url, identity: media.identity)
+                        identities[url] = media.identity
+                        availability = try sourceTimes.enumerated().map { index, sourceTime in
+                            try control.check()
+                            if angle.coverage?.contains(times[index]) == false { return .pictureGap }
+                            if sourceTime < .zero { return .beforeSource }
+                            if sourceTime >= media.duration { return .afterSource }
+                            guard try frameIndex(in: media, at: sourceTime) != nil else { return .pictureGap }
+                            availableIndices.append(index)
+                            return .available
+                        }
+                    } else {
+                        availability = Array(repeating: unavailable, count: times.count)
+                    }
+                    var rendered: [Int: JPEGFrame] = [:]
+                    if let media, !availableIndices.isEmpty {
+                        let plan = try plan(media, .times(availableIndices.map { sourceTimes[$0] }),
+                                            useSidecar: useSidecar, cancelled: cancelled)
+                        let frames = try render(media, ranges: plan.ranges, sample: .first, preset: preset,
+                                                control: control, fileName: { index in
+                            String(format: "frame-%06ld-angle-%03ld.jpg", availableIndices[index] + 1, angleIndex + 1)
+                        }, progress: { _, _ in }) { jpeg, name in
+                            try writing(name) { try jpeg.write(to: staging.appendingPathComponent(name)) }
+                        }
+                        rendered = Dictionary(uniqueKeysWithValues: zip(availableIndices, frames))
+                    }
+                    for index in times.indices where angle.coverage?.contains(times[index]) ?? true {
                         try control.check()
-                        if sourceTime < .zero { return .beforeSource }
-                        if sourceTime >= media.duration { return .afterSource }
-                        guard try frameIndex(in: media, at: sourceTime) != nil else { return .pictureGap }
-                        availableIndices.append(index)
-                        return .available
+                        let picture = rendered[index]
+                        let range = try picture.map {
+                            AudioSpan(from: max(project.range.from, angle.coverage?.from ?? project.range.from, try $0.clipFrom.adding(angle.offset)),
+                                      to: min(project.range.to, angle.coverage?.to ?? project.range.to, try $0.clipTo.adding(angle.offset)))
+                        }
+                        rows[index] = MulticamJPEGFrame(requestNumber: index + 1, groupTime: times[index], angleID: camera.id,
+                            recordingID: recordings.count > 1 ? angle.id : nil,
+                            sourceTime: sourceTimes[index], availability: availability[index], groupCoverage: range,
+                            file: picture?.file, frameTime: picture?.frameTime, frameDuration: picture?.frameDuration,
+                            framePTS: picture?.framePTS, width: picture?.width, height: picture?.height)
                     }
-                } else {
-                    availability = Array(repeating: unavailable, count: times.count)
                 }
-                var rendered: [Int: JPEGFrame] = [:]
-                if let media, !availableIndices.isEmpty {
-                    let plan = try plan(media, .times(availableIndices.map { sourceTimes[$0] }),
-                                        useSidecar: useSidecar, cancelled: cancelled)
-                    let frames = try render(media, ranges: plan.ranges, sample: .first, preset: preset,
-                                            control: control, fileName: { index in
-                        String(format: "frame-%06ld-angle-%03ld.jpg", availableIndices[index] + 1, angleIndex + 1)
-                    }, progress: { _, _ in }) { jpeg, name in
-                        try writing(name) { try jpeg.write(to: staging.appendingPathComponent(name)) }
-                    }
-                    rendered = Dictionary(uniqueKeysWithValues: zip(availableIndices, frames))
+                if var primary = metadata.first {
+                    if metadata.count > 1 { primary.additionalRecordings = Array(metadata.dropFirst()) }
+                    angles.append(primary)
                 }
                 byAngle.append(try times.indices.map { index in
                     try control.check()
-                    let picture = rendered[index]
-                    let range = try picture.map {
-                        AudioSpan(from: max(project.range.from, try $0.clipFrom.adding(angle.offset)),
-                                  to: min(project.range.to, try $0.clipTo.adding(angle.offset)))
-                    }
-                    return MulticamJPEGFrame(requestNumber: index + 1, groupTime: times[index], angleID: angle.id,
-                        sourceTime: sourceTimes[index], availability: availability[index], groupCoverage: range,
-                        file: picture?.file, frameTime: picture?.frameTime, frameDuration: picture?.frameDuration,
-                        framePTS: picture?.framePTS, width: picture?.width, height: picture?.height)
+                    if let row = rows[index] { return row }
+                    return try MulticamJPEGFrame(requestNumber: index + 1, groupTime: times[index], angleID: camera.id,
+                        recordingID: nil, sourceTime: times[index].subtracting(camera.offset), availability: .pictureGap,
+                        groupCoverage: nil, file: nil, frameTime: nil, frameDuration: nil, framePTS: nil, width: nil, height: nil)
                 })
             }
-            return MulticamJPEGManifest(project: document?.path, outputDirectory: destination.path, preset: preset,
+            return MulticamJPEGManifest(projectPath: document?.path, outputDirectory: destination.path, preset: preset,
                 angles: angles, frames: times.indices.flatMap { index in byAngle.map { $0[index] } })
         }
     }
@@ -411,12 +452,13 @@ public enum JPEGExport {
 
         let manifest = try produce(staging, destination)
         let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let document = try encoder.encode(manifest)
         try writing("manifest.json") { try document.write(to: staging.appendingPathComponent("manifest.json")) }
         try validate()
         try control.check()
-        guard chmod(staging.path, 0o777 & ~creationMask) == 0 else {
+        guard chmod(staging.path, try publicationPermissions(0o777)) == 0 else {
             throw CutError(code: "write_failed", message: "Could not publish the frame export folder.")
         }
         let failure = publishExclusively(from: staging, to: destination, isDirectory: true)
@@ -531,6 +573,7 @@ public enum JPEGExport {
                     let previousTime = previous.map { frames[$0].time.seconds } ?? 0
                     if frames[frame].time.seconds - previousTime > 2 {
                         for key in stride(from: frame, to: previous ?? 0, by: -1) {
+                            if key.isMultiple(of: 1_024) { try control.check() }
                             guard frames[key].time.seconds - previousTime > 2 else { break }
                             if frames[key].canStart, let dts = frames[key].dts {
                                 seekDTS = try ticks(dts)
@@ -610,18 +653,21 @@ public enum JPEGExport {
             return try fromScenes(SceneAnalysis.scan(media, useSidecar: useSidecar, cancelled: cancelled))
         case let .sceneReport(report):
             return try fromScenes(report)
-        case let .nonSilent(stream, threshold, minimum):
+        case let .nonSilent(stream, threshold, minimum, maxBlip):
             guard let index = stream ?? media.streams.first(where: { $0.kind == "audio" })?.index else {
                 throw CutError(code: "no_audio", message: "The selected source has no audio stream.")
             }
             let result = try AudioAnalysis.silence(media, stream: index, thresholdDB: threshold, minimum: minimum,
-                                                   useSidecar: useSidecar, cancelled: cancelled)
-            return try fromPauses(result.pauses, index, result.thresholdDB, minimum)
+                                                   useSidecar: useSidecar,
+                                                   cancelled: cancelled)
+            return try fromPauses(result.pauses(maxBlip: maxBlip), index, result.thresholdDB, minimum)
         case let .audibleRanges(pauses, index, threshold, minimum):
             return try fromPauses(pauses, index, threshold, minimum)
         case let .times(times):
             guard !times.isEmpty else { throw CutError(code: "invalid_range", message: "Supply at least one frame time.") }
+            let control = JPEGControl(cancelled)
             return try JPEGPlan(kind: "times", ranges: times.enumerated().map { i, time in
+                try control.check()
                 let index = media.frames.lowerBound { $0.time > time } - 1
                 guard time >= .zero, time < media.duration, index >= 0 else {
                     throw CutError(code: "invalid_range", message: "Frame time \(time) is outside the visible source.")
@@ -634,7 +680,7 @@ public enum JPEGExport {
     }
 }
 
-private final class JPEGRenderer {
+final class JPEGRenderer {
     static var failure: CutError { CutError(code: "frame_export_failed", message: "Could not render the selected picture as JPEG.") }
     let reader: OpaquePointer
     let control: JPEGControl
@@ -712,18 +758,42 @@ extension JPEGExport {
         try control.check()
         try checkSource(media)
         let target = try stillFrameTime(in: media, at: time, exclusiveEnd: exclusiveEnd)
-        let selected = try plan(media, .times([target]), useSidecar: false, cancelled: cancelled)
         var bytes: Data?
+        let frames = try renderReviewFrames(media, at: [target], preset: preset, control: control,
+                                            fileName: { _ in "review.jpg" }) { data, _ in
+            bytes = data
+        }
+        guard let bytes, let frame = frames.first else { throw CutError(code: "no_frame", message: "No review frame was available.") }
+        return (bytes, frame)
+    }
+
+    /// Writes requests in decode order while returning metadata in request order.
+    /// Times are source frame starts selected by `stillFrameTime`.
+    package static func writeReviewFrames(
+        _ media: MediaInfo, at times: [RationalTime], preset: JPEGPreset,
+        cancelled: @escaping @Sendable () -> Bool, fileName: (Int) -> String,
+        write: (Data, String) throws -> Void
+    ) throws -> [JPEGFrame] {
+        let control = JPEGControl(cancelled)
+        try control.check()
+        try checkSource(media)
+        return try renderReviewFrames(media, at: times, preset: preset, control: control, fileName: fileName, write: write)
+    }
+
+    private static func renderReviewFrames(
+        _ media: MediaInfo, at times: [RationalTime], preset: JPEGPreset,
+        control: JPEGControl, fileName: (Int) -> String, write: (Data, String) throws -> Void
+    ) throws -> [JPEGFrame] {
+        let selected = try plan(media, .times(times), useSidecar: false, cancelled: control.cancelled)
         let frames = try render(media, ranges: selected.ranges, sample: .first, preset: preset, control: control,
-                                fileName: { _ in "review.jpg" }, progress: { _, _ in }) { data, _ in
+                                fileName: fileName, progress: { _, _ in }) { data, name in
             guard preset != .review || data.count <= 1_048_576 else {
                 throw CutError(code: "image_too_large", message: "The review JPEG exceeds 1 MiB.")
             }
-            bytes = data
+            try write(data, name)
         }
         try control.check()
         try checkSource(media)
-        guard let bytes, let frame = frames.first else { throw CutError(code: "no_frame", message: "No review frame was available.") }
-        return (bytes, frame)
+        return frames
     }
 }

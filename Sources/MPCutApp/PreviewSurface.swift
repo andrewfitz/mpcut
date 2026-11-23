@@ -14,7 +14,7 @@ final class PreviewSurface: NSView {
     private(set) var isVideoMonitor = false
     var otherMonitorStatus: (() -> String?)?
     var presentationDescription: String? { badge.toolTip }
-    private var preferenceKey: String { isVideoMonitor ? "MonitorForceSDR" : "ViewerForceSDR" }
+    private var preferenceKey: String { isVideoMonitor ? "playback_monitor_force_sdr_enabled" : "playback_viewer_force_sdr_enabled" }
     private var cachedFormat: CMVideoFormatDescription?
     private var pictureTransform = CGAffineTransform.identity
     var windowChanged: ((PreviewSurface) -> Void)?
@@ -53,7 +53,7 @@ final class PreviewSurface: NSView {
     func setMonitor(_ isMonitor: Bool) {
         isVideoMonitor = isMonitor
         forceSDR = UserDefaults.standard.bool(forKey: preferenceKey)
-        cleanFeed = isMonitor && UserDefaults.standard.bool(forKey: "MonitorCleanFeed")
+        cleanFeed = isMonitor && UserDefaults.standard.bool(forKey: "playback_monitor_clean_feed_enabled")
         applyMonitorChrome()
         present()
     }
@@ -104,7 +104,7 @@ final class PreviewSurface: NSView {
 
     @objc private func toggleCleanFeed() {
         cleanFeed.toggle()
-        UserDefaults.standard.set(cleanFeed, forKey: "MonitorCleanFeed")
+        UserDefaults.standard.set(cleanFeed, forKey: "playback_monitor_clean_feed_enabled")
         applyMonitorChrome()
     }
 
@@ -246,6 +246,10 @@ final class PreviewSurface: NSView {
         var output = frame.buffer
         var status = "SDR"
         var reason: String?
+        if transfer.usesSDRCameraPreview {
+            status = "SDR preview"
+            reason = "The camera preview uses the decoded SDR picture."
+        }
         if let hdr = transfer.actualHDR {
             if wantsHDR {
                 // Submitting extended-range content lets macOS activate current headroom.

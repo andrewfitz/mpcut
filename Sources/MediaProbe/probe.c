@@ -56,6 +56,28 @@ int mp_canonical_channel_layout(const char *layout, int channels, char *canonica
     return written > 0 && (size_t)written <= capacity;
 }
 
+const char *mp_vorbis_order_layout(int channels)
+{
+    static const char *const names[] = {"mono", "stereo", "3.0", "quad", "5.0", "5.1", "6.1", "7.1"};
+    return channels >= 1 && channels <= 8 ? names[channels - 1] : NULL;
+}
+
+// The demuxers give Opus and Vorbis a channel count without speakers. An OpusHead with channel mapping
+// family 1, and a Vorbis stream of three to eight channels, carry the layout their channel count defines.
+static const char *coded_layout(const AVCodecParameters *params)
+{
+    const int channels = params->ch_layout.nb_channels;
+    if (params->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC)
+        return NULL;
+    if (params->codec_id == AV_CODEC_ID_VORBIS)
+        return channels > 2 ? mp_vorbis_order_layout(channels) : NULL;
+    const uint8_t *head = params->extradata;
+    if (params->codec_id != AV_CODEC_ID_OPUS || channels < 1 || channels > 8 || !head ||
+        params->extradata_size < 21 + channels || memcmp(head, "OpusHead", 8) || head[9] != channels || head[18] != 1)
+        return NULL;
+    return mp_vorbis_order_layout(channels);
+}
+
 void mp_probe_free(MPProbeResult *result)
 {
     if (!result)
@@ -197,6 +219,9 @@ static int describe_stream(AVFormatContext *file, AVStream *input, MPProbeStream
     stream->seek_preroll = params->seek_preroll;
     if (stream->channels)
         av_channel_layout_describe(&params->ch_layout, stream->channel_layout, sizeof(stream->channel_layout));
+    const char *coded = coded_layout(params);
+    if (coded)
+        snprintf(stream->channel_layout, sizeof(stream->channel_layout), "%s", coded);
     stream->bit_depth = params->bits_per_raw_sample;
     if (params->codec_type == AVMEDIA_TYPE_VIDEO) {
         AVRational rate = av_guess_frame_rate(file, input, NULL);
@@ -362,7 +387,9 @@ static bool description_shape(const AVCodecParameters *params, const uint8_t *co
     int parsed_size = 0;
     if (av_parser_parse2(parser, context, &parsed, &parsed_size, packet->data, packet->size,
                          packet->pts, packet->dts, packet->pos) == packet->size &&
-        parsed_size == packet->size && parser->format == AV_PIX_FMT_YUV420P &&
+        parsed_size == packet->size &&
+        (parser->format == AV_PIX_FMT_YUV420P ||
+         (params->codec_id == AV_CODEC_ID_HEVC && parser->format == AV_PIX_FMT_YUV420P10LE)) &&
         parser->width == params->width && parser->height == params->height &&
         parser->coded_width > 0 && parser->coded_height > 0 &&
         (parser->field_order == AV_FIELD_UNKNOWN || parser->field_order == AV_FIELD_PROGRESSIVE)) {
@@ -425,6 +452,8 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
     if (!video) {
         nonincreasing = stream->count && packet->pts <= stream->last_audio_pts;
         stream->last_audio_pts = packet->pts;
+        if (!stream->pcm)
+            stream->coded_bytes += packet->size;
     }
     const bool coarse_audio = result->video_index < 0 &&
                               (int64_t)stream->tb_num * params->sample_rate > stream->tb_den;

@@ -32,7 +32,7 @@ static uint64_t gcd(uint64_t a, uint64_t b)
     return a;
 }
 
-void mp_probe_hash_time(CC_SHA256_CTX *hash, int64_t ticks, AVRational base)
+static void encode_time(uint8_t *bytes, int64_t ticks, AVRational base)
 {
     uint64_t denominator = base.den;
     bool negative = ticks < 0;
@@ -41,13 +41,18 @@ void mp_probe_hash_time(CC_SHA256_CTX *hash, int64_t ticks, AVRational base)
     magnitude /= tick_factor;
     denominator /= tick_factor;
     uint64_t base_factor = gcd(base.num, denominator);
-    // One update per timestamp, including the high bits of a large numerator.
+    // Include the high bits of a large numerator.
     __uint128_t numerator = (__uint128_t)magnitude * (base.num / base_factor);
-    uint8_t bytes[32];
     AV_WB64(bytes, negative);
     AV_WB64(bytes + 8, (uint64_t)(numerator >> 64));
     AV_WB64(bytes + 16, (uint64_t)numerator);
     AV_WB64(bytes + 24, denominator / base_factor);
+}
+
+void mp_probe_hash_time(CC_SHA256_CTX *hash, int64_t ticks, AVRational base)
+{
+    uint8_t bytes[32];
+    encode_time(bytes, ticks, base);
     CC_SHA256_Update(hash, bytes, sizeof(bytes));
 }
 
@@ -118,14 +123,21 @@ void mp_probe_evidence_packet(MPProbeEvidence *evidence, const AVStream *stream,
     mp_probe_hash_value(&entry->payload, packet->size);
     if (packet->size > 0)
         CC_SHA256_Update(&entry->payload, packet->data, packet->size);
-    mp_probe_hash_time(&entry->timing, packet->pts, stream->time_base);
-    mp_probe_hash_time(&entry->timing, packet->duration, stream->time_base);
-    mp_probe_hash_value(&entry->timing, packet->flags & AV_PKT_FLAG_DISCARD);
-    mp_probe_hash_value(&entry->layout, packet->pos);
-    mp_probe_hash_value(&entry->layout, packet->flags & AV_PKT_FLAG_KEY);
-    mp_probe_hash_value(&entry->layout, packet->dts == AV_NOPTS_VALUE);
+    // Batch adjacent fields without changing the persisted digest format.
+    uint8_t timing[80];
+    encode_time(timing, packet->pts, stream->time_base);
+    encode_time(timing + 32, packet->duration, stream->time_base);
+    AV_WB64(timing + 64, packet->flags & AV_PKT_FLAG_DISCARD);
+    AV_WB64(timing + 72, 0);
+    CC_SHA256_Update(&entry->timing, timing, packet->side_data_elems ? 72 : sizeof(timing));
+
+    uint8_t layout[56];
+    AV_WB64(layout, packet->pos);
+    AV_WB64(layout + 8, packet->flags & AV_PKT_FLAG_KEY);
+    AV_WB64(layout + 16, packet->dts == AV_NOPTS_VALUE);
     if (packet->dts != AV_NOPTS_VALUE)
-        mp_probe_hash_time(&entry->layout, packet->dts, stream->time_base);
+        encode_time(layout + 24, packet->dts, stream->time_base);
+    CC_SHA256_Update(&entry->layout, layout, packet->dts == AV_NOPTS_VALUE ? 24 : sizeof(layout));
     for (int i = 0; i < packet->side_data_elems; i++) {
         const AVPacketSideData *side = &packet->side_data[i];
         switch (side->type) {
@@ -144,7 +156,8 @@ void mp_probe_evidence_packet(MPProbeEvidence *evidence, const AVStream *stream,
             break;
         }
     }
-    mp_probe_hash_value(&entry->timing, 0);
+    if (packet->side_data_elems)
+        mp_probe_hash_value(&entry->timing, 0);
     mp_probe_hash_value(&entry->payload, 0);
 }
 

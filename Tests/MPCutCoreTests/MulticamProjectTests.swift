@@ -20,6 +20,36 @@ final class MulticamProjectTests: XCTestCase {
                          .init(at: t(20), angle: "wide")])
     }
 
+    func testRecordingsKeepOneAngleAndPreserveGapsAcrossRepeatedRanges() throws {
+        var edit = project
+        edit.range = r(0, 15)
+        edit.audio = .follow
+        edit.angles[0].coverage = r(0, 6)
+        edit.angles[0].additionalRecordings = [
+            .init(id: "restart", file: "take 2.mov", offset: t(7), audioStream: 5, coverage: r(8, 15))
+        ]
+        edit.switches = [.init(at: .zero, angle: "wide")]
+        edit.assembly = [r(4, 10), r(8, 12)]
+        let decoded = try MulticamProject.decode(JSONEncoder().encode(edit))
+        XCTAssertEqual(decoded, edit)
+        XCTAssertEqual(decoded.sources.map(\.id), ["wide", "restart", "close", "lav"])
+        XCTAssertEqual(decoded.pictureSource(for: "wide", at: t(8))?.id, "restart")
+        XCTAssertNil(decoded.pictureSource(for: "wide", at: t(7)))
+        XCTAssertEqual(decoded.pictureSource(for: "wide", at: t(6), exclusiveEnd: true)?.id, "wide")
+
+        let plan = try decoded.plan()
+        XCTAssertEqual(plan.duration, t(10))
+        XCTAssertEqual(plan.intervals.map(\.angle), Array(repeating: "wide", count: 4))
+        XCTAssertEqual(plan.intervals.map(\.pictureSourceID), ["wide", nil, "restart", "restart"])
+        XCTAssertEqual(plan.intervals.map(\.output), [r(0, 2), r(2, 4), r(4, 6), r(6, 10)])
+        XCTAssertEqual(plan.picture.map(\.input), [r(4, 6), r(1, 3), r(1, 5)])
+        XCTAssertEqual(plan.audio.map(\.stream), [2, 5, 5])
+
+        edit.angles[0].additionalRecordings[0].offset = t(4)
+        edit.angles[0].additionalRecordings[0].coverage = r(5, 15)
+        XCTAssertThrowsError(try edit.validate())
+    }
+
     func testFixedMasterSpansSurviveCutsAndBreakAtAssemblyJumps() throws {
         var edit = project
         edit.assembly = [r(12, 25), r(5, 12), r(12, 25)]
@@ -92,7 +122,7 @@ final class MulticamProjectTests: XCTestCase {
         var edit = project
         let data = try JSONEncoder().encode(edit)
         var document = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        document["schemaVersion"] = 3
+        document["schema_version"] = 5
         let future = try JSONSerialization.data(withJSONObject: document)
         XCTAssertThrowsError(try JSONDecoder().decode(MulticamProject.self, from: future)) {
             XCTAssertEqual(($0 as? CutError)?.code, "unsupported_multicam_version")
@@ -131,9 +161,9 @@ final class MulticamProjectTests: XCTestCase {
 
     func testMalformedProjectTimesReportTheirJSONLocation() throws {
         let cases: [(String, (inout [String: Any]) throws -> Void)] = [
-            ("switches[1].at", { document in
+            ("switches[1].group_time", { document in
                 var switches = try XCTUnwrap(document["switches"] as? [[String: Any]])
-                switches[1]["at"] = "12x"
+                switches[1]["group_time"] = "12x"
                 document["switches"] = switches
             }),
             ("angles[1].offset", { document in
@@ -141,7 +171,7 @@ final class MulticamProjectTests: XCTestCase {
                 angles[1]["offset"] = "1/0"
                 document["angles"] = angles
             }),
-            ("range.to", { $0["range"] = ["from": "0", "to": "9223372036854775808"] }),
+            ("group_range.to", { $0["group_range"] = ["from": "0", "to": "9223372036854775808"] }),
             ("assembly[0].from", { $0["assembly"] = [["from": "", "to": "4"]] })
         ]
         for (location, change) in cases {
@@ -227,8 +257,8 @@ final class MulticamProjectTests: XCTestCase {
 
         // Typed forms keep their exact value.
         let typed = try document { document in
-            document["switches"] = [["at": "0", "angle": "wide"], ["at": "1001/30000", "angle": "close"],
-                                    ["at": "0.1", "angle": "wide"], ["at": "00:00:12.5", "angle": "close"]]
+            document["switches"] = [["group_time": "0", "angle_id": "wide"], ["group_time": "1001/30000", "angle_id": "close"],
+                                    ["group_time": "0.1", "angle_id": "wide"], ["group_time": "00:00:12.5", "angle_id": "close"]]
         }
         let parsed = try JSONDecoder().decode(MulticamProject.self, from: typed)
         XCTAssertEqual(parsed.switches.map(\.at), [.zero, frame, .init(numerator: 1, denominator: 10),

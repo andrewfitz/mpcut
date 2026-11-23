@@ -46,7 +46,6 @@ extension AnalysisSidecar {
     }
 
     static func persistedSceneAttempts(in db: SidecarDatabase, current: Bool) throws -> [PersistedSceneAttempt] {
-        guard try db.integer("PRAGMA user_version") >= 2 else { return [] }
         let generation = try self.generation(db)
         return try db.statement("""
             SELECT id, scope, generation, state, covered, owner, expires, EXISTS(
@@ -160,11 +159,15 @@ extension AnalysisSidecar {
     }
 
     func repairCanonicalSceneReport(scope: String, expectedCheckpoint: Data, sections: [String: Data]) throws {
+        guard let replacement = sections[Self.sceneSectionKey] else { throw Self.lostSceneClaim() }
         try transact(sections, cancelled: { Task.isCancelled }) { db, stamp in
-            guard try verifiedSection(Self.sceneSectionKey, in: db, stamp: stamp, maxBytes: nil,
-                                      cancelled: { Task.isCancelled }) == nil,
-                  let active = try activeAttempt(db, generation: generation(db), scope: scope),
+            guard let active = try activeAttempt(db, generation: generation(db), scope: scope),
                   try checkpoint(active, db: db) == expectedCheckpoint else {
+                throw Self.lostSceneClaim()
+            }
+            if let current = try verifiedSection(Self.sceneSectionKey, in: db, stamp: stamp, maxBytes: nil,
+                                                 cancelled: { Task.isCancelled }),
+               sceneSectionMatches(current, replacement: replacement, cancelled: { Task.isCancelled }) {
                 throw Self.lostSceneClaim()
             }
         }
@@ -279,8 +282,7 @@ extension AnalysisSidecar {
     private func readSceneSnapshot<T>(_ read: (SidecarDatabase, Int64) throws -> T?) -> T? {
         guard Self.readsEnabled else { return nil }
         do {
-            guard let db = try openReadSnapshot(), try currentStamp(db) != nil,
-                  try db.integer("PRAGMA user_version") >= 2 else { return nil }
+            guard let db = try openReadSnapshot(), try currentStamp(db) != nil else { return nil }
             let result = try read(db, generation(db))
             try checkSource()
             return result

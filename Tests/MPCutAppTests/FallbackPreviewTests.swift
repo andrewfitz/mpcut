@@ -180,12 +180,38 @@ final class FallbackPreviewTests: XCTestCase {
     }
 
     @MainActor
+    func testAudioOnlyScrubClearsAndRetiresTheVideoPicture() async throws {
+        let video = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
+                                                    subdirectory: "Fixtures"))
+        let audio = try XCTUnwrap(Bundle.module.url(forResource: "Gapless-Crop", withExtension: "mp3",
+                                                    subdirectory: "Fixtures"))
+        let picture = PreviewRange(url: video, exactStart: .zero, exactEnd: .init(numerator: 1))
+        let sound = PreviewRange(url: audio, exactStart: .zero, exactEnd: .init(numerator: 1),
+                                 isAudioOnly: true, usesMP3GaplessClock: true)
+        let preview = SequencePreview()
+        preview.scrubSoundEnabled = false
+        preview.update([picture, sound], at: 0.4)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while preview.displayedFrameTime == nil, .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertNotNil(preview.displayedFrameTime)
+
+        preview.scrub(to: 0.8, rangeIndex: 0, sourceFrame: 0.8)
+        preview.scrub(to: 1.2, rangeIndex: 1, sourceFrame: 0.2)
+        XCTAssertNil(preview.displayedFrameTime)
+        XCTAssertTrue(preview.readyForTransport)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(preview.displayedFrameTime)
+        preview.endScrub()
+    }
+
+    @MainActor
     func testFallbackScrubHoldsTheLastPictureBeforeTheClipEnd() async throws {
         let source = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
                                                       subdirectory: "Fixtures"))
         let range = PreviewRange(url: source, exactStart: .zero, exactEnd: .init(numerator: 1))
         let rendered = expectation(description: "The first excluded keyframe is not displayed")
-        let player = WebSequencePlayback(ranges: [range], onFrame: { frame in
+        let audioOccurrence = PreviewRange(url: source, exactStart: .zero, exactEnd: range.exactEnd, isAudioOnly: true)
+        let player = WebSequencePlayback(ranges: [audioOccurrence, range], onFrame: { frame in
             XCTAssertEqual(frame.time.seconds, 0.96, accuracy: 1e-8)
             rendered.fulfill()
         }, onTime: { _ in }, onIssue: { message in

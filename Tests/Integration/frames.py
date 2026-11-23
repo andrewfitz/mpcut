@@ -40,7 +40,7 @@ class Frames(unittest.TestCase):
 
     def export(self, name, *flags, count, source=None):
         dest = self.root / name
-        stdout = run([CLI, "frames", "--json", "--output", dest, *flags, source or self.source])
+        stdout = run([CLI, "review", "frames", "export", "--json", "--output", dest, *flags, source or self.source])
         report = json.loads(stdout)
         self.assertEqual(json.loads((dest / "manifest.json").read_bytes()), report)
         # Every caller states how many pictures it expects, so the per-frame
@@ -56,20 +56,20 @@ class Frames(unittest.TestCase):
 
     def test_scene_samples_and_budget(self):
         dest, report = self.export("budget", "--limit", "2", count=2)
-        self.assertEqual(report["rangeCount"], 5)
-        self.assertEqual([f["sceneNumber"] for f in report["frames"]], [1, 5])
-        self.assertEqual([ratio(f["frameTime"]) for f in report["frames"]], [Fraction(12,25), Fraction(112,25)])
+        self.assertEqual(report["range_count"], 5)
+        self.assertEqual([f["scene_number"] for f in report["frames"]], [1, 5])
+        self.assertEqual([ratio(f["frame_time"]) for f in report["frames"]], [Fraction(12,25), Fraction(112,25)])
         self.assertEqual([(f["width"], f["height"]) for f in report["frames"]], [(640,213)]*2)
         r, g, b = rgb(dest / report["frames"][1]["file"])
         self.assertTrue(r > 180 and g > 180 and b < 50)
         _, single = self.export("middle", "--limit", "1", "--sample", "first", "--preset", "full", count=1)
         first = single["frames"][0]
-        self.assertEqual((first["sceneNumber"], ratio(first["frameTime"]), first["width"]), (3,2,720))
+        self.assertEqual((first["scene_number"], ratio(first["frame_time"]), first["width"]), (3,2,720))
 
     def test_requested_order_duplicates_and_refusal(self):
         dest, report = self.export("times", "--at", "17/5", "--at", "0.4", "--at", "3.41", count=3)
         frames = report["frames"]
-        self.assertEqual([ratio(f["frameTime"]) for f in frames], [Fraction(17,5), Fraction(2,5), Fraction(17,5)])
+        self.assertEqual([ratio(f["frame_time"]) for f in frames], [Fraction(17,5), Fraction(2,5), Fraction(17,5)])
         self.assertEqual((dest / frames[0]["file"]).read_bytes(), (dest / frames[2]["file"]).read_bytes())
         self.assertGreater(rgb(dest / frames[0]["file"])[2], 200)
         self.assertGreater(rgb(dest / frames[1]["file"])[0], 200)
@@ -79,7 +79,7 @@ class Frames(unittest.TestCase):
                 (self.root / "badtime", ["--at","5"], 1, "invalid_range"),
                 (self.root / "badlimit", ["--at","0","--limit","1"], 2, "invalid_arguments")]:
             with self.subTest(code=code, flags=flags):
-                result = subprocess.run([CLI, "frames", "--json", "--output", output, *flags, self.source],
+                result = subprocess.run([CLI, "review", "frames", "export", "--json", "--output", output, *flags, self.source],
                                         capture_output=True, timeout=120)
                 self.assertEqual(result.returncode, status, result.stdout)
                 report = json.loads(result.stdout)
@@ -90,16 +90,16 @@ class Frames(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in dest.iterdir()), kept)
 
     def test_non_silent_ranges_and_empty_manifest(self):
-        _, report = self.export("audible", "--select", "non-silent", "--min-pause", "0.35",
+        _, report = self.export("audible", "--select", "non-silent", "--min-pause-seconds", "0.35",
                                 "--threshold-db", "-45", "--sample", "first", count=2)
-        self.assertEqual(report["stream"], 1)
-        self.assertEqual(report["rangeCount"], 2)
+        self.assertEqual(report["detection_audio_stream_index"], 1)
+        self.assertEqual(report["range_count"], 2)
         for f, expected in zip(report["frames"], [1,3], strict=True):
             self.assertAlmostEqual(float(ratio(f["from"])), expected, delta=.021)
             self.assertAlmostEqual(float(ratio(f["to"])), expected + 1, delta=.021)
-            self.assertLessEqual(ratio(f["clipFrom"]), ratio(f["from"]))
-            self.assertGreaterEqual(ratio(f["clipTo"]), ratio(f["to"]))
-        dest, empty = self.export("empty", "--select", "non-silent", "--threshold-db", "0", "--min-pause", "0.1", count=0)
+            self.assertLessEqual(ratio(f["clip_from"]), ratio(f["from"]))
+            self.assertGreaterEqual(ratio(f["clip_to"]), ratio(f["to"]))
+        dest, empty = self.export("empty", "--select", "non-silent", "--threshold-db", "0", "--min-pause-seconds", "0.1", count=0)
         self.assertEqual(empty["frames"], [])
         self.assertEqual(list(dest.iterdir()), [dest / "manifest.json"])
 
@@ -110,8 +110,8 @@ class Frames(unittest.TestCase):
         dest, report = self.export("vfr", "--at", "1.15", "--at", "1.38", count=2, source=source)
         self.assertEqual(ratio(report["origin"]), 2)
         for f, time, channel in zip(report["frames"], [Fraction(24,25), Fraction(34,25)], [0,2], strict=True):
-            self.assertEqual(ratio(f["frameTime"]), time)
-            self.assertEqual(f["framePTS"] * ratio(report["timeBase"]), 2 + time)
+            self.assertEqual(ratio(f["frame_time"]), time)
+            self.assertEqual(f["frame_pts"] * ratio(report["time_base"]), 2 + time)
             self.assertGreater(rgb(dest / f["file"])[channel], 200)
 
     def test_duplicate_presentation_timestamp_cannot_select_a_picture(self):
@@ -122,7 +122,7 @@ class Frames(unittest.TestCase):
              "[r][b][g]concat=n=3:v=1:a=0,setpts='if(lt(N,2),0,1/TB)'",
              "-fps_mode", "passthrough", "-c:v", "ffv1", source])
         dest = self.root / "duplicate-pictures"
-        result = subprocess.run([CLI, "frames", "--json", "--at", "0", "--output", dest, source],
+        result = subprocess.run([CLI, "review", "frames", "export", "--json", "--at", "0", "--output", dest, source],
                                 capture_output=True, timeout=120)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout)["error"]["code"], "ambiguous_frame")
@@ -130,7 +130,7 @@ class Frames(unittest.TestCase):
         self.assertFalse(list(self.root.glob(".mpcut-frames-*")))
         dest, report = self.export("unique-picture", "--at", "1", count=1, source=source)
         frame = report["frames"][0]
-        self.assertEqual(ratio(frame["frameTime"]), 1)
+        self.assertEqual(ratio(frame["frame_time"]), 1)
         self.assertGreater(rgb(dest / frame["file"])[1], 200)
 
     def test_portrait_rotation_changes_pixels_and_dimensions(self):

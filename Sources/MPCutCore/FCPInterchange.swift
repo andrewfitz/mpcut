@@ -39,7 +39,7 @@ public enum FCPInterchange {
                              cancelled: @escaping @Sendable () -> Bool = { false }) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled)
         try project.validateDestination(output, relativeTo: location, includesContents: output.pathExtension.lowercased() == "fcpxmld")
-        let conversion = try ProjectConverter.prepareStills(project, for: "Final Cut Pro .\(output.pathExtension)",
+        let conversion = try ProjectConverter.prepareForInterchange(project, for: "Final Cut Pro .\(output.pathExtension)",
                                                             allowLoss: allowLoss, supportsStillInserts: true)
         let project = conversion.project
         guard output.pathExtension.lowercased() == "fcpxmld" else {
@@ -147,7 +147,8 @@ private final class FCPReader {
             try loss("The declared sequence duration differs from its storyline. Imported the storyline duration.")
         }
         guard !clips.isEmpty else { throw invalidFCP("The timeline contains no supported clips.") }
-        let stillIndices = try Set(clips.indices.filter { try isStillVideo(clips[$0]) })
+        let stillIndices = try Set(clips.indices.filter { try isStillClip(clips[$0]) })
+        try checkSequenceAttributes(sequence)
         if let first = clips.indices.first(where: { !stillIndices.contains($0) }) {
             try checkFormat(sequence, first: clips[first])
         }
@@ -156,7 +157,6 @@ private final class FCPReader {
         if isMulticam, !recordingIndices.allSatisfy({ clips[$0].name == "mc-clip" }) {
             throw invalidFCP("Mixed multicam and ordinary storylines cannot be represented in a single MPCut project.")
         }
-        let group = isMulticam ? try multicam(recordingIndices.map { clips[$0] }) : nil
         var suppliedIDs = Set<String>()
         var imported: [CutSequenceClip] = isMulticam ? [] : try recordingIndices.map { index in
             let node = clips[index]
@@ -180,10 +180,10 @@ private final class FCPReader {
             next += 1
         }
         if stillIndices.isEmpty {
-            if let group { return .multicam(group) }
+            if isMulticam { return .multicam(try multicam(clips)) }
             return .sequence(imported)
         }
-        guard let formatID = sequence.attr("format"), let format = resources[formatID],
+        guard let formatID = sequence.attr("format"), let format = resources[formatID], format.name == "format",
               let cadence = try? format.time("frameDuration"), cadence > .zero else {
             throw invalidFCP("Still inserts need a sequence format with a positive frame duration.")
         }
@@ -252,17 +252,22 @@ private final class FCPReader {
             inserts[index] = StillInsert(id: id, assetID: assetID, duration: try node.time("duration"),
                                          cadence: cadence, framing: fit)
         }
-        if var restored = group {
-            var iterator = (restored.assembly ?? [restored.range]).makeIterator()
-            restored.assemblyItems = clips.indices.map { index in
-                if let insert = inserts[index] { return .still(insert) }
-                return .group(iterator.next()!)
-            }
-            restored.stillAssets = assets
-            restored.programColorPolicy = policy
-            return .multicam(restored)
+        if isMulticam {
+            return .multicam(try multicam(clips, inserts: inserts, assets: assets, color: policy))
         }
         if imported.isEmpty {
+            let stillItems = inserts.sorted { $0.key < $1.key }.map { StillAssemblyItem.still($0.value) }
+            // A wholly still assembly has no mc-clip to link its authored group.
+            // Require an exact match in MPCut's editing metadata before adopting one.
+            let matchingGroups = resources.compactMap { id, media -> String? in
+                guard let group = media.elements(forName: "multicam").first,
+                      editingMetadata(group)?.assemblyItems == stillItems else { return nil }
+                return id
+            }
+            if matchingGroups.count == 1 {
+                return .multicam(try multicam(clips, inserts: inserts, assets: assets, color: policy,
+                                              orphanGroupID: matchingGroups[0]))
+            }
             guard let width = format.attr("width").flatMap(Int.init),
                   let height = format.attr("height").flatMap(Int.init) else {
                 throw invalidFCP("A standalone still timeline needs a canvas size.")
@@ -282,17 +287,21 @@ private final class FCPReader {
                                                    stillFormat: standalone))
     }
 
-    private func isStillVideo(_ node: XMLElement) throws -> Bool {
-        guard node.name == "video", let ref = node.attr("ref"), let asset = resources[ref], asset.name == "asset",
+    private func isStillClip(_ node: XMLElement) throws -> Bool {
+        guard node.name == "video" || node.name == "asset-clip",
+              let ref = node.attr("ref"), let asset = resources[ref], asset.name == "asset",
               asset.attr("hasAudio") != "1", try asset.time("duration", default: .zero) == .zero else { return false }
         let url = try assetURL(ref, asset: asset)
         return StillImage.filenameExtensions.contains(url.pathExtension.lowercased())
     }
 
-    func checkFormat(_ sequence: XMLElement, first: XMLElement) throws {
+    private func checkSequenceAttributes(_ sequence: XMLElement) throws {
         for key in ["audioLayout", "audioRate", "renderFormat", "keywords"] where sequence.attr(key) != nil {
             try loss("The sequence's \(key) setting is not stored in a .cut project.")
         }
+    }
+
+    func checkFormat(_ sequence: XMLElement, first: XMLElement) throws {
         guard let formatID = sequence.attr("format") else { return }
         guard let format = resources[formatID], format.name == "format" else {
             throw invalidFCP("Missing sequence format \(formatID).")
@@ -355,7 +364,7 @@ private final class FCPReader {
         for child in node.elements where !names.contains(child.name ?? "") {
             let kind = child.name ?? "unknown"
             if kind == "metadata" {
-                let recognized = node.name == "multicam" ? [FCPGroupMetadata.reference, FCPGroupMetadata.audio, FCPGroupMetadata.base, FCPGroupMetadata.sources] : [FCPClipMetadata.key]
+                let recognized = node.name == "multicam" ? [FCPGroupMetadata.reference, FCPGroupMetadata.audio, FCPGroupMetadata.base, FCPGroupMetadata.sources, FCPGroupMetadata.editing] : [FCPClipMetadata.key]
                 if child.elements.allSatisfy({ $0.name == "md" && recognized.contains($0.attr("key") ?? "") }) { continue }
             }
             if kind == "adjust-conform" && child.attr("type") == "fit" && child.elements.isEmpty { continue }
@@ -475,14 +484,142 @@ private final class FCPReader {
         return url
     }
 
+    private func inspect(_ source: Linked) throws -> MediaInfo {
+        if let existing = media[source.url] { return existing }
+        var fileInfo = stat()
+        guard stat(source.url.path, &fileInfo) == 0, fileInfo.st_mode & S_IFMT == S_IFREG else {
+            throw invalidFCP("Relink the angle to a regular media file at \(source.url.path).")
+        }
+        do {
+            let info = try engine.inspectSummary(source.url)
+            media[source.url] = info
+            return info
+        } catch {
+            throw invalidFCP("Relink \(source.url.path) before importing multicam. Its source clock and audio stream indices are required (\(error.localizedDescription)).")
+        }
+    }
+
     struct Edit {
         let range: MulticamRange
         let angle: String
+        let recording: String?
         let audio: MulticamAudioSelection?
+        let timelineIndex: Int
     }
 
-    func multicam(_ clips: [XMLElement]) throws -> MulticamProject {
-        let groupID = try clips[0].required("ref")
+    /// Restore authored state only when it describes the program that is still in the XML storyline.
+    private func restore(_ editing: FCPMulticamEditing, edits: [Edit], inserts: [Int: StillInsert],
+                         reference: String, cameras: [MulticamSource], microphones: [MulticamSource],
+                         assets: [StillAsset], color: StillProgramColorPolicy?,
+                         audioStreams: [String: [StreamInfo]]) throws -> MulticamProject? {
+        let originalAudio = editing.extractedAudio ?? [:]
+        let sources = Dictionary(uniqueKeysWithValues: (cameras.flatMap(\.recordings) + microphones).map { ($0.id, $0) })
+        let helperIDs = Set(originalAudio.keys)
+        let microphoneIDs = Set(microphones.map(\.id))
+        func path(_ link: String) -> String? {
+            guard let decoded = URLComponents(string: link)?.percentEncodedPath.removingPercentEncoding else { return nil }
+            return try? CutProject.checkedMediaURL(decoded, relativeTo: location).standardizedFileURL.path
+        }
+        guard helperIDs.isSubset(of: microphoneIDs),
+              originalAudio.allSatisfy({ id, selection in
+                  guard let source = sources[id], let original = sources[selection.source] else { return false }
+                  if let authored = editing.audioLinks?[id] {
+                      return source.file == path(authored.path) && source.offset == authored.offset
+                          && original.file == path(authored.originalPath) && original.offset == authored.originalOffset
+                  }
+                  return source.file == original.file && source.offset == original.offset
+              }),
+              originalAudio.values.allSatisfy({ selection in
+                  !helperIDs.contains(selection.source)
+                      && audioStreams[selection.source]?.contains(where: { $0.index == selection.stream }) == true
+              }),
+              Set(editing.recordings.values.flatMap { $0 }) == Set(sources.keys).subtracting(helperIDs)
+        else { return nil }
+
+        func applySettings(_ source: MulticamSource, isPrimary: Bool) -> MulticamSource? {
+            guard source.coverage == editing.sourceCoverage?[source.id] else { return nil }
+            var result = source
+            if let setting = editing.sourceSettings?[source.id] {
+                if let stream = setting.audioStream,
+                   audioStreams[source.id]?.contains(where: { $0.index == stream }) != true {
+                    return nil
+                }
+                result.audioStream = setting.audioStream
+                // An explicit rename in FCP remains authoritative.
+                let fileName = URL(fileURLWithPath: source.file).lastPathComponent
+                let writtenName = isPrimary ? setting.name ?? fileName : fileName
+                if source.name == writtenName { result.name = setting.name }
+            }
+            return result
+        }
+
+        var restoredCameras = [MulticamSource](), restoredMicrophones = [MulticamSource]()
+        for camera in cameras {
+            guard var primary = applySettings(camera, isPrimary: true) else { return nil }
+            var additional = [MulticamSource]()
+            for recording in camera.additionalRecordings {
+                guard let restored = applySettings(recording, isPrimary: false) else { return nil }
+                additional.append(restored)
+            }
+            primary.additionalRecordings = additional
+            restoredCameras.append(primary)
+        }
+        for microphone in microphones where !helperIDs.contains(microphone.id) {
+            guard let restored = applySettings(microphone, isPrimary: true) else { return nil }
+            restoredMicrophones.append(restored)
+        }
+        let result = MulticamProject(referenceAngle: reference, range: editing.range, angles: restoredCameras,
+                                    audioSources: restoredMicrophones, audio: editing.audio, switches: editing.switches,
+                                    assemblyItems: editing.assemblyItems, stillAssets: assets, programColorPolicy: color)
+        let plan = try result.plan()
+        guard plan.intervals.count == edits.count else { return nil }
+
+        let items = editing.assemblyItems ?? [.group(editing.range)]
+        var expectedStills = [(RationalTime, StillInsert)]()
+        var cursor = RationalTime.zero
+        for item in items {
+            if let range = item.group {
+                cursor = try cursor.adding(range.to.subtracting(range.from))
+            } else if let insert = item.still {
+                expectedStills.append((cursor, insert))
+                cursor = try cursor.adding(insert.duration)
+            }
+        }
+        guard expectedStills.count == inserts.count else { return nil }
+        let timelineIndices = Set(edits.map(\.timelineIndex)).union(inserts.keys).sorted()
+        let grouped = Dictionary(grouping: edits, by: \.timelineIndex)
+        var output = RationalTime.zero
+        var stillIndex = 0
+        for index in timelineIndices {
+            if let insert = inserts[index] {
+                let (expectedPosition, expectedInsert) = expectedStills[stillIndex]
+                guard insert == expectedInsert, output == expectedPosition else { return nil }
+                stillIndex += 1
+                output = try output.adding(insert.duration)
+            } else {
+                for edit in grouped[index] ?? [] { output = try output.adding(edit.range.to.subtracting(edit.range.from)) }
+            }
+        }
+        guard zip(plan.intervals, edits).allSatisfy({ planned, visible in
+            let audio = visible.audio.map { originalAudio[$0.source] ?? $0 }
+            return planned.group == visible.range && planned.angle == visible.angle && planned.pictureSourceID == visible.recording
+                && planned.audio == audio
+        }) else { return nil }
+        return result
+    }
+
+    private func editingMetadata(_ multicam: XMLElement) -> FCPMulticamEditing? {
+        let fields = multicam.elements(forName: "metadata").flatMap { $0.elements(forName: "md") }
+        guard let value = fields.first(where: { $0.attr("key") == FCPGroupMetadata.editing })?.attr("value") else { return nil }
+        return try? JSONDecoder().decode(FCPMulticamEditing.self, from: Data(value.utf8))
+    }
+
+    func multicam(_ timeline: [XMLElement], inserts: [Int: StillInsert] = [:], assets: [StillAsset] = [],
+                  color: StillProgramColorPolicy? = nil, orphanGroupID: String? = nil) throws -> MulticamProject {
+        let clips = timeline.indices.filter { inserts[$0] == nil }.map { timeline[$0] }
+        guard let groupID = try orphanGroupID ?? clips.first?.required("ref") else {
+            throw invalidFCP("The timeline does not link a multicam group.")
+        }
         guard let group = resources[groupID]?.elements(forName: "multicam").first else {
             throw invalidFCP("Multicam resource \(groupID) is missing.")
         }
@@ -497,68 +634,110 @@ private final class FCPReader {
         // Give early-starting cameras nonnegative FCP angle times, then restore MPCut's clock.
         let storedBase = try field(FCPGroupMetadata.base).map { try RationalTime(parsing: $0) } ?? .zero
         guard storedBase <= .zero else { throw invalidFCP("Invalid multicam group clock metadata.") }
-        let earliest = try clips.map { try $0.time("start", default: tc).subtracting(tc) }.min() ?? .zero
-        let base = try max(storedBase, RationalTime.zero.subtracting(earliest))
+        let earliest = try clips.map { try $0.time("start", default: tc).subtracting(tc) }.min()
+        let base = try earliest.map { try max(storedBase, RationalTime.zero.subtracting($0)) } ?? storedBase
         if base != storedBase {
             try loss("Shifted the MPCut group origin to include edits before its original start.")
         }
         var cameras = [MulticamSource](), microphones = [MulticamSource]()
         var audioStreams = [String: [StreamInfo]]()
-        var coverage = [String: MulticamRange]()
-        var ids = Set<String>()
+        var coverage = [String: [(id: String, range: MulticamRange)]]()
+        let nodes = group.elements(forName: "mc-angle")
+        let angleIDs = try nodes.map { try $0.required("angleID") }
+        let ids = Set(angleIDs)
+        guard ids.count == nodes.count else { throw invalidFCP("Duplicate multicam angle ID.") }
+        var recordingIDs = ids
+        let editing = editingMetadata(group)
         try checkChildren(group, keeping: ["mc-angle"])
-        for angle in group.elements(forName: "mc-angle") {
-            let id = try angle.required("angleID")
-            guard ids.insert(id).inserted else { throw invalidFCP("Duplicate multicam angle \(id).") }
-            let sources = angle.elements.filter { $0.name != "gap" }
-            guard sources.count == 1, let node = sources.first, ["clip", "asset-clip", "video", "audio"].contains(node.name),
-                  node.attr("enabled") != "0" else {
-                throw invalidFCP("Angle \(id) must contain one enabled linked recording. Edited or compound angles cannot be reconstructed.")
-            }
+        for (angle, id) in zip(nodes, angleIDs) {
             var cursor = tc
-            for item in angle.elements.prefix(while: { $0 !== node }) {
-                try checkChildren(item, keeping: [])
-                cursor = try item.time("offset", default: cursor).adding(item.time("duration"))
-            }
-            for gap in angle.elements.filter({ $0.name == "gap" }) { try checkChildren(gap, keeping: []) }
-            let source = try linked(node)
-            var fileInfo = stat()
-            guard stat(source.url.path, &fileInfo) == 0, fileInfo.st_mode & S_IFMT == S_IFREG else {
-                throw invalidFCP("Relink the angle to a regular media file at \(source.url.path).")
-            }
-            let info: MediaInfo
-            if let existing = media[source.url] { info = existing }
-            else {
-                do { info = try engine.inspectSummary(source.url) }
-                catch { throw invalidFCP("Relink \(source.url.path) before importing multicam. Its source clock and audio stream indices are required (\(error.localizedDescription)).") }
-                media[source.url] = info
-            }
-            let at = try node.time("offset", default: cursor).subtracting(tc).adding(base)
-            let visible = try node.time("duration")
-            guard visible > .zero else { throw invalidFCP("Angle \(id) has an empty recording.") }
-            coverage[id] = try .init(from: at, to: at.adding(visible))
-            let offset = try at.subtracting(source.start).subtracting(info.multicamSourceOffset)
-            let streams = info.streams.filter { $0.kind == "audio" }
-            audioStreams[id] = streams
-            var defaultStream = streams.count == 1 ? streams[0].index : nil
-            if let setting = settings[id] {
-                defaultStream = setting.audioStream
-                if let selected = defaultStream, !streams.contains(where: { $0.index == selected }) {
-                    try loss("Removed the unavailable default audio stream \(selected) on angle \(id).")
-                    defaultStream = nil
+            var entries = [MulticamSource]()
+            let sourceCount = angle.elements.filter { $0.name != "gap" }.count
+            let mapped = editing?.recordings[id]
+            let additionalIDs = Set(mapped?.filter { $0 != id } ?? [])
+            let validMapping = mapped?.count == sourceCount && additionalIDs.count == sourceCount - 1
+                && mapped?.contains(id) == true && recordingIDs.isDisjoint(with: additionalIDs)
+            if validMapping { recordingIDs.formUnion(additionalIDs) }
+            var hasPicture: Bool?
+            var trimmed = false
+            for node in angle.elements {
+                let position = try node.time("offset", default: cursor)
+                let duration = try node.time("duration")
+                guard duration > .zero, position >= cursor else {
+                    throw invalidFCP("Angle \(id) has an empty or overlapping segment.")
                 }
+                cursor = try position.adding(duration)
+                if node.name == "gap" {
+                    try checkChildren(node, keeping: [])
+                    continue
+                }
+                guard ["clip", "asset-clip", "video", "audio"].contains(node.name), node.attr("enabled") != "0" else {
+                    throw invalidFCP("Angle \(id) must contain enabled linked recordings.")
+                }
+                let recordingID: String
+                if validMapping, let mapped {
+                    recordingID = mapped[entries.count]
+                } else if entries.isEmpty {
+                    recordingID = id
+                } else {
+                    var suffix = entries.count + 1
+                    while !recordingIDs.insert("\(id)-recording-\(suffix)").inserted { suffix += 1 }
+                    recordingID = "\(id)-recording-\(suffix)"
+                }
+                let source = try linked(node)
+                let info = try inspect(source)
+                let assetDuration = try source.asset.time("duration", default: info.duration)
+                trimmed = trimmed || source.start != .zero || duration != assetDuration
+                let at = try position.subtracting(tc).adding(base)
+                let range = try MulticamRange(from: at, to: at.adding(duration))
+                let offset = try at.subtracting(source.start).subtracting(info.multicamSourceOffset)
+                let streams = info.streams.filter { $0.kind == "audio" }
+                audioStreams[recordingID] = streams
+                var defaultStream = streams.count == 1 ? streams[0].index : nil
+                if recordingID == id, let setting = settings[id] {
+                    defaultStream = setting.audioStream
+                    if let selected = defaultStream, !streams.contains(where: { $0.index == selected }) {
+                        if editing?.extractedAudio?[recordingID] == nil {
+                            try loss("Removed the unavailable default audio stream \(selected) on recording \(recordingID).")
+                            defaultStream = nil
+                        } else {
+                            // The helper's old stream index is specific to its original media.
+                            defaultStream = streams.count == 1 ? streams[0].index : nil
+                        }
+                    }
+                }
+                let picture = settings[id]?.audioOnly != true
+                    && (source.asset.attr("hasVideo") == "1" || (source.asset.attr("hasVideo") == nil && info.hasVideo))
+                guard hasPicture == nil || hasPicture == picture else {
+                    throw invalidFCP("Angle \(id) mixes video and audio-only recordings.")
+                }
+                hasPicture = picture
+                coverage[id, default: []].append((recordingID, range))
+                entries.append(.init(id: recordingID, file: source.url.path, offset: offset,
+                                     name: recordingID == id ? angle.attr("name") : node.attr("name"),
+                                     audioStream: defaultStream, coverage: range))
             }
-            let entry = MulticamSource(id: id, file: source.url.path, offset: offset, name: angle.attr("name"),
-                                       audioStream: defaultStream)
-            let hasPicture = source.asset.attr("hasVideo") == "1" || (source.asset.attr("hasVideo") == nil && info.hasVideo)
-            if hasPicture && settings[id]?.audioOnly != true {
-                cameras.append(entry)
-            } else { microphones.append(entry) }
+            guard let primaryIndex = entries.firstIndex(where: { $0.id == id }) else {
+                throw invalidFCP("Angle \(id) has no linked recording.")
+            }
+            var primary = entries.remove(at: primaryIndex)
+            if hasPicture == true {
+                if entries.isEmpty, !trimmed, editing?.sourceCoverage?[primary.id] == nil { primary.coverage = nil }
+                primary.additionalRecordings = entries
+                cameras.append(primary)
+            } else {
+                guard entries.isEmpty else { throw invalidFCP("Audio-only angle \(id) contains multiple recordings.") }
+                primary.coverage = nil
+                microphones.append(primary)
+            }
         }
         let preferred = field(FCPGroupMetadata.reference)
         guard let reference = cameras.first(where: { $0.id == preferred })?.id ?? cameras.first?.id else { throw invalidFCP("The multicam group has no video angle.") }
         let cameraIDs = Set(cameras.map(\.id))
-        let edits = try clips.map { item -> Edit in
+        var segmented = Set(cameras.filter { $0.coverage != nil }.map(\.id))
+        var visible = [Edit]()
+        for (index, item) in timeline.enumerated() {
+            if inserts[index] != nil { continue }
             guard item.attr("ref") == groupID else { throw invalidFCP("Multiple multicam groups in one timeline cannot be represented.") }
             try checkTiming(item)
             let component = item.attr("srcEnable") ?? "all"
@@ -566,7 +745,7 @@ private final class FCPReader {
                 try loss("Removed the multicam clip's \(component)-only override.")
             }
             try checkChildren(item, keeping: ["mc-source"])
-            var picture: String?, sound: MulticamAudioSelection?
+            var picture: String?, soundAngles = [String]()
             for selection in item.elements(forName: "mc-source") {
                 try checkChildren(selection, keeping: [])
                 let id = try selection.required("angleID")
@@ -577,7 +756,32 @@ private final class FCPReader {
                     guard picture == nil, cameraIDs.contains(id) else { throw invalidFCP("Expected a single video angle.") }
                     picture = id
                 }
-                if component != "video", enabled == "audio" || enabled == "all", let streams = audioStreams[id], !streams.isEmpty {
+                if component != "video", enabled == "audio" || enabled == "all" { soundAngles.append(id) }
+            }
+            guard let picture else { throw invalidFCP("The multicam clip needs an explicit enabled video angle.") }
+            var start = try item.time("start", default: tc).subtracting(tc).adding(base)
+            guard start >= .zero else { throw invalidFCP("Multicam clip starts before the group timecode.") }
+            let end = try start.adding(item.time("duration"))
+            let selectedAngles = soundAngles.contains(picture) ? soundAngles : [picture] + soundAngles
+            while start < end {
+                var boundary = end
+                var sound: MulticamAudioSelection?
+                var pictureRecording: String?
+                for id in selectedAngles {
+                    let ranges = coverage[id] ?? []
+                    guard let available = ranges.first(where: { $0.range.contains(start) }) else {
+                        guard id == picture else {
+                            throw invalidFCP("The edit at \(start)s selects empty space on angle \(id).")
+                        }
+                        segmented.insert(id)
+                        if let next = ranges.first(where: { start < $0.range.from }) {
+                            boundary = min(boundary, next.range.from)
+                        }
+                        continue
+                    }
+                    boundary = min(boundary, available.range.to)
+                    if id == picture { pictureRecording = available.id }
+                    guard soundAngles.contains(id), let streams = audioStreams[available.id], !streams.isEmpty else { continue }
                     if let sound {
                         try loss("Kept multicam audio angle \(sound.source) and removed simultaneous angle \(id).")
                         continue
@@ -585,28 +789,37 @@ private final class FCPReader {
                     if streams.count != 1 {
                         try loss("Angle \(id) contains multiple embedded audio streams. Selected its first stream \(streams[0].index).")
                     }
-                    sound = .init(source: id, stream: streams[0].index)
+                    sound = .init(source: available.id, stream: streams[0].index)
                 }
+                visible.append(.init(range: .init(from: start, to: boundary), angle: picture, recording: pictureRecording,
+                                     audio: sound, timelineIndex: index))
+                start = boundary
             }
-            guard let picture else { throw invalidFCP("The multicam clip needs an explicit enabled video angle.") }
-            let start = try item.time("start", default: tc).subtracting(tc).adding(base)
-            guard start >= .zero else { throw invalidFCP("Multicam clip starts before the group timecode.") }
-            let end = try start.adding(item.time("duration"))
-            for id in [picture, sound?.source].compactMap({ $0 }) {
-                guard let available = coverage[id], available.from <= start, end <= available.to else {
-                    throw invalidFCP("The edit at \(start)s selects empty space on angle \(id).")
-                }
-            }
-            return Edit(range: .init(from: start, to: end), angle: picture, audio: sound)
         }
-        let ordered = edits.sorted { $0.range.from < $1.range.from }
+        for index in cameras.indices where cameras[index].coverage == nil && segmented.contains(cameras[index].id) {
+            cameras[index].coverage = coverage[cameras[index].id]?.first?.range
+        }
+        if let editing, let restored = try? restore(editing, edits: visible, inserts: inserts, reference: reference,
+                                                     cameras: cameras, microphones: microphones, assets: assets,
+                                                     color: color, audioStreams: audioStreams) {
+            return restored
+        }
+        guard !visible.isEmpty else { throw invalidFCP("The still assembly's multicam metadata no longer matches its resources.") }
+        let edits = visible
+        let ordered = edits.indices.sorted { (edits[$0].range.from, $0) < (edits[$1].range.from, $1) }
         var switches = [MulticamSwitch](), end = RationalTime.zero
-        for edit in ordered {
+        var overrides = [Int: String]()
+        for index in ordered {
+            let edit = edits[index]
             if let previous = switches.last, previous.angle != edit.angle || previous.audio != edit.audio {
-                guard end <= edit.range.from else {
-                    throw invalidFCP("Repeated group time uses different angle selections. MPCut switches apply to every occurrence.")
+                if end <= edit.range.from {
+                    switches.append(.init(at: edit.range.from, angle: edit.angle, audio: edit.audio))
+                } else {
+                    guard previous.audio == edit.audio else {
+                        throw invalidFCP("Repeated group time uses different audio. MPCut audio switches apply to every occurrence.")
+                    }
+                    overrides[index] = edit.angle
                 }
-                switches.append(.init(at: edit.range.from, angle: edit.angle, audio: edit.audio))
             } else if switches.isEmpty {
                 switches.append(.init(at: .zero, angle: edit.angle, audio: edit.audio))
             }
@@ -617,7 +830,7 @@ private final class FCPReader {
         })
         var policy = MulticamAudioPolicy.none
         let mode = field(FCPGroupMetadata.audio)
-        if mode == "follow" {
+        if mode == "follow" && segmented.isEmpty {
             // A switch with nil audio falls back to the default. Keep silence explicit
             // by retaining the none policy when follow would enable an unwanted mic.
             if switches.allSatisfy({ $0.audio != nil || cameraStreams[$0.angle] == nil }) { policy = .follow }
@@ -631,7 +844,7 @@ private final class FCPReader {
         for index in switches.indices {
             let expected: MulticamAudioSelection?
             switch policy {
-            case .none: expected = nil
+            case .none, .mix: expected = nil
             case .fixed(let mic): expected = mic
             case .follow:
                 let id = switches[index].angle
@@ -639,14 +852,26 @@ private final class FCPReader {
             }
             if switches[index].audio == expected { switches[index].audio = nil }
         }
+        let grouped = Dictionary(grouping: edits.indices, by: { edits[$0].timelineIndex })
+        let items = timeline.indices.flatMap { index -> [StillAssemblyItem] in
+            if let insert = inserts[index] { return [.still(insert)] }
+            return (grouped[index] ?? []).map { .group(edits[$0].range, angle: overrides[$0]) }
+        }
         return .init(referenceAngle: reference, range: .init(from: .zero, to: end), angles: cameras,
-                     audioSources: microphones, audio: policy, switches: switches, assembly: edits.map(\.range))
+                     audioSources: microphones, audio: policy, switches: switches, assemblyItems: items,
+                     stillAssets: assets, programColorPolicy: color)
     }
 }
 
 /// MPCut-specific editor fields carried in Apple's extensible clip metadata.
 struct FCPClipMetadata: Codable {
-    static let key = "com.mpcut.clip.v1"
+    static let key = "com.mpcut.sequence_clip.v2"
+    enum CodingKeys: String, CodingKey {
+        case id = "clip_id"
+        case audioTrack = "track_ordinal"
+        case originalFile = "original_file"
+        case replacementNames = "replacement_names"
+    }
     let id: String
     let audioTrack: Int?
     let originalFile: String?
@@ -654,7 +879,14 @@ struct FCPClipMetadata: Codable {
 }
 
 struct FCPStillMetadata: Codable {
-    static let key = "com.mpcut.still-insert.v1"
+    static let key = "com.mpcut.still_placement.v2"
+    enum CodingKeys: String, CodingKey {
+        case placementID = "placement_id"
+        case assetID = "asset_id"
+        case fingerprint
+        case colorPolicy = "program_color_policy"
+        case standalone = "still_format"
+    }
     let placementID: String
     let assetID: String
     let fingerprint: String
@@ -664,13 +896,19 @@ struct FCPStillMetadata: Codable {
 
 
 struct FCPAngleMetadata: Codable {
+    enum CodingKeys: String, CodingKey {
+        case name
+        case audioOnly = "audio_only"
+        case audioStream = "audio_stream_index"
+    }
     let audioOnly: Bool
     let audioStream: Int?
+    var name: String? = nil
 }
 
 enum FCPGroupMetadata {
-    static let base = "com.mpcut.multicam.base"
-    static let sources = "com.mpcut.multicam.sources"
-    static let reference = "com.mpcut.multicam.reference"
-    static let audio = "com.mpcut.multicam.audio"
+    static let base = "com.mpcut.multicam.group_start_time"
+    static let sources = "com.mpcut.multicam.source_settings"
+    static let reference = "com.mpcut.multicam.reference_angle_id"
+    static let audio = "com.mpcut.multicam.program_audio_mode"
 }

@@ -7,12 +7,39 @@ import MPCutCore
 @MainActor
 final class EditorPresentation: ObservableObject {
     enum Inspector: String, CaseIterable {
-        case switches = "Switch", sources = "Sources", assembly = "Assembly", export = "Export"
+        case switches, sources, assembly, export, transcript, participants
+
+        var label: String { self == .switches ? "Switch" : rawValue.capitalized }
     }
     @Published var inspector: Inspector = .switches
     @Published var inspectorVisible = true
+    @Published var sequenceTranscriptVisible = false
+    @Published var sequenceParticipantsVisible = false
+    @Published var pinnedParticipant: String?
+    @Published var pickedParticipantAppearance: ParticipantPickedAppearance?
+    @Published var participantDrawMode = false
+    @Published var participantDrawnBounds: ParticipantDrawnBounds?
+    @Published var participantTranscriptFilter: ParticipantSpeakerBinding?
+    @Published var selectedTranscriptSpeaker: ParticipantTranscriptSelection?
+    @Published var speakingParticipants: Set<String> = []
+
+
+    func transcriptVisible(multicam: Bool) -> Bool {
+        multicam ? inspectorVisible && inspector == .transcript : sequenceTranscriptVisible
+    }
+
+    func setTranscriptVisible(_ visible: Bool, multicam: Bool) {
+        if multicam {
+            if visible { inspector = .transcript }
+            if visible || inspector == .transcript { inspectorVisible = visible }
+        } else {
+            sequenceTranscriptVisible = visible
+            if visible { sequenceParticipantsVisible = false }
+        }
+    }
     @Published var waveformSpan: AudioViewerSpan = .timeline
     @Published var pauseControls = false
+    var transcriptKeyHandler: ((NSEvent, NSEvent.ModifierFlags) -> Bool)?
     var showAbout: (() -> Void)?
     var showSettings: (() -> Void)?
 }
@@ -20,21 +47,21 @@ final class EditorPresentation: ObservableObject {
 extension ProjectSessions {
     func mcpPresentation(tool: String, arguments: [String: Any], session: ProjectSession,
                          checkAccess: @escaping @MainActor () throws -> Void) async throws -> [String: Any]? {
-        guard tool == "get_presentation" || tool == "set_presentation" else { return nil }
+        guard ["workspace_layout_read", "workspace_layout_set", "workspace_panel_show", "timeline_time_reveal"].contains(tool) else { return nil }
         try checkAccess()
         var scan: [String: Any]?
-        if tool == "set_presentation" {
+        if tool != "workspace_layout_read" {
             if session.hasLifecycleModal,
-               !["showSettings", "showHelp", "showAbout"].contains(arguments["action"] as? String ?? "") {
+               !["show_settings", "show_help", "show_about"].contains(arguments["action"] as? String ?? "") {
                 throw MCPCommandError("editor_busy", "Dismiss the sheet on the target window to change its presentation.")
             }
-            let opensPauseControls = arguments["action"] as? String == "setPauseControls" &&
+            let opensPauseControls = arguments["action"] as? String == "set_pause_controls" &&
                 (arguments["visible"] as? NSNumber).map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } == true
             if opensPauseControls {
                 let shouldScan = session.isMulticam ? session.multicam.canScanAnalysis(.silence) :
                     session.editor.canScanSilence && !session.editor.pauseAnalysisReady
                 if shouldScan {
-                    scan = try await mcpAnalysis(tool: "scan_analysis", arguments: ["kind": "silence"],
+                    scan = try await mcpAnalysis(tool: "silence_editor_scan", arguments: [:],
                                                  session: session, checkAccess: checkAccess)
                     try checkAccess()
                     guard !session.hasLifecycleModal else {
@@ -42,7 +69,7 @@ extension ProjectSessions {
                     }
                 }
             }
-            try session.changePresentation(arguments)
+            try session.changePresentation(arguments, revealTime: tool == "timeline_time_reveal")
         }
         var state = session.presentationState()
         state["scan"] = scan
@@ -84,25 +111,29 @@ extension ProjectSession {
 
     fileprivate func presentationState() -> [String: Any] {
         var result: [String: Any] = [
-            "zoom": layoutZoom, "zoomFactor": pow(2, layoutZoom), "maximumZoom": TimelineViewControls.maximumZoom,
-            "largeThumbnails": editor.largeThumbnails, "pauseControlsVisible": presentation.pauseControls,
+            "zoom": layoutZoom, "zoom_factor": pow(2, layoutZoom), "maximum_zoom": TimelineViewControls.maximumZoom,
+            "timeline_large_previews_enabled": editor.largeThumbnails, "pause_controls_visible": presentation.pauseControls,
             "scope": isMulticam ? "multicam" : "sequence",
-            "historyVisible": isHistoryPresented, "monitorVisible": monitor?.isVisible == true,
-            "exportQueueVisible": isMulticam ? multicam.isBulkQueuePresented : editor.isBulkQueuePresented
+            "transcript_visible": presentation.transcriptVisible(multicam: isMulticam),
+            "history_visible": isHistoryPresented, "monitor_visible": monitor?.isVisible == true,
+            "export_queue_visible": isMulticam ? multicam.isBulkQueuePresented : editor.isBulkQueuePresented
         ]
         if isMulticam {
-            result["inspectorVisible"] = presentation.inspectorVisible
+            result["inspector_visible"] = presentation.inspectorVisible
             result["inspector"] = presentation.inspector.rawValue
-            result["reportVisible"] = multicam.report != nil
-            result["replacementAudioVisible"] = multicam.isReplacementAudioPresented
-            if let size = split(vertical: false)?.arrangedSubviews.last?.frame.height { result["timelineHeight"] = size }
-            if let size = split(vertical: true)?.arrangedSubviews.last?.frame.width { result["inspectorWidth"] = size }
+            result["report_visible"] = multicam.report != nil
+            result["replacement_audio_visible"] = multicam.isReplacementAudioPresented
+            if let size = split(vertical: false)?.arrangedSubviews.last?.frame.height { result["timeline_height"] = size }
+            if let size = split(vertical: true)?.arrangedSubviews.last?.frame.width { result["inspector_width"] = size }
             if let group = surface(.group), let tracks = surface(.tracks) {
-                result["trackLabelWidth"] = MulticamTimeline.trackWidth(Self.savedLabelWidth, available: tracks.contentView.bounds.width)
-                result["groupViewportWidth"] = group.contentView.bounds.width
+                result["track_label_width"] = MulticamTimeline.trackWidth(Self.savedLabelWidth, available: tracks.contentView.bounds.width)
+                result["group_viewport_width"] = group.contentView.bounds.width
             }
-        } else if editor.audioPreviewClip != nil {
-            result["waveformSpan"] = presentation.waveformSpan.rawValue
+        } else {
+            if editor.audioPreviewClip != nil { result["waveform_span"] = presentation.waveformSpan.rawValue }
+            if presentation.sequenceTranscriptVisible, let size = split(vertical: true)?.arrangedSubviews.last?.frame.width {
+                result["inspector_width"] = size
+            }
         }
         var scrolls: [String: Double] = [:]
         for target in ScrollSurface.allCases {
@@ -112,7 +143,7 @@ extension ProjectSession {
             let origin = target.horizontal ? visible.minX - doc.bounds.minX : visible.minY - doc.bounds.minY
             scrolls[target.rawValue] = span > 0 ? min(1, max(0, origin / span)) : 0
         }
-        result["scrollPositions"] = scrolls
+        result["scroll_positions"] = scrolls
         return result
     }
 
@@ -120,7 +151,7 @@ extension ProjectSession {
         UserDefaults.standard.object(forKey: MulticamTimeline.trackWidthPreference) as? Double ?? 172
     }
 
-    fileprivate func changePresentation(_ args: [String: Any]) throws {
+    fileprivate func changePresentation(_ args: [String: Any], revealTime: Bool) throws {
         let unavailable = MCPCommandError("control_unavailable", "This control is unavailable in the target window.")
         func text(_ key: String) throws -> String {
             guard let value = args[key] as? String else { throw MCPCommandError("invalid_arguments", "Supply \(key).") }
@@ -140,26 +171,26 @@ extension ProjectSession {
             return value.boolValue
         }
 
-        let action = try text("action")
+        let action = try revealTime ? "reveal_time" : text("action")
         switch action {
-        case "zoomIn", "zoomOut", "fit", "restoreZoom", "setZoom":
+        case "zoom_in", "zoom_out", "fit", "restore_zoom", "set_zoom":
             guard isMulticam ? multicam.project != nil : !editor.isEmpty else { throw unavailable }
             switch action {
-            case "zoomIn": layoutZoom = TimelineViewControls.adjustedZoom(layoutZoom, by: 1)
-            case "zoomOut": layoutZoom = TimelineViewControls.adjustedZoom(layoutZoom, by: -1)
+            case "zoom_in": layoutZoom = TimelineViewControls.adjustedZoom(layoutZoom, by: 1)
+            case "zoom_out": layoutZoom = TimelineViewControls.adjustedZoom(layoutZoom, by: -1)
             case "fit": layoutZoom = 0
-            case "restoreZoom": layoutZoom = isMulticam ? multicam.previousTimelineZoom : editor.previousTimelineZoom
+            case "restore_zoom": layoutZoom = isMulticam ? multicam.previousTimelineZoom : editor.previousTimelineZoom
             default: layoutZoom = try number("zoom", range: 0...TimelineViewControls.maximumZoom)
             }
-        case "setLargeThumbnails":
+        case "set_large_thumbnails":
             editor.largeThumbnails = try flag("enabled")
-        case "setWaveformSpan":
+        case "set_waveform_span":
             guard !isMulticam, editor.audioPreviewClip != nil else { throw unavailable }
             guard let span = AudioViewerSpan(rawValue: try text("span")) else {
                 throw MCPCommandError("invalid_arguments", "Choose a supported waveform span.")
             }
             presentation.waveformSpan = span
-        case "setInspector":
+        case "set_inspector":
             guard isMulticam, multicam.project != nil else { throw unavailable }
             let visible = args["visible"] == nil ? true : try flag("visible")
             if args["section"] != nil {
@@ -169,7 +200,10 @@ extension ProjectSession {
                 presentation.inspector = section
             }
             presentation.inspectorVisible = visible
-        case "setPauseControls":
+        case "set_transcript":
+            guard isMulticam ? multicam.project != nil : !editor.isEmpty else { throw unavailable }
+            presentation.setTranscriptVisible(try flag("visible"), multicam: isMulticam)
+        case "set_pause_controls":
             let visible = try flag("visible")
             if visible {
                 if isMulticam {
@@ -179,7 +213,7 @@ extension ProjectSession {
                 }
             }
             presentation.pauseControls = visible
-        case "revealTime":
+        case "reveal_time":
             guard let target = ScrollSurface(rawValue: try text("surface")), target.horizontal,
                   let scroll = surface(target) else { throw unavailable }
             let time = try RationalTime(parsing: text("time"))
@@ -195,7 +229,7 @@ extension ProjectSession {
                     throw MCPCommandError("invalid_time", "The requested time is outside the displayed multicam timeline.")
                 }
             } else { throw unavailable }
-        case "setScroll":
+        case "set_scroll":
             guard let target = ScrollSurface(rawValue: try text("surface")), let scroll = surface(target),
                   let document = scroll.documentView else { throw unavailable }
             let fraction = try number("fraction", range: 0...1)
@@ -208,14 +242,15 @@ extension ProjectSession {
             }
             clip.scroll(to: clip.constrainBoundsRect(proposed).origin)
             scroll.reflectScrolledClipView(clip)
-        case "setTrackLabelWidth":
+        case "set_track_label_width":
             guard isMulticam, let tracks = surface(.tracks) else { throw unavailable }
             let requested = try number("points", range: 106...360)
             let width = MulticamTimeline.trackWidth(requested, available: tracks.contentView.bounds.width)
             UserDefaults.standard.set(width, forKey: MulticamTimeline.trackWidthPreference)
-        case "setTimelineHeight", "setInspectorWidth":
-            let vertical = action == "setInspectorWidth"
-            guard isMulticam, let split = split(vertical: vertical) else { throw unavailable }
+        case "set_timeline_height", "set_inspector_width":
+            let vertical = action == "set_inspector_width"
+            guard isMulticam || (vertical && presentation.sequenceTranscriptVisible),
+                  let split = split(vertical: vertical) else { throw unavailable }
             let size = try number("points", range: 1...10000)
             let total = vertical ? split.bounds.width : split.bounds.height
             let requested = total - split.dividerThickness - size
@@ -223,23 +258,23 @@ extension ProjectSession {
             let maximum = split.maxPossiblePositionOfDivider(at: 0)
             split.setPosition(min(maximum, max(minimum, requested)), ofDividerAt: 0)
             split.layoutSubtreeIfNeeded()
-        case "showAbout":
+        case "show_about":
             guard let show = presentation.showAbout else { throw unavailable }
             show()
-        case "showSettings":
+        case "show_settings":
             guard let show = presentation.showSettings else { throw unavailable }
             show()
-        case "showHelp":
+        case "show_help":
             let topic = try text("topic")
             let document: MPCutDocument
             switch topic {
             case "guide": document = .guide
-            case "agentGuide": document = .agentGuide
-            case "releaseNotes": document = .releaseNotes
+            case "agent_guide": document = .agentGuide
+            case "release_notes": document = .releaseNotes
             default: throw MCPCommandError("invalid_arguments", "Unknown help topic.")
             }
             guard NSWorkspace.shared.open(document.url) else { throw unavailable }
-        case "showLastExport":
+        case "show_last_export":
             guard !isMulticam, editor.lastExportedURL != nil else { throw unavailable }
             editor.showExportInFinder()
         default:

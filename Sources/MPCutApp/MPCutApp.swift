@@ -2,7 +2,6 @@ import AppKit
 import MPCutCore
 import SwiftUI
 
-@main
 struct MPCutApp: App {
     @NSApplicationDelegateAdaptor private var application: EditorApplication
     @StateObject private var textFocus = TextFocus()
@@ -11,7 +10,7 @@ struct MPCutApp: App {
         WindowGroup("MPCut", id: ProjectSession.windowID, for: UUID.self) { $identifier in
             ProjectSessionHost(identifier: identifier, sessions: application.sessions)
         }
-        .defaultSize(width: 1060, height: 730)
+        .defaultSize(width: 1180, height: 760)
         .windowToolbarStyle(.unifiedCompact(showsTitle: true))
         .commands {
             AboutCommands()
@@ -53,6 +52,10 @@ private struct ProjectCommands: Commands {
             Button("Open MPCut Project…") { sessions.chooseProject(using: openWindow) }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
                 .help("Open saved project")
+            RecentFilesMenu(files: sessions.preferences.recentFiles) { url in
+                sessions.setWindowOpener(openWindow)
+                sessions.openFiles([url], in: session)
+            }
             Button("Recover Untitled Project…") { sessions.recoverUntitledProject(using: openWindow) }
                 .help("Recover unsaved project")
         }
@@ -92,7 +95,8 @@ private struct ProjectCommands: Commands {
         }
         CommandMenu("Sequence") {
             if let session {
-                SequenceCommands(editor: session.editor, multicam: session.multicam, isMulticam: isMulticam)
+                SequenceCommands(editor: session.editor, multicam: session.multicam, isMulticam: isMulticam,
+                                 showTimelineMap: { session.isTimelineMapPresented = true })
             }
         }
         CommandGroup(after: .toolbar) {
@@ -100,7 +104,10 @@ private struct ProjectCommands: Commands {
                 .disabled(session == nil)
                 .help("Show separate video preview")
             if let session {
-                TimelineCommands(editor: session.editor, multicam: session.multicam, isMulticam: isMulticam)
+                TimelineCommands(editor: session.editor, multicam: session.multicam, isMulticam: isMulticam) {
+                    let presentation = session.presentation
+                    presentation.setTranscriptVisible(!presentation.transcriptVisible(multicam: isMulticam), multicam: isMulticam)
+                }
             }
         }
         CommandMenu("Playback") {
@@ -158,10 +165,10 @@ private struct ProjectFileItems: View {
         if session.isMulticam {
             Button("Save Analysis Sidecars", action: multicam.saveAnalysisSidecars)
                 .disabled(!multicam.canSaveSidecars)
-                .help("Save analysis beside sources")
+                .help("Save the edit index and analysis in a sidecar beside each source file.")
         } else {
             Button("Save Analysis Sidecars", action: editor.saveAnalysisSidecars)
-                .help("Save analysis beside sources")
+                .help("Save the edit index and analysis in a sidecar beside each source file.")
                 .disabled(!editor.canSaveAnalysisSidecars)
         }
     }
@@ -172,9 +179,14 @@ private struct TimelineCommands: View {
     @ObservedObject var multicam: MulticamEditorModel
     let isMulticam: Bool
 
+    let toggleTranscript: () -> Void
+
     var body: some View {
+        Button("Toggle Transcript", action: toggleTranscript)
+            .keyboardShortcut("t", modifiers: [.command, .option])
+            .disabled(isMulticam ? multicam.project == nil : editor.isEmpty)
         if !isMulticam {
-            Toggle(editor.isAudioOnly ? "Large Timeline Waveform" : "Large Timeline Thumbnails", isOn: $editor.largeThumbnails)
+            Toggle("Enlarge Thumbnails and Waveforms", isOn: $editor.largeThumbnails)
                 .help("Enlarge timeline previews")
             Divider()
         }
@@ -231,7 +243,7 @@ private struct ExportCommands: View {
                 .keyboardShortcut("e")
                 .disabled(multicam.project == nil || multicam.isBusy)
                 .help("Export multicam program")
-            Button("Replace Source Audio…", action: multicam.chooseReplacementAudio)
+            Button("Replace Program Audio…", action: multicam.chooseReplacementAudio)
                 .disabled(!multicam.canReplaceSourceAudio)
                 .help("Replace multicam soundtrack")
             Button("Export Queue…", action: multicam.showBulkQueue)
@@ -295,6 +307,8 @@ private struct SequenceCommands: View {
     @ObservedObject var multicam: MulticamEditorModel
     let isMulticam: Bool
 
+    let showTimelineMap: () -> Void
+
     var body: some View {
         let tool = isMulticam ? $multicam.rangeTool : $editor.rangeTool
         Picker("Timeline Tool", selection: tool) {
@@ -314,6 +328,10 @@ private struct SequenceCommands: View {
                 .keyboardShortcut("i", modifiers: [.command, .shift])
                 .disabled(multicam.project == nil || multicam.isBusy)
                 .help("Insert a still image")
+            Button("Space Clips…", action: multicam.chooseSpaceClips)
+                .disabled(!multicam.canSpaceClips)
+            Button("Insert Color Gap…", action: multicam.chooseInsertGap)
+                .disabled(multicam.project == nil || multicam.isBusy)
             Divider()
             Button("Mark In") { multicam.markIn = multicam.markAnalysisTime() }
                 .keyboardShortcut("i", modifiers: [])
@@ -330,7 +348,7 @@ private struct SequenceCommands: View {
                 .keyboardShortcut(.escape, modifiers: [])
                 .disabled(multicam.markIn == nil && multicam.markOut == nil && multicam.assemblySelection == nil)
                 .help("Clear range marks")
-            Button("Add Marked Range to Assembly", action: multicam.addMarkedRange)
+            Button("Add Marked Range to Assembly") { multicam.byHand(multicam.addMarkedRange) }
                 .keyboardShortcut("a", modifiers: [.command, .option])
                 .disabled(!multicam.canAddMarkedRange)
                 .help("Add range to assembly")
@@ -338,7 +356,7 @@ private struct SequenceCommands: View {
                 .keyboardShortcut("a", modifiers: [.command, .shift])
                 .disabled(!multicam.canEnqueueMarkedRange)
                 .help("Queue marked range")
-            Button("Remove Marked Range from Assembly", action: multicam.removeMarkedRange)
+            Button("Remove Marked Range from Assembly") { multicam.byHand(multicam.removeMarkedRange) }
                 .disabled(multicam.isBusy || multicam.markedGroupSpan == nil)
                 .help("Remove range from assembly")
             Divider()
@@ -363,6 +381,10 @@ private struct SequenceCommands: View {
                 .keyboardShortcut("i", modifiers: [.command, .shift])
                 .disabled(!editor.canInsertStill)
                 .help("Insert a still image")
+            Button("Space Clips…", action: editor.chooseSpaceClips)
+                .disabled(!editor.canSpaceClips)
+            Button("Insert Color Gap…", action: editor.chooseInsertGap)
+                .disabled(!editor.canInsertStill)
             Divider()
             Button("Mark In", action: editor.setIn)
                 .keyboardShortcut("i", modifiers: [])
@@ -424,6 +446,14 @@ private struct SequenceCommands: View {
             }
             .help("Choose snapping targets")
         }
+        Button("Preview Selected Join") {
+            if isMulticam { multicam.previewSelectedJoin() } else { editor.previewSelectedJoin() }
+        }
+        .disabled(isMulticam ? !multicam.canPreviewSelectedJoin : !editor.canPreviewSelectedJoin)
+        .help("Audition the incoming join of the selected clip, assembly range, or switch")
+        Button("Map Timeline Range…", action: showTimelineMap)
+            .disabled(isMulticam ? multicam.project == nil : editor.isEmpty)
+            .help("Map a range between source and output time")
     }
 }
 
@@ -441,7 +471,7 @@ private struct MulticamRangeCommands: View {
         .disabled(!model.canTrimOccurrence)
         .help("Show range trim controls")
         Button(model.rangeTool ? "Split at Selection Edges" : "Split Assembly Range at Playhead") {
-            if model.rangeTool { model.splitSelectedRange() } else { model.splitOccurrence() }
+            model.byHand { if model.rangeTool { model.splitSelectedRange() } else { model.splitOccurrence() } }
         }
         .keyboardShortcut("b")
         .disabled(model.rangeTool ? !model.canSplitSelectedRange : !model.canCutOccurrence)
@@ -469,7 +499,7 @@ private struct PlaybackCommands: View {
         EditorTransportCommands(preview: preview, canNavigate: editor.canNavigate, canStep: editor.canEdit,
                                 canPlay: editor.canNavigate && !preview.hasBlockingIssue, audioOnly: editor.isAudioOnly, enterTime: editor.seekUsingTimeField,
                                 seekBoundary: { editor.seek($0 ? editor.duration : 0) }, step: { editor.step($0) })
-        Menu("Find Scenes") { SequenceFindSceneCommands(editor: editor) }
+        Menu("Scan for Scenes") { SequenceFindSceneCommands(editor: editor) }
             .disabled(!editor.canScanScenes(clipID: nil))
             .help("Show scene scan options")
         Button("Cancel Scene Analysis", action: editor.cancelSceneAnalysisFromEditor)
@@ -585,7 +615,7 @@ private struct MulticamPlaybackCommands: View {
         EditorTransportCommands(preview: preview, canNavigate: canNavigate, canStep: canNavigate, canPlay: canNavigate,
                                 enterTime: { model.timeEntryRequest += 1 },
                                 seekBoundary: model.seekPlaybackBoundary, step: model.step)
-        Menu("Find Scenes") { MulticamFindSceneCommands(model: model) }
+        Menu("Scan for Scenes") { MulticamFindSceneCommands(model: model) }
             .disabled(model.isBusy || !model.analysis.canScanScenes(camera: nil))
             .help("Show scene scan options")
         Button("Cancel Scene Analysis", action: model.analysis.cancelSceneAnalysisFromEditor)

@@ -9,25 +9,17 @@ extension StillExportPlanner {
         }
         let engine = CutEngine(cancelled: isCancelled, useSidecar: useSidecar, tracks: .video)
         let destination = output.standardizedFileURL
+        try engine.checkCancellation()
         try engine.checkDestination(destination)
         guard destination.pathExtension.isEmpty || destination.pathExtension.lowercased() == plan.container else {
             throw CutError(code: "invalid_output", message: "The destination extension must match the export plan.")
-        }
-        func checkSources() throws {
-            try engine.checkCancellation()
-            for (file, identity) in plan.identities {
-                guard identity.isCurrentSnapshot(at: file) else {
-                    throw CutError(code: "source_changed", message: "Source \(file.lastPathComponent) changed after export preflight.")
-                }
-            }
-            try plan.sound?.verifySources()
         }
         func update(_ fraction: Double) throws {
             if progress?(fraction) == false { interruption.stop() }
             try engine.checkCancellation()
         }
 
-        try checkSources()
+        try plan.verifySources(using: engine)
         try update(0)
         let staging = destination.deletingLastPathComponent()
             .appendingPathComponent(".mpcut-\(UUID().uuidString)", isDirectory: true)
@@ -71,9 +63,12 @@ extension StillExportPlanner {
                 let muxer = plan.container == "mka" || plan.container == "mkv" ? "matroska" : plan.container
                 let helper = try ReencodeEngine.findHelper(override: nil)
                 let inputs = lanes.flatMap { ["-i", $0.path] }
-                let maps = lanes.indices.flatMap { ["-map", "\($0):a:0"] }
+                let firstSound = picture == nil ? 0 : 1
+                let maps = (picture == nil ? [] : ["-map", "0:v:0"]) +
+                    sounds.indices.flatMap { ["-map", "\(firstSound + $0):a:0"] }
+                let dispositions = sounds.indices.flatMap { ["-disposition:a:\($0)", $0 == 0 ? "default" : "0"] }
                 try ReencodeEngine(cancelled: isCancelled).runHelper(helper, arguments:
-                    ["-xerror", "-copyts"] + inputs + maps +
+                    ["-xerror", "-copyts"] + inputs + maps + dispositions +
                     ["-c", "copy", "-avoid_negative_ts", "disabled", "-f", muxer, "-n", partial.path],
                     in: staging, duration: plan.duration)
             }
@@ -88,10 +83,11 @@ extension StillExportPlanner {
             try verifyTrackSelection(plan, media: audio)
         }
         try update(1)
-        try checkSources()
-        guard chmod(partial.path, 0o666 & ~creationMask) == 0 else {
+        try plan.verifySources(using: engine)
+        guard chmod(partial.path, try publicationPermissions(0o666)) == 0 else {
             throw CutError(code: "write_failed", message: String(cString: strerror(errno)))
         }
+        try engine.checkCancellation()
         let failure = publishExclusively(from: partial, to: destination)
         if failure == EEXIST {
             throw CutError(code: "output_exists", message: "A file already exists at the destination.")
@@ -132,13 +128,16 @@ extension StillExportPlanner {
                 generated = false
                 edges = repairs
             case .still(let file, let framing, let reference, let schedule):
+                guard let identity = plan.identities[file] else {
+                    throw CutError(code: "source_changed", message: "The still has no verified preflight identity.")
+                }
                 let suffix = transcode ? "mov" : plan.container
                 let staged = staging.appendingPathComponent("still-\(index).\(suffix)")
                 if transcode {
-                    media = try generator.generateLossless(asset: file, framing: framing, reference: reference,
+                    media = try generator.generateLossless(asset: file, identity: identity, framing: framing, reference: reference,
                                                            schedule: schedule, output: staged)
                 } else {
-                    media = try generator.generate(asset: file, framing: framing, reference: reference,
+                    media = try generator.generate(asset: file, identity: identity, framing: framing, reference: reference,
                                                    container: plan.container, schedule: schedule,
                                                    output: staged)
                 }
@@ -293,9 +292,21 @@ extension StillExportPlanner {
 
     private func verifyTrackSelection(_ plan: StillExportPlan, media: MediaInfo) throws {
         let expectedSoundTracks = plan.report.soundActions.count
-        let actualSoundTracks = media.streams.filter { $0.kind == "audio" }.count
-        guard media.hasVideo == !plan.pictures.isEmpty, actualSoundTracks == expectedSoundTracks else {
+        let soundTracks = media.streams.filter { $0.kind == "audio" }
+        guard media.hasVideo == !plan.pictures.isEmpty, soundTracks.count == expectedSoundTracks else {
             throw CutError(code: "write_failed", message: "The staged program did not retain the selected picture and sound tracks.")
+        }
+        if soundTracks.count > 1 {
+            for (stream, action) in zip(soundTracks, plan.report.soundActions) {
+                guard action.codec.map({ $0 == stream.codec }) ?? true,
+                      action.sampleRate.map({ $0 == stream.sampleRate }) ?? true else {
+                    throw CutError(code: "write_failed", message: "The staged track differs from its planned format or order.",
+                                   track: stream.index, laneID: action.laneID)
+                }
+            }
+            if soundTracks.map({ $0.disposition & 1 }) != [1] + Array(repeating: 0, count: soundTracks.count - 1) {
+                throw CutError(code: "write_failed", message: "The staged program did not retain the planned default soundtrack.")
+            }
         }
     }
 }

@@ -1,0 +1,19 @@
+[
+  {
+    "name": "multicam_sync_suggest",
+    "description": "Read sync evidence against the reference camera. Reports recorded timecode or Broadcast Wave offsets, waveform matches and drift when available. Confirm clock comparability and review the results before applying an offset with multicam_source_edit.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1},
+        "expected_revision": {"type": "integer", "minimum": 0},
+        "source_id": {"type": "string", "minLength": 1, "description": "Analyze one recording other than the reference. Defaults to all other recordings."},
+        "reference_source_id": {"type": "string", "minLength": 1, "description": "Select a recording on the reference camera. Defaults to its primary recording."},
+        "metadata_only": {"type": "boolean", "description": "Skip waveform analysis and drift checks."}
+      },
+      "required": ["project_handle"],
+      "additionalProperties": false
+    }
+  }
+]

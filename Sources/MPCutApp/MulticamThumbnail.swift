@@ -122,8 +122,15 @@ final class MulticamThumbnailService: ObservableObject {
     func image(media: MediaInfo, key: FilmstripTileKey, reuseSidecar: Bool) async -> CGImage? {
         guard !Task.isCancelled else { return nil }
         let url = media.url
-        let sourceID = sources[url].flatMap { $0.identity == media.identity ? $0.id : nil } ?? UUID()
-        sources[url] = (media.identity, sourceID)
+        let sourceID: UUID
+        if let current = sources[url], current.identity == media.identity {
+            sourceID = current.id
+        } else {
+            // A view can encounter a relinked file before it receives an explicit invalidation.
+            if sources[url] != nil { discardSource(url) }
+            sourceID = UUID()
+            sources[url] = (media.identity, sourceID)
+        }
         let cacheKey = CacheKey(source: sourceID, section: key.section,
                                 reuseSidecar: reuseSidecar && sidecarPreference.permits(media.url),
                                 indexed: media.hasFullEditIndex)
@@ -237,6 +244,10 @@ final class MulticamThumbnailService: ObservableObject {
 
     func invalidate(_ url: URL) {
         revisions[url, default: 0] += 1
+        discardSource(url)
+    }
+
+    private func discardSource(_ url: URL) {
         displayIdentity[url] = nil
         if let id = sources.removeValue(forKey: url)?.id {
             for key in imageOrder.filter({ $0.source == id }) { remove(key) }

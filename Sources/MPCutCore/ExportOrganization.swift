@@ -16,6 +16,14 @@ public struct ExportOrganization: Sendable, Equatable {
         return container.isEmpty ? name : "\(name).\(container)"
     }
 
+    package func destination(in directory: URL, stem: String, suffix: String, container: String) throws -> URL {
+        let name = filename(stem: stem, suffix: suffix, container: container)
+        guard !name.contains("/"), name.rangeOfCharacter(from: .controlCharacters) == nil else {
+            throw CutError(code: "invalid_output", message: "An export filename must be a single name without path separators or control characters.")
+        }
+        return directory.appendingPathComponent(name, isDirectory: false)
+    }
+
     public func validate() throws {
         for (label, value) in [("Subfolder", subfolder), ("Base name", baseName)] where !value.isEmpty {
             guard value != ".", value != "..", !value.trimmingCharacters(in: .whitespaces).isEmpty,
@@ -34,6 +42,9 @@ public struct ExportOrganization: Sendable, Equatable {
     /// Validate the chosen root and check the child without following a child symlink.
     package func directory(in root: URL, create: Bool) throws -> URL {
         try validate()
+        guard root.isFileURL else {
+            throw CutError(code: "invalid_output", message: "Choose a local export folder.")
+        }
         guard !subfolder.isEmpty else { return root }
         let child = root.appendingPathComponent(subfolder, isDirectory: true)
         let path = child.path

@@ -81,7 +81,7 @@ final class MulticamAnalysisTests: XCTestCase {
             return detail != nil
         }
         XCTAssertLessThan(try XCTUnwrap(detail).secondsPerBin, 0.001)
-        XCTAssertNotNil(try snapshot.sections(for: shortPicture, cancelled: { false })["wave.v1.\(stream)"])
+        XCTAssertNotNil(try snapshot.sections(for: shortPicture, cancelled: { false })["waveform_peaks.v1.\(stream)"])
     }
 
     @MainActor
@@ -120,6 +120,35 @@ final class MulticamAnalysisTests: XCTestCase {
     }
 
     @MainActor
+    func testMixScansConcurrentLanesInGroupTime() async throws {
+        let quiet = try fixture("Pause-Quiet")
+        let stream = try XCTUnwrap(quiet.audio.first?.stream.index)
+        let delay = RationalTime(numerator: 1)
+        let project = MulticamProject(referenceAngle: "wide", range: .init(from: .zero, to: .init(numerator: 4)),
+            angles: [.init(id: "wide", file: quiet.url.path, audioStream: stream),
+                     .init(id: "guest", file: quiet.url.path, offset: delay, audioStream: stream)],
+            audio: .mix, switches: [.init(at: .zero, angle: "wide")],
+            mixLanes: [.init(id: "wide-mic", target: .camera("wide"), label: "Wide", colorSlot: 0),
+                       .init(id: "guest-mic", target: .camera("guest"), label: "Guest", colorSlot: 1)])
+        let media = ["wide": quiet, "guest": quiet]
+        let analysis = MulticamAnalysisStore()
+        defer { analysis.reset() }
+        analysis.configureSilence(minimum: 0.5, threshold: -45)
+        analysis.maxBlip = 0
+        analysis.update(project: project, media: media, ordinary: media, useSidecars: false)
+        XCTAssertEqual(analysis.silenceTrackCount, 2)
+        XCTAssertEqual(analysis.groupAudioLanes.map(\.id), ["wide-mic", "guest-mic"])
+        XCTAssertEqual(analysis.soundtrack(in: project.range).map(\.laneID), ["wide-mic", "guest-mic"])
+        analysis.scan(.silence)
+        try await waitUntil { analysis.hasSilenceResults(project: project, media: media) }
+        let pauses = analysis.routedPauses(project: project, media: media)
+        XCTAssertEqual(pauses.count, 1)
+        let pause = try XCTUnwrap(pauses.first)
+        XCTAssertEqual(pause.from.seconds, 2.02, accuracy: 0.03)
+        XCTAssertEqual(pause.to.seconds, 2.98, accuracy: 0.03)
+    }
+
+    @MainActor
     func testUnavailableMicrophoneOutsideAssemblyDoesNotBlockPauseEditing() async throws {
         let source = try fixture("Pause-Quiet")
         let stream = try XCTUnwrap(source.audio.first?.stream.index)
@@ -141,6 +170,29 @@ final class MulticamAnalysisTests: XCTestCase {
         XCTAssertEqual(analysis.unindexedSilenceSources, ["missing"])
         XCTAssertTrue(analysis.hasSilenceResults(in: [kept]))
         XCTAssertFalse(analysis.hasSilenceResults(in: [project.range]))
+    }
+
+    @MainActor
+    func testSelectedCameraSceneScopeIncludesItsAdditionalRecordings() throws {
+        let first = try fixture("Scene-Cadence-Change")
+        let next = try fixture("Multicam-Delayed-ProRes")
+        let seam = RationalTime(numerator: 1)
+        let end = RationalTime(numerator: 2)
+        let camera = MulticamSource(id: "camera", file: first.url.path, coverage: .init(from: .zero, to: seam),
+                                    additionalRecordings: [.init(id: "second", file: next.url.path, offset: seam,
+                                                                 coverage: .init(from: seam, to: end))])
+        let project = MulticamProject(referenceAngle: camera.id, range: .init(from: .zero, to: end),
+                                      angles: [camera], audio: .none, switches: [.init(at: .zero, angle: camera.id)])
+        let sources = [camera.id: first, "second": next]
+        let analysis = MulticamAnalysisStore()
+        defer { analysis.reset() }
+        analysis.update(project: project, media: sources, ordinary: sources, useSidecars: false)
+        XCTAssertEqual(analysis.sceneInspectionKey(camera: camera.id), analysis.sceneInspectionKey(camera: nil))
+        XCTAssertNotEqual(analysis.sceneInspectionKey(camera: camera.id), analysis.sceneInspectionKey(camera: "second"))
+        analysis.refreshStaleScenes.insert("second")
+        guard case .stale? = analysis.sceneDisposition(camera: camera.id) else {
+            return XCTFail("A stale recording should mark the selected camera stale.")
+        }
     }
 
     @MainActor

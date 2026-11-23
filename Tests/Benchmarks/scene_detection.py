@@ -13,6 +13,8 @@ import tempfile
 import threading
 from time import perf_counter
 
+from benchmark_cli import command_help, normalize_report
+
 
 FPS = 30
 SIZE = "640x360"
@@ -94,7 +96,7 @@ def quality(expected, actual, tolerance=0.25 / FPS):
 def scene_start(scene):
     if "start" in scene:
         return scene["start"]["numerator"] / scene["start"]["denominator"]
-    return scene["startSeconds"]
+    return scene["start_seconds"]
 
 
 def measured_run(argv):
@@ -122,17 +124,21 @@ def measured_run(argv):
         return stdout.read(), stderr.read(), (elapsed, rss_mib, usage.ru_utime + usage.ru_stime)
 
 
-def mpcut(mpcut_command, path):
-    stdout, _, metrics = measured_run([*mpcut_command, "scenes", str(path), "--json"])
+def mpcut(cli, path):
+    command, legacy = cli
+    stdout, _, metrics = measured_run([*command, str(path), "--json"])
     report = json.loads(stdout)
+    if legacy:
+        report = normalize_report(report)
     return [scene_start(scene) for scene in report["scenes"]][1:], report, metrics
 
 
 def uncached_command(binary):
-    help_output = run([binary, "--help"])
-    if "--no-sidecar" in help_output.stdout or "--no-sidecar" in help_output.stderr:
-        return [binary, "--no-sidecar"]
-    return [binary]
+    help_output = command_help(binary)
+    legacy = "scenes scan" not in help_output
+    flags = ["--no-sidecar"] if "--no-sidecar" in help_output else []
+    command = ["scenes"] if legacy else ["scenes", "scan"]
+    return [binary, *flags, *command], legacy
 
 
 def scdet(ffmpeg, path, threshold, pixel_format):
@@ -182,10 +188,10 @@ def measure(args, path, score, pixel_format="nv12"):
 def summarize_view_groups(report, expected):
     actual = [scene["view"] for scene in report["scenes"]]
     if len(actual) != len(expected):
-        return {"estimatedViews": report["viewCount"], "expectedViews": len(set(expected))}
+        return {"estimatedViews": report["view_count"], "expectedViews": len(set(expected))}
     pairs = list(itertools.combinations(range(len(actual)), 2))
     correct = sum((actual[i] == actual[j]) == (expected[i] == expected[j]) for i, j in pairs)
-    return {"estimatedViews": report["viewCount"], "expectedViews": len(set(expected)),
+    return {"estimatedViews": report["view_count"], "expectedViews": len(set(expected)),
             "correctFrameGroupPairs": correct, "frameGroupPairs": len(pairs)}
 
 
@@ -201,7 +207,7 @@ def benchmark(args, directory):
     def score_unlabeled(cuts, report):
         result = {"cuts": len(cuts)}
         if report:
-            result["estimatedViews"] = report["viewCount"]
+            result["estimatedViews"] = report["view_count"]
         return result
 
     results = {}
@@ -250,7 +256,7 @@ def benchmark(args, directory):
         def score_film(cuts, report):
             result = {**scored_excerpts(cuts), "cutsTotal": len(cuts)}
             if report:
-                result["estimatedViews"] = report["viewCount"]
+                result["estimatedViews"] = report["view_count"]
             return result
 
         results["tears-of-steel"] = {"durationSeconds": 17620 / 24,

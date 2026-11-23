@@ -4,12 +4,31 @@ import XCTest
 
 @MainActor
 final class MCPAnalysisTests: XCTestCase {
+    func testWindowCloseCancelsAnalysisAcrossProjectGenerations() throws {
+        let jobs = MCPAnalysisJobs()
+        let preferences = EditorPreferences()
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        let other = ProjectSession(id: UUID(), preferences: preferences)
+        let previous = try jobs.reserve(session: session, kind: "scenes")
+        session.isMulticam = true
+        let current = try jobs.reserve(session: session, kind: "refresh")
+        let unrelated = try jobs.reserve(session: other, kind: "silence")
+
+        jobs.close(owner: session.mcpHandle)
+
+        XCTAssertTrue(previous.cancellationRequested)
+        XCTAssertTrue(current.cancellationRequested)
+        XCTAssertFalse(unrelated.cancellationRequested)
+        XCTAssertThrowsError(try jobs.lookup(current.id, session: session))
+        XCTAssertTrue(try jobs.lookup(unrelated.id, session: other) === unrelated)
+    }
+
     func testSceneSubscribersCancelIndependently() async {
         let request = MCPSceneRequest(target: nil, policy: .reuse)
-        let worker = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        let worker = MCPAnalysisReceipt(owner: "project_handle", revision: 1, kind: "scenes")
         worker.sceneRequest = request
-        let first = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
-        let last = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        let first = MCPAnalysisReceipt(owner: "project_handle", revision: 1, kind: "scenes")
+        let last = MCPAnalysisReceipt(owner: "project_handle", revision: 1, kind: "scenes")
         var nativeCancelCount = 0
         worker.cancelNative = { nativeCancelCount += 1 }
         worker.subscribe(first)
@@ -29,14 +48,14 @@ final class MCPAnalysisTests: XCTestCase {
         let editorWorker = MCPAnalysisReceipt(owner: "", revision: 0, kind: "scenes")
         editorWorker.sceneRequest = request
         editorWorker.cancelNative = { nativeCancelCount += 1 }
-        let observer = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        let observer = MCPAnalysisReceipt(owner: "project_handle", revision: 1, kind: "scenes")
         editorWorker.subscribe(observer)
         observer.cancel()
         XCTAssertEqual(observer.state, "cancelled")
         XCTAssertEqual(editorWorker.state, "running")
         XCTAssertEqual(nativeCancelCount, 1)
 
-        let remaining = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        let remaining = MCPAnalysisReceipt(owner: "project_handle", revision: 1, kind: "scenes")
         editorWorker.subscribe(remaining)
         editorWorker.cancelFromEditor()
         XCTAssertEqual(nativeCancelCount, 1)
@@ -47,11 +66,11 @@ final class MCPAnalysisTests: XCTestCase {
     }
 
     func testSelectedSceneSubscriberTracksItsCapturedSourceAndRange() throws {
-        let worker = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        let worker = MCPAnalysisReceipt(owner: "project_handle", revision: 1, kind: "scenes")
         worker.sceneRequest = MCPSceneRequest(target: nil, policy: .reuse)
-        let all = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
-        let selected = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
-        let late = MCPAnalysisReceipt(owner: "project", revision: 1, kind: "scenes")
+        let all = MCPAnalysisReceipt(owner: "project_handle", revision: 1, kind: "scenes")
+        let selected = MCPAnalysisReceipt(owner: "project_handle", revision: 1, kind: "scenes")
+        let late = MCPAnalysisReceipt(owner: "project_handle", revision: 1, kind: "scenes")
         let start = RationalTime(numerator: 10)
         let end = RationalTime(numerator: 20)
         let interval = SceneScanScope.range(start: start, end: end)
@@ -93,23 +112,23 @@ final class MCPAnalysisTests: XCTestCase {
         let preferences = EditorPreferences()
         let sessions = ProjectSessions(preferences: preferences)
         let project = ProjectSession(id: UUID(), preferences: preferences)
-        let result = try await sessions.mcpAnalysis(tool: "analysis_state", arguments: [:], session: project) {}
+        let result = try await sessions.mcpAnalysis(tool: "analysis_editor_state_read", arguments: [:], session: project) {}
         XCTAssertEqual(result?["kind"] as? String, "sequence")
         XCTAssertEqual((result?["sources"] as? [String: Any])?["total"] as? Int, 0)
         do {
-            _ = try await sessions.mcpAnalysis(tool: "scan_analysis", arguments: ["kind": "silence"], session: project) {}
+            _ = try await sessions.mcpAnalysis(tool: "silence_editor_scan", arguments: [:], session: project) {}
             XCTFail("An empty sequence cannot start an audio scan")
         } catch let issue as MCPCommandError {
             XCTAssertEqual(issue.code, "analysis_unavailable")
         }
         do {
-            _ = try await sessions.mcpAnalysis(tool: "analysis_state", arguments: ["limit": true], session: project) {}
+            _ = try await sessions.mcpAnalysis(tool: "analysis_editor_state_read", arguments: ["limit": true], session: project) {}
             XCTFail("JSON booleans must not be accepted as page lengths")
         } catch let issue as MCPCommandError {
             XCTAssertEqual(issue.code, "invalid_arguments")
         }
         project.isMulticam = true
-        let multicam = try await sessions.mcpAnalysis(tool: "analysis_state", arguments: [:], session: project) {}
+        let multicam = try await sessions.mcpAnalysis(tool: "analysis_editor_state_read", arguments: [:], session: project) {}
         XCTAssertEqual(multicam?["kind"] as? String, "multicam")
         XCTAssertTrue(JSONSerialization.isValidJSONObject(multicam ?? [:]))
     }
@@ -130,43 +149,49 @@ final class MCPAnalysisTests: XCTestCase {
             let result = try await sessions.mcpAnalysis(tool: name, arguments: args, session: project) {}
             return try XCTUnwrap(result)
         }
-        _ = try await call("configure_silence", ["thresholdDB": -45, "minimumPause": 0.5, "leavePause": 0.1])
-        let scan = try await call("scan_analysis", ["kind": "silence"])
-        let job = try XCTUnwrap(scan["job"] as? String)
+        _ = try await sessions.mcpLifecycle(tool: "preferences_set",
+            arguments: ["key": "silence_max_blip_seconds", "value": 0.3], session: project) {}
+        let configured = try await call("analysis_editor_state_read")
+        XCTAssertEqual(configured["silence_max_blip_seconds"] as? Double, 0.3)
+        prefs.minimumPause = 0.5
+        prefs.padding = 0.05
+        _ = try await call("silence_editor_threshold_set", ["silence_threshold_db": -45])
+        let scan = try await call("silence_editor_scan", [:])
+        let job = try XCTUnwrap(scan["job_id"] as? String)
         while !editor.pauseAnalysisReady && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
-        let terminal = try await call("analysis_job_status", ["job": job])
+        let terminal = try await call("analysis_job_status_read", ["job_id": job])
         XCTAssertEqual(terminal["status"] as? String, "succeeded")
         XCTAssertEqual(terminal["progress"] as? Double, 1)
         let source = try XCTUnwrap(editor.analysisSourceMedia.first)
         let audio = try XCTUnwrap(source.value.audio.first)
-        let envelope = try await call("get_waveform", ["source": source.key.uuidString, "stream": audio.stream.index,
-                                                      "columns": 16, "from": "0", "to": "1"])
+        let envelope = try await call("waveform_editor_envelope_read", ["source_id": source.key.uuidString, "audio_stream_index": audio.stream.index,
+                                                      "columns": 16, "source_from": "0", "source_to": "1"])
         XCTAssertEqual((envelope["low"] as? [Float])?.count, 16)
         XCTAssertLessThan(try XCTUnwrap((envelope["low"] as? [Float])?.min()), 0)
-        let peaks = try await call("get_waveform_peaks", ["source": source.key.uuidString, "stream": audio.stream.index,
-                                                         "columns": 16, "from": "0", "to": "1"])
-        XCTAssertEqual(peaks["source"] as? String, source.key.uuidString)
-        XCTAssertEqual(peaks["stream"] as? Int, audio.stream.index)
+        let peaks = try await call("waveform_editor_peaks_read", ["source_id": source.key.uuidString, "audio_stream_index": audio.stream.index,
+                                                         "columns": 16, "source_from": "0", "source_to": "1"])
+        XCTAssertEqual(peaks["source_id"] as? String, source.key.uuidString)
+        XCTAssertEqual(peaks["audio_stream_index"] as? Int, audio.stream.index)
         XCTAssertEqual((peaks["peaks"] as? [Any])?.count, 16)
         XCTAssertTrue(JSONSerialization.isValidJSONObject(peaks))
-        let result = try await call("list_pauses")
+        let result = try await call("silence_editor_pauses_list")
         let pauses = try XCTUnwrap(result["items"] as? [[String: Any]])
         let id = try XCTUnwrap(pauses.first?["id"] as? String)
-        _ = try await call("review_pause", ["action": "protect", "pause": id])
+        _ = try await call("silence_editor_pause_review", ["action": "protect", "pause": id])
         XCTAssertEqual(editor.currentPause?.isProtected, true)
-        _ = try await call("review_pause", ["action": "unprotect", "pause": id])
+        _ = try await call("silence_editor_pause_review", ["action": "unprotect", "pause": id])
         XCTAssertEqual(editor.currentPause?.isProtected, false)
         let originalDuration = editor.duration
-        _ = try await call("apply_pauses", ["mode": "queue"])
+        _ = try await call("silence_editor_takes_queue")
         XCTAssertFalse(editor.queuedRanges.isEmpty)
-        let shortened = try await call("apply_pauses", ["mode": "shorten"])
+        let shortened = try await call("silence_editor_pauses_shorten")
         XCTAssertEqual(shortened["changed"] as? Bool, true)
-        XCTAssertEqual(shortened["historyRetained"] as? Bool, true)
+        XCTAssertEqual(shortened["history_retained"] as? Bool, true)
         XCTAssertLessThan(editor.duration, originalDuration)
         editor.undo()
         XCTAssertEqual(editor.duration, originalDuration)
         do {
-            _ = try await call("review_pause", ["action": "seek", "pause": id])
+            _ = try await call("silence_editor_pause_review", ["action": "seek", "pause": id])
             XCTFail("A pause ID from an earlier revision should expire even after undo restores the same range")
         } catch let issue as MCPCommandError {
             XCTAssertEqual(issue.code, "analysis_unavailable")
@@ -186,8 +211,8 @@ final class MCPAnalysisTests: XCTestCase {
         let stream = try XCTUnwrap(media.audio.first?.stream.index)
         let camera = MulticamEditorModel.SourceDraft(source: .init(id: "wide", file: url.path, audioStream: stream), media: media)
         editor.confirmSetup(drafts: [camera], opening: "wide", audio: .follow)
-        let started = try await sessions.mcpAnalysis(tool: "scan_analysis", arguments: ["kind": "silence"], session: project) {}
-        let receipt = try sessions.mcpAnalysisJobs.lookup(started?["job"] as? String, session: project)
+        let started = try await sessions.mcpAnalysis(tool: "silence_editor_scan", arguments: [:], session: project) {}
+        let receipt = try sessions.mcpAnalysisJobs.lookup(started?["job_id"] as? String, session: project)
         XCTAssertEqual(receipt.state, "running")
         editor.scanAnalysis(.scenes)
         sessions.mcpAnalysisJobs.disable()
@@ -217,13 +242,13 @@ final class MCPAnalysisTests: XCTestCase {
             let result = try await sessions.mcpAnalysis(tool: name, arguments: args, session: project) {}
             return try XCTUnwrap(result)
         }
-        _ = try await call("configure_silence", ["source": noisyID.uuidString, "thresholdDB": -45])
+        _ = try await call("silence_editor_threshold_set", ["source_id": noisyID.uuidString, "silence_threshold_db": -45])
         XCTAssertNil(editor.manualThresholdDB)
         XCTAssertEqual(editor.analysisThreshold(for: noisyID, track: 0), -45)
-        let started = try await call("scan_analysis", ["kind": "silence"])
-        let job = try XCTUnwrap(started["job"] as? String)
-        _ = try await call("configure_silence", ["source": noisyID.uuidString, "thresholdDB": -50])
-        let terminal = try await call("analysis_job_status", ["job": job])
+        let started = try await call("silence_editor_scan", [:])
+        let job = try XCTUnwrap(started["job_id"] as? String)
+        _ = try await call("silence_editor_threshold_set", ["source_id": noisyID.uuidString, "silence_threshold_db": -50])
+        let terminal = try await call("analysis_job_status_read", ["job_id": job])
         XCTAssertEqual(terminal["status"] as? String, "cancelled")
         XCTAssertEqual(editor.analysisThreshold(for: noisyID, track: 0), -50)
     }
@@ -252,16 +277,16 @@ final class MCPAnalysisTests: XCTestCase {
             return try XCTUnwrap(result)
         }
         func waitForJob(_ result: [String: Any]) async throws -> [String: Any] {
-            let job = try XCTUnwrap(result["job"] as? String)
+            let job = try XCTUnwrap(result["job_id"] as? String)
             let receipt = try sessions.mcpAnalysisJobs.lookup(job, session: project)
             let jobDeadline = ContinuousClock.now + .seconds(15)
             while receipt.state == "running" && ContinuousClock.now < jobDeadline { try await Task.sleep(for: .milliseconds(20)) }
-            return try await call("analysis_job_status", ["job": job])
+            return try await call("analysis_job_status_read", ["job_id": job])
         }
         let clip = try XCTUnwrap(project.editor.timelineClips.first?.id.uuidString)
-        let allStarted = try await call("scan_analysis", ["kind": "scenes"])
-        let clipStarted = try await call("scan_analysis", ["kind": "scenes", "scope": "selected", "target": clip])
-        XCTAssertNotEqual(allStarted["job"] as? String, clipStarted["job"] as? String)
+        let allStarted = try await call("scenes_editor_scan", [:])
+        let clipStarted = try await call("scenes_editor_scan", ["scope": "selected", "target": clip])
+        XCTAssertNotEqual(allStarted["job_id"] as? String, clipStarted["job_id"] as? String)
         let joined = try await waitForJob(clipStarted)
         XCTAssertEqual(joined["status"] as? String, "succeeded")
         XCTAssertEqual(joined["sources"] as? [String], [clip])
@@ -277,30 +302,30 @@ final class MCPAnalysisTests: XCTestCase {
         XCTAssertNotNil(coverage["requested"])
         XCTAssertNotNil(coverage["confirmed"])
         XCTAssertNil(coverage["durable"])
-        let selected = try await waitForJob(call("scan_analysis", ["kind": "scenes", "scope": "selected", "target": clip]))
+        let selected = try await waitForJob(call("scenes_editor_scan", ["scope": "selected", "target": clip]))
         XCTAssertEqual(selected["status"] as? String, "succeeded")
         XCTAssertEqual(selected["scope"] as? String, "selected")
         XCTAssertEqual(selected["target"] as? String, clip)
-        let clipScenes = try await call("list_scenes", ["clip": clip, "limit": 1])
-        XCTAssertEqual(clipScenes["clip"] as? String, clip)
-        XCTAssertEqual(clipScenes["source"] as? String, source)
-        let listed = try await call("list_scenes", ["source": source, "limit": 1])
+        let clipScenes = try await call("scenes_editor_boundaries_list", ["clip_id": clip, "limit": 1])
+        XCTAssertEqual(clipScenes["clip_id"] as? String, clip)
+        XCTAssertEqual(clipScenes["source_id"] as? String, source)
+        let listed = try await call("scenes_editor_boundaries_list", ["source_id": source, "limit": 1])
         let first = try XCTUnwrap((listed["items"] as? [[String: Any]])?.first)
         let view = try XCTUnwrap(first["view"] as? Int)
-        _ = try await call("rename_view", ["source": source, "view": view, "name": "  Wide shot  "])
-        let saved = try await waitForJob(call("save_analysis_sidecars"))
+        _ = try await call("scenes_view_rename", ["source_id": source, "view": view, "name": "  Wide shot  "])
+        let saved = try await waitForJob(call("analysis_editor_sidecars_save"))
         XCTAssertEqual(saved["status"] as? String, "succeeded")
         XCTAssertEqual(saved["outputs"] as? [String], [AnalysisSidecar.url(for: copy).path])
         let reopened = try XCTUnwrap(AnalysisSidecar(media: media.value).sceneReport(for: media.value))
         XCTAssertEqual(reopened.views.first { $0.view == view }?.name, "Wide shot")
 
-        let unchanged = try await waitForJob(call("refresh_project_media"))
+        let unchanged = try await waitForJob(call("project_editor_media_refresh"))
         XCTAssertEqual(unchanged["status"] as? String, "succeeded")
         XCTAssertEqual((unchanged["sources"] as? [[String: Any]])?.first?["state"] as? String, "unchanged")
 
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: 5)], ofItemAtPath: copy.path)
         do {
-            _ = try await call("list_scenes", ["source": source])
+            _ = try await call("scenes_editor_boundaries_list", ["source_id": source])
             XCTFail("A changed recording should invalidate its live scene report")
         } catch let issue as MCPCommandError {
             XCTAssertEqual(issue.code, "source_changed")
@@ -308,12 +333,12 @@ final class MCPAnalysisTests: XCTestCase {
 
         let replacement = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov", subdirectory: "Fixtures"))
         try Data(contentsOf: replacement).write(to: copy, options: .atomic)
-        let refreshed = try await waitForJob(call("refresh_project_media", ["deep": true]))
+        let refreshed = try await waitForJob(call("project_editor_media_refresh", ["deep": true]))
         XCTAssertEqual(refreshed["status"] as? String, "succeeded")
-        let archived = try await call("list_scenes", ["source": source, "includeStale": true])
+        let archived = try await call("scenes_editor_boundaries_list", ["source_id": source, "include_stale": true])
         XCTAssertEqual(archived["stale"] as? Bool, true)
-        XCTAssertNotNil(archived["staleReason"])
-        XCTAssertEqual((archived["sourceStamp"] as? [String: Any])?["bytes"] as? Int64, SceneSourceStamp(media: media.value).bytes)
+        XCTAssertNotNil(archived["stale_reason"])
+        XCTAssertEqual((archived["source_stamp"] as? [String: Any])?["bytes"] as? Int64, SceneSourceStamp(media: media.value).bytes)
     }
 
     func testMulticamPauseReviewAndRoomToneInRepeatedAssembly() async throws {
@@ -341,36 +366,43 @@ final class MCPAnalysisTests: XCTestCase {
             let result = try await sessions.mcpAnalysis(tool: name, arguments: args, session: project) {}
             return try XCTUnwrap(result)
         }
-        _ = try await call("configure_silence", ["minimumPause": 0.4, "leavePause": 0.1, "thresholdDB": -45])
-        let started = try await call("scan_analysis", ["kind": "silence"])
-        let receipt = try sessions.mcpAnalysisJobs.lookup(started["job"] as? String, session: project)
+        prefs.minimumPause = 0.4
+        prefs.padding = 0.05
+        _ = try await sessions.mcpLifecycle(tool: "preferences_set",
+            arguments: ["key": "silence_max_blip_seconds", "value": 0.3], session: project) {}
+        _ = try await call("silence_editor_threshold_set", ["silence_threshold_db": -45])
+        let configured = try await call("analysis_editor_state_read")
+        XCTAssertEqual(configured["silence_max_blip_seconds"] as? Double, 0.3)
+        XCTAssertEqual(model.analysis.maxBlip, 0.3)
+        let started = try await call("silence_editor_scan", [:])
+        let receipt = try sessions.mcpAnalysisJobs.lookup(started["job_id"] as? String, session: project)
         let deadline = ContinuousClock.now + .seconds(15)
         while receipt.state == "running" && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
         XCTAssertEqual(receipt.state, "succeeded")
-        let listed = try await call("list_pauses")
+        let listed = try await call("silence_editor_pauses_list")
         let rows = try XCTUnwrap(listed["items"] as? [[String: Any]])
         let repeatPause = try XCTUnwrap(rows.first { ($0["occurrence"] as? Int) == 1 && $0["removal"] is [String: Any] })
         let id = try XCTUnwrap(repeatPause["id"] as? String)
-        _ = try await call("review_pause", ["pause": id, "action": "seek"])
+        _ = try await call("silence_editor_pause_review", ["pause": id, "action": "seek"])
         XCTAssertEqual(model.selectedOccurrence, 1)
-        let opened = try await call("review_pause", ["pause": id, "action": "preview"])
-        XCTAssertEqual(opened["reviewOpen"] as? Bool, true)
-        let kept = try await call("review_pause", ["pause": id, "action": "protect"])
-        XCTAssertEqual(kept["reviewOpen"] as? Bool, false)
+        let opened = try await call("silence_editor_pause_review", ["pause": id, "action": "preview"])
+        XCTAssertEqual(opened["review_open"] as? Bool, true)
+        let kept = try await call("silence_editor_pause_review", ["pause": id, "action": "protect"])
+        XCTAssertEqual(kept["review_open"] as? Bool, false)
         XCTAssertEqual(model.multicamPausePlan.filter(\.isProtected).map(\.id.occurrence), [0, 1])
-        _ = try await call("review_pause", ["pause": id, "action": "unprotect"])
+        _ = try await call("silence_editor_pause_review", ["pause": id, "action": "unprotect"])
 
         guard let duration = try? whole.to.subtracting(whole.from) else { return XCTFail("Invalid fixture range") }
         model.assemblySelection = AudioSpan(from: try duration.adding(.init(numerator: 3, denominator: 4)),
                                            to: try duration.adding(.init(numerator: 9, denominator: 4)))
-        let scoped = try await call("list_pauses")
+        let scoped = try await call("silence_editor_pauses_list")
         let selected = try XCTUnwrap(scoped["items"] as? [[String: Any]])
         XCTAssertEqual(selected.compactMap { $0["occurrence"] as? Int }, [1])
-        _ = try await call("apply_pauses", ["mode": "queue"])
+        _ = try await call("silence_editor_takes_queue")
         XCTAssertFalse(model.queuedRanges.isEmpty)
         XCTAssertTrue(model.queuedRanges.allSatisfy { $0.range.from >= .init(numerator: 3, denominator: 4) &&
             $0.range.to <= .init(numerator: 9, denominator: 4) })
-        _ = try await call("apply_pauses", ["mode": "shorten"])
+        _ = try await call("silence_editor_pauses_shorten")
         XCTAssertEqual(model.ranges.first, whole)
         XCTAssertLessThan(try XCTUnwrap(model.assemblyRangeEnds.last), try duration.adding(duration))
         model.undo()
@@ -378,7 +410,7 @@ final class MCPAnalysisTests: XCTestCase {
 
         model.assemblySelection = AudioSpan(from: try duration.adding(.init(numerator: 9, denominator: 4)),
                                            to: try duration.adding(.init(numerator: 11, denominator: 4)))
-        _ = try await call("use_room_tone")
+        _ = try await call("silence_threshold_calibrate_from_marks")
         XCTAssertNil(model.assemblySelection)
         XCTAssertNil(model.analysis.pauseThreshold)
         XCTAssertNotNil(model.analysis.threshold(for: .init(source: "wide", stream: first)))
@@ -390,7 +422,7 @@ final class MCPAnalysisTests: XCTestCase {
         let sessions = ProjectSessions(preferences: preferences)
         let project = ProjectSession(id: UUID(), preferences: preferences)
         do {
-            _ = try await sessions.mcpAnalysis(tool: "scan_analysis", arguments: ["kind": "silence"], session: project) {
+            _ = try await sessions.mcpAnalysis(tool: "silence_editor_scan", arguments: [:], session: project) {
                 throw MCPCommandError("disabled", "Control disabled.")
             }
             XCTFail("Revocation should prevent execution")

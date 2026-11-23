@@ -7,20 +7,29 @@ struct MulticamAssembly {
     private var fileIDs: [URL: String] = [:]
     private var intervals: [MulticamInterval] = []
     private var picture: [MulticamSpan] = []
-    private var audio: [MulticamSpan] = []
+    private var audioLanes: [MulticamPlannedAudioLane] = []
+    private var bindings: [MulticamAudioReplacement] = []
+    private var configuredSelections: [String: MulticamAudioSelection] = [:]
+    private var mixProject: URL?
     private var duration = RationalTime.zero
     private var followsCamera = false
     private var clips: [Clip] = []
+    private let includeAudio: Bool
+
+    init(includeAudio: Bool) { self.includeAudio = includeAudio }
 
     private enum Clip {
         case project(MulticamProject, URL, MulticamRange, Int)
         case file(MediaInfo, MulticamRange, Int, ExportTracks)
     }
 
-    var requiresAudio: Bool { followsCamera || !audio.isEmpty }
+    var requiresAudio: Bool { followsCamera || !audioLanes.isEmpty }
 
     var mapping: MulticamPlan {
-        MulticamPlan(intervals: intervals, picture: picture, audio: audio, duration: duration)
+        var plan = MulticamPlan(intervals: intervals, picture: picture, audioLanes: audioLanes, duration: duration)
+        plan.joinedAudioReplacements = bindings
+        plan.joinedAudioSelections = configuredSelections
+        return plan
     }
 
     /// The same request with one edge of clip `number` moved, to validate a suggested boundary.
@@ -30,7 +39,7 @@ struct MulticamAssembly {
             guard segment == number else { return range }
             return boundary == "from" ? MulticamRange(from: time, to: range.to) : MulticamRange(from: range.from, to: time)
         }
-        var result = MulticamAssembly()
+        var result = MulticamAssembly(includeAudio: includeAudio)
         for clip in clips {
             switch clip {
             case let .project(project, url, range, segment):
@@ -44,6 +53,8 @@ struct MulticamAssembly {
 
     mutating func appendProject(_ project: MulticamProject, at url: URL, range: MulticamRange,
                                 segment: Int) throws {
+        let mix = includeAudio && project.audio == .mix ? url : nil
+        try requireCompatibleMix(mix, segment: segment)
         // A requested clip range is a request fault, reported like a file clip's.
         guard range.from >= project.range.from, range.from < range.to, range.to <= project.range.to else {
             throw CutError(code: "invalid_range",
@@ -58,17 +69,37 @@ struct MulticamAssembly {
                            segment: segment, boundary: error.boundary, nearest: error.nearest, track: error.track)
         }
         var names = projectSourceIDs[url] ?? [:]
-        for source in project.angles + project.audioSources where names[source.id] == nil {
+        for source in project.sources where names[source.id] == nil {
             names[source.id] = register(project.sourceURL(for: source, relativeTo: url), as: source.id, segment: segment)
         }
+        if includeAudio, projectSourceIDs[url] == nil {
+            func rename(_ selection: MulticamAudioSelection) -> MulticamAudioSelection {
+                .init(source: names[selection.source]!, stream: selection.stream)
+            }
+            var ids = Set(bindings.map(\.id))
+            for binding in project.audioReplacements {
+                var id = binding.id
+                while !ids.insert(id).inserted { id = "\(segment):\(id)" }
+                bindings.append(.init(id: id, original: rename(binding.original),
+                                      replacement: rename(binding.replacement), relativeOffset: binding.relativeOffset,
+                                      uncovered: binding.uncovered))
+            }
+            for lane in clip.audioLanes {
+                if let selection = project.configuredSelection(for: lane) {
+                    configuredSelections[lane.id] = rename(selection)
+                }
+            }
+        }
         projectSourceIDs[url] = names
-        if case .follow = project.audio { followsCamera = true }
+        mixProject = mix
+        if includeAudio, case .follow = project.audio { followsCamera = true }
         try append(clip, names: names, segment: segment)
         clips.append(.project(project, url, range, segment))
     }
 
     mutating func appendFile(_ media: MediaInfo, range: MulticamRange, segment: Int,
                              tracks: ExportTracks) throws {
+        try requireCompatibleMix(nil, segment: segment)
         guard range.from >= .zero, range.to > range.from, range.to <= media.duration else {
             throw CutError(code: "invalid_range",
                            message: "Clip \(segment) must have increasing bounds within 0 to \(media.duration) seconds.",
@@ -104,13 +135,36 @@ struct MulticamAssembly {
         clips.append(.file(media, range, segment, tracks))
     }
 
+    private func requireCompatibleMix(_ candidate: URL?, segment: Int) throws {
+        guard clips.isEmpty || candidate == mixProject else {
+            throw CutError(code: "multicam_audio_join_unsupported",
+                           message: "Join ranges from the same Mix project to preserve its lane order. Render the inputs before joining different projects or recordings with Mix audio.",
+                           segment: segment)
+        }
+    }
+
     /// Nested ranges address group time. Flatten them to one group clock for the
     /// still planner, carrying the active microphone and each source's clock offset.
-    func projectWithVisibleReplacements() throws -> (project: MulticamProject, referenceAngles: [String: String])? {
+    func projectWithVisibleReplacements() throws -> (project: MulticamProject, location: URL?, referenceAngles: [String: String])? {
         guard clips.contains(where: { clip in
             guard case let .project(project, _, range, _) = clip else { return false }
             return project.hasVisibleReplacement(in: range)
         }) else { return nil }
+        if includeAudio && (mixProject != nil || !bindings.isEmpty) {
+            if case let .project(project, location, _, _) = clips.first {
+                let ranges = clips.compactMap { clip -> MulticamRange? in
+                    guard case let .project(_, url, range, _) = clip, url == location else { return nil }
+                    return range
+                }
+                if ranges.count == clips.count {
+                    var snapshot = project
+                    snapshot.assembly = ranges
+                    return (snapshot, location, [:])
+                }
+            }
+            throw CutError(code: "multicam_audio_join_unsupported",
+                           message: "Render the multicam project directly to preserve its visible stills and replacement audio before joining it with other clips.")
+        }
         var assets: [StillAsset] = []
         var replacements: [StillReplacement] = []
         var switches: [MulticamSwitch] = []
@@ -147,6 +201,7 @@ struct MulticamAssembly {
                 })
                 let used = Dictionary(uniqueKeysWithValues: project.stillAssets.map { ($0.id, $0) })
                 var usedAssetIDs: [String: String] = [:]
+                var referenceID: String?
                 for replacement in project.stillReplacements {
                     guard case .group(let authored) = replacement.coverage else { continue }
                     let from = max(authored.from, range.from)
@@ -174,9 +229,32 @@ struct MulticamAssembly {
                     let coverage = try MulticamRange(from: cursor.adding(from.subtracting(range.from)),
                                                      to: cursor.adding(to.subtracting(range.from)))
                     let id = "\(index + 1)-\(replacement.id)"
-                    let reference = routes[project.referenceAngle]!
-                    let offset = try reference.offset.adding(cursor.subtracting(range.from))
-                    referenceAngles[id] = registerAngle(.init(file: reference.file, offset: offset))
+                    if referenceID == nil {
+                        let shift = try cursor.subtracting(range.from)
+                        let reference = project.angles.first { $0.id == project.referenceAngle }!
+                        if reference.coverage == nil {
+                            let route = routes[reference.id]!
+                            referenceID = registerAngle(try .init(file: route.file, offset: route.offset.adding(shift)))
+                        } else {
+                            // Keep recording boundaries on the flattened clock, including reference-camera gaps.
+                            func shifted(_ recording: MulticamSource) throws -> MulticamSource {
+                                var result = recording
+                                result.id = "reference-\(index)-\(recording.id)"
+                                result.file = project.sourceURL(for: recording, relativeTo: url).path
+                                result.offset = try recording.offset.adding(shift)
+                                result.coverage = try recording.coverage.map {
+                                    try .init(from: $0.from.adding(shift), to: $0.to.adding(shift))
+                                }
+                                result.additionalRecordings = []
+                                return result
+                            }
+                            var camera = try shifted(reference)
+                            camera.additionalRecordings = try reference.additionalRecordings.map(shifted)
+                            flattenedAngles.append(camera)
+                            referenceID = camera.id
+                        }
+                    }
+                    referenceAngles[id] = referenceID
                     replacements.append(.init(id: id, assetID: assetID,
                                               framing: replacement.framing, coverage: .group(coverage)))
                 }
@@ -194,10 +272,19 @@ struct MulticamAssembly {
 
             let clockShift = try cursor.subtracting(range.from)
             for interval in intervals {
-                let source = routes[interval.angle]!
-                let angle = registerAngle(try .init(file: source.file, offset: source.offset.adding(clockShift)))
+                let angle: String
+                if let id = interval.pictureSourceID, let source = routes[id] {
+                    angle = registerAngle(try .init(file: source.file, offset: source.offset.adding(clockShift)))
+                } else if interval.pictureSourceID == nil, let reference = routes[interval.angle] {
+                    let end = try interval.group.to.adding(clockShift)
+                    angle = "gap-camera-\(flattenedAngles.count + 1)"
+                    flattenedAngles.append(try .init(id: angle, file: reference.file.path, offset: end,
+                                                        coverage: .init(from: end, to: end.adding(.init(numerator: 1)))))
+                } else {
+                    throw CutError(code: "missing_source", message: "Angle \(interval.angle) has no recording link.")
+                }
 
-                let audio = try interval.audio.map { selection in
+                let audio = try (includeAudio ? interval.audio : nil).map { selection in
                     let source = routes[selection.source]!
                     let route = Route(file: source.file, offset: try source.offset.adding(clockShift))
                     let id: String
@@ -219,7 +306,7 @@ struct MulticamAssembly {
                                       angles: flattenedAngles, audioSources: flattenedSound, audio: .none,
                                       switches: switches, stillAssets: assets, stillReplacements: replacements,
                                       programColorPolicy: color)
-        return (project, referenceAngles)
+        return (project, nil, referenceAngles)
     }
 
     private mutating func register(_ url: URL, as id: String, segment: Int) -> String {
@@ -248,18 +335,33 @@ struct MulticamAssembly {
                              output: shifted(span.output))
         }
         let addedIntervals = try clip.intervals.map { interval in
-            let microphone = try interval.audio.map {
+            let microphone = try (includeAudio ? interval.audio : nil).map {
                 try MulticamAudioSelection(source: renamed($0.source), stream: $0.stream)
             }
             return try MulticamInterval(group: interval.group, output: shifted(interval.output),
-                                        angle: renamed(interval.angle), audio: microphone, assemblyIndex: segment - 1)
+                                        angle: renamed(interval.angle), pictureSourceID: interval.pictureSourceID.map(renamed), audio: microphone,
+                                        assemblyIndex: segment - 1, startsAtSwitch: interval.startsAtSwitch)
         }
         let addedPicture = try clip.picture.map(shiftedSpan)
-        let addedAudio = try clip.audio.map(shiftedSpan)
+        if includeAudio {
+            if audioLanes.isEmpty {
+                audioLanes = clip.audioLanes.map { lane in
+                    .init(id: lane.id, label: lane.label, colorSlot: lane.colorSlot, spans: [],
+                          gaps: start == .zero ? [] : [.init(from: .zero, to: start)])
+                }
+            }
+            for index in audioLanes.indices {
+                if let lane = clip.audioLanes.first(where: { $0.id == audioLanes[index].id }) {
+                    for span in try lane.spans.map(shiftedSpan) { span.appendCoalescing(to: &audioLanes[index].spans) }
+                    audioLanes[index].gaps += try lane.gaps.map(shifted)
+                } else {
+                    audioLanes[index].gaps.append(try shifted(.init(from: .zero, to: clip.duration)))
+                }
+            }
+        }
         duration = try duration.adding(clip.duration)
         intervals += addedIntervals
         for span in addedPicture { span.appendCoalescing(to: &picture) }
-        for span in addedAudio { span.appendCoalescing(to: &audio) }
     }
 }
 

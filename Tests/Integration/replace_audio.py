@@ -30,7 +30,7 @@ class Replacement(unittest.TestCase):
         ffmpeg("-i", self.extracted, "-af", "volume=0.25", "-c:a", "pcm_s24le", self.processed)
 
     def replace(self, *, replacement=None, destination=None, target=2, extra=(), missing=False):
-        args = [CLI, "export", "--json", "--mode", "copy", "--clip", self.movie,
+        args = [CLI, "export", "soundtrack", "replace", "--json", "--mode", "copy", "--clip", self.movie,
                 "--replace-audio", replacement or self.processed, "--replace-track", str(target),
                 "--output", destination or self.output, *extra]
         result = subprocess.run(args, capture_output=True, timeout=30)
@@ -43,9 +43,15 @@ class Replacement(unittest.TestCase):
         return ffmpeg("-i", file, "-map", track, "-f", "s24le", "-c:a", "pcm_s24le", "-")
 
     def test_replaces_offset_pcm_track_and_preserves_picture_and_other_aac_packets(self):
-        self.replace(extra=("--dry-run",))
+        planned = self.replace(extra=("--dry-run",))
         self.assertFalse(self.output.exists())
-        self.replace()
+        rendered = self.replace()
+        bounds = {"from": "0", "to": "3"}
+        self.assertEqual(planned["cut_map"]["occurrences"], [{
+            "occurrence_number": 1, "input_number": 1, "file": str(self.movie),
+            "input_clock": "source", "input": bounds, "output": bounds,
+        }])
+        self.assertEqual(rendered["cut_map"], planned["cut_map"])
         for stream in ("v:0", "a:0"):
             original = packets(self.movie, stream)
             actual = packets(self.output, stream)
@@ -186,7 +192,7 @@ class Replacement(unittest.TestCase):
                "-f", "lavfi", "-i", "aevalsrc=0.1*sin(2*PI*(600*t+50*t*t)):s=48000:d=3",
                "-f", "lavfi", "-i", "sine=r=48000:d=3:f=200", "-map", "0:v", "-map", "1:a", "-map", "2:a",
                "-c:v", "libx264", "-g", "1", "-c:a:0", "aac", "-c:a:1", "pcm_s16le", original)
-        run([CLI, "export", "--json", "--mode", "copy", "--clip", original, "--from", "2", "--to", "3",
+        run([CLI, "export", "clips", "join", "--json", "--mode", "copy", "--clip", original, "--from", "2", "--to", "3",
              "--clip", original, "--from", "0", "--to", "1", "--output", edited], allow_diagnostics=True)
         decoder = self.native_decoder()
         reference = run([decoder, edited, "0"])
@@ -233,12 +239,20 @@ class Replacement(unittest.TestCase):
         alias = self.folder / "alias.mov"
         alias.symlink_to(base)
         request = {"file": str(base), "output": str(self.output), "clips": [
-            {"to": "1", "replaceAudio": str(donor)}, {"file": str(alias), "from": "1"}]}
-        result = subprocess.run([CLI, "export", "--json", "--stdin"], text=True,
+            {"to": "1", "replace_audio": str(donor)}, {"file": str(alias), "from": "1"}]}
+        result = subprocess.run([CLI, "export", "soundtrack", "replace", "--json", "--stdin"], text=True,
                                 input=json.dumps(request), capture_output=True, timeout=30)
         report = json.loads(result.stdout)
         self.assertEqual(result.returncode, 0, report)
-        self.assertEqual([segment["file"] for segment in report["segments"]], [str(base), str(alias)])
+        # The two pieces meet in one recording, so they are written as the one range they make, named by its first clip.
+        self.assertEqual([segment["file"] for segment in report["segments"]], [str(base)])
+        # Pieces that do not meet stay two, each reported by the path it was asked for.
+        apart = {"file": str(base), "output": str(self.folder / "apart.mov"), "clips": [
+            {"to": "1", "replace_audio": str(donor)}, {"file": str(alias), "from": "27/25"}]}
+        planned = subprocess.run([CLI, "export", "soundtrack", "replace", "--json", "--stdin", "--dry-run"], text=True,
+                                 input=json.dumps(apart), capture_output=True, timeout=30)
+        self.assertEqual(planned.returncode, 0, planned.stdout)
+        self.assertEqual([segment["file"] for segment in json.loads(planned.stdout)["segments"]], [str(base), str(alias)])
         self.assertEqual(self.pcm(self.output, "0:a:0"), self.pcm(donor, "0:a:0"))
         self.assertEqual([p["data_hash"] for p in packets(self.output, "v:0")],
                          [p["data_hash"] for p in packets(base, "v:0")])
@@ -250,9 +264,9 @@ class Replacement(unittest.TestCase):
                    f"sine=d=1:f={frequency}:r=48000", "-c:v", "libx264", "-g", "1",
                    "-threads", "1", "-c:a", "pcm_s16le", path)
         request = {"output": str(self.output), "order": [2, 1, 2], "clips": [
-            {"file": str(first), "replaceAudio": str(second)},
-            {"file": str(second), "replaceAudio": str(first)}]}
-        result = subprocess.run([CLI, "export", "--json", "--stdin"], text=True,
+            {"file": str(first), "replace_audio": str(second)},
+            {"file": str(second), "replace_audio": str(first)}]}
+        result = subprocess.run([CLI, "export", "soundtrack", "replace", "--json", "--stdin"], text=True,
                                 input=json.dumps(request), capture_output=True, timeout=30)
         report = json.loads(result.stdout)
         self.assertEqual(result.returncode, 0, report)
@@ -267,7 +281,7 @@ class Replacement(unittest.TestCase):
         self.assertEqual(self.output.read_bytes(), b"existing output")
 
     def test_ranged_replacement_failure_names_the_original_source(self):
-        arguments = [CLI, "export", "--mode", "copy", "--clip", self.movie, "--to", "0.125",
+        arguments = [CLI, "export", "soundtrack", "replace", "--mode", "copy", "--clip", self.movie, "--to", "0.125",
                      "--replace-audio", self.processed, "--replace-track", "2", "--output", self.output]
         result = subprocess.run(arguments, capture_output=True, text=True, timeout=30)
         self.assertNotEqual(result.returncode, 0)
@@ -284,7 +298,7 @@ class Replacement(unittest.TestCase):
         span = ("--from", "0.8", "--to", "2.12")
         report = self.replace(replacement=donor, target=1, extra=(*span, "--snap", "nearest", "--dry-run"))
         raises = report["tier"]["raise"]
-        self.assertEqual([offer["tier"] for offer in raises], ["trueLossless"])
+        self.assertEqual([offer["tier"] for offer in raises], ["true_lossless"])
         self.assertEqual(raises[0]["clips"], [{"file": str(self.movie), "from": "1", "to": "2"}])
         self.replace(replacement=donor, target=1, extra=("--from", "1", "--to", "2"))
         self.assertEqual([p["data_hash"] for p in packets(self.output, "v:0")],
@@ -310,10 +324,10 @@ class Replacement(unittest.TestCase):
 
     def test_rejects_smart_mode_for_replacement(self):
         settings = {"output": str(self.output), "clips": [{"file": str(self.movie)}],
-                    "replaceAudio": str(self.processed), "replaceTrack": 2}
+                    "replace_audio": str(self.processed), "replace_track": 2}
         for mode in ("smart", "copy"):
             request = dict(settings, mode=mode)
-            result = subprocess.run([CLI, "export", "--json", "--stdin", "--dry-run"],
+            result = subprocess.run([CLI, "export", "soundtrack", "replace", "--json", "--stdin", "--dry-run"],
                                     input=json.dumps(request), capture_output=True, text=True, timeout=30)
             report = json.loads(result.stdout)
             if mode == "smart":
@@ -321,7 +335,7 @@ class Replacement(unittest.TestCase):
                 self.assertEqual(report["error"]["code"], "invalid_arguments", report)
             else:
                 self.assertEqual(result.returncode, 0, report)
-                self.assertTrue(report["dryRun"])
+                self.assertTrue(report["dry_run"])
             self.assertFalse(self.output.exists())
 
     def test_mismatch_invalid_stream_and_existing_destination(self):

@@ -37,6 +37,8 @@ typedef struct {
     struct AVCodecParserContext *flac_parser;
     struct AVCodecContext *flac_context;
     int64_t last_audio_pts;
+    // Sum of the packet sizes of a compressed audio track. Zero for PCM and video.
+    int64_t coded_bytes;
     MPProbeMP3Anchor *mp3_anchors;
     size_t mp3_anchor_count;
     int mp3_unindexed;
@@ -58,7 +60,14 @@ typedef struct {
 // standard layout of its channel count ("stereo", "5.1"); a layout that names them is written as it is.
 // Returns 0 and writes nothing when the description cannot be read.
 int mp_canonical_channel_layout(const char *layout, int channels, char *canonical, size_t capacity);
+// The layout that Vorbis channel order defines for one to eight channels, which Opus channel mapping family 1
+// shares. Null for other counts.
+const char *mp_vorbis_order_layout(int channels);
 
+enum { MP_SOURCE_SYNC_TIMECODE = 1, MP_SOURCE_SYNC_BWF = 2 };
+// Positive values identify present metadata, including a genuine timestamp of zero.
+int mp_source_sync_stamp(const char *path, int stream, int rate_num, int rate_den,
+                         int64_t *units, int *scale_num, int *scale_den);
 int mp_source_timecode(const char *path, int stream, int rate_num, int rate_den,
                        int64_t *units, int *scale_num, int *scale_den);
 
@@ -79,6 +88,8 @@ typedef struct {
 int mp_probe_hdr(const char *path, int stream, const MPProbeHDRRange *ranges, size_t count,
                  MPProbeCancelled cancelled, void *context, MPProbeHDR *result,
                  char *error, size_t capacity);
+/* Check a copied MOV HEVC sample for unsupported dynamic HDR signaling and layers. */
+int mp_probe_check_still_hevc(const uint8_t *data, int size, const uint8_t *config, int config_size);
 enum {
     MP_PROBE_SIDE_MASTERING_DISPLAY = 1,
     MP_PROBE_SIDE_CONTENT_LIGHT = 2
@@ -92,6 +103,17 @@ size_t mp_scene_match_view(const uint8_t *feature, const uint8_t *layouts, size_
 // provisional scenes if the hardware reader must restart on the general decoder.
 typedef void (*MPSceneVisit)(void *context, int64_t pts, const uint8_t *feature);
 // Populated only when the decode pass can verify a report-only timeline.
+// RGB24, coded orientation. The pointer is valid only for the duration of
+// the callback. A null pointer signals a damaged or untimestamped picture.
+// unplaced_damage is set when the decoder recovers from an error without
+// yielding the affected picture's timestamp.
+typedef int (*MPParticipantFrameVisit)(void *context, int64_t pts, int64_t duration,
+                                      const uint8_t *rgb, int32_t width, int32_t height,
+                                      int32_t stride, int32_t sar_num, int32_t sar_den);
+int mp_participant_scan(const char *path, int stream, MPProbeCancelled cancelled,
+                        MPParticipantFrameVisit frame, MPSceneVisit scene, void *context,
+                        int *unplaced_damage, char *error, size_t capacity);
+
 typedef struct {
     int valid, tb_num, tb_den;
     int64_t first_pts, origin, end;
@@ -142,4 +164,19 @@ int mp_float_pcm_envelope(const float *samples, int frames, int channels, int ra
                           double start, MPAudioEnvelope *window);
 void mp_envelope_silence(MPAudioEnvelope *window, double from, double to);
 void mp_probe_free(MPProbeResult *result);
+/* Continuous mono PCM on the indexed source clock. */
+typedef struct MPTranscriptPCM MPTranscriptPCM;
+MPTranscriptPCM *mp_transcript_pcm_open(const char *path, int64_t samples, int rate, int channel);
+int mp_transcript_pcm_float(MPTranscriptPCM *pcm, const float *samples, int frames, int channels,
+                            int rate, double start);
+int mp_transcript_decode(MPTranscriptPCM *pcm, const char *path, int stream, double origin, double duration,
+                         MPProbeCancelled cancelled, void *context, char *error, size_t capacity);
+void mp_transcript_pcm_set_cancel(MPTranscriptPCM *pcm, MPProbeCancelled cancelled, void *context);
+int mp_transcript_pcm_finish(MPTranscriptPCM *pcm, MPProbeCancelled cancelled, void *context);
+/* Linear RMS of each 20 ms window of the written PCM. Complete after mp_transcript_pcm_finish. */
+const float *mp_transcript_pcm_levels(const MPTranscriptPCM *pcm, int64_t *count);
+/* The strongest source channel when the default downmix cancelled itself, otherwise -1. */
+int mp_transcript_pcm_cancelled_downmix(const MPTranscriptPCM *pcm);
+void mp_transcript_pcm_close(MPTranscriptPCM *pcm);
+
 #endif

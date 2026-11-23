@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 /// The clock and requested backing-pixel size are serialized exactly. A tile from another
 /// zoom level or display scale can have the same timestamp and different geometry.
 struct FilmstripTileKey: Equatable, Sendable {
-    static let sectionPrefix = "filmstrip.v1."
+    static let sectionPrefix = "timeline_filmstrip.v1."
     let time: Double
     let size: CGSize
 
@@ -104,6 +104,15 @@ struct FilmstripTileBuffer {
 
 /// Optional disk writes must never hold the serial decoder queue behind a SQLite writer.
 final class FilmstripTileWriter: @unchecked Sendable {
+    private struct Request {
+        let image: CGImage
+        let key: FilmstripTileKey
+        let sidecar: AnalysisSidecar
+        let preserveAlpha: Bool
+        let cancelled: @Sendable () -> Bool
+        var cost: Int { image.bytesPerRow * image.height }
+    }
+
     private let queue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "mpcut.filmstrip.persistence"
@@ -112,30 +121,77 @@ final class FilmstripTileWriter: @unchecked Sendable {
         return queue
     }()
     private let lock = NSLock()
+    private var pending: [Request] = []
+    private var draining = false
     private var retainedBytes = 0
     private var retainedCount = 0
 
     func submit(_ image: CGImage, key: FilmstripTileKey, sidecar: AnalysisSidecar,
                 preserveAlpha: Bool, cancelled: @escaping @Sendable () -> Bool) {
         let cost = image.bytesPerRow * image.height
-        let accepted = lock.withLock {
+        let startDrain = lock.withLock {
             guard retainedCount < 32, cost <= 16 * 1024 * 1024 - retainedBytes else { return false }
             retainedCount += 1
             retainedBytes += cost
+            pending.append(Request(image: image, key: key, sidecar: sidecar, preserveAlpha: preserveAlpha,
+                                   cancelled: cancelled))
+            guard !draining else { return false }
+            draining = true
             return true
         }
-        guard accepted else { return }
-        queue.addOperation { [self] in
-            defer {
-                lock.withLock {
-                    retainedCount -= 1
-                    retainedBytes -= cost
-                }
+        if startDrain { queue.addOperation { [self] in drain() } }
+    }
+
+    private func drain() {
+        while let batch = takeBatch() {
+            save(batch)
+            lock.withLock {
+                retainedCount -= batch.count
+                retainedBytes -= batch.reduce(0) { $0 + $1.cost }
             }
-            guard !cancelled(), let data = key.encoded(image, preserveAlpha: preserveAlpha) else { return }
-            sidecar.saveAutomatically([key.section: data],
-                retainingLatest: [FilmstripTileKey.sectionPrefix: FilmstripTileBuffer.countLimit],
-                cancelled: cancelled)
+        }
+    }
+
+    private func takeBatch() -> [Request]? {
+        lock.withLock {
+            guard let first = pending.first else {
+                draining = false
+                return nil
+            }
+            // Commit promptly and cap the time a burst can hold the SQLite write lock.
+            let batch = pending.prefix(8).prefix {
+                $0.sidecar.source == first.sidecar.source &&
+                    $0.sidecar.identity == first.sidecar.identity &&
+                    $0.sidecar.identity.changeTime == first.sidecar.identity.changeTime
+            }
+            let requests = Array(batch)
+            pending.removeFirst(requests.count)
+            return requests
+        }
+    }
+
+    private func save(_ batch: [Request]) {
+        guard let sidecar = batch.first?.sidecar else { return }
+        let encoded = batch.compactMap { request -> (key: String, value: Data, cancelled: @Sendable () -> Bool)? in
+            guard !request.cancelled(),
+                  let data = autoreleasepool(invoking: { request.key.encoded(request.image, preserveAlpha: request.preserveAlpha) })
+            else { return nil }
+            return (request.key.section, data, request.cancelled)
+        }
+        let active = encoded.filter { !$0.cancelled() }
+        let prefix = FilmstripTileKey.sectionPrefix
+        let limit = FilmstripTileBuffer.countLimit
+        do {
+            try sidecar.saveOrderedCacheEntries(active.map { ($0.key, $0.value) }, prefix: prefix, keepingLatest: limit,
+                                                 cancelled: { active.contains { $0.cancelled() } })
+        } catch let error as CutError where error.code == "cancelled" {
+            // A request can be cancelled independently of the other tiles in its transaction.
+            for entry in active {
+                sidecar.saveAutomatically([entry.key: entry.value], retainingLatest: [prefix: limit],
+                                          cancelled: entry.cancelled)
+            }
+        } catch {
+            // Filmstrip persistence is best effort.
         }
     }
 }

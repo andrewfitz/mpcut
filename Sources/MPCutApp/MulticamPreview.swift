@@ -18,7 +18,8 @@ struct MulticamPicturePosition: Equatable, Sendable {
         let index = plan.picture.lowerBound { $0.output.to > time } - (parkedAtEnd ? 1 : 0)
         guard plan.picture.indices.contains(index) else { return nil }
         let span = plan.picture[index]
-        guard time >= span.output.from, let source = media[span.source],
+        guard time >= span.output.from, parkedAtEnd ? time == span.output.to : time < span.output.to,
+              let source = media[span.source],
               let relative = try? time.subtracting(span.output.from),
               let local = try? span.input.from.adding(relative) else { return nil }
         return at(local, source: span.source, media: source, spanIndex: index, exclusiveEnd: parkedAtEnd)
@@ -30,6 +31,9 @@ struct MulticamPicturePosition: Equatable, Sendable {
         if !media.hasFullEditIndex, let video = media.videoStream {
             let start = max(.zero, video.start)
             guard time >= start else { return nil }
+            if video.duration > .zero, let end = try? video.start.adding(video.duration) {
+                guard exclusiveEnd ? time <= end : time < end else { return nil }
+            }
             let rate = video.frameRate > .zero ? video.frameRate : RationalTime(numerator: 30)
             let step = RationalTime(numerator: rate.denominator, denominator: rate.numerator)
             // Count frames in exact arithmetic. In floating point 1.16 s × 25 fps
@@ -85,28 +89,72 @@ struct MulticamPreviewAudioSpan: Equatable, Sendable {
     let input: Range<RationalTime>
     let output: Range<RationalTime>
     let channels: Int
+    let sampleRate: Int
+    let sourceExtent: Range<RationalTime>
+    let timestampTick: CMTime
+    let channelLayout: String
     let presentationTrackID: CMPersistentTrackID?
 
     init?(span: MulticamSpan, media: [String: MediaInfo]) {
         guard let source = media[span.source], let stream = span.stream,
               let track = source.audio.first(where: { $0.stream.index == stream }),
-              let ordinal = source.streams.filter({ $0.kind == "audio" }).firstIndex(where: { $0.index == stream })
+              let ordinal = source.streams.filter({ $0.kind == "audio" }).firstIndex(where: { $0.index == stream }),
+              track.start <= track.end
         else { return nil }
-        let start = max(.zero, track.start, span.input.from)
-        let end = min(track.end, span.input.to)
-        guard start < end,
-              let outputOffset = try? span.output.from.subtracting(span.input.from),
-              let outputStart = try? start.adding(outputOffset),
-              let outputEnd = try? end.adding(outputOffset) else { return nil }
+        guard span.input.from < span.input.to, span.output.from < span.output.to else { return nil }
         self.source = span.source
         url = source.url
         identity = source.identity
         origin = source.origin
         self.ordinal = ordinal
-        input = start..<end
-        output = outputStart..<outputEnd
+        input = span.input.from..<span.input.to
+        output = span.output.from..<span.output.to
         channels = track.stream.channels
+        sampleRate = track.stream.sampleRate
+        sourceExtent = track.start..<track.end
+        channelLayout = track.stream.canonicalChannelLayout
         presentationTrackID = source.requiresPresentationAudioAnalysis(stream: stream) ? track.stream.trackID : nil
+        timestampTick = presentationTrackID == nil ? previewTime(track.stream.timeBase) : .zero
+    }
+
+    /// Convert both clocks independently using the same sample-boundary rounding
+    /// as rendered downmix. A kept sub-sample edit uses its nearest source sample.
+    func mixerSlice(from start: RationalTime, to end: RationalTime?) throws -> (span: Self, sourceSamples: Int64)? {
+        let outputStart = max(start, output.lowerBound)
+        let outputEnd = min(end ?? output.upperBound, output.upperBound)
+        let outputRate = MulticamProgramMixer.sampleRate
+        let firstOutput = try outputStart.roundedToSamples(outputRate)
+        let lastOutput = try outputEnd.roundedToSamples(outputRate)
+        guard firstOutput < lastOutput, sampleRate > 0 else { return nil }
+
+        let firstSource = try origin.adding(sourceTime(at: outputStart)).roundedToSamples(sampleRate)
+        let lastSource = try origin.adding(sourceTime(at: outputEnd)).roundedToSamples(sampleRate)
+        let upperSource = try origin.adding(sourceExtent.upperBound).roundedToSamples(sampleRate)
+        let lowerSource = try origin.adding(sourceExtent.lowerBound).roundedToSamples(sampleRate)
+        guard lowerSource < upperSource else { return nil }
+        let nearest = min(max(firstSource, lowerSource), upperSource - 1)
+        let sourceStart = try RationalTime(numerator: nearest, denominator: Int64(sampleRate)).subtracting(origin)
+        let sourceEndSample = max(nearest + 1, min(lastSource, upperSource))
+        let sourceEnd = try RationalTime(numerator: sourceEndSample, denominator: Int64(sampleRate)).subtracting(origin)
+        let first = RationalTime(numerator: firstOutput, denominator: Int64(outputRate))
+        let last = RationalTime(numerator: lastOutput, denominator: Int64(outputRate))
+        return (Self(copying: self, input: sourceStart..<sourceEnd, output: first..<last), sourceEndSample - nearest)
+    }
+
+    private init(copying span: Self, input: Range<RationalTime>, output: Range<RationalTime>) {
+        source = span.source
+        url = span.url
+        identity = span.identity
+        ordinal = span.ordinal
+        origin = span.origin
+        self.input = input
+        self.output = output
+        channels = span.channels
+        sampleRate = span.sampleRate
+        sourceExtent = span.sourceExtent
+        timestampTick = span.timestampTick
+        channelLayout = span.channelLayout
+        presentationTrackID = span.presentationTrackID
     }
 
     var reverseRegion: ReverseAudioTimeline.Region {
@@ -124,7 +172,7 @@ struct MulticamPreviewAudioSpan: Equatable, Sendable {
     }
 }
 
-private enum MulticamDecodeError: LocalizedError {
+enum MulticamDecodeError: LocalizedError {
     case picture(URL)
     case audio(URL)
 
@@ -161,6 +209,7 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
     }
 
     let requests = MulticamDecodeQueue("picture")
+    let pictureWork = LatestPreviewWork()
     private var reader = FFPreviewReader(videoOnly: true)
     private var source: MulticamPictureSource?
     private var native: HardwareFrames?
@@ -169,7 +218,7 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
     private var frame: PreviewFrame?
 
     func invalidate(_ urls: Set<URL>) {
-        requests.queue.async {
+        pictureWork.enqueueMaintenance(on: requests.queue) {
             self.parked.removeAll { urls.contains($0.source.url) }
             if let source = self.source, urls.contains(source.url) {
                 self.source = nil
@@ -182,7 +231,7 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
     }
 
     func retainSources(_ sources: Set<MulticamPictureSource>) {
-        requests.queue.async {
+        pictureWork.enqueueMaintenance(on: requests.queue) {
             self.parked.removeAll { !sources.contains($0.source) }
             if let source = self.source, !sources.contains(source) {
                 self.source = nil
@@ -223,20 +272,24 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
         if let native {
             // HardwareFrames measures from the first presentation edit.
             // FFmpeg below uses the origin of the multicam index instead.
-            let decoded = try? {
+            func picture() throws -> PreviewFrame? {
                 let time = try target.frameTime.subtracting(target.multicamClockOffset)
                 return try target.provisional ? native.frame(at: time.seconds, cancelled: cancelled)
                     : native.indexedFrame(at: time, cancelled: cancelled)
-            }()
+            }
+            // A cancelled request can leave the error of a damaged picture for the next request.
+            // The decoder starts again at the keyframe after it reports an error.
+            var decoded: PreviewFrame?
+            do { decoded = try picture() } catch { decoded = try? picture() }
             guard !cancelled() else { return nil }
             if let decoded {
                 frame = decoded
                 previous = target
                 return decoded
             }
-            self.native = nil
             previous = nil
         }
+        let nativeRefused = native != nil
         let prior = previous
         previous = nil
         let mustSeek = prior.map {
@@ -254,6 +307,9 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
         }
         guard !cancelled() else { return nil }
         guard let decoded else { throw MulticamDecodeError.picture(target.url) }
+        // Both decoders refuse a damaged picture. A picture that only the native decoder
+        // refuses shows that it cannot read this source.
+        if nativeRefused { native = nil }
         previous = target
         frame = decoded
         return decoded
@@ -263,7 +319,21 @@ private final class MulticamPictureDecoder: @unchecked Sendable {
 /// Serial audio reader. A mapped span is opened only at a seek or a real sound edit.
 final class MulticamPreviewAudioDecoder: @unchecked Sendable {
     fileprivate let requests = MulticamDecodeQueue("audio")
-    private var fallback = FFPreviewReader(audioOnly: true, preservesSurround: true)
+    private let preserveChannels: Bool
+    private var fallback: FFPreviewReader
+    private var program: MulticamProgramAudioReader?
+
+    init(preserveChannels: Bool = false) {
+        self.preserveChannels = preserveChannels
+        fallback = FFPreviewReader(audioOnly: true, preservesSurround: true, preservesAudioChannels: preserveChannels)
+    }
+
+    func read(program timeline: MulticamMixedAudioTimeline, from start: RationalTime, open: Bool,
+              cancelled: @escaping () -> Bool) throws -> MulticamProgramAudioBatch {
+        if open { program = try MulticamProgramAudioReader(timeline: timeline, from: start) }
+        guard let program else { return MulticamProgramAudioBatch(end: true) }
+        return try program.read(cancelled: cancelled)
+    }
     private var identity: SourceIdentity?
     private var native: AVAssetReader?
     private var nativeOutput: AVAssetReaderOutput?
@@ -273,7 +343,7 @@ final class MulticamPreviewAudioDecoder: @unchecked Sendable {
         if open {
             if identity != span.identity {
                 identity = span.identity
-                fallback = FFPreviewReader(audioOnly: true, preservesSurround: true)
+                fallback = FFPreviewReader(audioOnly: true, preservesSurround: true, preservesAudioChannels: preserveChannels)
             }
             native?.cancelReading()
             native = nil
@@ -330,7 +400,7 @@ final class MulticamPreviewAudioDecoder: @unchecked Sendable {
             AVLinearPCMIsNonInterleaved: false, AVLinearPCMIsBigEndianKey: false
         ]
         let output: AVAssetReaderOutput
-        if span.channels > 2 {
+        if preserveChannels || span.channels > 2 {
             output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
         } else {
             settings[AVNumberOfChannelsKey] = 2
@@ -402,9 +472,13 @@ final class MulticamPreview: ObservableObject {
     private var reverseAnchor: RationalTime = .zero
     private var reverseStarted: ContinuousClock.Instant = .now
     private var audio: [MulticamPreviewAudioSpan] = []
+    private var mixedAudio: MulticamMixedAudioTimeline?
+    private var mixStart: RationalTime?
+    private var mixEnd = false
     private var plan: MulticamPlan?
     private var programStills: ProgramPreviewStills?
     private var programTransfer: String?
+    private var auditionTransfer: String?
     private let stillPreview = ProgramStillPreview()
     private var showingProgramStill = false
     private var media: [String: MediaInfo] = [:]
@@ -489,6 +563,7 @@ final class MulticamPreview: ObservableObject {
         showingProgramStill = false
         media.removeAll()
         audio.removeAll()
+        mixedAudio = nil
         time = .zero
         duration = .zero
         isAuditioning = false
@@ -503,6 +578,7 @@ final class MulticamPreview: ObservableObject {
 
     func invalidateMedia(_ urls: Set<URL>) {
         pause()
+        stopProgramStill()
         _ = pictureDecoder.requests.invalidate()
         pictureDecoder.invalidate(urls)
         prefetchedPicture = nil
@@ -511,12 +587,26 @@ final class MulticamPreview: ObservableObject {
         audioDecoder = MulticamPreviewAudioDecoder()
     }
 
-    func configure(plan: MulticamPlan, media: [String: MediaInfo], project: CutProject? = nil, document: URL? = nil) {
+    func configure(plan: MulticamPlan, media: [String: MediaInfo], project: CutProject? = nil,
+                   document: URL? = nil, audioIsResolved: Bool = false) {
         let reference = plan.picture.lazy.compactMap { media[$0.source] }.first { $0.hasVideo }
             ?? media.sorted { $0.key < $1.key }.lazy.map(\.value).first { $0.hasVideo }
         programStills = ProgramPreviewStills(project: project, reference: reference, document: document)
         programTransfer = project?.programColorPolicy?.transfer ?? programStills?.canvas.transfer
-        let mappedAudio = plan.audio.compactMap { MulticamPreviewAudioSpan(span: $0, media: media) }
+        let lanes: [MulticamPlannedAudioLane]
+        if !audioIsResolved, case .multicam(let multicam) = project {
+            lanes = (try? multicam.resolveAudioLanes(plan: plan, indexedSources: media, unavailableAsGap: true)) ?? []
+        } else if audioIsResolved {
+            lanes = plan.audioLanes
+        } else {
+            lanes = (try? plan.resolveAudioLanes(indexedSources: media, unavailableAsGap: true)) ?? []
+        }
+        let mappedAudio = plan.isMix ? [] : lanes.flatMap { lane in
+            lane.spans.compactMap { MulticamPreviewAudioSpan(span: $0, media: media) }
+        }
+        let mappedMix = plan.isMix && !lanes.isEmpty ? MulticamMixedAudioTimeline(lanes: lanes.map { lane in
+            .init(label: lane.label, spans: lane.spans.compactMap { MulticamPreviewAudioSpan(span: $0, media: media) })
+        }) : nil
         let position = currentTime()
         if self.plan?.picture != plan.picture {
             prefetchedPicture = nil
@@ -537,8 +627,13 @@ final class MulticamPreview: ObservableObject {
         isAuditioning = false
         endScrub()
         let clamped = min(position, duration)
-        if mappedAudio != audio || clamped != position {
+        if mappedAudio != audio || mappedMix != mixedAudio || clamped != position {
+            if mixedAudio != nil, mappedMix == nil {
+                _ = audioDecoder.requests.invalidate()
+                audioDecoder = MulticamPreviewAudioDecoder()
+            }
             audio = mappedAudio
+            mixedAudio = mappedMix
             resetAudio(at: clamped, preserveClock: playbackRate > 0 && clamped == position)
             if playbackRate < 0 { startReverseAudio(at: clamped) }
         }
@@ -584,6 +679,18 @@ final class MulticamPreview: ObservableObject {
         time = position
         render(at: position, interrupt: true)
         guard scrubSoundEnabled, previewAudioGain(volume: volume, muted: isMuted) > 0 else { return }
+        if let mixedAudio {
+            let reverse = position < previous
+            let point = position.seconds
+            let window = reverse || position == duration
+                ? max(0, point - 0.065)..<point : point..<min(duration.seconds, point + 0.065)
+            if !window.isEmpty, mixedAudio.hasAudio(at: window.lowerBound, before: window.upperBound) {
+                scrubAudio.submit(mixedAudio, window: window, reverse: reverse)
+            } else {
+                endScrub()
+            }
+            return
+        }
         let index = audio.lowerBound { $0.output.upperBound > position }
         guard audio.indices.contains(index), audio[index].output.contains(position) else {
             endScrub()
@@ -650,6 +757,10 @@ final class MulticamPreview: ObservableObject {
     private func startReverseAudio(at position: RationalTime) {
         reverseAnchor = position
         reverseStarted = .now
+        if let mixedAudio, mixedAudio.hasAudio(at: .zero, before: position) {
+            reverseAudio.start(ReverseAudioTimeline(mixedAudio: mixedAudio), at: position.seconds, speed: Int(-playbackRate))
+            return
+        }
         let regions = audio.map(\.reverseRegion)
         if regions.isEmpty {
             reverseAudio.stop()
@@ -675,6 +786,7 @@ final class MulticamPreview: ObservableObject {
         guard !isPlaying else { return }
         stopProgramStill()
         isAuditioning = true
+        auditionTransfer = media.videoStream?.colorTransfer
         let target = MulticamPicturePosition.at(sourceTime, source: url.path, media: media, spanIndex: -1)
         requestPicture(target, interrupt: true)
     }
@@ -787,13 +899,27 @@ final class MulticamPreview: ObservableObject {
             return
         }
         if changedTarget { prefetchedPicture = nil }
-        guard picture != target, decodingPicture == nil, failedPicture != target else { return }
+        if picture == target, let frame {
+            let tagged = taggedPicture(frame, at: target)
+            if frame.programTransfer != tagged.programTransfer || frame.cameraTransfer != tagged.cameraTransfer {
+                show(tagged, at: target)
+            }
+            return
+        }
+        guard decodingPicture == nil, failedPicture != target else { return }
         decodePicture(target, prefetch: false)
     }
 
-    private func show(_ decoded: PreviewFrame, at position: MulticamPicturePosition) {
+    private func taggedPicture(_ decoded: PreviewFrame, at position: MulticamPicturePosition) -> PreviewFrame {
         let transfer = media[position.source]?.videoStream?.colorTransfer
-        let frame = decoded.tagged(transfer: isAuditioning ? transfer : programTransfer ?? transfer)
+        var frame = decoded
+        frame.programTransfer = isAuditioning ? auditionTransfer : programTransfer ?? transfer
+        frame.cameraTransfer = isAuditioning ? nil : transfer ?? "unknown"
+        return frame
+    }
+
+    private func show(_ decoded: PreviewFrame, at position: MulticamPicturePosition) {
+        let frame = taggedPicture(decoded, at: position)
         self.frame = frame
         surfaces.allObjects.forEach { $0.display(frame) }
         picture = position
@@ -810,7 +936,7 @@ final class MulticamPreview: ObservableObject {
         let decoder = pictureDecoder
         let request = decoder.requests.invalidate()
         decodingPicture = target
-        decoder.requests.queue.async { [weak self] in
+        decoder.pictureWork.submit(on: decoder.requests.queue) { [weak self] in
             guard decoder.requests.isCurrent(request) else { return }
             let result = Result { try decoder.decode(target, request: request) }
             Task { @MainActor in
@@ -847,9 +973,19 @@ final class MulticamPreview: ObservableObject {
         decodingAudio = false
         audioIndex = audio.lowerBound { $0.output.upperBound > position }
         audioStart = audio.indices.contains(audioIndex) ? audio[audioIndex].sourceTime(at: position) : .zero
+        if let mixedAudio {
+            audioDecoder = MulticamPreviewAudioDecoder()
+            mixStart = mixedAudio.lanes.compactMap { lane in
+                let index = lane.spans.lowerBound { $0.output.upperBound > position }
+                return lane.spans.indices.contains(index) ? max(position, lane.spans[index].output.lowerBound) : nil
+            }.min()
+            mixEnd = mixStart == nil
+        } else {
+            mixStart = nil
+            mixEnd = true
+        }
         openAudio = true
-        audioHasPreroll = !audio.indices.contains(audioIndex) ||
-            audio[audioIndex].output.lowerBound.seconds > position.seconds + 0.30
+        audioHasPreroll = false
         if clearIssue { setAudioIssue(nil) }
     }
 
@@ -874,6 +1010,7 @@ final class MulticamPreview: ObservableObject {
         if audioRenderer.status == .failed {
             queuedAudio.removeAll(keepingCapacity: true)
             audioIndex = audio.count
+            mixEnd = true
             audioHasPreroll = true
             setAudioIssue(audioRenderer.error?.localizedDescription ?? "Audio preview could not be played.")
         }
@@ -883,12 +1020,48 @@ final class MulticamPreview: ObservableObject {
             audioRenderer.enqueue(sample)
             queuedAudio.removeFirst()
         }
-        if clock.rate == 0, audioHasPreroll {
+        let legacyInLookahead = audio.indices.contains(audioIndex) && audio[audioIndex].output.lowerBound.seconds <= limit
+        let mixInLookahead = !mixEnd && (mixStart?.seconds ?? .infinity) <= limit
+        let audioInLookahead = legacyInLookahead || mixInLookahead
+        if clock.rate == 0, audioHasPreroll || !audioInLookahead {
             clock.setRate(playbackRate, time: previewTime(position))
         }
-        if audio.indices.contains(audioIndex), audio[audioIndex].output.lowerBound.seconds <= limit,
-           queuedAudio.isEmpty, !decodingAudio {
-            decodeAudio()
+        if audioInLookahead, queuedAudio.isEmpty, !decodingAudio {
+            if let mixedAudio, let mixStart {
+                decodeMix(mixedAudio, from: mixStart)
+            } else {
+                decodeAudio()
+            }
+        }
+    }
+
+    private func decodeMix(_ timeline: MulticamMixedAudioTimeline, from start: RationalTime) {
+        let decoder = audioDecoder
+        let request = decoder.requests.invalidate()
+        let open = openAudio
+        decodingAudio = true
+        decoder.requests.queue.async { [weak self] in
+            guard decoder.requests.isCurrent(request) else { return }
+            let result = Result {
+                try decoder.read(program: timeline, from: start, open: open) { !decoder.requests.isCurrent(request) }
+            }
+            Task { @MainActor in
+                guard let self, decoder.requests.isCurrent(request), self.playbackRate > 0 else { return }
+                self.decodingAudio = false
+                self.openAudio = false
+                switch result {
+                case .success(let batch):
+                    self.queuedAudio.append(contentsOf: batch.samples)
+                    self.mixEnd = batch.end
+                    self.audioHasPreroll = self.audioHasPreroll || !batch.samples.isEmpty || batch.end
+                    if let issue = batch.issue { self.setAudioIssue(issue) }
+                case .failure(let error):
+                    self.mixEnd = true
+                    self.audioHasPreroll = true
+                    self.setAudioIssue(error.localizedDescription)
+                }
+                self.tick()
+            }
         }
     }
 

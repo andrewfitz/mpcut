@@ -1,0 +1,51 @@
+{
+  "format": "mpcut",
+  "schema_version": 4,
+  "kind": "multicam",
+  "reference_angle_id": "wide",
+  "group_range": {"from": "0", "to": "12"},
+  "angles": [
+    {"id": "wide", "file": "wide.mov", "audio_stream_index": 1},
+    {
+      "id": "close",
+      "file": "close.mov",
+      "offset": "1",
+      "audio_stream_index": 1,
+      "group_coverage": {"from": "1", "to": "6"},
+      "additional_recordings": [
+        {
+          "id": "close-restart",
+          "file": "close-2.mov",
+          "offset": "6",
+          "audio_stream_index": 1,
+          "group_coverage": {"from": "6", "to": "12"}
+        }
+      ]
+    }
+  ],
+  "audio_sources": [{"id": "lav", "file": "lav.wav"}],
+  "audio": {"mode": "mix"},
+  "fixed_audio": {"source_id": "wide", "audio_stream_index": 1},
+  "mix_lanes": [
+    {"id": "wide-mic", "target": {"kind": "camera", "angle_id": "wide"}, "label": "Wide mic", "color_slot": 0},
+    {"id": "close-mic", "target": {"kind": "camera", "angle_id": "close"}, "label": "Close mic", "color_slot": 3}
+  ],
+  "audio_replacements": [
+    {
+      "id": "close-lav",
+      "original": {"source_id": "close-restart", "audio_stream_index": 1},
+      "replacement": {"source_id": "lav", "audio_stream_index": 0},
+      "relative_offset": "1/2",
+      "uncovered": "keep_original"
+    }
+  ],
+  "switches": [{"group_time": "0", "angle_id": "wide", "audio": {"source_id": "wide", "audio_stream_index": 1}}],
+  "assembly": [{"from": "2", "to": "12"}, {"from": "6", "to": "8"}],
+  "history": {
+    "undo": [
+      {"action": "Replace Track Audio", "audio_replacements": []},
+      {"action": "Reorder Mix Lanes", "mix_lanes": [[1, 1], [0, 1]]},
+      {"action": "Switch to Mix", "audio": {"mode": "fixed", "source_id": "wide", "audio_stream_index": 1}, "mix_lanes": []}
+    ]
+  }
+}

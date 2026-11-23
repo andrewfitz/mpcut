@@ -111,6 +111,12 @@ final class ExportFindingsAppTests: XCTestCase {
             // A bar that needs more than the window clips its only flexible label, "Split".
             XCTAssertLessThanOrEqual(hosting.fittingSize.width, minimum, "The transport needs more than the minimum window width.")
         }
+        // The width at which every label is shown whole, whatever each control would give up first. A bar whose ideal
+        // width is more than the window truncates a label, which is how "Split" came to be cut short.
+        let ideal = NSHostingView(rootView: bar.fixedSize()).fittingSize.width
+        print("Editor transport ideal width: \(ideal) of \(minimum)")
+        XCTAssertGreaterThan(ideal, 500)
+        XCTAssertLessThanOrEqual(ideal, minimum, "The transport cannot show every label at the minimum window width.")
     }
 
     @MainActor

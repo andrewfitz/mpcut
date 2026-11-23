@@ -6,7 +6,7 @@ import Foundation
 
 /// How much of a timeline has to be encoded to export it. Declared best first, and compared so that a better tier is greater.
 public enum FidelityTier: String, CaseIterable, Codable, Comparable, Sendable {
-    case trueLossless, lossless, reencode
+    case trueLossless = "true_lossless", lossless, reencode
 
     private var order: Int {
         switch self {
@@ -34,38 +34,38 @@ public enum TierFactorEffect: Sendable {
 
 /// Stable ids of the reasons a better mode does not plan. Failures carry one as `reason`.
 public enum TierFactorID: String, CaseIterable, Codable, Sendable {
-    case cutVideoStart = "cut.videoStart"
-    case cutVideoEnd = "cut.videoEnd"
-    case cutOffFrame = "cut.offFrame"
-    case cutAudioPacket = "cut.audioPacket"
-    case cutAudioPriming = "cut.audioPriming"
-    case cutAudioSample = "cut.audioSample"
-    case cutAACCoverage = "cut.aacCoverage"
-    case cutPCMSampleClock = "cut.pcmSampleClock"
-    case cutOpusWindow = "cut.opusWindow"
-    case cutMP3Crop = "cut.mp3Crop"
-    case joinDecoderHistory = "join.decoderHistory"
-    case joinVideoDTSOverlap = "join.videoDTSOverlap"
-    case joinSmartOpenGOP = "join.smartOpenGOP"
-    case joinStreamMismatch = "join.streamMismatch"
-    case joinMediaType = "join.mediaType"
-    case joinDynamicRange = "join.dynamicRange"
-    case joinTimecode = "join.timecode"
-    case sourceUnsupportedTracks = "source.unsupportedTracks"
-    case sourceSmartIneligible = "source.smartIneligible"
-    case sourceMultipleDescriptions = "source.multipleDescriptions"
-    case sourceStartUnsafe = "source.startUnsafe"
-    case sourceTimeline = "source.timeline"
-    case sourceEncodeUnsupported = "source.encodeUnsupported"
-    case sourceChanged = "source.changed"
-    case outputContainer = "output.container"
-    case selectionTracks = "selection.tracks"
-    case placementPicture = "placement.picture"
-    case placementSilence = "placement.silence"
-    case writerOther = "writer.other"
+    case cutVideoStart = "cut_video_start"
+    case cutVideoEnd = "cut_video_end"
+    case cutOffFrame = "cut_off_frame"
+    case cutAudioPacket = "cut_audio_packet"
+    case cutAudioPriming = "cut_audio_priming"
+    case cutAudioSample = "cut_audio_sample"
+    case cutAACCoverage = "cut_aac_coverage"
+    case cutPCMSampleClock = "cut_pcm_sample_clock"
+    case cutOpusWindow = "cut_opus_window"
+    case cutMP3Crop = "cut_mp3_crop"
+    case joinDecoderHistory = "join_decoder_history"
+    case joinVideoDTSOverlap = "join_video_dts_overlap"
+    case joinSmartOpenGOP = "join_smart_open_gop"
+    case joinStreamMismatch = "join_stream_mismatch"
+    case joinMediaType = "join_media_type"
+    case joinDynamicRange = "join_dynamic_range"
+    case joinTimecode = "join_timecode"
+    case sourceUnsupportedTracks = "source_unsupported_tracks"
+    case sourceSmartIneligible = "source_smart_ineligible"
+    case sourceMultipleDescriptions = "source_multiple_descriptions"
+    case sourceStartUnsafe = "source_start_unsafe"
+    case sourceTimeline = "source_timeline"
+    case sourceEncodeUnsupported = "source_encode_unsupported"
+    case sourceChanged = "source_changed"
+    case outputContainer = "output_container"
+    case selectionTracks = "selection_tracks"
+    case placementPicture = "placement_picture"
+    case placementSilence = "placement_silence"
+    case writerOther = "writer_other"
 
     /// What the factor is about: one cut, the join of two clips, a source, the output or the selection.
-    public var scope: String { String(rawValue.prefix { $0 != "." }) }
+    public var scope: String { String(rawValue.prefix { $0 != "_" }) }
 
     public var effect: TierFactorEffect {
         switch self {
@@ -103,7 +103,7 @@ public enum TierFactorID: String, CaseIterable, Codable, Sendable {
         case .cutMP3Crop: return "An MP3 track cannot be cropped to the range with gapless timing."
         case .joinDecoderHistory: return "The audio decoder needs samples from before the join. It can copy one continuous range."
         case .joinVideoDTSOverlap: return "The two ranges overlap in video decode time at the join."
-        case .joinSmartOpenGOP: return "Frames in this range depend on earlier picture groups. Smart Trim has no keyframe where it can resume copying."
+        case .joinSmartOpenGOP: return "Frames in this open GOP depend on frames from an earlier group of pictures. Smart Trim has no verified keyframe where it can resume copying."
         case .joinStreamMismatch: return "These clips use different codecs, frame formats, timing or audio formats. Use Re-encode to export them together."
         case .joinMediaType: return "The timeline contains both video clips and audio-only recordings."
         case .joinDynamicRange: return "MPCut can’t combine HDR with SDR, or PQ with HLG. Export them separately."
@@ -164,6 +164,15 @@ public struct TierFactor: Codable, Equatable, Sendable {
     public let message: String
     /// Verified times that could replace the cut.
     public let nearest: [RationalTime]?
+    /// The multicam switch that a `nearest` time can replace, in group time. Absent unless the cut is a switch.
+    public let switchAt: RationalTime?
+    /// The multicam assembly range edge that a `nearest` time can replace. Absent at a switch.
+    public let edge: MulticamEdge?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, forces, segment, boundary, track, message, nearest, edge
+        case switchAt = "switch_group_time"
+    }
 
     public init(_ issue: CutError, forces: FidelityTier?) {
         id = issue.factor
@@ -173,10 +182,12 @@ public struct TierFactor: Codable, Equatable, Sendable {
         track = issue.track
         message = issue.message
         nearest = issue.nearest
+        switchAt = issue.multicamAt
+        edge = issue.multicam?.edge
     }
 
     public init(id: TierFactorID, forces: FidelityTier?, segment: Int? = nil, boundary: String? = nil, track: Int? = nil,
-                message: String, nearest: [RationalTime]? = nil) {
+                message: String, nearest: [RationalTime]? = nil, switchAt: RationalTime? = nil, edge: MulticamEdge? = nil) {
         self.id = id
         self.forces = forces
         self.segment = segment
@@ -184,6 +195,8 @@ public struct TierFactor: Codable, Equatable, Sendable {
         self.track = track
         self.message = message
         self.nearest = nearest
+        self.switchAt = switchAt
+        self.edge = edge
     }
 }
 
@@ -346,27 +359,30 @@ public final class TimelineTierEvaluator: @unchecked Sendable {
         var indexed: [URL: MediaInfo] = [:]
         for (file, info) in media { indexed[file.standardizedFileURL] = info }
         var used: [URL: MediaInfo] = [:]
+        let engine = CutEngine(cancelled: cancelled, useSidecar: useSidecar)
         for clip in clips {
+            try engine.checkCancellation()
             let file = clip.file.standardizedFileURL
             guard used[file] == nil else { continue }
             if let known = indexed[file] {
                 // A provisional clip has no cut index yet. Planning it would read the file again.
                 guard known.url == file, known.hasFullEditIndex else { return nil }
+                try engine.verifyIdentity(file, identity: known.identity)
                 used[file] = known
-            } else if let earlier = inspected[file], (try? SourceIdentity(file)) == earlier.identity {
+            } else if let earlier = inspected[file], earlier.identity.isCurrentSnapshot(at: file) {
                 used[file] = earlier
             } else {
                 // Asking for the tier reads. It never leaves a sidecar behind.
                 let read = try AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
                     try AnalysisSidecar.$readsEnabled.withValue(useSidecar && AnalysisSidecar.readsEnabled) {
-                        try CutEngine(cancelled: cancelled, useSidecar: useSidecar).inspect(file, keyframes: true)
+                        try engine.inspect(file, keyframes: true)
                     }
                 }
                 inspected[file] = read
                 used[file] = read
             }
         }
-        for (file, info) in used where identities[file] != info.identity {
+        for (file, info) in used where identities[file]?.matchesSnapshot(info.identity) != true {
             // Boundary sets belong to one state of the file.
             if identities[file] != nil {
                 for mode in caches.keys { caches[mode]?.discard(file) }

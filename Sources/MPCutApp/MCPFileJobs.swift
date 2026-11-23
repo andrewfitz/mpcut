@@ -5,19 +5,9 @@ import Foundation
 extension ProjectSessions {
     func mcpFile(tool: String, arguments: [String: Any], session: ProjectSession?,
                  checkAccess: @escaping @MainActor () throws -> Void) async throws -> [String: Any]? {
-        guard tool.hasPrefix("file_") else { return nil }
+        guard MCPFileRequest.isFileTool(tool) else { return nil }
         try checkAccess()
-        switch tool {
-        case "file_job_status", "file_job_cancel", "file_job_result":
-            guard let raw = arguments["job_id"] as? String, let id = UUID(uuidString: raw) else {
-                throw MCPCommandError("invalid_arguments", "Supply the job_id UUID returned by a file tool.")
-            }
-            if tool == "file_job_status" { return try mcpFileJobs.status(id: id) }
-            if tool == "file_job_cancel" { return try mcpFileJobs.cancel(id: id) }
-            return try mcpFileJobs.read(id: id, offset: arguments["offset"], limit: arguments["limit"])
-        default:
-            return try mcpFileJobs.start(tool: tool, arguments: arguments)
-        }
+        return try mcpFileJobs.perform(tool: tool, validatedArguments: arguments)
     }
 }
 
@@ -34,6 +24,9 @@ final class MCPFileJobs {
         var ended: ContinuousClock.Instant?
         var state = "running"
         var cleanup: (() -> Void)?
+        var diagnosticsReader: FileHandle?
+        var diagnosticsTail: (end: UInt64, text: String, isFinal: Bool)?
+        var resultSize: Int?
 
         init(id: UUID, tool: String, fingerprint: SHA256.Digest, directory: URL,
              process: Process, cleanup: (() -> Void)?) {
@@ -83,29 +76,53 @@ final class MCPFileJobs {
         return url
     }
 
+    func perform(tool: String, validatedArguments arguments: [String: Any]) throws -> [String: Any] {
+        switch tool {
+        case "file_job_status_read", "file_job_cancel", "file_job_result_read":
+            guard let raw = arguments["job_id"] as? String, let id = UUID(uuidString: raw) else {
+                throw MCPCommandError("invalid_arguments", "Supply the job_id UUID returned by a file tool.")
+            }
+            if tool == "file_job_status_read" { return try self.status(id: id) }
+            if tool == "file_job_cancel" { return try self.cancel(id: id) }
+            return try self.read(id: id, offset: arguments["offset"], limit: arguments["limit"])
+        default:
+            return try self.start(tool: tool, arguments: arguments, alreadyValidated: true)
+        }
+    }
+
     func start(tool: String, arguments: [String: Any], cleanup: (() -> Void)? = nil) throws -> [String: Any] {
+        try start(tool: tool, arguments: arguments, alreadyValidated: false, cleanup: cleanup)
+    }
+
+    private func start(tool: String, arguments: [String: Any], alreadyValidated: Bool,
+                       cleanup: (() -> Void)? = nil) throws -> [String: Any] {
         var launched = false
         defer { if !launched { cleanup?() } }
-        guard let raw = arguments["operationID"] as? String, let id = UUID(uuidString: raw) else {
-            throw MCPCommandError("invalid_arguments", "Supply a fresh UUID in operationID for each distinct file job.")
+        guard waiters.isEmpty else {
+            throw MCPCommandError("jobs_busy", "File jobs are shutting down.")
         }
-        let request = try MCPFileRequest(tool: tool, fields: arguments)
-        let data = try JSONSerialization.data(withJSONObject: arguments.filter { $0.key != "operationID" },
+        guard let raw = arguments["operation_id"] as? String, let id = UUID(uuidString: raw) else {
+            throw MCPCommandError("invalid_arguments", "Supply a fresh UUID in operation_id for each distinct file job.")
+        }
+        let data = try JSONSerialization.data(withJSONObject: arguments.filter { $0.key != "operation_id" },
                                               options: [.sortedKeys])
         let fingerprint = SHA256.hash(data: data)
-        prune()
-        if let job = jobs[id] {
+        if let job = retainedJob(id) {
             guard job.fingerprint == fingerprint, job.tool == tool else {
-                throw MCPCommandError("operation_id_conflict", "This operationID was already used with different arguments.")
+                throw MCPCommandError("operation_id_conflict", "This operation_id was already used with different arguments.")
             }
             return try status(id: id)
         }
+        let request = try alreadyValidated ? MCPFileRequest(tool: tool, validatedFields: arguments)
+            : MCPFileRequest(tool: tool, fields: arguments)
+        if jobs.count >= 512 { prune() }
         guard draining[id] == nil, jobs.values.filter({ $0.ended == nil }).count + draining.count < 8,
               jobs.count < 512 else {
             throw MCPCommandError("jobs_busy", "The file job queue is full. Retry after other jobs finish or expire.")
         }
         let process = Process()
         process.executableURL = try cli()
+        process.environment = ProcessInfo.processInfo.environment.merging(["MPCUT_HISTORY_ORIGIN": "agent"]) { _, new in new }
         process.arguments = request.arguments
         process.currentDirectoryURL = request.directory
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("mpcut-job-" + UUID().uuidString)
@@ -157,12 +174,20 @@ final class MCPFileJobs {
         jobs = jobs.filter { $0.value.ended.map { $0.duration(to: now) < Self.retention } ?? true }
     }
 
+    private func retainedJob(_ id: UUID) -> Job? {
+        guard let job = jobs[id] else { return nil }
+        if let ended = job.ended, ended.duration(to: .now) >= Self.retention {
+            jobs.removeValue(forKey: id)
+            return nil
+        }
+        return job
+    }
+
     private func job(_ id: UUID) throws -> Job {
-        prune()
-        guard let job = jobs[id] else {
+        guard let job = retainedJob(id) else {
             throw MCPCommandError("job_unavailable", "This job is unknown or expired. Completed jobs are retained for ten minutes.")
         }
-        if !job.process.isRunning { finish(job) }
+        if job.ended == nil, !job.process.isRunning { finish(job) }
         return job
     }
 
@@ -180,6 +205,7 @@ final class MCPFileJobs {
             job.state = "failed"
         }
         job.ended = .now
+        job.diagnosticsReader = nil
         job.cleanInputs()
     }
 
@@ -195,9 +221,12 @@ final class MCPFileJobs {
             }
         } else {
             // Release the spool at expiry even if the caller never polls again.
-            Task { [weak self] in
-                try? await Task.sleep(for: Self.retention)
-                self?.prune()
+            Task { [weak self, weak job] in
+                guard let deadline = job?.ended?.advanced(by: Self.retention) else { return }
+                do { try await Task.sleep(until: deadline, clock: .continuous) }
+                catch { return }
+                guard let job, self?.jobs[job.id] === job else { return }
+                self?.jobs.removeValue(forKey: job.id)
             }
         }
     }
@@ -243,9 +272,20 @@ final class MCPFileJobs {
     func status(id: UUID) throws -> [String: Any] {
         let job = try job(id)
         var result: [String: Any] = ["job_id": id.uuidString, "tool": job.tool, "state": job.state]
-        let recent = try tail(job.diagnostics)
+        let recent = try tail(job)
         let lines = recent.split(whereSeparator: \.isNewline).reversed()
-        if ["file_scenes", "file_refresh"].contains(job.tool),
+        if MCPFileRequest.transcriptCommand(for: job.tool) != nil,
+           let event = lines.lazy.compactMap({ line -> [String: Any]? in
+               guard let event = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                     event["job_id"] is String, event["state"] is String,
+                     event["tracks"] is Int, event["staged"] is Int else { return nil }
+               return event
+           }).first {
+            result["progress_event"] = event
+            if let tracks = event["tracks"] as? Int, let staged = event["staged"] as? Int, tracks > 0, staged >= 0 {
+                result["progress_percent"] = min(job.ended == nil ? 99 : 100, Int(100 * min(1, Double(staged) / Double(tracks))))
+            }
+        } else if ["scenes_file_scan", "project_file_media_refresh", "participants_file_scan", "participants_file_render_export"].contains(job.tool),
            let event = lines.lazy.compactMap({ line -> [String: Any]? in
                let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
                return object?["event"] as? String == "progress" ? object : nil
@@ -255,7 +295,7 @@ final class MCPFileJobs {
                 let percent = Int(100 * min(1, max(0, fraction)))
                 result["progress_percent"] = min(job.ended == nil ? 99 : 100, percent)
             }
-        } else if let percent = lines.compactMap({ line -> Int? in
+        } else if let percent = lines.lazy.compactMap({ line -> Int? in
             guard line.hasPrefix("Export "), line.hasSuffix("%") else { return nil }
             return Int(line.dropFirst(7).dropLast())
         }).first {
@@ -263,7 +303,7 @@ final class MCPFileJobs {
         }
         if job.ended != nil {
             result["exit_code"] = Int(job.process.terminationStatus)
-            let size = try bytes(job.output)
+            let size = try resultBytes(job)
             result["result_bytes"] = size
             if size > 0 && size <= Self.chunkSize {
                 let data = try Data(contentsOf: job.output)
@@ -277,10 +317,10 @@ final class MCPFileJobs {
 
     func read(id: UUID, offset: Any?, limit: Any?) throws -> [String: Any] {
         let job = try job(id)
-        guard job.ended != nil else { throw MCPCommandError("job_running", "Poll file_job_status until the job ends.") }
+        guard job.ended != nil else { throw MCPCommandError("job_running", "Poll file_job_status_read until the job ends.") }
         let start = try index(offset, fallback: 0)
         let count = try index(limit, fallback: Self.chunkSize)
-        let total = try bytes(job.output)
+        let total = try resultBytes(job)
         guard start <= total, (1...Self.chunkSize).contains(count) else {
             throw MCPCommandError("invalid_arguments", "Choose an offset within the result and a limit from 1 to 131072 bytes.")
         }
@@ -300,16 +340,36 @@ final class MCPFileJobs {
         return value
     }
 
-    private func bytes(_ url: URL) throws -> Int {
-        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
-        return (attrs[.size] as? NSNumber)?.intValue ?? 0
+    private func resultBytes(_ job: Job) throws -> Int {
+        if let size = job.resultSize { return size }
+        let attrs = try FileManager.default.attributesOfItem(atPath: job.output.path)
+        let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
+        job.resultSize = size
+        return size
     }
 
-    private func tail(_ url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
+    private func tail(_ job: Job) throws -> String {
+        // Only the child appends to the private spool. Refresh once after exit.
+        if let tail = job.diagnosticsTail, tail.isFinal { return tail.text }
+        let handle: FileHandle
+        if let reader = job.diagnosticsReader {
+            handle = reader
+        } else {
+            let fd = open(job.diagnostics.path, O_RDONLY | O_CLOEXEC)
+            guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        }
+        if job.ended == nil { job.diagnosticsReader = handle }
         let end = try handle.seekToEnd()
-        try handle.seek(toOffset: end > 4096 ? end - 4096 : 0)
-        return String(decoding: try handle.read(upToCount: 4096) ?? Data(), as: UTF8.self)
+        let text: String
+        if let tail = job.diagnosticsTail, tail.end == end {
+            text = tail.text
+        } else {
+            let count = min(end, 4096)
+            try handle.seek(toOffset: end - count)
+            text = String(decoding: try handle.read(upToCount: Int(count)) ?? Data(), as: UTF8.self)
+        }
+        job.diagnosticsTail = (end, text, isFinal: job.ended != nil)
+        return text
     }
 }

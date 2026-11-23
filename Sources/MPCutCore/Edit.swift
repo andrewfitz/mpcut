@@ -10,12 +10,18 @@ public struct CutError: Error, LocalizedError, Codable, Sendable {
     public let track: Int?
     public let multicam: MulticamDiagnostic?
     public let placementIDs: [String]?
+    public let laneID: String?
     public var multicamAt: RationalTime? { multicam?.at }
     /// The exports that work instead, least destructive first. Set by the front end from `ExportPlanner`.
     public var alternatives: [ExportAlternative]? = nil
     public var stillBoundaryAdjustments: [StillBoundaryAdjustment]? = nil
     /// The timeline tier factor this failure stands for, when the throw site names one. `factor` also covers the rest.
     public var reason: TierFactorID? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case code, message, segment, boundary, nearest, track, multicam, placementIDs, alternatives, stillBoundaryAdjustments, reason
+        case laneID = "lane_id"
+    }
 
     /// The same failure, named as a tier factor.
     func because(_ reason: TierFactorID?) -> CutError {
@@ -26,7 +32,7 @@ public struct CutError: Error, LocalizedError, Codable, Sendable {
 
     public init(code: String, message: String, segment: Int? = nil, boundary: String? = nil,
                 nearest: [RationalTime]? = nil, track: Int? = nil, multicam: MulticamDiagnostic? = nil,
-                placementIDs: [String]? = nil) {
+                placementIDs: [String]? = nil, laneID: String? = nil) {
         self.code = code
         self.message = message
         self.segment = segment
@@ -35,6 +41,7 @@ public struct CutError: Error, LocalizedError, Codable, Sendable {
         self.track = track
         self.multicam = multicam
         self.placementIDs = placementIDs
+        self.laneID = laneID ?? multicam?.laneID
     }
 
     public var errorDescription: String? { message }
@@ -114,6 +121,7 @@ public struct ResolvedSegment: Codable, Sendable {
     var generatedStill = false
     var videoDecodeTimes: [RationalTime] = []
     package var sourceClipIndex: Int? = nil
+    var sourceClipSeams: [RationalTime] = []
     public internal(set) var encodedEdges: [EncodedEdge]? = nil
 
     enum CodingKeys: String, CodingKey {

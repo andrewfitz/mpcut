@@ -35,6 +35,7 @@ public struct AudioExportPlan: Sendable {
             return "MP3 · \((written.bitRate ?? 0) / 1000) kbps"
         case .aac: return "AAC · \((written.bitRate ?? 0) / 1000) kbps"
         case .flac: return "FLAC · \(written.bitDepth ?? 0)-bit"
+        case .opus: return "Opus · \((written.bitRate ?? 0) / 1000) kbps"
         default:
             return written.codec == "pcm_f32le" ? "PCM · 32-bit float" : "PCM · \(written.bitDepth ?? 0)-bit"
         }
@@ -59,7 +60,7 @@ public struct AudioExportEngine: Sendable {
     }
 
     /// The conversions this build can describe, most faithful first.
-    public static let conversions: [ReencodeAudio] = [.flac, .pcm, .mp3, .aac]
+    public static let conversions: [ReencodeAudio] = [.flac, .pcm, .mp3, .aac, .opus]
 
     /// Output extensions for a conversion. The first is its default.
     public static func containers(for action: ReencodeAudio) -> [String] { ExportRules.conversionContainers(action) }
@@ -86,10 +87,7 @@ public struct AudioExportEngine: Sendable {
         }
         if let output { try engine.checkDestination(output) }
         let named = output?.pathExtension.lowercased() ?? ""
-        if output != nil, named.isEmpty {
-            throw CutError(code: "unsupported_container",
-                           message: "Give the output an extension to choose its format: .mp3, .flac, .wav or .m4a.")
-        }
+        if output != nil, named.isEmpty { throw ExportRules.soundExtensionRefusal }
         let explicit = requested?.lowercased() ?? (named.isEmpty ? nil : named)
         if let explicit {
             guard !explicit.isEmpty, explicit.utf8.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) }),
@@ -231,6 +229,9 @@ public struct AudioExportEngine: Sendable {
         let resampled = !plan.warnings.isEmpty
         let samples = try duration.roundedToSamples(plan.sampleRate)
         let seconds = Double(samples) / Double(plan.sampleRate)
+        func estimatedSize(at bitRate: Int) -> Int64? {
+            Int64(exactly: (Double(bitRate) / 8 * seconds).rounded(.towardZero))
+        }
         var written = ReencodeAudioAction(track: streams[0].index, action: action,
                                           reason: copyFailure.map { "Exact audio copy could not be verified. \($0.message)" })
         var warnings = plan.warnings
@@ -246,19 +247,28 @@ public struct AudioExportEngine: Sendable {
             let codec: String
             if streams.contains(where: { $0.codec.hasPrefix("pcm_f") }) {
                 codec = "pcm_f32le"
+                if streams.contains(where: { $0.codec.hasPrefix("pcm_f64") }) {
+                    warnings.append("The 64-bit floating-point source will be reduced to 32-bit float.")
+                }
             } else if let integerDepth {
                 codec = integerDepth <= 16 ? "pcm_s16le" : integerDepth <= 24 ? "pcm_s24le" : "pcm_s32le"
-                lossless = true
+                lossless = integerDepth <= 32
+                if integerDepth > 32 {
+                    warnings.append("The \(integerDepth)-bit source will be reduced to 32-bit PCM.")
+                }
             } else {
                 codec = "pcm_s24le"
             }
             let bytes = codec == "pcm_s16le" ? 2 : codec == "pcm_s24le" ? 3 : 4
             written.codec = codec
             written.bitDepth = bytes * 8
-            lossless = lossless || streams.allSatisfy { $0.codec.hasPrefix("pcm_f") } && !resampled
+            lossless = lossless || streams.allSatisfy { $0.codec.hasPrefix("pcm_f32") } && !resampled
             let size = samples.multipliedReportingOverflow(by: Int64(plan.channels * bytes))
-            guard !size.overflow else { throw CutError(code: "time_overflow", message: "The converted audio is too large.") }
-            estimate = size.partialValue + 128
+            let total = size.partialValue.addingReportingOverflow(128)
+            guard !size.overflow, !total.overflow else {
+                throw CutError(code: "time_overflow", message: "The converted audio is too large.")
+            }
+            estimate = total.partialValue
             if container == "wav", size.partialValue > 0xFFFF_F000 {
                 throw CutError(code: "unsupported_container",
                                message: "This PCM audio exceeds the 4 GB limit of WAV. Choose .caf, or convert to FLAC or AAC.")
@@ -276,9 +286,7 @@ public struct AudioExportEngine: Sendable {
             plan.encoderArguments = depth == 16 ? ["-c:a", "flac", "-sample_fmt", "s16"]
                 : ["-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24"]
         case .aac:
-            let measured = sources.compactMap { source in
-                indexed[source.media.url].flatMap { Self.averageBitRate($0, seconds: $0.duration.seconds) }
-            }
+            let measured = sources.compactMap { Self.averageBitRate($0.audio, in: indexed[$0.media.url]) }
             let fallback = max(96, min(512, plan.channels * 96)) * 1000
             var rate = fallback
             if native == .aac, measured.count == sources.count, let highest = measured.max() {
@@ -288,7 +296,7 @@ public struct AudioExportEngine: Sendable {
             }
             written.codec = "aac"
             written.bitRate = rate
-            estimate = Int64(Double(rate) / 8 * seconds)
+            estimate = estimatedSize(at: rate)
             plan.encoderArguments = ["-c:a", "aac", "-b:a", "\(rate)"]
         case .mp3:
             let profiles = native == .mp3 ? sources.compactMap { MP3Profile(media: $0.media, sound: $0.audio) } : []
@@ -297,13 +305,26 @@ public struct AudioExportEngine: Sendable {
             written.codec = "mp3"
             written.bitRate = chosen.bitRate
             written.quality = chosen.quality
-            if let rate = chosen.bitRate { estimate = Int64(Double(rate) / 8 * seconds) }
+            if let rate = chosen.bitRate { estimate = estimatedSize(at: rate) }
             warnings.append(chosen.note)
             plan.encoderArguments = ["-c:a", "libmp3lame"] + chosen.arguments + ["-write_xing", "1", "-id3v2_version", "0"]
+        case .opus:
+            // An Opus stream states no rate. The size of its packets over its audible span gives the average.
+            let measured = sources.compactMap { Self.averageBitRate($0.audio, in: indexed[$0.media.url]) }
+            let matched = native == .opus && measured.count == sources.count ? measured.max() : nil
+            let rate = Self.opusBitRate(matching: matched, channels: plan.channels)
+            written.codec = "opus"
+            written.bitRate = rate
+            estimate = estimatedSize(at: rate)
+            warnings.append("Opus is encoded at \(rate / 1000) kbps." + (matched.map { " The source averages \($0 / 1000) kbps." } ?? ""))
+            // Unconstrained libopus VBR takes the rate as a quality target, and the written average can differ from it by a third.
+            plan.encoderArguments = ["-c:a", "libopus", "-b:a", "\(rate)", "-vbr", "constrained"]
+            // Without a named mapping family the helper's libopus encoder assigns the channels of 5.0 and 6.1 to the wrong speakers.
+            if plan.channels > 2 { plan.encoderArguments? += ["-mapping_family", "1"] }
         default:
-            throw CutError(code: "invalid_arguments", message: "Choose auto, copy, aac, pcm, mp3 or flac for audio conversion.")
+            throw CutError(code: "invalid_arguments", message: "Choose auto, copy, aac, pcm, mp3, flac or opus for audio conversion.")
         }
-        plan.muxer = container == "m4a" ? "ipod" : muxerName(container)
+        plan.muxer = container == "m4a" ? "ipod" : container == "mka" ? "matroska" : muxerName(container)
         plan.verifiesSampleRange = true
         return AudioExportPlan(edit: plan.edit, requested: audio, actions: [written], warnings: warnings,
                                sampleRate: plan.sampleRate, channels: plan.channels, estimatedBytes: estimate,
@@ -319,7 +340,9 @@ public struct AudioExportEngine: Sendable {
             try engine.export(plan.edit, to: output, progress: progress)
             return
         }
-        let engine = CutEngine(cancelled: cancelled)
+        let cancellation = AudioExportCancellation()
+        let isCancelled: @Sendable () -> Bool = { cancelled?() == true || cancellation.isCancelled }
+        let engine = CutEngine(cancelled: isCancelled)
         try engine.checkCancellation()
         try engine.checkDestination(output)
         guard output.pathExtension.lowercased() == plan.edit.container else {
@@ -341,15 +364,16 @@ public struct AudioExportEngine: Sendable {
         }
         defer { try? FileManager.default.removeItem(at: staging) }
         let partial = staging.appendingPathComponent("audio").appendingPathExtension(plan.edit.container)
-        try MulticamEngine(cancelled: cancelled).writeConvertedSound(conversion, to: partial) { fraction in
-            _ = progress?(fraction * 0.98)
+        try MulticamEngine(cancelled: isCancelled).writeConvertedSound(conversion, to: partial) { fraction in
+            if progress?(fraction * 0.98) == false { cancellation.cancel() }
         }
         try verifySources()
+        if progress?(1) == false { cancellation.cancel() }
+        try engine.checkCancellation()
         // The helper creates the file with the caller's ordinary creation mask.
         let failure = publishExclusively(from: partial, to: destination)
         if failure == EEXIST { throw CutError(code: "output_exists", message: "A file already exists at the destination.") }
         if failure != 0 { throw CutError(code: "write_failed", message: String(cString: strerror(failure))) }
-        _ = progress?(1)
     }
 
     private static func containerIssue(_ container: String, action: ReencodeAudio?, copyFailure: CutError?) -> CutError {
@@ -358,9 +382,9 @@ public struct AudioExportEngine: Sendable {
         }
         let message: String
         if let action {
-            message = "\(action.rawValue.uppercased()) conversion cannot be written to .\(container). Use \(list(action))."
+            message = "\(ExportRules.displayName(audio: action)) conversion cannot be written to .\(container). Use \(list(action))."
         } else {
-            let choices = conversions.map { "\(list($0)) for \($0.rawValue.uppercased())" }.joined(separator: "; ")
+            let choices = conversions.map { "\(list($0)) for \(ExportRules.displayName(audio: $0))" }.joined(separator: "; ")
             let reason = copyFailure.map { "Exact audio copy is unavailable. \($0.message) " } ?? ""
             message = "\(reason)No conversion writes .\(container). Use \(choices)."
         }
@@ -378,11 +402,25 @@ public struct AudioExportEngine: Sendable {
         return stream.bitDepth > 0 ? stream.bitDepth : 24
     }
 
-    /// The whole-file rate of a source whose only stream is the selected sound.
-    private static func averageBitRate(_ media: MediaInfo, seconds: Double) -> Int? {
-        guard !media.hasVideo, media.streams.count == 1, seconds > 0,
+    /// The average rate of the selected sound from the size of its packets. An index without that size gives
+    /// the whole-file rate of a source whose only stream is the selected sound.
+    private static func averageBitRate(_ sound: AudioIndex, in media: MediaInfo?) -> Int? {
+        if let rate = sound.averageBitRate { return rate }
+        guard let media, !media.hasVideo, media.streams.count == 1, media.duration > .zero,
               let size = (try? FileManager.default.attributesOfItem(atPath: media.url.path))?[.size] as? NSNumber else { return nil }
-        return Int(size.doubleValue * 8 / seconds)
+        return Int(exactly: (size.doubleValue * 8 / media.duration.seconds).rounded(.towardZero))
+    }
+
+    /// The libopus target: the customary rate nearest the source's average, or a default for its channels.
+    static func opusBitRate(matching average: Int?, channels: Int) -> Int {
+        let steps = [8, 12, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 510].map { $0 * 1000 }
+        // The libopus default: 64 kbps for each stream and 32 kbps more for each coupled pair of channels.
+        let pairs = [0, 1, 1, 2, 2, 2, 2, 3]
+        let coupled = pairs.indices.contains(channels - 1) ? pairs[channels - 1] : 1
+        let target = average ?? (max(1, channels) * 64_000 - coupled * 32_000)
+        // libopus accepts at most 256 kbps per channel.
+        let allowed = steps.filter { $0 >= max(16_000, channels * 12_000) && $0 <= channels * 256_000 }
+        return allowed.min { abs($0 - target) < abs($1 - target) } ?? 96_000
     }
 
     // MARK: Helper capabilities
@@ -426,16 +464,18 @@ public struct AudioExportEngine: Sendable {
         case .mp3: name = "libmp3lame"
         case .flac: name = "flac"
         case .aac: name = "aac"
+        case .opus: name = "libopus"
         default: return
         }
         guard encoderCache.encoders(of: helper).contains(name) else {
             throw CutError(code: "encoder_unavailable",
-                           message: "The installed FFmpeg helper has no \(action.rawValue.uppercased()) encoder. Choose PCM, or update the helper.")
+                           message: "The installed FFmpeg helper has no \(ExportRules.displayName(audio: action)) encoder. Choose PCM, or update the helper.")
         }
     }
 }
 
 /// The rate control of an MP3 source, read from its first frame and Xing or Info tag.
+/// An MP3 track in another container gives the average rate of its packets.
 struct MP3Profile {
     enum Control { case constant, average, variable }
     let control: Control
@@ -450,8 +490,16 @@ struct MP3Profile {
     }
 
     init?(media: MediaInfo, sound: AudioIndex) {
-        guard media.format == "mp3", sound.stream.codec == "mp3",
-              let file = try? FileHandle(forReadingFrom: media.url) else { return nil }
+        guard sound.stream.codec == "mp3" else { return nil }
+        guard media.format == "mp3" else {
+            // A track in another container carries no tag to read. The size of its packets gives its average rate.
+            guard let average = sound.averageBitRate else { return nil }
+            control = .average
+            bitRate = average
+            quality = nil
+            return
+        }
+        guard let file = try? FileHandle(forReadingFrom: media.url) else { return nil }
         defer { try? file.close() }
         guard let head = try? file.read(upToCount: 10), head.count == 10 else { return nil }
         var offset: UInt64 = 0
@@ -464,6 +512,7 @@ struct MP3Profile {
         let data = [UInt8](bytes)
         guard let start = (0..<(data.count - 4)).first(where: { index in
             data[index] == 0xFF && data[index + 1] & 0xE0 == 0xE0 && (data[index + 1] >> 1) & 3 == 1
+                && data[index + 1] & 0x18 != 0x08
                 && data[index + 2] >> 4 != 0 && data[index + 2] >> 4 != 15 && (data[index + 2] >> 2) & 3 != 3
         }) else { return nil }
         let first = data[start + 1] & 0x18 == 0x18
@@ -473,13 +522,18 @@ struct MP3Profile {
         let frameRate = table[Int(data[start + 2] >> 4)] * 1000
         let seconds = sound.end.seconds - sound.start.seconds
         let fileSize = ((try? FileManager.default.attributesOfItem(atPath: media.url.path))?[.size] as? NSNumber)?.uint64Value ?? 0
-        var average = seconds > 0 && fileSize > offset ? Int(Double(fileSize - offset) * 8 / seconds) : frameRate
+        var average = frameRate
+        if let measured = sound.averageBitRate {
+            average = measured
+        } else if seconds > 0, fileSize > offset {
+            average = Int(exactly: (Double(fileSize - offset) * 8 / seconds).rounded(.towardZero)) ?? frameRate
+        }
         let tag = start + 4 + (first ? (mono ? 17 : 32) : (mono ? 9 : 17))
         guard tag + 8 <= data.count else { return nil }
         let name = String(decoding: data[tag..<(tag + 4)], as: UTF8.self)
         guard name == "Xing" || name == "Info" else {
             // Without a tag, a file whose size matches its first frame's rate is constant.
-            let constant = abs(average - frameRate) * 20 <= frameRate
+            let constant = abs(average - frameRate) <= frameRate / 20
             control = constant ? .constant : .variable
             bitRate = constant ? frameRate : average
             quality = nil

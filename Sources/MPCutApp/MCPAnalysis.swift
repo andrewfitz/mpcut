@@ -25,7 +25,7 @@ struct MCPSceneRequest: Equatable {
 }
 
 func mcpSceneCoverage(_ coverage: [String: SceneScanProgress]) -> [String: Any] {
-    guard let data = try? JSONEncoder().encode(coverage),
+    guard let data = try? MCPSchemas.encodeResult(coverage),
           let result = (try? JSONSerialization.jsonObject(with: data)) as? AnalysisObject else { return [:] }
     return result
 }
@@ -46,8 +46,7 @@ private func number(_ value: Any?, field: String) throws -> Double {
 }
 
 private func integer(_ value: Any?, field: String, range: ClosedRange<Int>) throws -> Int {
-    let raw = try number(value, field: field)
-    guard let n = Int(exactly: raw), range.contains(n) else { throw badInput("Invalid \(field).") }
+    guard let n = value.flatMap(mcpInteger), range.contains(n) else { throw badInput("Invalid \(field).") }
     return n
 }
 
@@ -73,14 +72,14 @@ private func scenePage(_ report: SceneReport, source: String, args: AnalysisObje
         row["name"] = names[scene.view]
         return row
     }
-    result["source"] = source
+    result["source_id"] = source
     result["clock"] = "source"
     if let staleReason {
         result["stale"] = true
-        result["staleReason"] = staleReason
-        result["sourceStamp"] = ["bytes": report.sourceStamp.bytes,
-                                 "modifiedSeconds": report.sourceStamp.modifiedSeconds,
-                                 "modifiedNanoseconds": report.sourceStamp.modifiedNanoseconds]
+        result["stale_reason"] = staleReason
+        result["source_stamp"] = ["bytes": report.sourceStamp.bytes,
+                                 "modified_seconds": report.sourceStamp.modifiedSeconds,
+                                 "modified_nanoseconds": report.sourceStamp.modifiedNanoseconds]
     }
     return result
 }
@@ -99,8 +98,8 @@ private struct WaveformWindow {
     let columns: Int
 
     init(_ args: AnalysisObject, duration: RationalTime) throws {
-        from = try analysisTime(args, "from", or: 0)
-        to = try analysisTime(args, "to", or: duration.seconds)
+        from = try analysisTime(args, "source_from", or: 0)
+        to = try analysisTime(args, "source_to", or: duration.seconds)
         guard from >= 0, from < to, to <= duration.seconds else { throw badInput("Choose a window within the source.") }
         columns = try integer(args["columns"] ?? 100, field: "columns", range: 1...2048)
     }
@@ -125,13 +124,13 @@ private func checkAnalysisSource(_ media: MediaInfo) throws {
 extension ProjectSessions {
     func mcpAnalysis(tool: String, arguments args: [String: Any], session: ProjectSession,
                      checkAccess: @escaping @MainActor () throws -> Void) async throws -> [String: Any]? {
-        let read = ["analysis_job_status", "analysis_state", "list_pauses", "list_scenes", "get_waveform_peaks", "get_waveform"]
-        let write = ["analysis_job_cancel", "scan_analysis", "cancel_analysis", "refresh_project_media", "configure_silence", "use_room_tone", "rename_view",
-                     "review_pause", "set_skip_pauses", "apply_pauses", "save_analysis_sidecars"]
+        let read = ["analysis_job_status_read", "analysis_editor_state_read", "silence_editor_pauses_list", "silence_editor_take_candidates_list", "scenes_editor_boundaries_list", "waveform_editor_peaks_read", "waveform_editor_envelope_read"]
+        let write = ["analysis_job_cancel", "scenes_editor_scan", "silence_editor_scan", "scenes_editor_scan_cancel", "silence_editor_scan_cancel", "project_editor_media_refresh", "silence_editor_track_select", "silence_editor_threshold_set", "silence_threshold_calibrate_from_marks", "scenes_view_rename",
+                     "silence_editor_pause_review", "silence_editor_take_boundary_edit", "timeline_editor_join_preview", "playback_pause_skipping_set", "silence_editor_pauses_shorten", "silence_editor_takes_queue", "analysis_editor_sidecars_save"]
         guard read.contains(tool) || write.contains(tool) else { return nil }
         try checkAccess()
         let editor = session.editor, multi = session.multicam, mc = session.isMulticam
-        let source = args["source"] as? String
+        let source = args["source_id"] as? String
         let uuid = source.flatMap { UUID(uuidString: $0) }
         func sourceMedia() -> MediaInfo? {
             mc ? source.flatMap(multi.ordinaryAnalysisMedia) : uuid.flatMap { editor.analysisSourceMedia[$0] }
@@ -140,10 +139,10 @@ extension ProjectSessions {
             mc ? source.flatMap { multi.analysis.sceneReports[$0] } : uuid.flatMap { editor.sceneReports[$0] }
         }
         func sceneReport() throws -> SceneReport {
-            guard let media = sourceMedia() else { throw unavailable("Choose an indexed source from analysis_state.") }
+            guard let media = sourceMedia() else { throw unavailable("Choose an indexed source from analysis_editor_state_read.") }
             try checkAnalysisSource(media)
             guard let report = storedSceneReport(), report.sourceStamp == SceneSourceStamp(media: media) else {
-                throw unavailable("Scan scenes for this source and read analysis_state.")
+                throw unavailable("Scan scenes for this source and read analysis_editor_state_read.")
             }
             return report
         }
@@ -151,17 +150,17 @@ extension ProjectSessions {
         let canEdit = session.window?.attachedSheet == nil && !reviewOpen
             && (mc ? (multi.project != nil && !multi.isBusy && multi.notice == nil) : editor.canEdit && !editor.mcpHasActiveTrim)
         switch tool {
-        case "analysis_job_status", "analysis_job_cancel":
-            let receipt = try mcpAnalysisJobs.lookup(args["job"] as? String, session: session)
+        case "analysis_job_status_read", "analysis_job_cancel":
+            let receipt = try mcpAnalysisJobs.lookup(args["job_id"] as? String, session: session)
             if tool == "analysis_job_cancel" { receipt.cancel() }
             return receipt.snapshot
-        case "refresh_project_media":
+        case "project_editor_media_refresh":
             if let active = mc ? multi.mcpRefreshReceipt : editor.mcpRefreshReceipt, active.state == "running" {
-                throw MCPCommandError("busy", "A project media refresh is running. Read analysis_state for progress.")
+                throw MCPCommandError("busy", "A project media refresh is running. Read analysis_editor_state_read for progress.")
             }
             guard session.window?.attachedSheet == nil, !reviewOpen,
                   mc ? multi.canRefreshProjectMedia : editor.canRefreshProjectMedia && !editor.mcpHasActiveTrim else {
-                throw unavailable("Project media refresh is unavailable. Inspect analysis_state.")
+                throw unavailable("Project media refresh is unavailable. Inspect analysis_editor_state_read.")
             }
             let receipt = try mcpAnalysisJobs.reserve(session: session, kind: "refresh")
             let deep = args["deep"] as? Bool ?? false
@@ -171,68 +170,80 @@ extension ProjectSessions {
                 editor.refreshProjectMedia(deep: deep, receipt: receipt)
             }
             return receipt.snapshot
-        case "analysis_state":
+        case "analysis_editor_state_read":
             var state: AnalysisObject = ["kind": mc ? "multicam" : "sequence",
-                                         "minimumPause": mc ? multi.analysis.pauseMinimum : editor.minimumPause,
-                                         "leavePause": mc ? multi.preferences.leavePause : editor.leavePause,
-                                         "skipPauses": mc ? multi.pauseEdits.skip : editor.skipPauses,
-                                         "sceneScanning": mc ? multi.analysis.isScanning(.scenes) : editor.sceneProgress != nil,
-                                         "silenceReady": mc ? multi.canApplyPauses : editor.pauseAnalysisReady]
-            state["sceneProgress"] = mc ? multi.analysis.sceneProgress : editor.sceneProgress
-            state["sceneStatus"] = mc ? multi.analysis.sceneStatus : editor.sceneStatus
-            state["sceneCoverage"] = mcpSceneCoverage(mc ? multi.analysis.sceneCoverage : editor.sceneCoverage)
-            state["selectedSceneClip"] = mc ? nil : editor.sceneClipID?.uuidString
-            state["selectedSceneCamera"] = mc ? multi.selectedSceneCamera : nil
-            state["mediaRefreshProgress"] = mc ? multi.mediaRefreshProgress : editor.mediaRefreshProgress
-            state["mediaRefreshIssues"] = mc ? multi.mediaRefreshIssues : editor.mediaRefreshIssues
-            state["silenceProgress"] = mc ? multi.analysis.silenceProgress : editor.silenceProgress
-            state["manualThresholdDB"] = mc ? multi.analysis.pauseThreshold : editor.manualThresholdDB
-            state["silenceIssue"] = mc ? multi.analysis.silenceIssue : editor.silenceIssue
+                                         "silence_max_blip_seconds": mc ? multi.analysis.maxBlip : editor.preferences.maxBlip,
+                                         "silence_min_pause_seconds": mc ? multi.analysis.pauseMinimum : editor.minimumPause,
+                                         "silence_padding_per_side_seconds": mc ? multi.preferences.padding : editor.padding,
+                                         "skip_pauses": mc ? multi.pauseEdits.skip : editor.skipPauses,
+                                         "scene_scanning": mc ? multi.analysis.isScanning(.scenes) : editor.sceneProgress != nil,
+                                         "silence_ready": mc ? multi.canApplyPauses : editor.pauseAnalysisReady]
+            state["scene_progress"] = mc ? multi.analysis.sceneProgress : editor.sceneProgress
+            state["scene_status"] = mc ? multi.analysis.sceneStatus : editor.sceneStatus
+            state["scene_coverage"] = mcpSceneCoverage(mc ? multi.analysis.sceneCoverage : editor.sceneCoverage)
+            state["selected_scene_clip"] = mc ? nil : editor.sceneClipID?.uuidString
+            state["selected_scene_camera"] = mc ? multi.selectedSceneCamera : nil
+            state["media_refresh_progress"] = mc ? multi.mediaRefreshProgress : editor.mediaRefreshProgress
+            state["media_refresh_issues"] = mc ? multi.mediaRefreshIssues : editor.mediaRefreshIssues
+            state["silence_progress"] = mc ? multi.analysis.silenceProgress : editor.silenceProgress
+            state["manual_threshold_db"] = mc ? multi.analysis.pauseThreshold : editor.manualThresholdDB
+            state["silence_issue"] = mc ? multi.analysis.silenceIssue : editor.silenceIssue
             state["status"] = mc ? (multi.analysis.status ?? multi.status) : editor.statusMessage
             state["issue"] = mc ? multi.notice?.message : editor.alert?.message
             let sources = mc ? multi.media : Dictionary(uniqueKeysWithValues: editor.analysisSourceMedia.map { ($0.key.uuidString, $0.value) })
             state["sources"] = try page(sources.keys.sorted(), args) { id in
                 let media = sources[id]!
                 let indexed = mc ? multi.ordinaryAnalysisMedia(id) != nil : media.hasFullEditIndex
-                var row: AnalysisObject = ["source": id, "path": media.url.path, "indexed": indexed,
-                                           "audioStreams": media.streams.filter { $0.kind == "audio" }.map(\.index)]
+                var row: AnalysisObject = ["source_id": id, "path": media.url.path, "indexed": indexed,
+                                           "audio_stream_indices": media.streams.filter { $0.kind == "audio" }.map(\.index)]
                 if !mc, let id = UUID(uuidString: id), let ordinal = editor.sourceAnalysisTracks[id] {
-                    row["analysisTrackOrdinal"] = ordinal
-                    row["manualThresholdDB"] = editor.analysisThreshold(for: id, track: ordinal)
+                    row["analysis_track_ordinal"] = ordinal
+                    row["manual_threshold_db"] = editor.analysisThreshold(for: id, track: ordinal)
                 }
                 return row
             }
             if !mc {
-                state["analysisTrackOrdinal"] = editor.playheadAnalysisTrack
-                state["followSourceAudio"] = editor.useSavedMonitoringTracks
-                state["analysisSource"] = editor.analysisPlayheadSourceID?.uuidString
+                state["analysis_track_ordinal"] = editor.playheadAnalysisTrack
+                state["follow_source_audio"] = editor.useSavedMonitoringTracks
+                state["analysis_source_id"] = editor.analysisPlayheadSourceID?.uuidString
             }
             return state
-        case "list_pauses":
+        case "silence_editor_pauses_list":
             if mc {
                 guard multi.canApplyPauses else { throw unavailable("Complete the program silence scan first.") }
                 return try page(multi.multicamPausePlan, args) { pause in
                     ["id": mcpPauseID(pause, revision: session.mcpRevision), "occurrence": pause.id.occurrence, "clock": "group",
                      "range": span(pause.visible), "removal": pause.removal.map { span($0) as Any } ?? NSNull(),
-                     "protected": pause.isProtected]
+                     "protected": pause.isProtected, "retained_seconds": pause.retainedSeconds,
+                     "requested_retained_seconds": pause.requestedRetainedSeconds.map { $0 as Any } ?? NSNull()]
                 }
             }
             guard editor.pauseAnalysisReady else { throw unavailable("Complete the sequence silence scan first.") }
             return try page(editor.pausePlan, args) { pause in
                 ["id": mcpPauseID(pause, revision: session.mcpRevision), "clock": "sequence",
                  "occurrence": pause.key.source.occurrence.uuidString, "range": span(pause.sequence),
-                 "removal": pause.removal.map { span($0) as Any } ?? NSNull(), "protected": pause.isProtected]
+                 "removal": pause.removal.map { span($0) as Any } ?? NSNull(), "protected": pause.isProtected,
+                 "retained_seconds": pause.retainedSeconds,
+                 "requested_retained_seconds": pause.requestedRetainedSeconds.map { $0 as Any } ?? NSNull()]
             }
-        case "list_scenes":
-            let includeStale = args["includeStale"] as? Bool ?? false
+        case "silence_editor_take_candidates_list":
+            guard mc ? multi.canApplyPauses : editor.pauseAnalysisReady else { throw unavailable("Complete the silence scan first.") }
+            let candidates = mc ? multi.multicamTakeCandidates(plan: multi.multicamPausePlan) : editor.takeCandidates
+            var result = try page(candidates, args) { candidate in
+                ["range": span(candidate.range), "manual_start": candidate.hasManualStart]
+            }
+            result["clock"] = mc ? "assembly" : "sequence"
+            return result
+        case "scenes_editor_boundaries_list":
+            let includeStale = args["include_stale"] as? Bool ?? false
             let issues = mc ? multi.mediaRefreshIssues : editor.mediaRefreshIssues
             func staleReason(_ id: String) -> String { issues[id] ?? "The recording changed after scene analysis." }
-            if let clip = args["clip"] as? String {
+            if let clip = args["clip_id"] as? String {
                 guard !mc, source == nil, let id = UUID(uuidString: clip) else {
                     throw badInput("Choose a sequence clip ID or a source ID.")
                 }
                 guard let bounds = editor.mcpOccurrence(id) else {
-                    throw unavailable("Choose a clip from get_editor_state.")
+                    throw unavailable("Choose a clip from project_editor_state_read.")
                 }
                 let archived = includeStale ? editor.staleSceneReport(clipID: id) : nil
                 guard let (sourceID, report) = archived ?? editor.sceneReport(clipID: id) else {
@@ -253,7 +264,7 @@ extension ProjectSessions {
                 let source = sourceID.uuidString
                 var result = try scenePage(report, source: source, args: args, interval: (bounds.start, bounds.end),
                                            staleReason: stale ? staleReason(source) : nil)
-                result["clip"] = id.uuidString
+                result["clip_id"] = id.uuidString
                 return result
             }
             let id = (mc ? source : uuid?.uuidString) ?? ""
@@ -268,23 +279,23 @@ extension ProjectSessions {
                 return try scenePage(previous, source: id, args: args, staleReason: staleReason(id))
             }
             return try scenePage(report, source: id, args: args)
-        case "get_waveform", "get_waveform_peaks":
+        case "waveform_editor_envelope_read", "waveform_editor_peaks_read":
             guard let source, let info = sourceMedia(), info.hasFullEditIndex else {
-                throw unavailable("Choose an indexed source from analysis_state.")
+                throw unavailable("Choose an indexed source from analysis_editor_state_read.")
             }
-            let stream = try integer(args["stream"], field: "stream", range: 0...Int(Int32.max))
+            let stream = try integer(args["audio_stream_index"], field: "audio_stream_index", range: 0...Int(Int32.max))
             guard info.streams.contains(where: { $0.kind == "audio" && $0.index == stream }) else {
                 throw badInput("Select an audio stream in this source.")
             }
             let id = mc ? source : uuid?.uuidString ?? source
-            if tool == "get_waveform_peaks" {
+            if tool == "waveform_editor_peaks_read" {
                 try checkAnalysisSource(info)
                 let wave = mc ? multi.analysis.completedWaveform(sourceID: id, stream: stream)
                     : uuid.flatMap { editor.audioStore.completedWaveforms(for: $0, media: info)[stream] }
                 guard let wave else { throw unavailable("A completed peak waveform for this source and stream is unavailable.") }
                 let window = try WaveformWindow(args, duration: wave.duration)
-                return ["source": id, "clock": "source", "stream": stream, "fromSeconds": window.from, "toSeconds": window.to,
-                        "peaks": window.peaks(in: wave), "binsPerSecond": AudioWaveform.rate]
+                return ["source_id": id, "clock": "source", "audio_stream_index": stream, "source_from_seconds": window.from, "source_to_seconds": window.to,
+                        "peaks": window.peaks(in: wave), "bins_per_second": AudioWaveform.rate]
             }
             let media = try info.extendingToAudioEnd(stream: stream)
             let window = try WaveformWindow(args, duration: media.duration)
@@ -303,17 +314,15 @@ extension ProjectSessions {
             try checkAccess()
             guard let current = sourceMedia(), current.url == info.url,
                   AudioAnalysisCacheKey(media: current, stream: stream) == AudioAnalysisCacheKey(media: info, stream: stream) else {
-                throw MCPCommandError("source_changed", "The project's source changed. Refresh analysis_state.")
+                throw MCPCommandError("source_changed", "The project's source changed. Refresh analysis_editor_state_read.")
             }
-            return ["source": id, "clock": "source", "stream": stream, "fromSeconds": envelope.from, "toSeconds": envelope.to,
+            return ["source_id": id, "clock": "source", "audio_stream_index": stream, "source_from_seconds": envelope.from, "source_to_seconds": envelope.to,
                     "low": envelope.low, "high": envelope.high]
-        case "scan_analysis", "cancel_analysis":
-            guard let value = args["kind"] as? String, ["scenes", "silence"].contains(value) else {
-                throw badInput("Specify scenes or silence.")
-            }
+        case "scenes_editor_scan", "silence_editor_scan", "scenes_editor_scan_cancel", "silence_editor_scan_cancel":
+            let value = tool.hasPrefix("scenes_") ? "scenes" : "silence"
             let target: TimelineSnapTarget = value == "scenes" ? .scenes : .silence
             let running = mc ? multi.analysis.isScanning(target) : (target == .scenes ? editor.sceneProgress : editor.silenceProgress) != nil
-            if tool == "cancel_analysis" {
+            if tool.hasSuffix("_cancel") {
                 guard running else { return ["status": "idle"] }
                 let sceneWorker = mc ? multi.analysis.mcpReceipts[.scenes] : editor.mcpSceneReceipt
                 if target == .scenes, let sceneWorker { sceneWorker.cancel() }
@@ -346,8 +355,8 @@ extension ProjectSessions {
                 case "reuse": policy = .reuse
                 case "resume": policy = .resume
                 case "restart":
-                    guard let operationID = args["operationID"] as? String, !operationID.isEmpty else {
-                        throw badInput("Supply an operationID for the restart.")
+                    guard let operationID = args["operation_id"] as? String, !operationID.isEmpty else {
+                        throw badInput("Supply an operation_id for the restart.")
                     }
                     policy = .restart(operationID: operationID)
                 default: throw badInput("Specify reuse, resume or restart policy.")
@@ -390,7 +399,7 @@ extension ProjectSessions {
                 if existing == nil, args["scope"] == nil, args["policy"] == nil {
                     return ["status": "running", "origin": "editor"]
                 }
-                throw MCPCommandError("busy", "A different scan is running. Read analysis_state for its progress.")
+                throw MCPCommandError("busy", "A different scan is running. Read analysis_editor_state_read for its progress.")
             }
             guard canEdit else { throw unavailable("Finish the current operation or dismiss the editor’s message.") }
             let canStart: Bool
@@ -399,7 +408,7 @@ extension ProjectSessions {
             } else {
                 canStart = mc ? multi.canScanAnalysis(target) || multi.canApplyPauses : editor.canScanSilence
             }
-            guard canStart else { throw unavailable("No eligible sources to scan. Inspect analysis_state or available reports.") }
+            guard canStart else { throw unavailable("No eligible sources to scan. Inspect analysis_editor_state_read or available reports.") }
             let subscriber = try mcpAnalysisJobs.reserve(session: session, kind: value)
             let receipt: MCPAnalysisReceipt
             if let sceneRequest {
@@ -442,17 +451,21 @@ extension ProjectSessions {
         default: break
         }
 
-        guard canEdit || (tool == "review_pause" && reviewOpen) else {
+        guard canEdit || (tool == "silence_editor_pause_review" && reviewOpen) else {
             throw unavailable("Finish the current operation or dismiss the editor’s message.")
         }
         switch tool {
-        case "configure_silence":
-            try configureAnalysis(args, session: session)
-        case "use_room_tone":
+        case "silence_editor_track_select":
+            guard !mc, !editor.audioTracks.isEmpty else { throw badInput("Select an audio track in an open sequence.") }
+            let ordinal = try integer(args["track_ordinal"], field: "track_ordinal", range: 0...(editor.audioTracks.count - 1))
+            editor.chooseAnalysisTrack(ordinal)
+        case "silence_editor_threshold_set":
+            try setAnalysisThreshold(args, session: session)
+        case "silence_threshold_calibrate_from_marks":
             guard mc ? multi.useRoomTone() : editor.useRoomTone() else {
                 throw unavailable("Mark a range with measured audio on the selected tracks.")
             }
-        case "rename_view":
+        case "scenes_view_rename":
             guard let name = args["name"] as? String, name.utf8.count <= 1024 else {
                 throw badInput("Choose an analyzed source and supply a view name up to 1024 bytes.")
             }
@@ -461,9 +474,49 @@ extension ProjectSessions {
             guard let index = report.scenes.firstIndex(where: { $0.view == view }) else { throw unavailable("This view is unavailable.") }
             if mc, let source { multi.analysis.rename(.init(source: source, report: report, index: index), to: name) }
             else if let uuid { editor.setViewName(name, source: uuid, view: view) }
-        case "review_pause":
+        case "silence_editor_pause_review":
             return try reviewPause(args, session: session)
-        case "set_skip_pauses":
+        case "timeline_editor_join_preview":
+            let clock: String
+            let position: RationalTime
+            let targets = ["before_clip_id", "before_occurrence", "switch_time"].filter { args[$0] != nil }
+            guard targets.count == 1 else { throw badInput("Specify one join target.") }
+            if mc, let switchTime = args["switch_time"] as? String {
+                let requested = try RationalTime(parsing: switchTime)
+                guard multi.previewMulticamSwitch(at: requested), let join = multi.pauseEdits.review?.position else {
+                    throw unavailable("Choose an existing switch inside the group.")
+                }
+                clock = "group"
+                position = join
+            } else if mc, args["before_occurrence"] != nil {
+                let index = try integer(args["before_occurrence"], field: "before_occurrence", range: 0...Int.max)
+                guard multi.previewMulticamAssemblyJoin(before: index), let join = multi.pauseEdits.review?.position else {
+                    throw unavailable("Choose the assembly occurrence on the right side of an existing join.")
+                }
+                clock = "assembly"
+                position = join
+            } else if !mc, let id = args["before_clip_id"] as? String,
+                      editor.previewExistingJoin(beforeTimelineItem: id), let cut = editor.cutPreview {
+                clock = "sequence"
+                position = cut.position
+            } else {
+                throw badInput("Choose a sequence clip ID, multicam assembly index, or multicam switch time in its project.")
+            }
+            return ["review_open": true, "position": position.description, "clock": clock]
+        case "silence_editor_take_boundary_edit":
+            guard let exact = args["position"] as? String, let action = args["action"] as? String else {
+                throw badInput("Supply a position and a take-boundary action.")
+            }
+            let position = try RationalTime(parsing: exact)
+            let changed: Bool
+            if mc { changed = multi.editMulticamTakeBoundary(at: position, add: action == "add") }
+            else {
+                changed = action == "add" ? editor.addTakeBoundary(at: position.seconds)
+                    : editor.removeTakeBoundary(at: position)
+            }
+            guard changed else { throw unavailable("Choose an interior cut point or a manual start from the take candidates.") }
+            return ["total": mc ? multi.multicamTakeCandidates(plan: multi.multicamPausePlan).count : editor.takeCandidates.count]
+        case "playback_pause_skipping_set":
             guard let value = args["enabled"] as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else {
                 throw badInput("Supply a boolean for enabled.")
             }
@@ -473,8 +526,8 @@ extension ProjectSessions {
                 guard canSkip else { throw unavailable("Scan for pauses first.") }
             }
             if mc { multi.pauseEdits.skip = value.boolValue } else { editor.skipPauses = value.boolValue }
-        case "apply_pauses":
-            guard let mode = args["mode"] as? String, ["shorten", "queue"].contains(mode) else { throw badInput("Specify shorten or queue.") }
+        case "silence_editor_pauses_shorten", "silence_editor_takes_queue":
+            let mode = tool == "silence_editor_takes_queue" ? "queue" : "shorten"
             let queue = mode == "queue"
             let revision = session.mcpRevision
             if mc {
@@ -487,11 +540,11 @@ extension ProjectSessions {
                 }
             }
             let changed = session.mcpRevision != revision
-            var result: AnalysisObject = ["mode": mode, "queueCount": mc ? multi.queuedRanges.count : editor.queuedRanges.count,
-                                          "changed": changed, "historyRetained": changed && preferences.historyLimit > 0]
+            var result: AnalysisObject = ["mode": mode, "queue_count": mc ? multi.queuedRanges.count : editor.queuedRanges.count,
+                                          "changed": changed, "history_retained": changed && preferences.historyLimit > 0]
             if changed { result["warning"] = mc ? multi.notice?.message : editor.alert?.message }
             return result
-        case "save_analysis_sidecars":
+        case "analysis_editor_sidecars_save":
             guard mc ? multi.canSaveSidecars : editor.canSaveAnalysisSidecars else { throw unavailable("Wait for source indexing.") }
             let receipt = try mcpAnalysisJobs.reserve(session: session, kind: "sidecars")
             if mc { multi.mcpSidecarReceipt = receipt; multi.saveAnalysisSidecars() }
@@ -508,46 +561,24 @@ extension ProjectSessions {
 }
 
 @MainActor
-private func configureAnalysis(_ args: AnalysisObject, session: ProjectSession) throws {
-    let editor = session.editor, multi = session.multicam, mc = session.isMulticam
-    guard ["trackOrdinal", "minimumPause", "leavePause", "thresholdDB"].contains(where: { args[$0] != nil }) else {
-        throw badInput("Supply at least one analysis setting.")
-    }
-    let track: Int? = try args["trackOrdinal"].map { value in
-        guard !mc && !editor.audioTracks.isEmpty else { throw badInput("Only sequences support selecting a track ordinal.") }
-        return try integer(value, field: "trackOrdinal", range: 0...(editor.audioTracks.count - 1))
-    }
-    let minimum = try args["minimumPause"].map { try number($0, field: "minimumPause") }
-    let leave = try args["leavePause"].map { try number($0, field: "leavePause") }
-    let manual = try args["thresholdDB"].flatMap { $0 is NSNull ? nil : try number($0, field: "thresholdDB") }
-    if args["source"] != nil && (mc || args["thresholdDB"] == nil) {
-        throw badInput("Choose a source only when setting a sequence threshold.")
-    }
-    guard minimum.map({ $0 >= 1 / Double(AudioWaveform.rate) && $0 <= 86400 }) ?? true,
-          leave.map({ (0...86400).contains($0) }) ?? true, manual.map({ (-120...0).contains($0) }) ?? true else {
-        throw badInput("Check pause length, padding and threshold ranges.")
-    }
-    if mc {
-        if minimum != nil || args["thresholdDB"] != nil {
-            multi.configureSilenceAnalysis(minimum: minimum ?? multi.analysis.pauseMinimum,
-                                           threshold: args["thresholdDB"] == nil ? multi.analysis.pauseThreshold : manual)
-        }
-        if let leave { multi.preferences.leavePause = leave }
+private func setAnalysisThreshold(_ args: AnalysisObject, session: ProjectSession) throws {
+    guard let value = args["silence_threshold_db"] else { throw badInput("Supply a silence threshold or null for automatic detection.") }
+    let threshold = value is NSNull ? nil : try number(value, field: "silence_threshold_db")
+    guard threshold.map({ (-120...0).contains($0) }) ?? true else { throw badInput("Choose a threshold between −120 and 0 dBFS.") }
+    if session.isMulticam {
+        guard args["source_id"] == nil else { throw badInput("Choose a source only for a sequence threshold.") }
+        session.multicam.configureSilenceAnalysis(minimum: session.multicam.analysis.pauseMinimum, threshold: threshold)
     } else {
-        var thresholdSource: UUID?
-        if args["thresholdDB"] != nil {
-            if let supplied = args["source"] {
-                thresholdSource = (supplied as? String).flatMap(UUID.init(uuidString:))
-                guard thresholdSource != nil else { throw badInput("Supply a sequence source ID from analysis_state.") }
-            } else { thresholdSource = editor.analysisPlayheadSourceID }
-            guard let thresholdSource, editor.hasAnalysisTrack(track ?? editor.sourceAnalysisTracks[thresholdSource] ?? editor.analysisTrack, in: thresholdSource) else {
-                throw unavailable("The threshold source has no indexed audio on the selected track.")
-            }
+        let editor = session.editor
+        let source: UUID?
+        if let supplied = args["source_id"] {
+            guard let id = (supplied as? String).flatMap(UUID.init(uuidString:)) else { throw badInput("Supply a sequence source ID.") }
+            source = id
+        } else { source = editor.analysisPlayheadSourceID }
+        guard let source, editor.hasAnalysisTrack(editor.sourceAnalysisTracks[source] ?? editor.analysisTrack, in: source) else {
+            throw unavailable("The threshold source has no indexed audio on the selected track.")
         }
-        if let track { editor.chooseAnalysisTrack(track) }
-        if let minimum { editor.minimumPause = minimum }
-        if let leave { editor.leavePause = leave }
-        if let thresholdSource { editor.setAnalysisThreshold(manual, for: thresholdSource) }
+        editor.setAnalysisThreshold(threshold, for: source)
     }
 }
 
@@ -565,16 +596,25 @@ private func reviewPause(_ args: AnalysisObject, session: ProjectSession) throws
     let editor = session.editor, multi = session.multicam, mc = session.isMulticam
     if action == "done" {
         if mc { multi.pauseEdits.review = nil } else { editor.cutPreview = nil }
-    } else if ["nextCut", "keepAndAdvance"].contains(action) {
-        guard !mc && editor.cutPreview != nil else { throw unavailable("Open a sequence cut preview first.") }
-        editor.advanceCutPreview(keepingCurrent: action == "keepAndAdvance")
+    } else if ["next_cut", "keep_and_advance"].contains(action) {
+        guard !mc && editor.cutPreview?.pauseKey != nil else { throw unavailable("Open a sequence cut preview first.") }
+        editor.advanceCutPreview(keepingCurrent: action == "keep_and_advance")
     } else {
-        guard ["seek", "preview", "protect", "unprotect"].contains(action), let id = args["pause"] as? String else {
-            throw badInput("Supply a pause ID from list_pauses and a review action.")
+        guard ["seek", "preview", "protect", "unprotect", "set_retained", "reset_retained"].contains(action), let id = args["pause"] as? String else {
+            throw badInput("Supply a pause ID from silence_editor_pauses_list and a review action.")
         }
         if mc {
             guard let pause = multi.multicamPausePlan.first(where: { mcpPauseID($0, revision: session.mcpRevision) == id }) else {
-                throw unavailable("Refresh list_pauses.")
+                throw unavailable("Refresh silence_editor_pauses_list.")
+            }
+            if action == "set_retained" || action == "reset_retained" {
+                let seconds = action == "set_retained" ? try number(args["retained_seconds"], field: "retained_seconds") : nil
+                guard multi.pauseEdits.review == nil, multi.setPauseRetainedDuration(seconds, for: pause),
+                      let updated = multi.multicamPausePlan.first(where: { $0.id == pause.id }) else {
+                    throw badInput("Close the preview and supply a nonnegative retained duration for the detected pause.")
+                }
+                return ["review_open": false, "retained_seconds": updated.retainedSeconds,
+                        "requested_retained_seconds": updated.requestedRetainedSeconds.map { $0 as Any } ?? NSNull()]
             }
             if let review = multi.pauseEdits.review {
                 guard action == "protect", review.id == pause.id else {
@@ -582,7 +622,7 @@ private func reviewPause(_ args: AnalysisObject, session: ProjectSession) throws
                 }
                 multi.setPauseProtection(true, for: pause)
                 multi.pauseEdits.review = nil
-                return ["reviewOpen": false]
+                return ["review_open": false]
             }
             if action == "preview" {
                 multi.reviewMulticamPause(pause)
@@ -592,7 +632,16 @@ private func reviewPause(_ args: AnalysisObject, session: ProjectSession) throws
         } else {
             guard editor.cutPreview == nil, editor.pauseAnalysisReady,
                   let pause = editor.pausePlan.first(where: { mcpPauseID($0, revision: session.mcpRevision) == id }) else {
-                throw unavailable("Close the cut preview and refresh list_pauses.")
+                throw unavailable("Close the cut preview and refresh silence_editor_pauses_list.")
+            }
+            if action == "set_retained" || action == "reset_retained" {
+                let seconds = action == "set_retained" ? try number(args["retained_seconds"], field: "retained_seconds") : nil
+                guard editor.setPauseRetainedDuration(seconds, for: pause.key),
+                      let updated = editor.pausePlan.first(where: { $0.key == pause.key }) else {
+                    throw badInput("Supply a nonnegative retained duration for the detected pause.")
+                }
+                return ["review_open": false, "retained_seconds": updated.retainedSeconds,
+                        "requested_retained_seconds": updated.requestedRetainedSeconds.map { $0 as Any } ?? NSNull()]
             }
             editor.seek(pause.sequence.from.seconds)
             guard editor.currentPause.map({ mcpPauseID($0, revision: session.mcpRevision) }) == id else {
@@ -604,5 +653,5 @@ private func reviewPause(_ args: AnalysisObject, session: ProjectSession) throws
             } else if action != "seek" && pause.isProtected != (action == "protect") { editor.protectCurrentPause() }
         }
     }
-    return ["reviewOpen": mc ? multi.pauseEdits.review != nil : editor.cutPreview != nil]
+    return ["review_open": mc ? multi.pauseEdits.review != nil : editor.cutPreview != nil]
 }

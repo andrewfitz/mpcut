@@ -159,7 +159,7 @@ class MixedTimelineTests(unittest.TestCase):
         return report
 
     def export(self, output, clips, *flags, dry=False, ok=True, mode="encode"):
-        args = ["export", "--json", "--output", output, *flags]
+        args = ["export", "clips", "join", "--json", "--output", output, *flags]
         if mode:
             args += ["--mode", mode]
         if dry:
@@ -191,13 +191,13 @@ class MixedTimelineTests(unittest.TestCase):
         planned = self.export(output, clips, "--audio", "pcm", dry=True)
         written = self.export(output, clips, "--audio", "pcm")
         for report in (planned, written):
-            report.pop("dryRun")
+            report.pop("dry_run")
         self.assertEqual(planned, written, "A dry run and the export it plans report the same.")
         self.assert_clean()
         self.assert_decodes(output)
 
         self.assertEqual((written["width"], written["height"], written["mode"]), (*CANVAS, "encode"))
-        self.assertEqual(written["canvas"]["audio"], [{"sampleRate": 48000, "channels": 2, "layout": "stereo"}])
+        self.assertEqual(written["canvas"]["audio"], [{"sample_rate": 48000, "channels": 2, "layout": "stereo"}])
         warnings = "\n".join(written["warnings"])
         for expected in ["Sources differ in video codec, picture size, frame rate, pixel format",
                          "(clips 1 and 2); the whole timeline is re-encoded to 320×180.",
@@ -208,7 +208,7 @@ class MixedTimelineTests(unittest.TestCase):
             self.assertIn(expected, warnings)
         tier = written["tier"]
         self.assertEqual((tier["id"], tier["mode"]), ("reencode", "encode"))
-        mismatch = [factor for factor in tier["factors"] if factor["id"] == "join.streamMismatch"]
+        mismatch = [factor for factor in tier["factors"] if factor["id"] == "join_stream_mismatch"]
         self.assertEqual(len(mismatch), 1)
         self.assertEqual(mismatch[0]["forces"], "reencode")
         self.assertIn("Clips 1 and 2 differ in video codec, picture size", mismatch[0]["message"])
@@ -267,12 +267,12 @@ class MixedTimelineTests(unittest.TestCase):
         clips = [self.wide, self.portrait, self.silent]
         request = {"output": str(self.root / "request.mp4"), "mode": "encode",
                    "clips": [{"file": str(clip)} for clip in clips]}
-        planned = self.cli("export", "--json", "--stdin", "--dry-run", stdin=json.dumps(request))
-        written = self.cli("export", "--json", "--stdin", stdin=json.dumps(request))
+        planned = self.cli("export", "clips", "join", "--json", "--stdin", "--dry-run", stdin=json.dumps(request))
+        written = self.cli("export", "clips", "join", "--json", "--stdin", stdin=json.dumps(request))
         for report in (planned, written):
-            report.pop("dryRun")
+            report.pop("dry_run")
         self.assertEqual(planned, written)
-        self.assertEqual([(item["action"], item["track"]) for item in written["audioActions"]], [("aac", 1)])
+        self.assertEqual([(item["action"], item["track"]) for item in written["audio_actions"]], [("aac", 1)])
         output = self.root / "request.mp4"
         self.assert_decodes(output)
         video, audio = streams(output)
@@ -288,7 +288,7 @@ class MixedTimelineTests(unittest.TestCase):
             self.assertLess(abs(onset - (start + int(TONE_START * rate))), rate // 250)
             self.assertGreater(power(sound[start + rate:start + rate + 4800], frequency, rate), 0.15)
         # Without sidecars or JSON, people read the same warnings.
-        text = subprocess.run([CLI, "--no-sidecar", "export", "--dry-run", "--mode", "encode", "--output", self.root / "text.mp4",
+        text = subprocess.run([CLI, "--no-sidecar", "export", "clips", "join", "--dry-run", "--mode", "encode", "--output", self.root / "text.mp4",
                                "--clip", self.wide, "--clip", self.portrait], capture_output=True, text=True)
         self.assertEqual(text.returncode, 0, text.stderr)
         self.assertIn("the whole timeline is re-encoded to 320×180", text.stdout + text.stderr)
@@ -344,7 +344,7 @@ class MixedTimelineTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 output = self.root / "refused.mp4"
                 refused = self.export(output, clips, dry=True, ok=False, mode=mode)["error"]
-                self.assertEqual((refused["code"], refused["reason"], refused["segment"]), ("incompatible_clip", "join.streamMismatch", 2))
+                self.assertEqual((refused["code"], refused["reason"], refused["segment"]), ("incompatible_clip", "join_stream_mismatch", 2))
                 offers = refused["alternatives"]
                 self.assertEqual([offer["id"] for offer in offers], ["reencode"])
                 self.assertIn("the whole timeline is re-encoded", offers[0]["warnings"][0])
@@ -358,7 +358,7 @@ class MixedTimelineTests(unittest.TestCase):
 
     def test_audio_copy_is_refused_with_alternatives(self):
         refused = self.export(self.root / "copy.mov", [self.wide, self.portrait], "--audio", "copy", dry=True, ok=False)["error"]
-        self.assertEqual((refused["code"], refused["reason"], refused["segment"]), ("incompatible_clip", "join.streamMismatch", 2))
+        self.assertEqual((refused["code"], refused["reason"], refused["segment"]), ("incompatible_clip", "join_stream_mismatch", 2))
         self.assertIn("their sound cannot be copied", refused["message"])
         offers = refused["alternatives"]
         self.assertTrue(offers)
@@ -388,7 +388,7 @@ class MixedTimelineTests(unittest.TestCase):
                                      (self.pq, self.hlg, ("HDR (PQ)", "HDR (HLG)"))]:
             with self.subTest(first=first.name, second=second.name):
                 refused = self.export(self.root / "hdr.mov", [first, second], "--video", "hevc", dry=True, ok=False)["error"]
-                self.assertEqual((refused["code"], refused["reason"], refused["segment"]), ("incompatible_clip", "join.dynamicRange", 2))
+                self.assertEqual((refused["code"], refused["reason"], refused["segment"]), ("incompatible_clip", "join_dynamic_range", 2))
                 for word in (*words, first.name, second.name, "Clip 1", "clip 2"):
                     self.assertIn(word, refused["message"])
                 # No mode writes it, so nothing is offered.
@@ -401,16 +401,16 @@ class MixedTimelineTests(unittest.TestCase):
 
     def test_a_movie_and_a_sound_only_recording_are_refused(self):
         refused = self.export(self.root / "kinds.mp4", [self.wide, self.sound], dry=True, ok=False)["error"]
-        self.assertEqual((refused["code"], refused["reason"], refused["segment"]), ("incompatible_clip", "join.mediaType", 2))
+        self.assertEqual((refused["code"], refused["reason"], refused["segment"]), ("incompatible_clip", "join_media_type", 2))
         self.assertIn("sound.m4a", refused["message"])
         self.assertFalse(refused.get("alternatives"))
         for mode in (None, "copy", "smart"):
             refused = self.export(self.root / "kinds.mp4", [self.wide, self.sound], dry=True, ok=False, mode=mode)["error"]
-            self.assertEqual((refused["code"], refused["reason"]), ("incompatible_clip", "join.mediaType"))
+            self.assertEqual((refused["code"], refused["reason"]), ("incompatible_clip", "join_media_type"))
             self.assertFalse(refused.get("alternatives"))
         # A recording first makes it a sound export, which has no picture to join.
         refused = self.export(self.root / "kinds.m4a", [self.sound, self.wide], dry=True, ok=False, mode=None)["error"]
-        self.assertEqual((refused["code"], refused["reason"]), ("incompatible_clip", "join.mediaType"))
+        self.assertEqual((refused["code"], refused["reason"]), ("incompatible_clip", "join_media_type"))
 
     # MARK: Containers
 
@@ -426,7 +426,7 @@ class MixedTimelineTests(unittest.TestCase):
         self.export(self.root / "containers.mp4", clips[:2], mode="copy")
         self.assertEqual(frame_count(self.root / "containers.mp4"), 50)
         planned = self.export(self.root / "containers-dry.mkv", clips, mode="copy", dry=True)
-        self.assertEqual(planned["tier"]["id"], "trueLossless")
+        self.assertEqual(planned["tier"]["id"], "true_lossless")
         # Re-encode treats them as one format too: no canvas, no warning about differences.
         encoded = self.export(self.root / "containers-encode.mp4", clips, dry=True)
         self.assertNotIn("canvas", encoded)
@@ -436,8 +436,8 @@ class MixedTimelineTests(unittest.TestCase):
         # MP4 states "2 channels" for this AAC track where MOV states "stereo". The packets are identical, and the
         # copy check compares the layout the words stand for, so the two join like two files of one container.
         def layout(path):
-            audio_stream = next(s for s in self.cli("inspect", "--json", path)["media"]["streams"] if s["kind"] == "audio")
-            return audio_stream["channelLayout"]
+            audio_stream = next(s for s in self.cli("media", "inspect", "--json", path)["media"]["streams"] if s["kind"] == "audio")
+            return audio_stream["channel_layout"]
         self.assertEqual((layout(self.wide), layout(self.same_mov)), ("2 channels", "stereo"), "inspect reports what each file states")
 
         # The control: the same join made from two MP4 files, which always copied.
@@ -460,10 +460,10 @@ class MixedTimelineTests(unittest.TestCase):
                     output = self.root / f"sound-{first.suffix[1:]}.{container}"
                     for mode in ("copy", "smart"):
                         planned = self.export(output, clips, mode=mode, dry=True)
-                        self.assertEqual((planned["mode"], planned["tier"]["id"], planned["tier"]["factors"]), (mode, "trueLossless", []))
+                        self.assertEqual((planned["mode"], planned["tier"]["id"], planned["tier"]["factors"]), (mode, "true_lossless", []))
                     report = self.export(output, clips, mode="copy")
-                    self.assertEqual((report["mode"], Fraction(report["encodedDuration"]["numerator"],
-                                                               report["encodedDuration"]["denominator"])), ("copy", 0))
+                    self.assertEqual((report["mode"], Fraction(report["encoded_duration"]["numerator"],
+                                                               report["encoded_duration"]["denominator"])), ("copy", 0))
                     # The same pictures and the same compressed sound as the clips, in order.
                     self.assertEqual(frame_count(output), 50)
                     for track in ("v:0", "a:0"):
@@ -484,7 +484,20 @@ class MixedTimelineTests(unittest.TestCase):
         # Layouts that name different speakers still do not copy together.
         refused = self.export(self.root / "other.mp4", [(self.wide, "0", "1"), (self.other_sound, "1", "2")],
                               mode="copy", dry=True, ok=False)["error"]
-        self.assertEqual((refused["code"], refused["reason"]), ("incompatible_clip", "join.streamMismatch"))
+        self.assertEqual((refused["code"], refused["reason"]), ("incompatible_clip", "join_stream_mismatch"))
+        # Nor do two layouts of one channel count that name different speakers: 5.1 with back and with side surrounds.
+        def surround(name, layout):
+            path = self.root / name
+            mix = "|".join(f"c{channel}=c0" for channel in range(6))
+            ffmpeg(*picture("320x180", 25), "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+                   "-filter_complex", f"[1:a]pan={layout}|{mix}[a]", "-map", "0:v", "-map", "[a]", "-c:v", "libx264",
+                   "-preset", "ultrafast", "-g", "25", "-threads", "1", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", path)
+            return path
+        back, side = surround("back.mov", "5.1"), surround("side.mov", "5.1(side)")
+        self.assertEqual((layout(back), layout(side)), ("5.1", "5.1(side)"))
+        refused = self.export(self.root / "surround.mov", [(back, "0", "1"), (side, "1", "2")], mode="copy", dry=True, ok=False)["error"]
+        self.assertEqual((refused["code"], refused["reason"], refused["segment"]), ("incompatible_clip", "join_stream_mismatch", 2))
+        self.assertEqual(refused["message"], "Clip audio track 1 channel layout is 5.1(side). The sequence requires 5.1.")
         # Re-encode treats the two containers as one format, as before: no canvas.
         encoded = self.export(self.root / "sound-encode.mp4", [(self.wide, "0", "1"), (self.same_mov, "1", "2")], dry=True)
         self.assertNotIn("canvas", encoded)
@@ -494,7 +507,7 @@ class MixedTimelineTests(unittest.TestCase):
         # Interchange writes no media and already took clips in different formats: pinned, not changed.
         output = self.root / "mixed.fcpxml"
         request = {"output": str(output), "clips": [{"file": str(self.wide)}, {"file": str(self.prores)}]}
-        self.cli("resolve", "--json", "--stdin", stdin=json.dumps(request))
+        self.cli("project", "resolve", "export", "--json", "--stdin", stdin=json.dumps(request))
         import xml.etree.ElementTree as tree
         document = tree.parse(output).getroot()
         formats = {item.get("id"): (item.get("width"), item.get("height"), item.get("frameDuration")) for item in document.iter("format")}
@@ -510,9 +523,9 @@ class MixedTimelineTests(unittest.TestCase):
                  {"id": "two", "file": str(self.prores), "from": "1/2", "to": "3/2"},
                  {"id": "three", "file": str(self.portrait), "from": "0", "to": "1"}]
         project = self.root / "mixed.cut"
-        project.write_text(json.dumps({"format": "mpcut", "schemaVersion": 1, "kind": "sequence", "clips": clips}))
+        project.write_text(json.dumps({"format": "mpcut", "schema_version": 3, "kind": "sequence", "clips": clips}))
         output = self.root / "mixed-fcp.fcpxml"
-        self.assertEqual(self.cli("convert", project, "--to", "fcp", "--output", output, "--json")["warnings"], [])
+        self.assertEqual(self.cli("project", "convert", project, "--to", "fcp", "--output", output, "--json")["warnings"], [])
         import xml.etree.ElementTree as tree
         document = tree.parse(output).getroot()
         formats = {item.get("id"): (item.get("width"), item.get("height"), item.get("frameDuration")) for item in document.iter("format")}
@@ -525,10 +538,26 @@ class MixedTimelineTests(unittest.TestCase):
                                   ("prores.mov", ("640", "480", "1/24s"), "6", "1s", "1/2s", "1s"),
                                   ("portrait.mov", ("96", "160", "1/30s"), "1", "2s", "0s", "1s")])
         restored = self.root / "restored.cut"
-        self.assertEqual(self.cli("convert", output, "--output", restored, "--json")["warnings"], [])
+        self.assertEqual(self.cli("project", "convert", output, "--output", restored, "--json")["warnings"], [])
         back = json.loads(restored.read_text())["clips"]
         self.assertEqual([(Path(clip["file"]).name, clip["from"], clip["to"]) for clip in back],
                          [(Path(clip["file"]).name, clip["from"], clip["to"]) for clip in clips])
+
+        # Clips cut on their own frames can end between frames of the sequence, which runs at the first clip's rate.
+        # That is refused and names the cut. With the loss allowed the cut is rounded to a frame and warned about.
+        clips[1].update({"from": "1/24", "to": "13/24"})
+        clips[2].update({"from": "1/30", "to": "1"})
+        project.write_text(json.dumps({"format": "mpcut", "schema_version": 3, "kind": "sequence", "clips": clips}))
+        rounded = self.root / "rounded.fcpxml"
+        refused = self.cli("project", "convert", project, "--to", "fcp", "--output", rounded, "--json", ok=False)["error"]
+        self.assertEqual(refused["code"], "conversion_loss")
+        self.assertIn("Timeline cut at 3/2s rounds to 38/25s at 25 fps.", refused["message"])
+        self.assertFalse(rounded.exists())
+        warnings = self.cli("project", "convert", project, "--to", "fcp", "--allow-loss", "--output", rounded, "--json")["warnings"]
+        self.assertEqual(warnings, ["Timeline cut at 3/2s rounds to 38/25s at 25 fps.", "Timeline cut at 37/15s rounds to 62/25s at 25 fps."])
+        document = tree.parse(rounded).getroot()
+        self.assertEqual([(clip.get("offset"), clip.get("start"), clip.get("duration")) for clip in document.iter("asset-clip")],
+                         [("0s", "0s", "1s"), ("1s", "1/24s", "13/25s"), ("38/25s", "1/30s", "24/25s")])
 
     # MARK: Seamless splits
 
@@ -540,8 +569,8 @@ class MixedTimelineTests(unittest.TestCase):
             for container in ("mp4", "mov", "mkv"):
                 with self.subTest(mode=mode, container=container):
                     planned = self.export(self.root / f"split-dry.{container}", split, mode=mode, dry=True)
-                    self.assertEqual((planned["mode"], planned["tier"]["id"], planned["tier"]["factors"]), (mode, "trueLossless", []))
-                    self.assertEqual(planned["encodedDuration"], {"numerator": 0, "denominator": 1})
+                    self.assertEqual((planned["mode"], planned["tier"]["id"], planned["tier"]["factors"]), (mode, "true_lossless", []))
+                    self.assertEqual(planned["encoded_duration"], {"numerator": 0, "denominator": 1})
                     self.assertEqual(len(planned["segments"]), 1)
         for container in ("mp4", "mov"):
             whole, joined = self.root / f"whole.{container}", self.root / f"split.{container}"
@@ -555,12 +584,12 @@ class MixedTimelineTests(unittest.TestCase):
         removed = [(self.wide, "0", "13/25"), (self.wide, "14/25", "2")]
         refused = self.export(self.root / "removed.mp4", removed, mode="copy", dry=True, ok=False)["error"]
         self.assertEqual((refused["code"], refused["reason"], refused["segment"], refused["boundary"]),
-                         ("unsafe_boundary", "cut.videoEnd", 1, "to"))
+                         ("unsafe_boundary", "cut_video_end", 1, "to"))
         self.assertTrue(refused["nearest"])
         encoded = self.export(self.root / "removed.mp4", removed, mode="smart", dry=True)
         self.assertEqual(encoded["tier"]["id"], "lossless")
-        self.assertEqual([factor["id"] for factor in encoded["tier"]["factors"]], ["cut.videoEnd", "cut.videoStart"])
-        self.assertGreater(Fraction(encoded["encodedDuration"]["numerator"], encoded["encodedDuration"]["denominator"]), 0)
+        self.assertEqual([factor["id"] for factor in encoded["tier"]["factors"]], ["cut_video_end", "cut_video_start"])
+        self.assertGreater(Fraction(encoded["encoded_duration"]["numerator"], encoded["encoded_duration"]["denominator"]), 0)
 
     # MARK: Batches and interruption
 
@@ -572,7 +601,7 @@ class MixedTimelineTests(unittest.TestCase):
             if not link.exists():
                 os.link(original, link)
             sources.append(link)
-        args = [CLI, "--no-sidecar", "export", "--json", "--mode", "encode", "--audio", "aac", "--output", str(output)]
+        args = [CLI, "--no-sidecar", "export", "clips", "join", "--json", "--mode", "encode", "--audio", "aac", "--output", str(output)]
         for index, source in enumerate(sources):
             start = Fraction(index % 5, 5)
             args += ["--clip", str(source), "--from", str(start), "--to", str(start + Fraction(1, 5))]
@@ -593,7 +622,7 @@ class MixedTimelineTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         report = json.loads(done.stdout)
         self.assertEqual((report["width"], report["height"]), (160, 120))
-        self.assertEqual(report["canvas"]["colorMatrix"], "unknown")
+        self.assertEqual(report["canvas"]["color_matrix"], "unknown")
         self.assert_decodes(output)
         video, audio = streams(output)
         self.assertEqual((video["width"], video["height"]), (160, 120))

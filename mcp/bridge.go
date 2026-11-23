@@ -46,11 +46,13 @@ func callEditor(ctx context.Context, path, tool string, args json.RawMessage) (*
 	if len(args) == 0 {
 		args = json.RawMessage("{}")
 	}
-	frame, err := json.Marshal(request{1, tool, args})
-	if err != nil {
+	var frame bytes.Buffer
+	encoder := json.NewEncoder(&frame)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(request{2, tool, args}); err != nil {
 		return nil, err
 	}
-	if len(frame)+1 > maxFrame {
+	if frame.Len() > maxFrame {
 		return failure("request_too_large", "Reduce the request to less than 4 MiB."), nil
 	}
 	unavailable := func() *mcp.CallToolResult {
@@ -95,7 +97,7 @@ func callEditor(ctx context.Context, path, tool string, args json.RawMessage) (*
 		}
 		return failure("outcome_unknown", "MPCut did not return a complete, valid response. Inspect current state or retry with the identical operation ID and arguments."), nil
 	}
-	if _, err := conn.Write(append(frame, '\n')); err != nil {
+	if _, err := conn.Write(frame.Bytes()); err != nil {
 		return unknown()
 	}
 	reader := bufio.NewReader(io.LimitReader(conn, maxFrame))
@@ -108,20 +110,23 @@ func callEditor(ctx context.Context, path, tool string, args json.RawMessage) (*
 	}
 	hasObject := func(raw json.RawMessage) bool { return bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) }
 	var result *mcp.CallToolResult
+	var body json.RawMessage
 	switch {
 	case hasObject(response.Error) && response.Result == nil:
 		var reported editorError
 		if err := json.Unmarshal(response.Error, &reported); err != nil || reported.Code == "" || reported.Message == "" {
 			return unknown()
 		}
-		result = toolResult(response.Error, true)
-	case hasObject(response.Result) && response.Error == nil && tool == "review_frame":
+		body = response.Error
+		result = toolResult(body, true)
+	case hasObject(response.Result) && response.Error == nil && tool == "review_editor_frame_read":
 		result, err = reviewFrameResult(response.Result)
 		if err != nil {
 			return failure("invalid_result", "MPCut did not return a valid review JPEG. Request the frame again."), nil
 		}
 	case hasObject(response.Result) && response.Error == nil:
-		result = toolResult(response.Result, false)
+		body = response.Result
+		result = toolResult(body, false)
 	default:
 		return unknown()
 	}
@@ -130,15 +135,39 @@ func callEditor(ctx context.Context, path, tool string, args json.RawMessage) (*
 	// byte when escaped. Measure large results, reserving room for the RPC envelope.
 	const resultLimit = mcp.DefaultMaxLineLength - (4 << 10)
 	if len(reply)*12 >= resultLimit {
-		encoded, err := json.Marshal(result)
-		if err != nil {
-			return unknown()
+		minimum, maximum := 0, resultLimit
+		if body != nil {
+			minimum, maximum = toolResultSizeBounds(body)
 		}
-		if len(encoded) >= resultLimit {
+		if minimum < resultLimit && maximum >= resultLimit {
+			encoded, err := json.Marshal(result)
+			if err != nil {
+				return unknown()
+			}
+			minimum = len(encoded)
+		}
+		if minimum >= resultLimit {
 			return failure("response_too_large", "MPCut returned too much data for one MCP response. Request a smaller page when available. If you requested an edit, inspect its current state before retrying."), nil
 		}
 	}
 	return result, nil
+}
+
+// The standard result embeds a validated JSON object twice: as JSON and as text.
+// Ordinary ASCII takes at most one byte in JSON and two in text. HTML-sensitive
+// bytes always take six bytes in both copies. Allow the same upper bound for
+// each non-ASCII byte and reserve room for the result fields and content header.
+func toolResultSizeBounds(body json.RawMessage) (minimum, maximum int) {
+	htmlBytes, nonASCIIBytes := 0, 0
+	for _, b := range body {
+		switch {
+		case b == '<', b == '>', b == '&':
+			htmlBytes++
+		case b >= 0x80:
+			nonASCIIBytes++
+		}
+	}
+	return 12 * htmlBytes, 3*len(body) + 9*(htmlBytes+nonASCIIBytes) + 256
 }
 
 func ownedByCurrentUser(info os.FileInfo) bool {

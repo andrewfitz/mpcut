@@ -6,8 +6,8 @@ import AVFoundation
 func matchingMovieDescriptions(url: URL, trackID: CMPersistentTrackID) -> Bool {
     let asset = AVURLAsset(url: url)
     guard let track = asset.track(withTrackID: trackID), track.mediaType == .video else { return false }
-    let descriptions = track.formatDescriptions as! [CMVideoFormatDescription]
-    guard descriptions.count > 1, let first = descriptions.first else { return false }
+    guard let descriptions = track.formatDescriptions as? [CMVideoFormatDescription],
+          descriptions.count > 1, let first = descriptions.first else { return false }
 
     func properties(_ description: CMVideoFormatDescription) -> NSDictionary {
         let type = CMFormatDescriptionGetMediaSubType(description)

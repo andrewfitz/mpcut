@@ -22,7 +22,7 @@ def read_time(value):
 
 def ranges(placement):
     return [(read_time(span["output"]["from"]), read_time(span["output"]["to"]))
-            for span in placement["visibleOccurrences"]]
+            for span in placement["visible_occurrences"]]
 
 
 def png(color):
@@ -53,7 +53,7 @@ class StillProjectCLI(unittest.TestCase):
         return reply
 
     def sequence(self):
-        return {"format": "mpcut", "schemaVersion": 1, "kind": "sequence",
+        return {"format": "mpcut", "schema_version": 3, "kind": "sequence",
                 "clips": [{"id": identity, "file": "offline.mov", "from": "0", "to": "6"}
                           for identity in ("first", "second")]}
 
@@ -61,73 +61,113 @@ class StillProjectCLI(unittest.TestCase):
         self.project.write_text(json.dumps(self.sequence()))
         destination = self.root / "versions" / "covered.cut"
         destination.parent.mkdir()
-        cover = self.run_json("still", "add", "--project", "-", "--image", "photo.png",
-                              "--replace", "--clock", "sequence", "--from", "8", "--to", "10",
+        cover = self.run_json("still", "picture", "replace", "--project", "-", "--image", "photo.png",
+                              "--clock", "sequence", "--from", "8", "--to", "10",
                               "--out-project", destination, data=self.project.read_text())
         self.assertEqual(cover["duration"], {"numerator": 12, "denominator": 1})
         self.assertEqual(ranges(cover["placements"][0]), [(8, 10)])
-        self.assertEqual(cover["placements"][0]["authoredFragments"][0]["clipID"], "second")
+        self.assertEqual(cover["placements"][0]["authored_fragments"][0]["clip_id"], "second")
         self.assertEqual(cover["assets"][0]["file"], "../photo.png")
         saved = json.loads(destination.read_text())
-        self.assertEqual(saved["schemaVersion"], 2)
-        self.assertEqual([entry["source"]["id"] for entry in saved["clips"]], ["first", "second"])
+        self.assertEqual(saved["schema_version"], 4)
+        self.assertEqual([entry["id"] for entry in saved["clips"]], ["first", "second"])
         before = destination.read_bytes()
-        issue = self.run_json("still", "add", "--project", destination, "--asset", cover["assetID"],
-                              "--replace", "--clock", "sequence", "--from", "9", "--to", "11",
+        issue = self.run_json("still", "picture", "replace", "--project", destination, "--asset", cover["asset_id"],
+                              "--clock", "sequence", "--from", "9", "--to", "11",
                               "--in-place", success=False)["error"]
-        self.assertIn(cover["placementID"], issue["placementIDs"])
+        self.assertIn(cover["placement_id"], issue["placement_i_ds"])
         self.assertEqual(destination.read_bytes(), before)
 
-        title = self.run_json("still", "add", "--project", destination, "--asset", cover["assetID"],
-                              "--insert", "--clock", "sequence", "--at", "9", "--frames", "1",
+        title = self.run_json("still", "placement", "insert", "--project", destination, "--asset", cover["asset_id"],
+                              "--clock", "sequence", "--at", "9", "--frames", "1",
                               "--rate", "30000/1001", "--in-place")
-        insert_id = title["placementID"]
+        insert_id = title["placement_id"]
         self.assertEqual(read_time(title["duration"]), Fraction(361001, 30000))
         placements = {p["id"]: p for p in title["placements"]}
-        self.assertEqual(ranges(placements[cover["placementID"]]), [(8, 9),
+        self.assertEqual(ranges(placements[cover["placement_id"]]), [(8, 9),
                          (Fraction(271001, 30000), Fraction(301001, 30000))])
         self.assertEqual(ranges(placements[insert_id]), [(9, Fraction(271001, 30000))])
 
         self.image.unlink()
-        offline = self.run_json("still", "list", "--project", destination)
+        offline = self.run_json("still", "placement", "list", "--project", destination)
         self.assertTrue(offline["assets"][0]["offline"])
         repaired = self.root / "renamed.png"
         repaired.write_bytes(png((0, 170, 67)))
-        relinked = self.run_json("still", "relink", "--project", destination, "--asset", cover["assetID"],
+        relinked = self.run_json("still", "asset", "relink", "--project", destination, "--asset", cover["asset_id"],
                                  "--image", repaired, "--in-place")
         self.assertFalse(relinked["assets"][0]["offline"])
-        self.assertEqual(relinked["assets"][0]["id"], cover["assetID"])
+        self.assertEqual(relinked["assets"][0]["id"], cover["asset_id"])
         self.assertEqual(len(relinked["placements"]), 2)
 
-        reframed = self.run_json("still", "update", "--project", destination, "--placement",
-                                 cover["placementID"], "--fit", "fill", "--crop-x", "1/2",
+        reframed = self.run_json("still", "placement", "update", "--project", destination, "--placement",
+                                 cover["placement_id"], "--fit", "fill", "--crop-x", "1/2",
                                  "--crop-y", "0.3", "--in-place")
-        cover_row = next(row for row in reframed["placements"] if row["id"] == cover["placementID"])
+        cover_row = next(row for row in reframed["placements"] if row["id"] == cover["placement_id"])
         self.assertEqual(cover_row["framing"]["mode"], "fill")
         self.assertEqual(read_time(cover_row["framing"]["crop"]["x"]), Fraction(1, 2))
         self.assertEqual(read_time(cover_row["framing"]["crop"]["y"]), Fraction(3, 10))
 
-        deleted = self.run_json("still", "remove", "--project", destination, "--placement", insert_id, "--in-place")
+        deleted = self.run_json("still", "placement", "remove", "--project", destination, "--placement", insert_id, "--in-place")
         self.assertEqual(read_time(deleted["duration"]), 12)
         self.assertEqual(len(deleted["placements"]), 1)
 
+    def test_gap_save_as_copies_transcripts_only_when_published(self):
+        source = Path(__file__).resolve().parents[1] / "MPCutAppTests" / "Fixtures" / "Pause-Quiet.mov"
+        project = self.sequence()
+        project["clips"] = [{"id": "take", "file": str(source), "from": "0", "to": "2"}]
+        self.project.write_text(json.dumps(project))
+        subtitles = self.root / "take.srt"
+        subtitles.write_text("1\n00:00:00,000 --> 00:00:01,000\nOpening line.\n")
+        self.run_json("transcript", "attachment", "import", "--project", self.project,
+                      "--transcript", subtitles, "--in-place")
+        original = self.project.read_bytes()
+        blocked = self.root / "blocked.cut"
+        blocked.write_bytes(b"Keep this project unchanged")
+        insert = ("timeline", "gap", "insert", "--project", self.project, "--clock", "sequence",
+                  "--at", "0", "--frames", "3", "--rate", "30", "--out-project")
+        refused = self.run_json(*insert, blocked, success=False)
+        self.assertEqual(refused["error"]["code"], "destination_exists")
+        self.assertEqual(blocked.read_bytes(), b"Keep this project unchanged")
+        self.assertFalse(blocked.with_name(blocked.name + ".transcripts").exists())
+        copy = self.root / "gap.cut"
+        report = self.run_json(*insert, copy)
+        asset = report["timeline"]["transcripts"]["attachments"][0]["asset"]
+        self.assertEqual(asset, json.loads(copy.read_bytes())["transcripts"]["attachments"][0]["asset"])
+        self.assertEqual((self.root / asset["file"]).parent.name, copy.name + ".transcripts")
+        self.assertTrue((self.root / asset["file"]).is_file())
+        self.assertEqual(self.project.read_bytes(), original)
+
     def test_group_replacement_repeats_while_assembly_insert_appears_once(self):
-        project = {"format": "mpcut", "schemaVersion": 1, "kind": "multicam",
-                   "referenceAngle": "wide", "range": {"from": "0", "to": "8"},
+        project = {"format": "mpcut", "schema_version": 3, "kind": "multicam",
+                   "reference_angle_id": "wide", "group_range": {"from": "0", "to": "8"},
                    "angles": [{"id": "wide", "file": "camera.mov", "offset": "0"}],
-                   "audio": {"mode": "none"}, "switches": [{"at": "0", "angle": "wide"}],
+                   "audio": {"mode": "none"}, "switches": [{"group_time": "0", "angle_id": "wide"}],
                    "assembly": [{"from": "4", "to": "8"}] * 2}
         self.project.write_text(json.dumps(project))
-        photo = self.run_json("still", "add", "--project", self.project, "--image", self.image,
-                              "--replace", "--clock", "group", "--from", "5", "--to", "7", "--in-place")
-        title = self.run_json("still", "add", "--project", self.project, "--asset", photo["assetID"],
-                              "--insert", "--clock", "assembly", "--at", "4", "--duration", "1",
+        photo = self.run_json("still", "picture", "replace", "--project", self.project, "--image", self.image,
+                              "--clock", "group", "--from", "5", "--to", "7", "--in-place")
+        title = self.run_json("still", "placement", "insert", "--project", self.project, "--asset", photo["asset_id"],
+                              "--clock", "assembly", "--at", "4", "--duration", "1",
                               "--rate", "25", "--in-place")
-        report = self.run_json("inspect", "--project", self.project)
+        report = self.run_json("project", "inspect", "--project", self.project)
         self.assertEqual(read_time(report["duration"]), 9)
         placements = {p["id"]: p for p in report["placements"]}
-        self.assertEqual(ranges(placements[photo["placementID"]]), [(1, 3), (6, 8)])
-        self.assertEqual(ranges(placements[title["placementID"]]), [(4, 5)])
+        self.assertEqual(ranges(placements[photo["placement_id"]]), [(1, 3), (6, 8)])
+        self.assertEqual(ranges(placements[title["placement_id"]]), [(4, 5)])
+
+    def test_insert_checks_the_overridden_occurrence_camera(self):
+        camera = Path(__file__).resolve().parents[1] / "MPCutAppTests" / "Fixtures" / "ProRes-2997.mov"
+        project = {"format": "mpcut", "schema_version": 3, "kind": "multicam",
+                   "reference_angle_id": "wide", "group_range": {"from": "0", "to": "1/10"},
+                   "angles": [{"id": "wide", "file": "offline.mov"}, {"id": "close", "file": str(camera)}],
+                   "audio": {"mode": "none"}, "switches": [{"group_time": "0", "angle_id": "wide"}],
+                   "assembly": [{"kind": "group", "from": "0", "to": "1/10", "angle_id": "close"}]}
+        self.project.write_text(json.dumps(project))
+        result = self.run_json("timeline", "gap", "insert", "--project", self.project,
+                               "--clock", "assembly", "--at", "1/100", "--frames", "1",
+                               "--rate", "30", "--in-place", success=False)
+        self.assertEqual(result["error"]["code"], "invalid_still_boundary", result)
+        self.assertEqual(json.loads(self.project.read_bytes()), project)
 
     def test_offline_replacement_preserves_audio_and_stdin_parity(self):
         fixtures = Path(__file__).resolve().parents[1] / "MPCutAppTests" / "Fixtures"
@@ -136,36 +176,36 @@ class StillProjectCLI(unittest.TestCase):
         payload["clips"] = [{"id": "source", "file": str(camera), "from": "0", "to": "4"}]
         self.project.write_text(json.dumps(payload))
         before = self.project.read_bytes()
-        issue = self.run_json("still", "add", "--project", self.project, "--image", self.image,
-                              "--replace", "--clock", "sequence", "--from", "1/20", "--to", "3/10",
+        issue = self.run_json("still", "picture", "replace", "--project", self.project, "--image", self.image,
+                              "--clock", "sequence", "--from", "1/20", "--to", "3/10",
                               "--in-place", success=False)["error"]
         self.assertEqual(issue["code"], "invalid_still_boundary")
         self.assertEqual(self.project.read_bytes(), before)
-        authoring = self.run_json("still", "add", "--project", self.project, "--image", self.image,
-                                  "--replace", "--clock", "sequence", "--from", "1/10", "--to", "3/10",
+        authoring = self.run_json("still", "picture", "replace", "--project", self.project, "--image", self.image,
+                                  "--clock", "sequence", "--from", "1/10", "--to", "3/10",
                                   "--in-place")
-        self.assertEqual(authoring["colorPolicy"]["transfer"], "bt709")
+        self.assertEqual(authoring["color_policy"]["transfer"], "bt709")
         self.image.unlink()
         output = self.root / "sound.m4a"
-        preflight = self.run_json("export", "--project", self.project, "--tracks", "audio",
+        preflight = self.run_json("export", "project", "render", "--project", self.project, "--tracks", "audio",
                                    "--output", output, "--dry-run")
-        stdin = self.run_json("export", "--stdin", "--dry-run", data=json.dumps({
-            "project": str(self.project), "tracks": "audio", "output": str(output)}))
+        stdin = self.run_json("export", "project", "render", "--stdin", "--dry-run", data=json.dumps({
+            "project_path": str(self.project), "tracks": "audio", "output": str(output)}))
         self.assertEqual(preflight, stdin)
         self.assertFalse(output.exists())
         self.assertEqual(read_time(preflight["duration"]), 4)
-        self.assertEqual(read_time(preflight["generatedStillDuration"]), 0)
-        self.assertEqual([action["audio"] for action in preflight["audioActions"]], ["copy", "copy"])
+        self.assertEqual(read_time(preflight["generated_still_duration"]), 0)
+        self.assertEqual([action["audio"] for action in preflight["audio_actions"]], ["copy", "copy"])
 
     def test_still_only_project_review_with_two_times(self):
-        result = self.run_json("still", "create", "--out-project", self.project, "--image", self.image,
+        result = self.run_json("still", "project", "create", "--out-project", self.project, "--image", self.image,
                                "--width", 320, "--height", 180, "--rate", "25", "--codec", "h264",
                                "--container", "mp4", "--frames", 25)
         output = self.root / "review"
-        review = self.run_json("frames", "--project", self.project, "--clock", "sequence",
+        review = self.run_json("review", "frames", "export", "--project", self.project, "--clock", "sequence",
                                "--at", "0", "--at", "1", "--output", output)
         self.assertEqual(review, json.loads((output / "manifest.json").read_text()))
-        self.assertEqual([frame["placementID"] for frame in review["frames"]], [result["placementID"]] * 2)
+        self.assertEqual([frame["placement_id"] for frame in review["frames"]], [result["placement_id"]] * 2)
         for frame in review["frames"]:
             self.assertEqual((frame["width"], frame["height"]), (320, 180))
             self.assertEqual((output / frame["file"]).read_bytes()[:2], b"\xff\xd8")

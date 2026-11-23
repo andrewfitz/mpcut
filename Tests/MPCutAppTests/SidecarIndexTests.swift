@@ -44,10 +44,10 @@ final class SidecarIndexTests: XCTestCase {
             let restored = try XCTUnwrap(engine.cachedIndex(file), name)
             XCTAssertEqual(try json.encode(original), try json.encode(restored), name)
             let repacked = try AnalysisSidecar.indexSections(for: restored)
-            XCTAssertEqual(sections["index.frames.v1"], repacked["index.frames.v1"], name)
-            XCTAssertEqual(sections["index.audio.v1"], repacked["index.audio.v1"], name)
+            XCTAssertEqual(sections["media_index_frames.v1"], repacked["media_index_frames.v1"], name)
+            XCTAssertEqual(sections["media_index_audio.v1"], repacked["media_index_audio.v1"], name)
             func header(_ sections: [String: Data]) throws -> NSDictionary {
-                let data = try XCTUnwrap(sections["index.v1"])
+                let data = try XCTUnwrap(sections["media_index.v1"])
                 return try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? NSDictionary)
             }
             XCTAssertEqual(try header(sections), try header(repacked), name)
@@ -138,15 +138,15 @@ final class SidecarIndexTests: XCTestCase {
         let original = try CutEngine(useSidecar: false).inspect(file, keyframes: true)
         let sidecar = AnalysisSidecar(media: original)
         let sections = try AnalysisSidecar.indexSections(for: original)
-        try sidecar.save(["index.v1": try XCTUnwrap(sections["index.v1"])])
+        try sidecar.save(["media_index.v1": try XCTUnwrap(sections["media_index.v1"])])
         XCTAssertNil(try engine.cachedIndex(file))
         try sidecar.save(sections)
-        try sidecar.save(["index.frames.v1": Data(repeating: 0xff, count: original.frames.count * 8)])
+        try sidecar.save(["media_index_frames.v1": Data(repeating: 0xff, count: original.frames.count * 8)])
         XCTAssertNil(try engine.cachedIndex(file))
         XCTAssertEqual(try engine.inspect(file, keyframes: true).frames.count, original.frames.count)
         try sidecar.save(sections)
-        let audio = try XCTUnwrap(sections["index.audio.v1"])
-        try sidecar.save(["index.audio.v1": Data(audio.dropLast())])
+        let audio = try XCTUnwrap(sections["media_index_audio.v1"])
+        try sidecar.save(["media_index_audio.v1": Data(audio.dropLast())])
         var partial: [Double] = []
         XCTAssertNil(try engine.cachedIndex(file, progress: { partial.append($0) }))
         XCTAssertTrue(partial.contains { $0 > 0 })
@@ -158,7 +158,7 @@ final class SidecarIndexTests: XCTestCase {
         XCTAssertNotNil(try engine.cachedIndex(file))
     }
 
-    func testLegacyIndexRevisionRejectsMaskedCopyIssuesAndOldStandaloneClocks() throws {
+    func testMissingIndexRevisionRequiresFreshInspection() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -170,15 +170,15 @@ final class SidecarIndexTests: XCTestCase {
             let sections = try AnalysisSidecar.indexSections(for: original)
             try store.save(sections)
             XCTAssertNotNil(try engine.cachedIndex(file), name)
-            let data = try XCTUnwrap(sections["index.v1"])
+            let data = try XCTUnwrap(sections["media_index.v1"])
             var header = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
-            XCTAssertNotNil(header.removeValue(forKey: "probeRevision"))
+            XCTAssertNotNil(header.removeValue(forKey: "probe_revision"))
             func writeHeader() throws {
-                try store.save(["index.v1": PropertyListSerialization.data(fromPropertyList: header, format: .binary, options: 0)])
+                try store.save(["media_index.v1": PropertyListSerialization.data(fromPropertyList: header, format: .binary, options: 0)])
             }
             try writeHeader()
-            XCTAssertEqual(try engine.cachedIndex(file) != nil, original.hasVideo, name)
-            header["copyIssue"] = MediaInfo.auxiliaryTrackIssue
+            XCTAssertNil(try engine.cachedIndex(file), name)
+            header["copy_issue"] = MediaInfo.auxiliaryTrackIssue
             try writeHeader()
             XCTAssertNil(try engine.cachedIndex(file), name)
             XCTAssertEqual(try engine.inspect(file, keyframes: true).copyIssue, original.copyIssue, name)

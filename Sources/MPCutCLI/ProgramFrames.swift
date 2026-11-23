@@ -14,13 +14,14 @@ struct ProgramFrameManifest: Encodable {
         var source: String?
         var sourceTime: RationalTime?
         var frameTime: RationalTime?
+        var generatedGap: Bool?
     }
 
     let ok = true
-    let version = 1
+    let schemaVersion = 2
     let selection = "program"
     let clock: String
-    let project: String
+    let projectPath: String
     let outputDirectory: String
     let duration: RationalTime
     let preset: JPEGPreset
@@ -31,54 +32,87 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
                         at times: [RationalTime], clock: StillOptions.Clock?, to output: URL, preset: JPEGPreset,
                         documentIdentity: SourceIdentity?,
                         useSidecar: Bool, cancelled: @escaping @Sendable () -> Bool) throws -> ProgramFrameManifest {
-    let timeline = try project.resolveStills()
-    let engine = CutEngine(cancelled: cancelled, useSidecar: useSidecar, tracks: .video)
+    guard project.participants.render == nil else {
+        throw ParticipantProjectExport.unsupported("Program frame export")
+    }
     let sequence = project.sequenceClips
-    let clips = Dictionary(uniqueKeysWithValues: (sequence ?? []).map { ($0.id, $0) })
     let requiredClock: StillOptions.Clock = sequence == nil ? .assembly : .sequence
     guard clock == nil || clock == requiredClock else {
         throw CLIError("invalid_arguments", "Use --clock \(requiredClock.rawValue) for program frames in this project.")
     }
     try media.validateDestination(output, relativeTo: location, includesContents: true)
+    let timeline = try project.resolveStills()
+    let engine = CutEngine(cancelled: cancelled, useSidecar: useSidecar, tracks: .video)
+    let clips = Dictionary(uniqueKeysWithValues: (sequence ?? []).map { ($0.id, $0) })
 
     var identities: [URL: SourceIdentity] = [:]
     if let documentIdentity { identities[location] = documentIdentity }
+    func record(_ identity: SourceIdentity, at url: URL) throws {
+        if let original = identities[url] {
+            guard original.matchesSnapshot(identity) else {
+                throw CutError(code: "source_changed", message: "‘\(url.path)’ changed while exporting review frames.")
+            }
+        } else {
+            identities[url] = identity
+        }
+    }
     var indexed: [URL: MediaInfo] = [:]
     func inspect(_ url: URL, multicam: Bool) throws -> MediaInfo {
         if let cached = indexed[url] { return cached }
         let media = try multicam ? engine.inspectMulticamSource(url) : engine.inspect(url, keyframes: true)
         indexed[url] = media
-        identities[url] = media.identity
+        try record(media.identity, at: url)
         return media
     }
 
+    var canvasReference: MediaInfo?
     func reference() throws -> MediaInfo? {
+        if let canvasReference { return canvasReference }
         if let sequence {
             for clip in sequence {
                 let url = CutProject.mediaURL(clip.file, relativeTo: location)
                 guard (try? SourceIdentity(url)) != nil else { continue }
                 let media = try engine.inspectSummary(url)
                 if media.hasVideo {
-                    identities[url] = media.identity
+                    try record(media.identity, at: url)
+                    canvasReference = media
                     return media
                 }
             }
         } else if case .multicam(let multicam) = project,
                   let source = multicam.angles.first(where: { $0.id == multicam.referenceAngle }) {
             let url = multicam.sourceURL(for: source, relativeTo: location)
-            return try inspect(url, multicam: true)
+            let media = try engine.inspectSummary(url)
+            try record(media.identity, at: url)
+            canvasReference = media
+            return media
         }
         return nil
     }
 
     return try JPEGExport.writeProgramFrameDirectory(to: output, cancelled: cancelled, validate: {
         for (url, identity) in identities {
-            guard (try? SourceIdentity(url)) == identity else {
+            guard identity.isCurrentSnapshot(at: url) else {
                 throw CutError(code: "source_changed", message: "‘\(url.path)’ changed while exporting review frames.")
             }
         }
     }) { staging in
-        let frames = try times.enumerated().map { ordinal, time in
+        struct CameraRequest {
+            let ordinal: Int
+            let name: String
+            let requestedTime: RationalTime
+            let outputRange: MulticamRange
+            let sourceID: String
+            let sourceTime: RationalTime
+            let frameTime: RationalTime
+        }
+        var sourceBatchIndices: [URL: Int] = [:]
+        var sourceBatches: [(media: MediaInfo, requests: [CameraRequest])] = []
+        var renderedStills: [String: (url: URL, asset: String, width: Int, height: Int)] = [:]
+        var renderedGap: (url: URL, width: Int, height: Int)?
+        var recordingGaps: [MulticamRange]?
+        var frames = try times.enumerated().map { ordinal, time -> ProgramFrameManifest.Frame? in
+            if cancelled() { throw CutError(code: "cancelled", message: "Operation cancelled.") }
             guard let index = timeline.pictureIndex(at: time) else {
                 throw CutError(code: "invalid_range", message: "Frame time \(time) is outside the program.")
             }
@@ -86,11 +120,18 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
             let name = String(format: "frame-%06d.jpg", ordinal + 1)
             let destination = staging.appendingPathComponent(name)
             if let placement = span.placementID {
+                if let rendered = renderedStills[placement] {
+                    try FileManager.default.copyItem(at: rendered.url, to: destination)
+                    return ProgramFrameManifest.Frame(requestNumber: ordinal + 1, requestedTime: time, outputRange: span.output,
+                                                      file: name, width: rendered.width, height: rendered.height,
+                                                      placementID: placement, assetID: rendered.asset)
+                }
                 let frame = try project.stillReviewFrame(placementID: placement, interval: span.output, document: location,
                                                          canvas: project.stillFormat == nil ? reference() : nil)
                 let jpeg = try frame.jpeg(preset: preset, cancelled: cancelled)
                 try jpeg.data.write(to: destination, options: .withoutOverwriting)
-                identities[frame.url] = frame.identity
+                renderedStills[placement] = (destination, frame.asset.id, jpeg.width, jpeg.height)
+                try record(frame.identity, at: frame.url)
                 return ProgramFrameManifest.Frame(requestNumber: ordinal + 1, requestedTime: time, outputRange: span.output,
                                                   file: name, width: jpeg.width, height: jpeg.height,
                                                   placementID: placement, assetID: frame.asset.id)
@@ -105,15 +146,54 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
                 sourceID = clipID
                 sourceTime = try range.from.adding(local)
                 sourceMedia = try inspect(CutProject.checkedMediaURL(clip.file, relativeTo: location), multicam: false)
-            case .group(_, let range):
+            case .group(let occurrence, let range):
                 guard case .multicam(let multicam) = project else {
                     throw CutError(code: "no_frame", message: "The camera is unavailable.")
                 }
                 let groupTime = try range.from.adding(local)
-                let angle = time == timeline.duration ? multicam.switches.last { $0.at < groupTime }?.angle :
-                    multicam.selection(at: groupTime)?.angle
-                guard let camera = multicam.angles.first(where: { $0.id == angle }) else {
+                let atEnd = time == timeline.duration
+                let angle = multicam.pictureAngle(at: groupTime, in: occurrence, exclusiveEnd: atEnd)
+                guard let angle else {
                     throw CutError(code: "no_frame", message: "No camera is selected at group time \(groupTime).")
+                }
+                guard let camera = multicam.pictureSource(for: angle, at: groupTime, exclusiveEnd: atEnd) else {
+                    let mapping = try recordingGaps == nil ? multicam.plan() : nil
+                    if let mapping { recordingGaps = mapping.recordingGaps }
+                    let rendered: (url: URL, width: Int, height: Int)
+                    if let renderedGap {
+                        try FileManager.default.copyItem(at: renderedGap.url, to: destination)
+                        rendered = renderedGap
+                    } else {
+                        let canvas: MediaInfo?
+                        if project.stillFormat == nil,
+                           let referenceID = mapping?.picture.first?.source ?? mapping?.intervals.first?.angle,
+                           let source = multicam.sources.first(where: { $0.id == referenceID }) {
+                            let url = multicam.sourceURL(for: source, relativeTo: location)
+                            let info = try indexed[url] ?? engine.inspectSummary(url)
+                            try record(info.identity, at: url)
+                            canvas = info
+                        } else {
+                            canvas = try project.stillFormat == nil ? reference() : nil
+                        }
+                        guard let geometry = project.stillReviewGeometry(reference: canvas) else {
+                            throw CutError(code: "invalid_canvas", message: "The program needs a video reference for image dimensions.")
+                        }
+                        let asset = StillAsset(gapID: "recording-gap")
+                        let frame = try StillReviewFrame(asset: asset, placementID: asset.id, framing: .fit,
+                                                        interval: span.output, document: location, width: geometry.width,
+                                                        height: geometry.height, displayAspect: geometry.aspect)
+                        let jpeg = try frame.jpeg(preset: preset, cancelled: cancelled)
+                        try jpeg.data.write(to: destination, options: .withoutOverwriting)
+                        try record(frame.identity, at: frame.url)
+                        rendered = (destination, jpeg.width, jpeg.height)
+                        renderedGap = rendered
+                    }
+                    let gaps = recordingGaps ?? []
+                    let index = gaps.lowerBound { atEnd ? $0.to >= time : $0.to > time }
+                    let gap = gaps.indices.contains(index) ? gaps[index] : span.output
+                    let range = MulticamRange(from: max(gap.from, span.output.from), to: min(gap.to, span.output.to))
+                    return ProgramFrameManifest.Frame(requestNumber: ordinal + 1, requestedTime: time, outputRange: range,
+                                                      file: name, width: rendered.width, height: rendered.height, generatedGap: true)
                 }
                 sourceID = camera.id
                 sourceMedia = try inspect(multicam.sourceURL(for: camera, relativeTo: location), multicam: true)
@@ -121,14 +201,34 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
             case .insert:
                 throw CutError(code: "no_frame", message: "The still placement is unavailable.")
             }
-            let (jpeg, frame) = try JPEGExport.reviewFrame(sourceMedia, at: sourceTime, exclusiveEnd: time == timeline.duration,
-                                                           preset: preset, cancelled: cancelled)
-            try jpeg.write(to: destination, options: .withoutOverwriting)
-            return ProgramFrameManifest.Frame(requestNumber: ordinal + 1, requestedTime: time, outputRange: span.output,
-                                              file: name, width: frame.width, height: frame.height,
-                                              source: sourceID, sourceTime: sourceTime, frameTime: frame.frameTime)
+            let exclusiveEnd = time == timeline.duration
+            let frameTime = try JPEGExport.stillFrameTime(in: sourceMedia, at: sourceTime, exclusiveEnd: exclusiveEnd)
+            let batchIndex: Int
+            if let existing = sourceBatchIndices[sourceMedia.url] {
+                batchIndex = existing
+            } else {
+                batchIndex = sourceBatches.count
+                sourceBatchIndices[sourceMedia.url] = batchIndex
+                sourceBatches.append((sourceMedia, []))
+            }
+            sourceBatches[batchIndex].requests.append(CameraRequest(
+                ordinal: ordinal, name: name, requestedTime: time, outputRange: span.output,
+                sourceID: sourceID, sourceTime: sourceTime, frameTime: frameTime))
+            return nil
         }
-        return ProgramFrameManifest(clock: requiredClock.rawValue, project: projectPath, outputDirectory: output.path,
-                                    duration: timeline.duration, preset: preset, frames: frames)
+        for (media, requests) in sourceBatches {
+            let rendered = try JPEGExport.writeReviewFrames(media, at: requests.map(\.frameTime), preset: preset,
+                                                            cancelled: cancelled, fileName: { requests[$0].name }) { jpeg, name in
+                try jpeg.write(to: staging.appendingPathComponent(name), options: .withoutOverwriting)
+            }
+            for (request, frame) in zip(requests, rendered) {
+                frames[request.ordinal] = ProgramFrameManifest.Frame(
+                    requestNumber: request.ordinal + 1, requestedTime: request.requestedTime, outputRange: request.outputRange,
+                    file: request.name, width: frame.width, height: frame.height, source: request.sourceID,
+                    sourceTime: request.sourceTime, frameTime: request.frameTime)
+            }
+        }
+        return ProgramFrameManifest(clock: requiredClock.rawValue, projectPath: projectPath, outputDirectory: output.path,
+                                    duration: timeline.duration, preset: preset, frames: frames.compactMap { $0 })
     }
 }

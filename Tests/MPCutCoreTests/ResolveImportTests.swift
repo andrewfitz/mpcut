@@ -3,6 +3,19 @@ import XCTest
 @testable import MPCutCore
 
 final class ResolveImportTests: XCTestCase {
+    func testGeometryVerifiesAnInlineStillHold() throws {
+        let report = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: report) }
+        try "24\t1920\t1080\t24\nvideo\t0\t24\n".write(to: report, atomically: true, encoding: .utf8)
+        let doc = try XMLDocument(xmlString: """
+        <fcpxml><resources><format id="f" frameDuration="1/24s" width="1920" height="1080"/>
+        <asset id="r" hasVideo="1" duration="0s"/></resources><library><event><project>
+        <sequence format="f" duration="1s"><spine><video ref="r" offset="0s" duration="1s">
+        <adjust-conform type="fit"/></video></spine></sequence></project></event></library></fcpxml>
+        """, options: [])
+        XCTAssertEqual(try ResolveTimelineGeometry.verify(document: doc, report: report, allowLoss: false), [])
+    }
+
     func testArchiveVerificationDetectsDroppedAudioAndShiftedVideoCuts() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

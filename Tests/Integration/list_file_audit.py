@@ -28,15 +28,23 @@ class ListFileAudit(unittest.TestCase):
 
     def test_quoted_clip_path_can_begin_with_combining_mark(self):
         self.csv.write_bytes(f'\ufefffile,from,to\r\n"{self.source.name}",0,0.5\r\n'.encode())
-        plan = self.command("export", "--clips", self.csv, "--output", "output.mov",
+        plan = self.command("export", "clips", "join", "--clips", self.csv, "--output", "output.mov",
                             "--dry-run", "--no-sidecar")
         self.assertEqual(len(plan["segments"]), 1)
 
     def test_empty_csv_scene_number_uses_default(self):
         self.csv.write_text("start,end,view,number\n0,0.5,1,\n0.5,1,2,2\n")
-        plan = self.command("scenes", self.source, "--scenes-file", self.csv, "--export-to",
+        plan = self.command("scenes", "export", self.source, "--scenes-file", self.csv, "--export-to",
                             self.directory, "--tracks", "video", "--dry-run", "--no-sidecar")
         self.assertEqual(len(plan["outputs"]), 2)
+
+    def test_unknown_json_scene_number_field_is_rejected(self):
+        scenes = self.directory / "scenes.json"
+        scenes.write_text('[{"start":0,"end":0.5,"view":1,"numbr":7}]')
+        result = self.command("scenes", "export", self.source, "--scenes-file", scenes, "--export-to",
+                              self.directory, "--tracks", "video", "--dry-run", "--no-sidecar", status=2)
+        self.assertEqual(result["error"]["code"], "invalid_json")
+        self.assertIn("numbr", result["error"]["message"])
 
     def test_malformed_json_is_rejected_without_creating_output(self):
         path = self.directory / "clips.json"
@@ -44,13 +52,13 @@ class ListFileAudit(unittest.TestCase):
         for raw in (b"[" * 520, b'[{"file":"fake","file":"other"}]', b'["fake",]'):
             with self.subTest(raw=raw):
                 path.write_bytes(raw)
-                result = self.command("export", "--clips", path, "--output", output, status=2)
+                result = self.command("export", "clips", "join", "--clips", path, "--output", output, status=2)
                 self.assertEqual(result["error"]["code"], "invalid_list")
                 self.assertFalse(output.exists())
 
     def test_json_ranges_do_not_round_overprecise_numbers(self):
         ranges = self.directory / "ranges.json"
-        args = ("rearrange", self.source, "--ranges", ranges, "--output", "output.mov",
+        args = ("export", "ranges", "join", self.source, "--ranges", ranges, "--output", "output.mov",
                 "--dry-run", "--no-sidecar")
         ranges.write_text('[{"from":0,"to":5e-1}]')
         self.assertEqual(len(self.command(*args)["segments"]), 1)
@@ -62,8 +70,8 @@ class ListFileAudit(unittest.TestCase):
     def test_json_rational_components_cannot_underflow_to_zero(self):
         clips = self.directory / "clips.json"
         times = self.directory / "times.json"
-        clip_args = ("export", "--clips", clips, "--output", "output.mov", "--dry-run", "--no-sidecar")
-        time_args = ("frames", self.source, "--at-file", times, "--output", "frames", "--no-sidecar")
+        clip_args = ("export", "clips", "join", "--clips", clips, "--output", "output.mov", "--dry-run", "--no-sidecar")
+        time_args = ("review", "frames", "export", self.source, "--at-file", times, "--output", "frames", "--no-sidecar")
         valid = '{"numerator":1,"denominator":2}'
         invalid = '{"numerator":1e-1000,"denominator":1}'
         for rational, status in ((valid, 0), (invalid, 2)):

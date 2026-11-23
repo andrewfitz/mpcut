@@ -112,7 +112,7 @@ int mpcut_aac_packet(MPCutAAC *aac, AVPacket *packet, AVRational input_tb,
     AVRational sample_tb = {1, track->sample_rate};
     int64_t first = av_rescale_q(packet->pts, input_tb, sample_tb);
     int64_t length = av_rescale_q(packet->duration, input_tb, sample_tb);
-    if (packet->pts == AV_NOPTS_VALUE || packet->dts != packet->pts
+    if (packet->pts == AV_NOPTS_VALUE || first == AV_NOPTS_VALUE || packet->dts != packet->pts
         || length <= 0 || first > INT64_MAX - length || av_cmp_q(output_tb, sample_tb)) {
         return errorf(error, cap, "Invalid AAC sample timing on track %d", packet->stream_index);
     }
@@ -314,7 +314,7 @@ static uint8_t *write_edits(uint8_t *p, const AudioTrack *track) {
 }
 
 static int rewrite_track(Box trak, const MPCutAAC *aac, uint8_t **output,
-                         uint64_t *movie_duration, unsigned *patched) {
+                         uint64_t *movie_duration, unsigned *patched, uint8_t *seen) {
     Box header;
     uint32_t id;
     size_t duration_offset, duration_width;
@@ -331,6 +331,11 @@ static int rewrite_track(Box trak, const MPCutAAC *aac, uint8_t **output,
         memcpy(*output, trak.begin, size);
         *output += size;
     } else {
+        if (seen[id - 1]) {
+            return 0;
+        }
+        seen[id - 1] = 1;
+
         Box media, media_header;
         uint32_t timescale;
         size_t media_offset, media_width;
@@ -343,6 +348,9 @@ static int rewrite_track(Box trak, const MPCutAAC *aac, uint8_t **output,
 
         duration = 0;
         for (size_t i = 0; i < track->count; i++) {
+            if ((uint64_t)track->edits[i].duration > UINT64_MAX - duration) {
+                return 0;
+            }
             duration += (uint64_t)track->edits[i].duration;
         }
 
@@ -419,7 +427,8 @@ static int locate_movie(FILE *file, int require_final, off_t *offset, size_t *si
 }
 
 static int rewrite_movie(const MPCutAAC *aac, const uint8_t *original, size_t original_size,
-                         uint8_t *replacement, size_t *replacement_size, unsigned expected) {
+                         uint8_t *replacement, size_t *replacement_size, unsigned expected,
+                         uint8_t *seen) {
     const uint8_t *position = original;
     Box moov, movie_header;
     size_t duration_offset, duration_width;
@@ -442,7 +451,7 @@ static int rewrite_movie(const MPCutAAC *aac, const uint8_t *original, size_t or
             return 0;
         }
         if (child.type == BOX('t','r','a','k')) {
-            if (!rewrite_track(child, aac, &output, &movie_duration, &patched)) {
+            if (!rewrite_track(child, aac, &output, &movie_duration, &patched, seen)) {
                 return 0;
             }
         } else {
@@ -501,8 +510,10 @@ int mpcut_aac_finalize(MPCutAAC *aac, const char *path, char *error, size_t cap)
     if (ok) {
         original = malloc(original_size);
         replacement = malloc(original_size + (size_t)extra_size);
-        ok = original && replacement && fread(original, 1, original_size, file) == original_size
-            && rewrite_movie(aac, original, original_size, replacement, &replacement_size, expected);
+        uint8_t *seen = calloc(aac->track_count, sizeof(*seen));
+        ok = original && replacement && seen && fread(original, 1, original_size, file) == original_size
+            && rewrite_movie(aac, original, original_size, replacement, &replacement_size, expected, seen);
+        free(seen);
     }
     if (ok) {
         ok = !fseeko(file, offset, SEEK_SET)
@@ -592,6 +603,18 @@ static int read_source_track(MPCutAACSource *source, Box trak, uint32_t movie_ti
         return 1;
     }
 
+    Box tkhd;
+    uint32_t track_id;
+    size_t offset, field_width;
+    if (!find_box(trak, BOX('t','k','h','d'), &tkhd)
+        || !time_fields(tkhd, 8, &track_id, &offset, &field_width)
+        || !track_id || track_id > INT_MAX) {
+        return 0;
+    }
+    size_t index = 0;
+    while (index < clock_count && clocks[index].track_id != (int)track_id) index++;
+    if (index == clock_count) return 1;
+
     const uint8_t *start = elst.payload;
     if (elst.end - start < 8 || start[0] > 1) {
         return 0;
@@ -612,20 +635,14 @@ static int read_source_track(MPCutAACSource *source, Box trak, uint32_t movie_ti
         return media >= 0 && AV_RB32(start + 2 * width) == (1U << 16);
     }
 
-    Box tkhd, mdhd;
-    uint32_t track_id, media_timescale;
-    size_t offset, field_width;
-    if (!find_box(trak, BOX('t','k','h','d'), &tkhd)
-        || !time_fields(tkhd, 8, &track_id, &offset, &field_width)
-        || !find_box(mdia, BOX('m','d','h','d'), &mdhd)
+    Box mdhd;
+    uint32_t media_timescale;
+    if (!find_box(mdia, BOX('m','d','h','d'), &mdhd)
         || !time_fields(mdhd, 4, &media_timescale, &offset, &field_width)
-        || !track_id || track_id > INT_MAX || !media_timescale || media_timescale > INT_MAX
+        || !media_timescale || media_timescale > INT_MAX
         || AV_RB32(stsd.payload + 4) != 1) {
         return 0;
     }
-    size_t index = 0;
-    while (index < clock_count && clocks[index].track_id != (int)track_id) index++;
-    if (index == clock_count) return 1;
     int sample_rate = clocks[index].sample_rate;
     if (sample_rate <= 0) return 0;
     uint64_t media_duration = field_width == 8 ? AV_RB64(mdhd.begin + offset) : AV_RB32(mdhd.begin + offset);

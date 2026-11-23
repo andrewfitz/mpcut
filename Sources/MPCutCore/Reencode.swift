@@ -22,7 +22,7 @@ public enum ReencodeAudio: String, CaseIterable, Codable, Sendable {
     case aac, pcm
     case removeAudio = "remove"
     /// Audio-only conversion targets. Movie re-encoding does not write them.
-    case mp3, flac
+    case mp3, flac, opus
 
     /// The actions a movie re-encode accepts.
     public static var movieCases: [ReencodeAudio] { ExportRules.movieAudioActions }
@@ -188,7 +188,8 @@ public struct ReencodeEngine: Sendable {
             }
             segments.append(ResolvedSegment(file: file, from: from, to: to, outputStart: duration,
                                             tracks: tracks, sourceOrigin: info.origin,
-                                            lastVideoFrame: info.frames[upper - 1].time, reachesEnd: to == info.duration))
+                                            lastVideoFrame: info.frames[upper - 1].time, reachesEnd: to == info.duration,
+                                            sourceClipIndex: offset))
             duration = end
         }
         guard let reference else { throw CutError(code: "empty_edit", message: "Add at least one clip before exporting.") }
@@ -237,7 +238,7 @@ public struct ReencodeEngine: Sendable {
                 return ResolvedSegment(file: picture.file, from: picture.from, to: picture.to, outputStart: picture.outputStart,
                                        tracks: picture.tracks.filter { $0.kind == "video" } + sound,
                                        sourceOrigin: picture.sourceOrigin, lastVideoFrame: picture.lastVideoFrame,
-                                       reachesEnd: picture.reachesEnd)
+                                       reachesEnd: picture.reachesEnd, sourceClipIndex: picture.sourceClipIndex)
             }
         }
         let executable = verifyingEncoder ? try Self.findHelper(override: helper) : URL(fileURLWithPath: "/dev/null")

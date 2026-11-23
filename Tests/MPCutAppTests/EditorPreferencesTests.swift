@@ -6,6 +6,33 @@ import XCTest
 
 final class EditorPreferencesTests: XCTestCase {
     @MainActor
+    func testRecentFilesPersistPromoteAndClear() throws {
+        let suite = "mpcut.recents." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let files = RecentFiles(defaults: defaults)
+        let first = URL(fileURLWithPath: "/Movies/First.cut")
+        let second = URL(fileURLWithPath: "/Movies/Second.mov")
+        files.record([first, second, first])
+        files.record([second])
+        XCTAssertEqual(RecentFiles(defaults: defaults).urls, [second, first])
+        files.clear()
+        XCTAssertTrue(RecentFiles(defaults: defaults).urls.isEmpty)
+    }
+
+    @MainActor
+    func testPaddingIgnoresRetiredTotalAndStoresSecondsPerSide() throws {
+        let name = "mpcut.padding.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set(0.6, forKey: "leavePause")
+        let preferences = EditorPreferences(defaults: defaults)
+        XCTAssertEqual(preferences.padding, 0.2)
+        preferences.padding = 0
+        XCTAssertEqual(EditorPreferences(defaults: defaults).padding, 0)
+    }
+
+    @MainActor
     func testSteppingFromTypedLimitCommitsOnlyTheFinishedCount() async throws {
         _ = NSApplication.shared
         let settings = EditorPreferences()
@@ -73,15 +100,42 @@ final class EditorPreferencesTests: XCTestCase {
         XCTAssertEqual(EditorPreferences(defaults: defaults).historyLimit, 0)
         settings.historyLimit = -1
         XCTAssertEqual(observed, [500, 0])
-        defaults.set(1500, forKey: "historyLimit")
+        defaults.set(1500, forKey: "history_max_steps")
         XCTAssertEqual(EditorPreferences(defaults: defaults).historyLimit, 500)
-        XCTAssertEqual(defaults.integer(forKey: "historyLimit"), 500)
-        defaults.set("not a count", forKey: "historyLimit")
+        XCTAssertEqual(defaults.integer(forKey: "history_max_steps"), 500)
+        defaults.set("not a count", forKey: "history_max_steps")
         XCTAssertEqual(EditorPreferences(defaults: defaults).historyLimit, 50)
-        defaults.set(2.5, forKey: "historyLimit")
+        defaults.set(2.5, forKey: "history_max_steps")
         XCTAssertEqual(EditorPreferences(defaults: defaults).historyLimit, 50)
-        defaults.set(false, forKey: "historyLimit")
+        defaults.set(false, forKey: "history_max_steps")
         XCTAssertEqual(EditorPreferences(defaults: defaults).historyLimit, 50)
+    }
+
+    @MainActor
+    func testLoadingTemporaryDefaultsLeavesStoredPreferencesIntact() throws {
+        let name = "mpcut.preferences-overrides.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        defer {
+            // The argument domain is shared by all defaults instances in this process.
+            defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+            defaults.removePersistentDomain(forName: name)
+        }
+        defaults.set(true, forKey: "analysis_sidecar_reuse_enabled")
+        defaults.setVolatileDomain(["analysis_sidecar_reuse_enabled": "NO", "automation_local_mcp_enabled": "YES",
+                                    "history_max_steps": "1500"], forName: UserDefaults.argumentDomain)
+
+        let settings = EditorPreferences(defaults: defaults)
+        XCTAssertFalse(settings.useAnalysisSidecars)
+        XCTAssertTrue(settings.localMCPEnabled)
+        XCTAssertEqual(settings.historyLimit, 500)
+        XCTAssertEqual(defaults.persistentDomain(forName: name) as? [String: Bool],
+                       ["analysis_sidecar_reuse_enabled": true])
+
+        settings.localMCPEnabled = false
+        settings.historyLimit = 30
+        XCTAssertEqual(defaults.persistentDomain(forName: name)?["automation_local_mcp_enabled"] as? Bool, false)
+        XCTAssertEqual(defaults.persistentDomain(forName: name)?["history_max_steps"] as? Int, 30)
     }
 
     @MainActor
@@ -121,7 +175,7 @@ final class EditorPreferencesTests: XCTestCase {
         first.snapTarget = .scenes
         first.largeThumbnails = true
         second.minimumPause = 2
-        second.leavePause = 0.25
+        second.padding = 0.125
         multicam.useAnalysisSidecars = false
         settings.defaultExportMode = .copy
         first.preview.isMuted = true
@@ -132,7 +186,7 @@ final class EditorPreferencesTests: XCTestCase {
         XCTAssertTrue(second.largeThumbnails)
         XCTAssertTrue(multicam.preferences.largeThumbnails)
         XCTAssertEqual(first.minimumPause, 2)
-        XCTAssertEqual(first.leavePause, 0.25)
+        XCTAssertEqual(first.padding, 0.125)
         XCTAssertFalse(first.useAnalysisSidecars)
         XCTAssertFalse(second.useAnalysisSidecars)
         XCTAssertEqual(second.defaultExportMode, .copy)

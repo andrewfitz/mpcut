@@ -1,8 +1,8 @@
 {
   "name": "mpcut",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "author": { "name": "MPCut" },
-  "description": "Review and edit open MPCut timelines on your Mac.",
+  "description": "Review and edit live MPCut timelines, inspect saved media, export clips and exchange editable projects on your Mac.",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {

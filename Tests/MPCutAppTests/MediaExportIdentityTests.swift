@@ -65,6 +65,17 @@ final class MediaExportIdentityTests: XCTestCase {
         }
     }
 
+    func testStillExportVerifiesSourceAfterHardLinkCreation() throws {
+        try withRecording { source, directory in
+            let media = try CutEngine(useSidecar: false).inspect(source, keyframes: true)
+            let alias = directory.appendingPathComponent("alias.mov")
+            try FileManager.default.linkItem(at: source, to: alias)
+            let output = directory.appendingPathComponent("frame.jpg")
+            try JPEGExport.writeStill(media, at: .zero, to: output)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        }
+    }
+
     func testStillAndReviewExportRejectRemovedRecording() throws {
         try withRecording { source, directory in
             let media = try CutEngine(useSidecar: false).inspect(source, keyframes: true)

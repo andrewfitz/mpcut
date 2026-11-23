@@ -72,7 +72,7 @@ class DamagedPictureData(unittest.TestCase):
     def frames(self, source, *times):
         folder = tempfile.mkdtemp(dir=self.root)
         selection = [option for time in times for option in ("--at", time)]
-        code, report = self.mpcut("frames", "--json", "--no-sidecar", *selection,
+        code, report = self.mpcut("review", "frames", "export", "--json", "--no-sidecar", *selection,
                                   "--output", Path(folder) / "frames", source)
         return code, report
 
@@ -86,16 +86,16 @@ class DamagedPictureData(unittest.TestCase):
 
     def test_scenes_read_around_a_picture_the_hardware_decoder_rejects(self):
         for path in [self.h264, self.matroska, self.hevc, self.prores]:
-            code, report = self.mpcut("scenes", "--json", "--no-sidecar", path)
+            code, report = self.mpcut("scenes", "scan", "--json", "--no-sidecar", path)
             self.assertEqual(code, 0, (path, report))
-            self.assertEqual([s["startSeconds"] for s in report["scenes"]], [0, 3], path)
+            self.assertEqual([s["start_seconds"] for s in report["scenes"]], [0, 3], path)
 
     def test_default_frame_export_reads_around_the_damage(self):
         for path in [self.h264, self.matroska, self.hevc, self.prores]:
             folder = Path(tempfile.mkdtemp(dir=self.root)) / "frames"
-            code, report = self.mpcut("frames", "--json", "--no-sidecar", "--output", folder, path)
+            code, report = self.mpcut("review", "frames", "export", "--json", "--no-sidecar", "--output", folder, path)
             self.assertEqual(code, 0, (path, report))
-            self.assertEqual([f["frameTime"] for f in report["frames"]],
+            self.assertEqual([f["frame_time"] for f in report["frames"]],
                              [{"numerator": 37, "denominator": 25}, {"numerator": 112, "denominator": 25}], path)
             self.assertEqual(sorted(p.name for p in folder.iterdir()),
                              ["frame-000001.jpg", "frame-000002.jpg", "manifest.json"])
@@ -105,7 +105,7 @@ class DamagedPictureData(unittest.TestCase):
         for path in [self.h264, self.matroska]:
             code, report = self.frames(path, "0.5", "1.5", "2.5", "3.5", "5")
             self.assertEqual(code, 0, (path, report))
-            self.assertEqual([f["frameTime"]["numerator"] / f["frameTime"]["denominator"] for f in report["frames"]],
+            self.assertEqual([f["frame_time"]["numerator"] / f["frame_time"]["denominator"] for f in report["frames"]],
                              [0.48, 1.48, 2.48, 3.48, 5], path)
         code, report = self.frames(self.prores, "0.5", "1.56", "1.64", "5")
         self.assertEqual(code, 0, report)
@@ -151,7 +151,7 @@ class DamagedPictureData(unittest.TestCase):
         source = self.root / "ambient.mov"
         run([FFMPEG, "-v", "error", "-r", "25", "-i", elementary, "-c", "copy", "-tag:v", "hvc1", source])
         output = self.root / "ambient-cut.mov"
-        code, report = self.mpcut("export", "--json", "--no-sidecar", "--mode", "smart", "--output", output,
+        code, report = self.mpcut("export", "clips", "join", "--json", "--no-sidecar", "--mode", "smart", "--output", output,
                                   "--clip", source, "--from", "1/25", "--to", "12/25")
         self.assertEqual(code, 1, report)
         self.assertIn("metadata", report["error"]["message"])
@@ -159,7 +159,7 @@ class DamagedPictureData(unittest.TestCase):
 
     def test_a_refused_picture_leaves_no_folder(self):
         folder = Path(tempfile.mkdtemp(dir=self.root))
-        code, _ = self.mpcut("frames", "--json", "--no-sidecar", "--at", "0.5", "--at", "1.7",
+        code, _ = self.mpcut("review", "frames", "export", "--json", "--no-sidecar", "--at", "0.5", "--at", "1.7",
                              "--output", folder / "frames", self.h264)
         self.assertEqual(code, 1)
         self.assertEqual(list(folder.iterdir()), [])
@@ -169,7 +169,7 @@ class DamagedPictureData(unittest.TestCase):
             garbage = self.root / ("garbage-" + source.name)
             garbage.write_bytes(source.read_bytes())
             damage_payload(garbage, range(150))
-            code, report = self.mpcut("scenes", "--json", "--no-sidecar", garbage)
+            code, report = self.mpcut("scenes", "scan", "--json", "--no-sidecar", garbage)
             self.assertEqual((code, report["ok"], report["error"]["code"]),
                              (1, False, "scene_analysis_failed"), source)
             code, report = self.frames(garbage, "3")
@@ -212,7 +212,7 @@ class SelectedTrackIssue(unittest.TestCase):
         cls.second.write_bytes(without_durations([2]))
 
     def export(self, source, stream, *options):
-        result = run([CLI, "export", "--json", "--dry-run", *options, "--tracks", "audio", "--audio-stream", str(stream),
+        result = run([CLI, "export", "clips", "join", "--json", "--dry-run", *options, "--tracks", "audio", "--audio-stream", str(stream),
                       "--output", self.root / "out.m4a", "--clip", source], check=False)
         return result.returncode, json.loads(result.stdout)
 
@@ -224,7 +224,7 @@ class SelectedTrackIssue(unittest.TestCase):
         code, report = self.export(self.second, 1, "--no-sidecar")
         self.assertEqual(code, 0, report)
         output = self.root / "healthy.m4a"
-        run([CLI, "export", "--no-sidecar", "--tracks", "audio", "--audio-stream", "1",
+        run([CLI, "export", "clips", "join", "--no-sidecar", "--tracks", "audio", "--audio-stream", "1",
              "--output", output, "--clip", self.second])
 
         def payload_hashes(file):
@@ -237,7 +237,7 @@ class SelectedTrackIssue(unittest.TestCase):
         self.assertEqual(payload_hashes(output), original)
 
     def test_saved_index_keeps_each_track_issue(self):
-        result = run([CLI, "sidecar", "--json", "--only", "index", self.both], check=False)
+        result = run([CLI, "analysis", "sidecar", "build", "--json", "--only", "index", self.both], check=False)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertTrue(Path(str(self.both) + ".cutdb").exists())
         for stream in [1, 2]:
@@ -252,13 +252,14 @@ class MissingProject(unittest.TestCase):
             missing = Path(scratch) / "missing.cut"
             for project in [missing, Path(scratch)]:
                 codes = []
-                for command in [["inspect", "--json", "--project", project],
-                                ["frames", "--json", "--project", project, "--at", "1",
+                for command in [["project", "inspect", "--json", "--project", project],
+                                ["review", "frames", "export", "--json", "--project", project, "--at", "1",
                                  "--output", Path(scratch) / "frames"]]:
                     result = run([CLI, *command], check=False)
                     report = json.loads(result.stdout)
                     codes.append((result.returncode, report["error"]["code"]))
-                self.assertEqual(codes, [(1, "cut_project_read_failed"), (1, "multicam_project_read_failed")], project)
+                # Every project command reports the same unreadable file the same way.
+                self.assertEqual(codes, [(1, "cut_project_read_failed"), (1, "cut_project_read_failed")], project)
             self.assertFalse((Path(scratch) / "frames").exists())
 
 

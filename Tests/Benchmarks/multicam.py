@@ -4,12 +4,15 @@
 import argparse
 from fractions import Fraction
 import json
+import os
 from pathlib import Path
-import re
+import signal
 import statistics
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Integration"))
 from media_regression import audio, ffmpeg, packets, probe, ratio  # noqa: E402
@@ -37,12 +40,12 @@ def make_fixture(directory, duration):
     step = duration // (SWITCH_COUNT + 1)
     split = 10 * step + step // 2
     project = {
-        "format": "mpcut", "schemaVersion": 1, "kind": "multicam", "referenceAngle": "wide",
-        "range": {"from": "0", "to": str(duration)},
+        "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "wide",
+        "group_range": {"from": "0", "to": str(duration)},
         "angles": [{"id": angle, "file": f"{angle}.mov", "offset": "0"} for angle in ANGLE_IDS],
-        "audioSources": [{"id": "lav", "file": "lav.wav", "offset": "0"}],
-        "audio": {"mode": "fixed", "source": "lav", "stream": 0},
-        "switches": [{"at": str(number * step), "angle": ANGLE_IDS[number % len(ANGLE_IDS)]}
+        "audio_sources": [{"id": "lav", "file": "lav.wav", "offset": "0"}],
+        "audio": {"mode": "fixed", "source_id": "lav", "audio_stream_index": 0},
+        "switches": [{"group_time": str(number * step), "angle_id": ANGLE_IDS[number % len(ANGLE_IDS)]}
                      for number in range(SWITCH_COUNT + 1)],
         "assembly": [{"from": str(split), "to": str(duration)}, {"from": "0", "to": str(split)}],
     }
@@ -51,19 +54,45 @@ def make_fixture(directory, duration):
     return project_path
 
 
-def timed(cli, *args):
-    result = subprocess.run(["/usr/bin/time", "-lp", cli, *args, "--json"],
-                            capture_output=True, text=True, timeout=600)
-    if result.returncode:
-        raise RuntimeError(f"{args} failed: {result.stdout}\n{result.stderr}")
-    report = json.loads(result.stdout)
+def timed(cli, *args, timeout=600):
+    command = [cli, *args, "--json"]
+    with tempfile.TemporaryFile(mode="w+") as stdout, tempfile.TemporaryFile(mode="w+") as stderr:
+        started = time.perf_counter()
+        with subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True) as child:
+            expired = threading.Event()
+
+            def kill_group():
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+            def expire():
+                expired.set()
+                kill_group()
+
+            watchdog = threading.Timer(timeout, expire)
+            watchdog.start()
+            try:
+                _, status, usage = os.wait4(child.pid, 0)
+                child.returncode = os.waitstatus_to_exitcode(status)
+            except BaseException:
+                kill_group()
+                raise
+            finally:
+                watchdog.cancel()
+                watchdog.join()
+            seconds = time.perf_counter() - started
+        stdout.seek(0)
+        stderr.seek(0)
+        if expired.is_set() and child.returncode == -signal.SIGKILL:
+            raise subprocess.TimeoutExpired(command, timeout, output=stdout.read(), stderr=stderr.read())
+        if child.returncode:
+            raise RuntimeError(f"{args} failed: {stdout.read()}\n{stderr.read()}")
+        report = json.load(stdout)
     if not report["ok"]:
         raise RuntimeError(report)
-    seconds = re.search(r"^real ([\d.]+)$", result.stderr, re.MULTILINE)
-    rss = re.search(r"^\s*(\d+)\s+maximum resident set size$", result.stderr, re.MULTILINE)
-    if not seconds or not rss:
-        raise RuntimeError(f"unable to read macOS time statistics: {result.stderr}")
-    return report, {"seconds": float(seconds[1]), "peakRssBytes": int(rss[1])}
+    return report, {"seconds": seconds, "peakRssBytes": usage.ru_maxrss}
 
 
 def summarize(samples):
@@ -83,8 +112,8 @@ def verify_media(project_path, output, plan):
     angle_packets = {
         angle["id"]: packets(project_path.parent / angle["file"]) for angle in project["angles"]
     }
-    selections = [(int(switch["at"]), switch["angle"]) for switch in project["switches"]]
-    group_end = int(project["range"]["to"])
+    selections = [(int(switch["group_time"]), switch["angle_id"]) for switch in project["switches"]]
+    group_end = int(project["group_range"]["to"])
     switch_ends = [start for start, _ in selections[1:]] + [group_end]
     source_pcm = audio(project_path.parent / "lav.wav")
     expected_pcm = bytearray()
@@ -109,7 +138,8 @@ def verify_media(project_path, output, plan):
                                      "output": interval_json(timeline_start, timeline_start + upper - lower)})
             expected_hashes.extend(p["data_hash"] for p in angle_packets[angle][lower * FPS:upper * FPS])
         output_start = output_end
-    if plan["picture"] != expected_picture or plan["audio"] != expected_audio:
+    lane, = plan["audio_lanes"]
+    if plan["picture"] != expected_picture or lane["spans"] != expected_audio:
         raise AssertionError("CLI plan disagrees with the source intervals")
     actual_packets = packets(output)
     if [p["data_hash"] for p in actual_packets] != expected_hashes:
@@ -125,29 +155,54 @@ def verify_media(project_path, output, plan):
 
 
 def review_frames(cli, project, output):
-    duration = int(json.loads(project.read_text())["range"]["to"])
+    duration = int(json.loads(project.read_text())["group_range"]["to"])
     times = [Fraction(duration * index, 5) + Fraction(17, 100) for index in range(5)]
     flags = [flag for time in times for flag in ("--at", str(time))]
-    report, metrics = timed(cli, "frames", "--project", project, "--output", output, *flags)
+    report, metrics = timed(cli, "review", "frames", "export", "--project", project, "--output", output, *flags)
     rows = report["frames"]
     expected_order = [(time, angle) for time in times for angle in ANGLE_IDS]
-    if [(ratio(row["groupTime"]), row["angleID"]) for row in rows] != expected_order:
+    if [(ratio(row["group_time"]), row["angle_id"]) for row in rows] != expected_order:
         raise AssertionError("multicam review did not return every requested time and angle")
-    for row, (time, _) in zip(rows, expected_order):
+    files = set()
+    sample = ("-frames:v", "1", "-vf", "scale=64:36", "-pix_fmt", "rgb24", "-f", "rawvideo", "-")
+    for row, (time, angle) in zip(rows, expected_order):
         frame_time = Fraction(time * FPS // 1, FPS)
-        if (row["availability"] != "available" or ratio(row["frameTime"]) != frame_time
-                or not (output / row["file"]).is_file()):
+        jpeg = (output / row["file"]).resolve()
+        if (row["availability"] != "available" or ratio(row["frame_time"]) != frame_time
+                or jpeg.parent != output.resolve() or jpeg in files):
             raise AssertionError(f"multicam review returned an unexpected frame for {time}")
+        files.add(jpeg)
+        encoded = jpeg.read_bytes()
+        if not encoded.startswith(b"\xff\xd8") or not encoded.endswith(b"\xff\xd9"):
+            raise AssertionError(f"invalid JPEG for {angle} at {time}")
+        actual = ffmpeg("-xerror", "-i", jpeg, *sample)
+        source = project.parent / f"{angle}.mov"
+        reference = ffmpeg("-ss", f"{float(frame_time):.2f}", "-i", source, *sample)
+        if len(actual) != 64 * 36 * 3 or len(reference) != len(actual):
+            raise AssertionError(f"could not decode both pictures for {angle} at {time}")
+        mean_error = sum(abs(a - b) for a, b in zip(actual, reference)) / len(reference)
+        if mean_error > 12:
+            raise AssertionError(f"JPEG pixels differ from {angle} at {time} (mean error {mean_error:.2f})")
     return {**metrics, "verifiedJpegs": len(rows)}
 
 
 def benchmark(cli, project, runs, scratch):
     assets = [project.parent / f"{angle}.mov" for angle in ANGLE_IDS] + [project.parent / "lav.wav"]
     sidecars = [path.with_name(path.name + ".cutdb") for path in assets]
-    if any(path.exists() for path in sidecars):
+    sidecar_files = [path.with_name(path.name + suffix)
+                     for path in sidecars for suffix in ("", "-wal", "-shm", "-journal")]
+    if any(path.exists() or path.is_symlink() for path in sidecar_files):
         raise ValueError("benchmark requires generated source files without sidecars")
+    try:
+        return benchmark_exports(cli, project, runs, scratch, assets, sidecars)
+    finally:
+        for path in sidecar_files:
+            path.unlink(missing_ok=True)
+
+
+def benchmark_exports(cli, project, runs, scratch, assets, sidecars):
     output = scratch / "program.mov"
-    export = ("export", "--project", project, "--mode", "copy", "--output", output)
+    export = ("export", "project", "render", "--project", project, "--mode", "copy", "--output", output)
     first_report, first_metrics = timed(cli, *export, "--dry-run", "--no-sidecar")
     if output.exists():
         raise AssertionError("preflight created an output file")
@@ -163,7 +218,7 @@ def benchmark(cli, project, runs, scratch):
 
     build = {}
     for asset in assets:
-        _, metrics = timed(cli, "sidecar", "--only", "index", asset)
+        _, metrics = timed(cli, "analysis", "sidecar", "build", "--only", "index", asset)
         build[asset.name] = metrics
     if not all(path.is_file() for path in sidecars):
         raise AssertionError("missing source index sidecars")
@@ -206,7 +261,7 @@ def main():
     if not options.fixture_only and not options.mpcut:
         parser.error("provide the mpcut executable")
     if not options.fixture_only and sys.platform != "darwin":
-        parser.error("timing currently requires macOS /usr/bin/time")
+        parser.error("timing currently requires macOS")
 
     with tempfile.TemporaryDirectory(prefix="mpcut-multicam-benchmark-") as scratch:
         scratch = Path(scratch)

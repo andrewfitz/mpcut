@@ -2,9 +2,9 @@ import MPCutCore
 import SwiftUI
 
 // The tier badge of the multicam editor. The tier comes from MulticamEngine.tier, which asks the engine for each
-// mode of the export rules in order. The editor shows the badge and does not ask before an edit lowers it:
-// `MulticamEditorModel.edit` applies a change at once and returns whether it did, and the program is planned off
-// the main thread, so there is no single point where an edit could wait for an answer.
+// mode of the export rules in order. `MulticamEditorModel.edit` applies a change at once and the program is planned
+// off the main thread, so no edit waits for an answer: the tier that arrives is handed to MulticamTierGate, which
+// asks when edits made by hand lowered it.
 
 extension MulticamEditorModel {
     /// The tier a caller may rely on: nil while it is being checked.
@@ -35,6 +35,9 @@ extension MulticamEditorModel {
             return
         }
         let generation = tierGeneration, token = EditCancellation()
+        let documentURL = projectURL
+        let useSidecars = useAnalysisSidecars
+        let excluded = AnalysisSidecar.excludedSources.union(sidecarExclusions)
         tierToken = token
         tierIsCurrent = false
         if tierState == nil { tierState = .checking }
@@ -43,18 +46,24 @@ extension MulticamEditorModel {
             try? await Task.sleep(for: .milliseconds(120))
             guard let self, self.tierGeneration == generation, !token.isCancelled else { return }
             let state = await Task.detached(priority: .utility) {
-                MulticamEngine(cancelled: { token.isCancelled }).tier(project, indexedSources: indexed)
+                AnalysisSidecar.$excludedSources.withValue(excluded) {
+                    AnalysisSidecar.$readsEnabled.withValue(useSidecars) {
+                        MulticamEngine(cancelled: { token.isCancelled }).tier(project, relativeTo: documentURL, indexedSources: indexed)
+                    }
+                }
             }.value
             guard self.tierGeneration == generation, !token.isCancelled else { return }
             self.tierToken = nil
             self.tierIsCurrent = true
             self.tierState = state
+            self.tierGate.settled(self)
         }
     }
 
     /// Selects the assembly range a factor belongs to.
     func goToTierFactor(_ factor: TierFactor) {
-        guard !isBusy, let number = factor.segment, assemblyItems.indices.contains(number - 1) else { return }
+        guard !isBusy, tierIsCurrent, let number = factor.segment, number > 0,
+              assemblyItems.indices.contains(number - 1) else { return }
         selectAssemblyOccurrence(number - 1)
     }
 }
@@ -67,10 +76,10 @@ struct MulticamTierBadge: View {
         if let state = model.tierState {
             TierBadge(state: state, help: Self.help(state)) { dismiss in
                 TierDetails(state: state, summary: Self.summary(state), title: { $0 == 0 ? "Program" : "Range \($0)" },
-                            segmentName: "range", canGo: !model.isBusy, go: { factor in
+                            segmentName: "range", canGo: !model.isBusy && model.tierIsCurrent, go: { factor in
                     model.goToTierFactor(factor)
                     dismiss()
-                }) { EmptyView() }
+                }, describe: model.namingSources(model.project)) { EmptyView() }
             }
         }
     }
@@ -101,7 +110,7 @@ struct MulticamTierBadge: View {
 
 extension MulticamEditorModel {
     /// The tier of the program as a remote client reads it, in the shape `EditorModel.tierReport` and
-    /// `mpcut inspect --project` use. Nil without a project. `current` is false while a newer program is being checked.
+    /// `mpcut project inspect --project` use. Nil without a project. `current` is false while a newer program is being checked.
     var tierReport: [String: Any]? {
         guard let state = tierState else { return nil }
         var report: [String: Any] = ["name": state.name, "current": tierIsCurrent]
@@ -121,6 +130,8 @@ extension MulticamEditorModel {
             if let boundary = factor.boundary { entry["boundary"] = boundary }
             if let track = factor.track { entry["track"] = track }
             if let nearest = factor.nearest { entry["nearest"] = nearest.map(\.description) }
+            if let at = factor.switchAt { entry["switch_group_time"] = at.description }
+            if let edge = factor.edge { entry["edge"] = ["range_number": edge.range, "boundary": edge.boundary, "group_time": edge.at.description] }
             return entry
         }
         return report

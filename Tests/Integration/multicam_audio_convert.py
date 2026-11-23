@@ -40,21 +40,21 @@ class MulticamAudioConversionTests(unittest.TestCase):
         project = self.root / f"project-{second.stem}.cut"
         project.write_text(json.dumps({
             "format": "mpcut",
-            "schemaVersion": 1,
+            "schema_version": 3,
             "kind": "multicam",
-            "referenceAngle": "cam",
-            "range": {"from": "0", "to": "3"},
+            "reference_angle_id": "cam",
+            "group_range": {"from": "0", "to": "3"},
             "angles": [{"id": "cam", "file": self.angle.name}],
-            "audioSources": [{"id": "first", "file": (first or self.mono).name}, {"id": "second", "file": second.name}],
-            "audio": {"mode": "fixed", "source": "first", "stream": 0},
-            "switches": [{"at": "0", "angle": "cam"},
-                         {"at": "24/25", "angle": "cam", "audio": {"source": "second", "stream": 0}},
-                         {"at": "48/25", "angle": "cam"}],
+            "audio_sources": [{"id": "first", "file": (first or self.mono).name}, {"id": "second", "file": second.name}],
+            "audio": {"mode": "fixed", "source_id": "first", "audio_stream_index": 0},
+            "switches": [{"group_time": "0", "angle_id": "cam"},
+                         {"group_time": "24/25", "angle_id": "cam", "audio": {"source_id": "second", "audio_stream_index": 0}},
+                         {"group_time": "48/25", "angle_id": "cam"}],
             "assembly": [{"from": "48/25", "to": "3"}, {"from": "0", "to": "48/25"}],
         }))
         output = self.root / f"{second.stem}-{treatment}-{mode}.{suffix}"
         options = ["--audio", treatment] if treatment else []
-        result = subprocess.run([CLI, "export", "--project", project, "--mode", mode,
+        result = subprocess.run([CLI, "export", "project", "render", "--project", project, "--mode", mode,
                                  *options, "--output", output, "--json"], capture_output=True, text=True, timeout=90)
         self.assertEqual(result.returncode == 0, succeed, result.stdout + result.stderr)
         self.assertEqual(output.exists(), succeed)
@@ -95,17 +95,17 @@ class MulticamAudioConversionTests(unittest.TestCase):
                 def render(other, label):
                     project = self.root / ("shared-" + label + ".cut")
                     project.write_text(json.dumps({
-                        "format": "mpcut", "schemaVersion": 1, "kind": "multicam", "referenceAngle": "cam",
-                        "range": {"from": "0", "to": "3"},
+                        "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "cam",
+                        "group_range": {"from": "0", "to": "3"},
                         "angles": [{"id": "cam", "file": self.angle.name}],
-                        "audioSources": [{"id": "a", "file": source.name}, {"id": "b", "file": other.name}],
-                        "audio": {"mode": "fixed", "source": "a", "stream": 0},
-                        "switches": [{"at": "0", "angle": "cam"}, {"at": "48/25", "angle": "cam",
-                                     "audio": {"source": "b", "stream": 0}}],
+                        "audio_sources": [{"id": "a", "file": source.name}, {"id": "b", "file": other.name}],
+                        "audio": {"mode": "fixed", "source_id": "a", "audio_stream_index": 0},
+                        "switches": [{"group_time": "0", "angle_id": "cam"}, {"group_time": "48/25", "angle_id": "cam",
+                                     "audio": {"source_id": "b", "audio_stream_index": 0}}],
                         "assembly": [{"from": "48/25", "to": "72/25"}, {"from": "6/25", "to": "18/25"}] * 2,
                     }))
                     output = self.root / (source.name + "-" + label + ".mov")
-                    run([CLI, "export", "--project", project, "--mode", "encode", "--audio", "pcm",
+                    run([CLI, "export", "project", "render", "--project", project, "--mode", "encode", "--audio", "pcm",
                          "--output", output, "--json"], allow_diagnostics=True)
                     return ffmpeg("-i", output, "-map", "0:a:0", "-c:a", "copy", "-f", "data", "-")
                 reference = render(duplicate, "independent")
@@ -126,7 +126,8 @@ class MulticamAudioConversionTests(unittest.TestCase):
         for suffix in ("mov", "mkv"):
             with self.subTest(suffix=suffix):
                 result, report = self.export(self.mp3, treatment="pcm", suffix=suffix)
-                self.assertEqual(report["audioAction"], "pcm")
+                lane, = report["audio_lanes"]
+                self.assertEqual(lane["action"], "pcm")
                 decoded = audio(result)
                 self.assertEqual(decoded[:len(prefix)], prefix)
                 actual = array("h", decoded)
@@ -175,7 +176,8 @@ class MulticamAudioConversionTests(unittest.TestCase):
         _, rejected = self.export(self.stereo, treatment="aac", suffix="mkv", succeed=False)
         self.assertEqual(rejected["error"]["code"], "unsupported_audio")
         result, report = self.export(self.stereo, treatment="aac", suffix="mp4")
-        self.assertEqual(report["audioAction"], "aac")
+        lane, = report["audio_lanes"]
+        self.assertEqual(lane["action"], "aac")
         self.assertTrue(any("stereo" in warning for warning in report["warnings"]))
         self.assertTrue(any("48 kHz" in warning for warning in report["warnings"]))
         stream = probe(result, "-select_streams", "a:0", "-show_streams")["streams"][0]

@@ -1,4 +1,5 @@
 import Foundation
+import MPCutCore
 import XCTest
 @testable import MPCutApp
 
@@ -54,6 +55,70 @@ final class ProjectDraftTests: XCTestCase {
         first.discard()
         XCTAssertEqual(try String(contentsOf: XCTUnwrap(second.url)), "two")
         second.discard()
+    }
+
+    func testScheduledProjectArchivePublishesUnderExistingDraftLease() throws {
+        let draft = ProjectDraft(directory: directory)
+        try draft.write { try Data().write(to: $0) }
+        let file = try XCTUnwrap(draft.url)
+        let project = CutProject.sequence([
+            .init(id: "clip", file: "offline.mov", from: .zero, to: .init(numerator: 1))
+        ])
+        let undo: [CutHistoryState] = [.init(action: "Add Clip", project: .sequence([]))]
+        try draft.schedule({ try project.saveStaged(to: $0, undo: undo, redo: []) },
+                           onError: { XCTFail($0.localizedDescription) })
+
+        let deadline = Date().addingTimeInterval(10)
+        while draft.hasScheduledWrites && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+        XCTAssertFalse(draft.hasScheduledWrites)
+        let document = try CutProject.loadDocument(from: file, limit: 1)
+        XCTAssertEqual(document.project, project)
+        XCTAssertEqual(document.undo, undo)
+        XCTAssertThrowsError(try ProjectDraft.reserveIfRecoverable(file, in: directory)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "draft_in_use")
+        }
+        draft.discard()
+    }
+
+    func testWishlistMediaAndReplayRoundTripThroughRecoveredDrafts() throws {
+        let projects = [
+            ("wishlist-sequence", false, "cutaway.mov", "unused"),
+            ("wishlist-multicam", true, "original-part-2.mov", "A2")
+        ]
+        for (name, multicam, historyFile, historyID) in projects {
+            let fixture = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "cut", subdirectory: "Fixtures"))
+            let input = try CutProject.loadDocument(from: fixture, limit: 2)
+            if case .multicam(let project) = input.project {
+                XCTAssertEqual(project.angles.first?.additionalRecordings.first?.file, "wide-part-2.mov")
+                XCTAssertEqual(project.assemblyItems?.last?.angleOverride, "B")
+                if case .multicam(let redo) = input.redo.first?.project {
+                    XCTAssertNil(redo.assemblyItems?.last?.angleOverride)
+                } else {
+                    XCTFail("Expected a multicam redo state")
+                }
+            } else {
+                XCTAssertEqual(input.project.sourceSelects.first?.name, "Reaction shot")
+                XCTAssertEqual(input.undo.first?.project.sourceSelects.count, 2)
+            }
+            var draft: ProjectDraft? = ProjectDraft(directory: directory)
+            try draft?.write { try input.project.saveStaged(to: $0, undo: input.undo, redo: input.redo) }
+            let file = try XCTUnwrap(draft?.url)
+            draft = nil
+            XCTAssertTrue(try ProjectDraft.recoverable(in: directory).contains {
+                $0.resolvingSymlinksInPath().path == file.resolvingSymlinksInPath().path
+            })
+            let recovered = try CutProject.loadDocument(from: file, limit: 2)
+            XCTAssertEqual(recovered.project, input.project)
+            XCTAssertEqual(recovered.undo, input.undo)
+            XCTAssertEqual(recovered.redo, input.redo)
+
+            let media = try CutProjectMedia.load(from: file, multicam: multicam)
+            let protectedURL = file.deletingLastPathComponent().appendingPathComponent(historyFile)
+            XCTAssertEqual(media.absoluteSources(relativeTo: file)[protectedURL.path], historyID)
+            XCTAssertThrowsError(try media.validateDestination(protectedURL, relativeTo: file)) {
+                XCTAssertEqual(($0 as? CutError)?.code, "cut_project_source_collision")
+            }
+        }
     }
 
     func testBackgroundWritesCoalesceAndPublishInOrder() throws {

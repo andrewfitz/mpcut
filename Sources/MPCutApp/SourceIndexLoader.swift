@@ -14,7 +14,7 @@ final class SourceIndexLoader {
         private let changeTime: SourceIdentity.ChangeTime?
 
         init(url: URL, sidecars: Bool, preview: Bool, identity: SourceIdentity? = nil, preferCompleted: Bool = false) {
-            self.url = url
+            self.url = url.standardizedFileURL
             self.sidecars = sidecars
             self.preview = preview
             self.identity = identity
@@ -55,11 +55,21 @@ final class SourceIndexLoader {
             var multicam: MulticamIndex?
         }
 
+        // A provisional import can continue with a packet scan after a corrupt sidecar.
+        // Pin the miss to both files so a replacement sidecar can be used immediately.
+        private struct FailedRestore {
+            let url: URL
+            let source: SourceIdentity
+            let sidecar: SourceIdentity
+            let fraction: Double
+        }
+
         private let lock = NSLock()
         private let byteLimit: Int
         private let countLimit = 8
         private var entries: [Entry] = []
         private var bytes = 0
+        private var failedRestores: [FailedRestore] = []
 
         init(byteLimit: Int) {
             self.byteLimit = byteLimit
@@ -89,11 +99,28 @@ final class SourceIndexLoader {
 
         func discard(_ url: URL) {
             lock.withLock {
+                failedRestores.removeAll { $0.url == url }
                 entries.removeAll { entry in
                     guard entry.url.standardizedFileURL == url else { return false }
                     bytes -= entry.cost
                     return true
                 }
+            }
+        }
+
+        func recordFailedRestore(for url: URL, source: SourceIdentity, sidecar: SourceIdentity, fraction: Double) {
+            lock.withLock {
+                failedRestores.removeAll { $0.url == url }
+                if failedRestores.count >= countLimit { failedRestores.removeFirst() }
+                failedRestores.append(FailedRestore(url: url, source: source, sidecar: sidecar, fraction: fraction))
+            }
+        }
+
+        func failedRestoreProgress(for url: URL, source: SourceIdentity, sidecar: SourceIdentity) -> Double? {
+            lock.withLock {
+                failedRestores.first {
+                    $0.url == url && $0.source.matchesSnapshot(source) && $0.sidecar.matchesSnapshot(sidecar)
+                }?.fraction
             }
         }
 
@@ -157,6 +184,7 @@ final class SourceIndexLoader {
 
     static let shared = SourceIndexLoader()
     private let probes = OperationQueue()
+    private let restores = OperationQueue()
     private let indexes = OperationQueue()
     private let completed: CompletedIndexes
     private var requests: [Key: Request] = [:]
@@ -166,6 +194,8 @@ final class SourceIndexLoader {
         completed = CompletedIndexes(byteLimit: completedIndexByteLimit)
         probes.maxConcurrentOperationCount = 4
         probes.qualityOfService = .userInitiated
+        restores.maxConcurrentOperationCount = 2
+        restores.qualityOfService = .userInitiated
         indexes.maxConcurrentOperationCount = 2
         indexes.qualityOfService = .utility
     }
@@ -224,6 +254,8 @@ final class SourceIndexLoader {
 
     func admit(_ key: Key, progress: @escaping (Double) -> Void = { _ in },
                completion: @escaping (Result<MulticamIndex, Error>) -> Void) -> () -> Void {
+        let key = Key(url: key.url, sidecars: key.sidecars, preview: key.preview,
+                      identity: key.identity, preferCompleted: key.preview)
         var cancel: (() -> Void)?
         let convert: (Result<Index, Error>) -> Void = { result in
             switch result {
@@ -302,7 +334,8 @@ final class SourceIndexLoader {
             let fraction = request.fraction
             if fraction > 0 {
                 Task { @MainActor [weak self] in
-                    guard self?.requests[key]?.subscribers[id] != nil else { return }
+                    guard let current = self?.requests[key], current.subscribers[id] != nil,
+                          current.fraction == fraction else { return }
                     progress(fraction)
                 }
             }
@@ -327,7 +360,17 @@ final class SourceIndexLoader {
                 }
                 return identity
             }
-            let work: @Sendable () -> Void = { [weak self] in
+            let report: @Sendable (Double) -> Void = { [weak self] fraction in
+                guard token.shouldReport(fraction) else { return }
+                Task { @MainActor [weak self] in
+                    guard let request = self?.requests[key], request.token === token,
+                          fraction > request.fraction else { return }
+                    request.fraction = fraction
+                    for subscriber in Array(request.subscribers.values) { subscriber.progress(fraction) }
+                }
+            }
+            let sidecarURL = AnalysisSidecar.url(for: key.url)
+            let work: @Sendable () -> Void = {
                 guard !token.isCancelled else { return }
                 var shouldStore = false
                 let result = Result {
@@ -342,14 +385,13 @@ final class SourceIndexLoader {
                         do { ordinary = try engine.inspectForPreview(key.url) }
                         catch { throw PreviewUnavailable(identity: identity) }
                     } else {
-                        ordinary = try engine.inspect(key.url, keyframes: true, expectedIdentity: identity) { fraction in
-                            guard token.shouldReport(fraction) else { return }
-                            Task { @MainActor [weak self] in
-                                guard let request = self?.requests[key], request.token === token,
-                                      fraction > request.fraction else { return }
-                                request.fraction = fraction
-                                for subscriber in Array(request.subscribers.values) { subscriber.progress(fraction) }
-                            }
+                        if key.sidecars, let sidecar = try? SourceIdentity(sidecarURL),
+                           let restored = completed.failedRestoreProgress(for: key.url, source: identity, sidecar: sidecar) {
+                            report(restored)
+                            ordinary = try engine.inspectFresh(key.url, keyframes: true, expectedIdentity: identity,
+                                                               progress: { report(restored + (1 - restored) * $0) })
+                        } else {
+                            ordinary = try engine.inspect(key.url, keyframes: true, expectedIdentity: identity, progress: report)
                         }
                     }
                     guard key.preview || ordinary.hasFullEditIndex else {
@@ -365,7 +407,57 @@ final class SourceIndexLoader {
                 }
                 finish(result, shouldStore)
             }
-            if key.preview {
+            if key.preview, key.preferCompleted, key.sidecars {
+                let probes = self.probes
+                let restores = self.restores
+                probes.addOperation {
+                    guard !token.isCancelled else { return }
+                    do {
+                        let identity = try freshIdentity()
+                        if let cached = completed.index(for: key, identity: identity) {
+                            finish(.success(cached), false)
+                            return
+                        }
+                        guard let sidecar = try? SourceIdentity(sidecarURL),
+                              let cache = try? AnalysisSidecar(source: key.url),
+                              completed.failedRestoreProgress(for: key.url, source: identity, sidecar: sidecar) == nil else {
+                            work()
+                            return
+                        }
+                        // Check the section names before occupying a slot that restores packet indexes.
+                        guard AnalysisSidecar.indexKeys.isSubset(of: cache.keys()) else {
+                            work()
+                            return
+                        }
+                        restores.addOperation {
+                            guard !token.isCancelled else { return }
+                            do {
+                                if let cached = completed.index(for: key, identity: try freshIdentity()) {
+                                    finish(.success(cached), false)
+                                    return
+                                }
+                                let engine = CutEngine(cancelled: { token.isCancelled }, useSidecar: true)
+                                var fraction = 0.0
+                                if let media = try engine.cachedIndex(key.url, expectedIdentity: identity, progress: {
+                                    fraction = max(fraction, min($0, 0.999))
+                                    report(fraction)
+                                }), media.hasFullEditIndex {
+                                    report(1)
+                                    finish(.success(Index(ordinary: media)), true)
+                                } else {
+                                    guard !token.isCancelled else { return }
+                                    completed.recordFailedRestore(for: key.url, source: identity, sidecar: sidecar, fraction: fraction)
+                                    probes.addOperation(work)
+                                }
+                            } catch {
+                                finish(.failure(error), false)
+                            }
+                        }
+                    } catch {
+                        finish(.failure(error), false)
+                    }
+                }
+            } else if key.preview {
                 probes.addOperation(work)
             } else if completed.hasCandidate(for: key) {
                 // A warm recording can reopen while both scan slots are occupied.

@@ -43,6 +43,27 @@ final class MulticamPreviewAuditTests: XCTestCase {
         XCTAssertEqual(wrong, [])
     }
 
+    func testPreviewSwitchesPhysicalRecordingAndLeavesGapsEmpty() throws {
+        let wide = try indexed("SmartTrim-GOP", "mp4")
+        let restart = try indexed("WebM-Opus-GOP", "webm")
+        let quarter = RationalTime(numerator: 1, denominator: 4)
+        let half = RationalTime(numerator: 1, denominator: 2)
+        let threeQuarters = RationalTime(numerator: 3, denominator: 4)
+        let end = RationalTime(numerator: 1)
+        let project = MulticamProject(referenceAngle: "wide", range: .init(from: .zero, to: end), angles: [
+            .init(id: "wide", file: wide.url.path, coverage: .init(from: .zero, to: quarter), additionalRecordings: [
+                .init(id: "restart", file: restart.url.path, offset: half, coverage: .init(from: half, to: threeQuarters))
+            ])
+        ], audio: .none, switches: [.init(at: .zero, angle: "wide")])
+        let plan = try project.plan()
+        let media = ["wide": wide, "restart": restart]
+        XCTAssertEqual(MulticamPicturePosition.at(.zero, in: plan, media: media)?.source, "wide")
+        XCTAssertNil(MulticamPicturePosition.at(quarter, in: plan, media: media))
+        XCTAssertEqual(MulticamPicturePosition.at(half, in: plan, media: media)?.source, "restart")
+        XCTAssertNil(MulticamPicturePosition.at(threeQuarters, in: plan, media: media))
+        XCTAssertNil(MulticamPicturePosition.at(end, in: plan, media: media))
+    }
+
     @MainActor
     func testForwardPlaybackParksAtTheEndOnTheLastPictureAndReverseReturnsToZero() async throws {
         let wide = try indexed("SmartTrim-GOP", "mp4")
@@ -210,6 +231,24 @@ final class MulticamPreviewAuditTests: XCTestCase {
         try await wait { preview.picture?.source == "close" }
         XCTAssertEqual(preview.picture, MulticamPicturePosition.at(preview.time, in: plan, media: media))
         XCTAssertNil(preview.issue)
+    }
+
+    @MainActor
+    func testSlowPlaybackAdvancesThroughLeadingAudioGap() async throws {
+        let source = try indexed("Shuttle-Chirp", "mov")
+        let gap = RationalTime(numerator: 1, denominator: 5)
+        let end = RationalTime(numerator: 2, denominator: 5)
+        let track = try XCTUnwrap(source.audio.first)
+        let span = MulticamSpan(source: "sound", stream: track.stream.index,
+                                input: .init(from: .zero, to: gap), output: .init(from: gap, to: end))
+        let media = ["sound": source]
+        XCTAssertNotNil(MulticamPreviewAudioSpan(span: span, media: media))
+        let preview = MulticamPreview()
+        defer { preview.reset() }
+        preview.configure(plan: .init(intervals: [], picture: [], audio: [span], duration: end), media: media)
+        preview.selectPlaybackSpeed(.eighth)
+        preview.togglePlayback()
+        try await wait { preview.currentTime() >= gap }
     }
 
     func testFallbackDecoderSeeksOnTheMovieClockWhenThePictureStartsLate() throws {

@@ -11,6 +11,7 @@ import time
 import unittest
 
 from frames import ratio, rgb, run
+from media_regression import audio
 
 
 class MulticamFrames(unittest.TestCase):
@@ -33,8 +34,8 @@ class MulticamFrames(unittest.TestCase):
         (cls.media / "bad.mov").write_bytes(b"Not a recording")
         cls.project = cls.root / "interview.cut"
         cls.project.write_text(json.dumps({
-            "format": "mpcut", "schemaVersion": 1, "kind": "multicam", "referenceAngle": "wide",
-            "range": {"from": "0", "to": "3"},
+            "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "wide",
+            "group_range": {"from": "0", "to": "3"},
             "angles": [
                 {"id": "wide", "file": "media/wide.mkv", "offset": "0"},
                 {"id": "close", "name": "Close", "file": "media/close.mkv", "offset": "1/2"},
@@ -42,12 +43,139 @@ class MulticamFrames(unittest.TestCase):
                 {"id": "damaged", "file": "media/bad.mov", "offset": "0"},
             ],
             "audio": {"mode": "follow"},
-            "switches": [{"at": "0", "angle": "wide"}, {"at": "1", "angle": "close"}],
+            "switches": [{"group_time": "0", "angle_id": "wide"}, {"group_time": "1", "angle_id": "close"}],
             "assembly": [{"from": "2", "to": "3"}],
         }))
 
     def cmd(self, dest, *options):
-        return [CLI, "frames", "--json", "--project", self.project, "--output", dest, *options]
+        return [CLI, "review", "frames", "export", "--json", "--project", self.project, "--output", dest, *options]
+
+    def restart_project(self, name):
+        restart = self.media / (name + ".mkv")
+        run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=blue:s=160x96:r=4:d=1",
+             "-c:v", "ffv1", restart])
+        project = self.root / (name + ".cut")
+        document = json.loads(self.project.read_text())
+        document["angles"] = [document["angles"][0]]
+        document["angles"][0].update({
+            "group_coverage": {"from": "0", "to": "1"},
+            "additional_recordings": [{"id": "restart", "file": "media/" + restart.name, "offset": "2",
+                                       "group_coverage": {"from": "2", "to": "3"}}],
+        })
+        document["switches"] = document["switches"][:1]
+        document["audio"] = {"mode": "none"}
+        project.write_text(json.dumps(document))
+        return project, document
+
+    def test_restart_frames_keep_the_angle_and_report_the_recording(self):
+        project, _ = self.restart_project("restart-review")
+        dest = self.root / "restart-frames"
+        report = json.loads(run([CLI, "review", "frames", "export", "--json", "--project", project,
+                                 "--output", dest, "--at", "1/2", "--at", "3/2", "--at", "5/2"]))
+        self.assertEqual([angle["id"] for angle in report["angles"]], ["wide"])
+        self.assertEqual(report["angles"][0]["additional_recordings"][0]["id"], "restart")
+        rows = report["frames"]
+        self.assertEqual([row["angle_id"] for row in rows], ["wide", "wide", "wide"])
+        self.assertEqual([row["availability"] for row in rows], ["available", "picture_gap", "available"])
+        self.assertEqual([row.get("recording_id") for row in rows], ["wide", None, "restart"])
+        self.assertGreater(rgb(dest / rows[0]["file"])[0], 200)
+        self.assertGreater(rgb(dest / rows[2]["file"])[2], 200)
+
+    def test_assembly_frames_follow_output_time_and_fill_recording_gaps(self):
+        project, document = self.restart_project("assembly-review")
+        document["assembly"] = [{"from": "2", "to": "3"}, {"from": "0", "to": "2"}]
+        project.write_text(json.dumps(document))
+        dest = self.root / "assembly-frames"
+        report = json.loads(run([CLI, "review", "frames", "export", "--json", "--project", project,
+                                 "--clock", "assembly", "--output", dest, "--at", "0", "--at", "5/2",
+                                 "--at", "3", "--at", "1/10", "--at", "3/2"]))
+        self.assertEqual(report, json.loads((dest / "manifest.json").read_text()))
+        self.assertEqual(report["clock"], "assembly")
+        rows = report["frames"]
+        self.assertEqual([row.get("source") for row in rows], ["restart", None, None, "restart", "wide"])
+        self.assertEqual([row.get("generated_gap", False) for row in rows], [False, True, True, False, False])
+        files = [dest / row["file"] for row in rows]
+        self.assertGreater(rgb(files[0])[2], 200)
+        self.assertLess(max(rgb(files[1])), 10)
+        self.assertGreater(rgb(files[4])[0], 200)
+        self.assertEqual(files[0].read_bytes(), files[3].read_bytes())
+        self.assertEqual(files[1].read_bytes(), files[2].read_bytes())
+
+    def test_project_edit_adds_recording_without_adding_camera(self):
+        restart = self.media / "authored-restart.mkv"
+        run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=blue:s=160x96:r=4:d=1",
+             "-c:v", "ffv1", restart])
+        original = self.root / "authoring.cut"
+        document = json.loads(self.project.read_text())
+        document["angles"] = document["angles"][:1]
+        document["switches"] = document["switches"][:1]
+        original.write_text(json.dumps(document))
+        project = self.root / "authored.cut"
+        request = self.root / "add-recording.json"
+        request.write_text(json.dumps({
+            "project_path": str(original), "out_project": str(project),
+            "operations": [{"action": "add_recording", "angle_id": "wide",
+                            "path": str(restart), "group_start": "4"}],
+        }))
+        run([CLI, "project", "edit", "--input", request, "--json"])
+        authored = json.loads(project.read_text())
+        self.assertEqual([angle["id"] for angle in authored["angles"]], ["wide"])
+        self.assertEqual(authored["switches"], document["switches"])
+        self.assertEqual(authored["group_range"]["to"], "5")
+        primary = authored["angles"][0]
+        self.assertEqual(primary["group_coverage"], {"from": "0", "to": "3"})
+        self.assertEqual(primary["additional_recordings"][0]["group_coverage"], {"from": "4", "to": "5"})
+
+    def test_restart_movie_fills_gap_with_black_and_keeps_fixed_sound(self):
+        project, document = self.restart_project("restart-render")
+        mic = self.media / "restart-microphone.mov"
+        run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=d=3:r=48000",
+             "-c:a", "pcm_s16le", mic])
+        document["audio_sources"] = [{"id": "mic", "file": "media/restart-microphone.mov"}]
+        document["audio"] = {"mode": "fixed", "source_id": "mic", "audio_stream_index": 0}
+        document.pop("assembly")
+        project.write_text(json.dumps(document))
+        movie = self.root / "restart.mov"
+        command = [CLI, "export", "project", "render", "--json", "--project", project, "--output", movie]
+        lossless = subprocess.run([*command, "--mode", "copy", "--dry-run"], capture_output=True, timeout=120)
+        self.assertNotEqual(lossless.returncode, 0)
+        issue = json.loads(lossless.stdout)["error"]
+        self.assertEqual(issue["code"], "recording_gap_requires_encoding")
+        self.assertTrue(any(offer["mode"] == "encode" for offer in issue["alternatives"]))
+        result = json.loads(run([*command, "--mode", "encode"]))
+        self.assertEqual(ratio(result["duration"]), 3)
+        gaps = result["generated_picture_gaps"]
+        self.assertEqual([(Fraction(gap["from"]), Fraction(gap["to"])) for gap in gaps], [(1, 2)])
+        self.assertEqual(audio(movie), audio(mic))
+        for time, channel in [("0.5", 0), ("1.5", None), ("2.5", 2)]:
+            pixel = run(["ffmpeg", "-loglevel", "error", "-ss", time, "-i", movie, "-vf",
+                         "format=rgb24,crop=1:1:iw*0.5:ih*0.5", "-frames:v", "1",
+                         "-c:v", "rawvideo", "-f", "rawvideo", "-"])
+            self.assertEqual(len(pixel), 3)
+            if channel is None:
+                self.assertLess(max(pixel), 8)
+            else:
+                self.assertGreater(pixel[channel], 200)
+
+    def test_restart_movie_generates_silence_when_camera_audio_follows(self):
+        project, document = self.restart_project("restart-follow")
+        sources = []
+        camera = document["angles"][0]
+        for number, (recording, color) in enumerate(zip([camera, *camera["additional_recordings"]], ["red", "blue"])):
+            source = self.media / f"follow-{number}.mov"
+            run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"color={color}:s=160x96:r=4:d=1",
+                 "-f", "lavfi", "-i", f"sine=f={440 + number * 220}:d=1:r=48000",
+                 "-c:v", "libx264", "-c:a", "pcm_s16le", source])
+            recording["file"] = "media/" + source.name
+            recording["audio_stream_index"] = 1
+            sources.append(source)
+        document["audio"] = {"mode": "follow"}
+        document.pop("assembly")
+        project.write_text(json.dumps(document))
+        movie = self.root / "restart-follow-output.mov"
+        run([CLI, "export", "project", "render", "--json", "--project", project, "--output", movie,
+             "--mode", "encode", "--audio", "pcm"])
+        self.assertEqual(audio(movie), audio(sources[0]) + bytes(48000 * 2) + audio(sources[1]))
 
     def test_aligned_requests_and_unavailable_angles(self):
         dest = self.root / "angles"
@@ -62,32 +190,32 @@ class MulticamFrames(unittest.TestCase):
         self.assertEqual(angles[2]["error"]["code"], "missing_source")
         self.assertEqual(angles[3]["error"]["code"], "probe_failed")
         rows = report["frames"]
-        self.assertEqual([(r["requestNumber"], ratio(r["groupTime"]), r["angleID"]) for r in rows],
+        self.assertEqual([(r["request_number"], ratio(r["group_time"]), r["angle_id"]) for r in rows],
                          [(i, Fraction(t), angle["id"])
                           for i, t in enumerate(requests, 1) for angle in angles])
         self.assertEqual([r["availability"] for r in rows[1::4]],
-                         ["available", "beforeSource", "available", "afterSource", "available"])
-        self.assertEqual([ratio(r["sourceTime"]) for r in rows[1::4]],
+                         ["available", "before_source", "available", "after_source", "available"])
+        self.assertEqual([ratio(r["source_time"]) for r in rows[1::4]],
                          [Fraction(t) - Fraction(1, 2) for t in requests])
-        self.assertTrue(all(r["availability"] == "missingSource" for r in rows[2::4]))
-        self.assertTrue(all(r["availability"] == "sourceError" for r in rows[3::4]))
+        self.assertTrue(all(r["availability"] == "missing_source" for r in rows[2::4]))
+        self.assertTrue(all(r["availability"] == "source_error" for r in rows[3::4]))
         self.assertEqual(sorted(p.name for p in dest.glob("*.jpg")),
                          sorted(r["file"] for r in rows if r["availability"] == "available"))
         for row in rows:
             if row["availability"] != "available":
-                self.assertTrue({"file", "framePTS", "frameTime", "groupCoverage"}.isdisjoint(row))
+                self.assertTrue({"file", "frame_pts", "frame_time", "group_coverage"}.isdisjoint(row))
                 continue
             path = dest / row["file"]
             self.assertEqual(path.read_bytes()[:2], b"\xff\xd8")
-            coverage = row["groupCoverage"]
-            self.assertLessEqual(ratio(coverage["from"]), ratio(row["groupTime"]))
-            self.assertGreater(ratio(coverage["to"]), ratio(row["groupTime"]))
-            angle = angles[0 if row["angleID"] == "wide" else 1]
-            self.assertEqual(row["framePTS"] * ratio(angle["timeBase"]),
-                             ratio(angle["origin"]) + ratio(row["frameTime"]))
+            coverage = row["group_coverage"]
+            self.assertLessEqual(ratio(coverage["from"]), ratio(row["group_time"]))
+            self.assertGreater(ratio(coverage["to"]), ratio(row["group_time"]))
+            angle = angles[0 if row["angle_id"] == "wide" else 1]
+            self.assertEqual(row["frame_pts"] * ratio(angle["time_base"]),
+                             ratio(angle["origin"]) + ratio(row["frame_time"]))
         first, second, last = rows[1], rows[9], rows[17]
-        self.assertEqual(ratio(first["frameTime"]), 0)
-        self.assertEqual(ratio(second["frameTime"]), Fraction(3, 4))
+        self.assertEqual(ratio(first["frame_time"]), 0)
+        self.assertEqual(ratio(second["frame_time"]), Fraction(3, 4))
         self.assertEqual((dest / first["file"]).read_bytes(), (dest / last["file"]).read_bytes())
         self.assertGreater(rgb(dest / rows[0]["file"])[0], 200)
         self.assertGreater(rgb(dest / first["file"])[2], 200)

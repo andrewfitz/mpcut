@@ -76,12 +76,12 @@ class MulticamFidelity(unittest.TestCase):
 
     def test_delayed_second_aac_track_follow_with_different_absolute_indices(self):
         self.project(
-            angles=[{"id": "wide", "file": str(self.wide), "offset": "0", "audioStream": 2},
-                    {"id": "close", "file": str(self.close), "offset": "0", "audioStream": 1}],
+            angles=[{"id": "wide", "file": str(self.wide), "offset": "0", "audio_stream_index": 2},
+                    {"id": "close", "file": str(self.close), "offset": "0", "audio_stream_index": 1}],
             end="3",
             audio={"mode": "follow"},
-            switches=[{"at": "0", "angle": "wide"},
-                      {"at": "2", "angle": "close"}],
+            switches=[{"group_time": "0", "angle_id": "wide"},
+                      {"group_time": "2", "angle_id": "close"}],
         )
         self.export()
         self.assert_picture(self.output, [(self.wide, 0, 2), (self.close, 2, 3)])
@@ -99,11 +99,11 @@ class MulticamFidelity(unittest.TestCase):
 
     def test_silent_aac_edit_on_one_absolute_index_and_audible_edit_on_another(self):
         self.project(
-            angles=[{"id": "wide", "file": str(self.wide), "offset": "0", "audioStream": 2},
-                    {"id": "close", "file": str(self.close), "offset": "0", "audioStream": 1}],
+            angles=[{"id": "wide", "file": str(self.wide), "offset": "0", "audio_stream_index": 2},
+                    {"id": "close", "file": str(self.close), "offset": "0", "audio_stream_index": 1}],
             end="2",
             audio={"mode": "follow"},
-            switches=[{"at": "0", "angle": "wide"}, {"at": "1", "angle": "close"}],
+            switches=[{"group_time": "0", "angle_id": "wide"}, {"group_time": "1", "angle_id": "close"}],
         )
         self.export()
         actual = self.decode(self.output)
@@ -113,8 +113,8 @@ class MulticamFidelity(unittest.TestCase):
         self.assertEqual(actual[-4096:], close[2 * 2 * 48000 - 4096:2 * 2 * 48000])
 
     def test_m4v_is_an_mp4_movie_in_copy_and_encode_modes(self):
-        self.project(end="2", audio={"mode": "fixed", "source": "close", "stream": 1},
-                     switches=[{"at": "0", "angle": "wide"}, {"at": "1", "angle": "close"}])
+        self.project(end="2", audio={"mode": "fixed", "source_id": "close", "audio_stream_index": 1},
+                     switches=[{"group_time": "0", "angle_id": "wide"}, {"group_time": "1", "angle_id": "close"}])
         for mode in ("copy", "encode"):
             with self.subTest(mode=mode):
                 output = self.root / f"program-{mode}.m4v"
@@ -129,8 +129,8 @@ class MulticamFidelity(unittest.TestCase):
                     self.assert_picture(output, [(self.wide, 0, 1), (self.close, 1, 2)])
 
     def test_repeated_export_of_reordered_b_frames_and_44100_hz_wav(self):
-        self.project(switches=[{"at": "0", "angle": "wide"}, {"at": "1", "angle": "close"}],
-                     audioSources=[{"id": "lav", "file": str(self.lav), "offset": "-1/10"}],
+        self.project(switches=[{"group_time": "0", "angle_id": "wide"}, {"group_time": "1", "angle_id": "close"}],
+                     audio_sources=[{"id": "lav", "file": str(self.lav), "offset": "-1/10"}],
                      assembly=[{"from": "2", "to": "4"}, {"from": "0", "to": "2"},
                                {"from": "2", "to": "3"}])
         pcm = self.decode(self.lav)

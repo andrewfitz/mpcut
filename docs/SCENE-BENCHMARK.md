@@ -1,6 +1,6 @@
 # Scene detection benchmark
 
-MPCut compares a 64 × 36 color grid from every decoded picture. An adaptive threshold and neighboring frames distinguish hard cuts from flashes and sustained motion. Pooled tile colors identify recurring views. The desktop and `mpcut scenes --json` use the same detector.
+MPCut compares a 64 × 36 color grid from every decoded picture. An adaptive threshold and neighboring frames distinguish hard cuts from flashes and sustained motion. Pooled tile colors identify recurring views. The desktop and `mpcut scenes scan --json` use the same detector.
 
 The original full-file scanner benchmarked below uses a pipelined AVAssetReader for eligible progressive H.264 and HEVC MOV/MP4 tracks with shared pixel buffers. The scanner checks the presentation timestamp, dimensions and pixel format on every frame, and checks the final frame count. When the track duration is not an integral number of ticks per frame, the reader verifies display times against a sorted table of video packet timestamps. The table uses eight bytes per frame and is capped at 64 MiB. Interlaced pictures, alpha, complex edits and incompatible timing use FFmpeg, with VideoToolbox decoding where available. ProRes 4:2:2 surfaces can be mapped directly for sampling. For software FFV1, the scanner checks the first packet and uses up to eight workers when the frame contains enough independent slices.
 
@@ -21,7 +21,7 @@ python3 Tests/Benchmarks/scene_detection.py dist/MPCut.app/Contents/Helpers/mpcu
   --codec-matrix --runs 3 --tears-of-steel /path/to/tears_of_steel_720p.mov
 ```
 
-The generated H.264 montages each have 13 shots, 12 cuts, four wide views and two crops. Both include an eight-frame insert. One adds two one-frame flashes. A hit must land on the expected frame. The benchmark also checks all 78 pairs of shots for correct grouping. The codec matrix transcodes the clean edit to 4K HEVC Main10, 4K ProRes 422 and 1080p FFV1. The two HEVC files contain identical compressed video with different sample-entry tags. Use `--require-identical` to fail on a baseline JSON difference, or omit `--baseline` to run the candidate and FFmpeg alone.
+The generated H.264 montages each have 13 shots, 12 cuts, four wide views and two crops. Both include an eight-frame insert. One adds two one-frame flashes. A hit must land on the expected frame. The benchmark also checks all 78 pairs of shots for correct grouping. The codec matrix transcodes the clean edit to 4K HEVC Main10, 4K ProRes 422 and 1080p FFV1. The two HEVC files contain identical compressed video with different sample-entry tags. Use `--require-identical` to fail on a baseline JSON difference, or omit `--baseline` to run the candidate and FFmpeg alone. For older CLIs, the benchmark uses the flat `scenes` command and converts legacy JSON field names before comparing reports.
 
 The benchmark disables analysis sidecars on CLI versions that support `--no-sidecar`, including for existing files supplied through `--extra` or `--tears-of-steel`. To measure the effect of reusing saved analysis, run `python3 Tests/Benchmarks/analysis_sidecar.py dist/MPCut.app/Contents/Helpers/mpcut /path/to/recording.mov`. It builds a sidecar next to a temporary copy, checks that fresh and cached reports agree, and prints median wall times and sidecar size.
 

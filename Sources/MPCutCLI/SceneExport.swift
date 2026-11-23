@@ -8,6 +8,19 @@ struct SceneExportInput: Decodable {
         let start: RationalTime
         let end: RationalTime
 
+        enum CodingKeys: String, CodingKey, CaseIterable {
+            case number, view, start, end
+            case startPTS = "start_pts", startSeconds = "start_seconds", viewLabel = "view_label"
+        }
+
+        init(from decoder: Decoder) throws {
+            let fields = try decoder.requestFields(CodingKeys.self, in: "Scene")
+            number = try fields.decodeIfPresent(Int.self, forKey: .number)
+            view = try fields.decode(Int.self, forKey: .view)
+            start = try fields.decode(RationalTime.self, forKey: .start)
+            end = try fields.decode(RationalTime.self, forKey: .end)
+        }
+
         init(number: Int?, view: Int, start: RationalTime, end: RationalTime) {
             self.number = number
             self.view = view
@@ -28,6 +41,20 @@ struct SceneExportInput: Decodable {
     let sourceStamp: SceneSourceStamp?
     let duration: RationalTime?
     var scenes: [Scene]
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case ok, file, duration, scenes, origin, views
+        case sourceStamp = "source_stamp", timeBase = "time_base", viewCount = "view_count"
+    }
+
+    init(from decoder: Decoder) throws {
+        let fields = try decoder.requestFields(CodingKeys.self, in: "Scene report")
+        ok = try fields.decodeIfPresent(Bool.self, forKey: .ok)
+        file = try fields.decode(String.self, forKey: .file)
+        duration = try fields.decodeIfPresent(RationalTime.self, forKey: .duration)
+        sourceStamp = try fields.decodeIfPresent(SceneSourceStamp.self, forKey: .sourceStamp)
+        scenes = try fields.decode([Scene].self, forKey: .scenes)
+    }
 
     init(file: String, scenes: [Scene]) {
         self.file = file

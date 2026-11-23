@@ -12,18 +12,29 @@ package func forEachOrderedBatch<Value>(
     transform: (Range<Int>) throws -> Value,
     consume: (Value) throws -> Void
 ) throws {
+    guard count >= 0, batchSize > 0, workerLimit > 0 else {
+        throw CutError(code: "invalid_arguments", message: "Invalid ordered batch size or worker count.")
+    }
     let workers = min(workerLimit, ProcessInfo.processInfo.activeProcessorCount)
-    for start in stride(from: 0, to: count, by: batchSize * workers) {
+    var start = 0
+    while start < count {
         try check()
-        let end = min(count, start + batchSize * workers)
-        let ranges = stride(from: start, to: end, by: batchSize).map { $0..<min($0 + batchSize, end) }
+        var ranges: [Range<Int>] = []
+        while start < count, ranges.count < workers {
+            let end = start + min(batchSize, count - start)
+            ranges.append(start..<end)
+            start = end
+        }
         if ranges.count == 1 {
-            try consume(transform(ranges[0]))
+            let result = Result { try transform(ranges[0]) }
+            try check()
+            try consume(result.get())
             continue
         }
-        let slots = ranges.map { _ in BatchSlot<Value>() }
-        DispatchQueue.concurrentPerform(iterations: ranges.count) { i in
-            slots[i].result = Result { try transform(ranges[i]) }
+        let batch = ranges
+        let slots = batch.map { _ in BatchSlot<Value>() }
+        DispatchQueue.concurrentPerform(iterations: batch.count) { i in
+            slots[i].result = Result { try transform(batch[i]) }
         }
         for slot in slots {
             try check()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare bulk preflight speed and require identical JSON on fractional PCM ranges."""
+"""Compare bulk preflight speed and require matching JSON on fractional PCM ranges."""
 
 import argparse
 import json
@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 import time
 import wave
+
+from benchmark_cli import command_help, normalize_report
 
 
 def benchmark(candidate, baseline, count, runs, directory):
@@ -20,31 +22,43 @@ def benchmark(candidate, baseline, count, runs, directory):
     ranges.write_text(json.dumps([{"from": "1/3", "to": "7/6"}] * count), encoding="utf-8")
     output = directory / "clips"
     output.mkdir()
-    command = ["bulk", source, "--ranges", ranges, "--output", output, "--dry-run", "--json", "--no-sidecar"]
-    executables = [("baseline", baseline), ("candidate", candidate)]
+    arguments = [source, "--ranges", ranges, "--output", output, "--dry-run", "--json"]
+    executables = []
+    for label, cli in (("baseline", baseline), ("candidate", candidate)):
+        help_text = command_help(cli)
+        legacy = "export ranges separate" not in help_text
+        command = ["bulk"] if legacy else ["export", "ranges", "separate"]
+        flags = ["--no-sidecar"] if "--no-sidecar" in help_text else []
+        executables.append((label, [cli, *flags, *command, *arguments], legacy))
+    mixed_syntax = executables[0][2] != executables[1][2]
     summary = {}
     for name, options in (("automatic", []), ("wav", ["--container", "wav"])):
-        samples = {label: [] for label, _ in executables}
+        samples = {label: [] for label, _, _ in executables}
         reference = None
         for run in range(runs):
             order = executables if run % 2 == 0 else reversed(executables)
-            for label, cli in order:
+            for label, command, legacy in order:
                 start = time.perf_counter()
-                result = subprocess.run([cli, *command, *options], capture_output=True, timeout=600)
+                result = subprocess.run([*command, *options], capture_output=True, timeout=600)
                 samples[label].append(time.perf_counter() - start)
                 if result.returncode:
                     raise RuntimeError(f"{label} failed: {result.stdout[:1000]!r} {result.stderr[:1000]!r}")
+                report = json.loads(result.stdout)
+                if not report["ok"] or len(report["outputs"]) != count:
+                    raise RuntimeError(f"{label} did not plan all {count} ranges")
+                if mixed_syntax:
+                    comparable = normalize_report(report) if legacy else report
+                else:
+                    comparable = result.stdout
                 if reference is None:
-                    report = json.loads(result.stdout)
-                    if not report["ok"] or len(report["outputs"]) != count:
-                        raise RuntimeError(f"{label} did not plan all {count} ranges")
-                    reference = result.stdout
-                elif result.stdout != reference:
+                    reference = comparable
+                elif comparable != reference:
                     raise RuntimeError(f"{label} JSON differs from the baseline for {name} container selection")
         medians = {label: statistics.median(times) for label, times in samples.items()}
         summary[name] = {"medianSeconds": medians, "samplesSeconds": samples,
                          "speedup": medians["baseline"] / medians["candidate"]}
-    return {"rangeCount": count, "identicalReports": True, "containers": summary}
+    return {"rangeCount": count, "identicalReports": True,
+            "normalizedLegacyFields": mixed_syntax, "containers": summary}
 
 
 if __name__ == "__main__":

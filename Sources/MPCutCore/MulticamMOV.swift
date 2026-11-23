@@ -23,7 +23,7 @@ enum MulticamMOV {
             mediaEnd = end
         }
         let mediaSize = mediaEnd - UInt64(prefix.count)
-        let movie = try merge(lanes: lanes, starts: starts)
+        let movie = try merge(lanes: lanes, starts: starts, audioAlternatesFrom: sounds.count > 1 ? (picture == nil ? 0 : 1) : nil)
 
         guard FileManager.default.createFile(atPath: output.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
             throw CutError(code: "write_failed", message: "Could not create the staged multicam movie.")
@@ -116,32 +116,45 @@ enum MulticamMOV {
         CutError(code: "write_failed", message: "The staged video or audio movie has an unsupported track or media layout.")
     }
 
-    private static func merge(lanes: [Lane], starts: [UInt64]) throws -> Data {
+    private static func merge(lanes: [Lane], starts: [UInt64], audioAlternatesFrom: Int?) throws -> Data {
         let parts = try lanes.map { try children(of: $0.movie) }
         let headers = try parts.map { try only("mvhd", in: $0) }
         let clocks = try headers.map { try movieClock($0.data) }
-        var scale: UInt64 = 1
-        for clock in clocks {
-            let rate = UInt64(clock.rate)
-            var a = scale
-            var b = rate
-            while b != 0 { (a, b) = (b, a % b) }
-            scale = scale / a * rate
-            if scale > Int32.max {
-                // A track's edit lengths may still convert exactly to a common existing
-                // clock even when the clocks themselves have no representable LCM.
-                scale = UInt64(clocks.map(\.rate).max() ?? 0)
-                guard scale <= Int32.max else { throw invalidMovie }
-                break
+        func commonClock(_ rates: [UInt32]) -> UInt32? {
+            var scale: UInt64 = 1
+            for rate in rates {
+                scale = scale / gcd(scale, UInt64(rate)) * UInt64(rate)
+                guard scale <= Int32.max else { return nil }
             }
+            return UInt32(scale)
         }
-        let rate = UInt32(scale)
+        let rate: UInt32
+        if let fullClock = commonClock(clocks.map(\.rate)) {
+            rate = fullClock
+        } else {
+            // Only durations in track headers and edit lists use the movie clock.
+            // Their reduced denominators may fit even when the original clocks do not.
+            let reduced = try zip(parts, clocks).map { entries, clock in
+                try requiredClock(for: entries, movieRate: clock.rate)
+            }
+            guard let exactClock = commonClock(reduced) else {
+                throw incompatibleClocks
+            }
+            rate = exactClock
+        }
         var duration: UInt64 = 0
         var nextID: UInt32 = 1
         var tracks = Data()
         for index in lanes.indices {
             let entries = parts[index].filter { $0.type == "trak" }
             guard !entries.isEmpty else { throw invalidMovie }
+            let enabledInAlternateGroup: Bool?
+            if let first = audioAlternatesFrom, index >= first {
+                guard entries.count == 1 else { throw invalidMovie }
+                enabledInAlternateGroup = index == first
+            } else {
+                enabledInAlternateGroup = nil
+            }
             var ids: [UInt32: UInt32] = [:]
             for entry in entries {
                 let trackHeader = try only("tkhd", in: children(of: entry.data))
@@ -151,7 +164,7 @@ enum MulticamMOV {
             }
             for entry in entries {
                 let track = try relocate(entry.data, lane: lanes[index], destination: starts[index],
-                                         ids: ids, from: clocks[index].rate, to: rate)
+                                         ids: ids, from: clocks[index].rate, to: rate, enabledInAlternateGroup: enabledInAlternateGroup)
                 duration = max(duration, track.duration)
                 tracks.append(try box("trak", track.data))
             }
@@ -170,8 +183,43 @@ enum MulticamMOV {
         return try box("moov", payload)
     }
 
+    private static func requiredClock(for entries: [Child], movieRate: UInt32) throws -> UInt32 {
+        var divisor = UInt64(movieRate)
+        for entry in entries where entry.type == "trak" {
+            let track = try children(of: entry.data)
+            let header = try only("tkhd", in: track).data
+            let wide = try isWide(header)
+            divisor = gcd(divisor, try readDuration(header, at: wide ? 28 : 20, wide: wide))
+            for edits in track where edits.type == "edts" {
+                let list = try only("elst", in: children(of: edits.data)).data
+                let table = try editTable(list)
+                for index in 0..<table.count {
+                    let duration = try readDuration(list, at: 8 + index * table.stride, wide: table.wide)
+                    divisor = gcd(divisor, duration)
+                }
+            }
+        }
+        return movieRate / UInt32(divisor)
+    }
+
+    private static func gcd(_ first: UInt64, _ second: UInt64) -> UInt64 {
+        var a = first
+        var b = second
+        while b != 0 { (a, b) = (b, a % b) }
+        return a
+    }
+
+    private static func editTable(_ data: Data) throws -> (wide: Bool, width: Int, stride: Int, count: Int) {
+        let wide = try isWide(data)
+        let width = wide ? 8 : 4
+        let stride = 2 * width + 4
+        let count = Int(try data.integer(UInt32.self, at: 4))
+        guard count == (data.count - 8) / stride, (data.count - 8).isMultiple(of: stride) else { throw invalidMovie }
+        return (wide, width, stride, count)
+    }
+
     private static func relocate(_ track: Data, lane: Lane, destination: UInt64, ids: [UInt32: UInt32],
-                                 from oldRate: UInt32, to newRate: UInt32) throws -> (data: Data, duration: UInt64) {
+                                 from oldRate: UInt32, to newRate: UInt32, enabledInAlternateGroup: Bool?) throws -> (data: Data, duration: UInt64) {
         var duration: UInt64?
         func transform(_ type: String, data: Data) throws -> Data {
             switch type {
@@ -184,6 +232,13 @@ enum MulticamMOV {
                 let oldID = try data.integer(UInt32.self, at: idField)
                 guard let id = ids[oldID] else { throw invalidMovie }
                 patched.setInteger(id, at: idField)
+                if let enabledInAlternateGroup {
+                    let alternateGroupField = wide ? 46 : 34
+                    guard patched.count >= alternateGroupField + 2 else { throw invalidMovie }
+                    patched.setInteger(UInt16(1), at: alternateGroupField)
+                    if enabledInAlternateGroup { patched[3] |= 1 }
+                    else { patched[3] &= ~UInt8(1) }
+                }
                 try setDuration(&patched, after: durationField, wide: wide, value: converted)
                 duration = converted
                 return try box(type, patched)
@@ -207,11 +262,7 @@ enum MulticamMOV {
                 }
                 return try box(type, rebuilt)
             case "elst" where oldRate != newRate:
-                let wide = try isWide(data)
-                let width = wide ? 8 : 4
-                let stride = 2 * width + 4
-                let count = Int(try data.integer(UInt32.self, at: 4))
-                guard count == (data.count - 8) / stride, (data.count - 8).isMultiple(of: stride) else { throw invalidMovie }
+                let (wide, width, stride, count) = try editTable(data)
                 var edited = Data(data.prefix(8))
                 edited[0] = 1
                 for index in 0..<count {
@@ -266,10 +317,12 @@ enum MulticamMOV {
         let product = number.multipliedFullWidth(by: UInt64(to))
         guard product.high < UInt64(from) else { throw invalidMovie }
         let (quotient, remainder) = UInt64(from).dividingFullWidth(product)
-        guard remainder == 0 else {
-            throw CutError(code: "unsupported_container", message: "The staged picture and sound use incompatible MOV presentation clocks.")
-        }
+        guard remainder == 0 else { throw incompatibleClocks }
         return quotient
+    }
+
+    private static var incompatibleClocks: CutError {
+        CutError(code: "unsupported_container", message: "The staged picture and sound use incompatible MOV presentation clocks.")
     }
 
     private static func isWide(_ data: Data) throws -> Bool {

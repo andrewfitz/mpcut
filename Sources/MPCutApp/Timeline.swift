@@ -23,6 +23,7 @@ struct TimelineClip: Identifiable {
     var audioSampleRate = 0
     var replacementAudio: String?
     var isStill = false
+    var isGap = false
     var mediaRevision = 0
     var mediaIssue: String?
     var stripLabel: String {
@@ -101,6 +102,30 @@ struct SnapTargetPicker: View {
     }
 }
 
+/// The snap choice in the timeline header: a quiet menu that names its own setting.
+struct SnapTargetMenu: View {
+    @Binding var selection: TimelineSnapTarget
+    var audioOnly = false
+
+    var body: some View {
+        Menu {
+            Picker("Snap to", selection: $selection) {
+                ForEach(TimelineSnapTarget.allCases, id: \.self) { target in
+                    if !audioOnly || target == .off || target == .silence { Text(target.label).tag(target) }
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } label: {
+            Text(selection == .off ? "Snap Off" : "Snap to \(selection.label)")
+        }
+        .barMenu()
+        .accessibilityLabel("Snap to")
+        .accessibilityValue(selection.label)
+        .help("Choose edit snapping targets")
+    }
+}
+
 struct TimelineScene: Equatable {
     let start: Double
     let view: Int
@@ -135,6 +160,7 @@ struct SequenceTimeline: View {
     var waveforms: [UUID: AudioWaveform] = [:]
     var openingWaveform: OpeningWaveform? = nil
     var waveformPauses: [UUID: [AudioSpan]] = [:]
+    var timelinePadding: [AudioSpan] = []
     var waveformRevision = 0
     static let maximumZoom = TimelineViewControls.maximumZoom
     fileprivate var waveformHeight: CGFloat { showsWaveform ? (largeThumbnails.wrappedValue ? 64 : 32) : 0 }
@@ -157,6 +183,7 @@ struct SequenceTimeline: View {
     /// It runs before the timeline decides whether it can take media, so a project also opens while the editor is busy.
     var onDropStills: (([URL], Double, Bool) -> Void)? = nil
     var onDropProjects: (([URL]) -> [URL])? = nil
+    var onPreviewJoin: ((UUID) -> Void)? = nil
     var onClipCSV: ((URL, UUID) -> Void)? = nil
     var pointerTarget: ((Double, Double) -> Double)? = nil
     var onPointerSeek: ((Double) -> Void)? = nil
@@ -184,13 +211,12 @@ struct SequenceTimeline: View {
             }
             TimelineScrollSurface(timeline: self, zoom: pow(2, zoom.wrappedValue),
                                   revealTime: revealTime, revealRequest: revealRequest)
-                .frame(height: showsControls ? 87 + thumbnailHeight + waveformHeight
-                       : 65 + thumbnailHeight + waveformHeight + assemblyAssetHeight)
+                .frame(height: (showsControls ? 87 : 65) + thumbnailHeight + waveformHeight + assemblyAssetHeight)
         }
     }
 
     private var controls: some View {
-        HStack(spacing: 8) {
+        TimelineControlBar {
             TimelineTimeControl(playhead: playhead, duration: duration, durationLabel: "Sequence duration",
                                 request: timeEntryRequest) { target in
                 onSeek(target)
@@ -198,19 +224,14 @@ struct SequenceTimeline: View {
                 revealRequest += 1
             }
             .layoutPriority(1)
-            Spacer(minLength: 0)
+        } options: {
             TimelineMarkReadouts(markIn: markIn, markOut: markOut)
-            SnapTargetPicker(selection: snapTarget, audioOnly: audioOnly)
-                .pickerStyle(.menu)
-                .fixedSize()
+            SnapTargetMenu(selection: snapTarget, audioOnly: audioOnly)
                 .disabled(!allowsClipEdits)
-                .controlSize(.small)
                 .layoutPriority(1)
             TimelineViewControls(zoom: zoom, largeThumbnails: largeThumbnails, audioOnly: audioOnly)
                 .layoutPriority(1)
         }
-        .padding(.horizontal, EditorMetrics.barInset)
-        .frame(height: 38)
     }
 
     static func parseTime(_ text: String, initialTime: Double) -> Double? {
@@ -400,6 +421,14 @@ final class TimelineRangeOverlay: NSView {
     }
 }
 
+/// Uses the same sorted, half-open spans as the shaded timeline overlay.
+func timelineRulerDescription(at seconds: Double, padding: [AudioSpan]) -> String {
+    let time = timelineTime(seconds, milliseconds: true)
+    let index = padding.lowerBound { $0.to.seconds > seconds }
+    guard index < padding.count, padding[index].from.seconds <= seconds else { return time }
+    return "\(time), retained silence padding"
+}
+
 final class TimelineSurface: NSView, NSViewToolTipOwner {
     private final class AccessibleClip: NSAccessibilityElement {
         var select: (() -> Bool)?
@@ -419,11 +448,11 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             setPosition?(value.doubleValue)
         }
 
-        func updateValue(_ time: Double, duration: Double) {
+        func updateValue(_ time: Double, duration: Double, padding: [AudioSpan]) {
             super.setAccessibilityValue(NSNumber(value: time))
             setAccessibilityMinValue(NSNumber(value: 0))
             setAccessibilityMaxValue(NSNumber(value: duration))
-            setAccessibilityValueDescription(timelineTime(time, milliseconds: true))
+            setAccessibilityValueDescription(timelineRulerDescription(at: time, padding: padding))
         }
     }
 
@@ -459,9 +488,15 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     }
 
     private struct TrimPosition {
-        let id: UUID
         let edge: TimelineEdge
         let time: Double
+    }
+
+    private struct TrimGeometry {
+        let index: Int
+        let clip: PositionedClip
+        let sequenceDelta: Double
+        let stripDelta: Double
     }
 
     private struct OpeningClock: Hashable {
@@ -488,6 +523,20 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             hasher.combine(openingClock)
             hasher.combine(mediaRevision)
         }
+    }
+
+    private struct FilmstripViewport: Equatable {
+        let visible: Range<CGFloat>
+        let scale: CGFloat
+        let tileSize: CGSize
+        let backingScale: CGFloat
+        let enabled: Bool
+    }
+
+    private struct VisibleFilmstripTile {
+        let rect: NSRect
+        let key: ThumbnailKey
+        let fallbacks: [ThumbnailKey]
     }
 
     var timeline: SequenceTimeline? {
@@ -527,8 +576,9 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
                 window?.invalidateCursorRects(for: self)
                 needsDisplay = true
             }
-            if previousDuration != sequenceDuration || oldValue?.playhead != timeline?.playhead {
-                accessibleRuler.updateValue(timeline?.playhead ?? 0, duration: sequenceDuration)
+            let paddingChanged = oldValue?.timelinePadding != timeline?.timelinePadding
+            if previousDuration != sequenceDuration || oldValue?.playhead != timeline?.playhead || paddingChanged {
+                accessibleRuler.updateValue(timeline?.playhead ?? 0, duration: sequenceDuration, padding: timeline?.timelinePadding ?? [])
             }
             let laneHeightChanged = oldValue?.thumbnailHeight != timeline?.thumbnailHeight ||
                 oldValue?.waveformHeight != timeline?.waveformHeight
@@ -537,7 +587,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             }
             if !sharedClips || oldValue?.sceneRevision != timeline?.sceneRevision ||
                 oldValue?.showsWaveform != timeline?.showsWaveform || oldValue?.selection != timeline?.selection ||
-                laneHeightChanged || oldValue?.assemblyAssets != timeline?.assemblyAssets
+                laneHeightChanged || paddingChanged || oldValue?.assemblyAssets != timeline?.assemblyAssets
                 || (oldValue?.thumbnail == nil) != (timeline?.thumbnail == nil) {
                 needsDisplay = true
             } else if oldValue?.waveformRevision != timeline?.waveformRevision {
@@ -571,6 +621,9 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     private var lastTrimTarget: Double?
     private var lastSeekTarget: Double?
     private var csvDrag = false
+    private var stillDrag = false
+    private var classifiedDropFiles: (all: [URL], media: [URL])?
+    private var stillDropTime: Double?
     private var csvTarget: Int?
     private var insertionIndex: Int?
     private var dragLocation: NSPoint?
@@ -579,13 +632,17 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     private var positions: [PositionedClip] = []
     private var hasAudioOnlyClips = false
     private var selectedPositionIndex: Int?
-    private var sequenceDuration = 0.0
     private var trimClipIndex: Int?
+    private var trimGeometry: TrimGeometry?
+    private var sequenceDuration: Double { (positions.last?.sequenceEnd ?? 0) + (trimGeometry?.sequenceDelta ?? 0) }
+    private var stripDuration: Double { (positions.last?.stripEnd ?? 0) + (trimGeometry?.stripDelta ?? 0) }
+    private var filmstripViewport: FilmstripViewport?
+    private var filmstripTilesByPosition: [Int: [VisibleFilmstripTile]] = [:]
     private var visibleThumbnailTiles: [ThumbnailKey: [NSRect]] = [:]
     private var thumbnails: [ThumbnailKey: NSImage] = [:]
     private var thumbnailOrder: [ThumbnailKey] = []
     private var unavailableThumbnails: Set<ThumbnailKey> = []
-    private var thumbnailRequests: [ThumbnailKey] = []
+    private var thumbnailRequests: ArraySlice<ThumbnailKey> = []
     private var thumbnailTask: Task<Void, Never>?
     private var activeThumbnail: ThumbnailKey?
     private var accessibleClips: [UUID: AccessibleClip] = [:]
@@ -611,12 +668,12 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
 
     private var scale: CGFloat {
         let available = max(1, viewportWidth - 2 * margin)
-        let sourceDuration = positions.last?.stripEnd ?? 0
+        let sourceDuration = stripDuration
         return sourceDuration > 0 ? available * zoom / sourceDuration : available
     }
 
     var contentWidth: CGFloat {
-        let duration = positions.last?.stripEnd ?? 0
+        let duration = stripDuration
         return margin * 2 + duration * scale
     }
 
@@ -675,7 +732,8 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         accessibleRuler.setPosition = { [weak self] in self?.seekAccessibly(to: $0) }
         let ids = Set(positions.map { $0.clip.id })
         accessibleClips = accessibleClips.filter { ids.contains($0.key) }
-        let children = positions.enumerated().map { index, position in
+        let children: [AccessibleClip] = positions.indices.map { index in
+            let position = position(at: index)
             let id = position.clip.id
             let element = accessibleClips[id] ?? AccessibleClip()
             accessibleClips[id] = element
@@ -707,7 +765,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             if index + 1 < positions.count {
                 actions.append(accessibleMove(id, by: 1, name: "Move clip later"))
             }
-            element.setAccessibilityCustomActions(timeline?.allowsClipEdits == true ? actions : [])
+            element.setAccessibilityCustomActions(timeline?.allowsClipEdits == true && !position.clip.isGap ? actions : [])
             return element
         }
         return [accessibleRuler] + children.map { $0 as NSAccessibilityElement }
@@ -727,7 +785,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             let children = accessibilityChildren()
             if local.y < laneTop { return children?.first }
             let index = firstClipIndex { stripX(at: $0.stripEnd) > local.x }
-            if positions.indices.contains(index), clipRect(positions[index]).contains(local) {
+            if positions.indices.contains(index), clipRect(position(at: index)).contains(local) {
                 return children?[index + 1]
             }
             return super.accessibilityHitTest(point)
@@ -743,7 +801,8 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
 
     private func focusAccessibleClip(_ id: UUID) -> Bool {
         guard isEditingEnabled, let timeline,
-              let clip = positions.first(where: { $0.clip.id == id }) else { return false }
+              let index = positions.firstIndex(where: { $0.clip.id == id }) else { return false }
+        let clip = position(at: index)
         timeline.onSelect(id)
         timeline.onSeek(clip.sequenceStart)
         reveal(time: clip.sequenceStart)
@@ -753,7 +812,8 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     private func accessibleTrim(_ id: UUID, edge: TimelineEdge, restore: Bool, name: String) -> NSAccessibilityCustomAction {
         NSAccessibilityCustomAction(name: name) { [weak self] in
             guard let self, self.isEditingEnabled, let timeline = self.timeline, timeline.allowsClipEdits,
-                  let position = self.positions.first(where: { $0.clip.id == id }) else { return false }
+                  let index = self.positions.firstIndex(where: { $0.clip.id == id }) else { return false }
+            let position = self.position(at: index)
             let sourceTime: Double
             if restore {
                 sourceTime = edge == .start ? 0 : position.clip.sourceDuration
@@ -782,24 +842,14 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     private func rebuildPositions() {
         var stripStart = 0.0
         var nextSequenceTime = 0.0
-        var trimDelta = 0.0
-        trimClipIndex = nil
         keptRuns.removeAll(keepingCapacity: true)
         hasAudioOnlyClips = false
-        positions = (timeline?.clips ?? []).enumerated().map { index, clip in
+        positions = (timeline?.clips ?? []).map { clip in
             if clip.isAudioOnly { hasAudioOnlyClips = true }
-            let sequenceStart = clip.sequenceRange.map { $0.lowerBound + trimDelta } ?? nextSequenceTime
-            var sourceStart = clip.sourceStart
-            var sourceEnd = clip.sourceEnd
-            if let trimPosition, trimPosition.id == clip.id {
-                trimClipIndex = index
-                if trimPosition.edge == .start { sourceStart = trimPosition.time }
-                else { sourceEnd = trimPosition.time }
-                trimDelta = (sourceEnd - sourceStart) - clip.duration
-            }
-            let sequenceEnd = clip.sequenceRange.map { $0.upperBound + trimDelta } ?? (sequenceStart + (sourceEnd - sourceStart))
+            let sequenceStart = clip.sequenceRange?.lowerBound ?? nextSequenceTime
+            let sequenceEnd = clip.sequenceRange?.upperBound ?? (sequenceStart + clip.duration)
             let position = PositionedClip(clip: clip, stripStart: stripStart, sequenceStart: sequenceStart, sequenceEnd: sequenceEnd,
-                                          sourceStart: sourceStart, sourceEnd: sourceEnd)
+                                          sourceStart: clip.sourceStart, sourceEnd: clip.sourceEnd)
             stripStart = position.stripEnd
             nextSequenceTime = position.sequenceEnd
             if let last = keptRuns.last, last.stripEnd == position.keptStart,
@@ -812,8 +862,39 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             }
             return position
         }
-        sequenceDuration = nextSequenceTime
+        if case let .trim(id, _, _, _, _) = interaction {
+            trimClipIndex = positions.firstIndex { $0.clip.id == id }
+        }
+        updateTrimGeometry()
         updateTimelineOverlay()
+    }
+
+    private func updateTrimGeometry() {
+        filmstripViewport = nil
+        guard let trimPosition, let index = trimClipIndex else {
+            trimGeometry = nil
+            return
+        }
+        let original = positions[index]
+        let sourceStart = trimPosition.edge == .start ? trimPosition.time : original.sourceStart
+        let sourceEnd = trimPosition.edge == .end ? trimPosition.time : original.sourceEnd
+        let sequenceDelta = (sourceEnd - sourceStart) - original.clip.duration
+        let clip = PositionedClip(clip: original.clip, stripStart: original.stripStart,
+                                  sequenceStart: original.sequenceStart, sequenceEnd: original.sequenceEnd + sequenceDelta,
+                                  sourceStart: sourceStart, sourceEnd: sourceEnd)
+        trimGeometry = TrimGeometry(index: index, clip: clip, sequenceDelta: sequenceDelta,
+                                    stripDelta: clip.stripEnd - original.stripEnd)
+    }
+
+    // A preview changes one clip and translates all clips that follow it.
+    private func position(at index: Int) -> PositionedClip {
+        let original = positions[index]
+        guard let trimGeometry, index >= trimGeometry.index else { return original }
+        if index == trimGeometry.index { return trimGeometry.clip }
+        return PositionedClip(clip: original.clip, stripStart: original.stripStart + trimGeometry.stripDelta,
+                              sequenceStart: original.sequenceStart + trimGeometry.sequenceDelta,
+                              sequenceEnd: original.sequenceEnd + trimGeometry.sequenceDelta,
+                              sourceStart: original.sourceStart, sourceEnd: original.sourceEnd)
     }
 
     fileprivate func stripX(at time: Double) -> CGFloat { margin + time * scale }
@@ -822,7 +903,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     private func x(at sequenceTime: Double, preceding: Bool = false) -> CGFloat {
         guard !positions.isEmpty else { return margin }
         let index = min(positions.count - 1, firstClipIndex { preceding ? $0.sequenceEnd >= sequenceTime : $0.sequenceEnd > sequenceTime })
-        let clip = positions[index]
+        let clip = position(at: index)
         let local = min(clip.sequenceEnd, max(clip.sequenceStart, sequenceTime)) - clip.sequenceStart
         return stripX(at: clip.keptStart + local)
     }
@@ -831,7 +912,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         guard !positions.isEmpty else { return 0 }
         let time = stripTime(at: x)
         let index = min(positions.count - 1, firstClipIndex { $0.stripEnd > time })
-        let clip = positions[index]
+        let clip = position(at: index)
         if time <= clip.keptStart { return clip.sequenceStart }
         if time >= clip.keptEnd { return clip.sequenceEnd }
         return clip.sequenceStart + (time - clip.keptStart)
@@ -867,7 +948,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             fill(NSRect(x: 0, y: top, width: bounds.width, height: 1), .separatorColor)
             for asset in timeline.assemblyAssets {
                 let left = x(at: asset.interval.from.seconds)
-                let right = x(at: asset.interval.to.seconds)
+                let right = x(at: asset.interval.to.seconds, preceding: true)
                 let rect = NSRect(x: left, y: top + 3, width: max(1, right - left), height: 18)
                 guard rect.intersects(dirtyRect) else { continue }
                 fill(rect, NSColor.systemPurple.withAlphaComponent(0.25))
@@ -883,17 +964,15 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         fill(NSRect(x: 0, y: laneTop - 3, width: bounds.width, height: 1), .separatorColor)
 
         let waveformOnly = waveformHeight > 0 && dirtyRect.minY >= waveformTop && dirtyRect.maxY <= waveformTop + waveformHeight
-        if !waveformOnly { visibleThumbnailTiles.removeAll(keepingCapacity: true) }
+        if !waveformOnly { updateVisibleFilmstrip(visibleRect) }
         var visibleWaveforms = Set<WaveformSurface>()
         defer { timeline.envelopeStore?.setVisibleTimelineSurfaces(visibleWaveforms) }
         if positions.isEmpty {
-            label("Drop audio or video files here", at: NSPoint(x: margin + 10, y: laneTop + 20),
+            let hint = timeline.onDropStills == nil ? "Drop audio or video files here" : "Drop video, audio, or still images here"
+            label(hint, at: NSPoint(x: margin + 10, y: laneTop + 20),
                   font: .systemFont(ofSize: 13, weight: .medium), color: .secondaryLabelColor)
-            thumbnailRequests = []
-            thumbnailTask?.cancel()
         } else {
             let visible = visibleRect
-            var keys: [ThumbnailKey] = []
             let visibleStart = stripTime(at: visible.minX)
             let visibleEnd = stripTime(at: visible.maxX)
             var lastLabelEnd = -CGFloat.infinity
@@ -901,23 +980,20 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             let wantsDetail = timeline.showsWaveform && AudioEnvelopeStore.needsTimelineDetail(
                 secondsPerPixel: 1 / (scale * (window?.backingScaleFactor ?? 2)))
             for index in first..<positions.count {
-                let position = positions[index]
+                let position = position(at: index)
                 if position.stripStart >= visibleEnd { break }
                 let refreshDetail = timeline.showsWaveform && timeline.envelopeStore?.isVisibleOnly(position.clip.sourceID) == true
                 if position.clip.isAudioOnly || wantsDetail || refreshDetail { visibleWaveforms.insert(.timeline(position.clip.id)) }
                 if dirtyRect.minY < laneTop {
                     drawRuler(visible, position: position, lastLabelEnd: &lastLabelEnd)
                 }
-                drawClip(position, selected: position.clip.id == timeline.selection,
-                         visible: visible, keys: &keys, waveformOnly: waveformOnly)
-            }
-            if !waveformOnly {
-                thumbnailRequests = keys.filter { thumbnails[$0] == nil && !unavailableThumbnails.contains($0) }
-                loadThumbnails()
+                if position.clip.isGap { continue }
+                drawClip(position, index: index, selected: position.clip.id == timeline.selection,
+                         visible: visible, dirty: dirtyRect, waveformOnly: waveformOnly)
             }
 
             if let trimPosition, let trimClipIndex {
-                let position = positions[trimClipIndex]
+                let position = position(at: trimClipIndex)
                 let edge = trimPosition.edge == .start ? position.keptStart : position.keptEnd
                 drawTimelinePlayhead(x: stripX(at: edge), top: 16, bottom: laneTop + laneHeight + 6, color: .controlAccentColor)
                 drawTrimTime(trimPosition.time, edgeX: stripX(at: edge))
@@ -929,16 +1005,23 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
 
     private func drawDragMarkers() {
         if let csvTarget, positions.indices.contains(csvTarget) {
-            let rect = clipRect(positions[csvTarget]).insetBy(dx: 1, dy: 1)
+            let rect = clipRect(position(at: csvTarget)).insetBy(dx: 1, dy: 1)
             NSColor.controlAccentColor.setStroke()
             let outline = NSBezierPath(rect: rect)
             outline.lineWidth = 2
             outline.stroke()
         }
-        if let insertionIndex {
+        let marker: CGFloat?
+        if let stillDropTime {
+            marker = x(at: stillDropTime)
+        } else if let insertionIndex {
             let time = positions.indices.contains(insertionIndex)
-                ? positions[insertionIndex].stripStart : positions.last?.stripEnd ?? 0
-            let marker = stripX(at: time)
+                ? position(at: insertionIndex).stripStart : stripDuration
+            marker = stripX(at: time)
+        } else {
+            marker = nil
+        }
+        if let marker {
             fill(NSRect(x: marker - 1.5, y: laneTop - 5, width: 3, height: laneHeight + 10),
                  .controlAccentColor)
             NSColor.controlAccentColor.setFill()
@@ -971,9 +1054,10 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         }
     }
 
-    private func drawWaveform(clip: TimelineClip, lane: NSRect, sourceStart: Double, visible: NSRect) {
+    private func drawWaveform(clip: TimelineClip, lane: NSRect, sourceStart: Double, visible: NSRect, dirty: NSRect) {
         let area = lane.intersection(visible)
-        guard !area.isEmpty, needsToDraw(area) else { return }
+        let repaint = area.intersection(dirty)
+        guard !repaint.isEmpty, needsToDraw(repaint) else { return }
         fill(area, .controlBackgroundColor)
         let scale = self.scale
         let from = sourceStart + (area.minX - lane.minX) / scale
@@ -1013,13 +1097,13 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         }
         let path = WaveformDrawing.timelinePath(in: CGRect(x: area.minX, y: lane.minY, width: area.width, height: lane.height),
             sourceStart: from, pointsPerSecond: scale, displayScale: backing, detail: detail,
-            coarse: wave)
+            coarse: wave, dirtyX: repaint.minX..<repaint.maxX)
         NSColor.systemTeal.withAlphaComponent(0.9).setFill()
         NSBezierPath(cgPath: path).fill()
     }
 
-    private func drawClip(_ position: PositionedClip, selected: Bool, visible: NSRect,
-                          keys: inout [ThumbnailKey], waveformOnly: Bool) {
+    private func drawClip(_ position: PositionedClip, index: Int, selected: Bool, visible: NSRect, dirty: NSRect,
+                          waveformOnly: Bool) {
         let rect = clipRect(position)
         let strip = NSRect(x: stripX(at: position.stripStart), y: laneTop,
                           width: (position.displayTo - position.displayFrom) * scale, height: laneHeight)
@@ -1038,15 +1122,16 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
                     pixels: Int(ceil(area.width * backing)))
                 WaveformDrawing.draw(in: lane, visible: area, seconds: sourceStart..<position.displayTo, scale: backing,
                                      detail: detail, coarse: timeline?.waveforms[position.clip.sourceID],
-                                     pauses: timeline?.waveformPauses[position.clip.sourceID] ?? [], color: .systemTeal)
+                                     pauses: timeline?.waveformPauses[position.clip.sourceID] ?? [], color: .systemTeal,
+                                     dirty: dirty)
             }
         } else {
-            if !waveformOnly, timeline?.thumbnail != nil, strip.width > 0 {
-                drawThumbnails(position, rect: filmstrip, visible: visible, keys: &keys)
+            if !waveformOnly, filmstrip.intersects(dirty) {
+                drawThumbnails(at: index, displaySize: position.clip.displaySize, dirty: dirty)
             }
             if timeline?.showsWaveform == true {
                 let lane = NSRect(x: strip.minX, y: filmstrip.maxY, width: strip.width, height: waveformHeight)
-                drawWaveform(clip: position.clip, lane: lane, sourceStart: position.displayFrom, visible: visible)
+                drawWaveform(clip: position.clip, lane: lane, sourceStart: position.displayFrom, visible: visible, dirty: dirty)
             }
         }
         for excluded in [NSRect(x: strip.minX, y: laneTop, width: max(0, rect.minX - strip.minX), height: laneHeight),
@@ -1069,6 +1154,22 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         fill(NSRect(x: rect.minX, y: body.maxY, width: rect.width, height: rect.maxY - body.maxY), chrome)
         // A lane without pictures (the assembly) is too short for bands, so it takes one even tint.
         fill(body, body.height < 12 ? chrome : selected ? NSColor.controlAccentColor.withAlphaComponent(0.06) : .clear)
+        // Project the retained edges from the edit plan onto this occurrence only.
+        let padding = timeline?.timelinePadding ?? []
+        let area = body.intersection(visible)
+        if !area.isEmpty {
+            let start = position.sequenceStart + (area.minX - rect.minX) / scale
+            let end = position.sequenceStart + (area.maxX - rect.minX) / scale
+            for span in padding[padding.lowerBound { $0.to.seconds > start }...] {
+                if span.from.seconds >= end { break }
+                let left = max(area.minX, rect.minX + (span.from.seconds - position.sequenceStart) * scale)
+                let right = min(area.maxX, rect.minX + (span.to.seconds - position.sequenceStart) * scale)
+                if right > left {
+                    fill(NSRect(x: left, y: area.minY, width: right - left, height: area.height),
+                         NSColor.systemIndigo.withAlphaComponent(0.22))
+                }
+            }
+        }
         let nameX = max(rect.minX + 8, visible.minX + 6)
         let nameWidth = max(0, min(rect.maxX - 8, visible.maxX - 6) - nameX)
         let nameRect = NSRect(x: nameX, y: rect.minY + 4, width: nameWidth, height: 15)
@@ -1152,89 +1253,120 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         }
     }
 
-    private func drawThumbnails(_ position: PositionedClip, rect: NSRect, visible: NSRect,
-                                keys: inout [ThumbnailKey]) {
-        // Distribute the clip width evenly, including the final picture.
-        let layout = TimelineFilmstrip(width: rect.width, targetWidth: thumbnailWidth)
-        let tileWidth = layout.tileWidth
-        let tiles = layout.visibleTiles(origin: rect.minX, visible: visible.minX..<visible.maxX)
-        guard !tiles.isEmpty, position.clip.mediaIssue == nil else { return }
+    private func updateVisibleFilmstrip(_ visible: NSRect) {
+        let viewport = FilmstripViewport(visible: visible.minX..<visible.maxX, scale: scale,
+                                         tileSize: CGSize(width: thumbnailWidth, height: thumbnailHeight),
+                                         backingScale: window?.backingScaleFactor ?? 2,
+                                         enabled: timeline?.thumbnail != nil)
+        guard filmstripViewport != viewport else { return }
+        filmstripViewport = viewport
+        visibleThumbnailTiles.removeAll(keepingCapacity: true)
+        filmstripTilesByPosition.removeAll(keepingCapacity: true)
+        var keys: [ThumbnailKey] = []
+        if viewport.enabled {
+            let start = stripTime(at: visible.minX)
+            let end = stripTime(at: visible.maxX)
+            let first = firstClipIndex { $0.stripEnd > start }
+            for index in first..<positions.count {
+                let position = position(at: index)
+                if position.stripStart >= end { break }
+                guard !position.clip.isGap, !position.clip.isAudioOnly, position.clip.mediaIssue == nil else { continue }
+                let rect = NSRect(x: stripX(at: position.stripStart), y: laneTop + 21,
+                                  width: (position.displayTo - position.displayFrom) * viewport.scale,
+                                  height: viewport.tileSize.height)
+                guard rect.width > 0 else { continue }
+                filmstripTilesByPosition[index] = planFilmstripTiles(position, rect: rect, viewport: viewport, keys: &keys)
+            }
+        }
+        thumbnailRequests = keys.filter { thumbnails[$0] == nil && !unavailableThumbnails.contains($0) }[...]
+        loadThumbnails()
+    }
 
-        let backingScale = window?.backingScaleFactor ?? 2
-        let size = CGSize(width: thumbnailWidth * backingScale, height: thumbnailHeight * backingScale)
+    private func planFilmstripTiles(_ position: PositionedClip, rect: NSRect, viewport: FilmstripViewport,
+                                    keys: inout [ThumbnailKey]) -> [VisibleFilmstripTile] {
+        // Distribute the clip width evenly, including the final picture.
+        let layout = TimelineFilmstrip(width: rect.width, targetWidth: viewport.tileSize.width)
+        let tileWidth = layout.tileWidth
+        let tiles = layout.visibleTiles(origin: rect.minX, visible: viewport.visible)
+        guard !tiles.isEmpty else { return [] }
+
+        let size = CGSize(width: viewport.tileSize.width * viewport.backingScale,
+                          height: viewport.tileSize.height * viewport.backingScale)
         let groups = min(tiles.count, TimelineFilmstrip.openingFrameLimit)
         let middle = groups / 2
         let last = groups - 1
         let openingClock = OpeningClock(origin: position.clip.sourceOrigin, duration: position.clip.sourceDuration)
 
-        func openingKey(_ group: Int) -> ThumbnailKey {
+        let openingKeys = (0..<groups).map { group in
             // Round up both boundaries so every group gets at least one tile.
             let from = tiles.lowerBound + (group * tiles.count + groups - 1) / groups
             let to = tiles.lowerBound + ((group + 1) * tiles.count + groups - 1) / groups
             let sample = group == 0 ? CGFloat(from) : CGFloat(from + to) / 2
             return ThumbnailKey(source: position.clip.sourceID,
-                                sourceTime: position.displayFrom + Double(sample * tileWidth / scale),
+                                sourceTime: position.displayFrom + Double(sample * tileWidth / viewport.scale),
                                 size: size, openingClock: openingClock, mediaRevision: position.clip.mediaRevision)
         }
 
-        if position.clip.usesOpeningFilmstrip {
+        let usesOpening = position.clip.usesOpeningFilmstrip
+        if usesOpening {
             // Cover the start, middle and end first. Each is also one of the final ten.
-            keys.append(openingKey(0))
-            if middle > 0 { keys.append(openingKey(middle)) }
-            if last > middle { keys.append(openingKey(last)) }
+            keys.append(openingKeys[0])
+            if middle > 0 { keys.append(openingKeys[middle]) }
+            if last > middle { keys.append(openingKeys[last]) }
             for group in 1..<groups where group != middle && group != last {
-                keys.append(openingKey(group))
+                keys.append(openingKeys[group])
             }
         }
 
-        for tile in tiles {
+        return tiles.map { tile in
             let group = (tile - tiles.lowerBound) * groups / tiles.count
             let key: ThumbnailKey
-            if !position.clip.usesOpeningFilmstrip {
-                let start = position.displayFrom + Double(CGFloat(tile) * tileWidth / scale)
-                let end = min(position.displayTo, position.displayFrom + Double(CGFloat(tile + 1) * tileWidth / scale))
+            if usesOpening {
+                key = openingKeys[group]
+            } else {
+                let start = position.displayFrom + Double(CGFloat(tile) * tileWidth / viewport.scale)
+                let end = min(position.displayTo, position.displayFrom + Double(CGFloat(tile + 1) * tileWidth / viewport.scale))
                 key = ThumbnailKey(source: position.clip.sourceID, sourceTime: position.clip.thumbnailTime(from: start, to: end), size: size, mediaRevision: position.clip.mediaRevision)
                 if keys.last != key { keys.append(key) }
-            } else {
-                key = openingKey(group)
             }
-            let range = layout.tileRange(tile, origin: rect.minX, displayScale: backingScale)
+            let range = layout.tileRange(tile, origin: rect.minX, displayScale: viewport.backingScale)
             let tileRect = NSRect(x: range.lowerBound, y: rect.minY, width: range.upperBound - range.lowerBound,
                                   height: rect.height)
             visibleThumbnailTiles[key, default: []].append(tileRect)
-            let shouldDraw = needsToDraw(tileRect)
-            if !position.clip.usesOpeningFilmstrip && !shouldDraw { continue }
-            var image = thumbnails[key]
-            if image == nil {
-                func useOpeningImage(_ fallback: ThumbnailKey) {
-                    image = thumbnails[fallback]
-                    if image == nil && position.clip.usesOpeningFilmstrip && fallback != key {
-                        visibleThumbnailTiles[fallback, default: []].append(tileRect)
-                    }
-                }
-                if !position.clip.usesOpeningFilmstrip { useOpeningImage(openingKey(group)) }
-                // Unfilled groups share the closest of the three early pictures.
-                let anchor: Int
-                if group * 2 <= middle { anchor = 0 }
-                else if group * 2 <= middle + last { anchor = middle }
-                else { anchor = last }
-                if image == nil && anchor != group { useOpeningImage(openingKey(anchor)) }
-                if image == nil && anchor != 0 { useOpeningImage(openingKey(0)) }
+            var fallbacks = [ThumbnailKey]()
+            if !usesOpening { fallbacks.append(openingKeys[group]) }
+            // Unfilled groups share the closest of the three early pictures.
+            let anchor: Int
+            if group * 2 <= middle { anchor = 0 }
+            else if group * 2 <= middle + last { anchor = middle }
+            else { anchor = last }
+            if anchor != group { fallbacks.append(openingKeys[anchor]) }
+            if anchor != 0 && group != 0 { fallbacks.append(openingKeys[0]) }
+            if usesOpening {
+                for fallback in fallbacks { visibleThumbnailTiles[fallback, default: []].append(tileRect) }
             }
-            if shouldDraw, let image {
-                let displaySize = position.clip.displaySize
-                let aspectSize = displaySize.width > 0 && displaySize.height > 0 ? displaySize : image.size
-                let scale = max(tileRect.width / aspectSize.width, tileRect.height / aspectSize.height)
-                let width = aspectSize.width * scale
-                let height = aspectSize.height * scale
-                let target = NSRect(x: tileRect.midX - width / 2, y: tileRect.midY - height / 2,
-                                    width: width, height: height)
-                NSGraphicsContext.saveGraphicsState()
-                NSBezierPath(rect: tileRect).addClip()
-                image.draw(in: target, from: .zero, operation: .sourceOver, fraction: 1,
-                           respectFlipped: true, hints: nil)
-                NSGraphicsContext.restoreGraphicsState()
-            }
+            return VisibleFilmstripTile(rect: tileRect, key: key, fallbacks: fallbacks)
+        }
+    }
+
+    private func drawThumbnails(at index: Int, displaySize: CGSize, dirty: NSRect) {
+        guard let tiles = filmstripTilesByPosition[index] else { return }
+        let first = tiles.lowerBound { $0.rect.maxX > dirty.minX }
+        for tile in tiles.dropFirst(first) {
+            guard tile.rect.minX < dirty.maxX else { break }
+            guard needsToDraw(tile.rect) else { continue }
+            guard let image = thumbnails[tile.key] ?? tile.fallbacks.lazy.compactMap({ self.thumbnails[$0] }).first else { continue }
+            let aspectSize = displaySize.width > 0 && displaySize.height > 0 ? displaySize : image.size
+            let scale = max(tile.rect.width / aspectSize.width, tile.rect.height / aspectSize.height)
+            let width = aspectSize.width * scale
+            let height = aspectSize.height * scale
+            let target = NSRect(x: tile.rect.midX - width / 2, y: tile.rect.midY - height / 2,
+                                width: width, height: height)
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: tile.rect).addClip()
+            image.draw(in: target, from: .zero, operation: .sourceOver, fraction: 1,
+                       respectFlipped: true, hints: nil)
+            NSGraphicsContext.restoreGraphicsState()
         }
     }
 
@@ -1271,15 +1403,17 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
 
     fileprivate func updateTimelineOverlay() {
         let hasMarks = previewRange != nil || timeline?.markIn != nil || timeline?.markOut != nil
-        let hasDragMarker = csvTarget != nil || insertionIndex != nil
+        let hasDragMarker = csvTarget != nil || insertionIndex != nil || stillDropTime != nil
         rangeOverlay.update(viewport: visibleRect.intersection(bounds),
                             showMarks: hasDragMarker || (!positions.isEmpty && hasMarks))
     }
 
-    private func setDragMarkers(csvTarget: Int? = nil, insertionIndex: Int? = nil) {
-        guard self.csvTarget != csvTarget || self.insertionIndex != insertionIndex else { return }
+    private func setDragMarkers(csvTarget: Int? = nil, insertionIndex: Int? = nil, stillDropTime: Double? = nil) {
+        guard self.csvTarget != csvTarget || self.insertionIndex != insertionIndex
+                || self.stillDropTime != stillDropTime else { return }
         self.csvTarget = csvTarget
         self.insertionIndex = insertionIndex
+        self.stillDropTime = stillDropTime
         updateTimelineOverlay()
     }
 
@@ -1291,11 +1425,8 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             let end = max(markIn, markOut)
             let visibleStart = stripTime(at: visible.minX)
             let visibleEnd = stripTime(at: visible.maxX)
-            let first = keptRuns.lowerBound { $0.stripEnd > visibleStart && $0.sequenceEnd > start }
             let shade = NSBezierPath()
-            for index in first..<keptRuns.count {
-                let run = keptRuns[index]
-                if run.stripStart >= visibleEnd || run.sequenceStart >= end { break }
+            func appendShade(_ run: KeptRun) {
                 let lower = max(run.sequenceStart, start)
                 let upper = min(run.sequenceEnd, end)
                 if upper > lower {
@@ -1303,6 +1434,31 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
                     let right = stripX(at: run.stripEnd + (upper - run.sequenceEnd))
                     shade.appendRect(NSRect(x: left, y: 24, width: right - left, height: laneTop + laneHeight - 22)
                         .intersection(visible))
+                }
+            }
+            if trimGeometry != nil {
+                // Use the adjusted clips in view while the cached runs still describe the committed edit.
+                let first = firstClipIndex { $0.keptEnd > visibleStart && $0.sequenceEnd > start }
+                var run: KeptRun?
+                for index in first..<positions.count {
+                    let clip = position(at: index)
+                    if clip.keptStart >= visibleEnd || clip.sequenceStart >= end { break }
+                    if run?.stripEnd == clip.keptStart, run?.sequenceEnd == clip.sequenceStart {
+                        run?.sequenceEnd = clip.sequenceEnd
+                        run?.stripEnd = clip.keptEnd
+                    } else {
+                        if let run { appendShade(run) }
+                        run = KeptRun(sequenceStart: clip.sequenceStart, sequenceEnd: clip.sequenceEnd,
+                                      stripStart: clip.keptStart, stripEnd: clip.keptEnd)
+                    }
+                }
+                if let run { appendShade(run) }
+            } else {
+                let first = keptRuns.lowerBound { $0.stripEnd > visibleStart && $0.sequenceEnd > start }
+                for index in first..<keptRuns.count {
+                    let run = keptRuns[index]
+                    if run.stripStart >= visibleEnd || run.sequenceStart >= end { break }
+                    appendShade(run)
                 }
             }
             NSColor.controlAccentColor.withAlphaComponent(0.19).setFill()
@@ -1349,8 +1505,8 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         }
         guard timeline?.allowsClipEdits == true,
               let selectedPositionIndex else { return }
-        let selected = positions[selectedPositionIndex]
-        guard !selected.clip.isStill else { return }
+        let selected = position(at: selectedPositionIndex)
+        guard !selected.clip.isStill, !selected.clip.isGap else { return }
         let rect = clipRect(selected)
         for edge in [TimelineEdge.start, .end] {
             let grip = gripRect(rect, edge: edge, position: selected)
@@ -1362,10 +1518,17 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
         guard isEditingEnabled, let timeline, timeline.allowsClipEdits,
-              let index = clipIndex(at: point), let labels = timeline.audioTrackLabels?(positions[index].clip.sourceID),
-              !labels.isEmpty else { return super.menu(for: event) }
-        let clip = positions[index]
+              let index = clipIndex(at: point) else { return super.menu(for: event) }
+        let clip = position(at: index)
         let menu = NSMenu()
+        if index > 0, timeline.onPreviewJoin != nil {
+            let item = menu.addItem(withTitle: "Preview Join Before Clip", action: #selector(previewJoin(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = clip.clip.id
+        }
+        let labels = timeline.audioTrackLabels?(clip.clip.sourceID) ?? []
+        guard !labels.isEmpty else { return menu.items.isEmpty ? super.menu(for: event) : menu }
+        if !menu.items.isEmpty { menu.addItem(.separator()) }
         for (ordinal, label) in labels.enumerated() {
             let item = menu.addItem(withTitle: "Monitor " + label, action: #selector(monitorTrack(_:)), keyEquivalent: "")
             item.target = self
@@ -1379,6 +1542,11 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         replace.toolTip = "Replace selected clip audio"
         replace.representedObject = clip.clip.id
         return menu
+    }
+
+    @objc private func previewJoin(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID else { return }
+        timeline?.onPreviewJoin?(id)
     }
 
     @objc private func monitorTrack(_ sender: NSMenuItem) {
@@ -1396,27 +1564,28 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         case playhead
         case seek(selecting: UUID?)
         case clip(UUID)
-        case trim(PositionedClip, TimelineEdge)
+        case trim(Int, TimelineEdge)
     }
 
     private func pointerTarget(at point: NSPoint, in timeline: SequenceTimeline) -> PointerTarget {
         if timeline.onRangeSelect != nil { return .range }
-        if abs(point.x - x(at: timeline.playhead)) <= 10, (14...36).contains(point.y) { return .playhead }
+        let hitsPlayhead = abs(point.x - x(at: timeline.playhead)) <= 10 && (14...36).contains(point.y)
 
         let inWaveform = waveformHeight > 0 && (waveformTop..<(waveformTop + waveformHeight)).contains(point.y)
         guard timeline.allowsClipEdits, !inWaveform, (laneTop..<(laneTop + laneHeight)).contains(point.y) else {
-            return .seek(selecting: nil)
+            return hitsPlayhead ? .playhead : .seek(selecting: nil)
         }
 
         // Let the first and last handles be grabbed from the empty timeline margin.
         let index = min(positions.count - 1, firstClipIndex { stripX(at: $0.stripEnd) > point.x })
         if let selectedPositionIndex {
-            let selected = positions[selectedPositionIndex]
-            if let edge = trimEdge(at: point, for: selected) { return .trim(selected, edge) }
+            let selected = position(at: selectedPositionIndex)
+            if let edge = trimEdge(at: point, for: selected) { return .trim(selectedPositionIndex, edge) }
         }
-        let position = positions[index]
-        if let edge = trimEdge(at: point, for: position) { return .trim(position, edge) }
-        guard clipRect(position).contains(point) else { return .seek(selecting: nil) }
+        let position = position(at: index)
+        if let edge = trimEdge(at: point, for: position) { return .trim(index, edge) }
+        if hitsPlayhead { return .playhead }
+        guard !position.clip.isGap, clipRect(position).contains(point) else { return .seek(selecting: nil) }
         let id = position.clip.id
         if position.clip.isAudioOnly && point.y >= laneTop + 21 { return .seek(selecting: id) }
         return .clip(id)
@@ -1441,15 +1610,17 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         case .clip(let id):
             timeline.onSelect(id)
             interaction = .clip(id, event.locationInWindow)
-        case .trim(let position, let edge):
-            timeline.onSelect(position.clip.id)
+        case .trim(let index, let edge):
+            let position = position(at: index)
             let sourceTime = edge == .start ? position.sourceStart : position.sourceEnd
             interaction = .trim(position.clip.id, edge, sourceTime, point.x, scale)
+            trimClipIndex = index
+            timeline.onSelect(position.clip.id)
         }
     }
 
     private func trimEdge(at point: NSPoint, for position: PositionedClip) -> TimelineEdge? {
-        guard !position.clip.isStill else { return nil }
+        guard !position.clip.isStill, !position.clip.isGap else { return nil }
         let rect = clipRect(position)
         for edge in [TimelineEdge.start, .end] {
             if gripRect(rect, edge: edge, position: position).contains(point) { return edge }
@@ -1501,7 +1672,8 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         case let .trim(id, edge, initialTime, downX, initialScale):
             // A click near an edge must not trim. One point can span seconds of a long clip.
             guard lastTrimTarget != nil || abs(point.x - downX) > 3 else { return }
-            guard let clip = timeline.clips.first(where: { $0.id == id }) else { return }
+            guard let trimClipIndex else { return }
+            let clip = positions[trimClipIndex].clip
             let sourceTime = min(clip.sourceDuration, max(0, initialTime + Double((point.x - downX) / initialScale)))
             guard sourceTime != lastTrimTarget else { return }
             lastTrimTarget = sourceTime
@@ -1509,19 +1681,20 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
                 validate(id, edge, sourceTime, false) { [weak self] effective in
                     guard let self, case .trim(id, edge, _, _, _) = self.interaction,
                           self.lastTrimTarget == sourceTime else { return }
-                    self.showHandle(id, edge: edge, at: effective)
+                    self.showHandle(edge: edge, at: effective)
                 }
             } else {
-                showHandle(id, edge: edge, at: timeline.onTrim(id, edge, sourceTime, false))
+                showHandle(edge: edge, at: timeline.onTrim(id, edge, sourceTime, false))
             }
         }
     }
 
-    private func showHandle(_ id: UUID, edge: TimelineEdge, at time: Double?) {
+    private func showHandle(edge: TimelineEdge, at time: Double?) {
         guard time != trimPosition?.time else { return }
-        trimPosition = time.map { TrimPosition(id: id, edge: edge, time: $0) }
+        trimPosition = time.map { TrimPosition(edge: edge, time: $0) }
         if time == nil { timeline?.onCancelTrim() }
-        rebuildPositions()
+        updateTrimGeometry()
+        updateTimelineOverlay()
         (enclosingScrollView as? TimelineScrollView)?.resizeDocument()
         needsDisplay = true
     }
@@ -1596,20 +1769,26 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         lastSeekTarget = nil
         let wasTrimming = trimPosition != nil
         trimPosition = nil
+        trimClipIndex = nil
+        if wasTrimming { updateTrimGeometry() }
         csvDrag = false
+        stillDrag = false
+        classifiedDropFiles = nil
         setDragMarkers()
         endEdgeScroll()
         if wasTrimming {
-            rebuildPositions()
+            updateTimelineOverlay()
             (enclosingScrollView as? TimelineScrollView)?.resizeDocument()
         }
         if wasSelectingRange { updateTimelineOverlay() }
         if wasTrimming || !(enclosingScrollView is TimelineScrollView) { needsDisplay = true }
     }
 
-    private func pointerTime(at x: CGFloat) -> Double {
+    private func pointerTime(at x: CGFloat, seeking: Bool = false) -> Double {
         let raw = sequenceTime(at: x)
-        return timeline?.pointerTarget?(raw, 8 / scale) ?? raw
+        guard let timeline else { return raw }
+        let tolerance = seeking && timeline.snapTarget.wrappedValue == .keyframes ? .infinity : 8 / scale
+        return timeline.pointerTarget?(raw, tolerance) ?? raw
     }
 
     private func rangeTime(at x: CGFloat) -> Double {
@@ -1618,7 +1797,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
 
     private func seek(to x: CGFloat, scrubbing: Bool = false) {
         guard let timeline else { return }
-        let target = pointerTime(at: x)
+        let target = pointerTime(at: x, seeking: true)
         guard target != lastSeekTarget else { return }
         lastSeekTarget = target
         if scrubbing, let onScrub = timeline.onScrub { onScrub(target) }
@@ -1635,7 +1814,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         var high = positions.count
         while low < high {
             let middle = (low + high) / 2
-            if pastTarget(positions[middle]) {
+            if pastTarget(position(at: middle)) {
                 high = middle
             } else {
                 low = middle + 1
@@ -1659,13 +1838,19 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
 
     private func clipIndex(at point: NSPoint) -> Int? {
         let index = firstClipIndex { stripX(at: $0.stripEnd) > point.x }
-        guard positions.indices.contains(index), clipRect(positions[index]).contains(point) else { return nil }
+        guard positions.indices.contains(index), !positions[index].clip.isGap,
+              clipRect(position(at: index)).contains(point) else { return nil }
         return index
     }
 
     private func updateDropMarker(at point: NSPoint) {
-        setDragMarkers(csvTarget: csvDrag ? clipIndex(at: point) : nil,
-                       insertionIndex: csvDrag ? nil : insertionSlot(at: point.x))
+        if csvDrag {
+            setDragMarkers(csvTarget: clipIndex(at: point))
+        } else if stillDrag {
+            setDragMarkers(stillDropTime: NSEvent.modifierFlags.contains(.option) ? nil : sequenceTime(at: point.x))
+        } else {
+            setDragMarkers(insertionIndex: insertionSlot(at: point.x))
+        }
     }
 
     /// True when the timeline can take media now. Project files are routed whether or not it can.
@@ -1685,15 +1870,22 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             endExternalDrop()
             return timeline?.onDropProjects != nil && urls.contains(where: ProjectSessions.isDroppedProject) ? .copy : []
         }
-        let containsCSV = urls.contains { $0.pathExtension.lowercased() == "csv" }
-        guard !urls.isEmpty, !containsCSV || (urls.count == 1 && timeline?.onClipCSV != nil) else {
+        if classifiedDropFiles?.all != urls {
+            let media = timeline?.onDropProjects == nil ? urls : urls.filter { !ProjectSessions.isDroppedProject($0) }
+            classifiedDropFiles = (urls, media)
+            stillDrag = timeline?.onDropStills != nil && !media.isEmpty && media.allSatisfy(StillPanels.isSupportedImage)
+        }
+        let media = classifiedDropFiles?.media ?? []
+        let routesProjects = media.count < urls.count
+        let containsCSV = media.contains { $0.pathExtension.lowercased() == "csv" }
+        guard !media.isEmpty, !containsCSV || (media.count == 1 && timeline?.onClipCSV != nil) else {
             endExternalDrop()
-            return []
+            return routesProjects ? .copy : []
         }
         startEdgeScroll(at: sender.draggingLocation, external: true)
         csvDrag = containsCSV
         updateDropMarker(at: point)
-        return csvDrag && csvTarget == nil ? [] : .copy
+        return csvDrag && csvTarget == nil && !routesProjects ? [] : .copy
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -1702,10 +1894,10 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         let isCopy = sender.draggingSourceOperationMask.contains(.copy)
         endExternalDrop()
         guard isCopy else { return false }
-        return dropFiles(urls, at: point)
+        return dropFiles(urls, at: point, replacingMarkedRange: NSEvent.modifierFlags.contains(.option))
     }
 
-    func dropFiles(_ dropped: [URL], at point: NSPoint) -> Bool {
+    func dropFiles(_ dropped: [URL], at point: NSPoint, replacingMarkedRange: Bool = false) -> Bool {
         guard let timeline, timeline.allowsFileDrops, !dropped.isEmpty else { return false }
         // Projects are routed first, as the viewer's drop does, so a busy editor does not refuse them.
         var urls = dropped
@@ -1715,12 +1907,12 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         let routed = urls.count < dropped.count
         guard acceptsMedia, !urls.isEmpty else { return routed }
         if let csv = urls.first(where: { $0.pathExtension.lowercased() == "csv" }) {
-            guard urls.count == 1, let onClipCSV = timeline.onClipCSV, let index = clipIndex(at: point) else { return false }
+            guard urls.count == 1, let onClipCSV = timeline.onClipCSV, let index = clipIndex(at: point) else { return routed }
             onClipCSV(csv, positions[index].clip.id)
             return true
         }
         if urls.allSatisfy(StillPanels.isSupportedImage), let onDropStills = timeline.onDropStills {
-            onDropStills(urls, sequenceTime(at: point.x), NSEvent.modifierFlags.contains(.option))
+            onDropStills(urls, sequenceTime(at: point.x), replacingMarkedRange)
         } else {
             timeline.onDrop(urls, insertionSlot(at: point.x))
         }
@@ -1728,9 +1920,11 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     }
 
     private func endExternalDrop() {
+        classifiedDropFiles = nil
         guard isExternalDrag else { return }
         endEdgeScroll()
         csvDrag = false
+        stillDrag = false
         setDragMarkers()
     }
 
@@ -1778,6 +1972,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             timeline?.envelopeStore?.setVisibleTimelineSurfaces([])
             if trimPosition != nil { timeline?.onCancelTrim() }
             clearInteraction()
+            filmstripViewport = nil
             thumbnailRequests = []
             thumbnailTask?.cancel()
         }

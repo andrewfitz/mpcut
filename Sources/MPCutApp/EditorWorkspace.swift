@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-struct EditorWorkspace<Viewer: View, Transport: View, Timeline: View, Status: View>: View {
+struct EditorWorkspace<Viewer: View, Transport: View, Timeline: View, Status: View, Sidebar: View>: View {
     let viewer: Viewer
     let transport: Transport
     let timeline: Timeline
@@ -10,18 +10,44 @@ struct EditorWorkspace<Viewer: View, Transport: View, Timeline: View, Status: Vi
     let showsStatus: Bool
     var allowsTimelineResize = false
 
+    var showsSidebar = false
+    @ViewBuilder let sidebar: () -> Sidebar
+    @AppStorage("workspace_full_height_sidebar_enabled", store: EditorPreferences.applicationDefaults) private var fullHeight = false
+    @State private var panelWidth: CGFloat = 440
+
+    init(viewer: Viewer, transport: Transport, timeline: Timeline, status: Status,
+         showsTimeline: Bool, showsStatus: Bool, allowsTimelineResize: Bool = false,
+         showsSidebar: Bool = false, @ViewBuilder sidebar: @escaping () -> Sidebar = { EmptyView() }) {
+        self.viewer = viewer
+        self.transport = transport
+        self.timeline = timeline
+        self.status = status
+        self.showsTimeline = showsTimeline
+        self.showsStatus = showsStatus
+        self.allowsTimelineResize = allowsTimelineResize
+        self.showsSidebar = showsSidebar
+        self.sidebar = sidebar
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            if showsTimeline && allowsTimelineResize {
-                VSplitView {
-                    previewAndTransport
-                    timeline
+            ZStack {
+                if showsSidebar && fullHeight {
+                    split { editingArea }
+                } else {
+                    editingArea
                 }
-            } else {
-                previewAndTransport
-                if showsTimeline {
-                    Divider()
-                    timeline
+            }
+            // Both dock positions use the same reader, preserving search, selection and scroll state.
+            .overlayPreferenceValue(PanelBounds.self) { anchor in
+                if showsSidebar {
+                    GeometryReader { proxy in
+                        let rect = anchor.map { proxy[$0] } ?? .zero
+                        sidebar()
+                            .frame(width: rect.width, height: rect.height)
+                            .clipped()
+                            .position(x: rect.midX, y: rect.midY)
+                    }
                 }
             }
             if showsStatus {
@@ -31,12 +57,97 @@ struct EditorWorkspace<Viewer: View, Transport: View, Timeline: View, Status: Vi
         }
     }
 
+    @ViewBuilder private var editingArea: some View {
+        if showsTimeline && allowsTimelineResize {
+            VSplitView {
+                previewAndTransport
+                timeline
+            }
+        } else {
+            VStack(spacing: 0) {
+                previewAndTransport
+                if showsTimeline {
+                    Divider()
+                    timeline
+                }
+            }
+        }
+    }
+
+    private func split<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        HSplitView {
+            content().frame(minWidth: 360, maxWidth: .infinity)
+            PanelWidthBinding(width: $panelWidth)
+                .frame(minWidth: 330, idealWidth: 440, maxWidth: 680)
+                .anchorPreference(key: PanelBounds.self, value: .bounds) { $0 }
+        }
+    }
+
     private var previewAndTransport: some View {
         VStack(spacing: 0) {
-            viewer
+            Group {
+                if showsSidebar && !fullHeight {
+                    split { viewer }
+                } else {
+                    viewer
+                }
+            }
                 .frame(minHeight: 180, maxHeight: .infinity)
             if showsTimeline { transport }
         }
+    }
+}
+
+private struct PanelBounds: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? { nil }
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
+
+/// Apply the requested width once per split, then remember native divider drags.
+private struct PanelWidthBinding: NSViewRepresentable {
+    @Binding var width: CGFloat
+
+    func makeNSView(context: Context) -> Probe { Probe() }
+    func updateNSView(_ view: Probe, context: Context) { view.width = $width }
+
+    final class Probe: NSView {
+        var width: Binding<CGFloat>?
+        private weak var initializedSplit: NSSplitView?
+
+        override func layout() {
+            super.layout()
+            DispatchQueue.main.async { [weak self] in self?.sync() }
+        }
+
+        private func sync() {
+            guard window != nil, let width,
+                  let split = sequence(first: self as NSView, next: { $0.superview })
+                    .compactMap({ $0 as? NSSplitView }).first(where: { $0.isVertical }),
+                  split.arrangedSubviews.count == 2, split.bounds.width > 0 else { return }
+            if initializedSplit !== split {
+                initializedSplit = split
+                let position = split.bounds.width - split.dividerThickness - width.wrappedValue
+                split.setPosition(min(split.maxPossiblePositionOfDivider(at: 0),
+                                      max(split.minPossiblePositionOfDivider(at: 0), position)), ofDividerAt: 0)
+            } else if let size = split.arrangedSubviews.last?.frame.width, size >= 330, abs(width.wrappedValue - size) > 0.5 {
+                width.wrappedValue = size
+            }
+        }
+    }
+}
+
+struct PanelDockToggle: View {
+    @AppStorage("workspace_full_height_sidebar_enabled", store: EditorPreferences.applicationDefaults) private var fullHeight = false
+
+    var body: some View {
+        PaneIconButton(title: "Full-height panel", symbol: "arrow.up.and.down", active: fullHeight,
+                       help: fullHeight ? "Tuck panel above timeline" : "Extend panel beside timeline") {
+            fullHeight.toggle()
+        }
+        .accessibilityValue(fullHeight ? "On" : "Off")
+        .accessibilityIdentifier("editor.fullHeightPanel")
     }
 }
 
@@ -147,87 +258,122 @@ struct EditorTransportBar<Player: EditorPlayback, Accessory: View>: View {
     @ViewBuilder let accessory: Accessory
 
     var body: some View {
-        Group {
-            if cameras.isEmpty && !rangeTools.active {
-                tools(compact: false)
-            } else {
+        ViewThatFits(in: .horizontal) {
+            tools(compact: false)
+            tools(compact: true)
+            VStack(spacing: 4) {
+                HStack {
+                    playback
+                    Spacer(minLength: 0)
+                    accessory
+                }
                 ViewThatFits(in: .horizontal) {
-                    tools(compact: false)
-                    tools(compact: true)
+                    HStack {
+                        markTools(compact: true)
+                        separator
+                        editTools(compact: true)
+                        Spacer(minLength: 0)
+                        history
+                    }
+                    VStack(spacing: 4) {
+                        HStack {
+                            markTools(compact: true)
+                            Spacer(minLength: 0)
+                        }
+                        HStack {
+                            editTools(compact: true)
+                            Spacer(minLength: 0)
+                            history
+                        }
+                    }
                 }
             }
+            .controlSize(.small)
+            .padding(.horizontal, 10)
         }
-        .frame(height: 43)
+        .padding(.vertical, 6)
+        .frame(minHeight: 43)
         .background(.bar)
     }
 
     private func tools(compact: Bool) -> some View {
         HStack(spacing: compact ? 3 : 5) {
-            HStack(spacing: 3) {
-                steps(-1)
-                PreviewPlayButton(preview: preview)
-                steps(1)
-                PreviewSpeedMenu(preview: preview)
-            }
-            .disabled(!canNavigate)
-
+            playback
             separator
-
-            // Clear Marks keeps its place so the tools after it never shift.
-            HStack(spacing: compact ? 2 : 4) {
-                ClipTool(icon: "text.cursor", label: "Range Selection Tool", shortcut: "R",
-                         toolTip: rangeTools.active ? "Use pointer (A)" : "Select range (R)",
-                         active: rangeTools.active) { rangeTools.active.toggle() }
-                    .accessibilityValue(rangeTools.active ? "On" : "Off")
-                ClipTool(icon: nil, label: "Mark In", visibleTitle: compact ? "In" : nil,
-                         shortcut: "I", active: marks.hasIn, action: marks.setIn)
-                    .fixedSize(horizontal: true, vertical: false)
-                ClipTool(icon: nil, label: "Mark Out", visibleTitle: compact ? "Out" : nil,
-                         shortcut: "O", active: marks.hasOut, action: marks.setOut)
-                    .fixedSize(horizontal: true, vertical: false)
-                if !cameras.isEmpty {
-                    separator.padding(.horizontal, compact ? 4 : 6)
-                    if cameras.count > 4 || (compact && cameras.count > 2) {
-                        ScrollView(.horizontal) { cameraButtons }
-                            .frame(minWidth: compact ? 56 : 124, idealWidth: compact ? 56 : 124, maxWidth: 124)
-                            .frame(height: 28)
-                    } else {
-                        cameraButtons.fixedSize()
-                    }
-                }
-                ClipTool(icon: "xmark.circle", label: "Clear Marks", shortcut: "⌥X or Esc", action: marks.clear)
-                    .disabled(!marks.hasIn && !marks.hasOut)
-                editTool(addRange, icon: "text.badge.plus", shortcut: "⇧⌘A",
-                         toolTip: "Queue marked range (⇧⌘A)")
-            }
-            .disabled(!canEdit)
-
+            markTools(compact: compact)
             separator
-
-            HStack(spacing: 4) {
-                if rangeTools.active {
-                    ClipTool(icon: "scissors", label: "Split at Selection Edges", shortcut: "⌘B", action: rangeTools.split)
-                        .disabled(!rangeTools.canSplit)
-                    ClipTool(icon: "square.and.arrow.up", label: "Export Selection…", shortcut: "⌥⌘E", action: rangeTools.export)
-                    ClipTool(icon: "trash", label: "Delete Selection", shortcut: "⌫", action: rangeTools.delete)
-                        .disabled(!rangeTools.canDelete)
-                } else {
-                    editTool(split, icon: "scissors", shortcut: "⌘B", visibleTitle: compact ? nil : "Split")
-                        .fixedSize(horizontal: true, vertical: false)
-                    editTool(delete, icon: "trash", shortcut: "⌫")
-                }
-            }
-            .disabled(!canEdit || (rangeTools.active && !rangeTools.canAct))
-
+            editTools(compact: compact)
             Spacer(minLength: 0)
             accessory
-            HStack(spacing: 4) {
-                editTool(undo, icon: "arrow.uturn.backward", shortcut: "⌘Z")
-                editTool(redo, icon: "arrow.uturn.forward", shortcut: "⇧⌘Z")
-            }
+            history
         }
         .padding(.horizontal, EditorMetrics.barInset - ClipTool.iconInset)
         .controlSize(compact ? .small : .regular)
+    }
+
+    private var playback: some View {
+        HStack(spacing: 3) {
+            steps(-1)
+            PreviewPlayButton(preview: preview)
+            steps(1)
+            PreviewSpeedMenu(preview: preview)
+        }
+        .disabled(!canNavigate)
+    }
+
+    private func markTools(compact: Bool) -> some View {
+        // Clear Marks keeps its place so the tools after it never shift.
+        HStack(spacing: compact ? 2 : 4) {
+            ClipTool(icon: "text.cursor", label: "Range Selection Tool", shortcut: "R",
+                     toolTip: rangeTools.active ? "Use pointer (A)" : "Select range (R)",
+                     active: rangeTools.active) { rangeTools.active.toggle() }
+                .accessibilityValue(rangeTools.active ? "On" : "Off")
+            ClipTool(icon: nil, label: "Mark In", visibleTitle: compact ? "In" : nil,
+                     shortcut: "I", active: marks.hasIn, action: marks.setIn)
+                .fixedSize(horizontal: true, vertical: false)
+            ClipTool(icon: nil, label: "Mark Out", visibleTitle: compact ? "Out" : nil,
+                     shortcut: "O", active: marks.hasOut, action: marks.setOut)
+                .fixedSize(horizontal: true, vertical: false)
+            if !cameras.isEmpty {
+                separator.padding(.horizontal, compact ? 4 : 6)
+                if cameras.count > 4 || (compact && cameras.count > 2) {
+                    ScrollView(.horizontal) { cameraButtons }
+                        .frame(minWidth: compact ? 56 : 124, idealWidth: compact ? 56 : 124, maxWidth: 124)
+                        .frame(height: 28)
+                } else {
+                    cameraButtons.fixedSize()
+                }
+            }
+            ClipTool(icon: "xmark.circle", label: "Clear Marks", shortcut: "⌥X or Esc", action: marks.clear)
+                .disabled(!marks.hasIn && !marks.hasOut)
+            editTool(addRange, icon: "text.badge.plus", shortcut: "⇧⌘A",
+                     toolTip: "Queue marked range (⇧⌘A)")
+        }
+        .disabled(!canEdit)
+    }
+
+    private func editTools(compact: Bool) -> some View {
+        HStack(spacing: 4) {
+            if rangeTools.active {
+                ClipTool(icon: "scissors", label: "Split at Selection Edges", shortcut: "⌘B", action: rangeTools.split)
+                    .disabled(!rangeTools.canSplit)
+                ClipTool(icon: "square.and.arrow.up", label: "Export Selection…", shortcut: "⌥⌘E", action: rangeTools.export)
+                ClipTool(icon: "trash", label: "Delete Selection", shortcut: "⌫", action: rangeTools.delete)
+                    .disabled(!rangeTools.canDelete)
+            } else {
+                editTool(split, icon: "scissors", shortcut: "⌘B", visibleTitle: compact ? nil : "Split")
+                    .fixedSize(horizontal: true, vertical: false)
+                editTool(delete, icon: "trash", shortcut: "⌫")
+            }
+        }
+        .disabled(!canEdit || (rangeTools.active && !rangeTools.canAct))
+    }
+
+    private var history: some View {
+        HStack(spacing: 4) {
+            editTool(undo, icon: "arrow.uturn.backward", shortcut: "⌘Z")
+            editTool(redo, icon: "arrow.uturn.forward", shortcut: "⇧⌘Z")
+        }
     }
 
     private var separator: some View {
@@ -238,8 +384,8 @@ struct EditorTransportBar<Player: EditorPlayback, Accessory: View>: View {
         HStack(spacing: 4) {
             ForEach(cameras) { camera in
                 let shortcut = camera.number <= 9 ? String(camera.number) : ""
-                let action = "Switch to camera \(camera.number)"
-                ClipTool(icon: nil, label: "Camera \(camera.number), \(camera.name)",
+                let action = "Take camera \(camera.number)"
+                ClipTool(icon: nil, label: "Take camera \(camera.number), \(camera.name), at group time",
                          visibleTitle: camera.number.formatted(), shortcut: shortcut,
                          toolTip: shortcut.isEmpty ? action : "\(action) (\(shortcut))",
                          active: camera.active, outlined: true, action: camera.perform)
@@ -302,7 +448,8 @@ struct EditorStatusBar<Content: View>: View {
         .foregroundStyle(.secondary)
         .controlSize(.small)
         .font(.callout)
-        .padding(.horizontal, EditorMetrics.barInset)
+        // Bar controls carry their own inset, so their glyphs start on the timeline header's line.
+        .padding(.horizontal, EditorMetrics.barInset - EditorMetrics.barControlInset)
         .frame(height: 32)
         .background(.bar)
     }
@@ -314,6 +461,15 @@ enum EditorMetrics {
     static let barInset: CGFloat = 16
     static let sheetPadding: CGFloat = 20
     static let cornerRadius: CGFloat = 6
+    /// The inset, rounded frame around lists and previews inside sheets.
+    static let panelRadius: CGFloat = 8
+    /// Text controls in the status bar and the timeline header.
+    static let barControlHeight: CGFloat = 22
+    static let barControlInset: CGFloat = 6
+    /// Square icon controls in the timeline header and the side panes.
+    static let paneControl: CGFloat = 24
+    /// Leading and trailing inset of a side pane's header, body and footer.
+    static let paneInset: CGFloat = 14
 }
 
 func progressPercent(_ fraction: Double) -> String {
@@ -447,8 +603,8 @@ struct PreviewSoundControls: View {
                             .frame(width: 22, height: 22)
                     }
                     .buttonStyle(ToolButtonStyle(active: isMuted))
-                    .accessibilityLabel(isMuted ? "Unmute preview" : "Mute preview")
-                    .help(isMuted ? "Unmute preview" : "Mute preview")
+                    .accessibilityLabel(isMuted ? "Unmute preview audio" : "Mute preview audio")
+                    .help(isMuted ? "Unmute preview audio" : "Mute preview audio")
                     Slider(value: Binding(get: { volume }, set: {
                         volume = $0
                         isMuted = false
@@ -498,9 +654,10 @@ struct PreviewSpeedMenu<Player: EditorPlayback>: View {
             .help("Set playback speed")
         } label: {
             Text(preview.playbackRate < 0 ? PlaybackSpeed.label(for: preview.playbackRate) : preview.displayedSpeed.label)
+                .font(.system(size: 13, weight: .medium))
                 .monospacedDigit()
         }
-        .fixedSize()
+        .barMenu()
         .accessibilityLabel("Playback Speed")
         .help("Choose playback speed")
         .disabled(preview.hasBlockingIssue)
@@ -525,7 +682,7 @@ struct ToolButtonStyle: ButtonStyle {
 
         var body: some View {
             configuration.label
-                .foregroundStyle(active ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
+                .foregroundStyle(.primary)
                 .opacity(isEnabled ? 1 : 0.32)
                 .background(background, in: RoundedRectangle(cornerRadius: EditorMetrics.cornerRadius, style: .continuous))
                 .overlay {
@@ -568,7 +725,8 @@ struct ClipTool: View {
 
     var body: some View {
         let title = visibleTitle ?? (icon == nil ? label : nil)
-        Button(action: action) {
+        // A tool is used by hand. The multicam editor asks after its edits. The file editor's actions arm themselves.
+        Button(action: { MulticamTierGate.byHand(action) }) {
             HStack(spacing: 5) {
                 if let icon {
                     Image(systemName: icon)

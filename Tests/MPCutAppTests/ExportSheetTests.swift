@@ -1,10 +1,99 @@
 import AppKit
 import AVFoundation
-import MPCutCore
 import XCTest
 @testable import MPCutApp
+@testable import MPCutCore
 
 final class ExportSheetTests: XCTestCase {
+    func testMulticamAudioOutputAndActionAreIndependentOfPictureMode() {
+        var choices = MulticamExportChoices(entry: .multicamSheet, preferred: .copy)
+        XCTAssertEqual(choices.audioOutput, .separateTracks)
+        XCTAssertEqual(choices.audio, .copyOriginal)
+        XCTAssertNil(choices.requestedAudioAction)
+        XCTAssertTrue(choices.deliveryActions.contains(.auto))
+        XCTAssertTrue(choices.deliveryActions.contains(.removeAudio))
+
+        choices.container = "webm"
+        choices.audioOutput = .downmixStereo
+        choices.settle()
+        XCTAssertEqual(choices.effectiveMode, .copy)
+        XCTAssertEqual(choices.audio, .auto)
+        XCTAssertEqual(choices.requestedAudioAction, .auto)
+        XCTAssertFalse(choices.deliveryActions.contains(.copyOriginal))
+        XCTAssertFalse(choices.containers().contains("webm"))
+
+        choices.audio = .pcm
+        choices.container = "mp4"
+        choices.settle()
+        XCTAssertEqual(choices.container, "mov")
+        XCTAssertEqual(choices.containers(), ["mov", "mkv"])
+    }
+
+    func testMulticamAlternativeRestoresItsRequestedAudioDelivery() {
+        var choices = MulticamExportChoices(entry: .multicamSheet)
+        choices.audioOutput = .downmixStereo
+        choices.audio = .pcm
+        func offer(audio: ReencodeAudio, flags: [String]) -> ExportAlternative {
+            ExportAlternative(id: "delivery", rung: .copyOtherContainer, label: "Use MOV",
+                              mode: .copy, tracks: .all, container: "mov", audio: audio,
+                              codec: nil, bitRate: nil, quality: nil, lossless: audio == .copyOriginal,
+                              warnings: [], arguments: flags, clips: nil)
+        }
+        choices.apply(offer(audio: .copyOriginal, flags: ["--audio", "copy"]))
+        choices.settle()
+        XCTAssertEqual(choices.audioOutput, .separateTracks)
+        XCTAssertEqual(choices.audio, .copyOriginal)
+
+        choices.apply(offer(audio: .aac, flags: ["--audio-output", "downmix_mono", "--audio", "aac"]))
+        choices.settle()
+        XCTAssertEqual(choices.audioOutput, .downmixMono)
+        XCTAssertEqual(choices.audio, .aac)
+    }
+
+    func testMulticamQueueReviewsDownmixWithCopiedPicture() throws {
+        let movie = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Noisy", withExtension: "mov", subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(movie)
+        let range = MulticamRange(from: .zero, to: media.duration)
+        let streams = media.audio.prefix(2).map(\.stream.index)
+        XCTAssertEqual(streams.count, 2)
+        let lanes = streams.enumerated().map { ordinal, stream in
+            MulticamAudioLane(id: "mic-\(ordinal)", target: .recording(.init(source: "a", stream: stream)),
+                              label: "Mic \(ordinal + 1)", colorSlot: ordinal)
+        }
+        let project = MulticamProject(referenceAngle: "a", range: range,
+                                      angles: [.init(id: "a", file: movie.path)], audio: .mix,
+                                      switches: [.init(at: .zero, angle: "a")], mixLanes: lanes)
+        let entry = MulticamQueuedRange(name: "Take", range: range, project: project, media: ["a": media])
+        var choices = MulticamExportChoices(entry: .multicamQueue, preferred: .copy)
+        choices.audioOutput = .downmixStereo
+        choices.audio = .pcm
+        choices.settle()
+        let summary = try AnalysisSidecar.$readsEnabled.withValue(false) {
+            try MulticamBulkExport.review([entry], choices: choices, organization: .init()).get()
+        }
+        XCTAssertTrue(summary.contains("1 audio track · stereo · PCM"), summary)
+        XCTAssertTrue(summary.contains("Stereo downmix"), summary)
+    }
+
+    func testStillFallbackReplaysVerifiedVideoAndSoundSettings() {
+        let alternative = ExportAlternative(id: "still-encode-mov", rung: .reencode, label: "Re-encode the program",
+                                            mode: .encode, tracks: .all, container: "mov", audio: .aac,
+                                            codec: "hevc", bitRate: nil, quality: nil, lossless: false, warnings: [],
+                                            arguments: ["--mode", "encode", "--video", "hevc", "--quality", "high",
+                                                        "--audio", "auto"], clips: nil)
+        var sheet = ExportSheetOptions()
+        sheet.placements = .replacement
+        let replay = sheet.applying(alternative)
+        var multicam = MulticamExportChoices(entry: .multicamQueue)
+        multicam.placements = .replacement
+        multicam.apply(alternative)
+        let settings = ReencodeSettings(codec: .hevc, quality: .highQuality, audio: .auto)
+        XCTAssertEqual(replay.settings, settings)
+        XCTAssertEqual(multicam.settings, settings)
+        XCTAssertEqual(replay.container, "mov")
+        XCTAssertEqual(multicam.container, "mov")
+    }
+
     /// `swift test` runs inside Xcode's xctest, so the development helper cannot be
     /// found relative to the running executable.
     override class func setUp() {
@@ -272,11 +361,11 @@ final class ExportSheetTests: XCTestCase {
         try FileManager.default.copyItem(at: fixture, to: file)
         let source = try CutEngine(useSidecar: false).inspect(file, keyframes: true)
         var sections = try AnalysisSidecar.indexSections(for: source)
-        let data = try XCTUnwrap(sections["index.v1"])
+        let data = try XCTUnwrap(sections["media_index.v1"])
         var header = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
         let advisory = "Synthetic copy restriction from the saved index."
-        header["copyIssue"] = advisory
-        sections["index.v1"] = try PropertyListSerialization.data(fromPropertyList: header, format: .binary, options: 0)
+        header["copy_issue"] = advisory
+        sections["media_index.v1"] = try PropertyListSerialization.data(fromPropertyList: header, format: .binary, options: 0)
         try AnalysisSidecar(media: source).save(sections)
         let clips: [ClipRequest] = [.init(file: file)]
         guard case .unavailable(let reason, _) = ExportAvailability.check(.init(), clips: clips, media: [:]) else {

@@ -94,7 +94,7 @@ extension ProjectSessions {
                     snapshot = .multicam(project)
                 } else {
                     try session.editor.validateHistoryDestination(output, includesContents: format.isPackage)
-                    snapshot = session.editor.stillProject
+                    snapshot = session.editor.transcriptProject
                 }
             } catch {
                 ProjectPanels.present(NSAlert(error: error), in: session.window)

@@ -15,6 +15,7 @@ extension CutEngine {
     }
 
     package func multicamClock(_ media: MediaInfo) throws -> MediaInfo {
+        if media.multicamClockOffset > .zero { return media }
         let offset = media.multicamSourceOffset
         let provisional = !media.hasFullEditIndex
         guard offset > .zero || provisional else { return media }
@@ -53,7 +54,11 @@ extension CutEngine {
             return try AudioIndex(stream: stream, packets: packets,
                                   start: audio.start.adding(offset), end: audio.end.adding(offset),
                                   hasPriming: audio.hasPriming, pcmContinuity: audio.pcmContinuity,
-                                  presentationEdits: audio.presentationEdits, opusWindow: audio.opusWindow)
+                                  presentationEdits: audio.presentationEdits, mp3Anchors: audio.mp3Anchors,
+                                  opusWindow: audio.opusWindow,
+                                  pcmGaps: audio.pcmGaps.map { gap in
+                                      try MulticamRange(from: gap.from.adding(offset), to: gap.to.adding(offset))
+                                  }, codedBytes: audio.codedBytes)
         }
         let videoIndex = media.videoStream.flatMap { video in streams.firstIndex(where: { $0.index == video.index }) }
         return try MediaInfo(url: media.url, format: media.format, duration: media.duration.adding(offset),

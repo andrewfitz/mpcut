@@ -11,6 +11,49 @@ extension MulticamEditorModel {
         isReplacementAudioPresented = true
     }
 
+    func chooseTrackReplacementAudio(_ selection: MulticamAudioSelection) {
+        guard canReplaceSourceAudio, project?.pictureSources.contains(where: { $0.id == selection.source }) == true,
+              media[selection.source]?.audio.contains(where: { $0.stream.index == selection.stream }) == true else { return }
+        preview.pause()
+        trackReplacementTarget = selection
+    }
+
+    @discardableResult
+    func replaceTrackAudio(_ original: MulticamAudioSelection, with selection: MulticamAudioSelection,
+                           external: SourceDraft, relativeOffset: RationalTime,
+                           uncovered: MulticamAudioReplacement.Uncovered) -> Bool {
+        guard canReplaceSourceAudio, selection.source == external.id,
+              let scratch = media[original.source],
+              scratch.audio.contains(where: { $0.stream.index == original.stream }),
+              external.media.audio.contains(where: { $0.stream.index == selection.stream }),
+              soundtrackIsCurrent(scratch), soundtrackIsCurrent(external.media) else { return false }
+        if let existing = project?.sources.first(where: { $0.id == external.id }) {
+            guard project?.audioSources.contains(where: { $0.id == external.id }) == true,
+                  URL(fileURLWithPath: existing.file).standardizedFileURL == external.media.url.standardizedFileURL,
+                  media[existing.id].map({ $0.identity == external.media.identity }) ?? true else {
+                fail("The incoming recording changed. Choose it again.")
+                return false
+            }
+        }
+        cacheIndexedSource(external.media, ordinary: external.ordinaryMedia)
+        let replaced = edit("Replace Track Audio") { project in
+            if !project.audioSources.contains(where: { $0.id == external.id }) {
+                var source = external.source
+                source.offset = .zero
+                source.audioStream = selection.stream
+                project.audioSources.append(source)
+            }
+            let index = project.audioReplacements.firstIndex { $0.original == original }
+            let id = index.map { project.audioReplacements[$0].id } ?? UUID().uuidString
+            let binding = MulticamAudioReplacement(id: id, original: original, replacement: selection,
+                                                   relativeOffset: relativeOffset, uncovered: uncovered)
+            if let index { project.audioReplacements[index] = binding }
+            else { project.audioReplacements.append(binding) }
+        }
+        if replaced { status = "Updated the recording’s audio track." }
+        return replaced
+    }
+
     @discardableResult
     func replaceProgramAudio(with selection: MulticamAudioSelection) -> Bool {
         guard canReplaceSourceAudio,
@@ -20,6 +63,19 @@ extension MulticamEditorModel {
         let replaced = edit("Replace Program Audio") { $0.replaceProgramAudio(with: selection) }
         if replaced { status = "Updated the multicam soundtrack." }
         return replaced
+    }
+
+    func programAudioCoverageIssue(with selection: MulticamAudioSelection) -> String? {
+        guard var candidate = project else { return nil }
+        do {
+            candidate.replaceProgramAudio(with: selection)
+            let lanes = try candidate.resolveAudioLanes(plan: candidate.plan(), indexedSources: media)
+            guard let gaps = lanes.first?.gaps, !gaps.isEmpty else { return nil }
+            let ranges = gaps.map { "\($0.from)–\($0.to) s" }.joined(separator: ", ")
+            return "Program audio needs continuous coverage across the cut. Uncovered output · \(ranges)"
+        } catch {
+            return (error as? CutError)?.message ?? error.localizedDescription
+        }
     }
 
     private func soundtrackIsCurrent(_ indexed: MediaInfo) -> Bool {
@@ -77,12 +133,14 @@ extension MulticamEditorModel {
     }
 
     @discardableResult
-    func replaceProgramAudio(with selection: MulticamAudioSelection, external: SourceDraft) -> Bool {
+    func replaceProgramAudio(with selection: MulticamAudioSelection, external: SourceDraft,
+                             confirmedOffset: RationalTime? = nil) -> Bool {
         guard canReplaceSourceAudio, selection.source == external.id,
               external.media.audio.contains(where: { $0.stream.index == selection.stream }) else { return false }
         guard soundtrackIsCurrent(external.media) else { return false }
         if let existing = project?.sources.first(where: { $0.id == external.id }) {
-            guard URL(fileURLWithPath: existing.file).standardizedFileURL == external.media.url.standardizedFileURL,
+            guard confirmedOffset == nil,
+                  URL(fileURLWithPath: existing.file).standardizedFileURL == external.media.url.standardizedFileURL,
                   media[existing.id].map({ $0.identity == external.media.identity }) ?? true else {
                 fail("This project recording changed. Relink the source before replacing its soundtrack.")
                 return false
@@ -93,6 +151,7 @@ extension MulticamEditorModel {
             if !project.sources.contains(where: { $0.id == external.id }) {
                 var source = external.source
                 source.audioStream = selection.stream
+                if let confirmedOffset { source.offset = confirmedOffset }
                 project.audioSources.append(source)
             }
             project.replaceProgramAudio(with: selection)
@@ -114,9 +173,21 @@ struct MulticamReplacementAudioView: View {
     @State private var selection: MulticamAudioSelection?
     @State private var external: MulticamEditorModel.SourceDraft?
     @State private var issue: String?
+    @State private var aligningExternal = false
+    @State private var externalStream: Int?
 
     var body: some View {
-        EditorSheet(title: "Replace Source Audio",
+        if aligningExternal, let external {
+            MulticamTrackReplacementView(model: model, original: nil, incoming: external, incomingStream: externalStream) {
+                model.isReplacementAudioPresented = false
+            }
+        } else {
+            programChoices
+        }
+    }
+
+    private var programChoices: some View {
+        EditorSheet(title: "Replace Program Audio",
                     message: "Use the same soundtrack across camera switches. This replaces any audio choices you made at those switches.") {
             Form {
                 Picker("Source stream", selection: $selection) {
@@ -130,6 +201,7 @@ struct MulticamReplacementAudioView: View {
                 }
                 .disabled(model.isBusy)
                 .help("Choose soundtrack stream")
+                .onChange(of: selection) { _, _ in issue = nil }
             }
             if model.isBusy {
                 ProgressView("Indexing external soundtrack…")
@@ -141,7 +213,8 @@ struct MulticamReplacementAudioView: View {
                 issue = nil
                 model.chooseExternalSoundtrack(onFailure: { issue = $0 }) { draft in
                     external = draft
-                    selection = draft.source.audioStream.map { .init(source: draft.id, stream: $0) }
+                    externalStream = draft.source.audioStream
+                    aligningExternal = true
                 }
             }
             .help("Browse for soundtrack file")
@@ -153,14 +226,19 @@ struct MulticamReplacementAudioView: View {
             }
             .keyboardShortcut(.cancelAction)
             .help("Cancel soundtrack replacement")
-            Button("Use Soundtrack") {
+            Button(externalSource == nil ? "Use Soundtrack" : "Align Soundtrack…") {
                 guard let selection else { return }
-                let replaced: Bool
-                if let external, external.id == selection.source {
-                    replaced = model.replaceProgramAudio(with: selection, external: external)
-                } else {
-                    replaced = model.replaceProgramAudio(with: selection)
+                if let source = externalSource, let info = model.media[source.id] {
+                    external = .init(source: source, media: info, ordinaryMedia: model.ordinaryAnalysisMedia(source.id))
+                    externalStream = selection.stream
+                    aligningExternal = true
+                    return
                 }
+                if let uncovered = model.programAudioCoverageIssue(with: selection) {
+                    issue = uncovered
+                    return
+                }
+                let replaced = model.byHand { model.replaceProgramAudio(with: selection) }
                 if replaced { model.isReplacementAudioPresented = false }
             }
             .keyboardShortcut(.defaultAction)
@@ -172,15 +250,18 @@ struct MulticamReplacementAudioView: View {
         .frame(width: 500)
     }
 
+    private var externalSource: MulticamSource? {
+        model.project?.audioSources.first { $0.id == selection?.source }
+    }
+
     private var sources: [MulticamSource] {
-        let sources = model.project?.sources ?? []
-        guard let external, !sources.contains(where: { $0.id == external.id }) else { return sources }
-        return sources + [external.source]
+        guard let project = model.project else { return [] }
+        let bound = Set(project.audioReplacements.map { $0.replacement.source })
+        return project.sources.filter { !bound.contains($0.id) }
     }
 
     private func streams(for source: String) -> [StreamInfo] {
-        let info = source == external?.id ? external?.media : model.media[source]
-        guard let info, info.hasFullEditIndex else { return [] }
+        guard let info = model.media[source], info.hasFullEditIndex else { return [] }
         return info.audio.map(\.stream)
     }
 }

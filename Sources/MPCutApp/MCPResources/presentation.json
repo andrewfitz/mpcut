@@ -1,17 +1,17 @@
 [
   {
-    "name": "get_presentation",
+    "name": "workspace_layout_read",
     "description": "Read a project window’s timeline zoom, native layout, panel state and scroll positions. Returned scroll surface names identify available controls.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1
         }
       },
       "required": [
-        "project"
+        "project_handle"
       ],
       "additionalProperties": false
     },
@@ -21,36 +21,32 @@
     }
   },
   {
-    "name": "set_presentation",
-    "description": "Adjust a native presentation control in this project window. For setScroll choose a surface and fraction. For sizing supply points. setPauseControls opens the native silence review and may start its scan. showHelp opens the named guide. Thumbnail size and track label width are shared preferences. Returns the resulting presentation state.",
+    "name": "workspace_layout_set",
+    "description": "Change the layout of the requested editor window.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1
         },
         "action": {
           "type": "string",
           "enum": [
-            "zoomIn",
-            "zoomOut",
-            "setZoom",
+            "zoom_in",
+            "zoom_out",
+            "set_zoom",
             "fit",
-            "restoreZoom",
-            "setLargeThumbnails",
-            "setInspector",
-            "setWaveformSpan",
-            "setPauseControls",
-            "setScroll",
-            "setTrackLabelWidth",
-            "setTimelineHeight",
-            "setInspectorWidth",
-            "showAbout",
-            "showSettings",
-            "showHelp",
-            "showLastExport",
-            "revealTime"
+            "restore_zoom",
+            "set_large_thumbnails",
+            "set_inspector",
+            "set_transcript",
+            "set_waveform_span",
+            "set_pause_controls",
+            "set_scroll",
+            "set_track_label_width",
+            "set_timeline_height",
+            "set_inspector_width"
           ]
         },
         "zoom": {
@@ -61,30 +57,31 @@
         },
         "enabled": {
           "type": "boolean",
-          "description": "Used by setLargeThumbnails; shared across windows."
+          "description": "Used by set_large_thumbnails; shared across windows."
         },
         "span": {
           "type": "string",
           "enum": [
-            "Timeline zoom",
-            "Whole clip",
-            "10 s",
-            "1 s",
-            "100 ms",
-            "10 ms"
+            "timeline_zoom",
+            "whole_clip",
+            "10_seconds",
+            "1_second",
+            "100_milliseconds",
+            "10_milliseconds"
           ]
         },
         "visible": {
           "type": "boolean",
-          "description": "Required for setPauseControls; defaults to true for setInspector."
+          "description": "Required for set_pause_controls and set_transcript. Defaults to true for set_inspector."
         },
         "section": {
           "type": "string",
           "enum": [
-            "Switch",
-            "Sources",
-            "Assembly",
-            "Export"
+            "switches",
+            "sources",
+            "assembly",
+            "export",
+            "transcript"
           ]
         },
         "surface": {
@@ -107,23 +104,206 @@
           "minimum": 1,
           "maximum": 10000,
           "description": "Divider size in screen points. Track labels accept 106 to 360. Native layout constraints apply."
+        }
+      },
+      "required": [
+        "project_handle",
+        "action"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_zoom"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "zoom"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_large_thumbnails"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_waveform_span"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "span"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_transcript"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "visible"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_pause_controls"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "visible"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_scroll"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "surface",
+              "fraction"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_track_label_width"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "points"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_timeline_height"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "points"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_inspector_width"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "points"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "workspace_panel_show",
+    "description": "Show the requested app or project panel.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "show_about",
+            "show_settings",
+            "show_help",
+            "show_last_export"
+          ]
         },
         "topic": {
           "type": "string",
           "enum": [
             "guide",
-            "agentGuide",
-            "releaseNotes"
+            "agent_guide",
+            "release_notes"
+          ]
+        }
+      },
+      "required": [
+        "project_handle",
+        "action"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "timeline_time_reveal",
+    "description": "Reveal the requested exact time on a horizontal timeline surface.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "surface": {
+          "type": "string",
+          "enum": [
+            "sequence",
+            "assembly",
+            "group"
           ]
         },
         "time": {
           "type": "string",
-          "description": "For revealTime, a rational timestamp in the named sequence, assembly or group clock. Scrolls the time into view without moving the playhead."
+          "description": "For reveal_time, a rational timestamp in the named sequence, assembly or group clock. Scrolls the time into view without moving the playhead."
         }
       },
       "required": [
-        "project",
-        "action"
+        "project_handle",
+        "surface",
+        "time"
       ],
       "additionalProperties": false
     }

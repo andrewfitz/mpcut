@@ -1,30 +1,93 @@
 import AppKit
 import Darwin
+import MPCutCore
 import XCTest
 @testable import MPCutApp
 
 final class MCPLocalControlTests: XCTestCase {
+    func testSplitToolsRejectRetiredSelectorsAndCrossFamilyActions() throws {
+        let schemas = try MCPSchemas.loaded.get()
+        let audioPolicy = MulticamAudioPolicy.fixed(.init(source: "mic", stream: 2))
+        let audio = try JSONSerialization.jsonObject(with: MCPSchemas.encodeResult(audioPolicy))
+        XCTAssertNoThrow(try schemas.validate(tool: "multicam_setup_confirm", arguments: [
+            "project_handle": "window", "operation_id": "setup", "expected_revision": 0, "audio": audio
+        ]))
+        XCTAssertThrowsError(try schemas.validate(tool: "project_editor_state_read", arguments: ["project": "old"]))
+        XCTAssertThrowsError(try schemas.validate(tool: "project_editor_state_read", arguments: ["project_path": "/tmp/demo.cut"]))
+        XCTAssertThrowsError(try schemas.validate(tool: "project_open", arguments: ["operation_id": "open", "project_handle": "window"]))
+        XCTAssertNoThrow(try schemas.validate(tool: "project_editor_state_read", arguments: ["project_handle": "window"]))
+        let edit: [String: Any] = ["project_handle": "window", "expected_revision": 1, "operation_id": "edit"]
+        for retired in ["render_project", "configure_silence", "set_playback", "sequence_control"] {
+            XCTAssertThrowsError(try schemas.validate(tool: retired, arguments: edit))
+        }
+        for (tool, fields) in [
+            ("export_editor_project_plan", ["output": "/tmp/movie.mov", "dry_run": false]),
+            ("silence_editor_scan", ["kind": "scenes"]),
+            ("silence_editor_takes_queue", ["mode": "shorten"]),
+            ("sequence_clip_edit", ["action": "speed", "rate": 1]),
+            ("timeline_gap_insert", ["at": "0", "duration": "1", "space": "sequence", "path": "/tmp/card.png"])
+        ] as [(String, [String: Any])] {
+            XCTAssertThrowsError(try schemas.validate(tool: tool, arguments: edit.merging(fields) { _, v in v }), tool)
+        }
+    }
+
     func testRejectsMalformedSchemaArgumentsAtAppBoundary() throws {
         let schemas = try MCPSchemas.loaded.get()
-        XCTAssertThrowsError(try schemas.validate(tool: "get_editor_state", arguments: ["project": "a", "limit": true]))
-        XCTAssertThrowsError(try schemas.validate(tool: "get_editor_state", arguments: ["project": "a", "offset": -1]))
-        XCTAssertThrowsError(try schemas.validate(tool: "seek", arguments: ["project": "a", "space": "group", "time": "1", "occurrence": true]))
-        XCTAssertThrowsError(try schemas.validate(tool: "split_at", arguments: ["project": "a", "space": "group", "time": "1"]))
-        XCTAssertThrowsError(try schemas.validate(tool: "list_projects", arguments: ["surprise": true]))
-        XCTAssertNoThrow(try schemas.validate(tool: "get_editor_state", arguments: ["project": "a", "limit": 1]))
-        XCTAssertNoThrow(try schemas.validate(tool: "get_editor_state", arguments: ["project": "a", "offset": Int.max]))
-        XCTAssertThrowsError(try schemas.validate(tool: "get_editor_state", arguments: ["project": "a", "offset": UInt64.max]))
-        let playback: [String: Any] = ["project": "a", "expectedRevision": 0, "operationID": "playback-rate", "action": "speed"]
+        XCTAssertThrowsError(try schemas.validate(tool: "project_editor_state_read", arguments: ["project_handle": "a", "limit": true]))
+        XCTAssertThrowsError(try schemas.validate(tool: "project_editor_state_read", arguments: ["project_handle": "a", "offset": -1]))
+        XCTAssertThrowsError(try schemas.validate(tool: "timeline_playhead_seek", arguments: ["project_handle": "a", "space": "group", "time": "1", "occurrence": true]))
+        XCTAssertThrowsError(try schemas.validate(tool: "timeline_item_split", arguments: ["project_handle": "a", "space": "group", "time": "1"]))
+        XCTAssertThrowsError(try schemas.validate(tool: "project_windows_list", arguments: ["surprise": true]))
+        XCTAssertNoThrow(try schemas.validate(tool: "project_editor_state_read", arguments: ["project_handle": "a", "limit": 1]))
+        XCTAssertNoThrow(try schemas.validate(tool: "project_editor_state_read", arguments: ["project_handle": "a", "offset": Int.max]))
+        XCTAssertThrowsError(try schemas.validate(tool: "project_editor_state_read", arguments: ["project_handle": "a", "offset": UInt64.max]))
+        let threshold: (Any) -> [String: Any] = { ["project_handle": "a", "expected_revision": 0,
+                                                   "operation_id": "threshold", "silence_threshold_db": $0] }
+        for value: Any in [NSNull(), -36.5] as [Any] {
+            XCTAssertNoThrow(try schemas.validate(tool: "silence_editor_threshold_set", arguments: threshold(value)))
+        }
+        for value: Any in [true, "auto", -121] as [Any] {
+            XCTAssertThrowsError(try schemas.validate(tool: "silence_editor_threshold_set", arguments: threshold(value)))
+        }
+        let playback: [String: Any] = ["project_handle": "a", "expected_revision": 0, "operation_id": "playback-rate", "action": "speed"]
         let rate: (Any) -> [String: Any] = { playback.merging(["rate": $0]) { _, new in new } }
-        XCTAssertThrowsError(try schemas.validate(tool: "sequence_control", arguments: rate(true)))
-        XCTAssertThrowsError(try schemas.validate(tool: "sequence_control", arguments: rate(3.0)))
-        XCTAssertNoThrow(try schemas.validate(tool: "sequence_control", arguments: rate(1.25)))
+        XCTAssertThrowsError(try schemas.validate(tool: "playback_transport_control", arguments: rate(true)))
+        XCTAssertThrowsError(try schemas.validate(tool: "playback_transport_control", arguments: rate(3.0)))
+        XCTAssertNoThrow(try schemas.validate(tool: "playback_transport_control", arguments: rate(1.25)))
+        let still: [String: Any] = ["project_handle": "a", "expected_revision": 0, "operation_id": "image-edit",
+                                    "path": "/tmp/card.png"]
+        let insert = still.merging(["space": "assembly", "at": "0", "duration": "1"]) { _, new in new }
+        let replacement = still.merging(["space": "group", "from": "0", "to": "1"]) { _, new in new }
+        XCTAssertNoThrow(try schemas.validate(tool: "still_editor_placement_insert", arguments: insert))
+        XCTAssertNoThrow(try schemas.validate(tool: "still_editor_picture_replace", arguments: replacement))
+        for (arguments, excluded) in [(insert, ["from", "to"]), (replacement, ["at", "duration", "cadence"])] {
+            for key in excluded {
+                var mixed = arguments
+                mixed[key] = "1"
+                XCTAssertThrowsError(try schemas.validate(tool: arguments["at"] == nil ? "still_editor_picture_replace" : "still_editor_placement_insert", arguments: mixed), key)
+            }
+        }
+        let spacing: [String: Any] = ["project_handle": "a", "expected_revision": 0, "operation_id": "spacing"]
+        XCTAssertNoThrow(try schemas.validate(tool: "timeline_clips_space", arguments: spacing.merging(["duration": "0"]) { _, new in new }))
+        XCTAssertNoThrow(try schemas.validate(tool: "timeline_clips_space", arguments: spacing.merging(["source_timing": true]) { _, new in new }))
+        XCTAssertThrowsError(try schemas.validate(tool: "timeline_clips_space", arguments: spacing))
+        XCTAssertThrowsError(try schemas.validate(tool: "timeline_clips_space",
+                                                  arguments: spacing.merging(["duration": "1", "source_timing": true]) { _, new in new }))
+        XCTAssertThrowsError(try schemas.validate(tool: "timeline_clips_space", arguments: spacing.merging(["source_timing": false]) { _, new in new }))
+        XCTAssertThrowsError(try schemas.validate(tool: "review_editor_frame_read", arguments: ["project_handle": "a", "space": "sequence"]))
+        XCTAssertThrowsError(try schemas.validate(tool: "review_editor_frame_read", arguments: ["project_handle": "a", "time": "0"]))
+        XCTAssertNoThrow(try schemas.validate(tool: "review_editor_frame_read", arguments: ["project_handle": "a", "space": "sequence", "time": "0"]))
+        let output: [String: Any] = ["project_handle": "a", "expected_revision": 0, "operation_id": "frame-export", "output": "/tmp/review"]
+        XCTAssertThrowsError(try schemas.validate(tool: "review_editor_frames_export",
+                                                   arguments: output.merging(["selection": "times"]) { _, new in new }))
+        XCTAssertNoThrow(try schemas.validate(tool: "review_editor_frames_export",
+                                              arguments: output.merging(["selection": "times", "times": ["0"]]) { _, new in new }))
         let inlineArguments: [String: Any] = [
-            "operationID": "42970FFD-0FF6-42C1-BF05-0ECFAD579C1E",
+            "operation_id": "42970FFD-0FF6-42C1-BF05-0ECFAD579C1E",
             "project_data": ["history": [9_007_199_254_740_992]]
         ]
         let inlinePath = MCPSchemas.projectDataPath + [.key("history"), .index(0)]
-        let inline = try schemas.validate(tool: "file_inspect", arguments: inlineArguments,
+        let inline = try schemas.validate(tool: "project_file_inspect", arguments: inlineArguments,
                                           wireIntegers: [inlinePath: .init(exact: 9_007_199_254_740_993)])
         XCTAssertEqual((inline["project_data"] as? [String: Any])?["history"] as? [Int], [9_007_199_254_740_993])
     }
@@ -45,43 +108,43 @@ final class MCPLocalControlTests: XCTestCase {
         preferences.localMCPEnabled = true
         XCTAssertTrue(bridge.running)
         XCTAssertTrue(EditorPreferences(defaults: defaults).localMCPEnabled)
-        let listed = try await socketReply(#"{"version":1,"tool":"list_projects","arguments":{}}"#, directory: directory)
+        let listed = try await socketReply(#"{"version":2,"tool":"project_windows_list","arguments":{}}"#, directory: directory)
         XCTAssertEqual((listed["result"] as? [String: Any])?["projects"] as? [[String: String]], [])
-        let duplicate = try await socketReply(#"{"version":1,"tool":"list_projects","arguments":{},"arguments":{}}"#, directory: directory)
+        let duplicate = try await socketReply(#"{"version":2,"tool":"project_windows_list","arguments":{},"arguments":{}}"#, directory: directory)
         XCTAssertEqual((duplicate["error"] as? [String: String])?["code"], "invalid_arguments")
-        for invalidVersion in ["true", "1.0000000000000001"] {
-            let wrongVersion = try await socketReply(#"{"version":\#(invalidVersion),"tool":"list_projects","arguments":{}}"#, directory: directory)
+        for invalidVersion in ["true", "1", "2.0000000000000001"] {
+            let wrongVersion = try await socketReply(#"{"version":\#(invalidVersion),"tool":"project_windows_list","arguments":{}}"#, directory: directory)
             XCTAssertEqual((wrongVersion["error"] as? [String: String])?["code"], "bridge_version")
         }
         let fractionalPreference = try await socketReply(
-            #"{"version":1.0,"tool":"set_preference","arguments":{"operationID":"fractional-volume","key":"volume","value":0.375}}"#,
+            #"{"version":2.0,"tool":"preferences_set","arguments":{"operation_id":"fractional-volume","key":"playback_preview_volume_fraction","value":0.375}}"#,
             directory: directory)
-        XCTAssertEqual((fractionalPreference["result"] as? [String: Any])?["volume"] as? Double, 0.375)
+        XCTAssertEqual((fractionalPreference["result"] as? [String: Any])?["playback_preview_volume_fraction"] as? Double, 0.375)
         let fractionalHistoryLimit = try await socketReply(
-            #"{"version":1,"tool":"set_preference","arguments":{"operationID":"fractional-history","key":"historyLimit","value":1.0000000000000001}}"#,
+            #"{"version":2,"tool":"preferences_set","arguments":{"operation_id":"fractional-history","key":"history_max_steps","value":1.0000000000000001}}"#,
             directory: directory)
         XCTAssertEqual((fractionalHistoryLimit["error"] as? [String: String])?["code"], "invalid_arguments")
         let fractionalOrder = try await socketReply(
-            #"{"version":1,"tool":"file_export","arguments":{"operationID":"42970FFD-0FF6-42C1-BF05-0ECFAD579C1E","edit":{"clips":[{"file":"/tmp/example.mov"}],"order":[1,1.0000000000000001],"output":"/tmp/example-out.mov"}}}"#,
+            #"{"version":2,"tool":"export_file_clips_join","arguments":{"operation_id":"42970FFD-0FF6-42C1-BF05-0ECFAD579C1E","edit":{"clips":[{"file":"/tmp/example.mov"}],"order":[1,1.0000000000000001],"output":"/tmp/example-out.mov"}}}"#,
             directory: directory)
         let orderError = try XCTUnwrap(fractionalOrder["error"] as? [String: String])
         XCTAssertEqual(orderError["code"], "invalid_arguments")
         XCTAssertTrue(orderError["message"]?.contains("edit.order[1]") == true)
         let fractionalProject = try await socketReply(
-            #"{"version":1,"tool":"file_inspect","arguments":{"operationID":"42970FFD-0FF6-42C1-BF05-0ECFAD579C1E","project_data":{"format":"mpcut","schemaVersion":1.0000000000000001,"kind":"sequence","clips":[]}}}"#,
+            #"{"version":2,"tool":"project_file_inspect","arguments":{"operation_id":"42970FFD-0FF6-42C1-BF05-0ECFAD579C1E","project_data":{"format":"mpcut","schema_version":3.0000000000000001,"kind":"sequence","clips":[]}}}"#,
             directory: directory)
         let projectError = try XCTUnwrap(fractionalProject["error"] as? [String: String])
         XCTAssertEqual(projectError["code"], "invalid_arguments")
         XCTAssertTrue(projectError["message"]?.contains("project_data") == true)
-        let setVolume: [String: Any] = ["key": "volume", "value": 0.5, "operationID": UUID().uuidString]
-        _ = try await bridge.perform(tool: "set_preference", arguments: setVolume)
+        let setVolume: [String: Any] = ["key": "playback_preview_volume_fraction", "value": 0.5, "operation_id": UUID().uuidString]
+        _ = try await bridge.perform(tool: "preferences_set", arguments: setVolume)
         preferences.volume = 0.75
-        _ = try await bridge.perform(tool: "set_preference", arguments: setVolume)
+        _ = try await bridge.perform(tool: "preferences_set", arguments: setVolume)
         XCTAssertEqual(preferences.volume, 0.75, "Replaying a completed call must preserve subsequent GUI settings.")
         var conflict = setVolume
         conflict["value"] = 0.2
         do {
-            _ = try await bridge.perform(tool: "set_preference", arguments: conflict)
+            _ = try await bridge.perform(tool: "preferences_set", arguments: conflict)
             XCTFail("Operation ID reuse with different arguments should fail")
         } catch let error as MCPFailure { XCTAssertEqual(error.code, "operation_conflict") }
         let session = sessions.session(for: nil)
@@ -90,23 +153,23 @@ final class MCPLocalControlTests: XCTestCase {
         sessions.register(session, window: window)
         defer { sessions.windowClosed(session); window.close() }
         let sequence = session.mcpHandle
-        let result = try await bridge.perform(tool: "get_editor_state", arguments: ["project": sequence])
+        let result = try await bridge.perform(tool: "project_editor_state_read", arguments: ["project_handle": sequence])
         XCTAssertEqual(result["total"] as? Int, 0)
         for offset in ["1.0000000000000001", "10000000000000001e-16", "9223372036854775808.0"] {
             let reply = try await socketReply(
-                #"{"version":1e0,"tool":"get_editor_state","arguments":{"project":"\#(sequence)","offset":\#(offset)}}"#,
+                #"{"version":2e0,"tool":"project_editor_state_read","arguments":{"project_handle":"\#(sequence)","offset":\#(offset)}}"#,
                 directory: directory)
             XCTAssertEqual((reply["error"] as? [String: String])?["code"], "invalid_arguments", offset)
         }
         for (offset, expected) in [("1.0", 1), ("1e0", 1), ("10e-1", 1), ("9007199254740993.0", 9007199254740993)] {
             let reply = try await socketReply(
-                #"{"version":1,"tool":"get_editor_state","arguments":{"project":"\#(sequence)","offset":\#(offset)}}"#,
+                #"{"version":2,"tool":"project_editor_state_read","arguments":{"project_handle":"\#(sequence)","offset":\#(offset)}}"#,
                 directory: directory)
             XCTAssertEqual((reply["result"] as? [String: Any])?["offset"] as? Int, expected, offset)
         }
         session.isMulticam = true
         do {
-            _ = try await bridge.perform(tool: "get_editor_state", arguments: ["project": sequence])
+            _ = try await bridge.perform(tool: "project_editor_state_read", arguments: ["project_handle": sequence])
             XCTFail("The former sequence handle should have expired")
         } catch let error as MCPFailure { XCTAssertEqual(error.code, "project_closed") }
         session.isMulticam = false
@@ -114,7 +177,7 @@ final class MCPLocalControlTests: XCTestCase {
         preferences.localMCPEnabled = false
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory + "/control.sock"))
         do {
-            _ = try await bridge.perform(tool: "list_projects", arguments: [:])
+            _ = try await bridge.perform(tool: "project_windows_list", arguments: [:])
             XCTFail("The listener was disabled")
         } catch let error as MCPFailure { XCTAssertEqual(error.code, "control_disabled") }
     }
@@ -135,9 +198,9 @@ final class MCPLocalControlTests: XCTestCase {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(atPath: directory)
         }
-        let creation = ["operationID": UUID().uuidString]
-        let created = try await bridge.perform(tool: "new_project", arguments: creation)
-        let project = try XCTUnwrap(created["project"] as? String)
+        let creation = ["operation_id": UUID().uuidString]
+        let created = try await bridge.perform(tool: "project_create", arguments: creation)
+        let project = try XCTUnwrap(created["project_handle"] as? String)
         let session = try XCTUnwrap(sessions.sessions.values.first { $0.mcpHandle == project })
         let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 400, height: 300),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
@@ -146,21 +209,21 @@ final class MCPLocalControlTests: XCTestCase {
         defer { if sessions.sessions[session.id] != nil { sessions.windowClosed(session); window.close() } }
 
         let revision = session.mcpRevision
-        let args: [String: Any] = ["project": project, "expectedRevision": revision,
-                                   "operationID": UUID().uuidString, "changes": "discard"]
-        let noClose = args.merging(["changes": "cancel", "operationID": UUID().uuidString]) { _, new in new }
-        _ = try await bridge.perform(tool: "close_project", arguments: noClose)
-        let closed = try await bridge.perform(tool: "close_project", arguments: args)
+        let args: [String: Any] = ["project_handle": project, "expected_revision": revision,
+                                   "operation_id": UUID().uuidString, "changes": "discard"]
+        let noClose = args.merging(["changes": "cancel", "operation_id": UUID().uuidString]) { _, new in new }
+        _ = try await bridge.perform(tool: "project_close", arguments: noClose)
+        let closed = try await bridge.perform(tool: "project_close", arguments: args)
         XCTAssertNil(sessions.sessions[session.id])
-        XCTAssertEqual(closed["project"] as? String, project)
+        XCTAssertEqual(closed["project_handle"] as? String, project)
         XCTAssertEqual(closed["revision"] as? Int, revision)
-        let replay = try await bridge.perform(tool: "close_project", arguments: args)
+        let replay = try await bridge.perform(tool: "project_close", arguments: args)
         XCTAssertEqual(replay["closed"] as? Bool, true)
-        XCTAssertEqual(replay["project"] as? String, project)
+        XCTAssertEqual(replay["project_handle"] as? String, project)
         XCTAssertEqual(replay["revision"] as? Int, revision)
 
-        let changed = args.merging(["expectedRevision": revision + 1]) { _, new in new }
-        for (tool, arguments) in [("new_project", creation), ("close_project", noClose), ("close_project", changed)] {
+        let changed = args.merging(["expected_revision": revision + 1]) { _, new in new }
+        for (tool, arguments) in [("project_create", creation), ("project_close", noClose), ("project_close", changed)] {
             do {
                 _ = try await bridge.perform(tool: tool, arguments: arguments)
                 XCTFail("Only the successful close receipt remains accessible after the document closes")

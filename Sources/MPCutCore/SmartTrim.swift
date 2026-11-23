@@ -52,7 +52,7 @@ func smartTrimEdges(frames: [FrameInfo], kept: Range<Int>, from: RationalTime, t
     let tailStart = endSafe ? kept.upperBound
         : kept.last(where: { frames[$0].canEnd }) ?? kept.lowerBound
 
-    func edge(_ range: Range<Int>) -> EncodedEdge {
+    func edge(_ range: Range<Int>) throws -> EncodedEdge {
         let start = frames[range.lowerBound].time
         let end = range.upperBound == kept.upperBound ? to : frames[range.upperBound].time
         // A few dependent pictures alone can contain almost no data. Include their
@@ -60,7 +60,10 @@ func smartTrimEdges(frames: [FrameInfo], kept: Range<Int>, from: RationalTime, t
         let first = frames[...range.lowerBound].lastIndex(where: { $0.canStart && $0.canEnd }) ?? 0
         let next = frames[range.upperBound...].firstIndex(where: { $0.canStart && $0.canEnd }) ?? frames.count
         let budgetEnd = next == frames.count ? sourceEnd : frames[next].time
-        let seconds = (budgetEnd - frames[first].time).seconds
+        let seconds = try budgetEnd.subtracting(frames[first].time).seconds
+        guard seconds > 0 else {
+            throw CutError(code: "unsupported_timing", message: "The Smart Trim edge has no usable duration.", segment: segment)
+        }
         let bytes = frames[first..<next].reduce(0.0) { $0 + Double($1.byteCount) }
         let maximumRate = codec == "av1" ? 100_000_000 : Int32.max
         let rate = Int64(min(Double(maximumRate), max(1, (bytes * 8 / seconds).rounded())))
@@ -76,10 +79,10 @@ func smartTrimEdges(frames: [FrameInfo], kept: Range<Int>, from: RationalTime, t
                            message: "This range crosses open picture groups without a verified point to resume copying. Choose a verified boundary.",
                            segment: segment)
         }
-        return [edge(kept)]
+        return [try edge(kept)]
     }
     var edges: [EncodedEdge] = []
-    if headEnd > kept.lowerBound { edges.append(edge(kept.lowerBound..<headEnd)) }
-    if tailStart < kept.upperBound { edges.append(edge(tailStart..<kept.upperBound)) }
+    if headEnd > kept.lowerBound { edges.append(try edge(kept.lowerBound..<headEnd)) }
+    if tailStart < kept.upperBound { edges.append(try edge(tailStart..<kept.upperBound)) }
     return edges
 }

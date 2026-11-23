@@ -2,6 +2,34 @@ import AppKit
 import MPCutCore
 import SwiftUI
 
+/// Keep time entry and zoom available when a side panel narrows the timeline.
+struct TimelineControlBar<Position: View, Options: View>: View {
+    @ViewBuilder let position: () -> Position
+    @ViewBuilder let options: () -> Options
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                position()
+                Spacer(minLength: 0)
+                options()
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    position()
+                    Spacer(minLength: 0)
+                }
+                HStack(spacing: 4) { options() }
+            }
+        }
+        // The time readout starts on the bar inset. The trailing tool's glyph ends on it.
+        .padding(.leading, EditorMetrics.barInset)
+        .padding(.trailing, EditorMetrics.barInset - 7)
+        .padding(.vertical, 5)
+        .frame(minHeight: 38)
+    }
+}
+
 struct TimelineTimeControl: View {
     let playhead: Double
     let duration: Double
@@ -167,7 +195,7 @@ struct TimelineViewControls: View {
             Slider(value: $zoom, in: 0...Self.maximumZoom) { Text("Timeline zoom") }
                 .labelsHidden()
                 .controlSize(.small)
-                .frame(width: 96)
+                .frame(minWidth: 48, idealWidth: 96, maxWidth: 96)
                 .accessibilityValue(zoomDescription)
                 .help("Adjust timeline zoom")
             zoomButton("Zoom In", symbol: "plus.magnifyingglass", amount: 1)

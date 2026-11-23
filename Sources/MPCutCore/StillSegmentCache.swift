@@ -27,8 +27,8 @@ public struct StillSegmentCache: Sendable {
             hash.update(data: Data("MPCut still segment v1\u{0}".utf8))
             for file in files {
                 let identity = try SourceIdentity(file)
-                let content = try StillSegmentCache.checksum(file, cancelled: cancelled)
-                guard try SourceIdentity(file) == identity else { throw StillSegmentCache.changedInput }
+                let content = try StillSegmentCache.checksum(file, expected: identity, cancelled: cancelled)
+                guard identity.isCurrentSnapshot(at: file) else { throw StillSegmentCache.changedInput }
                 hash.update(data: Data(content))
                 fingerprints.append(Input(url: file, identity: identity))
             }
@@ -42,7 +42,7 @@ public struct StillSegmentCache: Sendable {
 
         fileprivate func checkInputs() throws {
             for input in inputs {
-                guard (try? SourceIdentity(input.url)) == input.identity else { throw StillSegmentCache.changedInput }
+                guard input.identity.isCurrentSnapshot(at: input.url) else { throw StillSegmentCache.changedInput }
             }
         }
     }
@@ -232,15 +232,27 @@ public struct StillSegmentCache: Sendable {
         return info
     }
 
-    private static func checksum(_ url: URL, cancelled: () -> Bool) throws -> SHA256.Digest {
-        let file = try FileHandle(forReadingFrom: url)
+    private static func checksum(_ url: URL, expected: SourceIdentity? = nil, cancelled: () -> Bool) throws -> SHA256.Digest {
+        let file = try StillImage.openRegularImage(url)
         defer { try? file.close() }
+        let identity = try SourceIdentity(file: file)
+        guard expected?.matchesSnapshot(identity) != false else { throw changedInput }
         var digest = SHA256()
+        let capacity = Int(min(1 << 20, max(4 << 10, identity.size)))
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: capacity, alignment: MemoryLayout<UInt64>.alignment)
+        defer { buffer.deallocate() }
         while true {
             try checkCancellation(cancelled)
-            guard let data = try file.read(upToCount: 1 << 20), !data.isEmpty else { break }
-            digest.update(data: data)
+            let count = Darwin.read(file.fileDescriptor, buffer, capacity)
+            if count < 0 {
+                let failure = errno
+                if failure == EINTR { continue }
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(failure))
+            }
+            guard count > 0 else { break }
+            digest.update(bufferPointer: UnsafeRawBufferPointer(start: buffer, count: count))
         }
+        guard identity.matchesSnapshot(try SourceIdentity(file: file)) else { throw changedInput }
         return digest.finalize()
     }
 

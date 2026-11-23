@@ -29,6 +29,7 @@ struct FFPreviewBatch {
 final class FFPreviewReader: @unchecked Sendable {
     private let videoOnly: Bool
     private let preservesSurround: Bool
+    private let preservesAudioChannels: Bool
     private let audioOnly: Bool
     private var decoder: OpaquePointer?
     private var url: URL?
@@ -42,8 +43,10 @@ final class FFPreviewReader: @unchecked Sendable {
     private var audioFinished = false
     private var cancelled: (() -> Bool)?
 
-    init(videoOnly: Bool = false, audioOnly: Bool = false, preservesSurround: Bool = false) {
+    init(videoOnly: Bool = false, audioOnly: Bool = false, preservesSurround: Bool = false,
+         preservesAudioChannels: Bool = false) {
         self.preservesSurround = preservesSurround
+        self.preservesAudioChannels = preservesAudioChannels
         self.audioOnly = audioOnly
         self.videoOnly = videoOnly
     }
@@ -85,6 +88,7 @@ final class FFPreviewReader: @unchecked Sendable {
             }
             guard let decoder else { throw failure(error) }
             if preservesSurround { mp_preview_preserve_surround(decoder) }
+            if preservesAudioChannels { mp_preview_preserve_audio_channels(decoder) }
             openedSoundOnly = soundOnly
             openedAudioTrack = audioTrack
             openedOrigin = audioOrigin
@@ -119,6 +123,16 @@ final class FFPreviewReader: @unchecked Sendable {
         return (kind, sample)
     }
 
+    private func readPicture() throws -> (kind: Int32, image: CVPixelBuffer?, pts: CMTime, duration: CMTime) {
+        var image: CVPixelBuffer?
+        var pts = CMTime.invalid
+        var duration = CMTime.invalid
+        var error: UnsafePointer<CChar>?
+        let kind = mp_preview_next_picture(decoder, &image, &pts, &duration, &error)
+        if kind < 0 { throw failure(error) }
+        return (kind, image, pts, duration)
+    }
+
     func scrubSamples(url: URL, range: Range<Double>, audioOrigin: RationalTime? = nil,
                       audioTrack: Int? = nil) throws -> [CMSampleBuffer] {
         if audioOnly, self.url == url, openedOrigin == audioOrigin, openedAudioTrack == audioTrack,
@@ -149,7 +163,7 @@ final class FFPreviewReader: @unchecked Sendable {
             return !precedingEnd.isFinite || precedingEnd <= target
         }
         while !cancelled() {
-            let (kind, sample) = try read()
+            let (kind, image, pts, duration) = try readPicture()
             if kind == MPPreviewEnd.rawValue {
                 if missing() { throw FFPreviewError.decode(WebSequencePlayback.damagedPicture) }
                 guard let preceding else {
@@ -157,9 +171,8 @@ final class FFPreviewReader: @unchecked Sendable {
                 }
                 return preceding
             }
-            guard kind == MPPreviewVideo.rawValue, let sample,
-                  let buffer = sample.imageBuffer else { continue }
-            let frame = PreviewFrame(buffer: buffer, time: sample.presentationTimeStamp, transform: transform)
+            guard let image else { continue }
+            let frame = PreviewFrame(buffer: image, time: pts, transform: transform)
             if nearbyKeyframe, !mp_preview_met_damage(decoder), frame.time.seconds >= target - 8,
                frame.time.seconds <= target, frame.time.seconds < end { return frame }
             if frame.time.seconds > target + 0.000_000_001, missing() {
@@ -171,7 +184,7 @@ final class FFPreviewReader: @unchecked Sendable {
             if abs(frame.time.seconds - target) <= 0.000_000_001 { return frame }
             if frame.time.seconds > target { return preceding }
             preceding = frame
-            precedingEnd = frame.time.seconds + sample.duration.seconds
+            precedingEnd = frame.time.seconds + duration.seconds
         }
         return nil
     }
@@ -180,12 +193,12 @@ final class FFPreviewReader: @unchecked Sendable {
     // active view sequentially until a seek or camera switch.
     func indexedFrame(at target: CMTime, cancelled: () -> Bool) throws -> PreviewFrame? {
         while !cancelled() {
-            let (kind, sample) = try read()
+            let (kind, image, pts, _) = try readPicture()
             if kind == MPPreviewEnd.rawValue { break }
-            guard kind == MPPreviewVideo.rawValue, let sample, let buffer = sample.imageBuffer else { continue }
-            if sample.presentationTimeStamp >= target {
-                guard sample.presentationTimeStamp == target else { return nil }
-                return PreviewFrame(buffer: buffer, time: sample.presentationTimeStamp, transform: transform)
+            guard let image else { continue }
+            if pts >= target {
+                guard pts == target else { return nil }
+                return PreviewFrame(buffer: image, time: pts, transform: transform)
             }
         }
         return nil
@@ -423,14 +436,19 @@ final class WebSequencePlayback {
             : min(range.end, range.start + (self.time - offsets[rangeIndex]))
         if playing {
             fill()
-        } else if !range.isAudioOnly && !separatesPicture {
-            still(url: range.url, at: requestedSourceTime, before: range.end)
+        } else if !range.isAudioOnly && range.unavailablePicture == nil && !separatesPicture {
+            still(url: range.url, at: requestedSourceTime, before: range.end, transfer: range.programTransfer)
         }
     }
 
-    func audition(url: URL, at time: Double, before end: Double = .infinity) {
+    func audition(url: URL, at time: Double, before end: Double = .infinity, transfer: String? = nil) {
         if playing { pause() } else { resetRequests() }
-        if ranges.first(where: { $0.url == url })?.isAudioOnly != true { still(url: url, at: time, before: end) }
+        let sourceTransfer = ranges.first(where: { $0.url == url && !$0.isAudioOnly })?.programTransfer
+        still(url: url, at: time, before: end, transfer: transfer ?? sourceTransfer)
+    }
+
+    func cancelStill() {
+        if renderingStill { resetRequests() }
     }
 
     func displayStill(at position: Double) {
@@ -438,9 +456,9 @@ final class WebSequencePlayback {
         park(at: position)
         let index = max(0, offsets.lowerBound { $0 > time } - 1)
         let range = ranges[index]
-        guard !range.isAudioOnly, !separatesPicture else { return }
+        guard !range.isAudioOnly, range.unavailablePicture == nil, !separatesPicture else { return }
         let sourceTime = min(range.end, range.start + (time - offsets[index]))
-        still(url: range.url, at: sourceTime, before: range.end)
+        still(url: range.url, at: sourceTime, before: range.end, transfer: range.programTransfer)
     }
 
     private func resetRequests() {
@@ -459,7 +477,7 @@ final class WebSequencePlayback {
         audio.removeAll()
     }
 
-    private func still(url: URL, at time: Double, before end: Double = .infinity) {
+    private func still(url: URL, at time: Double, before end: Double, transfer: String?) {
         renderingStill = true
         let requests = requests
         let generation = generation
@@ -480,7 +498,7 @@ final class WebSequencePlayback {
                 guard let self, requests.current(generation) else { return }
                 self.renderingStill = false
                 switch result {
-                case .success(let frame?): self.onFrame(frame)
+                case .success(let frame?): self.onFrame(frame.tagged(transfer: transfer, cameraTransfer: transfer ?? "unknown"))
                 case .success(nil): self.onGap()
                 case .failure(let error): self.onIssue(error.localizedDescription)
                 }
@@ -507,7 +525,7 @@ final class WebSequencePlayback {
         let target = requestedSourceTime
         let offset = offsets[rangeIndex] - range.start
         let open = openingRange
-        let soundOnly = separatesPicture || range.isAudioOnly
+        let soundOnly = separatesPicture || range.isAudioOnly || range.unavailablePicture != nil
         let first = waitingForFirstFrame && !soundOnly
         reading = true
         requests.queue.async { [weak self] in
@@ -534,7 +552,9 @@ final class WebSequencePlayback {
                         self.onIssue(Self.undecodableAudio)
                         return
                     }
-                    self.video.append(contentsOf: batch.video.map { $0.tagged(transfer: range.programTransfer) })
+                    self.video.append(contentsOf: batch.video.map {
+                        $0.tagged(transfer: range.programTransfer, cameraTransfer: range.programTransfer ?? "unknown")
+                    })
                     self.audio.append(contentsOf: batch.audio)
                     self.reachedRangeEnd = batch.end
                     if batch.hasPictureGap && self.waitingForFirstFrame { self.startsWithoutPicture = true }
@@ -590,7 +610,8 @@ final class WebSequencePlayback {
             if !video.isEmpty || startsWithoutPicture {
                 setClockRate()
                 hasStartedClock = true
-            } else if (separatesPicture || ranges[rangeIndex].isAudioOnly) && (!audio.isEmpty || reachedRangeEnd) {
+            } else if (separatesPicture || ranges[rangeIndex].isAudioOnly || ranges[rangeIndex].unavailablePicture != nil)
+                        && (!audio.isEmpty || reachedRangeEnd) {
                 setClockRate()
                 hasStartedClock = true
             } else if reachedRangeEnd {

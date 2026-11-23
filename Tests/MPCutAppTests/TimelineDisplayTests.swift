@@ -129,7 +129,7 @@ final class TimelineDisplayTests: XCTestCase {
         let suite = "MulticamTimelineTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        defaults.set(230.0, forKey: "multicamTimelineTrackWidth")
+        defaults.set(230.0, forKey: "multicam_track_label_width_points")
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 650, height: 240),
                               styleMask: .titled, backing: .buffered, defer: false)
         let hosting = NSHostingView(rootView: MulticamTimelineFixture(state: state).defaultAppStorage(defaults))
@@ -572,6 +572,38 @@ final class TimelineDisplayTests: XCTestCase {
     }
 
     @MainActor
+    func testGapLaneSeeksWithoutSelectingOrDraggingAnInvisibleClip() throws {
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 1032, height: 119))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = surface.bounds.width
+        let left = clip(size: .zero)
+        var gap = clip(size: .zero)
+        gap.isGap = true
+        let right = clip(size: .zero)
+        var selections: [UUID] = []
+        var seeks: [Double] = []
+        var moves: [UUID] = []
+        surface.timeline = SequenceTimeline(
+            clips: [left, gap, right], playhead: 0, selection: nil, thumbnailHeight: 36,
+            onSelect: { selections.append($0) }, onSeek: { seeks.append($0) },
+            onTrim: { _, _, _, _ in nil }, onMove: { id, _ in moves.append(id) }, onDrop: { _, _ in })
+
+        func event(_ type: NSEvent.EventType, x: CGFloat) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.mouseEvent(with: type, location: NSPoint(x: x, y: 60), modifierFlags: [],
+                                             timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                             eventNumber: 1, clickCount: 1, pressure: 1))
+        }
+        surface.mouseDown(with: try event(.leftMouseDown, x: 516))
+        XCTAssertEqual(seeks.count, 1)
+        XCTAssertEqual(try XCTUnwrap(seeks.first), 15, accuracy: 0.001)
+        surface.mouseDragged(with: try event(.leftMouseDragged, x: 600))
+        surface.mouseUp(with: try event(.leftMouseUp, x: 600))
+        XCTAssertTrue(selections.isEmpty)
+        XCTAssertTrue(moves.isEmpty)
+    }
+
+    @MainActor
     func testBenchmarkRangeDragAcrossFiftyThousandClips() throws {
         guard ProcessInfo.processInfo.environment["MPCUT_RANGE_DRAG_BENCHMARK"] == "1" else {
             throw XCTSkip("Set MPCUT_RANGE_DRAG_BENCHMARK=1 to time range drag")
@@ -647,6 +679,52 @@ final class TimelineDisplayTests: XCTestCase {
     }
 
     @MainActor
+    func testKeyframePlayheadDragAndTrimHandleAtPlayhead() async throws {
+        _ = NSApplication.shared
+        let file = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
+                                                  subdirectory: "Fixtures"))
+        let model = EditorModel()
+        defer { model.endSession() }
+        model.useAnalysisSidecars = false
+        model.importFiles([file])
+        let deadline = ContinuousClock.now + .seconds(5)
+        while model.isBusy && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(model.canEdit)
+        model.snapTarget = .keyframes
+
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 32 + model.duration * 100, height: 119))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = surface.bounds.width
+        surface.timeline = SequenceTimeline(clips: model.timelineClips, playhead: model.playhead,
+                                            selection: model.selectedID, thumbnailHeight: 32,
+                                            snapTarget: .constant(.keyframes), onSelect: model.select,
+                                            onSeek: model.seek, onTrim: model.trim, onMove: { _, _ in },
+                                            onDrop: { _, _ in }, pointerTarget: model.pointerTarget,
+                                            onPointerSeek: model.seekFromPointer, onScrub: model.scrub,
+                                            onEndScrub: model.preview.endScrub, onCancelTrim: model.cancelTrim)
+        func mouse(_ type: NSEvent.EventType, x: CGFloat, y: CGFloat) throws -> NSEvent {
+            let point = surface.convert(NSPoint(x: x, y: y), to: nil)
+            return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                                                     timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                                     eventNumber: 1, clickCount: 1, pressure: 1))
+        }
+
+        // The top of the clip handle overlaps the playhead's grab area at the clip start.
+        surface.mouseDown(with: try mouse(.leftMouseDown, x: 18, y: 33))
+        surface.mouseDragged(with: try mouse(.leftMouseDragged, x: 78, y: 33))
+        surface.mouseUp(with: try mouse(.leftMouseUp, x: 78, y: 33))
+        XCTAssertEqual(model.timelineClips.first?.sourceStart, 1)
+        model.undo()
+
+        // The pointer stops at 0.6 seconds, 40 points from the nearest keyframe.
+        surface.mouseDown(with: try mouse(.leftMouseDown, x: 16, y: 22))
+        surface.mouseDragged(with: try mouse(.leftMouseDragged, x: 76, y: 22))
+        surface.mouseUp(with: try mouse(.leftMouseUp, x: 76, y: 22))
+        XCTAssertEqual(model.playhead, 1, accuracy: 1e-9)
+    }
+
+    @MainActor
     func testWaveformDrawsAndScrubsCompactRangesAtSourceOffsets() throws {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "Scrub-Tone", withExtension: "webm", subdirectory: "Fixtures"))
         let media = try CutEngine().inspectForPreview(url)
@@ -699,6 +777,23 @@ final class TimelineDisplayTests: XCTestCase {
         XCTAssertEqual(changedPixels(at: 181, drawn, shaded), 0)
         XCTAssertGreaterThan(changedPixels(at: 241, empty, shadedBeforePeaks), 20)
 
+        // The second occurrence starts at 0.30 in the source and 0.10 on the timeline.
+        // A 0.20–0.25 sequence pause with 0.01 padding retains only its outer edges.
+        state.timelinePadding = [span(20, 21), span(24, 25)]
+        let padded = try render()
+        for (time, kept) in [(0.20, true), (0.21, false), (0.23, false), (0.24, true), (0.25, false)] {
+            surface.timeline = SequenceTimeline(clips: clips, playhead: time, selection: state.selection,
+                                                timelinePadding: state.timelinePadding, onSelect: state.onSelect,
+                                                onSeek: state.onSeek, onTrim: state.onTrim, onMove: state.onMove,
+                                                onDrop: state.onDrop)
+            let ruler = try XCTUnwrap(surface.accessibilityChildren()?.first as? NSAccessibilityElement)
+            XCTAssertEqual(ruler.accessibilityValueDescription()?.contains("retained silence padding"), kept)
+        }
+        surface.timeline = state
+        XCTAssertGreaterThan(changedPixels(at: 221, padded, shadedBeforePeaks), 20)
+        XCTAssertEqual(changedPixels(at: 241, padded, shadedBeforePeaks), 0)
+        XCTAssertGreaterThan(changedPixels(at: 261, padded, shadedBeforePeaks), 20)
+
         func mouse(_ type: NSEvent.EventType, at x: CGFloat) throws -> NSEvent {
             let point = surface.convert(NSPoint(x: x, y: 116), to: nil)
             return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
@@ -750,6 +845,36 @@ final class TimelineDisplayTests: XCTestCase {
             XCTAssertFalse(surface.dropFiles([project], at: point))
             XCTAssertEqual(opened.count, 2)
         }
+    }
+
+    @MainActor
+    func testStillDropsUseSequenceTimeAndPreserveReplacementIntent() {
+        let clips = (0..<2).map { _ in clip(size: CGSize(width: 1920, height: 1080)) }
+        var timeline = timeline(clips)
+        let project = URL(fileURLWithPath: "/tmp/program.cut")
+        let image = URL(fileURLWithPath: "/tmp/card.png")
+        var opened = [URL]()
+        var drops: [([URL], Double, Bool)] = []
+        timeline.onDropProjects = { urls in
+            opened += urls.filter { $0 == project }
+            return urls.filter { $0 != project }
+        }
+        timeline.onDropStills = { drops.append(($0, $1, $2)) }
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 632, height: 150))
+        surface.viewportWidth = surface.frame.width
+        surface.timeline = timeline
+        let point = NSPoint(x: 250, y: 50)
+        XCTAssertTrue(surface.dropFiles([project, image], at: point))
+        XCTAssertTrue(surface.dropFiles([image], at: point, replacingMarkedRange: true))
+        XCTAssertEqual(opened, [project])
+        XCTAssertEqual(drops.count, 2)
+        guard drops.count == 2 else { return }
+        XCTAssertEqual(drops[0].0, [image])
+        XCTAssertGreaterThan(drops[0].1, 0)
+        XCTAssertLessThan(drops[0].1, clips[0].duration)
+        XCTAssertEqual(drops[0].1, drops[1].1)
+        XCTAssertFalse(drops[0].2)
+        XCTAssertTrue(drops[1].2)
     }
 
     @MainActor

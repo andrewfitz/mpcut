@@ -7,12 +7,17 @@ enum WaveformDrawing {
     /// A connected outline of signed peaks. Sample once per visible backing pixel,
     /// or once per source bin when the display is finer than the available data.
     static func timelinePath(in area: CGRect, sourceStart: Double, pointsPerSecond: CGFloat,
-                             displayScale: CGFloat, detail: DisplayEnvelope?, coarse: AudioWaveform?) -> CGPath {
+                             displayScale: CGFloat, detail: DisplayEnvelope?, coarse: AudioWaveform?,
+                             dirtyX: Range<CGFloat>? = nil) -> CGPath {
         let path = CGMutablePath()
         guard area.width > 0, area.height > 0, detail != nil || coarse != nil else { return path }
         let pixel = 1 / displayScale
         let bin = detail?.secondsPerBin ?? 1 / Double(AudioWaveform.rate)
         let step = max(detail == nil ? 1 : pixel, bin * pointsPerSecond)
+        // Keep the viewport's sampling grid and include the neighbors that connect across the repaint edges.
+        let first = max(0, floor(((dirtyX?.lowerBound ?? area.minX) - area.minX) / step) - 1)
+        let last = min(ceil(area.width / step), ceil(((dirtyX?.upperBound ?? area.maxX) - area.minX) / step) + 1)
+        guard first < last else { return path }
         let amplitude = max(0, area.height / 2 - 2)
         func y(_ value: Float) -> CGFloat {
             let level = sqrt(min(1, CGFloat(abs(value))))
@@ -28,9 +33,11 @@ enum WaveformDrawing {
             path.closeSubpath()
             lower.removeAll(keepingCapacity: true)
         }
-        var left = area.minX
-        while left < area.maxX {
-            let right = min(area.maxX, left + step)
+        var column = first
+        while column < last {
+            let left = area.minX + column * step
+            let right = min(area.maxX, area.minX + (column + 1) * step)
+            guard left < right else { break }
             let from = sourceStart + (left - area.minX) / pointsPerSecond
             let to = sourceStart + (right - area.minX) / pointsPerSecond
             let levels = detail?.range(from: from, to: to) ?? coarse?.peak(from: from, to: to).map { (-$0, $0) }
@@ -47,9 +54,9 @@ enum WaveformDrawing {
             } else {
                 close(at: left)
             }
-            left = right
+            column += 1
         }
-        close(at: area.maxX)
+        close(at: min(area.maxX, area.minX + last * step))
         return path
     }
 
@@ -73,25 +80,31 @@ enum WaveformDrawing {
 
     /// Draw one column per backing pixel. The signed envelope preserves transients and DC offset.
     static func draw(in rect: CGRect, visible: CGRect, seconds: Range<Double>, scale: CGFloat,
-                     detail: DisplayEnvelope?, coarse: AudioWaveform?, pauses: [AudioSpan], color: NSColor) {
+                     detail: DisplayEnvelope?, coarse: AudioWaveform?, pauses: [AudioSpan], color: NSColor,
+                     dirty: CGRect? = nil) {
         let area = rect.intersection(visible)
-        guard area.width > 0, area.height > 0, seconds.upperBound > seconds.lowerBound else { return }
+        let repaint = area.intersection(dirty ?? area)
+        guard !repaint.isEmpty, seconds.upperBound > seconds.lowerBound else { return }
         let units = (seconds.upperBound - seconds.lowerBound) / rect.width
         func time(_ x: CGFloat) -> Double { seconds.lowerBound + (x - rect.minX) * units }
         func x(_ t: Double) -> CGFloat { rect.minX + (t - seconds.lowerBound) / units }
-        for pause in pauses[pauses.lowerBound { $0.to.seconds > time(area.minX) }...] {
-            if pause.from.seconds >= time(area.maxX) { break }
-            let l = max(area.minX, x(pause.from.seconds)), r = min(area.maxX, x(pause.to.seconds))
+        for pause in pauses[pauses.lowerBound { $0.to.seconds > time(repaint.minX) }...] {
+            if pause.from.seconds >= time(repaint.maxX) { break }
+            let l = max(repaint.minX, x(pause.from.seconds)), r = min(repaint.maxX, x(pause.to.seconds))
             NSColor.systemTeal.withAlphaComponent(0.15).setFill()
             CGRect(x: l, y: rect.minY, width: max(0, r - l), height: rect.height).fill()
         }
         let pixel = 1 / max(scale, 1)
         let amp = rect.height * 0.465
         let line = CGMutablePath()
-        var left = area.minX
+        // Retain the visible area's sampling grid during a partial repaint.
+        var column = max(0, floor((repaint.minX - area.minX) / pixel) - 1)
+        let end = min(ceil(area.width / pixel), ceil((repaint.maxX - area.minX) / pixel) + 1)
         var previous: (bottom: CGFloat, top: CGFloat)?
-        while left < area.maxX {
-            let right = min(left + pixel, area.maxX)
+        while column < end {
+            let left = area.minX + column * pixel
+            let right = min(area.minX + (column + 1) * pixel, area.maxX)
+            guard left < right else { break }
             let from = time(left), to = time(right)
             let levels = detail?.range(from: from, to: to) ?? coarse?.peak(from: from, to: to).map { (-$0, $0) }
             if let (low, high) = levels {
@@ -102,11 +115,11 @@ enum WaveformDrawing {
                 line.addLine(to: CGPoint(x: center, y: max(top + pixel, bottom, previous?.top ?? bottom)))
                 previous = (bottom, top)
             } else { previous = nil }
-            left = right
+            column += 1
         }
         guard let cg = NSGraphicsContext.current?.cgContext else { return }
         cg.saveGState()
-        cg.clip(to: area)
+        cg.clip(to: repaint)
         cg.setShouldAntialias(false)
         cg.setLineWidth(pixel)
         cg.setStrokeColor(color.cgColor)
@@ -117,8 +130,19 @@ enum WaveformDrawing {
 }
 
 enum AudioViewerSpan: String, CaseIterable {
-    case timeline = "Timeline zoom", whole = "Whole clip", seconds10 = "10 s", second = "1 s"
-    case ms100 = "100 ms", ms10 = "10 ms"
+    case timeline = "timeline_zoom", whole = "whole_clip", seconds10 = "10_seconds", second = "1_second"
+    case ms100 = "100_milliseconds", ms10 = "10_milliseconds"
+
+    var label: String {
+        switch self {
+        case .timeline: "Timeline zoom"
+        case .whole: "Whole clip"
+        case .seconds10: "10 s"
+        case .second: "1 s"
+        case .ms100: "100 ms"
+        case .ms10: "10 ms"
+        }
+    }
 
     func range(from: Double, to: Double, at time: Double, zoom: Double) -> Range<Double> {
         let start = min(from, time), end = max(to, time)
@@ -165,6 +189,10 @@ struct AudioWaveformViewer: NSViewRepresentable {
         return canvas
     }
     func updateNSView(_ view: AudioWaveformCanvas, context: Context) { view.set(self) }
+
+    static func dismantleNSView(_ view: AudioWaveformCanvas, coordinator: ()) {
+        view.endGesture()
+    }
 }
 
 @MainActor
@@ -209,6 +237,7 @@ final class AudioWaveformCanvas: NSView {
 
     func set(_ data: AudioWaveformViewer) {
         var data = data
+        if !data.enabled { endGesture() }
         deferred = nil
         if let gesture, gesture.clip.id != data.clip.id, var held = model, held.clip.id == gesture.clip.id {
             // Reaching the join activates the next clip. The drag keeps its own page until release.
@@ -220,14 +249,21 @@ final class AudioWaveformCanvas: NSView {
         let old = model, oldRange = displayed
         model = data
         updateDisplayedRange(data)
-        guard !displayed.isEmpty else { return }
+        cursor.isHidden = displayed.isEmpty
+        setAccessibilityEnabled(data.enabled && !displayed.isEmpty)
+        guard !displayed.isEmpty else {
+            sampleLabel.string = nil
+            setAccessibilityValue(nil)
+            needsDisplay = true
+            return
+        }
         if old?.clip.id != data.clip.id || old?.clip.sourceID != data.clip.sourceID || old?.revision != data.revision ||
+            old?.clip.name != data.clip.name || old?.clip.audioSampleRate != data.clip.audioSampleRate ||
             oldRange != displayed || old?.offset != data.offset || old?.markIn != data.markIn || old?.markOut != data.markOut {
             needsDisplay = true
         }
         updateCursor()
-        if data.clip.audioSampleRate > 0 {
-            let sample = Int64((data.sourceTime * Double(data.clip.audioSampleRate)).rounded())
+        if data.clip.audioSampleRate > 0, let sample = Int64(exactly: (data.sourceTime * Double(data.clip.audioSampleRate)).rounded()) {
             sampleLabel.string = "Sample " + sample.formatted() + "  ·  " + data.clip.audioSampleRate.formatted() + " Hz"
         } else { sampleLabel.string = nil }
         setAccessibilityValue(timelineTime(data.sourceTime, milliseconds: true))
@@ -335,10 +371,15 @@ final class AudioWaveformCanvas: NSView {
         guard let data = model, data.enabled, let gesture else { return }
         data.scrub(target(event, in: gesture))
     }
+    fileprivate func endGesture() {
+        let ending = gesture
+        gesture = nil
+        ending?.end()
+    }
+
     override func mouseUp(with event: NSEvent) {
-        guard let gesture else { return }
-        self.gesture = nil
-        gesture.end()
+        guard gesture != nil else { return }
+        endGesture()
         if let deferred {
             set(deferred)
             needsDisplay = true

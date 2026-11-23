@@ -40,6 +40,17 @@ if [[ -n "$output_dir" && -d "$output_dir" ]]; then
     done
 fi
 
+if [[ -n "${MPCUT_TILETRAIL_PREFIX:-}" ]]; then
+    MPCUT_TILETRAIL_PREFIX=$(cd "$MPCUT_TILETRAIL_PREFIX" && pwd)
+    export MPCUT_TILETRAIL_PREFIX
+    for file in include/tiletrail.h lib/libtiletrail.a LICENSE; do
+        if [[ ! -f "$MPCUT_TILETRAIL_PREFIX/$file" ]]; then
+            echo "TileTrail artifact is missing $file." >&2
+            exit 1
+        fi
+    done
+fi
+
 "$root/scripts/build-ffmpeg.sh"
 ffmpeg="$root/.build/mpcut-ffmpeg"
 export MPCUT_BUNDLED_FFMPEG=1
@@ -63,6 +74,8 @@ trap cleanup EXIT
 mkdir -p "$contents"/{Frameworks,Helpers,MacOS,Resources/FFmpeg}
 install -m 755 "$bin_dir/MPCutDesktop" "$contents/MacOS/MPCut"
 install -m 755 "$bin_dir/mpcut" "$contents/Helpers/mpcut"
+# Strip the staged executables before signing, keeping SwiftPM's debug artifacts.
+xcrun strip -S -x "$contents/MacOS/MPCut" "$contents/Helpers/mpcut"
 version=$(DYLD_LIBRARY_PATH="$ffmpeg/install/lib" "$bin_dir/mpcut" --version)
 if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "Expected a three-part MPCut release version, got $version." >&2
@@ -72,13 +85,21 @@ fi
 install -m 755 "$ffmpeg/install/bin/ffmpeg" "$contents/Helpers/ffmpeg"
 install -m 644 "$root/packaging/Info.plist" "$contents/Info.plist"
 install -m 644 "$root/packaging/Credits.html" "$contents/Resources/Credits.html"
+if [[ -n "${MPCUT_TILETRAIL_PREFIX:-}" ]]; then
+    install -m 644 "$MPCUT_TILETRAIL_PREFIX/LICENSE" "$contents/Resources/TileTrail-LICENSE.txt"
+fi
 (cd "$root/packaging/premiere" && /usr/bin/zip -q -X "$contents/Resources/MPCut Premiere.ccx" manifest.json index.html index.js)
 manual="$contents/Resources/Documentation"
 mkdir -p "$manual/packaging"
 # Finder metadata on screenshots is invalid inside a signed application bundle.
-cp -RX "$root/docs" "$manual/docs"
+mkdir -p "$manual/docs"
+/usr/bin/rsync -r --exclude='__pycache__/' --exclude='*.pyc' --exclude='.DS_Store' "$root/docs/" "$manual/docs/"
 install -m 644 "$root/packaging/FFmpeg-Notice.txt" "$manual/packaging/"
+mkdir -p "$manual/packaging/grok" "$manual/plugins/mpcut"
+install -m 644 "$root/packaging/grok/Setup.md" "$manual/packaging/grok/"
+/usr/bin/rsync -r --exclude='.DS_Store' "$root/plugins/mpcut/" "$manual/plugins/mpcut/"
 install -m 644 "$root/README.md" "$root/CHANGELOG.md" "$root/AUDIT.md" "$manual/"
+install -m 644 "$root/Sources/MPCutCore/Gap.png" "$contents/Resources/Gap.png"
 install -m 644 "$root/Resources/MPCut.icns" "$contents/Resources/MPCut.icns"
 
 for library in "$ffmpeg"/install/lib/*.dylib; do
@@ -108,6 +129,9 @@ install -m 644 "$ffmpeg/install/SVT-AV1"/{LICENSE.md,LICENSE-BSD2.md,PATENTS.md,
 lame_name=$(cat "$ffmpeg/install/lame-source-name")
 mkdir "$notices/LAME"
 install -m 644 "$ffmpeg/install/LAME"/{COPYING,LICENSE} "$ffmpeg/$lame_name.tar.gz" "$notices/LAME/"
+opus_name=$(cat "$ffmpeg/install/opus-source-name")
+mkdir "$notices/Opus"
+install -m 644 "$ffmpeg/install/Opus/COPYING" "$ffmpeg/$opus_name.tar.gz" "$notices/Opus/"
 
 for binary in "$contents"/Frameworks/*.dylib "$contents"/Helpers/* "$contents/MacOS/MPCut"; do
     if [[ $(xcrun lipo -archs "$binary") != arm64 ]]; then
@@ -156,7 +180,8 @@ plutil -lint "$contents/Info.plist"
 env -i PATH=/usr/bin:/bin "$contents/Helpers/mpcut" --help >/dev/null
 env -i PATH=/usr/bin:/bin "$contents/Helpers/ffmpeg" -version >/dev/null
 python3 "$root/scripts/mcp-reference.py" --check
-python3 "$root/Tests/Integration/mcp_bundle.py" "$app"
+# The bundle check uses assertions, which PYTHONOPTIMIZE would otherwise disable.
+env -u PYTHONOPTIMIZE python3 "$root/Tests/Integration/mcp_bundle.py" "$app"
 
 if [[ -e "$final" || -L "$final" ]]; then
     mv "$final" "$previous"

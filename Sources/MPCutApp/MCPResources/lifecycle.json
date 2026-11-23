@@ -1,6 +1,6 @@
 [
   {
-    "name": "get_preferences",
+    "name": "preferences_read",
     "description": "Read shared MPCut settings and inspect the local-control toggle.",
     "inputSchema": {
       "type": "object",
@@ -10,12 +10,12 @@
     }
   },
   {
-    "name": "set_preference",
-    "description": "Change a native preference. Lowering historyLimit immediately trims retained history in open projects. Local MCP access is controlled in Settings.",
+    "name": "preferences_set",
+    "description": "Change a native preference. Lowering history_max_steps immediately trims retained history in open projects. Local MCP access is controlled in Settings.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
@@ -24,17 +24,20 @@
         "key": {
           "type": "string",
           "enum": [
-            "historyLimit",
-            "useAnalysisSidecars",
-            "defaultExportMode",
-            "snapTarget",
-            "largeThumbnails",
-            "minimumPause",
-            "leavePause",
-            "volume",
-            "isMuted",
-            "scrubSoundEnabled",
-            "jpegPreset"
+            "history_max_steps",
+            "analysis_sidecar_reuse_enabled",
+            "media_auto_refresh_enabled",
+            "export_tier_downgrade_warning_enabled",
+            "export_movie_default_mode",
+            "timeline_snap_target",
+            "timeline_large_previews_enabled",
+            "silence_min_pause_seconds",
+            "silence_max_blip_seconds",
+            "silence_padding_per_side_seconds",
+            "playback_preview_volume_fraction",
+            "playback_preview_muted",
+            "playback_scrub_audio_enabled",
+            "export_jpeg_default_preset"
           ]
         },
         "value": {
@@ -49,53 +52,177 @@
               "type": "number"
             }
           ],
-          "description": "historyLimit 0–500, volume 0–1, pause durations in seconds. Enum values match get_preferences."
+          "description": "history_max_steps 0–500, playback_preview_volume_fraction 0–1, silence_max_blip_seconds 0–1 second, pause durations in seconds. Enum values match preferences_read."
         }
       },
       "required": [
-        "operationID",
+        "operation_id",
         "key",
         "value"
       ],
       "allOf": [
         {
-          "if": { "properties": { "key": { "const": "historyLimit" } } },
-          "then": { "properties": { "value": { "type": "integer", "minimum": 0, "maximum": 500 } } }
+          "if": {
+            "properties": {
+              "key": {
+                "const": "history_max_steps"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 500
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "key": { "const": "volume" } } },
-          "then": { "properties": { "value": { "type": "number", "minimum": 0, "maximum": 1 } } }
+          "if": {
+            "properties": {
+              "key": {
+                "enum": [
+                  "playback_preview_volume_fraction",
+                  "silence_max_blip_seconds"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "key": { "const": "minimumPause" } } },
-          "then": { "properties": { "value": { "type": "number", "minimum": 0.02 } } }
+          "if": {
+            "properties": {
+              "key": {
+                "const": "silence_min_pause_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0.02
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "key": { "const": "leavePause" } } },
-          "then": { "properties": { "value": { "type": "number", "minimum": 0 } } }
+          "if": {
+            "properties": {
+              "key": {
+                "const": "silence_padding_per_side_seconds"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "key": { "enum": ["useAnalysisSidecars", "largeThumbnails", "isMuted", "scrubSoundEnabled"] } } },
-          "then": { "properties": { "value": { "type": "boolean" } } }
+          "if": {
+            "properties": {
+              "key": {
+                "enum": [
+                  "media_auto_refresh_enabled",
+                  "export_tier_downgrade_warning_enabled",
+                  "analysis_sidecar_reuse_enabled",
+                  "timeline_large_previews_enabled",
+                  "playback_preview_muted",
+                  "playback_scrub_audio_enabled"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean"
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "key": { "const": "defaultExportMode" } } },
-          "then": { "properties": { "value": { "enum": ["copy", "smart", "encode"] } } }
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_movie_default_mode"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "copy",
+                  "smart",
+                  "encode"
+                ]
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "key": { "const": "snapTarget" } } },
-          "then": { "properties": { "value": { "enum": ["off", "keyframes", "scenes", "silence"] } } }
+          "if": {
+            "properties": {
+              "key": {
+                "const": "timeline_snap_target"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "off",
+                  "keyframes",
+                  "scenes",
+                  "silence"
+                ]
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "key": { "const": "jpegPreset" } } },
-          "then": { "properties": { "value": { "enum": ["review", "full"] } } }
+          "if": {
+            "properties": {
+              "key": {
+                "const": "export_jpeg_default_preset"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "enum": [
+                  "review",
+                  "full"
+                ]
+              }
+            }
+          }
         }
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "list_drafts",
+    "name": "project_drafts_list",
     "description": "List unlocked untitled project recovery files and last-modified times.",
     "inputSchema": {
       "type": "object",
@@ -105,12 +232,12 @@
     }
   },
   {
-    "name": "new_project",
+    "name": "project_create",
     "description": "Create a new ordinary sequence or multicam project window. Supply local recording paths for initial import. Multicam requires a camera and opens the setup sheet.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
@@ -136,24 +263,24 @@
         }
       },
       "required": [
-        "operationID"
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "open_project",
+    "name": "project_open",
     "description": "Open a saved MPCut project and wait for native document loading. An already-open document is activated.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
           "description": "Unique operation ID for identical retries."
         },
-        "path": {
+        "project_path": {
           "type": "string",
           "minLength": 1,
           "pattern": "^/",
@@ -161,25 +288,25 @@
         }
       },
       "required": [
-        "operationID",
-        "path"
+        "operation_id",
+        "project_path"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "recover_project",
-    "description": "Recover an unlocked draft from a path returned by list_drafts.",
+    "name": "project_draft_recover",
+    "description": "Recover an unlocked draft from a path returned by project_drafts_list.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
           "description": "Unique operation ID for identical retries."
         },
-        "path": {
+        "draft_path": {
           "type": "string",
           "minLength": 1,
           "pattern": "^/",
@@ -187,28 +314,28 @@
         }
       },
       "required": [
-        "operationID",
-        "path"
+        "operation_id",
+        "draft_path"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "add_media",
+    "name": "project_media_add",
     "description": "Add local recordings using the native editor. In a sequence, append or insert at index; in a multicam editor this opens source setup. Read editor state after partial import.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1,
-          "description": "Live handle returned by list_projects."
+          "description": "Live handle returned by project_windows_list."
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
@@ -231,69 +358,69 @@
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
+        "project_handle",
+        "expected_revision",
+        "operation_id",
         "paths"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "save_project",
-    "description": "Save the live project with native history. Supply a new .cut path for Save As. Writing over another existing destination requires replaceExisting.",
+    "name": "project_save",
+    "description": "Save the live project with native history. Supply a new .cut path for Save As. Writing over another existing destination requires replace_existing.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1,
-          "description": "Live handle returned by list_projects."
+          "description": "Live handle returned by project_windows_list."
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
           "description": "Unique operation ID for identical retries."
         },
-        "path": {
+        "project_path": {
           "type": "string",
           "minLength": 1,
           "pattern": "^/",
           "description": "Absolute local filesystem path."
         },
-        "replaceExisting": {
+        "replace_existing": {
           "type": "boolean"
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID"
+        "project_handle",
+        "expected_revision",
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "close_project",
+    "name": "project_close",
     "description": "Close this window. Specify what to do with unsaved edits; save requires a .cut path if the document is untitled.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1,
-          "description": "Live handle returned by list_projects."
+          "description": "Live handle returned by project_windows_list."
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
@@ -307,129 +434,122 @@
             "cancel"
           ]
         },
-        "path": {
+        "project_path": {
           "type": "string",
           "minLength": 1,
           "pattern": "^/",
           "description": "Absolute local filesystem path."
         },
-        "replaceExisting": {
+        "replace_existing": {
           "type": "boolean"
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID"
+        "project_handle",
+        "expected_revision",
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "focus_project",
+    "name": "project_window_focus",
     "description": "Bring the specified project window to the front.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1,
-          "description": "Live handle returned by list_projects."
+          "description": "Live handle returned by project_windows_list."
         }
       },
       "required": [
-        "project"
+        "project_handle"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "set_video_monitor",
+    "name": "playback_monitor_visibility_set",
     "description": "Show or close the target window’s native video monitor.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1,
-          "description": "Live handle returned by list_projects."
+          "description": "Live handle returned by project_windows_list."
         },
         "visible": {
           "type": "boolean"
         }
       },
       "required": [
-        "project",
+        "project_handle",
         "visible"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "show_history",
+    "name": "history_panel_show",
     "description": "Show the native history sheet for the target project.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1,
-          "description": "Live handle returned by list_projects."
+          "description": "Live handle returned by project_windows_list."
         }
       },
       "required": [
-        "project"
+        "project_handle"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "get_multicam_setup",
+    "name": "multicam_setup_read",
     "description": "Inspect the pending setup after a multicam import. Returns source IDs, picture/stream availability, and whether the project already exists.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1,
-          "description": "Live handle returned by list_projects."
+          "description": "Live handle returned by project_windows_list."
         }
       },
       "required": [
-        "project"
+        "project_handle"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "multicam_setup",
-    "description": "Confirm or dismiss native multicam source setup. For creation you can choose opening camera and program audio. Options use the source IDs from get_multicam_setup.",
+    "name": "multicam_setup_confirm",
+    "description": "Confirm pending camera setup, optionally supplying source order, names, microphones and opening angle.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1,
-          "description": "Live handle returned by list_projects."
+          "description": "Live handle returned by project_windows_list."
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
           "description": "Unique operation ID for identical retries."
         },
-        "action": {
-          "type": "string",
-          "enum": [
-            "confirm",
-            "dismiss"
-          ]
-        },
-        "sourceOrder": {
+        "source_order": {
           "type": "array",
           "items": {
             "type": "string",
@@ -442,7 +562,7 @@
             "type": "string"
           }
         },
-        "audioStreams": {
+        "audio_streams": {
           "type": "object",
           "additionalProperties": {
             "oneOf": [
@@ -468,14 +588,15 @@
               "enum": [
                 "follow",
                 "none",
-                "fixed"
+                "fixed",
+                "mix"
               ]
             },
-            "source": {
+            "source_id": {
               "type": "string",
               "minLength": 1
             },
-            "stream": {
+            "audio_stream_index": {
               "type": "integer",
               "minimum": 0
             }
@@ -487,21 +608,50 @@
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
-        "action"
+        "project_handle",
+        "expected_revision",
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "get_native_operations",
-    "description": "Inspect current native UI import/export/multicam workers for a specified project, including conversion started in that window. Omit project to inspect app-wide conversion. Scene/silence scans use analysis_state.",
+    "name": "multicam_setup_dismiss",
+    "description": "Dismiss the pending multicam setup in the target project.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Live handle returned by project_windows_list."
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique operation ID for identical retries."
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "project_operations_list",
+    "description": "Inspect current native UI import/export/multicam workers for a specified project, including conversion started in that window. Omit project to inspect app-wide conversion. Scene/silence scans use analysis_editor_state_read.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
           "type": "string",
           "minLength": 1,
           "description": "Target live window. Omit for app-wide project conversion."
@@ -512,35 +662,35 @@
     }
   },
   {
-    "name": "cancel_native_operation",
-    "description": "Cancel the exact native worker returned by get_native_operations. Supply its same project handle for window-owned work. An ended worker cannot cancel its successor.",
+    "name": "project_operation_cancel",
+    "description": "Cancel the exact native worker returned by project_operations_list. Supply its same project handle for window-owned work. An ended worker cannot cancel its successor.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1,
           "description": "Target live window. Omit for app-wide project conversion."
         },
-        "nativeOperation": {
+        "native_operation_id": {
           "type": "string",
           "format": "uuid"
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128
         }
       },
       "required": [
-        "nativeOperation",
-        "operationID"
+        "native_operation_id",
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "dismiss_notice",
+    "name": "workspace_notice_dismiss",
     "description": "Dismiss a native informational or error notice after inspecting it. Use its exact message so a newer notice remains visible.",
     "inputSchema": {
       "type": "object",
@@ -549,14 +699,14 @@
           "type": "string",
           "minLength": 1
         },
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1
         }
       },
       "required": [
         "message",
-        "project"
+        "project_handle"
       ],
       "additionalProperties": false
     }

@@ -1,14 +1,18 @@
 # Using MPCut from an MCP agent
 
-An agent connected to MPCut can edit any open timeline, including an unsaved sequence or multicam assembly. Its edits use the same snapping and undo history as yours. File tools use the bundled CLI. Give one a project path and it reads the last saved version. [Tool reference](MCP-REFERENCE.md) · [CLI agent guide](USAGE.md#use-the-cli-from-an-agent)
+For unattended work on saved media, launch the stdio helper with `--files-only`. See [headless setup and examples](HEADLESS.md).
+
+An agent connected to MPCut can edit any open timeline, including an unsaved sequence or multicam assembly. Its edits use the same snapping and undo history as yours. File tools use the bundled CLI. Supply a saved file in `project_path` to inspect its last saved revision. Use the window’s `project_handle` for an unsaved edit. [Tool reference](MCP-REFERENCE.md) · [CLI scripting](CLI.md#script-mpcut)
 
 ## Connect an editing agent
 
-1. Open a build of MPCut that includes `Contents/Helpers/mpcut-mcp`. In **Settings → General → Automation**, turn on **Enable local MCP control**. This lets local applications running under your macOS account inspect and edit open projects.
+1. Open a build of MPCut that includes `Contents/Helpers/mpcut-mcp`. In **Settings → General → Automation**, turn on **Enable local MCP control**. Local MCP control starts off in 2.0, including after upgrading from 1.x. Turning it on lets local applications running under your macOS account inspect and edit open projects.
 2. Configure the host to launch the bundled helper as a **stdio** server named `mpcut`. Supply the executable’s absolute path as one command value, including any spaces, and leave the arguments empty. Match the helper to the running app bundle. If you move or replace the app, update the host’s path and restart its connection.
 3. Open a project and ask, “List my open MPCut projects and tell me which one is an unsaved sequence.” An empty `projects` array means the app responded and has no project windows.
 
-For Codex, register the installed app with this command, then start a new session. Substitute the actual path if your app is elsewhere.
+For desktop plugin or Grok connector setup, follow the host-specific instructions. [Desktop setup](DESKTOP-PLUGINS.md)
+
+For Codex CLI, register the installed app with this command, then start a new session. Substitute the actual path if your app is elsewhere.
 
 ```sh
 codex mcp add mpcut -- "/Applications/MPCut.app/Contents/Helpers/mpcut-mcp"
@@ -46,7 +50,7 @@ python3 docs/mcp_walkthrough.py --project "HANDLE_FROM_THE_LIST"
 python3 docs/mcp_walkthrough.py --file "/absolute/path/to/interview.mov"
 ```
 
-Discovery reads both built-in guides. With local control enabled, the second command lists windows. Once the chosen project has loaded, the third reads its timeline, history, presentation, analysis, queue and, for multicam, sources. The last command inspects file metadata with sidecar use disabled and reads the completed job result. Increase `--timeout` when a walkthrough needs more than 60 seconds.
+Discovery reads both built-in guides. With local control enabled, the second command lists windows. Once the chosen project has loaded, the third reads its timeline, history, presentation, analysis, queue and, for multicam, sources. The last command inspects file metadata with sidecar use disabled and reads the completed job result. Increase `--timeout` when a walkthrough needs more than 60 seconds. Use `--timings NEW_FILE.json` to record client-observed RPC durations, request and response sizes, and polling waits. Use `--poll-interval SECONDS` to compare polling cadences. RPC durations include transport and server work.
 
 ## Instructions for the agent
 
@@ -56,7 +60,7 @@ Paste this block into the host’s agent instructions to share MPCut’s editing
 >
 > State which timeline clock you are using. Supply exact rational times where available. Use the native editing tool and report the actual committed boundary, affected occurrence and history action. Save, export, change settings or send to another application when the user’s request calls for it.
 >
-> For a new mutation or a file job, generate one UUID for `operationID`. If the response is lost, retry the identical request with the same ID within the documented retry window. On a revision conflict, reread state and re-evaluate the requested edit. For background work, follow the job to its terminal result and report completed outputs and any failures.
+> For a new mutation or a file job, generate one UUID for `operation_id`. If the response is lost, retry the identical request with the same ID within the documented retry window. On a revision conflict, reread state and re-evaluate the requested edit. For background work, follow the job to its terminal result and report completed outputs and any failures.
 
 ## Read the clock before editing
 
@@ -69,7 +73,45 @@ Paste this block into the host’s agent instructions to share MPCut’s editing
 
 For live requests, send time as a rational seconds string, such as `"1001/30000"` for one frame at 29.97 fps. Read the indexed timing when media has a variable frame rate. Ranges include their start and exclude their end. A clip name or source timestamp alone can match several occurrences.
 
-To seek to a specific multicam replay from a group timestamp, send its assembly `occurrence` index and the corresponding `expectedRevision` with `space: "group"`. The preview opens on the assembly clock at that occurrence.
+To seek to a specific multicam replay from a group timestamp, send its assembly `occurrence` index and the corresponding `expected_revision` with `space: "group"`. The preview opens on the assembly clock at that occurrence.
+
+Use `timeline_editor_range_map` to translate an interval between clocks. Read each returned piece in occurrence order, including repeats. To map an earlier edit or compare it with the current edit using `history_editor_compare`, first call `history_read` for its retained index and matching history token.
+
+## Check what the edit can export
+
+Read the optional `tier` in `project_editor_state_read` for a sequence or multicam project. When the assessment is current and includes a mode, use its container and factors to explain what the complete edit can preserve. An empty sequence has no tier. For delivery, preflight the requested tracks, container and range separately, especially if the user wants a single excerpt. [Export quality in the editor](USAGE.md#check-export-quality)
+
+After an unsafe multicam cut, inspect `multicam_state_read` with `section: "suggestions"`. The returned `edge` gives the one-based `range_number`, its `from` or `to` boundary, the current `group_time`, and the offered `times`. To accept one, call `multicam_assembly_edit` with `action: "apply_edge_suggestion"` and put the chosen time in `to`. Use the normal revision and operation ID for the mutation. Switch suggestions apply to a camera switch on the group clock. [Multicam tool arguments](MCP-REFERENCE.md#multicam_assembly_edit)
+
+## Find dialogue and review an edit
+
+1. Use `project_windows_list`, then `transcript_editor_attachments_list`. Keep the project handle, timeline `revision`, `transcript_revision`, and the chosen attachment’s `id` and `result_id`.
+2. Search with `transcript_editor_words_search`, a `query`, and `space: "current_cut"`. Read `source` for deleted takes and `group` for synchronized multicam dialogue. Follow `next_offset` in the same revision until the page omits it. When the line appears more than once, supply the intended `first_occurrence_id` and `last_occurrence_id` in the selection.
+3. Call `transcript_editor_edit_plan` with an `edit` containing the action, selections, and boundary policy. Check the requested and resolved boundaries, copy-safe alternatives, affected occurrences, duration, and any tier assessment.
+4. Use `transcript_editor_edit_apply`, the reviewed `plan_id`, and a new operation ID. Pass the same expected timeline and transcript revisions and result identity. If the tool returns `stale_transcript_plan`, refresh and review again. A committed edit appears in native history.
+
+For a named excerpt, plan with `edit.action: "queue"`, then use `transcript_editor_excerpt_queue`, the plan ID, and a name. Read its ID and name with `export_queue_list`. Use `transcript_editor_excerpt_save` to write the captured queue entry as an editable `.cut`. For a transcript file, use `transcript_editor_attachment_export`, an absolute path, and a format. Poll both outputs with `export_editor_job_status_read`.
+
+Read, search, locate, compare and export use all attached transcripts when you omit `attachment_id` and `result_id`. Project-wide pages return `attachment_results`, which you can send as `expected_attachment_results` on later pages. An occurrence identifies its attachment even when another recording has the same word ID. Supply that attachment for track evidence or edits.
+
+Call `transcript_editor_script_align` for one summary per nonempty script beat. Page takes with `transcript_editor_script_candidates_list` or missing and additional terms with `transcript_editor_script_qualifiers_list`. Supply the same script and the returned zero-based `beat`. A qualifier index selects the term whose occurrences you want to page.
+
+Use `transcript_editor_coverage_read` for timed gaps in the requested clock. Source and group clocks also return track recognition and binding statuses. Page that list separately with `track_offset` and `track_limit`.
+
+The bundled Python walkthrough can find and export an excerpt from a saved project with an attached transcript. Supply an existing empty output folder. If a phrase appears more than once, rerun with the intended `--match` from the search results. [Runnable walkthrough](mcp_walkthrough.py)
+
+```sh
+python3 docs/mcp_walkthrough.py --transcript-project "/absolute/path/interview.cut" \
+  --quote "the line to find" --output-dir "/absolute/path/excerpts"
+```
+
+For a project with no attachments, add `--import-transcript "/absolute/path/interview.json" --bind-source lav --bind-stream 0`. In a sequence, use `--bind-file` with the recording path. Set `--bind-track` if the imported track ID differs from `source`.
+
+Use `transcript_provider_capabilities_read` and `transcript_tracks_list` to check the local Transcriberrr provider and choose inputs. For requested recognition, call `transcript_editor_job_start` with the current timeline and transcript revisions and a fresh operation ID. The request’s `download` flag permits a model download. Keep the returned `job_id`, poll `transcript_editor_job_status_read`, and page the per-track coverage. Use `transcript_editor_job_warnings_list` for diagnostics and check `attached` before reading the result from the project. A transcript job can continue after local control is turned off. After reopening the project, obtain its current handle and use `transcript_editor_jobs_list` to recover job IDs.
+
+After changing a multicam source offset, use `transcript_editor_job_reconcile`, the current project handle, attachment ID, result ID, timeline and transcript revisions, and a fresh `operation_id`. The controller keeps valid recognition and recomputes alignment at the new offsets. Poll `transcript_editor_job_status_read` with the returned `job_id` until it reports `completed` or `partial` with `attached: true`. Read the updated attachment before planning edits.
+
+For a saved project, pass the corresponding CLI JSON request to the matching `transcript_file_*` tool under `request` with a UUID `operation_id`. Poll `file_job_status_read` and use `file_job_result_read` when the output is too large to return inline. [Transcript tools](MCP-REFERENCE.md#transcripts) · [CLI transcript commands](USAGE.md)
 
 ## Worked example: split an unsaved sequence
 
@@ -77,37 +119,39 @@ To seek to a specific multicam replay from a group timestamp, send its assembly 
 
 | Step | Agent action | Evidence |
 | --- | --- | --- |
-| 1 | Discover the tools, then call `list_projects`. Choose the sequence named Interview selects. | The project handle identifies its live window even if another window gains focus. |
-| 2 | Call `get_editor_state` for that handle. Find the second occurrence and confirm that 12 seconds is strictly between its `sequenceFrom` and `sequenceTo`. Read the revision, snapping and history settings. | If 12 seconds is already an edge of the intended clip, report the existing boundary. If 12 seconds falls in a different occurrence, clarify which target the editor intended. |
-| 3 | Call `split_at` with the handle, revision, a fresh operation ID, the occurrence, sequence coordinates and time `12`. | The committed result identifies the actual cut, both resulting occurrences and the applied revision. A background preflight may take time. |
+| 1 | Discover the tools, then call `project_windows_list`. Choose the sequence named Interview selects. | The project handle identifies its live window even if another window gains focus. |
+| 2 | Call `project_editor_state_read` for that handle. Find the second occurrence and confirm that 12 seconds is strictly between its `sequence_from` and `sequence_to`. Read the revision, snapping and history settings. | If 12 seconds is already an edge of the intended clip, report the existing boundary. If 12 seconds falls in a different occurrence, clarify which target the editor intended. |
+| 3 | Call `timeline_item_split` with the handle, revision, a fresh operation ID, the occurrence, sequence coordinates and time `12`. | The committed result identifies the actual cut, both resulting occurrences and the applied revision. A background preflight may take time. |
 | 4 | Read back the dirty flag, then report it and the actual boundary. When history is retained, name the action the editor can undo. | “Split the second interview clip at 12 s on the sequence. The edit is unsaved. Focus Interview selects and use Command-Z to undo Split Clip.” |
 
 For an ordinary sequence, construct the arguments from the actual state response. This JavaScript fragment assumes the client has located the relevant `clip` in `state.clips`.
 
 ```javascript
 const splitArgs = {
-  project: state.project,
-  expectedRevision: state.revision,
-  operationID: crypto.randomUUID(),
+  project_handle: state.project_handle,
+  expected_revision: state.revision,
+  operation_id: crypto.randomUUID(),
   occurrence: clip.id,
   space: "sequence",
   time: "12"
 };
-// Pass { name: "split_at", arguments: splitArgs } to tools/call.
+// Pass { name: "timeline_item_split", arguments: splitArgs } to tools/call.
 // Retain these arguments until the outcome is known.
 ```
 
-Inspect the MCP result’s `isError` and `structuredContent`. An ordinary successful split reports `action`, `boundary`, `sequenceTime`, `sourceTime`, `left`, `right`, `historyRetained` and the applied `revision`. A split exactly at an existing edge returns `invalid_boundary` for an ordinary sequence. If you already see the boundary in state, report it directly. Supply the current revision with the next edit. [Tool reference](MCP-REFERENCE.md)
+Inspect the MCP result’s `isError` and `structuredContent`. An ordinary successful split reports `action`, `boundary`, `sequence_time`, `source_time`, `left`, `right`, `history_retained` and the applied `revision`. A split exactly at an existing edge returns `invalid_boundary` for an ordinary sequence. If you already see the boundary in state, report it directly. Supply the current revision with the next edit. [Tool reference](MCP-REFERENCE.md)
 
 ## Edit still images
 
-Read `get_editor_state` and page `list_stills` at that revision. Source rows carry source bounds. Inserted still rows carry a placement ID, an asset ID and output bounds. Multicam assembly indices include both cards and group ranges. Refresh indices after each structural edit.
+Read `project_editor_state_read` and page `still_editor_placements_list` at that revision. Source rows carry source bounds. Inserted still rows carry a placement ID, an asset ID and output bounds. Multicam assembly indices include both cards and group ranges. Refresh indices after each structural edit.
 
-- Call `add_still` with `operation: "replace"`, an absolute image `path`, and `from` and `to` in sequence or multicam group time. A replacement keeps the underlying sound. Group replacements appear in each assembly occurrence of the covered group interval.
-- For a title or other insert, call `add_still` with `operation: "insert"`, `at` and `duration` in sequence or assembly time. The duration shifts later picture and sound. Supply an exact `cadence` frame interval when the current timeline has no verified fixed cadence.
-- Use `update_still` to adjust framing, change an insert's duration or position, or edit replacement coverage. Refer to fragments by the current index under their placement. `relink_still` updates all uses of an asset in one undo step. `remove_still` reveals the camera under a replacement or removes an insert and closes its gap.
-- Call `review_frame` at a program time to see what plays. In multicam, supply an explicit angle to inspect a camera. For JPEG files use `export_review_frames` with a program `space` and `selection: "times"` or sample the active playhead.
-- Preflight with `render_project` and `dryRun: true`. An omitted mode chooses Smart Trim for visible still picture. Set `requireCameraCopy: true` when the export must preserve all retained camera packets. Read the exact camera copy, camera encode and generated still durations, plus the per-track sound actions. To accept a verified whole-timeline boundary change, pass its `stillAdjustment` to `apply_export_review` with the same render settings.
+- Call `still_editor_picture_replace` with an absolute image `path`, and `from` and `to` in sequence or multicam group time. A replacement keeps the underlying sound. Group replacements appear in each assembly occurrence of the covered group interval.
+- For a title or other insert, call `still_editor_placement_insert` with the image path, `at` and `duration` in sequence or assembly time. The duration shifts later picture and sound. Supply an exact `cadence` frame interval when the current timeline has no verified fixed cadence.
+- Use `still_editor_placement_update` to adjust framing, change an insert's duration or position, or edit replacement coverage. Refer to fragments by the current index under their placement. `still_editor_asset_relink` updates all uses of an asset in one undo step. `still_editor_placement_remove` reveals the camera under a replacement or removes an insert and closes its gap.
+- Call `review_editor_frame_read` at a program time to see what plays. In multicam, supply an explicit angle to inspect a camera. For JPEG files use `review_editor_frames_export` with a program `space` and `selection: "times"` or sample the active playhead.
+- Preflight with `export_editor_project_plan`. An omitted mode chooses Smart Trim for visible still picture. Set `require_camera_copy: true` when the export must preserve all retained camera packets. Read the exact camera copy, camera encode and generated still durations, plus the per-track sound actions. To accept a verified whole-timeline boundary change, pass its `still_adjustment` to `export_editor_boundary_apply` with the same render settings.
+
+For gaps between picture items, use `timeline_clips_space` with a uniform rational `duration` or `source_timing: true`. A duration of zero removes gaps between picture items. Source timing requires chronological, nonoverlapping ranges of the same recording or multicam group. Read the resulting gaps with `still_editor_placements_list`. Spacing is one native history action. For rendering, `export_file_project_render` or `export_file_clips_join` accepts `space_clips` for the render. Use the CLI’s `timeline clips space` command to write the spacing into a saved project.
 
 ## Editing and delivery recipes
 
@@ -116,7 +160,7 @@ Read `get_editor_state` and page `list_stills` at that revision. Source rows car
 | “Recover yesterday’s untitled selects, apply this CSV and save a copy.” | Identify the draft, recover it, inspect the selected occurrence and CSV mode, apply ordered keep ranges or split points, review the timeline, then Save As to the requested destination. | Recovered project, resulting clips, retained history and saved path. |
 | “Put the wide angle on the first question, then shorten only its second replay.” | Read group switches, program audio and assembly occurrences. Apply the camera switch in group time. Refresh the revision, identify the second replay, and trim that assembly occurrence. | Affected group interval, audio routing and the specific occurrence trimmed. |
 | “Review the quiet gaps, keep the breath before the answer, and queue the takes.” | Select the microphone or routed program, scan with the requested threshold and padding, audition the relevant join, protect the pause, then queue retained takes. | Protected interval, queued ranges and analysis settings. If the user asks to shorten the timeline, verify the native history entry. |
-| “Find every wide shot and give me review images.” | Scan scenes, identify the recurring view by its samples, and use `file_frames` with the matching exact source `times` from the report. For a live check, `review_frame` accepts an exact sequence, group or assembly time. | View, sample rule, exact source times and output paths. |
+| “Find every wide shot and give me review images.” | Scan scenes, identify the recurring view by its samples, and use `review_file_frames_export` with the matching exact source times in `at` from the report. For a live check, `review_editor_frame_read` accepts an exact sequence, group or assembly time. | View, sample rule, exact source times and output paths. |
 | “Check whether this selection will copy cleanly.” | Read the live selection and track layout. Run export preflight with the requested container, mode and streams. Inspect proposed boundary changes or encoding options. | Copy eligibility, reason, proposed boundaries and whether any media was written. |
 | “Export these ranges as separate files with the processed soundtrack.” | Inspect source and replacement streams and timing. Establish which queue/export workflows support replacement. If they require separate steps, verify the replacement output before using it as the source for a file-based batch. Preflight destinations, then follow the jobs. | Source binding, stream IDs, completed files and any failed range. |
 | “Send this unsaved multicam assembly to Resolve as an editable timeline.” | Read the live assembly, choose the requested interchange route and handle reported prerequisites or loss options. Send the captured revision and follow conversion through the requested external open/import step. | Revision, interchange file, warnings and external import outcome. |
@@ -125,33 +169,55 @@ Read `get_editor_state` and page `list_stills` at that revision. Source rows car
 
 ## Tool sequences for common requests
 
-Use these sequences with the tool names and argument schemas advertised by the installed helper. Values such as project handles, occurrence IDs, group angle IDs and revisions come from prior results.
+Use these sequences with the tool names and argument schemas advertised by the installed helper. Open a saved edit by passing its absolute `project_path` to `project_open`. Pass the returned `project_handle` on subsequent calls to that window. Resolve occurrence IDs, group angle IDs and revisions from live state.
 
 | Workflow | Calls and inputs |
 | --- | --- |
-| Start a sequence and review a clip | Call `new_project` with a fresh `operationID` and absolute media `paths`, then read `get_editor_state`. For an existing window, use `add_media` with its handle and revision. Use `seek` with `space: "sequence"` and rational `time`, then `set_playback` with `playing: true` or `false`. |
-| Recover, apply CSV and save | `list_drafts` → `recover_project` with the returned `path` → `get_editor_state` → `sequence_control` with `action: "applyCSV"`, `occurrence` ID and absolute CSV `path` → `save_project` with the updated revision and a new absolute `.cut` path. |
-| Work with multicam | `new_project` with `kind: "multicam"` and media paths → `get_multicam_setup` → `multicam_setup` with `action: "confirm"` and the desired opening source ID in `opening`. In an existing project, use `get_multicam` with `section: "sources"`. Pass the source ID as `angle` or the displayed `number` to `set_camera_at`, with a group `time`. Read `get_editor_state` for current assembly indices before calling `multicam_assembly`. |
-| Remove or queue pauses | `configure_silence` → `scan_analysis` with `kind: "silence"` → poll the analysis receipt → `list_pauses`. Use a returned `pause` ID with `review_pause` to preview or protect it. `apply_pauses` uses `mode: "queue"` to enqueue or `"shorten"` to edit. Check `get_export_queue` or `get_history`. |
-| Inspect pictures | `scan_analysis` with `kind: "scenes"` scans all sources by default. For one clip or camera, add `scope: "selected"` and its stable ID in `target`. Poll the receipt and read `list_scenes` with the `source` or sequence `clip` ID. Use `export_review_frames` with `selection: "scenes"` and a new directory in `output` for the active picture source. Poll `live_job_status` for JPEGs and the manifest. |
-| Check for changed recordings | Call `refresh_project_media` with the project revision and a fresh `operationID`. Poll the analysis receipt for changes and read `analysis_state` for sources that need review. For a saved project, use `file_refresh` and poll the file job. |
-| Preflight and export | `render_project` with the live handle, revision, operation ID, mode, absolute output path and `dryRun: true`. Read the terminal job’s `result.eligible` and plan or reason. For an authorized export, send a new operation ID with `dryRun: false`. Confirm the completed job’s `outputs`. |
-| Remux without re-encoding | For a live project, use `render_project` with `mode: "copy"` and an output path ending in the desired extension. If preflight refuses, inspect `result.alternatives` for a `copyOtherContainer` rung. Retry with its mode, a fresh path ending in its container extension and a new operation ID. For saved projects or file edits, use `file_export` with `mode: "copy"` and `dry_run: true`. Read `result` from `file_job_status` for the CLI plan or `result.error.alternatives` for a refusal. |
-| Choose monitoring and layout | `get_presentation` → `set_presentation` with an action such as `"fit"`, then `set_video_monitor` with `visible: true`. Read shared values with `get_preferences`. A `set_preference` change to `volume` applies across the app. |
-| Inspect saved media and deliver files | `file_inspect` with a fresh UUID in `operationID`, absolute `file` and `detail: "audio_packets"`. Follow the file job, then query `file_waveform` with the absolute stream index. Use `file_export` or `file_bulk` for specified saved inputs. |
-| Send a timeline to another editor | `convert_live_project` or `send_live_to_resolve` → `live_job_status`. Report warnings, outputs and whether external import was requested and succeeded. Native Resolve, Premiere and Final Cut workflows require the host apps and their documented integrations. [Interchange requirements](../README.md#convert-projects) |
-| Undo or restore a specific edit | `get_history` → `restore_history` with a fresh operation ID, current revision, returned `historyToken` and desired `index`. Index zero precedes the first retained action. For one step use `undo` or `redo`. Read back the cursor. |
+| Start a sequence and review a clip | Call `project_create` with a fresh `operation_id` and absolute media `paths`, then read `project_editor_state_read`. Use `timeline_playhead_seek` with `space: "sequence"` and a rational `time`. Start playback with `playback_transport_play` and stop with `playback_transport_pause`. |
+| Recover, apply CSV and save | List drafts with `project_drafts_list`. Pass the returned `draft_path` to `project_draft_recover`, then find the target occurrence in `project_editor_state_read`. Call `sequence_clip_edit` with `action: "apply_csv"`, the occurrence ID and absolute CSV path. Call `project_save` with the `project_handle`, new revision and destination `project_path`. |
+| Save or assemble source ranges | Read `source_selects_list`, then use `source_select_save` to retain a named source range. Supply absolute source ranges or saved select IDs in order to `sequence_source_ranges_apply`. Use equal sequence bounds to insert or distinct bounds to replace. |
+| Work with multicam | Call `project_create` with `kind: "multicam"` and media paths. Read `multicam_setup_read`, then call `multicam_setup_confirm` with the desired opening source ID in `opening`. In an existing project, use `multicam_state_read` with `section: "sources"`. Pass the source ID as `angle_id` or its displayed `camera_number` to `multicam_camera_take` with `group_time`. Read current assembly indices before calling `multicam_assembly_edit`. |
+| Align sources or assess a switch | Use `multicam_sync_suggest` for candidate offsets and drift evidence. To check a proposed take, read the `switch_coverage` section of `multicam_state_read` with the angle and group time. Inspect both picture and routed audio through the next switch. |
+| Change the picture on one replay | Read the assembly occurrences and call `multicam_assembly_edit` with `action: "angle_set"`, the occurrence index and the target angle. Use `angle_clear` to return that occurrence to the group switches. |
+| Remove or queue pauses | Choose the track with `silence_editor_track_select` and set its threshold with `silence_editor_threshold_set` as needed. Start `silence_editor_scan`, poll `analysis_job_status_read`, then read `silence_editor_pauses_list`. Use a returned pause ID with `silence_editor_pause_review` to preview or protect it. Choose `silence_editor_takes_queue` to queue retained takes or `silence_editor_pauses_shorten` to edit the timeline. |
+| Inspect pictures | Call `scenes_editor_scan` to scan all sources. For one source, add `scope: "selected"` and its stable ID in `target`. Poll the receipt and read `scenes_editor_boundaries_list` with the source or clip ID. Use `review_editor_frames_export` with `selection: "scenes"` and a new directory in `output`. Poll `export_editor_job_status_read` for JPEGs and the manifest. |
+| Check for changed recordings | Call `project_editor_media_refresh` with the project revision and a fresh `operation_id`. Poll the analysis receipt for changes and read `analysis_editor_state_read` for sources that need review. For a saved project, use `project_file_media_refresh` and poll the file job. |
+| Preflight and export | Call `export_editor_project_plan` with the handle, revision, operation ID, mode and absolute output path. Poll `export_editor_job_status_read` and inspect eligibility and the plan. To produce the requested movie, call `export_editor_project_render` with a fresh operation ID and check its completed outputs. |
+| Inspect or revise a queued excerpt | Read `export_queue_list` and inspect the entry’s captured items. Use `export_queue_entry_rename` to change its name. To revise the contents, set new marks and call `export_queue_entry_revise` in replace or extend mode. Verify the returned capture before rendering. |
+| Remux without re-encoding | Plan the live edit with `export_editor_project_plan`, `mode: "copy"` and the desired output extension. Inspect any offered alternative containers and preflight the chosen one. For a saved project, use `export_file_project_render` with `dry_run: true`. For a list of file clips, use `export_file_clips_join` with the same copy and dry-run settings. Read the result or refusal through `file_job_status_read`. |
+| Choose monitoring and layout | Read `workspace_layout_read`, then fit the timeline with `workspace_layout_set` and `action: "fit"`. Use `playback_monitor_visibility_set` with `visible: true` to show the monitor. Read `preferences_read` before changing app-wide preview volume with `preferences_set`, `key: "playback_preview_volume_fraction"` and a numeric `value` from 0 to 1. |
+| Inspect saved media and deliver files | `media_file_inspect` with a fresh UUID in `operation_id`, absolute `file` and `detail: "audio_packets"`. Follow the file job, then query `waveform_file_envelope_read` with the absolute stream index. Use `export_file_clips_join` or `export_file_ranges_separate` for specified saved inputs. |
+| Send a timeline to another editor | Call `project_editor_convert` to write the requested project format. For Resolve, choose `project_editor_resolve_export` to write interchange or `project_editor_resolve_import` to also import it. Poll `export_editor_job_status_read` and report warnings, paths and any import result. [Interchange requirements](../README.md#convert-projects) |
+| Undo or restore a specific edit | `history_read` → `history_state_restore` with a fresh operation ID, current revision, returned `history_token` and desired `index`. Index zero precedes the first retained action. For one step use `history_undo` or `history_redo`. Read back the cursor. |
 
-For a silence threshold on one sequence source, pass its `source` ID to `configure_silence`. Omitting it uses the source at the playhead. To calibrate from room tone, mark a quiet interval on the sequence, group or assembly clock, then call `use_room_tone`. Multicam protection follows the selected group pause across repeated uses. To queue or shorten pauses in just one replay, select that interval on the assembly clock before calling `list_pauses` or `apply_pauses`. Group marks include every replay of the marked interval.
+To treat a click lasting up to 300 ms between quiet stretches as part of one pause, call `preferences_set` with `key: "silence_max_blip_seconds"`, `value: 0.30` and a fresh `operation_id`. Set `value: 0` to split at every interruption. A separate `preferences_set` with `key: "silence_padding_per_side_seconds"` controls how much quiet audio to keep on each side of a cut. Sequence and multicam editors share both settings. Read them back with `preferences_read`.
+
+For example, these are the `tools/call` parameters for the 300 ms blip setting. Generate a new UUID when issuing your own operation.
+
+```json
+{
+  "name": "preferences_set",
+  "arguments": {
+    "operation_id": "beac5b8a-5c99-4bc1-9152-d63d21b9fe31",
+    "key": "silence_max_blip_seconds",
+    "value": 0.30
+  }
+}
+```
+
+To set the threshold for one sequence source, pass its `source` ID and `silence_threshold_db` to `silence_editor_threshold_set`. Omitting the ID uses the source at the playhead. To measure room tone, mark a quiet interval on the sequence, group or assembly clock and call `silence_threshold_calibrate_from_marks`. Multicam protection follows a group pause across replays. To queue or shorten pauses in one replay, select the interval on the assembly clock first. Group marks include every replay of the marked interval.
+
+Set a detected pause’s retained duration with `silence_editor_pause_review` and `action: "set_retained"`. Read back the requested and aligned duration. To correct missed take boundaries, use `silence_editor_take_boundary_edit` and inspect `silence_editor_take_candidates_list` before queueing. To audition an existing join, use `timeline_editor_join_preview` with the sequence clip or multicam assembly occurrence immediately after it, or with the group switch time.
 
 ### Follow work through completion
 
-- A job-based live output tool returns `job`, `state` and `inputRevision`. Poll `live_job_status` with the project handle and `job` until `succeeded`, `failed` or `cancelled`. Report published `outputs` and the terminal `result` or `error`. To stop, use `cancel_live_job` and observe the final state. Applying reviewed cuts and replacing live audio return their edit outcomes directly.
-- A file tool returns `job_id`. Poll `file_job_status` until `succeeded`, `failed` or `cancelled`. Read the CLI’s inline `result` or `output_text` when present. For a large result, call `file_job_result` from offset zero, decode each `base64` page, advance to `next_offset` until `done`, and concatenate the bytes before parsing. Receipts are retained for ten minutes after completion. `file_job_cancel` requests cancellation. An export may already have published files.
-- A native scan, sidecar save or media refresh returns `job`, `inputRevision`, `kind` and `status`. Poll `analysis_job_status` with the project handle and job ID. On a shared scene worker, `analysis_job_cancel` releases your receipt while other subscribers keep scanning. The final subscriber waits for checkpoint results. Read `coverage` for confirmed and durable positions, and inspect saved sections with `file_sidecar` and `status: true`.
-- Use `get_native_operations` for an existing GUI import, export, multicam operation or conversion. To cancel a specific native operation at the editor’s request, pass its `nativeOperation` and a fresh `operationID` to `cancel_native_operation`. Supply the same project scope used for the lookup.
+- A job-based live output tool returns `job_id`, `state` and `input_revision`. Poll `export_editor_job_status_read` with the project handle and `job_id` until `succeeded`, `failed` or `cancelled`. Report published `outputs` and the terminal `result` or `error`. To stop, use `export_editor_job_cancel` and observe the final state. Applying reviewed cuts and replacing live audio return their edit outcomes directly.
+- For an export with a cut map, read `cut_map.occurrences` from the completed plan or render. Use its occurrence and clock fields to distinguish individual uses and the render segments that contain them.
+- A file tool returns `job_id`. Poll `file_job_status_read` until `succeeded`, `failed` or `cancelled`. Read the CLI’s inline `result` or `output_text` when present. For a large result, call `file_job_result_read` from offset zero, decode each `base64` page, advance to `next_offset` until `done`, and concatenate the bytes before parsing. Receipts are retained for ten minutes after completion. `file_job_cancel` requests cancellation. An export may already have published files.
+- A native scan, sidecar save or media refresh returns `job_id`, `input_revision`, `kind` and `status`. Poll `analysis_job_status_read` with the project handle and job ID. On a shared scene worker, `analysis_job_cancel` releases your receipt while other subscribers keep scanning. The final subscriber waits for checkpoint results. Read `coverage` for confirmed and durable positions, and inspect saved sections with `analysis_file_sidecar_inspect`.
+- Use `project_operations_list` for an existing GUI import, export, multicam operation or conversion. To cancel a specific native operation at the editor’s request, pass its `native_operation_id` and a fresh `operation_id` to `project_operation_cancel`. Supply the same project scope used for the lookup.
 
-For file operations use absolute paths and explicit sidecar and dry-run options as needed. Live output tools use camelCase options such as `dryRun`. File tools mirror CLI terms such as `dry_run`. Use each tool’s advertised field names. [Tool reference](MCP-REFERENCE.md)
+Use absolute paths for file operations. Read each tool’s schema for its sidecar options and output settings. [Tool reference](MCP-REFERENCE.md)
 
 ## Recovery
 
@@ -159,10 +225,11 @@ For file operations use absolute paths and explicit sidecar and dry-run options 
 | --- | --- |
 | Tools appear, but the app is unavailable | Check the app instance and its local-control setting. If the user disabled control, return control to them. |
 | Project disappeared or a handle expired | List projects again. Re-establish the intended document before applying any edit. |
+| A transcript edit plan is stale | Refresh the timeline and transcript revisions, resolve the intended occurrences and review a new plan with `transcript_editor_edit_plan` before applying it. |
 | A person edited while the agent was planning | Read the new revision and locate the original occurrence and interval. Proceed if the requested edit is still unambiguous. |
 | An edit reply was lost or MPCut reports `outcome_unknown` | Replay the identical operation ID and arguments within ten minutes of completion while the same document and enabled app session remain valid. A replay can describe a cut the editor has since undone. After expiry, a relaunch or a change to the local-control setting, inspect timeline and history before retrying. |
-| A successful close reply was lost | Replay the same `close_project` request within the retry window. The result uses the closed document’s original handle, even if a new window now has its file open. |
-| MPCut reports `response_too_large` | For reads, narrow the time window or page size where the tool supports it. Retrieve file results with `file_job_result`. For an edit, check current timeline state and history for its outcome before submitting further edits. |
+| A successful close reply was lost | Replay the same `project_close` request within the retry window. The result uses the closed document’s original handle, even if a new window now has its file open. |
+| MPCut reports `response_too_large` | For reads, narrow the time window or page size where the tool supports it. Retrieve file results with `file_job_result_read`. For an edit, check current timeline state and history for its outcome before submitting further edits. |
 | MPCut reports `stale_revision` or `stale_history` | Read the current timeline and retained history. Use new references and a fresh operation ID after resolving the intended edit again. |
 | An operation ID already belongs to another request | For `operation_conflict` or `operation_id_conflict`, inspect the previous outcome. Supply a fresh UUID for each distinct request. |
 | The app is indexing, busy or displaying a modal panel | Inspect job and window state. Wait for the relevant job or surface the specific interaction the editor needs to complete. |
@@ -181,11 +248,4 @@ go test -C mcp ./integration -v -count=1 -args -bundle="/absolute/path/to/MPCut.
 
 The fixture provides executable examples for a two-window split, a repeated request, stale revision recovery, an unsaved interchange snapshot, inline JPEG review, and file jobs with both dry-run and published results. The native fixtures exercise cancellation and partial outputs. [Verification by workflow](MCP-COVERAGE.md)
 
-## Maintain the documentation
-
-Update `Sources/MPCutApp/MCPResources/` when a tool’s inputs change. Maintain the result and action descriptions in `scripts/mcp-reference.py`, run `python3 scripts/mcp-reference.py`, then verify the generated reference with `python3 scripts/mcp-reference.py --check`. For each implemented capability, publish the following materials alongside the feature.
-
-1. **Human setup guide.** Document app and helper versions, supported hosts and protocol revisions, exact configuration for each tested host, install paths, Settings behavior, a first connection test and how to disconnect. Record the host and build used to verify each example.
-2. **Agent instructions and tool reference.** Keep the instruction block concise. Derive the reference from registered schemas. For every tool document scope, parameters, units and coordinate space, defaults, dynamic choices, prerequisites, side effects, history/dirty/save behavior, cancellation, retries, outputs and recovery codes. Include each capability’s availability in the installed version.
-3. **Executable examples.** Capture sanitized request/result pairs against fixtures. Include a successful edit, a no-op, a stale revision, a lost reply, a partial export, and two windows with changing focus. Use handles returned by earlier calls. Give each operation family in the matrix at least one runnable example, and each conditional variant a documented input and expected result.
-4. **Publication and maintenance.** Link the guide from Usage and release notes, include it in the app’s existing offline documentation bundle, and expose version-matched help to connected agents. Compare reference entries against runtime discovery on release; run the recipes from a clean host configuration and check links in the packaged guide. Mark tested hosts and workflows with their actual results.
+The tool reference is generated from `Sources/MPCutApp/MCPResources/` and the result descriptions in `scripts/mcp-reference.py`. Run `python3 scripts/mcp-reference.py --check` to compare the reference with those sources.

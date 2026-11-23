@@ -20,12 +20,16 @@ struct StillVideoGenerator {
         try verifyHelper(ReencodeEngine.findHelper(override: nil), settings: settings, schedule: schedule)
     }
 
-    func generate(asset: URL, framing: StillImageFraming, reference: StreamInfo, container: String,
+    func generate(asset: URL, identity: SourceIdentity, framing: StillImageFraming, reference: StreamInfo, container: String,
                   schedule: StillSampleSchedule, output: URL) throws -> MediaInfo {
+        let engine = CutEngine(cancelled: { Task.isCancelled || cancelled?() == true })
+        try engine.checkCancellation()
+        try engine.verifyIdentity(asset, identity: identity)
         let settings = try Encoding(reference, container: container, policy: colorPolicy, standalone: standalone)
         try check(schedule, settings: settings)
         let helper = try ReencodeEngine.findHelper(override: nil)
-        let parameters = CacheParameters(framing: framing, configuration: reference.configuration, schedule: schedule,
+        let parameters = CacheParameters(framing: framing, width: settings.width, height: settings.height,
+                                         configuration: reference.configuration, schedule: schedule,
                                          arguments: settings.outputArguments, packetFilters: settings.packetFilters,
                                          colorPolicy: colorPolicy, libraries: helperLibraries(helper),
                                          operatingSystem: ProcessInfo.processInfo.operatingSystemVersionString)
@@ -34,21 +38,24 @@ struct StillVideoGenerator {
         return try StillSegmentCache.shared.withSegment(
             key: key, outputExtension: container, cancelled: cancelled ?? { false },
             generate: {
-                try encode(asset: asset, framing: framing, helper: helper, settings: settings, schedule: schedule, output: $0)
+                try encode(asset: asset, identity: identity, framing: framing, helper: helper, settings: settings, schedule: schedule, output: $0)
             }, validate: {
                 _ = try validate($0, settings: settings, schedule: schedule)
             }, use: {
+                // A cache hit skips encode(), which otherwise checks the planned
+                // image generation before reading any pixels.
+                try engine.verifyIdentity(asset, identity: identity)
                 try FileManager.default.copyItem(at: $0, to: output)
                 return try validate(output, settings: settings, schedule: schedule)
             })
     }
 
-    func generateLossless(asset: URL, framing: StillImageFraming, reference: StreamInfo,
+    func generateLossless(asset: URL, identity: SourceIdentity, framing: StillImageFraming, reference: StreamInfo,
                           schedule: StillSampleSchedule, output: URL) throws -> MediaInfo {
         let settings = try Encoding(reference, container: "mov", lossless: true,
                                     sampleTimescale: schedule.exactTimescale(), policy: colorPolicy)
         try check(schedule, settings: settings)
-        try encode(asset: asset, framing: framing, helper: ReencodeEngine.findHelper(override: nil),
+        try encode(asset: asset, identity: identity, framing: framing, helper: ReencodeEngine.findHelper(override: nil),
                    settings: settings, schedule: schedule, output: output)
         return try validate(output, settings: settings, schedule: schedule)
     }
@@ -62,22 +69,21 @@ struct StillVideoGenerator {
         return RationalTime(numerator: max(1, timescale / 30), denominator: timescale)
     }
 
-    private func encode(asset: URL, framing: StillImageFraming, helper: URL, settings: Encoding,
+    private func encode(asset: URL, identity: SourceIdentity, framing: StillImageFraming, helper: URL, settings: Encoding,
                         schedule: StillSampleSchedule, output: URL) throws {
         let runner = ReencodeEngine(cancelled: cancelled)
         try runner.checkCancellation()
-        let identity = try SourceIdentity(asset)
         let directory = output.deletingLastPathComponent()
         let input = directory.appendingPathComponent("still-\(UUID().uuidString).rgb48")
         defer { try? FileManager.default.removeItem(at: input) }
-        let pixels = try StillImage.render(asset, canvas: settings.canvas, framing: framing, cancelled: cancelled).rgb48LE()
+        let pixels = try StillImage.render(asset, canvas: settings.canvas, framing: framing, expectedIdentity: identity, cancelled: cancelled).rgb48LE()
         try runner.checkCancellation()
         try pixels.write(to: input, options: .withoutOverwriting)
         try run(helper, settings: settings, schedule: schedule, output: output, input: [
             "-f", "rawvideo", "-pixel_format", "rgb48le", "-video_size", "\(settings.width)x\(settings.height)",
             "-framerate", frameRate(stagingCadence(for: schedule, timescale: settings.timescale)), "-i", input.path
         ])
-        guard (try? SourceIdentity(asset)) == identity else {
+        guard identity.isCurrentSnapshot(at: asset) else {
             throw CutError(code: "source_changed", message: "The still image changed while generating its video.")
         }
     }
@@ -105,7 +111,8 @@ struct StillVideoGenerator {
         let arguments = ["-f", "lavfi", "-i",
                          "testsrc=size=\(settings.width)x\(settings.height):rate=\(frameRate(cadence))"]
         let key = Capability.Key(helper: helper, identity: identity,
-                                 args: arguments + settings.outputArguments, runs: template.runs)
+                                 args: arguments + settings.outputArguments, packetFilters: settings.packetFilters,
+                                 runs: template.runs)
         guard !Capability.shared.contains(key) else { return }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mpcut-still-check-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
@@ -143,10 +150,11 @@ struct StillVideoGenerator {
         }
         var position = RationalTime.zero
         var index = 0
+        let engine = CutEngine(cancelled: { Task.isCancelled || cancelled?() == true })
         for run in schedule.runs {
             for _ in 0..<run.count {
-                if index.isMultiple(of: 1_024), cancelled?() == true {
-                    throw CutError(code: "cancelled", message: "The operation was cancelled.")
+                if index.isMultiple(of: 1_024) {
+                    try engine.checkCancellation()
                 }
                 let frame = media.frames[index]
                 guard frame.time == position, frame.dts == position, frame.duration == run.duration else {
@@ -178,8 +186,10 @@ struct StillVideoGenerator {
     }
 
     private struct CacheParameters: Encodable {
-        let policyVersion = 3
+        let policyVersion = 4
         let framing: StillImageFraming
+        let width: Int
+        let height: Int
         let configuration: Data
         let schedule: StillSampleSchedule
         let arguments: [String]
@@ -194,6 +204,7 @@ struct StillVideoGenerator {
             let helper: URL
             let identity: SourceIdentity
             let args: [String]
+            let packetFilters: [String]
             let runs: [StillSampleSchedule.Run]
         }
         static let shared = Capability()

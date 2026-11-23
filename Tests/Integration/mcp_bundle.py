@@ -7,14 +7,22 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "docs"))
+from mcp_walkthrough import Client
+
 PROTOCOL_VERSION = "2026-07-28"
-DOCUMENTATION = {"agent-guide": "MCP-AGENT-GUIDE.md", "tool-reference": "MCP-REFERENCE.md"}
+DOCUMENTATION = {"agent-guide": "MCP-AGENT-GUIDE.md", "tool-reference": "MCP-REFERENCE.md", "headless": "HEADLESS.md"}
 
 
 def check_bundle(app):
+    if not __debug__:
+        raise SystemExit("MPCut bundle verification requires Python assertions. Run without -O or PYTHONOPTIMIZE.")
+
     contents = app / "Contents"
     resources = contents / "Resources"
     with (contents / "Info.plist").open("rb") as info_file:
@@ -32,7 +40,7 @@ def check_bundle(app):
         for tool in json.loads(descriptor):
             assert tool["name"] not in expected, tool["name"]
             expected[tool["name"]] = tool
-    assert {"list_projects", "get_editor_state", "split_at"} <= expected.keys()
+    assert {"project_windows_list", "project_editor_state_read", "timeline_item_split"} <= expected.keys()
 
     for name in ("Go-LICENSE", "Go-PATENTS", "github.com/modelcontextprotocol/go-sdk/LICENSE"):
         assert (resources / "MCPNotices" / name).stat().st_size > 0, name
@@ -90,7 +98,7 @@ def check_bundle(app):
                     else:
                         assert actual == value, (name, key)
 
-            invalid = call("tools/call", name="get_editor_state", arguments={})
+            invalid = call("tools/call", name="project_editor_state_read", arguments={})
             assert invalid["isError"], invalid
             discover = call("server/discover")
             assert PROTOCOL_VERSION in discover["supportedVersions"], discover
@@ -112,7 +120,18 @@ def check_bundle(app):
                 process.wait()
                 raise
         assert process.returncode == 0, process.returncode
-    print(f"Verified MPCut {version}, {len(expected)} packaged tools and both offline documentation resources.")
+        # Exercise bundle-relative lookup for both child processes before publication.
+        client = Client(contents / "Helpers" / "mpcut-mcp", "--files-only", env=environment)
+        try:
+            job = client.call("cli_version_read", operation_id=str(uuid.uuid4()))
+            while job["state"] in ("running", "cancelling"):
+                time.sleep(0.05)
+                job = client.call("file_job_status_read", job_id=job["job_id"])
+            assert job["state"] == "succeeded" and job["result"]["version"] == version, job
+        finally:
+            client.close()
+        assert client.process.returncode == 0, client.process.returncode
+    print(f"Verified MPCut {version}, {len(expected)} packaged tools and {len(DOCUMENTATION)} offline documentation resources.")
 
 
 def time_limit(_signal, _frame):

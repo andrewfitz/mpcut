@@ -1,6 +1,6 @@
 import Foundation
 
-public struct DetectedScene: Encodable, Sendable {
+public struct DetectedScene: Codable, Sendable {
     public let number: Int
     public let startPTS: Int64
     public let start: RationalTime
@@ -8,13 +8,25 @@ public struct DetectedScene: Encodable, Sendable {
     public let end: RationalTime
     public let view: Int
     public let viewLabel: String
+
+    private enum CodingKeys: String, CodingKey {
+        case number, start, end, view
+        case startPTS = "start_pts"
+        case startSeconds = "start_seconds"
+        case viewLabel = "view_label"
+    }
 }
 
-public struct SceneView: Encodable, Sendable {
+public struct SceneView: Codable, Sendable {
     public let view: Int
     public let label: String
     public let sceneNumbers: [Int]
     public let name: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case view, label, name
+        case sceneNumbers = "scene_numbers"
+    }
 
     init(view: Int, label: String, sceneNumbers: [Int], name: String? = nil) {
         self.view = view
@@ -35,10 +47,24 @@ public struct SceneView: Encodable, Sendable {
     }
 }
 
-public struct SceneSourceStamp: Codable, Equatable, Sendable {
+public struct SceneSourceStamp: Codable, Hashable, Sendable {
     public let bytes: Int64
     public let modifiedSeconds: Int
     public let modifiedNanoseconds: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case bytes
+        case modifiedSeconds = "modified_seconds"
+        case modifiedNanoseconds = "modified_nanoseconds"
+    }
+
+    public init(from decoder: Decoder) throws {
+        try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_source_stamp")
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        bytes = try fields.decode(Int64.self, forKey: .bytes)
+        modifiedSeconds = try fields.decode(Int.self, forKey: .modifiedSeconds)
+        modifiedNanoseconds = try fields.decode(Int.self, forKey: .modifiedNanoseconds)
+    }
 
     public init(media: MediaInfo) {
         self.init(identity: media.identity)
@@ -51,8 +77,8 @@ public struct SceneSourceStamp: Codable, Equatable, Sendable {
     }
 }
 
-public struct SceneReport: Encodable, Sendable {
-    public let ok = true
+public struct SceneReport: Codable, Sendable {
+    public var ok: Bool { true }
     public let file: String
     public let sourceStamp: SceneSourceStamp
     public let timeBase: RationalTime
@@ -64,7 +90,10 @@ public struct SceneReport: Encodable, Sendable {
     package var syntheticLeading: Bool = false
 
     private enum CodingKeys: String, CodingKey {
-        case ok, file, sourceStamp, timeBase, origin, duration, scenes, viewCount, views
+        case ok, file, origin, duration, scenes, views
+        case sourceStamp = "source_stamp"
+        case timeBase = "time_base"
+        case viewCount = "view_count"
     }
 
     func forSource(_ url: URL) -> SceneReport {
@@ -80,6 +109,33 @@ public struct SceneReport: Encodable, Sendable {
         let existing = views[index]
         views[index] = SceneView(view: existing.view, label: existing.label,
                                  sceneNumbers: existing.sceneNumbers, name: name)
+    }
+}
+
+extension SceneReport {
+    public init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(file: try fields.decode(String.self, forKey: .file),
+                  sourceStamp: try fields.decode(SceneSourceStamp.self, forKey: .sourceStamp),
+                  timeBase: try fields.decode(RationalTime.self, forKey: .timeBase),
+                  origin: try fields.decode(RationalTime.self, forKey: .origin),
+                  duration: try fields.decode(RationalTime.self, forKey: .duration),
+                  scenes: try fields.decode([DetectedScene].self, forKey: .scenes),
+                  viewCount: try fields.decode(Int.self, forKey: .viewCount),
+                  views: try fields.decode([SceneView].self, forKey: .views))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var fields = encoder.container(keyedBy: CodingKeys.self)
+        try fields.encode(ok, forKey: .ok)
+        try fields.encode(file, forKey: .file)
+        try fields.encode(sourceStamp, forKey: .sourceStamp)
+        try fields.encode(timeBase, forKey: .timeBase)
+        try fields.encode(origin, forKey: .origin)
+        try fields.encode(duration, forKey: .duration)
+        try fields.encode(scenes, forKey: .scenes)
+        try fields.encode(viewCount, forKey: .viewCount)
+        try fields.encode(views, forKey: .views)
     }
 }
 

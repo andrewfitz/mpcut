@@ -32,7 +32,7 @@ extension CutProject {
         case .multicam(let project):
             for (index, item) in (project.assemblyItems ?? []).enumerated() {
                 switch item {
-                case .group(let range): try advance(index, range.to.subtracting(range.from))
+                case .group(let range, _): try advance(index, range.to.subtracting(range.from))
                 case .still(let insert): try advance(index, insert.duration, insert: insert)
                 }
             }
@@ -41,13 +41,16 @@ extension CutProject {
     }
 
     func mcpStillList(location: URL?, offset: Int, limit: Int) throws -> [String: Any] {
+        guard offset >= 0, (1...200).contains(limit) else {
+            throw MCPCommandError("invalid_arguments", "Use a nonnegative offset and a limit from 1 through 200.")
+        }
         let inserts = stillInserts
         let replacements = stillReplacements
         let placements = inserts.count + replacements.count
         let first = min(offset, placements)
         let last = first + min(limit, placements - first)
         var result: [String: Any] = ["items": [[String: Any]](), "offset": offset, "total": placements]
-        if let policy = programColorPolicy { result["programColorPolicy"] = try mcpStillJSON(policy) }
+        if let policy = programColorPolicy { result["program_color_policy"] = try mcpStillJSON(policy) }
         guard first < last else { return result }
         let visible = Dictionary(grouping: try resolveStills().spans.compactMap { span in
             span.placementID.map { ($0, span.output) }
@@ -62,14 +65,19 @@ extension CutProject {
             let ranges = visible[id, default: []].map { $0.1 }
             let duration = try ranges.reduce(RationalTime.zero) { sum, range in try sum.adding(range.to.subtracting(range.from)) }
             var row: [String: Any] = ["placement": id, "asset": assetID, "operation": operation, "clock": clock,
-                                      "framing": try mcpStillJSON(framing), "visibleDuration": duration.description,
-                                      "visibleRanges": ranges.map { ["from": $0.from.description, "to": $0.to.description] },
-                                      "visibleClock": multicam ? "assembly" : "sequence"]
+                                      "framing": try mcpStillJSON(framing), "visible_duration": duration.description,
+                                      "visible_ranges": ranges.map { ["from": $0.from.description, "to": $0.to.description] },
+                                      "visible_clock": multicam ? "assembly" : "sequence"]
             if let asset = assets[assetID] {
-                let path = CutProject.mediaURL(asset.file, relativeTo: location ?? URL(fileURLWithPath: "/Untitled.cut")).path
-                row["path"] = path
                 row["name"] = asset.displayName
-                row["offline"] = !FileManager.default.isReadableFile(atPath: path)
+                if asset.isGap {
+                    row["kind"] = "gap"
+                    row["offline"] = false
+                } else {
+                    let path = CutProject.mediaURL(asset.file, relativeTo: location ?? URL(fileURLWithPath: "/Untitled.cut")).path
+                    row["path"] = path
+                    row["offline"] = !FileManager.default.isReadableFile(atPath: path)
+                }
             }
             return row
         }
@@ -82,8 +90,8 @@ extension CutProject {
                 row["duration"] = insert.duration.description
                 row["cadence"] = insert.cadence.description
                 if let occurrence = insertsByID[insert.id] {
-                    row["authoredFrom"] = occurrence.from.description
-                    row["authoredTo"] = occurrence.to.description
+                    row["authored_from"] = occurrence.from.description
+                    row["authored_to"] = occurrence.to.description
                     if multicam { row["occurrence"] = occurrence.index } else { row["occurrence"] = insert.id }
                 }
                 return row
@@ -93,12 +101,12 @@ extension CutProject {
                                clock: multicam ? "group" : "source", framing: replacement.framing)
             switch replacement.coverage {
             case .group(let range):
-                row["authoredFrom"] = range.from.description
-                row["authoredTo"] = range.to.description
+                row["authored_from"] = range.from.description
+                row["authored_to"] = range.to.description
             case .sequence(let fragments):
                 row["fragments"] = fragments.enumerated().map { index, fragment in
-                    ["index": index, "documentID": fragment.clipID, "sourceFrom": fragment.range.from.description,
-                     "sourceTo": fragment.range.to.description] as [String: Any]
+                    ["index": index, "document_id": fragment.clipID, "source_from": fragment.range.from.description,
+                     "source_to": fragment.range.to.description] as [String: Any]
                 }
             }
             return row
@@ -108,7 +116,7 @@ extension CutProject {
 }
 
 private func mcpStillJSON(_ value: some Encodable) throws -> Any {
-    try JSONSerialization.jsonObject(with: JSONEncoder().encode(value))
+    try JSONSerialization.jsonObject(with: MCPSchemas.encodeResult(value))
 }
 
 extension ProjectSession {
@@ -166,8 +174,8 @@ extension ProjectSession {
                                      "space": isMulticam ? "assembly" : "sequence",
                                      "left": isMulticam ? card.index as Any : card.insert.id,
                                      "right": isMulticam ? right.index as Any : right.insert.id,
-                                     "leftPlacement": card.insert.id, "rightPlacement": right.insert.id,
-                                     "historyRetained": mcpRevision != revision && (isMulticam ? multicam.preferences.historyLimit : editor.mcpHistoryLimit) > 0]
+                                     "left_placement": card.insert.id, "right_placement": right.insert.id,
+                                     "history_retained": mcpRevision != revision && (isMulticam ? multicam.preferences.historyLimit : editor.mcpHistoryLimit) > 0]
         return result
     }
 }
@@ -175,9 +183,9 @@ extension ProjectSession {
 extension ProjectSessions {
     func mcpStills(tool: String, arguments: [String: Any], session: ProjectSession,
                    checkAccess: @escaping @MainActor () throws -> Void) async throws -> [String: Any]? {
-        guard ["list_stills", "add_still", "update_still", "remove_still", "relink_still"].contains(tool) else { return nil }
+        guard ["still_editor_placements_list", "timeline_gap_insert", "still_editor_placement_insert", "still_editor_picture_replace", "still_editor_placement_update", "still_editor_placement_remove", "still_editor_asset_relink", "timeline_clips_space"].contains(tool) else { return nil }
         guard let project = session.mcpStillProject else { throw MCPCommandError("invalid_target", "Open a picture timeline.") }
-        if tool == "list_stills" {
+        if tool == "still_editor_placements_list" {
             return try project.mcpStillList(location: session.mcpStillLocation, offset: arguments["offset"] as? Int ?? 0,
                                            limit: arguments["limit"] as? Int ?? 50)
         }
@@ -188,8 +196,28 @@ extension ProjectSessions {
         var result: [String: Any] = [:]
         let action: String
         switch tool {
-        case "add_still":
-            let operation = try input.string("operation")
+        case "timeline_clips_space":
+            guard project.hasSpacingBoundaries else {
+                throw MCPCommandError("invalid_target", "Space Clips requires at least two clips or still pictures.")
+            }
+            let background = arguments["background"] as? String ?? "#000000"
+            let duration = try input.time("duration")
+            let suppliedCadence = try input.time("cadence")
+            // Removing gaps does not create frames and works without an inferred timeline cadence.
+            let cadence = suppliedCadence ?? (duration == .zero ? RationalTime(numerator: 1, denominator: 30)
+                : session.mcpDefaultStillCadence(at: .zero))
+            guard let cadence else {
+                throw input.invalid("Supply cadence as an exact frame interval for this timeline.")
+            }
+            if let duration {
+                candidate = try project.spacingClips(duration: duration, cadence: cadence, background: background)
+            } else {
+                candidate = try project.spacingClipsUsingSourceTiming(cadence: cadence, background: background,
+                                                                     relativeTo: session.mcpStillLocation)
+            }
+            action = "Space Clips"
+        case "timeline_gap_insert", "still_editor_placement_insert", "still_editor_picture_replace":
+            let operation = tool == "still_editor_picture_replace" ? "replace" : "insert"
             let space = try input.string("space")
             if operation == "insert" {
                 guard space == (session.isMulticam ? "assembly" : "sequence"), arguments["from"] == nil, arguments["to"] == nil else {
@@ -201,37 +229,43 @@ extension ProjectSessions {
                     throw input.invalid("Use group or sequence bounds for a replacement.")
                 }
             }
-            let image = try await input.image()
-            try checkAccess()
-            let existingAsset = candidate.stillAssets.first { asset in
+            let asset: StillAsset
+            if tool == "timeline_gap_insert" {
+                guard operation == "insert", arguments["path"] == nil else {
+                    throw input.invalid("A color gap requires an insert with no image path.")
+                }
+                asset = candidate.stillAssets.first(where: \.isGap) ?? StillAsset(gapID: UUID().uuidString)
+            } else {
+                let image = try await input.image()
                 let location = session.mcpStillLocation ?? URL(fileURLWithPath: "/Untitled.cut")
-                return asset.fingerprint == image.fingerprint && CutProject.mediaURL(asset.file, relativeTo: location) == image.url
+                asset = candidate.stillAssets.first {
+                    !$0.isGap && $0.fingerprint == image.fingerprint && CutProject.mediaURL($0.file, relativeTo: location) == image.url
+                } ?? StillAsset(id: UUID().uuidString, file: image.url.path,
+                                displayName: image.url.lastPathComponent, fingerprint: image.fingerprint)
             }
-            let assetID = existingAsset?.id ?? UUID().uuidString
+            try checkAccess()
+            let assetID = asset.id
             let placementID = UUID().uuidString
             let framing = try input.framing(existing: .fit)
-            if existingAsset == nil {
-                candidate = try candidate.addingStillAsset(.init(id: assetID, file: image.url.path,
-                                                                  displayName: image.url.lastPathComponent, fingerprint: image.fingerprint))
-            }
+            candidate = try candidate.addingStillAsset(asset)
             if operation == "insert" {
-                let at = try input.requiredTime("at")
+                let at = try session.mcpStillBoundary(input.requiredTime("at"), space: space)
                 let cadence = try input.time("cadence") ?? session.mcpDefaultStillCadence(at: at)
                 guard let cadence else { throw input.invalid("Supply cadence as an exact frame interval for this timeline.") }
                 let insert = StillInsert(id: placementID, assetID: assetID, duration: try input.requiredTime("duration"),
                                          cadence: cadence, framing: framing)
-                candidate = try candidate.insertingStill(insert, at: session.mcpStillBoundary(at, space: space))
-                action = "Insert Still"
+                candidate = try candidate.insertingStill(insert, at: at)
+                action = asset.isGap ? "Insert Color Gap" : "Insert Still"
             } else {
                 candidate = try session.mcpReplacePicture(in: candidate, id: placementID, asset: assetID, framing: framing,
                                                           from: input.requiredTime("from"), to: input.requiredTime("to"))
                 action = "Replace Picture"
             }
             result = ["placement": placementID, "asset": assetID]
-        case "update_still":
+        case "still_editor_placement_update":
             let id = try input.id("placement")
             if let insert = project.stillInserts.first(where: { $0.id == id }) {
-                guard ["from", "to", "clock", "fragmentIndex", "duplicateID", "detachID"].allSatisfy({ arguments[$0] == nil }) else {
+                guard ["from", "to", "clock", "fragment_index", "duplicate_id", "detach_id"].allSatisfy({ arguments[$0] == nil }) else {
                     throw input.invalid("Use at or duration to edit an insert.")
                 }
                 let asset = arguments["asset"] as? String ?? insert.assetID
@@ -250,9 +284,9 @@ extension ProjectSessions {
                 }
                 let framing = try input.framing(existing: replacement.framing)
                 let asset = arguments["asset"] as? String ?? replacement.assetID
-                let duplicate = arguments["duplicateID"] as? String
-                let detached = arguments["detachID"] as? String
-                if ["from", "to", "at", "fragmentIndex", "clock", "duplicateID", "detachID"].contains(where: { arguments[$0] != nil }) {
+                let duplicate = arguments["duplicate_id"] as? String
+                let detached = arguments["detach_id"] as? String
+                if ["from", "to", "at", "fragment_index", "clock", "duplicate_id", "detach_id"].contains(where: { arguments[$0] != nil }) {
                     let clock = arguments["clock"] as? String
                     func boundary(_ key: String) throws -> RationalTime? {
                         guard let time = try input.time(key) else { return nil }
@@ -265,7 +299,7 @@ extension ProjectSessions {
                         if !session.isMulticam { return try session.editor.stillBoundary(at: time.seconds) }
                         return time
                     }
-                    candidate = try candidate.editingStillReplacement(id: id, fragmentIndex: arguments["fragmentIndex"] as? Int,
+                    candidate = try candidate.editingStillReplacement(id: id, fragmentIndex: arguments["fragment_index"] as? Int,
                                                                      from: boundary("from"), to: boundary("to"), at: boundary("at"),
                                                                      clock: clock, duplicateID: duplicate, detachID: detached)
                     if !session.isMulticam {
@@ -274,7 +308,7 @@ extension ProjectSessions {
                 }
                 let target = detached ?? duplicate ?? id
                 candidate = try candidate.updatingStill(id: target, assetID: asset, framing: framing)
-                if target != id { result["originalPlacement"] = id }
+                if target != id { result["original_placement"] = id }
                 result["placement"] = target
                 result["asset"] = asset
             } else {
@@ -282,7 +316,7 @@ extension ProjectSessions {
             }
             if result["placement"] == nil { result["placement"] = id }
             action = "Update Still"
-        case "remove_still":
+        case "still_editor_placement_remove":
             let id = try input.id("placement")
             candidate = try project.removingStill(id: id)
             result["placement"] = id
@@ -303,7 +337,7 @@ extension ProjectSessions {
         if candidate != project { try session.mcpCommitStill(candidate, action: action) }
         result["action"] = action
         result["changed"] = session.mcpRevision != revision
-        result["historyRetained"] = session.mcpRevision != revision && preferences.historyLimit > 0
+        result["history_retained"] = session.mcpRevision != revision && preferences.historyLimit > 0
         if session.isMulticam, let notice = session.multicam.notice { result["warning"] = notice.message }
         return result
     }
@@ -334,8 +368,8 @@ private struct MCPStillInput {
     func framing(existing: StillImageFraming) throws -> StillImageFraming {
         var value = existing
         if let mode = fields["fit"] as? String { value.mode = mode == "fit" ? .fit : .fill }
-        if fields["clearCrop"] as? Bool == true {
-            guard fields["crop"] == nil else { throw invalid("Choose crop or clearCrop.") }
+        if fields["clear_crop"] as? Bool == true {
+            guard fields["crop"] == nil else { throw invalid("Choose crop or clear_crop.") }
             value.crop = nil
         }
         if let crop = fields["crop"] as? [String: Any] {
@@ -352,12 +386,8 @@ private struct MCPStillInput {
         guard path.hasPrefix("/"), !path.utf8.contains(0) else { throw invalid("Supply an absolute local image path.") }
         let url = URL(fileURLWithPath: path)
         let worker = Task.detached(priority: .userInitiated) {
-            let fingerprint = try StillImage.fingerprint(url)
+            let fingerprint = try StillImage.inspectAndFingerprint(url, cancelled: { Task.isCancelled }).fingerprint
             try Task.checkCancellation()
-            _ = try StillImage.inspect(url)
-            guard try StillImage.fingerprint(url) == fingerprint else {
-                throw CutError(code: "source_changed", message: "The image changed while it was being imported.")
-            }
             return (url, fingerprint)
         }
         return try await withTaskCancellationHandler {
@@ -368,13 +398,7 @@ private struct MCPStillInput {
 
 private extension ProjectSession {
     func mcpDefaultStillCadence(at target: RationalTime) -> RationalTime? {
-        if !isMulticam { return editor.stillCadence }
-        let ends = multicam.assemblyRangeEnds
-        let index = min(ends.lowerBound { $0 > target }, max(0, ends.count - 1))
-        guard let range = multicam.assemblyRange(at: index),
-              let elapsed = try? target.subtracting(multicam.assemblyStart(at: index)),
-              let group = try? range.from.adding(elapsed) else { return nil }
-        return multicam.multicamStillCadence(atGroup: group)
+        isMulticam ? multicam.multicamStillCadence(atAssembly: target) : editor.stillCadence
     }
 
     func mcpStillBoundary(_ target: RationalTime, space: String) throws -> RationalTime {

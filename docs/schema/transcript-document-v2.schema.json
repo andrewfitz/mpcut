@@ -1,0 +1,640 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MPCut transcript document v2",
+  "description": "Times are exact rational seconds in the identified clock. Observation and track-local word bounds are in the track presentation clock.",
+  "$ref": "#/$defs/document",
+  "$defs": {
+    "time": {
+      "type": "object",
+      "properties": {
+        "numerator": {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        },
+        "denominator": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        }
+      },
+      "required": [
+        "numerator",
+        "denominator"
+      ]
+    },
+    "clock": {
+      "enum": [
+        "presentation",
+        "session",
+        "group",
+        "current_cut"
+      ]
+    },
+    "precision": {
+      "enum": [
+        "word",
+        "cue"
+      ]
+    },
+    "evidence": {
+      "enum": [
+        "recognized",
+        "inferred"
+      ]
+    },
+    "coverage": {
+      "enum": [
+        "recognized",
+        "skipped",
+        "failed",
+        "coverage_only"
+      ]
+    },
+    "role": {
+      "enum": [
+        "isolated_mic",
+        "mixed_audio",
+        "unknown"
+      ]
+    },
+    "activity_frame": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "$ref": "#/$defs/time"
+        },
+        "end": {
+          "$ref": "#/$defs/time"
+        },
+        "level": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "start",
+        "end",
+        "level"
+      ]
+    },
+    "track": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "audio_stream_index": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "channel": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin": {
+          "$ref": "#/$defs/time"
+        },
+        "session_start": {
+          "$ref": "#/$defs/time"
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage"
+        },
+        "role": {
+          "$ref": "#/$defs/role"
+        },
+        "activity": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/activity_frame"
+          }
+        },
+        "words": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/word"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "speakers": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/speaker"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stream_evidence": {},
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "warning": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "approximate_clock": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "origin",
+        "session_start",
+        "coverage",
+        "role",
+        "activity"
+      ],
+      "additionalProperties": false
+    },
+    "speaker": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ]
+    },
+    "observation": {
+      "type": "object",
+      "properties": {
+        "track_id": {
+          "type": "string"
+        },
+        "word_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "start": {
+          "$ref": "#/$defs/time"
+        },
+        "end": {
+          "$ref": "#/$defs/time"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        },
+        "basis": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "speaker_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "track_id",
+        "start",
+        "end",
+        "evidence"
+      ],
+      "additionalProperties": false
+    },
+    "word": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "start": {
+          "$ref": "#/$defs/time"
+        },
+        "end": {
+          "$ref": "#/$defs/time"
+        },
+        "utterance_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "speaker_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "precision": {
+          "$ref": "#/$defs/precision"
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/observation"
+          }
+        },
+        "candidate_track_ids": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "projection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/word_projection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "start",
+        "end",
+        "precision",
+        "observations"
+      ],
+      "additionalProperties": false
+    },
+    "word_projection": {
+      "type": "object",
+      "properties": {
+        "clock": {
+          "$ref": "#/$defs/clock"
+        },
+        "word_id": {
+          "type": "string"
+        },
+        "attachment_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "original_text": {
+          "type": "string"
+        },
+        "original_speaker_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "original_source_start": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "original_source_end": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "track_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "audio_stream_index": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "routed_source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "routed_stream_index": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "clip_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "assembly_index": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "partial": {
+          "type": "boolean"
+        },
+        "stale_matches": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "clock",
+        "word_id",
+        "original_text",
+        "partial",
+        "stale_matches"
+      ],
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "device": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "language": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "duration": {
+          "$ref": "#/$defs/time"
+        },
+        "metadata": {}
+      },
+      "required": [
+        "source",
+        "duration",
+        "metadata"
+      ]
+    },
+    "document": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "const": 2
+        },
+        "clock": {
+          "$ref": "#/$defs/clock"
+        },
+        "tracks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/track"
+          }
+        },
+        "speakers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/speaker"
+          }
+        },
+        "words": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/word"
+          }
+        },
+        "approximate_clock": {
+          "type": "boolean"
+        },
+        "job_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fingerprint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/provenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "clock",
+        "tracks",
+        "speakers",
+        "words",
+        "approximate_clock"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

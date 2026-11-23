@@ -31,6 +31,7 @@ struct MPPreviewDecoder {
     CMVideoFormatDescriptionRef video_description;
     CMAudioFormatDescriptionRef audio_description;
     bool preserve_surround;
+    bool preserve_audio_channels;
     SwrContext *resampler;
     AVChannelLayout audio_layout;
     int audio_rate;
@@ -80,6 +81,10 @@ static enum AVPixelFormat hardware_format(AVCodecContext *codec, const enum AVPi
             MPPreviewDecoder *preview = codec->opaque;
             // FFmpeg leaves the caller-owned session intact when changing
             // formats. Release it before initializing the replacement.
+            if (preview->verified_session) {
+                CFRelease(preview->verified_session);
+                preview->verified_session = NULL;
+            }
             clear_hardware(&preview->hardware);
             codec->hwaccel_context = &preview->hardware;
             return *formats;
@@ -200,19 +205,25 @@ MPPreviewDecoder *mp_preview_open(const char *path, enum MPPreviewTracks tracks,
     // An explicit ordinal and a standalone audio file each monitor one track.
     if (lane_count > 1) {
         preview->mix = linked_mix_create(lane_count);
-        if (!preview->mix)
+        if (!preview->mix) {
+            *error = "Could not allocate the linked preview audio mix.";
             goto failure;
+        }
         int ordinal = 0;
         for (unsigned i = 0; i < preview->format->nb_streams; i++) {
             AVStream *lane = preview->format->streams[i];
             if (lane->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
                 continue;
-            MPPreviewDecoder *child = mp_preview_open(path, MPPreviewSoundOnly, ordinal, origin, cancelled, context, error);
+            const char *lane_error = NULL;
+            MPPreviewDecoder *child = mp_preview_open(path, MPPreviewSoundOnly, ordinal, origin, cancelled, context,
+                                                      &lane_error);
             if (child)
                 child->linked_lane = true;
             linked_mix_set_lane(preview->mix, ordinal++, child, lane->time_base);
-            if (preview_cancelled(preview))
+            if (preview_cancelled(preview)) {
+                *error = "Preview opening was cancelled.";
                 goto failure;
+            }
         }
     } else if (preview->audio_enabled && !open_stream(preview, &preview->audio, audio, AVMEDIA_TYPE_AUDIO)) {
         preview->audio_unavailable = preview->audio.index >= 0;
@@ -351,14 +362,16 @@ CGAffineTransform mp_preview_transform(const MPPreviewDecoder *preview)
         matrix[6] / 65536.0, matrix[7] / 65536.0);
 }
 
-static int seek_transport_stream(MPPreviewDecoder *preview, int64_t target)
+static int seek_transport_stream(MPPreviewDecoder *preview, int64_t target, int64_t desired)
 {
     const AVRational base = preview->video.codec->pkt_timebase;
-    const int64_t desired = av_rescale_q(target + preview->origin, AV_TIME_BASE_Q, base);
     // The transport stream demuxer indexes decode timestamps, which need not
     // belong to random-access packets. Confirm a keyframe before the target.
     for (int64_t preroll = 2 * AV_TIME_BASE; preroll < target; ) {
-        int64_t timestamp = av_rescale_q(target - preroll + preview->origin, AV_TIME_BASE_Q, base);
+        int64_t preroll_ticks = av_rescale_q(preroll, AV_TIME_BASE_Q, base);
+        if (preroll_ticks < 0 || desired < INT64_MIN + preroll_ticks)
+            break;
+        int64_t timestamp = desired - preroll_ticks;
         if (av_seek_frame(preview->format, preview->video.index, timestamp, AVSEEK_FLAG_BACKWARD) >= 0) {
             int64_t replay_position = INT64_MAX;
             while (!preview_cancelled(preview) && av_read_frame(preview->format, preview->packet) >= 0) {
@@ -391,11 +404,9 @@ static int seek_transport_stream(MPPreviewDecoder *preview, int64_t target)
 
 static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_timeline_origin)
 {
-    if (!isfinite(seconds) || seconds < 0 || seconds >= (double)INT64_MAX / AV_TIME_BASE)
+    if (!isfinite(seconds) || seconds < 0 || seconds * AV_TIME_BASE >= 0x1p63)
         return false;
     int64_t target = llround(seconds * AV_TIME_BASE);
-    if (preview->origin > 0 && target > INT64_MAX - preview->origin)
-        return false;
     if (preview->mix) {
         if (preview->mixed_audio)
             CFRelease(preview->mixed_audio);
@@ -412,6 +423,8 @@ static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_ti
     if (preview->audio_only) {
         if (!preview->audio.codec)
             return !preview->audio_unavailable;
+        if (preview->origin > 0 && target > INT64_MAX - preview->origin)
+            return false;
         // Decode a little audio preroll for transform codecs, independently of the video GOP.
         int64_t absolute = preview->origin + FFMAX(0, target - AV_TIME_BASE / 4);
         // The raw MP3 demuxer gives encoded packet zero PTS zero, but the
@@ -420,11 +433,10 @@ static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_ti
             absolute = 0;
         int64_t ticks = av_rescale_q(absolute, AV_TIME_BASE_Q, preview->format->streams[preview->audio.index]->time_base);
         result = av_seek_frame(preview->format, preview->audio.index, ticks, AVSEEK_FLAG_BACKWARD);
-    } else if (strcmp(preview->format->iformat->name, "mpegts") == 0) {
-        result = seek_transport_stream(preview, target);
     } else {
         const AVStream *video = preview->format->streams[preview->video.index];
-        double relative = mp_preview_has_audio(preview) ? fmax(0, seconds - 0.25) : seconds;
+        bool transport_stream = strcmp(preview->format->iformat->name, "mpegts") == 0;
+        double relative = !transport_stream && mp_preview_has_audio(preview) ? fmax(0, seconds - 0.25) : seconds;
         long double ticks = (long double)relative * video->time_base.den / video->time_base.num;
         // Keep exact rational frame times that passed through Double. A real
         // fractional tick must round down or a backward seek can return a future keyframe.
@@ -442,7 +454,9 @@ static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_ti
                                      AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
         if (ticks >= 0x1p63L || (start > 0 && (int64_t)ticks > INT64_MAX - start))
             return false;
-        result = av_seek_frame(preview->format, preview->video.index, start + (int64_t)ticks, AVSEEK_FLAG_BACKWARD);
+        int64_t desired = start + (int64_t)ticks;
+        result = transport_stream ? seek_transport_stream(preview, target, desired) :
+            av_seek_frame(preview->format, preview->video.index, desired, AVSEEK_FLAG_BACKWARD);
     }
     if (result < 0)
         return false;
@@ -457,7 +471,8 @@ static bool seek_preview(MPPreviewDecoder *preview, double seconds, bool from_ti
     preview->eof = false;
     preview->awaiting_keyframe = true;
     // A damaged packet silences the rest of that pass only. A missing decoder stays unavailable.
-    preview->audio_unavailable = preview->audio.index >= 0 && !preview->audio.codec;
+    if (preview->audio.codec)
+        preview->audio_unavailable = false;
     preview->audio_failures = 0;
     preview->video_failures = 0;
     preview->met_damage = false;
@@ -510,15 +525,26 @@ static bool using_hardware(MPPreviewDecoder *preview)
     return hardware;
 }
 
-static CMSampleBufferRef video_sample(MPPreviewDecoder *preview)
+static CVPixelBufferRef video_picture(MPPreviewDecoder *preview, CMTime *pts, CMTime *duration)
 {
     AVFrame *frame = preview->frame;
     CVPixelBufferRef image = (CVPixelBufferRef)frame->data[3];
-    CMSampleBufferRef sample = NULL;
-    CMTime pts = sample_time(preview, &preview->video);
-    if (!image || !CMTIME_IS_VALID(pts))
+    *pts = sample_time(preview, &preview->video);
+    if (!image || !CMTIME_IS_NUMERIC(*pts))
         return NULL;
     av_vt_pixbuf_set_attachments(preview->video.codec, image, frame);
+    AVRational base = preview->video.codec->pkt_timebase;
+    *duration = frame->duration > 0 ? timestamp_time(frame->duration, base) : kCMTimeInvalid;
+    return image;
+}
+
+static CMSampleBufferRef video_sample(MPPreviewDecoder *preview)
+{
+    CMTime pts, duration;
+    CVPixelBufferRef image = video_picture(preview, &pts, &duration);
+    CMSampleBufferRef sample = NULL;
+    if (!image)
+        return NULL;
     if (!preview->video_description || !CMVideoFormatDescriptionMatchesImageBuffer(preview->video_description, image)) {
         CMVideoFormatDescriptionRef description = NULL;
         if (CMVideoFormatDescriptionCreateForImageBuffer(NULL, image, &description) != noErr)
@@ -527,8 +553,6 @@ static CMSampleBufferRef video_sample(MPPreviewDecoder *preview)
             CFRelease(preview->video_description);
         preview->video_description = description;
     }
-    AVRational base = preview->video.codec->pkt_timebase;
-    CMTime duration = frame->duration > 0 ? timestamp_time(frame->duration, base) : kCMTimeInvalid;
     CMSampleTimingInfo timing = {duration, pts, kCMTimeInvalid};
     CMSampleBufferCreateReadyWithImageBuffer(NULL, image, preview->video_description, &timing, &sample);
     return sample;
@@ -542,6 +566,12 @@ void mp_preview_preserve_surround(MPPreviewDecoder *preview)
     swr_free(&preview->resampler);
     if (preview->mix)
         linked_mix_preserve_surround(preview->mix);
+}
+
+void mp_preview_preserve_audio_channels(MPPreviewDecoder *preview)
+{
+    preview->preserve_audio_channels = true;
+    swr_free(&preview->resampler);
 }
 
 static bool configure_resampler(MPPreviewDecoder *preview)
@@ -563,7 +593,7 @@ static bool configure_resampler(MPPreviewDecoder *preview)
     preview->audio_format = frame->format;
     preview->audio_rate = frame->sample_rate;
     AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-    bool surround = preview->preserve_surround && frame->ch_layout.nb_channels > 2;
+    bool surround = preview->preserve_audio_channels || (preview->preserve_surround && frame->ch_layout.nb_channels > 2);
     // Convert packing without rematrixing speakers or imposing a default order.
     AVChannelLayout discrete = { .order = AV_CHANNEL_ORDER_UNSPEC, .nb_channels = frame->ch_layout.nb_channels };
     AVChannelLayout *input = surround ? &discrete : &frame->ch_layout;
@@ -571,7 +601,7 @@ static bool configure_resampler(MPPreviewDecoder *preview)
     if (swr_alloc_set_opts2(&preview->resampler, output, AV_SAMPLE_FMT_FLT, frame->sample_rate,
                            input, frame->format, frame->sample_rate, 0, NULL) < 0 ||
         // AVAssetReaderAudioMixOutput duplicates a linked mono track into both channels at unity.
-        (preview->linked_lane && frame->ch_layout.nb_channels == 1 &&
+        (preview->linked_lane && !surround && frame->ch_layout.nb_channels == 1 &&
          swr_set_matrix(preview->resampler, (double[]){1.0, 1.0}, 1) < 0) ||
         swr_init(preview->resampler) < 0) {
         swr_free(&preview->resampler);
@@ -616,12 +646,13 @@ static AudioChannelLabel audio_channel_label(enum AVChannel channel, int index)
 }
 
 static CMAudioFormatDescriptionRef make_audio_description(const AudioStreamBasicDescription *format,
-                                                          const AVChannelLayout *source)
+                                                          const AVChannelLayout *source,
+                                                          bool preserve_channels)
 {
     CMAudioFormatDescriptionRef description = NULL;
     AudioChannelLayout *layout = NULL;
     size_t layout_size = 0;
-    if (format->mChannelsPerFrame > 2) {
+    if (preserve_channels || format->mChannelsPerFrame > 2) {
         layout_size = offsetof(AudioChannelLayout, mChannelDescriptions) +
             format->mChannelsPerFrame * sizeof(AudioChannelDescription);
         layout = calloc(1, layout_size);
@@ -650,12 +681,14 @@ static CMSampleBufferRef audio_sample(MPPreviewDecoder *preview)
 {
     AVFrame *frame = preview->frame;
     CMTime pts = sample_time(preview, &preview->audio);
-    if (!CMTIME_IS_VALID(pts) || frame->nb_samples <= 0 || frame->nb_samples > 65536 ||
+    if (!CMTIME_IS_NUMERIC(pts) || frame->nb_samples <= 0 || frame->nb_samples > 65536 ||
         frame->sample_rate <= 0 || frame->ch_layout.nb_channels <= 0 || !configure_resampler(preview))
         return NULL;
 
-    const int channels = preview->preserve_surround && frame->ch_layout.nb_channels > 2
+    const int channels = preview->preserve_audio_channels || (preview->preserve_surround && frame->ch_layout.nb_channels > 2)
         ? frame->ch_layout.nb_channels : 2;
+    if ((unsigned)channels > UINT32_MAX / sizeof(float))
+        return NULL;
     const UInt32 stride = (UInt32)channels * (UInt32)sizeof(float);
     if (!preview->audio_description) {
         AudioStreamBasicDescription format = {
@@ -668,7 +701,7 @@ static CMSampleBufferRef audio_sample(MPPreviewDecoder *preview)
             .mChannelsPerFrame = channels,
             .mBitsPerChannel = 8 * sizeof(float),
         };
-        preview->audio_description = make_audio_description(&format, &frame->ch_layout);
+        preview->audio_description = make_audio_description(&format, &frame->ch_layout, preview->preserve_audio_channels);
         if (!preview->audio_description)
             return NULL;
     }
@@ -774,9 +807,16 @@ static bool damaged_video_picture(MPPreviewDecoder *preview, int result, bool se
     return true;
 }
 
-static int next_stream_sample(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const char **error)
+static int next_stream_sample(MPPreviewDecoder *preview, CMSampleBufferRef *sample,
+                              CVPixelBufferRef *image, CMTime *pts, CMTime *duration, const char **error)
 {
-    *sample = NULL;
+    if (sample)
+        *sample = NULL;
+    if (image) {
+        *image = NULL;
+        *pts = kCMTimeInvalid;
+        *duration = kCMTimeInvalid;
+    }
     *error = NULL;
     // Yield periodically even when an edited or damaged container has long gaps.
     for (int step = 0; step < 32; step++) {
@@ -788,10 +828,19 @@ static int next_stream_sample(MPPreviewDecoder *preview, CMSampleBufferRef *samp
             if (result == 0) {
                 int kind = stream == &preview->video ? MPPreviewVideo : MPPreviewAudio;
                 if (kind == MPPreviewVideo) {
-                    if (preview->encoding_edge && (preview->frame->decode_error_flags ||
-                        (preview->frame->flags & (AV_FRAME_FLAG_CORRUPT | AV_FRAME_FLAG_INTERLACED)))) {
+                    bool corrupt = preview->frame->decode_error_flags ||
+                        (preview->frame->flags & AV_FRAME_FLAG_CORRUPT);
+                    if (preview->encoding_edge && (corrupt || (preview->frame->flags & AV_FRAME_FLAG_INTERLACED))) {
                         av_frame_unref(preview->frame);
                         *error = "Smart Trim requires intact, progressive source pictures.";
+                        return MPPreviewError;
+                    }
+                    if (corrupt) {
+                        av_frame_unref(preview->frame);
+                        preview->receiving = NULL;
+                        if (damaged_video_picture(preview, AVERROR_INVALIDDATA, false))
+                            continue;
+                        *error = "VideoToolbox repeatedly returned damaged pictures.";
                         return MPPreviewError;
                     }
                     if (preview->encoding_edge && !edge_metadata_supported(preview->frame)) {
@@ -805,19 +854,26 @@ static int next_stream_sample(MPPreviewDecoder *preview, CMSampleBufferRef *samp
                         return MPPreviewError;
                     }
                     preview->video_failures = 0;
-                    *sample = video_sample(preview);
-                } else {
+                    if (image) {
+                        CVPixelBufferRef picture = video_picture(preview, pts, duration);
+                        if (picture)
+                            *image = CVPixelBufferRetain(picture);
+                    } else {
+                        *sample = video_sample(preview);
+                    }
+                } else if (sample) {
                     preview->audio_failures = 0;
                     *sample = audio_sample(preview);
                 }
                 av_frame_unref(preview->frame);
-                if (*sample)
+                if ((sample && *sample) || (image && *image))
                     return kind;
                 if (kind == MPPreviewVideo) {
                     *error = "A decoded video frame could not be presented.";
                     return MPPreviewError;
                 }
                 preview->audio_unavailable = true;
+                preview->receiving = NULL;
                 continue;
             }
             preview->receiving = NULL;
@@ -887,6 +943,8 @@ static int next_stream_sample(MPPreviewDecoder *preview, CMSampleBufferRef *samp
             preview->eof = true;
             continue;
         }
+        if (result == AVERROR(EAGAIN) || (result == AVERROR_EXIT && preview_cancelled(preview)))
+            return MPPreviewAgain;
         if (result < 0) {
             *error = "FFmpeg could not read the next preview packet.";
             return MPPreviewError;
@@ -930,7 +988,7 @@ static int next_stream_sample(MPPreviewDecoder *preview, CMSampleBufferRef *samp
 int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const char **error)
 {
     if (!preview->mix || !preview->audio_enabled)
-        return next_stream_sample(preview, sample, error);
+        return next_stream_sample(preview, sample, NULL, NULL, NULL, error);
     *sample = NULL;
     *error = NULL;
     if (!preview->mixed_audio && !preview->mix_audio_end) {
@@ -942,7 +1000,7 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
         preview->mix_audio_end = result == MPPreviewEnd;
     }
     if (!preview->audio_only && !preview->mixed_picture && !preview->mix_video_end) {
-        int result = next_stream_sample(preview, &preview->mixed_picture, error);
+        int result = next_stream_sample(preview, &preview->mixed_picture, NULL, NULL, NULL, error);
         if (result == MPPreviewAgain || result == MPPreviewError)
             return result;
         preview->mix_video_end = result == MPPreviewEnd;
@@ -960,4 +1018,17 @@ int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample, const 
         return MPPreviewVideo;
     }
     return MPPreviewEnd;
+}
+
+int mp_preview_next_picture(MPPreviewDecoder *preview, CVPixelBufferRef *image, CMTime *pts,
+                            CMTime *duration, const char **error)
+{
+    if (!preview || mp_preview_has_audio(preview) || preview->encoding_edge) {
+        *image = NULL;
+        *pts = kCMTimeInvalid;
+        *duration = kCMTimeInvalid;
+        *error = "Direct picture decoding requires picture-only preview.";
+        return MPPreviewError;
+    }
+    return next_stream_sample(preview, NULL, image, pts, duration, error);
 }

@@ -35,11 +35,13 @@ enum PremiereTimeline {
 
     static func write(_ project: CutProject, relativeTo location: URL, to xml: URL,
                       name: String, allowLoss: Bool, flattenMulticam: Bool = false) throws -> [String] {
-        let conversion = try ProjectConverter.prepareStills(project, for: "Adobe Premiere Pro", allowLoss: allowLoss)
+        let conversion = try ProjectConverter.prepareForInterchange(project, for: "Adobe Premiere Pro", allowLoss: allowLoss)
         var edits: [Edit] = []
         var warnings = Set(conversion.warnings)
         var media: [URL: MediaInfo] = [:]
         var nativeGroup: MulticamProject?
+        var programDuration: RationalTime?
+        var referenceVideo: StreamInfo?
         let engine = CutEngine(useSidecar: false)
         func inspect(_ url: URL) throws -> MediaInfo {
             if let found = media[url] { return found }
@@ -71,11 +73,15 @@ enum PremiereTimeline {
             }
         case .multicam(let group):
             let plan = try group.plan()
-            let cameras = try group.angles.map { try inspect(CutProject.checkedMediaURL($0.file, relativeTo: location)) }
+            programDuration = plan.duration
+            let cameras = try group.pictureSources.map { try inspect(CutProject.checkedMediaURL($0.file, relativeTo: location)) }
             guard cameras.allSatisfy(\.hasVideo) else { throw issue("Each multicam camera must link to a video recording.") }
+            if let index = group.pictureSources.firstIndex(where: { $0.id == group.referenceAngle }) {
+                referenceVideo = cameras[index].videoStream
+            }
             let fps = cameras.first?.videoStream?.frameRate
             let native = !flattenMulticam && (2...4).contains(cameras.count)
-                && group.angles.allSatisfy { $0.offset == .zero }
+                && group.angles.allSatisfy { $0.offset == .zero && $0.coverage == nil && $0.additionalRecordings.isEmpty }
                 && cameras.allSatisfy { $0.videoStream != nil && $0.videoStream?.frameRate == fps
                     && $0.multicamSourceOffset == .zero && $0.duration >= group.range.to }
             if native {
@@ -107,12 +113,12 @@ enum PremiereTimeline {
                                   angle: stream == nil ? sourceID : nil))
             }
             for interval in plan.intervals {
-                try append(interval, sourceID: interval.angle, stream: nil)
+                if let source = interval.pictureSourceID { try append(interval, sourceID: source, stream: nil) }
                 if let selection = interval.audio { try append(interval, sourceID: selection.source, stream: selection.stream) }
             }
         }
         for file in Set(edits.map(\.file)) { _ = try inspect(file) }
-        let video = edits.lazy.compactMap { media[$0.file]?.videoStream }.first
+        let video = edits.lazy.filter(\.video).compactMap { media[$0.file]?.videoStream }.first ?? referenceVideo
         let fps = video?.frameRate ?? RationalTime(numerator: 30)
         func frame(_ time: RationalTime, at rate: RationalTime) throws -> Int64 {
             let exact = try time.multiplied(by: rate)
@@ -136,7 +142,7 @@ enum PremiereTimeline {
         let sound = tracks.add("audio")
         var videoClipCount = 0
         var audioTracks: [(node: XMLElement, clipCount: Int)] = []
-        var end: Int64 = 0
+        var end = try programDuration.map { try frame($0, at: fps) } ?? 0
         var next = 1
         var fileIDs: [URL: String] = [:]
         for edit in edits {
@@ -330,15 +336,18 @@ extension PremiereTimeline {
     }
 
     static func read(_ xml: URL, allowLoss: Bool) throws -> (CutProject, [String]) {
-        guard let size = try xml.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-              size <= MulticamProject.maximumFileSize else { throw issue("Premiere sequence description exceeds the project size limit.") }
-        let data = try Data(contentsOf: xml)
-        guard let text = String(data: data, encoding: .utf8), !text.contains("<!ENTITY") else {
-            throw issue("Expected UTF-8 Premiere sequence XML without entity declarations.")
+        let data: Data
+        do { data = try ProjectFile.readBytes(from: xml) }
+        catch { throw issue(error.localizedDescription) }
+        guard data.count <= MulticamProject.maximumFileSize else { throw issue("Premiere sequence description exceeds the project size limit.") }
+        guard let text = String(data: data, encoding: .utf8), !text.contains("\0"), !text.contains("<!ENTITY"),
+              !text.contains("<!DOCTYPE") || text.range(of: #"<!DOCTYPE(?!\s+xmeml\s*>)"#, options: .regularExpression) == nil else {
+            throw issue("Expected UTF-8 Premiere sequence XML without entity declarations or external DTDs.")
         }
         let document = try XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever])
-        guard let sequence = document.rootElement()?.elements(forName: "sequence").first,
-              let media = sequence.elements(forName: "media").first else { throw issue("Missing Premiere sequence.") }
+        guard let root = document.rootElement(), root.name == "xmeml",
+              root.elements(forName: "sequence").count == 1, let sequence = root.elements(forName: "sequence").first,
+              let media = sequence.elements(forName: "media").first else { throw issue("Expected one Premiere sequence.") }
         var warnings = Set<String>()
         func loss(_ text: String) throws {
             guard allowLoss else { throw CutError(code: "conversion_loss", message: text) }
@@ -360,7 +369,8 @@ extension PremiereTimeline {
         for case let file as XMLElement in try sequence.nodes(forXPath: ".//file[pathurl]") {
             guard let id = file.attribute(forName: "id")?.stringValue,
                   let raw = file.value("pathurl"), let url = URL(string: raw), url.isFileURL,
-                  ["", "localhost"].contains(url.host ?? ""), url.path.hasPrefix("/"), url.query == nil, url.fragment == nil,
+                  ["", "localhost"].contains(url.host?.lowercased() ?? ""), url.user == nil, url.password == nil, url.port == nil,
+                  url.path.hasPrefix("/"), url.query == nil, url.fragment == nil,
                   !raw.lowercased().contains("%00"), ProjectFile.validMediaPath(url.path) else { throw issue("Premiere media must reference a local file.") }
             let path = "/" + url.path.drop(while: { $0 == "/" })
             guard files[id] == nil || files[id] == path else { throw issue("Conflicting Premiere source paths for file ID \(id).") }
@@ -419,21 +429,12 @@ extension PremiereTimeline {
             }
         }
         let pictures = try tracks("video"), sounds = try tracks("audio")
-        let base = pictures.isEmpty ? sounds.first ?? [] : pictures.flatMap { $0 }.sorted { $0.start < $1.start }
+        let pictureItems = pictures.flatMap { $0 }.sorted { $0.start < $1.start }
+        guard zip(pictureItems, pictureItems.dropFirst()).allSatisfy({ $0.end <= $1.start }) else {
+            throw issue("Overlapping Premiere picture clips require flattening before import.")
+        }
         if pictures.count > 1 {
-            guard zip(base, base.dropFirst()).allSatisfy({ $0.end <= $1.start }) else {
-                throw issue("Multiple overlapping Premiere video tracks require flattening before import.")
-            }
             try loss("Combined cuts from separate Premiere picture tracks into one MPCut timeline.")
-        }
-        var last = RationalTime.zero
-        for item in base {
-            guard item.start == last else { throw issue("A Premiere timeline with gaps or overlapping edits cannot be represented in MPCut.") }
-            last = item.end
-        }
-        if let declared = Int64(sequence.value("duration") ?? "") {
-            let duration = try RationalTime(numerator: declared).multiplied(by: .init(numerator: sequenceRate.denominator, denominator: sequenceRate.numerator))
-            guard duration == last else { throw issue("The occupied timeline does not cover the declared Premiere sequence duration.") }
         }
         for track in sounds {
             guard zip(track, track.dropFirst()).allSatisfy({ $0.end <= $1.start }) else {
@@ -441,7 +442,6 @@ extension PremiereTimeline {
             }
         }
         let audio = sounds.flatMap { $0 }
-        guard audio.allSatisfy({ $0.end <= last }) else { throw issue("Premiere audio extends past the selected picture timeline.") }
         let engine = CutEngine(useSidecar: false)
         var metadata: [String: MediaInfo] = [:]
         func inspect(_ path: String) throws -> MediaInfo {
@@ -458,17 +458,33 @@ extension PremiereTimeline {
         func sameEdit(_ a: Item, _ b: Item) -> Bool {
             a.file == b.file && a.start == b.start && a.end == b.end && a.sourceIn == b.sourceIn && a.sourceOut == b.sourceOut
         }
-        for item in base {
+        var last = max(pictureItems.last?.end ?? .zero, audio.lazy.map(\.end).max() ?? .zero)
+        if let value = sequence.value("duration") {
+            guard let declared = Int64(value), declared >= 0 else { throw issue("Invalid Premiere sequence duration.") }
+            let duration = try RationalTime(numerator: declared).multiplied(by: .init(numerator: sequenceRate.denominator, denominator: sequenceRate.numerator))
+            guard duration >= last else { throw issue("A Premiere clip extends past the declared sequence duration.") }
+            last = duration
+        }
+        for item in pictureItems {
             let info = try inspect(item.file)
-            guard pictures.isEmpty || info.hasVideo else { throw issue("The Premiere picture source has no video: \(item.file)") }
+            guard info.hasVideo else { throw issue("The Premiere picture source has no video: \(item.file)") }
             guard item.sourceOut <= info.duration else { throw issue("The Premiere source trim exceeds the duration of \(item.file).") }
         }
+        // Audio-only recordings between picture clips can form ordinary sequence items.
+        let audioOnly = try (sounds.first ?? []).filter { item in
+            let index = pictureItems.lowerBound { $0.end > item.start }
+            guard index == pictureItems.count || pictureItems[index].start >= item.end else { return false }
+            return try !inspect(item.file).hasVideo
+        }
+        let sequenceItems = (pictureItems + audioOnly).sorted { $0.start < $1.start }
+        let contiguous = (sequenceItems.first?.start ?? .zero) == .zero && (sequenceItems.last?.end ?? .zero) == last
+            && zip(sequenceItems, sequenceItems.dropFirst()).allSatisfy { $0.end == $1.start }
         let starts = Dictionary(grouping: audio, by: \.start)
         var matched = 0
-        let simple = try base.allSatisfy { item in
+        let simple = try contiguous && sequenceItems.allSatisfy { item in
             let matches = starts[item.start] ?? []
             let info = try inspect(item.file)
-            if pictures.isEmpty && info.hasVideo { throw issue("An audio-only Premiere edit from a video source requires a separate audio file in MPCut.") }
+            guard item.sourceOut <= info.duration else { throw issue("The Premiere source trim exceeds the duration of \(item.file).") }
             let channels = info.streams.filter { $0.kind == "audio" }.reduce(0) { $0 + $1.channels }
             matched += matches.count
             guard matches.count == channels, matches.allSatisfy({ sameEdit(item, $0) }),
@@ -479,14 +495,16 @@ extension PremiereTimeline {
             return true
         } && matched == audio.count
         if simple {
-            let clips = base.enumerated().map { i, item in
+            let clips = sequenceItems.enumerated().map { i, item in
                 CutSequenceClip(id: "clip-\(i + 1)", file: item.file, from: item.sourceIn, to: item.sourceOut)
             }
             let project = CutProject.sequence(clips)
             try project.validate()
             return (project, warnings.sorted())
         }
-        guard pictures.first != nil, last > .zero else { throw issue("Independent overlapping audio-only tracks cannot be represented in MPCut.") }
+        guard !pictures.isEmpty, last > .zero else { throw issue("Independent audio tracks over an audio-only interval cannot be represented in MPCut.") }
+        let pictureHasGaps = pictureItems.first?.start != .zero || pictureItems.last?.end != last
+            || zip(pictureItems, pictureItems.dropFirst()).contains { $0.end != $1.start }
         // Represent independently positioned picture and microphones with MPCut's synchronized source offsets.
         var angles: [MulticamSource] = [], microphones: [MulticamSource] = [], switches: [MulticamSwitch] = []
         var identifiers: [String: [RationalTime: String]] = [:]
@@ -501,6 +519,15 @@ extension PremiereTimeline {
             if video { angles.append(source) } else { microphones.append(source) }
             return id
         }
+        if pictureHasGaps {
+            let recordings = try pictureItems.enumerated().map { index, item in
+                let offset = try item.start.subtracting(item.sourceIn).subtracting(inspect(item.file).multicamSourceOffset)
+                return MulticamSource(id: "camera-\(index + 1)", file: item.file, offset: offset,
+                                      coverage: .init(from: item.start, to: item.end))
+            }
+            angles = [recordings[0]]
+            angles[0].additionalRecordings = Array(recordings.dropFirst())
+        }
         var boundaries: [RationalTime: [AudioBoundary]] = [:]
         for (track, items) in sounds.enumerated() {
             for item in items {
@@ -509,13 +536,17 @@ extension PremiereTimeline {
                 boundaries[item.end, default: []].append(.end(track: track))
             }
         }
-        let times = Set(base.lazy.map(\.start)).union(boundaries.keys).sorted()
+        let times = Set(pictureItems.lazy.map(\.start)).union(boundaries.keys).union([.zero]).sorted()
         var pictureIndex = 0
         var activeTracks: [Int: Item] = [:]
         for start in times where start < last {
-            while base[pictureIndex].end <= start { pictureIndex += 1 }
-            let picture = base[pictureIndex]
-            let camera = try id(picture, video: true)
+            let camera: String
+            if pictureHasGaps {
+                camera = angles[0].id
+            } else {
+                while pictureItems[pictureIndex].end <= start { pictureIndex += 1 }
+                camera = try id(pictureItems[pictureIndex], video: true)
+            }
             if let events = boundaries[start] {
                 for event in events {
                     switch event {
@@ -537,12 +568,17 @@ extension PremiereTimeline {
                 let channels = Set(active.map(\.channel))
                 guard channels.count == active.count else { throw issue("Overlapping Premiere tracks duplicate audio channels. Mix them down before import.") }
                 var offset = 0
-                let stream = try inspect(first.file).streams.first { stream in
+                let info = try inspect(first.file)
+                let stream = info.streams.first { stream in
                     guard stream.kind == "audio" else { return false }
                     defer { offset += stream.channels }
                     return channels == Set((0..<stream.channels).map { offset + $0 + 1 })
                 }
                 guard let stream else { throw issue("Premiere selected partial channels or mixed streams that cannot be represented by a microphone selection.") }
+                let end = try stream.duration > .zero ? stream.start.adding(stream.duration) : info.duration
+                guard active.allSatisfy({ stream.start <= $0.sourceIn && $0.sourceOut <= end }) else {
+                    throw issue("The Premiere audio trim exceeds the selected stream in \(first.file).")
+                }
                 selection = try .init(source: id(first, video: false), stream: stream.index)
             }
             switches.append(.init(at: start, angle: camera, audio: selection))

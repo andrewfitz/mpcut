@@ -3,14 +3,15 @@ import MPCutCore
 
 struct StillCreateOptions {
     let project: URL
-    let image: URL
+    let image: URL?
+    let framing: StillImageFraming
     let format: StillTimelineFormat
     let duration: RationalTime
     let color: StillTimelineFormat.Color
 
     init(_ arguments: [String]) throws {
         let supported: Set<String> = [
-            "--out-project", "--image", "--width", "--height", "--rate", "--codec",
+            "--out-project", "--image", "--gap", "--background", "--width", "--height", "--rate", "--codec",
             "--container", "--duration", "--frames", "--color"
         ]
         var options = arguments.filter { $0 != "--json" }.makeIterator()
@@ -22,6 +23,7 @@ struct StillCreateOptions {
             guard values[option] == nil else {
                 throw CLIError("invalid_arguments", "Duplicate \(option).")
             }
+            if option == "--gap" { values[option] = "true"; continue }
             guard let value = options.next(), !value.isEmpty, !value.hasPrefix("--") else {
                 throw CLIError("invalid_arguments", "Missing value for \(option).")
             }
@@ -36,7 +38,12 @@ struct StillCreateOptions {
         }
 
         project = try fileURL(required("--out-project"), label: "Output")
-        image = try fileURL(required("--image"), label: "Image")
+        guard (values["--gap"] != nil) != (values["--image"] != nil) else {
+            throw CLIError("invalid_arguments", "Specify --gap or --image FILE.")
+        }
+        image = try values["--image"].map { try fileURL($0, label: "Image") }
+        framing = StillImageFraming(mode: .fit, background: values["--background"] ?? "#000000")
+        try framing.validate()
         let rate = try RationalTime(parsing: required("--rate"))
         guard let width = try Int(required("--width")), let height = try Int(required("--height")),
               rate > .zero else {
@@ -70,7 +77,7 @@ struct StillCreateOptions {
 
 struct StillCreateReport: Encodable {
     let ok = true
-    let project: String
+    let projectPath: String
     let format: StillTimelineFormat
     let assetID: String
     let placementID: String
@@ -79,20 +86,22 @@ struct StillCreateReport: Encodable {
 }
 
 extension StillCreateOptions {
-    func create() throws -> StillCreateReport {
-        let identity = try SourceIdentity(image)
-        _ = try StillImage.inspect(image)
-        let fingerprint = try StillImage.fingerprint(image)
-        guard try SourceIdentity(image) == identity else {
-            throw CutError(code: "source_changed", message: "The still image changed while creating the project.")
-        }
-        let asset = StillAsset(id: UUID().uuidString, file: CutProject.relativeMediaPath(image.path, to: project),
+    func create(cancelled: @escaping () -> Bool) throws -> StillCreateReport {
+        let asset: StillAsset
+        if let image {
+            let fingerprint = try StillImage.inspectAndFingerprint(image, cancelled: cancelled).fingerprint
+            asset = StillAsset(id: UUID().uuidString, file: CutProject.relativeMediaPath(image.path, to: project),
                                displayName: image.lastPathComponent, fingerprint: fingerprint)
+        } else {
+            asset = StillAsset(gapID: UUID().uuidString)
+        }
         let placementID = UUID().uuidString
         let document = try CutProject.makeStillTimeline(format: format, asset: asset, placementID: placementID,
-                                                        duration: duration, colorPolicy: color.policy)
-        try document.save(to: project, undo: [], redo: [], replacingExisting: false)
-        return StillCreateReport(project: project.path, format: format, assetID: asset.id,
+                                                        duration: duration, framing: framing, colorPolicy: color.policy)
+        _ = try document.saveRevision(to: project, undo: [], redo: [], replacingExisting: false, expected: nil) {
+            if cancelled() { throw CancellationError() }
+        }
+        return StillCreateReport(projectPath: project.path, format: format, assetID: asset.id,
                                  placementID: placementID, duration: duration, colorPolicy: color.policy)
     }
 }

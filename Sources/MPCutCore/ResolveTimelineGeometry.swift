@@ -97,11 +97,20 @@ enum ResolveTimelineGeometry {
                 guard let ref = item.attribute(forName: "ref")?.stringValue, let asset = assets[ref] else { throw geometryError }
                 if asset.attribute(forName: "hasVideo")?.stringValue == "1" { try append("video", at: position, length: length) }
                 if asset.attribute(forName: "hasAudio")?.stringValue == "1" { try append("audio", at: position, length: length) }
+            case "video":
+                guard let ref = item.attribute(forName: "ref")?.stringValue, let asset = assets[ref],
+                      asset.attribute(forName: "hasVideo")?.stringValue == "1",
+                      try time(asset, "duration") == .zero,
+                      item.children?.compactMap({ ($0 as? XMLElement)?.name }) == ["adjust-conform"] else {
+                    throw geometryError
+                }
+                try append("video", at: position, length: length)
             case "clip":
                 let origin = try time(item, "start")
-                for case let child as XMLElement in item.children ?? [] where child.name == "audio" || child.name == "video" {
+                for case let child as XMLElement in item.children ?? [] {
+                    guard let kind = child.name, kind == "audio" || kind == "video" else { continue }
                     let start = try position.adding(time(child, "offset").subtracting(origin))
-                    try append(child.name!, at: start, length: time(child, "duration"))
+                    try append(kind, at: start, length: time(child, "duration"))
                 }
             default: throw geometryError
             }

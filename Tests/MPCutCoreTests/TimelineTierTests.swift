@@ -125,14 +125,14 @@ final class TimelineTierTests: XCTestCase {
 
     /// Factors without a scenario here, each with the reason.
     private static let notExercised: [TierFactorID: String] = [
-        // TimelineTierFactorFixtureTests has scenarios for cut.audioPacket, cut.aacCoverage, cut.pcmSampleClock, cut.mp3Crop,
-        // cut.opusWindow, join.smartOpenGOP, join.timecode, source.unsupportedTracks and source.encodeUnsupported. The rest were tried
+        // TimelineTierFactorFixtureTests has scenarios for cut_audio_packet, cut_aac_coverage, cut_pcm_sample_clock, cut_mp3_crop,
+        // cut_opus_window, join_smart_open_gop, join_timecode, source_unsupported_tracks and source_encode_unsupported. The rest were tried
         // with sources the bundled helper can make, and each states what was tried.
-        .cutAudioPriming: "Not reached: in MP3 and AAC movies made with the helper (MOV, Matroska, MPEG-TS, sound starting with or after the picture) a cut inside the priming is refused earlier as cut.audioPacket.",
-        .joinVideoDTSOverlap: "Not reached: joins of reordered H.264 and HEVC from the helper's hardware encoders are refused earlier as cut.videoStart in containers that cannot reschedule (Matroska, MPEG-TS).",
+        .cutAudioPriming: "Not reached: in MP3 and AAC movies made with the helper (MOV, Matroska, MPEG-TS, sound starting with or after the picture) a cut inside the priming is refused earlier as cut_audio_packet.",
+        .joinVideoDTSOverlap: "Not reached: joins of reordered H.264 and HEVC from the helper's hardware encoders are refused earlier as cut_video_start in containers that cannot reschedule (Matroska, MPEG-TS).",
         .joinDynamicRange: "Needs an HDR source; no committed fixture. Tests/Integration/mixed_timeline.py generates PQ and HLG clips and checks the refusal and its reason.",
         .sourceMultipleDescriptions: "Only reached with a named container, which the timeline tier never names; covered by the code mapping below.",
-        .sourceTimeline: "Not reached by a planner: a source with a timeline issue, such as two video tracks, is refused as source.unsupportedTracks (see the fixture test). The code `unsupported_timeline` is raised at import and maps to it below.",
+        .sourceTimeline: "Not reached by a planner: a source with a timeline issue, such as two video tracks, is refused as source_unsupported_tracks (see the fixture test). The code `unsupported_timeline` is raised at import and maps to it below.",
         .outputContainer: "Only reached when no container carries the clips, or with a named container; covered by the code mapping below.",
         .selectionTracks: "The timeline tier always asks for every track; covered by the code mapping below.",
         .writerOther: "The fallback for failures that are not about the timeline."
@@ -212,7 +212,7 @@ final class TimelineTierTests: XCTestCase {
         try handle.seekToEnd()
         try handle.write(contentsOf: Data([0]))
         try handle.close()
-        let after = TimelineTierEvaluator(useSidecar: false).evaluate(clips, media: indexed)
+        let after = evaluator.evaluate(clips, media: indexed)
         XCTAssertNil(after.tier)
         XCTAssertEqual(after.factors.map(\.id), [.sourceChanged])
         exercised.insert(.sourceChanged)
@@ -370,7 +370,10 @@ final class TimelineTierTests: XCTestCase {
         if case .checking = TimelineTierEvaluator(useSidecar: false).evaluate(clips, media: [gop: preview]) {} else {
             XCTFail("A clip without its cut index is still being checked.")
         }
-        if case .checking = TimelineTierEvaluator(useSidecar: false).evaluate(clips, media: try media(clips), cancelled: { true }) {} else {
+        let evaluator = TimelineTierEvaluator(useSidecar: false)
+        let indexed = try media(clips)
+        XCTAssertEqual(evaluator.evaluate(clips, media: indexed).tier, .trueLossless)
+        if case .checking = evaluator.evaluate(clips, media: indexed, cancelled: { true }) {} else {
             XCTFail("A cancelled check has no answer.")
         }
         XCTAssertNil(TimelineTierEvaluator(useSidecar: false).evaluate([]).tier)

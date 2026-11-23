@@ -8,76 +8,261 @@ struct MCPFileRequest {
     var input: Data?
     var directory: URL
 
-    private static let dataTools: [String: Set<String>] = {
-        let source: Set<String> = ["file", "project", "project_data"]
-        let tracks: Set<String> = ["tracks", "audio_stream"]
-        let detector: Set<String> = ["threshold_db", "min_pause", "stream"]
-        let encoding = tracks.union(["mode", "video", "audio", "quality", "snap"])
-        return [
-            "inspect": source.union(tracks).union(["detail", "from", "to", "stream", "no_sidecar"]),
-            "waveform": ["file", "from", "to", "columns", "stream", "no_sidecar"],
-            "frames": source.union(detector).union(["output", "preset", "at", "at_file", "select", "sample", "limit", "no_sidecar"]),
-            "sidecar": detector.union(["file", "status", "only", "only_file", "no_sidecar"]),
-            "scenes": tracks.union(["file", "project", "report", "input_file", "scenes_file", "export_to", "container",
-                                    "group_by", "dry_run", "no_sidecar", "from", "to", "clip_id", "camera_id",
-                                    "all_sources", "policy"]),
-            "refresh": ["project", "deep", "no_sidecar"],
-            "silence": source.union(tracks).union(detector).union(["report", "input_file", "pauses_file", "leave", "waveform", "mode", "output", "dry_run", "no_sidecar"]),
-            "export": encoding.union(["output", "project", "project_data", "edit", "input_file", "clips_file", "order_file", "dry_run", "no_sidecar", "require_camera_copy"]),
-            "resolve": ["project", "project_data", "output", "edit", "clips_file", "input_file", "open", "no_sidecar"],
-            "bulk": encoding.union(["file", "ranges", "ranges_file", "input_file", "output_directory", "container", "dry_run", "no_sidecar"]),
-            "rearrange": tracks.union(["file", "ranges", "ranges_file", "output", "snap", "dry_run", "no_sidecar"]),
-            "convert": ["file", "output", "to", "allow_loss", "flatten_multicam"],
-            "help": ["topic"],
-            "version": []
-        ]
-    }()
+    // Each callable operation has a fixed CLI path. Catalog validation rejects fields
+    // belonging to a different operation before any process can start.
+    private static let routes: [String: (family: String, path: [String])] = [
+        "still_file_project_create": ("still", ["still", "project", "create"]),
+        "still_file_placement_insert": ("still", ["still", "placement", "insert"]),
+        "still_file_picture_replace": ("still", ["still", "picture", "replace"]),
+        "timeline_file_gap_insert": ("still", ["timeline", "gap", "insert"]),
+        "still_file_placement_update": ("still", ["still", "placement", "update"]),
+        "still_file_placement_remove": ("still", ["still", "placement", "remove"]),
+        "still_file_asset_relink": ("still", ["still", "asset", "relink"]),
+        "still_file_placements_list": ("still", ["still", "placement", "list"]),
+        "timeline_file_clips_space": ("still", ["timeline", "clips", "space"]),
+        "participants_file_scan": ("participants", ["participants", "scan"]),
+        "participants_file_markers_build": ("participants", ["participants", "markers", "build"]),
+        "participants_file_project_inspect": ("participants", ["participants", "project", "inspect"]),
+        "participants_file_project_accept": ("participants", ["participants", "project", "accept"]),
+        "participants_file_project_apply": ("participants", ["participants", "project", "apply"]),
+        "participants_file_render_plan": ("participants", ["participants", "render", "plan"]),
+        "participants_file_render_export": ("participants", ["participants", "render", "export"]),
+        "participants_file_angles_list": ("participants", ["participants", "angles", "list"]),
+        "participants_file_angles_plan": ("participants", ["participants", "angles", "plan"]),
+        "participants_file_angles_render": ("participants", ["participants", "angles", "render"]),
+        "media_file_inspect": ("inspect", ["media", "inspect"]),
+        "project_file_inspect": ("inspect", ["project", "inspect"]),
+        "waveform_file_envelope_read": ("waveform", ["waveform", "envelope", "read"]),
+        "project_file_create": ("author", ["project", "create"]),
+        "project_file_edit": ("author", ["project", "edit"]),
+        "timeline_file_range_map": ("review_project", ["timeline", "range", "map"]),
+        "history_file_compare": ("review_project", ["history", "compare"]),
+        "multicam_file_sync_suggest": ("review_project", ["multicam", "sync", "suggest"]),
+        "multicam_file_switch_coverage_read": ("review_project", ["multicam", "switch", "coverage"]),
+        "silence_file_shorten": ("silence", ["silence", "shorten"]),
+        "silence_file_scan": ("silence", ["silence", "scan"]),
+        "silence_file_plan": ("silence", ["silence", "plan"]),
+        "silence_file_export": ("silence", ["silence", "export"]),
+        "scenes_file_scan": ("scenes", ["scenes", "scan"]),
+        "scenes_file_export": ("scenes", ["scenes", "export"]),
+        "project_file_media_refresh": ("refresh", ["project", "media", "refresh"]),
+        "review_file_frames_export": ("frames", ["review", "frames", "export"]),
+        "analysis_file_sidecar_inspect": ("sidecar", ["analysis", "sidecar", "inspect"]),
+        "analysis_file_sidecar_build": ("sidecar", ["analysis", "sidecar", "build"]),
+        "export_file_project_render": ("export", ["export", "project", "render"]),
+        "export_file_clips_join": ("export", ["export", "clips", "join"]),
+        "export_file_soundtrack_replace": ("export", ["export", "soundtrack", "replace"]),
+        "export_file_ranges_join": ("rearrange", ["export", "ranges", "join"]),
+        "export_file_ranges_separate": ("bulk", ["export", "ranges", "separate"]),
+        "project_file_convert": ("convert", ["project", "convert"]),
+        "project_file_resolve_export": ("resolve", ["project", "resolve", "export"]),
+        "project_file_resolve_import": ("resolve", ["project", "resolve", "import"]),
+        "cli_help_read": ("help", ["help"]),
+        "cli_version_read": ("version", ["--version"]),
+    ]
 
     static func supports(_ tool: String) -> Bool {
-        tool.hasPrefix("file_") && dataTools[String(tool.dropFirst(5))] != nil
+        routes[tool] != nil || transcriptCommand(for: tool) != nil
+    }
+
+    static func isFileTool(_ tool: String) -> Bool {
+        supports(tool) || ["file_job_status_read", "file_job_result_read", "file_job_cancel"].contains(tool)
     }
 
     init(tool: String, fields: [String: Any]) throws {
-        let command = String(tool.dropFirst(5))
-        let a = Fields(values: fields)
-        guard Self.supports(tool), let allowed = Self.dataTools[command] else {
+        let validated = try MCPSchemas.loaded.get().validate(tool: tool, arguments: fields)
+        try self.init(tool: tool, validatedFields: validated)
+    }
+
+    init(tool: String, validatedFields fields: [String: Any]) throws {
+        let transcript = Self.transcriptCommand(for: tool)
+        guard let route = Self.routes[tool] ?? transcript.map({ ("transcript", $0) }) else {
             throw MCPCommandError("unknown_tool", "Unknown file tool.")
         }
-        let extra = Set(fields.keys).subtracting(allowed).subtracting(["operationID", "working_directory"])
-        guard extra.isEmpty else { throw a.invalid("Unknown fields: " + extra.sorted().joined(separator: ", ")) }
+        let command = route.family
+        let a = Fields(values: fields)
         directory = try a.path("working_directory").map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? FileManager.default.homeDirectoryForCurrentUser
-        arguments = [command == "version" ? "--version" : command, "--json"]
+        if let command = transcript {
+            guard var request = fields["request"] as? [String: Any] else {
+                throw a.invalid("Supply a JSON request object.")
+            }
+            let payload = Fields(values: request)
+            for key in ["project_path", "file", "transcript", "output", "out_project", "script_file", "plan_file", "job_directory"] {
+                _ = try payload.path(key)
+            }
+            if command.starts(with: ["transcript", "job"]) || request["job_id"] != nil {
+                let liveDirectory = LiveTranscriptController.jobsDirectory.resolvingSymlinksInPath().standardizedFileURL
+                let directory = try payload.path("job_directory").map { URL(fileURLWithPath: $0, isDirectory: true) }
+                    ?? TranscriptJobStore.defaultDirectory
+                let resolved = directory.resolvingSymlinksInPath().standardizedFileURL
+                guard resolved.path != liveDirectory.path, !resolved.path.hasPrefix(liveDirectory.path + "/") else {
+                    throw a.invalid("Use a file job directory. Access live jobs through transcript_editor_job_status_read and a project handle.")
+                }
+                request["job_directory"] = resolved.path
+            }
+            if tool == "transcript_file_job_prepare", request["operation_id"] == nil {
+                request["operation_id"] = fields["operation_id"]
+            }
+            if ["transcript_file_job_prepare", "transcript_file_job_retry", "transcript_file_job_run"].contains(tool), request["progress"] == nil {
+                request["progress"] = "jsonl"
+            }
+            arguments = command + ["--stdin", "--json"]
+            input = try a.jsonObject(request)
+            return
+        }
+        arguments = route.path + ["--json"]
+        if command == "participants" {
+            for key in ["file", "project_path", "analysis_file", "resume_file", "participants_file", "out_project", "output", "output_directory"] {
+                _ = try a.path(key)
+            }
+            var request = fields.filter { !["operation_id", "working_directory"].contains($0.key) }
+            if ["participants_file_scan", "participants_file_render_export"].contains(tool) {
+                request["progress"] = "jsonl"
+            }
+            arguments.append("--stdin")
+            input = try a.jsonObject(request)
+            return
+        }
+        if command == "review_project" {
+            guard let project = try a.path("project_path") else { throw a.invalid("Supply an absolute project_path.") }
+            if tool == "multicam_file_switch_coverage_read" {
+                guard let angle = try a.string("angle_id"), let groupTime = try a.string("group_time") else {
+                    throw a.invalid("Supply angle_id and group_time.")
+                }
+                arguments.append("--stdin")
+                input = try a.jsonObject(["project_path": project, "angle_id": angle, "group_time": groupTime])
+                return
+            }
+            arguments += ["--project", project]
+            for (key, flag) in [("before_project_path", "--before-project"), ("file", "--file")] {
+                if let value = try a.path(key) { arguments += [flag, value] }
+            }
+            for key in ["space", "from", "to", "source_id", "reference_source_id"] {
+                if let value = try a.string(key) { arguments += [a.flag(key), value] }
+            }
+            if fields["occurrence_index"] != nil {
+                arguments += ["--occurrence-index", try a.number("occurrence_index", integer: true)]
+            }
+            if let path = try a.path("replacement") {
+                arguments += ["--replacement", path]
+                if fields["reference_stream"] != nil {
+                    arguments += ["--reference-stream", try a.number("reference_stream", integer: true)]
+                }
+                arguments += ["--replacement-stream", try a.number("replacement_stream", integer: true)]
+                if fields["program"] != nil, try a.bool("program") { arguments.append("--program") }
+                if let seed = try a.string("seed") { arguments += ["--seed", seed] }
+            }
+            if fields["metadata_only"] != nil, try a.bool("metadata_only") { arguments.append("--metadata-only") }
+            return
+        }
+        if command == "author" {
+            guard let request = fields["request"] as? [String: Any] else { throw a.invalid("Supply a project request.") }
+            let paths = Fields(values: request)
+            _ = try paths.path("out_project")
+            _ = try paths.path("project_path")
+            arguments.append("--stdin")
+            input = try a.jsonObject(request)
+            return
+        }
+        if command == "still" {
+            for key in fields.keys.sorted() where !["operation_id", "working_directory"].contains(key) {
+                let flag = key == "project_path" ? "--project" : a.flag(key)
+                switch key {
+                case "in_place", "gap", "source_timing":
+                    if try a.bool(key) { arguments.append(flag) }
+                case "width", "height", "frames", "fragment_index":
+                    arguments += [flag, try a.number(key, integer: true)]
+                case "image", "out_project", "project_path":
+                    if let path = try a.path(key) { arguments += [flag, path] }
+                default:
+                    if let value = try a.string(key) { arguments += [flag, value] }
+                }
+            }
+            return
+        }
 
-        for name in ["dry_run", "no_sidecar", "open", "allow_loss", "flatten_multicam", "status", "all_sources", "deep", "require_camera_copy"] where fields[name] != nil {
+        for name in ["dry_run", "no_sidecar", "allow_loss", "flatten_multicam", "all_sources", "deep", "require_camera_copy"] where fields[name] != nil {
             if try a.bool(name) { arguments.append(a.flag(name)) }
         }
-        for name in ["stream", "columns", "waveform", "audio_stream", "limit"] where fields[name] != nil {
+        for name in ["columns", "waveform", "limit"] where fields[name] != nil {
             arguments += [a.flag(name), try a.number(name, integer: true)]
         }
-        for name in ["min_pause", "threshold_db", "leave"] where fields[name] != nil {
-            arguments += [a.flag(name), try a.number(name, integer: false)]
+        for (name, flag) in [("packet_audio_stream_index", "--stream"), ("silence_audio_stream_index", "--stream"),
+                             ("audio_stream_index", command == "waveform" ? "--stream" : "--audio-stream")] where fields[name] != nil {
+            arguments += [flag, try a.number(name, integer: true)]
         }
-        for name in ["from", "to", "select", "sample", "preset", "group_by", "audio", "mode", "video", "quality", "tracks", "snap"] {
+        for (key, flag) in [("silence_min_pause_seconds", "--min-pause-seconds"), ("silence_threshold_db", "--threshold-db"),
+                            ("silence_padding_per_side_seconds", "--padding-per-side-seconds")] where fields[key] != nil {
+            arguments += [flag, try a.number(key, integer: false)]
+        }
+        if fields["silence_max_blip_seconds"] != nil {
+            let raw = try a.number("silence_max_blip_seconds", integer: false)
+            guard let seconds = Double(raw), (0...1).contains(seconds),
+                  fields["report"] == nil, fields["input_file"] == nil else {
+                throw a.invalid("Use silence_max_blip_seconds between 0 and 1 seconds with a new silence scan.")
+            }
+            arguments += ["--max-blip-seconds", raw]
+        }
+        for (key, flag) in [("source_from", "--from"), ("source_to", "--to"), ("destination_format", "--to")] {
+            if let value = try a.string(key) { arguments += [flag, value] }
+        }
+        if let destination = try a.path("out_project") { arguments += ["--out-project", destination] }
+        let hasProject = fields["project_path"] != nil || fields["project_data"] != nil
+        if fields["protect_pauses"] != nil {
+            guard hasProject else { throw a.invalid("Protected pause IDs require a project.") }
+            for id in try a.strings("protect_pauses") { arguments += ["--protect-pause", id] }
+        }
+        if let overrides = fields["retain_pauses"] as? [[String: Any]] {
+            guard hasProject else {
+                throw a.invalid("Retained pause durations require a project.")
+            }
+            for override in overrides {
+                let duration = Fields(values: override)
+                guard let id = try duration.string("pause_id"), !id.contains("=") else {
+                    throw a.invalid("Supply a pause ID returned by the project scan.")
+                }
+                arguments += ["--retain-pause", id + "=" + (try duration.number("retained_seconds", integer: false))]
+            }
+        }
+        if fields["take_boundaries"] != nil {
+            guard hasProject, fields["output"] == nil else {
+                throw a.invalid("Take boundaries require a project report without an output movie.")
+            }
+            for time in try a.strings("take_boundaries") { arguments += ["--take-boundary", time] }
+        }
+        if let clock = try a.string("clock") {
+            guard hasProject else { throw a.invalid("clock requires a project.") }
+            arguments += ["--clock", clock]
+        }
+        let subfolder = try a.string("subfolder")
+        let baseName = try a.string("base_name")
+        try ExportOrganization(subfolder: subfolder ?? "", baseName: baseName ?? "").validate()
+        if let subfolder { arguments += ["--subfolder", subfolder] }
+        if let baseName { arguments += ["--base-name", baseName] }
+        if let selection = try a.string("select") {
+            arguments += ["--select", selection == "non_silent" ? "non-silent" : selection]
+        }
+        for name in ["sample", "preset", "group_by", "audio", "audio_output", "mode", "video", "quality", "tracks", "snap"] {
             if let value = try a.string(name) { arguments += [a.flag(name), value] }
         }
         if command == "scenes" {
-            let rangePresent = fields["from"] != nil || fields["to"] != nil
+            let rangePresent = fields["source_from"] != nil || fields["source_to"] != nil
             let selectedScopes = ["clip_id", "camera_id"].filter { fields[$0] != nil }.count
             let projectScopes = selectedScopes + (fields["all_sources"] as? Bool == true ? 1 : 0)
             let policy = try a.string("policy")
-            guard projectScopes <= 1, projectScopes == 0 || fields["project"] != nil else {
+            guard projectScopes <= 1, projectScopes == 0 || fields["project_path"] != nil else {
                 throw a.invalid("Choose one saved-project scene scope.")
             }
             if rangePresent {
-                guard fields["file"] != nil, let from = try a.string("from"), let to = try a.string("to"),
+                guard fields["file"] != nil, let from = try a.string("source_from"), let to = try a.string("source_to"),
                       let start = try? RationalTime(parsing: from), let end = try? RationalTime(parsing: to),
                       start >= .zero, end > start else {
-                    throw a.invalid("A file range requires a nonnegative from and a later to.")
+                    throw a.invalid("A file range requires a nonnegative source_from and a later source_to.")
                 }
             }
-            let exportFields = ["report", "input_file", "scenes_file", "export_to", "dry_run", "container", "group_by", "tracks", "audio_stream"]
-            if fields["project"] != nil || rangePresent || policy != nil {
+            let exportFields = ["report", "input_file", "scenes_file", "export_to", "dry_run", "container", "group_by", "tracks", "audio_stream_index"]
+            if fields["project_path"] != nil || rangePresent || policy != nil {
                 guard exportFields.allSatisfy({ fields[$0] == nil }) else {
                     throw a.invalid("Project, range, and policy options are for scanning scenes.")
                 }
@@ -89,17 +274,17 @@ struct MCPFileRequest {
                 guard ["reuse", "resume", "restart"].contains(policy) else { throw a.invalid("Unknown scene scan policy.") }
                 arguments += ["--policy", policy]
                 if policy == "restart" {
-                    guard let raw = try a.string("operationID"), let id = UUID(uuidString: raw) else {
-                        throw a.invalid("Supply an operationID UUID to restart the scan.")
+                    guard let raw = try a.string("operation_id"), let id = UUID(uuidString: raw) else {
+                        throw a.invalid("Supply an operation_id UUID to restart the scan.")
                     }
                     arguments += ["--operation-id", id.uuidString]
                 }
             }
-            if fields["export_to"] == nil && (fields["file"] != nil || fields["project"] != nil) {
+            if fields["export_to"] == nil && (fields["file"] != nil || fields["project_path"] != nil) {
                 arguments += ["--progress", "jsonl"]
             }
         } else if command == "refresh" {
-            try a.requireOne(["project"])
+            try a.requireOne(["project_path"])
             arguments += ["--progress", "jsonl"]
         }
         if let detail = try a.string("detail"), detail != "metadata" {
@@ -108,7 +293,7 @@ struct MCPFileRequest {
         }
         if let path = try a.path("export_to") { arguments += ["--export-to", path] }
         if let path = try a.path("output") { arguments += ["--output", path] }
-        if let topic = try a.string("topic") { arguments.append(topic) }
+        if let topic = try a.string("topic") { arguments += topic.split(separator: " ").map(String.init) }
         if fields["only"] != nil { arguments += ["--only", try a.strings("only").joined(separator: ",")] }
         if fields["at"] != nil {
             for time in try a.strings("at") {
@@ -126,29 +311,61 @@ struct MCPFileRequest {
         }
 
         if ["inspect", "frames", "export", "resolve", "scenes", "silence"].contains(command) {
-            try a.requireOne(["file", "project", "project_data", "edit", "report", "input_file", "clips_file"])
+            try a.requireOne(["file", "project_path", "project_data", "edit", "report", "input_file", "clips_file"])
         }
 
         switch command {
+        case "silence":
+            if (fields["audio"] != nil || fields["audio_output"] != nil) && (!hasProject || fields["output"] == nil) {
+                throw a.invalid("Audio delivery requires a project and an output path.")
+            }
+            if hasProject && ["silence_audio_stream_index", "audio_stream_index", "waveform", "tracks", "pauses_file"]
+                .contains(where: { fields[$0] != nil }) {
+                throw a.invalid("Project silence uses the tracks selected in the project and scans its original media.")
+            }
+            if (fields["report"] != nil || fields["input_file"] != nil)
+                && ["silence_audio_stream_index", "silence_threshold_db", "silence_min_pause_seconds", "waveform"]
+                .contains(where: { fields[$0] != nil }) {
+                throw a.invalid("Detection settings and waveform columns require a new silence scan.")
+            }
+        case "frames":
+            let exact = fields["at"] != nil || fields["at_file"] != nil
+            if hasProject && !exact {
+                throw a.invalid("Supply at or at_file for project frame exports.")
+            }
+            if exact && ["select", "sample", "limit"].contains(where: { fields[$0] != nil }) {
+                throw a.invalid("Use select, sample and limit for automatic frame selection.")
+            }
+            if fields["select"] as? String != "non_silent"
+                && ["silence_audio_stream_index", "silence_threshold_db", "silence_min_pause_seconds"]
+                .contains(where: { fields[$0] != nil }) {
+                throw a.invalid("Audio settings require select non_silent.")
+            }
         case "bulk":
             if fields["input_file"] != nil,
                !Set(fields.keys).isDisjoint(with: ["file", "output_directory", "ranges", "ranges_file", "container"]) {
                 throw a.invalid("A bulk input_file contains its own source, destination, ranges and container.")
             }
         case "export", "resolve":
-            if fields["require_camera_copy"] != nil, fields["project"] == nil && fields["project_data"] == nil {
+            if fields["require_camera_copy"] != nil, fields["project_path"] == nil && fields["project_data"] == nil {
                 throw a.invalid("Use require_camera_copy with a project input.")
             }
-            let needsOutput = ["project", "project_data", "clips_file"].contains { fields[$0] != nil }
+            if let spacing = try a.string("space_clips") {
+                guard spacing == "source" || (try? RationalTime(parsing: spacing)).map({ $0 >= .zero }) == true else {
+                    throw a.invalid("Use source or a nonnegative gap duration for space_clips.")
+                }
+                arguments += ["--space-clips", spacing]
+            }
+            let needsOutput = ["project_path", "project_data", "clips_file"].contains { fields[$0] != nil }
             guard needsOutput == (fields["output"] != nil) else {
                 throw a.invalid(needsOutput ? "Supply output for the selected input." : "Supply the destination in the edit request.")
             }
-        case "frames", "rearrange", "convert":
+        case "rearrange", "convert":
             guard fields["output"] != nil else { throw a.invalid("Supply output.") }
         default:
             break
         }
-        if let project = try a.path("project") {
+        if let project = try a.path("project_path") {
             arguments += ["--project", project]
         } else if let project = fields["project_data"] {
             arguments += ["--project", "-"]
@@ -158,13 +375,8 @@ struct MCPFileRequest {
                   try Fields(values: edit).path("output") != nil else {
                 throw a.invalid("Supply edit.output and a nonempty edit.clips array.")
             }
-            if clips.contains(where: { $0["csv"] != nil || $0["rangesFile"] != nil }) {
-                guard command == "export" else { throw a.invalid("CSV/range files are supported by file_export.") }
-                arguments += try a.csvExport(edit: edit, clips: clips)
-            } else {
-                arguments += ["--stdin"]
-                input = try a.jsonObject(edit)
-            }
+            arguments += ["--stdin"]
+            input = try a.jsonObject(edit)
         } else if let report = fields["report"] {
             arguments += ["--stdin"]
             input = try a.jsonObject(report)
@@ -185,7 +397,7 @@ struct MCPFileRequest {
                 let ranges = try a.ranges()
                 if command == "bulk" {
                     guard let output = try a.path("output_directory") else { throw a.invalid("Supply output_directory.") }
-                    var request: [String: Any] = ["file": file, "outputDirectory": output,
+                    var request: [String: Any] = ["file": file, "output_directory": output,
                                                   "ranges": ranges.map { ["from": $0.from, "to": $0.to] }]
                     request["container"] = try a.string("container")
                     arguments.append("--stdin")
@@ -284,41 +496,36 @@ struct MCPFileRequest {
             }
         }
 
-        func csvExport(edit: [String: Any], clips: [[String: Any]]) throws -> [String] {
-            let e = Self(values: edit)
-            guard let output = try e.path("output"),
-                  Set(edit.keys).isSubset(of: ["file","output","clips","order","replaceAudio","replaceTrack","replacementStream"]) else {
-                throw invalid("Supply edit.output and supported file edit fields.")
-            }
-            var result = ["--output", output]
-            if let donor = try e.path("replaceAudio") { result += ["--replace-audio", donor] }
-            for (key, option) in [("replaceTrack","--replace-track"), ("replacementStream","--replacement-stream")] where edit[key] != nil {
-                result += [option, try e.number(key, integer: true)]
-            }
-            if edit["order"] != nil {
-                let values = edit["order"] as? [Any] ?? []
-                let order = values.compactMap(mcpInteger)
-                guard !order.isEmpty, order.count == values.count, order.allSatisfy({ $0 >= 1 }) else {
-                    throw invalid("Supply one-based clip numbers for order.")
-                }
-                result += ["--order", order.map(String.init).joined(separator: ",")]
-            }
-            let source = try e.path("file")
-            for clip in clips {
-                let c = Self(values: clip)
-                guard let file = try c.path("file") ?? source,
-                      Set(clip.keys).isSubset(of: ["file", "from", "to", "csv", "rangesFile"]),
-                      clip["csv"] == nil || clip["rangesFile"] == nil else {
-                    throw invalid("CSV/range edits accept file clips with from, to, and one cut list.")
-                }
-                result += ["--clip", file]
-                for key in ["from", "to"] {
-                    if let t = try c.timestamp(key) { result += [c.flag(key), t] }
-                }
-                if let csv = try c.path("csv") { result += ["--csv", csv] }
-                if let ranges = try c.path("rangesFile") { result += ["--ranges", ranges] }
-            }
-            return result
+    }
+}
+
+extension MCPFileRequest {
+    static func transcriptCommand(for tool: String) -> [String]? {
+        switch tool {
+        case "transcript_file_provider_capabilities_read": ["transcript", "provider", "capabilities"]
+        case "transcript_file_tracks_list": ["transcript", "tracks", "list"]
+        case "transcript_file_job_run": ["transcript", "job", "run"]
+        case "transcript_file_job_prepare": ["transcript", "job", "prepare"]
+        case "transcript_file_job_status_read": ["transcript", "job", "status"]
+        case "transcript_file_job_cancel": ["transcript", "job", "cancel"]
+        case "transcript_file_job_retry": ["transcript", "job", "retry"]
+        case "transcript_file_attachment_import": ["transcript", "attachment", "import"]
+        case "transcript_file_attachment_inspect": ["transcript", "attachment", "inspect"]
+        case "transcript_file_attachment_bind": ["transcript", "attachment", "bind"]
+        case "transcript_file_attachment_detach": ["transcript", "attachment", "detach"]
+        case "transcript_file_words_read": ["transcript", "words", "read"]
+        case "transcript_file_words_search": ["transcript", "words", "search"]
+        case "transcript_file_occurrences_locate": ["transcript", "words", "locate"]
+        case "transcript_file_takes_compare": ["transcript", "words", "compare"]
+        case "transcript_file_edits_suggest": ["transcript", "words", "suggest"]
+        case "transcript_file_words_correct": ["transcript", "words", "correct"]
+        case "transcript_file_selection_resolve": ["transcript", "words", "select"]
+        case "transcript_file_script_align": ["transcript", "script", "align"]
+        case "transcript_file_edit_plan": ["transcript", "edit", "plan"]
+        case "transcript_file_edit_apply": ["transcript", "edit", "apply"]
+        case "transcript_file_excerpt_queue": ["transcript", "excerpt", "queue"]
+        case "transcript_file_export": ["transcript", "export"]
+        default: nil
         }
     }
 }

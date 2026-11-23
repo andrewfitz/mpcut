@@ -8,13 +8,19 @@ extension MulticamEditorModel {
 
     func chooseStillFrame() {
         guard canExportStillFrame, let window, let project else { return }
+        if project.participants.render != nil {
+            fail(ParticipantProjectExport.unsupported("Project frame export").message)
+            return
+        }
+        let generation = mcpGeneration
         preview.pause()
         do {
             if let still = try stillFrameAtPlayhead() {
                 let options = StillFrameSaveOptions()
                 let panel = options.panel(source: still.url, directory: projectURL?.deletingLastPathComponent())
                 ProjectPanels.present(panel, in: window) { [weak self, options] accepted in
-                    guard let self, accepted, let output = panel.url, self.project == project else { return }
+                    guard let self, accepted, let output = panel.url, self.mcpGeneration == generation,
+                          self.project == project else { return }
                     do { try self.validateHistoryDestination(output) }
                     catch { self.fail(error.localizedDescription); return }
                     let confirmed = options.confirmedDestination(at: output)
@@ -26,7 +32,7 @@ extension MulticamEditorModel {
             }
             guard let mapping else { return }
             let position = try MulticamStillPosition.at(preview.currentTime(), in: mapping)
-            guard let angle = project.angles.first(where: { $0.id == position.angle }) else {
+            guard let angle = project.pictureSources.first(where: { $0.id == position.angle }) else {
                 throw CutError(code: "no_frame", message: "No camera is selected at the playhead.")
             }
             if let issue = refreshPictureIssue(sourceID: angle.id) {
@@ -41,7 +47,8 @@ extension MulticamEditorModel {
             let options = StillFrameSaveOptions()
             let panel = options.panel(source: url, directory: projectURL?.deletingLastPathComponent())
             ProjectPanels.present(panel, in: window) { [weak self, options] accepted in
-                guard let self, accepted, let output = panel.url, self.project == project, self.mapping == mapping else { return }
+                guard let self, accepted, let output = panel.url, self.mcpGeneration == generation,
+                      self.project == project, self.mapping == mapping else { return }
                 do { try self.validateHistoryDestination(output) }
                 catch { self.fail(error.localizedDescription); return }
                 let confirmed = options.confirmedDestination(at: output)
@@ -60,6 +67,11 @@ extension MulticamEditorModel {
 
     func chooseJPEGExport() {
         guard !isBusy, let window, let project else { return }
+        if project.participants.render != nil {
+            fail(ParticipantProjectExport.unsupported("Project frame export").message)
+            return
+        }
+        let generation = mcpGeneration
         preview.pause()
         let outputTime = preview.currentTime()
         // An end handle is exclusive. Review the held outgoing picture at a parked endpoint.
@@ -80,8 +92,9 @@ extension MulticamEditorModel {
         } else {
             group = groupTime(at: position)
         }
-        let angle = group.flatMap(project.selection(at:)).flatMap { selection in
-            project.angles.first(where: { $0.id == selection.angle })
+        let angle = group.flatMap { time in
+            let occurrence = assemblyPreview ? occurrenceIndex(at: position) : nil
+            return project.pictureAngle(at: time, in: occurrence).flatMap { project.pictureSource(for: $0, at: time) }
         }
         let cameraURL = angle.map { angle in
             projectURL.map { project.sourceURL(for: angle, relativeTo: $0) } ?? URL(fileURLWithPath: angle.file)
@@ -99,7 +112,8 @@ extension MulticamEditorModel {
                                   hasAudio: stream != nil, multicam: true, hasAnalysisSource: angle != nil,
                                   hasProgramStill: still != nil)
         ProjectPanels.present(panel, in: window) { [weak self] accepted in
-            guard let self, accepted, let directory = panel.url, self.project == project else { return }
+            guard let self, accepted, let directory = panel.url, self.mcpGeneration == generation,
+                  self.project == project else { return }
             do {
                 try self.validateHistoryDestination(directory, includesContents: true)
                 let limit = try options.frameLimit()
@@ -107,7 +121,7 @@ extension MulticamEditorModel {
                 let programPicture = options.programPicture
                 let times = options.allSwitches ? project.switches.map(\.at) : group.map { [$0] } ?? []
                 let cameras = mode == .playhead
-                    ? times.compactMap { project.selection(at: $0)?.angle }
+                    ? times.flatMap { time in project.angles.compactMap { project.pictureSource(for: $0.id, at: time)?.id } }
                     : [angle?.id].compactMap { $0 }
                 if !(mode == .playhead && (programPicture || angle == nil) && still != nil),
                    let issue = cameras.lazy.compactMap({ self.refreshPictureIssue(sourceID: $0) }).first {
@@ -115,6 +129,7 @@ extension MulticamEditorModel {
                 }
                 let indexed = self.media, document = self.projectURL
                 let minimum = self.preferences.minimumPause
+                let maxBlip = self.preferences.maxBlip
                 let analysis = source.map(self.analysis.snapshot(for:))
                 let threshold = angle.flatMap { angle in stream.flatMap { self.analysis.threshold(for: .init(source: angle.id, stream: $0)) } }
                 self.run("Exporting JPEG frames…", exporting: true) { token, useSidecar in
@@ -139,12 +154,14 @@ extension MulticamEditorModel {
                     let selection: JPEGSelection
                     if mode == .scenes {
                         selection = analysis?.scenes.map(JPEGSelection.sceneReport) ?? .scenes
-                    } else if let result = analysis?.silence.first(where: { $0.stream == stream && $0.minimum == minimum }),
+                    } else if let result = analysis?.silence.first(where: {
+                        $0.stream == stream && $0.minimum == minimum && $0.requestedThresholdDB == threshold
+                    }),
                               try media.extendingToAudioEnd(stream: result.stream).duration == media.duration {
-                        selection = .audibleRanges(pauses: result.pauses, stream: result.stream,
+                        selection = .audibleRanges(pauses: result.pauses(maxBlip: maxBlip), stream: result.stream,
                                                    thresholdDB: result.thresholdDB, minimumPause: minimum)
                     } else {
-                        selection = .nonSilent(stream: stream, thresholdDB: threshold, minimumPause: minimum)
+                        selection = .nonSilent(stream: stream, thresholdDB: threshold, minimumPause: minimum, maxBlip: maxBlip)
                     }
                     return try JPEGExport.write(media, to: directory, selection: selection, sample: sample,
                         preset: preset, limit: limit, useSidecar: useSidecar, cancelled: cancelled).frames.count

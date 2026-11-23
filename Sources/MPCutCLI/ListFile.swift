@@ -3,10 +3,6 @@ import MPCutCore
 
 /// File arguments carry data, including paths that happen to look like command-line flags.
 enum ListFile {
-    static func isListPath(_ path: String) -> Bool {
-        ["csv", "json"].contains(URL(fileURLWithPath: path).pathExtension.lowercased())
-    }
-
     private static func invalid(_ message: String) -> CLIError { CLIError("invalid_list", message) }
 
     private struct Entries<Element: Decodable>: Decodable {
@@ -179,20 +175,20 @@ enum ListFile {
         try values(path, csv: { records in
             guard let first = records.first else { return [] }
             let header = first.map { $0.lowercased() }
-            let hasHeader = header.first == "file" || header.first == "project"
+            let hasHeader = header.first == "file" || header.first == "project_path"
             let columns = hasHeader ? header : ["file"]
-            guard Set(columns).isSubset(of: ["file", "project", "from", "to"]), Set(columns).count == columns.count else {
-                throw invalid("Use CSV clip columns file or project, with optional from and to.")
+            guard Set(columns).isSubset(of: ["file", "project_path", "from", "to"]), Set(columns).count == columns.count else {
+                throw invalid("Use CSV clip columns file or project_path, with optional from and to.")
             }
             return try records.dropFirst(hasHeader ? 1 : 0).map { row in
                 guard row.count == columns.count else { throw invalid("Invalid CSV clip row.") }
                 let fields = Dictionary(uniqueKeysWithValues: zip(columns, row)).filter { !$0.value.isEmpty }
-                guard (fields["file"] == nil) != (fields["project"] == nil) else {
-                    throw invalid("Choose one file or project for each clip.")
+                guard (fields["file"] == nil) != (fields["project_path"] == nil) else {
+                    throw invalid("Choose file or project_path for each clip.")
                 }
                 var clip = InputClip(file: "")
                 clip.file = fields["file"]
-                clip.project = fields["project"]
+                clip.project = fields["project_path"]
                 clip.from = fields["from"]
                 clip.to = fields["to"]
                 return clip
@@ -209,6 +205,14 @@ enum ListFile {
             let end: Scalar
             let view: Decimal
             let number: Decimal?
+
+            init(from decoder: Decoder) throws {
+                let fields = try decoder.requestFields(SceneExportInput.Scene.CodingKeys.self, in: "Scene")
+                start = try fields.decode(Scalar.self, forKey: .start)
+                end = try fields.decode(Scalar.self, forKey: .end)
+                view = try fields.decode(Decimal.self, forKey: .view)
+                number = try fields.decodeIfPresent(Decimal.self, forKey: .number)
+            }
         }
         return try values(path, csv: { records in
             guard let header = records.first, Set(header).isSuperset(of: ["start", "end", "view"]),

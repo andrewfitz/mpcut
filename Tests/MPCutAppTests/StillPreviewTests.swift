@@ -1,5 +1,7 @@
 import AVFoundation
+import ImageIO
 import MPCutCore
+import UniformTypeIdentifiers
 import XCTest
 @testable import MPCutApp
 
@@ -23,6 +25,53 @@ final class StillPreviewTests: XCTestCase {
         XCTAssertEqual(program.picture(at: RationalTime(numerator: 9))?.url.path, "/tmp/sequence/media/photo.png")
         XCTAssertNil(program.picture(at: RationalTime(numerator: 11)))
         XCTAssertEqual(program.duration, .init(numerator: 13))
+    }
+
+    func testStillProgramUsesExplicitCanvasAndRejectsReplacedImage() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("card.png")
+        let context = try XCTUnwrap(CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+                                              space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        context.fill(.init(x: 0, y: 0, width: 2, height: 2))
+        let png = try XCTUnwrap(CGImageDestinationCreateWithURL(source as CFURL, UTType.png.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(png, try XCTUnwrap(context.makeImage()), nil)
+        XCTAssertTrue(CGImageDestinationFinalize(png))
+        let asset = StillAsset(id: "image", file: "card.png", displayName: "Card",
+                               fingerprint: try StillImage.fingerprint(source))
+        let cadence = RationalTime(numerator: 1, denominator: 30)
+        let card = StillInsert(id: "card", assetID: asset.id, duration: .init(numerator: 1), cadence: cadence)
+        let format = StillTimelineFormat(width: 96, height: 64, cadence: cadence, codec: .h264, container: "mov")
+        let project = CutProject.stillSequence(.init(items: [.still(card)], stillAssets: [asset], stillFormat: format))
+        let movie = try XCTUnwrap(Bundle.module.url(forResource: "Shuttle-Chirp", withExtension: "mov",
+                                                    subdirectory: "Fixtures"))
+        let reference = try CutEngine(useSidecar: false).inspect(movie, keyframes: false)
+        let document = directory.appendingPathComponent("project.cut")
+        let program = try XCTUnwrap(ProgramPreviewStills(project: project, reference: reference, document: document))
+        let picture = try XCTUnwrap(program.picture(at: RationalTime.zero))
+        let renderer = ProgramPreviewRenderer()
+        let frame = try await renderer.render(picture, canvas: program.canvas)
+        XCTAssertEqual(CVPixelBufferGetWidth(frame.buffer), 96)
+        XCTAssertEqual(CVPixelBufferGetHeight(frame.buffer), 64)
+        let review = try project.stillReviewFrame(placementID: card.id, interval: picture.output,
+                                                document: document, canvas: reference)
+        let jpeg = try review.jpeg(preset: .review, cancelled: { false })
+        XCTAssertEqual(jpeg.width, 96)
+        XCTAssertEqual(jpeg.height, 64)
+
+        try Data("replacement".utf8).write(to: source, options: .atomic)
+        do {
+            _ = try await renderer.render(picture, canvas: program.canvas)
+            XCTFail("The changed still should require relinking.")
+        } catch let error as CutError {
+            XCTAssertEqual(error.code, "source_changed")
+        }
+        XCTAssertThrowsError(try review.jpeg(preset: .review, cancelled: { false })) {
+            XCTAssertEqual(($0 as? CutError)?.code, "source_changed")
+        }
     }
 
     @MainActor
@@ -52,6 +101,11 @@ final class StillPreviewTests: XCTestCase {
         let input = try XCTUnwrap(source)
         let frame = PreviewFrame(buffer: input, time: .zero, transform: .identity, programTransfer: "smpte2084")
         XCTAssertFalse(PreviewTransfer(frame: frame).isVerified)
+        XCTAssertFalse(PreviewTransfer(frame: frame.tagged(transfer: "smpte2084", cameraTransfer: "smpte2084")).isVerified)
+        let untaggedCamera = PreviewTransfer(frame: frame.tagged(transfer: "smpte2084", cameraTransfer: "unknown"))
+        XCTAssertTrue(untaggedCamera.isVerified)
+        XCTAssertTrue(untaggedCamera.usesSDRCameraPreview)
+        XCTAssertEqual(untaggedCamera.program, "PQ")
 
         let pq = kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
         CVBufferSetAttachment(input, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)

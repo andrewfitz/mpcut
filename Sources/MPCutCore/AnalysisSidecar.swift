@@ -35,7 +35,7 @@ public struct AnalysisSidecar: Sendable {
     }
 
     public let source: URL
-    let identity: SourceIdentity
+    package let identity: SourceIdentity
     public var url: URL { Self.url(for: source) }
 
     public static func url(for source: URL) -> URL { source.appendingPathExtension("cutdb") }
@@ -61,7 +61,7 @@ public struct AnalysisSidecar: Sendable {
     }
 
     private static let applicationID: Int32 = 0x4d504354 // MPCT
-    private static let version: Int32 = 2
+    static let schemaVersion: Int32 = 3
 
     package func checkSource() throws {
         guard identity.isCurrentSnapshot(at: source) else {
@@ -100,9 +100,9 @@ public struct AnalysisSidecar: Sendable {
             throw sidecarError("The sidecar has no readable SQLite header.")
         }
         guard !header.usesWriteAheadLog, header.applicationID == Self.applicationID,
-              (1...Self.version).contains(header.userVersion) else { throw unsupported }
+              header.userVersion == Self.schemaVersion else { throw unsupported }
         let kind = try db.integer("PRAGMA application_id")
-        guard kind == Self.applicationID, (1...Self.version).contains(try db.integer("PRAGMA user_version")) else {
+        guard kind == Self.applicationID, try db.integer("PRAGMA user_version") == Self.schemaVersion else {
             throw CutError(code: "unsupported_sidecar", message: "This file is not a supported MPCut analysis sidecar.")
         }
     }
@@ -138,23 +138,11 @@ public struct AnalysisSidecar: Sendable {
         return saved.drop { $0 != ":" } == stamp.drop { $0 != ":" } ? saved : nil
     }
 
-    /// An empty file, or one of MPCut's databases that SQLite reports as
-    /// corrupt, can be rebuilt. Any other file is left for the user to resolve.
-    private func damaged(cancelled: () -> Bool) -> Bool {
+    // A nonempty container can hold authored metadata even when SQLite cannot read it.
+    private func isEmptyPlaceholder() -> Bool {
         var info = stat()
-        guard lstat(url.path, &info) == 0 else { return false }
-        if info.st_size == 0 { return true }
-        guard let db = try? SidecarDatabase(url, writing: true) else { return false }
-        do {
-            try db.whileWaitingForLocks(cancelled) {
-                try validate(db)
-                _ = try storedStamp(db)
-            }
-            return false
-        } catch {
-            guard db.isCorrupt, let header = db.headerVersions() else { return false }
-            return header.applicationID == Self.applicationID && (1...Self.version).contains(header.userVersion)
-        }
+        return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFREG &&
+            info.st_nlink == 1 && info.st_size == 0
     }
 
     /// Inspects the container and media identity without loading any analysis payload.
@@ -285,6 +273,23 @@ public struct AnalysisSidecar: Sendable {
         try transact(sections, updating: updating, retainingLatest: retainingLatest, cancelled: cancelled) { _, _ in }
     }
 
+    /// Save automatic cache entries in arrival order, including repeated keys.
+    /// The last write to a key counts as its latest use for retention.
+    package func saveOrderedCacheEntries(_ entries: [(key: String, value: Data)], prefix: String,
+                                         keepingLatest limit: Int, cancelled: () -> Bool) throws {
+        guard Self.readsEnabled, Self.automaticWritesEnabled, !isExcluded, !entries.isEmpty else { return }
+        guard Self.validKey(prefix), limit >= 0,
+              entries.allSatisfy({ Self.validKey($0.key) && $0.key.hasPrefix(prefix) }) else {
+            throw sidecarError("Invalid ordered cache entries or retention limit.")
+        }
+        try transact(cancelled: cancelled) { db, stamp in
+            for (key, value) in entries {
+                try writeSection(key, value: value, db: db, stamp: stamp, cancelled: cancelled)
+            }
+            try Self.pruneSections(in: db, prefix: prefix, keepingLatest: limit)
+        }
+    }
+
     @discardableResult
     func transact<T>(_ sections: [String: Data] = [:], updating: [String: (Data?) throws -> Data] = [:],
                      retainingLatest: [String: Int] = [:], cancelled: () -> Bool,
@@ -299,7 +304,7 @@ public struct AnalysisSidecar: Sendable {
             throw sidecarError("Invalid section retention limit.")
         }
 
-        if try !exists() || damaged(cancelled: cancelled) {
+        if try !exists() || isEmptyPlaceholder() {
             // Stage beside the media. Exclusive publication prevents a race with
             // a second writer and leaves no empty database behind on cancellation.
             var template = Array((url.deletingLastPathComponent().appendingPathComponent(".mpcut-XXXXXX").path).utf8CString)
@@ -312,7 +317,7 @@ public struct AnalysisSidecar: Sendable {
                                    cancelled: cancelled, refresh: refresh, change)
             try checkSource()
             try checkSidecarCancellation(cancelled)
-            guard chmod(staging.path, 0o666 & ~creationMask) == 0 else { throw sidecarError(String(cString: strerror(errno))) }
+            guard chmod(staging.path, try publicationPermissions(0o666)) == 0 else { throw sidecarError(String(cString: strerror(errno))) }
             if try publish(staging, cancelled: cancelled) { return result }
             // Another writer published first. Merge into its committed database.
             guard try exists() else { throw sidecarError("The destination changed while saving.") }
@@ -329,7 +334,7 @@ public struct AnalysisSidecar: Sendable {
         try checkSidecarCancellation(cancelled)
     }
 
-    /// A damaged database has no SQLite write lock that all repairers can use.
+    /// Empty placeholders have no SQLite write lock that all publishers can use.
     /// Serialize the final destination check and rename across processes without
     /// creating another file beside the recording. Healthy writers use SQLite.
     private func publish(_ staging: URL, cancelled: () -> Bool) throws -> Bool {
@@ -354,7 +359,7 @@ public struct AnalysisSidecar: Sendable {
         try checkSource()
         try checkSidecarCancellation(cancelled)
         if try exists() {
-            guard damaged(cancelled: cancelled) else { return false }
+            guard isEmptyPlaceholder() else { return false }
             try checkSidecarCancellation(cancelled)
             try requireClearJournalPath()
             guard rename(staging.path, url.path) == 0 else { throw sidecarError(String(cString: strerror(errno))) }
@@ -384,8 +389,8 @@ public struct AnalysisSidecar: Sendable {
                     CREATE TABLE sections(name TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL, value BLOB NOT NULL);
                     """)
                 try db.update("INSERT INTO source(id, stamp) VALUES(1, ?)", [stamp])
+                try createManifest(db)
             }
-            try migrateManifest(db)
             let indexUpdate = try refresh == nil
                 ? prepareIndexEvidence(sections[Self.evidenceKey], in: db, cancelled: cancelled)
                 : (refresh: nil, evidence: sections[Self.evidenceKey])
@@ -404,19 +409,22 @@ public struct AnalysisSidecar: Sendable {
                 try writeSection(key, value: value, db: db, stamp: saved, cancelled: cancelled)
             }
             for (prefix, keep) in retainingLatest {
-                // The rowid tracks insertion, including INSERT OR REPLACE above.
-                // Match the literal prefix; section names may contain wildcards.
-                try db.update("""
-                    DELETE FROM sections WHERE rowid IN (
-                        SELECT rowid FROM sections WHERE substr(name, 1, length(?)) = ?
-                        ORDER BY rowid DESC LIMIT -1 OFFSET ?)
-                    """, [prefix, prefix, String(keep)])
+                try Self.pruneSections(in: db, prefix: prefix, keepingLatest: keep)
             }
             try checkSource()
             try checkSidecarCancellation(cancelled)
             try db.execute("COMMIT")
             return result
         }
+    }
+
+    private static func pruneSections(in db: SidecarDatabase, prefix: String, keepingLatest limit: Int) throws {
+        // The rowid tracks insertion, including INSERT OR REPLACE. Match the literal prefix.
+        try db.update("""
+            DELETE FROM sections WHERE rowid IN (
+                SELECT rowid FROM sections WHERE substr(name, 1, length(?)) = ?
+                ORDER BY rowid DESC LIMIT -1 OFFSET ?)
+            """, [prefix, prefix, String(limit)])
     }
 
     func writeSection(_ key: String, value: Data, db: SidecarDatabase, stamp saved: String,
@@ -520,7 +528,6 @@ final class SidecarDatabase {
 
     func error() -> CutError { sidecarError(String(cString: sqlite3_errmsg(handle))) }
 
-    var isCorrupt: Bool { [SQLITE_CORRUPT, SQLITE_NOTADB].contains(sqlite3_errcode(handle)) }
 
     /// Reads the file header through SQLite's own descriptor. Closing a second
     /// descriptor would release every lock this process holds on the database.

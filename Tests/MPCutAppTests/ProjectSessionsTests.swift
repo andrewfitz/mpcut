@@ -5,6 +5,20 @@ import XCTest
 
 final class ProjectSessionsTests: XCTestCase {
     @MainActor
+    func testDroppedFinderMediaAliasReturnsItsRecording() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let recording = directory.appendingPathComponent("Camera.mov")
+        try Data().write(to: recording)
+        let alias = directory.appendingPathComponent("Camera alias")
+        try URL.writeBookmarkData(recording.bookmarkData(options: [.suitableForBookmarkFile]), to: alias)
+        let sessions = ProjectSessions(preferences: EditorPreferences())
+        let dropped = try XCTUnwrap(sessions.openDroppedProjects([alias], in: nil).first)
+        XCTAssertTrue(ProjectSessions.sameFile(dropped, recording))
+    }
+
+    @MainActor
     func testFinderColdLaunchWaitsForActualWindowAndWarmOpenCreatesOne() async throws {
         _ = NSApplication.shared
         var opened: [UUID] = []
@@ -39,6 +53,81 @@ final class ProjectSessionsTests: XCTestCase {
         sessions.openFiles([document, document])
         XCTAssertEqual(opened.count, 1)
         XCTAssertEqual(sessions.sessions.count, 1)
+    }
+
+    @MainActor
+    func testFinderBatchJoinsClipsOrStartsMulticamWithoutSetup() async throws {
+        _ = NSApplication.shared
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
+                                                       subdirectory: "Fixtures"))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = directory.appendingPathComponent("Camera B.mov")
+        let second = directory.appendingPathComponent("Camera A.mov")
+        try FileManager.default.copyItem(at: fixture, to: first)
+        try FileManager.default.copyItem(at: fixture, to: second)
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        var opened: [UUID] = []
+        let sessions = ProjectSessions(preferences: preferences, launching: true, openWindow: { opened.append($0) })
+        let session = sessions.session(for: nil)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 730, height: 500),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer {
+            if let sheet = window.attachedSheet { window.endSheet(sheet, returnCode: .alertThirdButtonReturn) }
+            for active in Array(sessions.sessions.values) { sessions.windowClosed(active) }
+            window.close()
+        }
+        func waitUntil(_ condition: () -> Bool) async throws {
+            let deadline = ContinuousClock.now + .seconds(5)
+            while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertTrue(condition())
+        }
+
+        sessions.openFiles([first, second], fromFinder: true)
+        sessions.finishLaunching()
+        sessions.register(session, window: window)
+        try await waitUntil { window.attachedSheet != nil }
+        XCTAssertTrue(session.editor.isEmpty)
+        window.endSheet(try XCTUnwrap(window.attachedSheet), returnCode: .alertFirstButtonReturn)
+        try await waitUntil { session.editor.timelineClips.count == 2 }
+        XCTAssertEqual(session.editor.timelineClips.map(\.name), [first.lastPathComponent, second.lastPathComponent])
+        XCTAssertTrue(opened.isEmpty)
+
+        let other = sessions.session(for: nil)
+        let otherWindow = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: true)
+        otherWindow.isReleasedWhenClosed = false
+        sessions.register(other, window: otherWindow)
+        defer { otherWindow.close() }
+        let project = directory.appendingPathComponent("Other.cut")
+        try CutProject.sequence([]).save(to: project)
+        sessions.openFiles([first, second], in: session, fromFinder: true)
+        sessions.openFiles([project], in: other)
+        XCTAssertNil(sessions.project(at: project))
+        window.endSheet(try XCTUnwrap(window.attachedSheet), returnCode: .alertThirdButtonReturn)
+        try await waitUntil { sessions.project(at: project) === other }
+        XCTAssertTrue(opened.isEmpty)
+
+        sessions.openFiles([second, first], in: session, fromFinder: true)
+        window.endSheet(try XCTUnwrap(window.attachedSheet), returnCode: .alertFirstButtonReturn)
+        try await waitUntil { session.editor.timelineClips.count == 4 }
+        XCTAssertEqual(session.editor.timelineClips.map(\.name),
+                       [first.lastPathComponent, second.lastPathComponent, second.lastPathComponent, first.lastPathComponent])
+
+        sessions.openFiles([second, first], in: session, fromFinder: true)
+        window.endSheet(try XCTUnwrap(window.attachedSheet), returnCode: .alertSecondButtonReturn)
+        try await waitUntil { !opened.isEmpty }
+        let multicam = try XCTUnwrap(opened.first.map { sessions.session(for: $0) })
+        try await waitForProject(multicam.multicam)
+        XCTAssertTrue(multicam.isMulticam)
+        XCTAssertTrue(multicam.multicam.setup.isEmpty)
+        let angles = try XCTUnwrap(multicam.multicam.project?.angles)
+        XCTAssertEqual(angles.map { URL(fileURLWithPath: $0.file).lastPathComponent },
+                       [second.lastPathComponent, first.lastPathComponent])
+        XCTAssertEqual(multicam.multicam.project?.referenceAngle, angles.first?.id)
+        XCTAssertEqual(session.editor.timelineClips.count, 4)
     }
 
     @MainActor
@@ -251,8 +340,12 @@ final class ProjectSessionsTests: XCTestCase {
         XCTAssertEqual(sessions.commandContext?.isMulticam, false)
         notifications.post(name: NSWindow.willBeginSheetNotification, object: multicamWindow)
         XCTAssertNil(sessions.commandContext)
-        notifications.post(name: NSWindow.didBecomeKeyNotification, object: multicamWindow)
+        sessions.restoreCommandsAfterSheet(on: multicamWindow, keyWindow: nil, mainWindow: multicamWindow)
         XCTAssertTrue(sessions.commandContext?.session === multicam)
+        sessions.restoreCommandsAfterSheet(on: multicamWindow, keyWindow: regularWindow, mainWindow: multicamWindow)
+        XCTAssertTrue(sessions.commandContext?.session === regular)
+        sessions.restoreCommandsAfterSheet(on: multicamWindow, keyWindow: nil, mainWindow: regularWindow)
+        XCTAssertNil(sessions.commandContext)
         notifications.post(name: NSWindow.didBecomeKeyNotification, object: settingsWindow)
         XCTAssertNil(sessions.commandContext)
     }
@@ -291,7 +384,7 @@ final class ProjectSessionsTests: XCTestCase {
             let session = sessions.session(for: nil)
             session.isMulticam = true
             sessions.register(session, window: window)
-            try session.multicam.draft.write { try CutProject.sequence([]).save(to: $0) }
+            try session.multicam.draft.write { try CutProject.sequence([]).saveStaged(to: $0, undo: [], redo: []) }
             return try XCTUnwrap(session.multicam.draft.url)
         }
         XCTAssertTrue(files.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })

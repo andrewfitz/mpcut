@@ -37,6 +37,8 @@ void mp_preview_close(MPPreviewDecoder *preview);
 void mp_preview_enable_audio(MPPreviewDecoder *preview, bool enabled);
 /* Request the selected stream's surround layout before reading its first sample. */
 void mp_preview_preserve_surround(MPPreviewDecoder *preview);
+/* Keep the selected source channel order, including a single mono channel. */
+void mp_preview_preserve_audio_channels(MPPreviewDecoder *preview);
 bool mp_preview_has_audio(const MPPreviewDecoder *preview);
 bool mp_preview_has_unavailable_audio(const MPPreviewDecoder *preview);
 /* Seconds count from the video track's first picture, whatever origin was given to mp_preview_open. */
@@ -44,8 +46,14 @@ bool mp_preview_seek(MPPreviewDecoder *preview, double seconds);
 /* Seconds count from the origin of the presented sample times. The two differ
  * when an explicit origin precedes a picture track that starts late. */
 bool mp_preview_seek_timeline(MPPreviewDecoder *preview, double seconds);
+/* On MPPreviewVideo or MPPreviewAudio, the caller owns the returned sample.
+ * MPPreviewAgain means no sample is ready and the caller may retry. */
 int mp_preview_next(MPPreviewDecoder *preview, CMSampleBufferRef *sample CF_RETURNS_RETAINED,
                     const char **error);
+/* For picture-only preview. On MPPreviewVideo, the caller owns the image and
+ * receives its presentation timing. Other results leave the image empty. */
+int mp_preview_next_picture(MPPreviewDecoder *preview, CVPixelBufferRef *image CF_RETURNS_RETAINED,
+                            CMTime *pts, CMTime *duration, const char **error);
 /* Whether the decoder rejected a picture since the last seek. A preview then resumes at the
  * next keyframe and omits the pictures in between. A Smart Trim edge returns the intact
  * pictures decoded before the damage and then reports an error. */
@@ -54,3 +62,20 @@ bool mp_preview_met_damage(const MPPreviewDecoder *preview);
  * error was decoded from packets that precede the damaged one. */
 bool mp_preview_edge_intact_before_damage(const MPPreviewDecoder *preview);
 CGAffineTransform mp_preview_transform(const MPPreviewDecoder *preview);
+
+/* The program mixer accepts timestamped, interleaved Float PCM on the output
+ * clock. When next returns Again with a lane >= 0, submit one sample buffer or
+ * NULL to finish that lane. Matrix rows contain one coefficient per input
+ * channel. A discontinuity resets resampling at a source edit. Its clock
+ * tick describes input packet timestamp precision (zero for exact sample
+ * timestamps). Provide the rounded program range and source sample count for
+ * each span so resampling respects edit boundaries. */
+typedef struct LinkedAudioMix MPProgramAudioMix;
+MPProgramAudioMix *mp_program_mix_create(int lanes);
+void mp_program_mix_close(MPProgramAudioMix *);
+void mp_program_mix_submit(MPProgramAudioMix *, int lane, CMSampleBufferRef,
+                           const double *matrix, bool discontinuity, CMTime timestamp_tick,
+                           int64_t source_samples, CMTime output_start, CMTime output_end);
+int mp_program_mix_next(MPProgramAudioMix *, CMSampleBufferRef *sample CF_RETURNS_RETAINED, int *lane);
+/* Returns the FFmpeg speaker abbreviation of a channel in decoded PCM. */
+const char *mp_program_mix_speaker(CMAudioFormatDescriptionRef, int channel);

@@ -1,6 +1,6 @@
 # Resolve export verification
 
-Tested on macOS with DaVinci Resolve Studio 21.2.0.6. Both the packaged MPCut File menu and `mpcut resolve --open` imported the two-camera edit into a dedicated Resolve project. Resolve identified the video and audio timeline items as **Multicam**. Its Edit page showed both camera feeds and both sound sources.
+Tested on macOS with DaVinci Resolve Studio 21.2.0.6. Both the packaged MPCut File menu and `mpcut project resolve import` imported the two-camera edit into a dedicated Resolve project. Resolve identified the video and audio timeline items as **Multicam**. Its Edit page showed both camera feeds and both sound sources.
 
 ## Multicam assembly
 
@@ -40,6 +40,10 @@ The offline regression test creates temporary media and checks timecode, XML esc
 The CLI wrote a multicam assembly and an ordinary replacement-track edit to both `.drp` and `.drt`, then imported all four archives into new `.cut` files using Resolve Studio 21.2. The native writer reopens each staged archive in Resolve before publication and compares track counts, item names and types, clip positions, source offsets and timeline duration. Each operation restored the previously open project.
 
 The reopened multicam DRP showed the same five picture and audio intervals listed above. Both native imports recovered the one-second Close camera offset, the selected microphones and the repeated source range. The recovered group ends at second 5, the last group time used in the program. MPCut warned about the unused portion of the original eight-second group before export.
+
+An angle can carry several recordings with a gap between them. Selecting that angle over the gap leaves the picture black while its independent program microphone continues. The assembled timeline can repeat a group range and choose a different camera on one occurrence. The native regression checks both archive formats for linked recordings and their coverage, repeated ranges, occurrence-specific camera choices and independent audio. Resolve assigns its own angle identifiers and may reorder the angles. MPCut reconstructs switch markers and assembly items from Resolve’s timeline cuts on import.
+
+A Resolve 21.2 render of this FCPXML layout had black frames in both selected gap intervals. The independent microphone had the same measured level across the first gap and adjacent cuts. The second gap used a video-only selection and rendered silent.
 
 ![Reopened native DRP on the Resolve Edit page at frame 12. The angle viewer matches Close source second 2 and Wide source second 3.](images/resolve-native-multicam-close.jpg)
 

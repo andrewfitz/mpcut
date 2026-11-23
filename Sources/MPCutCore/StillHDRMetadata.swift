@@ -18,10 +18,14 @@ struct StillHDRMetadata: Sendable {
 
     static func inspect(_ media: MediaInfo, retaining ranges: [MulticamRange] = [],
                         cancelled: (@Sendable () -> Bool)?) throws -> Self {
+        let engine = CutEngine(cancelled: { Task.isCancelled || cancelled?() == true })
+        try engine.checkCancellation()
+        try engine.verifyIdentity(media.url, identity: media.identity)
         let scale = media.video.timeBase.denominator
         guard let nativeScale = Int32(exactly: scale), nativeScale > 0 else { throw unverifiable(media.url) }
         var windows: [MPProbeHDRRange] = []
         for range in ranges.sorted(by: { $0.from < $1.from }) {
+            try engine.checkCancellation()
             let start = try range.from.adding(media.origin).roundedToSamples(Int(scale))
             let end = try range.to.adding(media.origin).roundedToSamples(Int(scale))
             if let last = windows.last, start <= last.end {
@@ -33,7 +37,8 @@ struct StillHDRMetadata: Sendable {
         let control = Cancellation(cancelled)
         let callback: MPProbeCancelled = { pointer in
             guard let pointer else { return 0 }
-            return Unmanaged<Cancellation>.fromOpaque(pointer).takeUnretainedValue().cancelled?() == true ? 1 : 0
+            let control = Unmanaged<Cancellation>.fromOpaque(pointer).takeUnretainedValue()
+            return Task.isCancelled || control.cancelled?() == true ? 1 : 0
         }
         guard let stream = Int32(exactly: media.video.index) else { throw unverifiable(media.url) }
         var result = MPProbeHDR()
@@ -47,9 +52,9 @@ struct StillHDRMetadata: Sendable {
                 }
             }
         }
-        try CutEngine(cancelled: cancelled).checkCancellation()
+        try engine.checkCancellation()
+        try engine.verifyIdentity(media.url, identity: media.identity)
         guard status == 0 else { throw unverifiable(media.url, reason: String(cString: error)) }
-        try CutEngine(cancelled: cancelled).verifyIdentity(media.url, identity: media.identity)
         let mastering = result.has_mastering == 0 ? nil : withUnsafeBytes(of: result.mastering) {
             Array($0.bindMemory(to: UInt32.self))
         }

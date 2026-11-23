@@ -31,7 +31,7 @@ final class StillTimelineWindowTests: XCTestCase {
         let source = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
                                                      subdirectory: "Fixtures"))
         let cadence = try RationalTime(parsing: "1001/30000")
-        let boundary = try RationalTime(parsing: "1001/10000")
+        let boundary = try RationalTime(parsing: "1001/15000")
         let sourceEnd = try RationalTime(parsing: "1001/2500")
         let color = StillProgramColorPolicy(transfer: "smpte2084", primaries: "bt2020", matrix: "bt2020nc",
                                             range: "tv", viewingConditions: "Rec.2100 reference",
@@ -58,7 +58,7 @@ final class StillTimelineWindowTests: XCTestCase {
                               switches: [.init(at: .zero, angle: "wide")]))
             : .sequence([.init(id: "video", file: source.path, from: .zero, to: sourceEnd)])
         try project.settingStillColorPolicy(color).save(to: path)
-        _ = try await sessions.handleMCPCommand(tool: "open_project", arguments: ["path": path.path],
+        _ = try await sessions.handleMCPCommand(tool: "project_open", arguments: ["project_path": path.path],
                                                 session: nil, checkAccess: {})
         let session = try XCTUnwrap(sessions.project(at: path))
         XCTAssertEqual(session.isMulticam, multicam)
@@ -86,7 +86,11 @@ final class StillTimelineWindowTests: XCTestCase {
         editor.orderFront(nil)
 
         if multicam {
-            session.multicam.insertMulticamStill(card, atAssembly: boundary)
+            session.multicam.dropMulticamStills([card], atAssembly: boundary, replacingMarkedRange: true)
+            XCTAssertEqual(session.multicam.notice?.message, "Mark a picture range and drop one image to replace it.")
+            XCTAssertNil(editor.attachedSheet)
+            session.multicam.notice = nil
+            session.multicam.dropMulticamStills([card], atAssembly: boundary, replacingMarkedRange: false)
         } else {
             session.editor.addDroppedStills([card], at: boundary.seconds)
         }
@@ -96,6 +100,9 @@ final class StillTimelineWindowTests: XCTestCase {
         try await wait("committed still placement") { session.mcpStillProject?.stillInserts.count == 1 }
         let insert = try XCTUnwrap(session.mcpStillProject?.stillInserts.first)
         XCTAssertEqual(insert.cadence, cadence)
+        if multicam {
+            XCTAssertEqual(session.multicam.assemblyStillDropTime(boundary.seconds), boundary)
+        }
         try await wait("editable inserted still") { session.mcpCanEditStills }
         if multicam {
             let row = try XCTUnwrap(session.multicam.multicamStillRows.first)
@@ -114,10 +121,35 @@ final class StillTimelineWindowTests: XCTestCase {
         let update = try XCTUnwrap(button(in: editor.attachedSheet?.contentView, titled: "Apply"))
         update.performClick(nil)
         try await wait("updated still duration") { session.mcpStillProject?.stillInserts.first?.duration == changeDuration }
-        if multicam { session.multicam.setAssemblyPreview(true) }
-        let monitorReply = try await sessions.handleMCPCommand(tool: "set_video_monitor", arguments: ["visible": true],
+        let oneSecond = RationalTime(numerator: 1)
+        let selectedEnd = try boundary.adding(oneSecond)
+        if multicam {
+            session.multicam.setAssemblyPreview(true)
+            session.multicam.selectAssemblyRange(boundary, selectedEnd)
+            session.multicam.enqueueMarkedRange()
+        } else {
+            session.editor.selectRange(boundary.seconds, selectedEnd.seconds)
+            session.editor.addMarkedRange()
+        }
+        let queuedStills: () -> [StillInsert] = {
+            if multicam { return session.multicam.queuedRanges.first?.snapshot.assemblyItems?.compactMap(\.still) ?? [] }
+            return session.editor.queuedRanges.first?.stillProject?.stillInserts ?? []
+        }
+        XCTAssertEqual(queuedStills().first?.id, insert.id)
+        let queuedDuration = try XCTUnwrap(queuedStills().first?.duration)
+        XCTAssertLessThan(queuedDuration, changeDuration)
+        if multicam { session.multicam.undo() } else { session.editor.undo() }
+        try await wait("undo restored original duration") {
+            session.mcpStillProject?.stillInserts.first?.duration == insert.duration
+        }
+        XCTAssertEqual(queuedStills().first?.duration, queuedDuration)
+        if multicam { session.multicam.redo() } else { session.editor.redo() }
+        try await wait("redo restored changed duration") {
+            session.mcpStillProject?.stillInserts.first?.duration == changeDuration
+        }
+        let monitorReply = try await sessions.handleMCPCommand(tool: "playback_monitor_visibility_set", arguments: ["visible": true],
                                                                session: session, checkAccess: {})
-        XCTAssertEqual(monitorReply["monitorVisible"] as? Bool, true)
+        XCTAssertEqual(monitorReply["monitor_visible"] as? Bool, true)
         let monitor = try XCTUnwrap(session.monitor)
         XCTAssertTrue(monitor.isVisible)
         if let panelScreen = monitor.screen, let editorScreen = editor.screen,
@@ -130,7 +162,10 @@ final class StillTimelineWindowTests: XCTestCase {
         let viewer = try XCTUnwrap(surface(in: editor.contentView))
         let monitorView = try XCTUnwrap(surface(in: monitor.contentView))
         let expected = previewTime(boundary)
-        let outputAfterCard = try boundary.adding(changeDuration).adding(cadence)
+        // Seek inside a source frame, far enough past the insert that its source timestamp
+        // differs from the still's output timestamp even if transport rounds a frame boundary.
+        let sourceOffset = try cadence.multiplied(by: .init(numerator: 7, denominator: 2))
+        let outputAfterCard = try boundary.adding(changeDuration).adding(sourceOffset)
         if multicam {
             session.multicam.preview.seek(to: .zero)
             session.multicam.preview.togglePlayback()
@@ -164,12 +199,62 @@ final class StillTimelineWindowTests: XCTestCase {
             guard let frame = viewer.displayedFrameTime else { return false }
             return frame != expected && frame == monitorView.displayedFrameTime
         }
+        for preview in [viewer, monitorView] {
+            let status = try XCTUnwrap(preview.presentationDescription)
+            XCTAssertTrue(status.hasPrefix("SDR preview"), status)
+            XCTAssertTrue(status.contains("program PQ"), status)
+        }
         try await wait("updated fidelity tier") {
             multicam ? session.multicam.tierIsCurrent : session.editor.tierIsCurrent
         }
-        let tier = try XCTUnwrap(multicam ? session.multicam.settledTier : session.editor.settledTier)
-        XCTAssertLessThan(tier, .trueLossless)
+        let tier = multicam ? session.multicam.tierState : session.editor.tierState
+        guard case .unavailable(let issue) = tier else {
+            XCTFail("Expected HDR export with the default settings to be unavailable, got \(tier?.name ?? "no tier").")
+            return
+        }
+        XCTAssertTrue(["unsupported_format", "helper_unavailable"].contains(issue.code), issue.message)
         if !multicam { XCTAssertNotEqual(session.editor.openingExportMode(), .copy) }
+
+        // Adding a card inside the original footage left camera / card / camera.
+        // Spacing those three pictures should leave two empty ruler intervals.
+        if multicam { session.multicam.chooseSpaceClips() } else { session.editor.chooseSpaceClips() }
+        try await wait("Space Clips sheet") { editor.attachedSheet != nil }
+        let accessory = editor.attachedSheet?.contentView
+        let timing = try XCTUnwrap(descendant(NSPopUpButton.self, in: accessory) { _ in true })
+        let duration = try XCTUnwrap(descendant(NSTextField.self, in: accessory) {
+            $0.toolTip == "Set the same duration in seconds for every gap"
+        })
+        XCTAssertEqual(timing.titleOfSelectedItem, "Fixed Duration")
+        timing.selectItem(withTitle: "Source Timing")
+        _ = timing.sendAction(timing.action, to: timing.target)
+        XCTAssertFalse(duration.isEnabled)
+        timing.selectItem(withTitle: "Fixed Duration")
+        _ = timing.sendAction(timing.action, to: timing.target)
+        XCTAssertTrue(duration.isEnabled)
+        let colorWell = try XCTUnwrap(descendant(NSColorWell.self, in: accessory) { _ in true })
+        colorWell.color = NSColor(srgbRed: 0, green: 1, blue: 0, alpha: 1)
+        try XCTUnwrap(button(in: editor.attachedSheet?.contentView, titled: "Apply")).performClick(nil)
+        try await wait("two internal spaces") { session.mcpStillProject?.stillInserts.count == 3 }
+        let spaced = try XCTUnwrap(session.mcpStillProject)
+        let gapIDs = Set(spaced.stillAssets.filter(\.isGap).map(\.id))
+        XCTAssertEqual(spaced.stillInserts.filter { gapIDs.contains($0.assetID) }.map(\.framing.background),
+                       ["#00FF00", "#00FF00"])
+        if multicam {
+            XCTAssertEqual(session.multicam.assemblyAssetSpans.count, 1)
+        } else {
+            XCTAssertEqual(session.editor.timelineClips.map(\.isGap), [false, true, false, true, false])
+            XCTAssertEqual(session.editor.stillAssetSpans.count, 1)
+        }
+        let insideGap = try boundary.adding(cadence)
+        if multicam { session.multicam.seekAssembly(at: insideGap, scrubbing: false) }
+        else { session.editor.seek(insideGap.seconds) }
+        try await wait("editor and monitor display the gap") {
+            viewer.displayedFrameTime == expected && monitorView.displayedFrameTime == expected
+        }
+        if multicam { session.multicam.undo() } else { session.editor.undo() }
+        try await wait("single undo removes both spaces") { session.mcpStillProject?.stillInserts.count == 1 }
+        if multicam { session.multicam.redo() } else { session.editor.redo() }
+        try await wait("single redo restores both spaces") { session.mcpStillProject == spaced }
     }
 
     private func writeCard(_ url: URL) throws {

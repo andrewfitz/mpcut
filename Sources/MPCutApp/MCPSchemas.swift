@@ -12,6 +12,12 @@ struct MCPSchemas {
     static let loaded = Result { try MCPSchemas() }
     let inputs: [String: Object]
 
+    static func encodeResult(_ value: some Encodable) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        return try encoder.encode(value)
+    }
+
     init() throws {
         let directory: URL
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("MCPTools", isDirectory: true),
@@ -37,7 +43,7 @@ struct MCPSchemas {
                 }
             }
         }
-        guard inputs["get_editor_state"] != nil else { throw MCPFailure("schema_unavailable", "Missing MPCut tool definitions.") }
+        guard inputs["project_editor_state_read"] != nil else { throw MCPFailure("schema_unavailable", "Missing MPCut tool definitions.") }
         self.inputs = inputs
     }
 
@@ -82,6 +88,16 @@ struct MCPSchemas {
             }
             return MCPFailure("invalid_arguments", "\(location): \(reason)")
         }
+        if let types = schema["type"] as? [String] {
+            var variant = schema
+            for type in types {
+                variant["type"] = type
+                if let validated = try? check(input, schema: variant, tool: tool, path: path, wireIntegers: wireIntegers) {
+                    return validated
+                }
+            }
+            throw reject("Expected a supported value of type " + types.joined(separator: " or ") + ".")
+        }
         var value = input
         if let choices = schema["enum"] as? [Any], !choices.contains(where: { matches(value, $0) }) {
             throw reject("Expected one of " + choices.map { String(describing: $0) }.joined(separator: ", ") + ".")
@@ -93,6 +109,10 @@ struct MCPSchemas {
         }
         for constraint in schema["allOf"] as? [Object] ?? [] {
             value = try check(value, schema: constraint, tool: tool, path: path, wireIntegers: wireIntegers)
+        }
+        if let excluded = schema["not"] as? Object,
+           (try? check(value, schema: excluded, tool: tool, path: path, wireIntegers: wireIntegers)) != nil {
+            throw reject("This field combination is unsupported.")
         }
         if let condition = schema["if"] as? Object, let consequent = schema["then"] as? Object,
            (try? check(value, schema: condition, tool: tool, path: path, wireIntegers: wireIntegers)) != nil {

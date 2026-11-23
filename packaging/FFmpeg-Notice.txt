@@ -1,4 +1,4 @@
-MPCut includes an FFmpeg executable and libraries from the FFmpeg, SVT-AV1 and LAME projects.
+MPCut includes an FFmpeg executable and libraries from the FFmpeg, SVT-AV1, LAME and Opus projects.
 
 The bundled FFmpeg 9.0.2 executable and libraries are distributed under the GNU Lesser
 General Public License, version 2.1 or later. See COPYING.LGPLv2.1 and
@@ -14,20 +14,28 @@ GNU Library General Public License, version 2 or later. See LAME/COPYING and
 LAME/LICENSE. The project site is https://lame.sourceforge.io/ and the source
 archive is https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz.
 
-This directory includes the three upstream source archives, the patch to require
+The FFmpeg codec library also incorporates the libopus 1.6.1 Opus encoder from
+the Xiph.Org Foundation, built without its command-line programs. libopus is
+distributed under a three-clause BSD license, and Opus is subject to the
+royalty-free patent licenses that the license file lists. See Opus/COPYING.
+The project site is https://opus-codec.org/ and the source archive is
+https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz.
+
+This directory includes the four upstream source archives, the patch to require
 hardware decoding in VideoToolbox, and the build recipe. FFmpeg's shared
 libraries are installed in Contents/Frameworks. The three video encoders
 enabled for Smart Trim are h264_videotoolbox, hevc_videotoolbox and libsvtav1.
 Re-encode uses the FFmpeg executable in Contents/Helpers/ffmpeg with the
 h264_videotoolbox, hevc_videotoolbox and prores_videotoolbox video encoders
 and native AAC and PCM audio encoders. Audio conversion also uses the
-libmp3lame MP3 encoder and the native FLAC encoder.
+libmp3lame MP3 encoder, the libopus Opus encoder and the native FLAC encoder.
 
 To rebuild the executable and libraries on Apple Silicon with Xcode, CMake and pkg-config, create a build
 directory with scripts/, packaging/, and .build/mpcut-ffmpeg/ subdirectories.
 Copy build-ffmpeg.sh into scripts/, changes.diff into packaging/ as
 ffmpeg-require-hardware.patch, and the source archives (the LAME archive is in
-LAME/ and the SVT-AV1 archive in SVT-AV1/) into .build/mpcut-ffmpeg/.
+LAME/, the Opus archive in Opus/ and the SVT-AV1 archive in SVT-AV1/) into
+.build/mpcut-ffmpeg/.
 Run `bash scripts/build-ffmpeg.sh` from the build directory. The resulting
 libraries are in .build/mpcut-ffmpeg/install/lib/ and the executable is in
 .build/mpcut-ffmpeg/install/bin/ffmpeg.

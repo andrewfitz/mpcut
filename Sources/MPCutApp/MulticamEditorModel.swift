@@ -27,26 +27,40 @@ final class MulticamEditorModel: ObservableObject {
     private(set) var lastEditAction: String?
     @Published private(set) var project: MulticamProject? {
         didSet {
-            mcpRevision += 1
-            if oldValue != project { refreshTier() }
+            var previous = oldValue
+            var current = project
+            previous?.transcripts = .init()
+            current?.transcripts = .init()
+            if previous != current {
+                mcpRevision += 1
+                refreshTier()
+            }
             if oldValue?.assemblyItems != project?.assemblyItems || oldValue?.range != project?.range {
+                pauseEdits.clearOccurrenceSettings()
                 assemblyRangeEnds = Self.assemblyEnds(for: assemblyItems)
                 rangeSelectionEdits = nil
                 if assemblySelection != nil { assemblySelection = nil }
             }
         }
     }
+    private(set) var transcriptMediaRevision: UInt64 = 0
     @Published private(set) var media: [String: MediaInfo] = [:] {
-        didSet { refreshTier() }
+        didSet {
+            transcriptMediaRevision &+= 1
+            refreshTier()
+        }
     }
     @Published private(set) var sourceIssues: [String: String] = [:]
     @Published private(set) var sourceIndexProgress: [String: Double] = [:]
     @Published private(set) var sourceIndexIssues: [String: String] = [:]
-    @Published private(set) var projectURL: URL?
+    @Published private(set) var projectURL: URL? {
+        didSet { if let projectURL { preferences.recentFiles.record([projectURL]) } }
+    }
     private var projectDiskRevision: ProjectDiskRevision?
     @Published private(set) var savedProject: MulticamProject?
     struct HistoryEntry: Equatable, Sendable {
         let action: String
+        var origin = HistoryOrigin.current
         var project: MulticamProject
         var selection: Selection?
     }
@@ -77,10 +91,12 @@ final class MulticamEditorModel: ObservableObject {
     @Published private(set) var isExporting = false
     @Published private(set) var progress: Double?
     @Published var report: String?
+    @Published var exportDeliverySummary: String?
     @Published var exportRequested = false
     @Published var queuedRanges: [MulticamQueuedRange] = []
     @Published var isBulkQueuePresented = false
     @Published var isReplacementAudioPresented = false
+    @Published var trackReplacementTarget: MulticamAudioSelection?
     var bulkExportDirectory: URL?
     @Published private(set) var suggestions: [RationalTime] = []
     @Published private(set) var suggestionAnchor: RationalTime?
@@ -94,6 +110,7 @@ final class MulticamEditorModel: ObservableObject {
     var tierIsCurrent = true
     var tierGeneration = 0
     var tierToken: EditCancellation?
+    let tierGate = MulticamTierGate()
     @Published private(set) var assemblyPreview = false
     @Published var selectedSwitch: RationalTime?
     @Published var selectedOccurrence = 0
@@ -153,8 +170,16 @@ final class MulticamEditorModel: ObservableObject {
         guard let project, !refreshBaselines.isEmpty || !refreshReviewReasons.isEmpty else { return [:] }
         let plans = [try? project.plan(ranges: [project.range]), try? project.plan()].compactMap { $0 }
         let spanIssues = Dictionary(plans.flatMap { plan in
-            (plan.picture + plan.audio).compactMap { span in
-                refreshIssue(for: span, mayStartWithSilence: span == plan.audio.first).map { (span.source, $0) }
+            let pictureIssues = plan.picture.compactMap { span in
+                refreshIssue(for: span).map { (span.source, $0) }
+            }
+            let audioLanes = !project.audioReplacements.isEmpty
+                ? (try? project.resolveAudioLanes(plan: plan, indexedSources: media)) ?? plan.audioLanes
+                : plan.audioLanes
+            return pictureIssues + audioLanes.flatMap { lane in
+                lane.spans.enumerated().compactMap { index, span in
+                    refreshIssue(for: span, mayStartWithSilence: index == 0).map { (span.source, "\(lane.label) — \($0)") }
+                }
             }
         }, uniquingKeysWith: { first, _ in first })
         return Dictionary(uniqueKeysWithValues: project.sources.compactMap { source in
@@ -194,6 +219,7 @@ final class MulticamEditorModel: ObservableObject {
         let cancel: () -> Void
     }
     private var sourceLoads: [URL: SourceLoad] = [:]
+    private var sourceProgressUpdate: Task<Void, Never>?
     private var importLoads: [() -> Void] = []
     private var importID: UUID?
     private var cancelRelinkRequest: (() -> Void)?
@@ -220,6 +246,7 @@ final class MulticamEditorModel: ObservableObject {
         preview = MulticamPreview(preferences: preferences)
         filmstrip.sidecarPreference.enabled = preferences.useAnalysisSidecars
         analysis.setSnap(preferences.snapTarget)
+        analysis.maxBlip = preferences.maxBlip
         analysis.configureSilence(minimum: preferences.minimumPause, threshold: nil)
         analysis.changed = { [weak self] in
             self?.analysisNavigationAvailability.removeAll()
@@ -241,11 +268,13 @@ final class MulticamEditorModel: ObservableObject {
                 self?.trimHistoryAndUpdateDraft()
             case .snapTarget:
                 if let self { self.analysis.setSnap(self.preferences.snapTarget) }
+            case .maxBlip:
+                if let self { self.analysis.maxBlip = self.preferences.maxBlip }
             case .minimumPause:
                 if let self {
                     self.analysis.configureSilence(minimum: self.preferences.minimumPause, threshold: self.analysis.pauseThreshold)
                 }
-            case .largeThumbnails, .defaultExportMode, .jpegPreset, .leavePause:
+            case .largeThumbnails, .defaultExportMode, .jpegPreset, .padding:
                 self?.objectWillChange.send()
             default:
                 break
@@ -261,7 +290,20 @@ final class MulticamEditorModel: ObservableObject {
     var undoTitle: String { undoStack.last.map { "Undo " + $0.action } ?? "Undo" }
     var redoTitle: String { redoStack.last.map { "Redo " + $0.action } ?? "Redo" }
     var historyCursor: Int { undoStack.count }
-    var historyActions: [String] { undoStack.map(\.action) + redoStack.reversed().map(\.action) }
+
+    func retainedTimeline(at index: Int) -> CutProject? {
+        guard (0...(undoStack.count + redoStack.count)).contains(index), let project else { return nil }
+        if index == historyCursor { return .multicam(project) }
+        if index < historyCursor { return .multicam(undoStack[index].project) }
+        return .multicam(redoStack[redoStack.count - (index - historyCursor)].project)
+    }
+    var projectHistory: [ProjectHistoryAction] {
+        func action(_ entry: HistoryEntry) -> ProjectHistoryAction {
+            ProjectHistoryAction(name: entry.action, origin: entry.origin)
+        }
+        return undoStack.map(action) + redoStack.reversed().map(action)
+    }
+    var historyActions: [String] { projectHistory.map(\.name) }
 
     var projectName: String? { projectURL?.deletingPathExtension().lastPathComponent }
     var hasSession: Bool { project != nil || isBusy || !setup.isEmpty }
@@ -281,7 +323,7 @@ final class MulticamEditorModel: ObservableObject {
     var assemblyGroupIndices: [Int] { assemblyItems.indices.filter { assemblyRange(at: $0) != nil } }
 
     func assemblyRange(at index: Int) -> MulticamRange? {
-        guard assemblyItems.indices.contains(index), case .group(let range) = assemblyItems[index] else { return nil }
+        guard assemblyItems.indices.contains(index), let range = assemblyItems[index].group else { return nil }
         return range
     }
 
@@ -304,9 +346,11 @@ final class MulticamEditorModel: ObservableObject {
         }
     }
 
-    func importSources(_ urls: [URL]) { importSources(urls, allowCommit: nil) }
+    func importSources(_ urls: [URL], startAutomatically: Bool = false) {
+        importSources(urls, allowCommit: nil, startAutomatically: startAutomatically)
+    }
 
-    func importSources(_ urls: [URL], allowCommit: (() -> Bool)?) {
+    func importSources(_ urls: [URL], allowCommit: (() -> Bool)?, startAutomatically: Bool = false) {
         guard canChooseSources else { return }
         // A reopened project stores physical paths, and the same recording can
         // arrive through a symlinked folder or another spelling of its name.
@@ -351,8 +395,8 @@ final class MulticamEditorModel: ObservableObject {
                 if self.project != nil || drafts.contains(where: { $0.media.hasVideo }) {
                     for (url, info) in ordinaryResults { self.ordinaryByURL[url] = info }
                     self.setup = drafts
-                    self.savePendingSetup()
                     for draft in drafts { self.indexedByURL[draft.media.url] = draft.media }
+                    self.prepareImportedSources(startAutomatically: startAutomatically)
                 } else if errors.isEmpty {
                     errors.append("Select at least one camera recording.")
                 }
@@ -363,24 +407,30 @@ final class MulticamEditorModel: ObservableObject {
 
     /// Source setup can stay on screen while the user chooses an opening camera.
     /// A crash here should still recover the recordings they already added.
-    private func savePendingSetup() {
+    private func prepareImportedSources(startAutomatically: Bool) {
         guard project == nil, let first = setup.first(where: { $0.media.hasVideo }) else { return }
         let choice = first.media.audio.isEmpty ? setup.first(where: { !$0.media.audio.isEmpty }) : first
         let audio: MulticamAudioPolicy
         if let choice, let track = choice.media.audio.first {
             audio = .fixed(.init(source: choice.id, stream: track.stream.index))
         } else { audio = .none }
-        updatePendingSetup(setup, opening: first.id, audio: audio)
+        if startAutomatically {
+            confirmSetup(drafts: setup, opening: first.id, audio: audio)
+        } else {
+            updatePendingSetup(setup, opening: first.id, audio: audio)
+        }
     }
 
-    func updatePendingSetup(_ drafts: [SourceDraft], opening: String, audio: MulticamAudioPolicy) {
+    func updatePendingSetup(_ drafts: [SourceDraft], opening: String, audio: MulticamAudioPolicy,
+                            fixedAudio: MulticamAudioSelection? = nil) {
         guard !setup.isEmpty, Set(drafts.map(\.id)) == Set(setup.map(\.id)) else { return }
         if setup.map(\.source) != drafts.map(\.source) { setup = drafts }
         guard project == nil else { return }
         let drafts = Self.normalizedNames(in: drafts)
         guard let reference = drafts.first(where: { $0.id == opening && $0.media.hasVideo }) else { return }
         let duration = indexedByURL[reference.media.url]?.duration ?? reference.media.duration
-        writePendingSetup(Self.initialProject(drafts: drafts, opening: reference, duration: duration, audio: audio))
+        writePendingSetup(Self.initialProject(drafts: drafts, opening: reference, duration: duration, audio: audio,
+                                              fixedAudio: fixedAudio))
     }
 
     private func writePendingSetup(_ pending: MulticamProject) {
@@ -391,11 +441,17 @@ final class MulticamEditorModel: ObservableObject {
     }
 
     private static func initialProject(drafts: [SourceDraft], opening: SourceDraft, duration: RationalTime,
-                                       audio: MulticamAudioPolicy) -> MulticamProject {
-        MulticamProject(referenceAngle: opening.id, range: .init(from: .zero, to: duration),
-                        angles: drafts.filter { $0.media.hasVideo }.map(\.source),
-                        audioSources: drafts.filter { !$0.media.hasVideo }.map(\.source), audio: audio,
-                        switches: [.init(at: .zero, angle: opening.id)])
+                                       audio: MulticamAudioPolicy, fixedAudio: MulticamAudioSelection?) -> MulticamProject {
+        var project = MulticamProject(referenceAngle: opening.id, range: .init(from: .zero, to: duration),
+                                      angles: drafts.filter { $0.media.hasVideo }.map(\.source),
+                                      audioSources: drafts.filter { !$0.media.hasVideo }.map(\.source), audio: audio,
+                                      switches: [.init(at: .zero, angle: opening.id)])
+        if audio == .mix { project.mixLanes = project.defaultMixLanes }
+        if let fixedAudio, project.sources.contains(where: { $0.id == fixedAudio.source }),
+           project.fixedAudio == nil {
+            project.fixedAudio = fixedAudio
+        }
+        return project
     }
 
     func dismissSetup() {
@@ -440,7 +496,8 @@ final class MulticamEditorModel: ObservableObject {
         }
     }
 
-    func confirmSetup(drafts: [SourceDraft], opening: String, audio: MulticamAudioPolicy, ifCurrent id: UUID? = nil) {
+    func confirmSetup(drafts: [SourceDraft], opening: String, audio: MulticamAudioPolicy,
+                      fixedAudio: MulticamAudioSelection? = nil, ifCurrent id: UUID? = nil) {
         guard !isBusy, id == nil || id == setupPresentationID else { return }
         let drafts = Self.normalizedNames(in: drafts)
         let video = drafts.filter { $0.media.hasVideo }
@@ -457,7 +514,7 @@ final class MulticamEditorModel: ObservableObject {
         } else if let reference = video.first(where: { $0.id == opening }) {
             let candidate = Self.initialProject(drafts: drafts, opening: reference,
                                                 duration: newMedia[reference.id]?.duration ?? reference.media.duration,
-                                                audio: audio)
+                                                audio: audio, fixedAudio: fixedAudio)
             do {
                 try candidate.validate()
                 install(project: candidate, media: newMedia, issues: [:], url: nil)
@@ -468,6 +525,7 @@ final class MulticamEditorModel: ObservableObject {
             fail("Choose an opening camera to create the project.")
             return
         }
+        preferences.recentFiles.record(drafts.map { $0.media.url })
         dismissSetup()
     }
 
@@ -523,7 +581,7 @@ final class MulticamEditorModel: ObservableObject {
                 guard case .multicam(let prior) = state.project else {
                     throw CutError(code: "invalid_multicam_project", message: "Expected a multicam history state.")
                 }
-                return HistoryEntry(action: state.action, project: absolute(prior))
+                return HistoryEntry(action: state.action, origin: state.origin, project: absolute(prior))
             }
             return try (absolute(project), states.undo.map(entry), states.redo.map(entry),
                         savedMedia.absoluteSources(relativeTo: url), savedMedia.diskRevision)
@@ -541,6 +599,75 @@ final class MulticamEditorModel: ObservableObject {
             self.trimHistoryAndUpdateDraft()
             self.reconcileSourceLoads()
         }
+    }
+
+    func chooseAdditionalRecording(for angle: String) {
+        let panel = NSOpenPanel()
+        panel.title = "Add Recording to Camera"
+        ProjectPanels.present(panel, in: window) { [weak self] accepted in
+            guard let self, accepted, let url = panel.url, let project = self.project else { return }
+            let start = project.recordings(for: angle).compactMap { source in
+                source.coverage?.to ?? self.media[source.id].flatMap { try? source.offset.adding($0.duration) }
+            }.max()
+            guard let start, let window = self.window else { self.fail("Load the camera before adding another recording."); return }
+            let alert = NSAlert()
+            alert.messageText = "Place Camera Recording"
+            alert.informativeText = "Enter the group time of the first picture in seconds."
+            let field = NSTextField(string: start.description)
+            field.frame = NSRect(x: 0, y: 0, width: 210, height: 24)
+            field.setAccessibilityLabel("Group start")
+            alert.accessoryView = field
+            alert.window.initialFirstResponder = field
+            alert.addButton(withTitle: "Add Recording")
+            alert.addButton(withTitle: "Cancel")
+            alert.beginSheetModal(for: window) { response in
+                guard response == .alertFirstButtonReturn else { return }
+                Task { @MainActor in
+                    do {
+                        let groupStart = try RationalTime(parsing: field.stringValue)
+                        _ = try await self.addRecording(to: angle, from: url, at: groupStart)
+                    } catch is CancellationError { }
+                    catch { self.fail(error.localizedDescription) }
+                }
+            }
+        }
+    }
+
+    func addRecording(to angle: String, from url: URL, at start: RationalTime,
+                      validateCommit: () throws -> Void = {}) async throws -> String {
+        guard !isBusy, let project, let primary = project.angles.first(where: { $0.id == angle }) else {
+            throw CutError(code: "invalid_multicam_project", message: "Choose an available camera angle.")
+        }
+        let revision = mcpRevision
+        let generation = mcpGeneration
+        let firstURL = Self.availableURL(primary)
+        let useSidecar = usesSidecar(for: url)
+        let cancellation = EditCancellation()
+        let work = Task.detached(priority: .userInitiated) {
+            let engine = CutEngine(cancelled: { cancellation.isCancelled }, useSidecar: useSidecar)
+            let primaryMedia = try primary.coverage == nil ? firstURL.map(engine.inspectMulticamSource) : nil
+            let ordinary = try engine.inspect(url, keyframes: true)
+            return (try engine.multicamClock(ordinary), ordinary, primaryMedia)
+        }
+        let (info, ordinary, first) = try await withTaskCancellationHandler {
+            try await work.value
+        } onCancel: {
+            cancellation.cancel()
+        }
+        try Task.checkCancellation()
+        try validateCommit()
+        guard !isBusy, mcpRevision == revision, mcpGeneration == generation else {
+            throw MCPCommandError("stale_revision", "The multicam project changed while the recording was read.")
+        }
+        var candidate = project
+        let id = UUID().uuidString
+        try candidate.addRecording(id: id, media: info, to: angle, at: start, primaryMedia: first)
+        cacheIndexedSource(info, ordinary: ordinary)
+        guard edit("Add Camera Recording", { $0 = candidate }) else {
+            throw CutError(code: "invalid_multicam_project", message: "The camera recording could not be added.")
+        }
+        preferences.recentFiles.record([url])
+        return id
     }
 
     func relink(_ id: String) {
@@ -597,7 +724,7 @@ final class MulticamEditorModel: ObservableObject {
     private func startRelink(_ id: String, to url: URL, validateCommit: @escaping @MainActor () throws -> Void,
                              completed: @escaping (Result<Bool, Error>) -> Void) -> UUID? {
         guard let project, !isBusy, let source = project.sources.first(where: { $0.id == id }) else { return nil }
-        let angle = project.angles.contains { $0.id == id }
+        let angle = project.pictureSources.contains { $0.id == id }
         let url = url.standardizedFileURL
         importingURLs = [url]
         reconcileSourceLoads()
@@ -605,10 +732,33 @@ final class MulticamEditorModel: ObservableObject {
         status = "Reading replacement source…"
         var selectedStreams = Set(project.switches.compactMap(\.audio)
             .filter { $0.source == id }.map(\.stream))
-        if case .fixed(let selection) = project.audio, selection.source == id {
+        if let selection = project.fixedAudio, selection.source == id {
             selectedStreams.insert(selection.stream)
         }
-        if project.audio == .follow, angle, let stream = source.audioStream {
+        for lane in project.mixLanes {
+            switch lane.target {
+            case .camera(let camera):
+                if project.angles.first(where: { $0.id == camera })?.recordings.contains(where: { $0.id == id }) == true,
+                   let stream = source.audioStream {
+                    selectedStreams.insert(stream)
+                }
+            case .recording(let selection) where selection.source == id:
+                selectedStreams.insert(selection.stream)
+            case .recording:
+                break
+            }
+        }
+        for binding in project.audioReplacements {
+            for selection in [binding.original, binding.replacement] where selection.source == id {
+                selectedStreams.insert(selection.stream)
+            }
+        }
+        for person in project.participants.people {
+            if let selection = person.audio?.selection, selection.source == id {
+                selectedStreams.insert(selection.stream)
+            }
+        }
+        if angle, let stream = source.audioStream {
             selectedStreams.insert(stream)
         }
         let preview = selectedStreams.isEmpty
@@ -630,11 +780,18 @@ final class MulticamEditorModel: ObservableObject {
                                    message: "The replacement recording is missing selected audio stream\(missing.count == 1 ? "" : "s") \(missing.map(String.init).joined(separator: ", ")).")
                 }
                 self.cacheIndexedSource(index.multicam, ordinary: index.ordinary)
-                guard source.file != url.path else { return false }
+                let staleGeometry = project.participants.needsReconciliation(sourceID: id, identity: index.multicam.identity)
+                guard source.file != url.path else {
+                    if staleGeometry { self.fail("The recording ‘\(source.displayName)’ needs participant geometry review.") }
+                    return false
+                }
                 guard self.updateSource(id, { $0.file = url.path }) else {
                     let message = self.notice?.message ?? "The multicam editor could not relink this recording."
                     self.notice = nil
                     throw CutError(code: "edit_failed", message: message)
+                }
+                if staleGeometry {
+                    self.fail("The replacement for ‘\(source.displayName)’ needs participant geometry review.")
                 }
                 return true
             }
@@ -689,8 +846,49 @@ final class MulticamEditorModel: ObservableObject {
         }
     }
 
+    private var transcriptPauseCache = TranscriptPauseProtectionCache()
+
+    func transcriptProtectedGroupPauses() -> [AudioSpan] {
+        guard let project else { return [] }
+        let context = projectURL ?? draft.url
+        let protections = transcriptPauseCache.resolve(project.transcripts, relativeTo: context)
+        guard !protections.isEmpty else { return [] }
+        return (try? protections.group(project: project,
+                                       sourceFingerprints: media.mapValues { $0.identity.transcriptFingerprint })) ?? []
+    }
+
+    var transcriptState: ProjectTranscripts { project?.transcripts ?? .init() }
+
+    func transcriptAssetContext() throws -> URL {
+        if let url = projectURL ?? draft.url { return url }
+        guard let project else { throw CutError(code: "missing_project", message: "No transcript store is available.") }
+        try draft.write { _ = try Self.writeDocument(project, undo: undoStack, redo: redoStack, to: $0) }
+        guard let url = draft.url else { throw CutError(code: "missing_project", message: "No transcript store is available.") }
+        return url
+    }
+
+    func setTranscriptState(_ proposed: ProjectTranscripts, action: String? = nil, forceRevision: Bool = false) throws {
+        guard var project else { throw CutError(code: "missing_project", message: "No transcript store is available.") }
+        let previous = project
+        var next = proposed
+        next.revision = project.transcripts.revision
+        guard forceRevision || next != project.transcripts else { return }
+        try next.advanceRevision()
+        try next.validate()
+        if let action {
+            undoStack.append(HistoryEntry(action: action, project: previous, selection: selection))
+            redoStack.removeAll()
+            _ = trimHistory()
+            historyRevision += 1
+        }
+        project.transcripts = next
+        self.project = project
+        reconcileSourceLoads()
+        updateDraft()
+    }
+
     func writeProject(to destination: URL, replacingExisting: Bool = true) throws {
-        guard let project, !isBusy else {
+        guard var project, !isBusy else {
             throw CutError(code: "editor_busy", message: "Finish multicam setup and wait for the current operation.")
         }
         let url = destination.standardizedFileURL
@@ -702,9 +900,13 @@ final class MulticamEditorModel: ObservableObject {
         }
         try validateHistoryDestination(url)
         let expected = projectDiskRevision.flatMap { $0.matchesDestination(url) ? $0 : nil }
-        projectDiskRevision = try Self.writeDocument(project, undo: undoStack, redo: redoStack, to: url,
-                                                     replacingExisting: replacingExisting, coordinate: true, expected: expected)
+        let saved = try Self.writeDocument(project, undo: undoStack, redo: redoStack, to: url,
+                                           replacingExisting: replacingExisting, coordinate: true, expected: expected,
+                                           copyingTranscriptsFrom: projectURL ?? draft.url)
+        projectDiskRevision = saved.revision
+        project.transcripts.attachments = saved.attachments
         projectURL = url
+        self.project = project
         savedProject = project
         savedMediaPaths = documentMediaPaths
         reconcileSourceLoads()
@@ -716,12 +918,29 @@ final class MulticamEditorModel: ObservableObject {
 
     private var documentMediaPaths: [String: String] {
         var paths: [String: String] = [:]
-        func include(_ document: MulticamProject) {
-            for source in document.angles { paths[source.file] = source.id }
+        func include(_ document: MulticamProject, includeAttachments: Bool = false) {
+            for source in document.pictureSources { paths[source.file] = source.id }
             for source in document.audioSources { paths[source.file] = source.id }
             for asset in CutProject.multicam(document).stillAssets { paths[asset.file] = asset.id }
+            for record in document.transcripts.authoring {
+                for anchor in record.anchors + [record.speakerReference].compactMap({ $0 }) {
+                    if let file = anchor.binding.file { paths[file] = record.id }
+                }
+            }
+            guard includeAttachments else { return }
+            for attachment in document.transcripts.attachments {
+                if let context = projectURL ?? draft.url {
+                    paths[CutProject.mediaURL(attachment.asset.file, relativeTo: context).path] = attachment.id
+                    if let location = TranscriptStore.assetLocation(attachment.asset, relativeTo: context) {
+                        paths[location.path] = attachment.id
+                    }
+                }
+                for binding in attachment.bindings {
+                    if let file = binding.file { paths[file] = attachment.id }
+                }
+            }
         }
-        if let project { include(project) }
+        if let project { include(project, includeAttachments: true) }
         for entry in undoStack { include(entry.project) }
         for entry in redoStack { include(entry.project) }
         return paths
@@ -767,22 +986,35 @@ final class MulticamEditorModel: ObservableObject {
     nonisolated private static func writeDocument(_ project: MulticamProject, undo: [HistoryEntry],
                                                   redo: [HistoryEntry], to url: URL, replacingExisting: Bool = true,
                                                   coordinate: Bool = false,
-                                                  expected: ProjectDiskRevision? = nil) throws -> ProjectDiskRevision? {
+                                                  expected: ProjectDiskRevision? = nil,
+                                                  copyingTranscriptsFrom source: URL? = nil) throws
+        -> (revision: ProjectDiskRevision?, attachments: [TranscriptAttachment]) {
         var paths: [String: String] = [:]
         func document(_ value: MulticamProject) -> CutProject {
             .multicam(Self.mapSourcePaths(in: value, cache: &paths) { CutProject.relativeMediaPath($0, to: url) })
         }
         func state(_ entry: HistoryEntry) -> CutHistoryState {
-            CutHistoryState(action: entry.action, project: document(entry.project))
+            CutHistoryState(action: entry.action, origin: entry.origin, project: document(entry.project))
         }
         let current = document(project)
         let undo = undo.map(state), redo = redo.map(state)
         if coordinate {
-            return try current.saveRevision(to: url, undo: undo, redo: redo,
-                                            replacingExisting: replacingExisting, expected: expected)
+            if let source {
+                let saved = try current.saveCopyRevision(to: url, copyingTranscriptsFrom: source, undo: undo, redo: redo,
+                                                         replacingExisting: replacingExisting, expected: expected)
+                // The disk archive stores binding paths relative to its location. Keep live bindings absolute.
+                var attachments = project.transcripts.attachments
+                for index in attachments.indices {
+                    attachments[index].asset = saved.project.transcripts.attachments[index].asset
+                }
+                return (saved.revision, attachments)
+            }
+            let revision = try current.saveRevision(to: url, undo: undo, redo: redo,
+                                                    replacingExisting: replacingExisting, expected: expected)
+            return (revision, project.transcripts.attachments)
         }
-        try current.save(to: url, undo: undo, redo: redo, replacingExisting: replacingExisting)
-        return nil
+        try current.saveStaged(to: url, undo: undo, redo: redo, replacingExisting: replacingExisting)
+        return (nil, project.transcripts.attachments)
     }
 
     /// All states use the document's directory. Resolve each distinct media path once per read or write.
@@ -794,14 +1026,10 @@ final class MulticamEditorModel: ObservableObject {
             cache[file] = mapped
             return mapped
         }
-        func map(_ source: MulticamSource) -> MulticamSource {
-            var copy = source
-            copy.file = path(source.file)
-            return copy
-        }
         var copy = project
-        copy.angles = project.angles.map(map)
-        copy.audioSources = project.audioSources.map(map)
+        copy.transcripts = project.transcripts.mapSourcePaths(path)
+        copy.angles = project.angles.map { $0.mappingFiles(path) }
+        copy.audioSources = project.audioSources.map { $0.mappingFiles(path) }
         copy.stillAssets = project.stillAssets.map { asset in
             var copy = asset
             copy.file = path(asset.file)
@@ -867,8 +1095,14 @@ final class MulticamEditorModel: ObservableObject {
         defer { draft.relinquish() }
         guard let project = project ?? pendingSetupProject, isChanged else { return }
         let undo = undoStack, redo = redoStack
+        let source = projectURL
         let save: @Sendable (URL) throws -> Void = { url in
-            _ = try Self.writeDocument(project, undo: undo, redo: redo, to: url)
+            var document = project
+            if let source {
+                let draftDocument = url.deletingLastPathComponent().appendingPathComponent("Untitled.cut")
+                document.transcripts = try TranscriptStore.copy(in: document.transcripts, from: source, to: draftDocument, draft: true)
+            }
+            _ = try Self.writeDocument(document, undo: undo, redo: redo, to: url)
         }
         do {
             try draft.write(save)
@@ -895,6 +1129,7 @@ final class MulticamEditorModel: ObservableObject {
         timeEntryRequest = 0
         resetExportQueue()
         isReplacementAudioPresented = false
+        trackReplacementTarget = nil
         cancel()
         operation = nil
         worker = nil
@@ -986,11 +1221,11 @@ final class MulticamEditorModel: ObservableObject {
     }
 
     @discardableResult
-    func edit(_ action: String? = nil, _ change: (inout MulticamProject) -> Void) -> Bool {
+    func edit(_ action: String? = nil, _ change: (inout MulticamProject) throws -> Void) -> Bool {
         guard !isBusy, let project else { return false }
         var next = project
-        change(&next)
         do {
+            try change(&next)
             _ = try next.plan()
             _ = try next.groupIntervals()
         }
@@ -1005,6 +1240,7 @@ final class MulticamEditorModel: ObservableObject {
         }
         apply(next)
         lastEditAction = name
+        tierGate.edited(self, from: project)
         updateDraft()
         return true
     }
@@ -1050,11 +1286,17 @@ final class MulticamEditorModel: ObservableObject {
         var restored: Selection? = selection
         while index != undo.count {
             let entry = backwards ? undo.removeLast() : redo.removeLast()
-            let inverse = HistoryEntry(action: entry.action, project: target, selection: restored)
+            let inverse = HistoryEntry(action: entry.action, origin: entry.origin, project: target, selection: restored)
             if backwards { redo.append(inverse) } else { undo.append(inverse) }
             target = entry.project
             restored = entry.selection
         }
+        var transcripts = project.transcripts
+        if transcripts.authoring != target.transcripts.authoring {
+            transcripts.authoring = target.transcripts.authoring
+            do { try transcripts.advanceRevision() } catch { fail(error.localizedDescription); return }
+        }
+        target.transcripts = transcripts
         undoStack = undo
         redoStack = redo
         apply(target)
@@ -1100,7 +1342,7 @@ final class MulticamEditorModel: ObservableObject {
     }
 
     private func updateMedia(for project: MulticamProject, force: Bool = false) {
-        let cameras = Set(project.angles.map(\.id))
+        let cameras = Set(project.pictureSources.map(\.id))
         let updated = Dictionary(uniqueKeysWithValues: project.sources.compactMap { source -> (String, MediaInfo)? in
             guard let url = Self.availableURL(source),
                   let info = indexedByURL[url],
@@ -1130,6 +1372,8 @@ final class MulticamEditorModel: ObservableObject {
     }
 
     private func stopSourceLoads() {
+        sourceProgressUpdate?.cancel()
+        sourceProgressUpdate = nil
         for load in sourceLoads.values { load.cancel() }
         sourceLoads.removeAll()
         sourceIndexProgress = [:]
@@ -1161,7 +1405,7 @@ final class MulticamEditorModel: ObservableObject {
             let cancel = SourceIndexLoader.shared.admit(key, progress: { [weak self] fraction in
                 guard let self, let load = self.sourceLoads[url], load.id == id, fraction > load.progress else { return }
                 self.sourceLoads[url]?.progress = fraction
-                self.publishSourceProgress()
+                self.scheduleSourceProgressUpdate()
             }) { [weak self] result in
                 guard let self, self.sourceLoads[url]?.id == id else { return }
                 self.sourceLoads[url] = nil
@@ -1184,7 +1428,25 @@ final class MulticamEditorModel: ObservableObject {
         publishSourceProgress()
     }
 
+    func latestSourceIndexProgress(_ source: MulticamSource) -> Double? {
+        guard let url = Self.availableURL(source) else { return nil }
+        return sourceLoads[url]?.progress
+    }
+
+    private func scheduleSourceProgressUpdate() {
+        guard sourceProgressUpdate == nil else { return }
+        // Multiple sources can advance between UI updates. Keep their latest fractions.
+        sourceProgressUpdate = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(100))
+            guard let self, !Task.isCancelled else { return }
+            self.sourceProgressUpdate = nil
+            self.publishSourceProgress()
+        }
+    }
+
     private func publishSourceProgress() {
+        sourceProgressUpdate?.cancel()
+        sourceProgressUpdate = nil
         let sources = (project?.sources ?? []) + setup.map(\.source)
         var progress: [String: Double] = [:]
         var issues: [String: String] = [:]
@@ -1235,8 +1497,20 @@ final class MulticamEditorModel: ObservableObject {
     @discardableResult
     func updateSource(_ id: String, _ change: (inout MulticamSource) -> Void) -> Bool {
         edit { project in
-            if let row = project.angles.firstIndex(where: { $0.id == id }) {
-                change(&project.angles[row])
+            func update(_ source: inout MulticamSource) throws {
+                let oldOffset = source.offset
+                change(&source)
+                if let coverage = source.coverage, source.offset != oldOffset {
+                    let delta = try source.offset.subtracting(oldOffset)
+                    source.coverage = try .init(from: coverage.from.adding(delta), to: coverage.to.adding(delta))
+                }
+            }
+            for row in project.angles.indices {
+                if project.angles[row].id == id {
+                    try update(&project.angles[row])
+                } else if let index = project.angles[row].additionalRecordings.firstIndex(where: { $0.id == id }) {
+                    try update(&project.angles[row].additionalRecordings[index])
+                }
             }
             if let row = project.audioSources.firstIndex(where: { $0.id == id }) {
                 change(&project.audioSources[row])
@@ -1250,8 +1524,9 @@ final class MulticamEditorModel: ObservableObject {
     }
 
     var lastCameraGroupEnd: RationalTime? {
-        project?.angles.compactMap { source in
-            media[source.id].flatMap { try? $0.duration.adding(source.offset) }
+        project?.pictureSources.compactMap { source in
+            if let coverage = source.coverage { return coverage.to }
+            return media[source.id].flatMap { try? $0.duration.adding(source.offset) }
         }.max()
     }
 
@@ -1268,7 +1543,7 @@ final class MulticamEditorModel: ObservableObject {
         guard let project, let source = project.sources.first(where: { $0.id == id }), let info = media[id] else { return nil }
         let clock = clock ?? currentGroupTime()
         guard let sampleTime = try? clock.subtracting(source.offset) else { return nil }
-        let isAngle = project.angles.contains(where: { $0.id == id })
+        let isAngle = project.pictureSources.contains(where: { $0.id == id })
         let frames = isAngle ? info.frames : []
         let duration: RationalTime?
         if !frames.isEmpty {
@@ -1282,7 +1557,12 @@ final class MulticamEditorModel: ObservableObject {
             }
         } else if !isAngle {
             let selection: MulticamAudioSelection?
-            if let override = project.selection(at: clock)?.audio { selection = override }
+            if project.audio == .mix {
+                selection = project.mixLanes.lazy.compactMap { lane -> MulticamAudioSelection? in
+                    guard case .recording(let route) = lane.target, route.source == id else { return nil }
+                    return route
+                }.first
+            } else if let override = project.selection(at: clock)?.audio { selection = override }
             else if case .fixed(let fixed) = project.audio { selection = fixed }
             else { selection = nil }
             let stream = selection?.source == id ? selection?.stream : source.audioStream
@@ -1315,12 +1595,17 @@ final class MulticamEditorModel: ObservableObject {
         guard let project else { return }
         mapping = try? project.plan(ranges: assemblyPreview ? nil : [project.range])
         if let mapping {
+            let resolved = (try? project.resolveAudioLanes(plan: mapping, indexedSources: media, unavailableAsGap: true)) ?? []
+            let playableAudio = resolved.map { lane in
+                var playable = lane
+                playable.spans = lane.spans.filter { refreshIssue(for: $0) == nil }
+                return playable
+            }
             let playable = MulticamPlan(intervals: mapping.intervals,
                                         picture: mapping.picture.filter { refreshIssue(for: $0) == nil },
-                                        audio: mapping.audio.enumerated().compactMap { index, span in
-                                            refreshIssue(for: span, mayStartWithSilence: index == 0) == nil ? span : nil
-                                        }, duration: mapping.duration)
-            preview.configure(plan: playable, media: media, project: stillPreviewProject, document: projectURL)
+                                        audioLanes: playableAudio, duration: mapping.duration)
+            preview.configure(plan: playable, media: media, project: stillPreviewProject, document: projectURL,
+                              audioIsResolved: true)
         }
         refreshAnalysis()
     }
@@ -1431,8 +1716,9 @@ final class MulticamEditorModel: ObservableObject {
     }
 
     func audition(_ id: String) {
-        guard let source = project?.angles.first(where: { $0.id == id }), let info = media[id],
-              let time = try? currentGroupTime().subtracting(source.offset) else { return }
+        let group = currentGroupTime()
+        guard let source = project?.pictureSource(for: id, at: group), let info = media[source.id],
+              let time = try? group.subtracting(source.offset) else { return }
         preview.audition(url: info.url, sourceTime: time, media: info)
     }
 
@@ -1465,14 +1751,15 @@ final class MulticamEditorModel: ObservableObject {
     func step(_ delta: Int) {
         preview.pause()
         let time = currentGroupTime()
-        let target = snappedFrame(time, delta: delta)
         guard assemblyPreview, let mapping else {
-            if let target { seekGroup(target) }
+            if let target = snappedFrame(time, delta: delta) { seekGroup(target) }
             return
         }
 
         let output = preview.time
         let index = occurrenceIndex(at: output)
+        let angle = assemblyItems.indices.contains(index) ? assemblyItems[index].angleOverride : nil
+        let target = snappedFrame(time, delta: delta, preferredAngle: angle)
         if let still = assemblyStill(at: index) {
             let start = assemblyStart(at: index)
             let end = assemblyRangeEnds[index]
@@ -1503,7 +1790,9 @@ final class MulticamEditorModel: ObservableObject {
             selectedOccurrence = next
             preview.seek(to: last)
         } else if let range = assemblyRange(at: next) {
-            seekOccurrence(next, group: max(range.from, snappedFrame(range.to, delta: -1) ?? range.from), mapping: mapping)
+            let angle = assemblyItems[next].angleOverride
+            let last = snappedFrame(range.to, delta: -1, preferredAngle: angle) ?? range.from
+            seekOccurrence(next, group: max(range.from, last), mapping: mapping)
         } else {
             preview.seek(to: delta > 0 ? mapping.duration : .zero)
         }
@@ -1534,29 +1823,43 @@ final class MulticamEditorModel: ObservableObject {
         return max(0, start - 1)
     }
 
-    func snappedFrame(_ time: RationalTime, delta: Int) -> RationalTime? {
+    func snappedFrame(_ time: RationalTime, delta: Int, preferredAngle: String? = nil) -> RationalTime? {
         guard let project else { return nil }
         let active = project.selection(at: time)?.angle ?? project.switches.last?.angle
         var candidates: [RationalTime] = []
-        for id in [project.referenceAngle, active].compactMap({ $0 }) {
-            guard let source = project.angles.first(where: { $0.id == id }),
-                  let frames = media[id]?.frames, let first = frames.first, let last = frames.last,
+        let angles = preferredAngle.map { [$0] } ?? [project.referenceAngle, active].compactMap { $0 }
+        for source in angles.flatMap({ project.recordings(for: $0) }) {
+            if delta == 0, source.coverage?.contains(time) == false { continue }
+            guard let frames = media[source.id]?.frames, let first = frames.first, let last = frames.last,
                   let sourceTime = try? time.subtracting(source.offset),
-                  let end = try? last.time.adding(last.duration) else { continue }
-            if sourceTime < first.time || sourceTime > end || (sourceTime == end && delta >= 0) {
+                  let physicalEnd = try? last.time.adding(last.duration) else { continue }
+            var start = first.time, end = physicalEnd
+            if let coverage = source.coverage {
+                guard let lower = try? coverage.from.subtracting(source.offset),
+                      let upper = try? coverage.to.subtracting(source.offset) else { continue }
+                start = max(start, lower)
+                end = min(end, upper)
+            }
+            guard start < end else { continue }
+            let lastIndex = frames.lowerBound { $0.time >= end } - 1
+            guard lastIndex >= 0 else { continue }
+            if sourceTime < start || sourceTime > end || (sourceTime == end && delta >= 0) {
                 let edge: RationalTime?
-                if delta > 0, sourceTime < first.time { edge = first.time }
-                else if delta < 0, sourceTime >= end { edge = last.time }
+                if delta > 0, sourceTime < start { edge = start }
+                else if delta < 0, sourceTime >= end { edge = max(start, frames[lastIndex].time) }
                 else { edge = nil }
                 if let edge, let group = try? edge.adding(source.offset), project.range.contains(group) {
                     candidates.append(group)
                 }
                 continue
             }
-            let index = frameIndex(at: sourceTime, frames: frames)
-            let adjustment = delta < 0 && frames[index].time < sourceTime ? 0 : delta
+            let firstIndex = frameIndex(at: start, frames: frames)
+            let index = min(lastIndex, frameIndex(at: sourceTime, frames: frames))
+            let frameStart = max(start, frames[index].time)
+            let adjustment = delta < 0 && frameStart < sourceTime ? 0 : delta
             let next = index + adjustment
-            let frame = next >= frames.count ? end : frames[max(0, next)].time
+            if source.coverage != nil, next < firstIndex || next > lastIndex { continue }
+            let frame = next > lastIndex ? end : max(start, frames[max(firstIndex, next)].time)
             if let group = try? frame.adding(source.offset) {
                 return min(project.range.to, max(project.range.from, group))
             }
@@ -1584,18 +1887,15 @@ final class MulticamEditorModel: ObservableObject {
 
     /// Both live camera buttons and explicit-time commands use native snapping and history.
     @discardableResult
-    func take(_ id: String, at clock: RationalTime) -> RationalTime? {
-        guard let project, !isBusy, project.range.contains(clock),
-              project.angles.contains(where: { $0.id == id }) else { return nil }
-        let exact = project.switches.first { $0.at == clock }
-        let at = exact?.at ?? snappedAnalysisTime(clock, excludingGroupEdges: true) ?? snappedFrame(clock, delta: 0) ?? clock
-        guard project.range.from <= at, at < project.range.to else { return nil }
-        if edit("Switch Camera", { candidate in
+    func take(_ id: String, at clock: RationalTime, snap: Bool = true) -> RationalTime? {
+        guard let project, !isBusy, let at = snap ? proposedCameraTime(id, at: clock) : clock else { return nil }
+        guard let marker = try? project.proposedSwitch(at: at, angle: id).marker else { return nil }
+        if edit("Take Camera", { candidate in
             if let index = candidate.switches.firstIndex(where: { $0.at == at }) {
-                candidate.switches[index].angle = id
+                candidate.switches[index] = marker
             } else {
-                candidate.switches.append(MulticamSwitch(at: at, angle: id))
-                candidate.switches.sort { $0.at < $1.at }
+                let index = candidate.switches.lowerBound { $0.at > at }
+                candidate.switches.insert(marker, at: index)
             }
         }) {
             editSelection = .group
@@ -1603,6 +1903,46 @@ final class MulticamEditorModel: ObservableObject {
             return at
         }
         return nil
+    }
+
+    private func proposedCameraTime(_ id: String, at clock: RationalTime) -> RationalTime? {
+        guard let project, project.range.contains(clock), project.angles.contains(where: { $0.id == id }) else { return nil }
+        let exact = project.switches.first { $0.at == clock }
+        let at = exact?.at ?? snappedAnalysisTime(clock, excludingGroupEdges: true) ?? snappedFrame(clock, delta: 0) ?? clock
+        return project.range.contains(at) ? at : nil
+    }
+
+    func cameraCoverage(_ id: String, at clock: RationalTime) throws -> MulticamSwitchCoverage {
+        guard let project, let at = proposedCameraTime(id, at: clock) else {
+            throw CutError(code: "invalid_target", message: "Choose a camera and a time inside the group.")
+        }
+        return try project.switchCoverage(at: at, angle: id, media: media) { span in
+            refreshIssue(for: span, mayStartWithSilence: span.output.from == .zero) == nil
+        }
+    }
+
+    func cameraCoverageAtPlayhead(_ id: String) throws -> MulticamSwitchCoverage {
+        guard let group = editableGroupPlayhead else {
+            throw CutError(code: "invalid_target", message: "Move the playhead to a camera recording.")
+        }
+        return try cameraCoverage(id, at: group)
+    }
+
+    @discardableResult
+    func setOccurrenceAngle(_ index: Int, angle: String?) -> Bool {
+        guard let project, let range = assemblyRange(at: index),
+              angle.map({ id in project.angles.contains { $0.id == id } }) ?? true else { return false }
+        guard assemblyItems[index].angleOverride != angle else { return true }
+        if edit(angle == nil ? "Restore Group Picture" : "Override Occurrence Picture", { candidate in
+            var items = candidate.assemblyItems ?? [.group(candidate.range)]
+            items[index] = .group(range, angle: angle)
+            candidate.assemblyItems = items
+        }) {
+            selectedOccurrence = index
+            focusAssemblyEdit()
+            return true
+        }
+        return false
     }
 
     func moveSwitch(_ original: RationalTime, to at: RationalTime, snap: Bool = false) {
@@ -1661,10 +2001,10 @@ final class MulticamEditorModel: ObservableObject {
         let index = index ?? selectedOccurrence
         if edit("Trim Assembly Range", { project in
             var items = project.assemblyItems ?? [.group(project.range)]
-            guard items.indices.contains(index), case .group(let current) = items[index] else { return }
+            guard items.indices.contains(index), let current = items[index].group else { return }
             let revised = MulticamRange(from: from ?? current.from, to: to ?? current.to)
             guard revised != current else { return }
-            items[index] = .group(revised)
+            items[index] = .group(revised, angle: items[index].angleOverride)
             project.assemblyItems = items
         }) {
             selectedOccurrence = index
@@ -1686,8 +2026,10 @@ final class MulticamEditorModel: ObservableObject {
         var splitItems = assemblyItems
         guard !isBusy, let current = assemblyRange(at: index) else { return false }
         guard current.from < at, at < current.to else { return false }
+        let angle = splitItems[index].angleOverride
         splitItems.replaceSubrange(index...index, with: [
-            .group(.init(from: current.from, to: at)), .group(.init(from: at, to: current.to))
+            .group(.init(from: current.from, to: at), angle: angle),
+            .group(.init(from: at, to: current.to), angle: angle)
         ])
         preview.pause()
         if edit("Split Assembly Range", { $0.assemblyItems = splitItems }) {
@@ -1713,6 +2055,19 @@ final class MulticamEditorModel: ObservableObject {
         guard assemblyItems.indices.contains(index), !isBusy else { return }
         if !assemblyPreview { setAssemblyPreview(true) }
         selectOccurrence(index)
+    }
+
+    func assemblyKeyframePointerTarget(_ seconds: Double, tolerance: Double) -> Double {
+        guard analysis.snapTarget == .keyframes, let output = timelineRationalTime(seconds) else { return seconds }
+        let index = assemblyRangeEnds.lowerBound { $0.seconds > seconds }
+        guard let range = assemblyRange(at: index) else { return seconds }
+        let start = assemblyStart(at: index)
+        guard start.seconds < seconds, let elapsed = try? output.subtracting(start),
+              let group = try? range.from.adding(elapsed),
+              let keyframe = snappedAnalysisTime(group, within: range, pictureAngle: assemblyItems[index].angleOverride),
+              abs(keyframe.seconds - group.seconds) <= tolerance,
+              let snapped = try? start.adding(keyframe.subtracting(range.from)) else { return seconds }
+        return snapped.seconds
     }
 
     func seekAssemblyTimeline(_ seconds: Double, scrubbing: Bool) {
@@ -1758,9 +2113,12 @@ final class MulticamEditorModel: ObservableObject {
         if time == original {
             result = original
         } else if analysis.snapTarget == .keyframes {
-            result = nearestAssemblyCopyEdge(target, edge: edge, range: range, project: project)
+            result = nearestAssemblyCopyEdge(target, edge: edge, range: range, project: project,
+                                             angle: assemblyItems[index].angleOverride)
         } else {
-            result = snappedAnalysisTime(target) ?? snappedFrame(target, delta: 0) ?? target
+            let angle = assemblyItems[index].angleOverride
+            result = snappedAnalysisTime(target, pictureAngle: angle)
+                ?? snappedFrame(target, delta: 0, preferredAngle: angle) ?? target
         }
         guard let result,
               project.range.from <= result, result <= project.range.to,
@@ -1778,12 +2136,15 @@ final class MulticamEditorModel: ObservableObject {
     }
 
     private func nearestAssemblyCopyEdge(_ target: RationalTime, edge: TimelineEdge, range: MulticamRange,
-                                         project: MulticamProject) -> RationalTime? {
-        guard let intervals = try? project.groupIntervals() else { return nil }
+                                         project: MulticamProject, angle: String?) -> RationalTime? {
+        var snapshot = project
+        snapshot.assemblyItems = [.group(project.range, angle: angle)]
+        guard let intervals = try? snapshot.plan().intervals else { return nil }
         var nearest: RationalTime?
         for interval in intervals {
-            guard let offset = project.angles.first(where: { $0.id == interval.angle })?.offset,
-                  let info = media[interval.angle], !info.frames.isEmpty,
+            guard let id = interval.pictureSourceID,
+                  let offset = project.pictureSources.first(where: { $0.id == id })?.offset,
+                  let info = media[id], !info.frames.isEmpty,
                   let local = try? target.subtracting(offset),
                   let from = try? max(project.range.from, interval.group.from).subtracting(offset),
                   let to = try? min(project.range.to, interval.group.to).subtracting(offset) else { continue }
@@ -1821,10 +2182,24 @@ final class MulticamEditorModel: ObservableObject {
         var reordered = current
         let occurrence = reordered.remove(at: index)
         reordered.insert(occurrence, at: destination)
+        let durations = pauseEdits.retainedSeconds
+        let boundaries = pauseEdits.takeBoundaries
         preview.pause()
         if reordered != current {
             let action = occurrence.still == nil ? "Move Assembly Range" : "Move Still"
             guard edit(action, { $0.assemblyItems = reordered }) else { return }
+        }
+        if !durations.isEmpty || !boundaries.isEmpty {
+            var order = Array(current.indices)
+            order.remove(at: index)
+            order.insert(index, at: destination)
+            for (newIndex, oldIndex) in order.enumerated() {
+                pauseEdits.takeBoundaries[newIndex] = boundaries[oldIndex]
+            }
+            let indices = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
+            pauseEdits.retainedSeconds = Dictionary(uniqueKeysWithValues: durations.compactMap { id, seconds in
+                indices[id.occurrence].map { (MulticamPauseEdit.ID(occurrence: $0, span: id.span), seconds) }
+            })
         }
         selectAssemblyOccurrence(destination)
     }
@@ -1947,38 +2322,60 @@ final class MulticamEditorModel: ObservableObject {
 
     func stillExportDocument(wholeGroup: Bool, selection: [MulticamRange]?) -> CutProject? {
         guard var snapshot = project else { return nil }
-        if selection != nil, exportProgram == .selection, let span = assemblySelection,
-           assemblySelectionIncludesStill {
+        if selection != nil, let span = assemblySelection,
+           assemblySelectionIncludesStill || assemblyItems.contains(where: { $0.angleOverride != nil }) {
             return (try? snapshot.assemblySelection(.init(from: span.from, to: span.to))).map(CutProject.multicam)
         }
         if let ranges = selection ?? (wholeGroup ? [snapshot.range] : nil) {
-            snapshot.assemblyItems = ranges.map(StillAssemblyItem.group)
+            snapshot.assemblyItems = ranges.map { .group($0) }
         }
         return .multicam(snapshot)
     }
 
     func exportSourceIssue(tracks: ExportTracks, wholeGroup: Bool, mode: ExportMode = .copy,
-                           settings: ReencodeSettings = .init(), selection: [MulticamRange]? = nil) -> String? {
+                           settings: ReencodeSettings = .init(), selection: [MulticamRange]? = nil,
+                           audioAction: ReencodeAudio? = nil) -> String? {
         guard let project else { return "Open a multicam project first." }
-        if selection != nil, exportProgram == .selection, let span = assemblySelection,
-           assemblySelectionIncludesStill {
+        if project.participants.render != nil {
+            if wholeGroup || selection != nil { return ParticipantProjectExport.unsupported("A range export").message }
+            if mode != .encode { return ParticipantProjectExport.requiresEncoding.message }
+            return nil
+        }
+        if selection != nil, let span = assemblySelection,
+           assemblySelectionIncludesStill || assemblyItems.contains(where: { $0.angleOverride != nil }) {
             do { _ = try project.assemblySelection(.init(from: span.from, to: span.to)) }
             catch { return error.localizedDescription }
         } else if selection?.isEmpty == true { return "Select a range on the timeline to export." }
         do {
-            if case .multicam(let stillProject)? = stillExportDocument(wholeGroup: wholeGroup, selection: selection),
-               try CutProject.multicam(stillProject).exportPlacementScope() != .none {
-                return refreshExportIssue(in: try stillProject.plan(), tracks: tracks, mode: mode, settings: settings)
+            guard case .multicam(let snapshot)? = stillExportDocument(wholeGroup: wholeGroup, selection: selection) else {
+                return "Select a valid range to export."
             }
-            let plan = try project.plan(ranges: selection ?? (wholeGroup ? [project.range] : nil))
-            let needsAudio = tracks != .video && (mode != .encode || settings.audio != .removeAudio)
-            let selected = (tracks == .audio ? [] : plan.picture) + (needsAudio ? plan.audio : [])
-            for span in selected {
-                if let issue = refreshIssue(for: span, mayStartWithSilence: span == plan.audio.first) { return issue }
-                guard media[span.source]?.hasFullEditIndex != true else { continue }
+            let plan = try snapshot.plan()
+            let needsAudio = tracks != .video && (audioAction ?? (mode == .encode ? settings.audio : .copyOriginal)) != .removeAudio
+            let routedAudio = needsAudio
+                ? try snapshot.resolveAudioLanes(plan: plan, indexedSources: [:], assumeUnindexedCoverage: true) : []
+            if try CutProject.multicam(snapshot).exportPlacementScope() != .none {
+                return refreshExportIssue(in: plan, tracks: tracks, mode: mode, settings: settings,
+                                          audioAction: audioAction, routedAudio: routedAudio)
+            }
+            func issue(for span: MulticamSpan, mayStartWithSilence: Bool = false) -> String? {
+                if let issue = refreshIssue(for: span, mayStartWithSilence: mayStartWithSilence) { return issue }
+                guard media[span.source]?.hasFullEditIndex != true else { return nil }
                 let name = project.sources.first(where: { $0.id == span.source })?.displayName ?? span.source
                 let detail = sourceIssues[span.source] ?? sourceIndexIssues[span.source] ?? "The editing index is still loading."
                 return "\(name) — \(detail)"
+            }
+            if tracks != .audio {
+                for span in plan.picture {
+                    if let issue = issue(for: span) { return issue }
+                }
+            }
+            for lane in routedAudio {
+                for (index, span) in lane.spans.enumerated() {
+                    if let issue = issue(for: span, mayStartWithSilence: index == 0) {
+                        return snapshot.audio == .mix ? "\(lane.label) — \(issue)" : issue
+                    }
+                }
             }
             return nil
         } catch { return error.localizedDescription }
@@ -1998,10 +2395,13 @@ final class MulticamEditorModel: ObservableObject {
 
     func export(output: URL, mode: ExportMode, tracks: ExportTracks, dryRun: Bool, wholeGroup: Bool,
                 settings: ReencodeSettings = .init(), selection: [MulticamRange]? = nil,
-                requireCameraCopy: Bool = false, checked: (() -> Void)? = nil) {
+                requireCameraCopy: Bool = false, saveResult: Bool = false,
+                audioOutput: MulticamAudioOutput = .separateTracks, audioAction: ReencodeAudio? = nil,
+                reviewed: ((String) -> Void)? = nil, checked: (() -> Void)? = nil) {
         guard let project, !isBusy else { return }
         preview.pause()
         report = nil
+        exportDeliverySummary = nil
         suggestions = []
         suggestionAnchor = nil
         edgeSuggestion = nil
@@ -2015,7 +2415,8 @@ final class MulticamEditorModel: ObservableObject {
         // The engine numbers a range edge within what it was given: the saved assembly when no ranges are passed.
         defer { exportsSavedAssembly = ranges == nil && isBusy }
         let indexedSources = media.filter { $0.value.hasFullEditIndex }
-        if let issue = exportSourceIssue(tracks: tracks, wholeGroup: wholeGroup, mode: mode, settings: settings, selection: selection) {
+        if let issue = exportSourceIssue(tracks: tracks, wholeGroup: wholeGroup, mode: mode, settings: settings,
+                                         selection: selection, audioAction: audioAction) {
             fail(issue)
             return
         }
@@ -2027,34 +2428,54 @@ final class MulticamEditorModel: ObservableObject {
         let protected = protectedMediaPaths
         run(dryRun ? "Checking multicam export…" : "Exporting multicam program…", exporting: !dryRun) { token, useSidecar in
             try CutProject.validateMediaDestination(output, absoluteSources: protected)
+            if saveResult && !dryRun {
+                try CutProject.validateMediaDestination(ExportResultFile.destination(beside: output), absoluteSources: protected)
+            }
             return try AnalysisSidecar.$readsEnabled.withValue(useSidecar) {
-                if let stillDocument, try stillDocument.exportPlacementScope() != .none {
+                if let stillDocument, stillDocument.participants.render == nil, try stillDocument.exportPlacementScope() != .none {
                     let planner = StillExportPlanner(useSidecar: useSidecar, cancelled: { token.isCancelled })
                     let plan = try planner.resolve(stillDocument, tracks: tracks, mode: mode,
                                                    requireCameraCopy: tracks != .audio && requireCameraCopy,
-                                                   output: output, settings: settings)
-                    if dryRun { return plan.inspectorSummary }
+                                                   output: output, settings: settings,
+                                                   audioOutput: audioOutput, audioAction: audioAction)
+                    if dryRun { return (plan.inspectorSummary, plan.audioDeliverySummary) }
+                    let result = saveResult ? try ExportResultFile(output: output, plan: plan.report, cutMap: plan.report.cutMap) : nil
                     try planner.write(plan, to: output) {
                         update(token, $0)
                         return !token.isCancelled
                     }
-                    return "Exported \(output.lastPathComponent)"
+                    return (result?.completionMessage(for: output) ?? "Exported \(output.lastPathComponent)", "")
                 }
                 let engine = MulticamEngine(cancelled: { token.isCancelled })
                 // The plan, or the failure with the alternatives of the export rules, as every export reports them.
-                let plan = try engine.resolution(project, output: output, mode: mode, tracks: tracks, assembly: ranges,
-                                                 settings: settings, indexedSources: indexedSources).get()
+                guard case .multicam(let snapshot)? = stillDocument else {
+                    throw CutError(code: "invalid_range", message: "Select a valid range to export.")
+                }
+                let plan = try engine.resolution(snapshot, output: output, mode: mode, tracks: tracks,
+                                                 settings: settings, indexedSources: indexedSources,
+                                                 audioOutput: audioOutput, audioAction: audioAction).get()
+                if requireCameraCopy, plan.participantRender != nil {
+                    throw CutError(code: "camera_copy_required", message: "The participant export would encode picture.")
+                }
                 if dryRun {
                     let encoder = JSONEncoder()
                     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-                    return String(decoding: try encoder.encode(plan), as: UTF8.self)
+                    return (String(decoding: try encoder.encode(plan), as: UTF8.self), plan.audioDeliverySummary)
                 }
+                let result = saveResult ? try ExportResultFile(output: output, plan: plan,
+                                                               cutMap: ExportCutMap(multicam: plan.mapping)) : nil
                 try engine.write(plan, to: output) { update(token, $0) }
-                return "Exported \(output.lastPathComponent)"
+                return (result?.completionMessage(for: output) ?? "Exported \(output.lastPathComponent)", "")
             }
         } onSuccess: { result in
-            if dryRun { self.report = result; checked?() }
-            else { self.status = result }
+            if dryRun {
+                if let reviewed { reviewed(result.1) }
+                else {
+                    self.exportDeliverySummary = result.1
+                    self.report = result.0
+                }
+                checked?()
+            } else { self.status = result.0 }
         }
     }
 
@@ -2244,7 +2665,12 @@ extension MulticamEditorModel {
         return true
     }
 
+    func clearQueueInvalidation(_ id: UUID) {
+        invalidatedQueueIDs.remove(id)
+    }
+
     func queuedMediaRefreshIssue() -> CutError? {
+        if project?.participants.render != nil { return ParticipantProjectExport.unsupported("A queued range export") }
         guard queuedRanges.contains(where: { invalidatedQueueIDs.contains($0.id) }) else { return nil }
         return CutError(code: "source_changed", message: "Remove and re-add affected queued ranges to export the refreshed media.")
     }
@@ -2274,15 +2700,25 @@ extension MulticamEditorModel {
     }
 
     func refreshExportIssue(in plan: MulticamPlan, tracks: ExportTracks, mode: ExportMode,
-                            settings: ReencodeSettings) -> String? {
-        let needsAudio = tracks != .video && (mode != .encode || settings.audio != .removeAudio)
-        let referenced = (tracks == .audio ? [] : plan.picture) + (needsAudio ? plan.audio : [])
-        return referenced.lazy.compactMap { self.refreshIssue(for: $0, mayStartWithSilence: $0 == plan.audio.first) }.first
+                            settings: ReencodeSettings, audioAction: ReencodeAudio? = nil,
+                            routedAudio: [MulticamPlannedAudioLane]? = nil) -> String? {
+        let needsAudio = tracks != .video && (audioAction ?? (mode == .encode ? settings.audio : .copyOriginal)) != .removeAudio
+        if tracks != .audio, let issue = plan.picture.lazy.compactMap({ self.refreshIssue(for: $0) }).first { return issue }
+        guard needsAudio else { return nil }
+        let lanes = routedAudio ?? (try? plan.resolveAudioLanes(indexedSources: [:], assumeUnindexedCoverage: true)) ?? plan.audioLanes
+        for lane in lanes {
+            if let issue = lane.spans.enumerated().lazy.compactMap({
+                self.refreshIssue(for: $0.element, mayStartWithSilence: $0.offset == 0)
+            }).first {
+                return lane.colorSlot == nil ? issue : "\(lane.label) — \(issue)"
+            }
+        }
+        return nil
     }
 
     func refreshPictureIssue(sourceID: String) -> String? {
         if let issue = refreshReviewReasons[sourceID] { return issue }
-        guard let source = project?.angles.first(where: { $0.id == sourceID }),
+        guard let source = project?.pictureSources.first(where: { $0.id == sourceID }),
               let url = Self.availableURL(source), refreshReviewPicture.contains(url) else { return nil }
         return "\(source.displayName) — the picture track could not be verified."
     }
@@ -2316,7 +2752,7 @@ extension MulticamEditorModel {
             }
             refreshReviewStreams[alias, default: []].formUnion(result.reviewStreams)
             if result.pictureNeedsReview { refreshReviewPicture.insert(alias) }
-            let expectedVideo = project.angles.contains { $0.id == source.id }
+            let expectedVideo = project.pictureSources.contains { $0.id == source.id }
             if let ordinary = refreshed?.forRefreshAlias(alias),
                let index = aligned?.forRefreshAlias(alias)
                     ?? (result.state == .unchanged ? try? CutEngine().multicamClock(ordinary) : nil) {
@@ -2349,5 +2785,30 @@ extension MulticamEditorModel {
         preview.seek(to: position)
         mcpRevision += 1
         for source in sources { mediaRefreshWarnings[source.id] = result.persistenceError }
+    }
+}
+
+extension MulticamEditorModel {
+    func replaceParticipantProject(_ next: ParticipantProject, action: String) throws {
+        guard edit(action, { project in
+            var document = CutProject.multicam(project)
+            document.participants = next
+            try document.validate()
+            if case .multicam(let updated) = document { project = updated }
+        }) else {
+            throw CutError(code: "invalid_participant_edit", message: "The participant edit could not be applied.")
+        }
+    }
+
+    func seekParticipantAppearance(sourceID: String, range: MulticamRange) {
+        let occurrences = mapping?.picture.compactMap { span -> RationalTime? in
+            let source = max(range.from, span.input.from)
+            guard span.source == sourceID, source < min(range.to, span.input.to) else { return nil }
+            return try? span.output.from.adding(source.subtracting(span.input.from))
+        } ?? []
+        if let time = occurrences.min(by: { abs($0.seconds - preview.time.seconds) < abs($1.seconds - preview.time.seconds) }) {
+            preview.pause()
+            preview.seek(to: time)
+        }
     }
 }

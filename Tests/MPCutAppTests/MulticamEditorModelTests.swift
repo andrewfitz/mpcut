@@ -7,6 +7,108 @@ import XCTest
 
 final class MulticamEditorModelTests: XCTestCase {
     @MainActor
+    func testSaveAsCopiesTranscriptOnlyAfterTheDestinationIsAvailable() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let model = MulticamEditorModel(preferences: preferences, draft: ProjectDraft(directory: directory.appendingPathComponent("Drafts")))
+        defer { model.reset() }
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "Multicam-Delayed-PCM", withExtension: "mov", subdirectory: "Fixtures"))
+        let source = directory.appendingPathComponent("Camera.mov")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: fixture, to: source)
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(source)
+        let stream = try XCTUnwrap(media.audio.first?.stream.index)
+        let camera = MulticamEditorModel.SourceDraft(source: .init(id: "wide", file: source.path, audioStream: stream), media: media)
+        model.confirmSetup(drafts: [camera], opening: "wide", audio: .none)
+        let draft = try model.transcriptAssetContext()
+        let data = Data("{\"version\":1}".utf8)
+        let asset = try TranscriptStore.put(data, relativeTo: draft, draft: true)
+        let binding = TranscriptBinding(trackID: "mic", file: source.path, streamIndex: stream)
+        try model.setTranscriptState(.init(attachments: [.init(id: "dialogue", asset: asset, bindings: [binding])]))
+
+        let destination = directory.appendingPathComponent("Multicam.cut")
+        let occupiedProject = CutProject.sequence([])
+        try occupiedProject.save(to: destination)
+        XCTAssertThrowsError(try model.writeProject(to: destination, replacingExisting: false)) { error in
+            XCTAssertEqual((error as? CutError)?.code, "destination_exists")
+        }
+        XCTAssertEqual(try CutProject.load(from: destination), occupiedProject)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: TranscriptStore.folder(relativeTo: destination).path))
+        XCTAssertEqual(try TranscriptStore.read(asset, relativeTo: draft), data)
+
+        try model.writeProject(to: destination)
+        let saved = try CutProject.load(from: destination)
+        let attachment = try XCTUnwrap(saved.transcripts.attachments.first)
+        XCTAssertEqual(try TranscriptStore.read(attachment.asset, relativeTo: destination), data)
+        XCTAssertEqual(attachment.bindings.first?.file, source.lastPathComponent)
+        XCTAssertEqual(model.transcriptState.attachments.first?.bindings, [binding])
+        XCTAssertEqual(model.transcriptState.attachments.first?.asset, attachment.asset)
+    }
+
+    @MainActor
+    func testMixTrackEditsPersistAcrossModesAndReopen() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        preferences.historyLimit = 8
+        let model = MulticamEditorModel(preferences: preferences, draft: ProjectDraft(directory: directory.appendingPathComponent("Drafts")))
+        defer { model.reset() }
+        let engine = CutEngine(useSidecar: false)
+        let drafts = try zip(["wide", "close"], ["Multicam-Delayed-PCM", "Pause-Quiet"]).map { id, name in
+            let path = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "mov", subdirectory: "Fixtures"))
+            let media = try engine.inspectMulticamSource(path)
+            return MulticamEditorModel.SourceDraft(
+                source: .init(id: id, file: path.path, name: id.capitalized,
+                              audioStream: try XCTUnwrap(media.audio.first?.stream.index)),
+                media: media
+            )
+        }
+        let fixed = MulticamAudioSelection(source: drafts[0].id, stream: try XCTUnwrap(drafts[0].source.audioStream))
+        let override = MulticamAudioSelection(source: drafts[1].id, stream: try XCTUnwrap(drafts[1].source.audioStream))
+        model.confirmSetup(drafts: drafts, opening: fixed.source, audio: .fixed(fixed))
+        model.changeSwitch(.zero, audio: override)
+        XCTAssertTrue(model.setProgramAudio(.mix))
+        let original = try XCTUnwrap(model.project?.mixLanes)
+        XCTAssertEqual(original.map(\.target), [.camera("wide"), .camera("close")])
+        XCTAssertEqual(original.map(\.colorSlot), [0, 1])
+        // The configured camera lane already resolves to this recording and stream.
+        model.addMixLane(target: .recording(fixed), label: "Duplicate track")
+        XCTAssertEqual(model.project?.mixLanes, original)
+        XCTAssertNotNil(model.notice)
+        model.notice = nil
+        let secondStream = try XCTUnwrap(drafts[1].media.audio.dropFirst().first?.stream.index)
+        let extra = MulticamAudioSelection(source: drafts[1].id, stream: secondStream)
+        model.addMixLane(target: .recording(extra), label: "Room mic")
+        let room = try XCTUnwrap(model.project?.mixLanes.last)
+        XCTAssertEqual(room.target, .recording(extra))
+        model.moveMixLane(original[1].id, by: -1)
+        model.renameMixLane(original[1].id, label: "Guest")
+        let edited = try XCTUnwrap(model.project?.mixLanes)
+        XCTAssertEqual(edited.map(\.id), [original[1].id, original[0].id, room.id])
+        XCTAssertEqual(edited.map(\.colorSlot), [1, 0, 2])
+
+        XCTAssertTrue(model.setProgramAudio(.none))
+        let path = directory.appendingPathComponent("Mix.cut")
+        XCTAssertTrue(model.saveProject(to: path))
+        let reopened = MulticamEditorModel(preferences: preferences)
+        defer { reopened.reset() }
+        reopened.openProject(path)
+        try await waitForIndex(reopened)
+        XCTAssertEqual(reopened.project?.audio, MulticamAudioPolicy.none)
+        XCTAssertEqual(reopened.project?.fixedAudio, fixed)
+        XCTAssertEqual(reopened.project?.switches[0].audio, override)
+        XCTAssertTrue(reopened.setProgramAudio(.mix))
+        XCTAssertEqual(reopened.project?.mixLanes, edited)
+        XCTAssertEqual(reopened.project?.mixLanes.first?.label, "Guest")
+        reopened.undo()
+        XCTAssertEqual(reopened.project?.audio, MulticamAudioPolicy.none)
+    }
+
+    @MainActor
     func testNamedHistoryDraftPromotionRecoveryAndRetention() async throws {
         let fixture = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov", subdirectory: "Fixtures"))
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -45,7 +147,7 @@ final class MulticamEditorModelTests: XCTestCase {
 
         // A crashed instance releases the lock but leaves the last revision on disk.
         var orphan: ProjectDraft? = ProjectDraft(directory: draftDirectory)
-        try orphan?.write { try draft.project.save(to: $0, undo: draft.undo, redo: draft.redo) }
+        try orphan?.write { try draft.project.saveStaged(to: $0, undo: draft.undo, redo: draft.redo) }
         let orphanURL = try XCTUnwrap(orphan?.url)
         orphan = nil
         let recovered = MulticamEditorModel(preferences: preferences, draft: ProjectDraft(directory: draftDirectory))
@@ -447,6 +549,8 @@ final class MulticamEditorModelTests: XCTestCase {
         XCTAssertEqual(model.ranges, [repeated, other, trimmed])
 
         let exactEnd = try thirdStart.adding(frames[5].time.subtracting(trimmed.from))
+        XCTAssertEqual(model.assemblyKeyframePointerTarget(exactEnd.seconds - 0.007, tolerance: .infinity),
+                       exactEnd.seconds, accuracy: 1e-9)
         model.seekAssemblyTimeline(exactEnd.seconds, scrubbing: false)
         try await Task.sleep(for: .milliseconds(30))
         let children = try XCTUnwrap(surface.accessibilityChildren() as? [NSAccessibilityElement])
@@ -549,11 +653,10 @@ final class MulticamEditorModelTests: XCTestCase {
 
     @MainActor
     func testSavedProjectPublishesBeforeAnyIndexAndUsesProvisionalPictureClock() async throws {
-        let url = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
-                                                   subdirectory: "Fixtures"))
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
+        let url = try copyPreviewFixture(to: directory)
         let projectURL = directory.appendingPathComponent("progressive.cut")
         let project = MulticamProject(referenceAngle: "wide", range: .init(from: .zero, to: .init(numerator: 1)),
                                       angles: [.init(id: "wide", file: url.path),
@@ -602,8 +705,10 @@ final class MulticamEditorModelTests: XCTestCase {
 
     @MainActor
     func testSetupCanBeConfirmedWithPreviewMetadata() async throws {
-        let url = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
-                                                   subdirectory: "Fixtures"))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = try copyPreviewFixture(to: directory)
         let model = MulticamEditorModel()
         defer { model.reset() }
         model.useAnalysisSidecars = false
@@ -755,6 +860,86 @@ final class MulticamEditorModelTests: XCTestCase {
         model.splitOccurrence()
         XCTAssertEqual(model.ranges.map(\.from), [.zero, .zero, firstCut])
         XCTAssertEqual(model.ranges.map(\.to), [end, firstCut, end])
+    }
+
+    @MainActor
+    func testOccurrenceAngleChangesPlaybackAndUndoWithoutChangingGroup() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
+                                                   subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(url)
+        let preferences = EditorPreferences()
+        preferences.historyLimit = 5
+        let model = MulticamEditorModel(preferences: preferences)
+        defer { model.reset() }
+        model.confirmSetup(drafts: ["wide", "close"].map {
+            .init(source: .init(id: $0, file: url.path), media: media)
+        }, opening: "wide", audio: .none)
+
+        let end = media.frames[6].time
+        let range = MulticamRange(from: .zero, to: end)
+        model.addAssemblyRange(range)
+        model.addAssemblyRange(range)
+        let revision = model.mcpRevision
+        let coverage = try model.cameraCoverage("close", at: .zero)
+        XCTAssertEqual(coverage.picture.status, .covered)
+        XCTAssertEqual(coverage.audio.status, .unrouted)
+        XCTAssertEqual(model.mcpRevision, revision)
+
+        XCTAssertTrue(model.setOccurrenceAngle(1, angle: "close"))
+        model.selectAssemblyOccurrence(1)
+        XCTAssertTrue(model.assemblyPreview)
+        XCTAssertEqual(model.interval(at: model.preview.currentTime())?.angle, "close")
+        XCTAssertEqual(model.interval(at: .zero)?.angle, "wide")
+        XCTAssertEqual(model.project?.switches.map { $0.angle }, ["wide"])
+        let split = media.frames[3].time
+        XCTAssertTrue(model.commitOccurrenceSplit(index: 1, at: split))
+        XCTAssertEqual(model.assemblyItems.map { $0.angleOverride }, [nil, "close", "close"])
+        model.undo()
+        XCTAssertEqual(model.assemblyItems.map { $0.angleOverride }, [nil, "close"])
+        model.undo()
+        XCTAssertEqual(model.assemblyItems.map { $0.angleOverride }, [nil, nil])
+
+        XCTAssertTrue(model.edit("Limit Close Coverage", { project in
+            project.angles[1].coverage = .init(from: media.frames[1].time, to: media.frames[4].time)
+        }))
+        XCTAssertEqual(model.snappedFrame(media.frames[5].time, delta: -1, preferredAngle: "close"),
+                       media.frames[3].time)
+        XCTAssertNil(model.snappedFrame(media.frames[3].time, delta: 1, preferredAngle: "close"))
+    }
+
+    @MainActor
+    func testProposedCameraCoverageFindsLeadingPictureAndTrailingMicGaps() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
+                                                   subdirectory: "Fixtures"))
+        let micURL = try XCTUnwrap(Bundle.module.url(forResource: "Multicam-Delayed-PCM", withExtension: "mov",
+                                                      subdirectory: "Fixtures"))
+        let engine = CutEngine(useSidecar: false)
+        let media = try engine.inspectMulticamSource(url)
+        let mic = try engine.inspectMulticamSource(micURL)
+        let stream = try XCTUnwrap(mic.audio.first)
+        let spacing = media.frames[2].time
+        var project = MulticamProject(referenceAngle: "wide", range: .init(from: .zero, to: media.duration),
+                    angles: [.init(id: "wide", file: url.path), .init(id: "close", file: url.path, offset: spacing)],
+                    audioSources: [.init(id: "mic", file: micURL.path)],
+                    audio: .fixed(.init(source: "mic", stream: stream.stream.index)),
+                    switches: [.init(at: .zero, angle: "wide")])
+        let desiredEnd = try project.range.to.subtracting(spacing)
+        project.audioSources[0].offset = try desiredEnd.subtracting(stream.end)
+        let coverage = try project.switchCoverage(at: .zero, angle: "close",
+                                                   media: ["close": media, "mic": mic])
+        XCTAssertEqual(coverage.picture.status, .gaps)
+        XCTAssertEqual(coverage.picture.missing.first, .init(from: .zero, to: spacing))
+        XCTAssertEqual(coverage.audio.status, .gaps)
+        XCTAssertEqual(coverage.audio.missing.last, .init(from: desiredEnd, to: project.range.to))
+    }
+
+    private func copyPreviewFixture(to directory: URL) throws -> URL {
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
+                                                       subdirectory: "Fixtures"))
+        // A unique source path keeps the shared loader's completed index cache cold.
+        let copy = directory.appendingPathComponent(fixture.lastPathComponent)
+        try FileManager.default.copyItem(at: fixture, to: copy)
+        return copy
     }
 
     @MainActor

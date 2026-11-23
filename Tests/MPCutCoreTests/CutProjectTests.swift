@@ -98,27 +98,76 @@ final class CutProjectTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: request.file), Data([1]))
     }
 
+    func testOutputCollisionUsesPhysicalParentTraversal() throws {
+        let fm = FileManager.default
+        let folder = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let physical = folder.appendingPathComponent("physical")
+        let child = physical.appendingPathComponent("child")
+        try fm.createDirectory(at: child, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: folder) }
+        try fm.createSymbolicLink(at: folder.appendingPathComponent("shortcut"), withDestinationURL: child)
+        let output = folder.appendingPathComponent("shortcut/../offline.mov")
+        let clip = CutSequenceClip(id: "a", file: "physical/offline.mov", from: .zero, to: .init(numerator: 1))
+        let project = CutProject.sequence([clip])
+        XCTAssertThrowsError(try project.validateDestination(output, relativeTo: folder.appendingPathComponent("edit.cut"))) {
+            XCTAssertEqual(($0 as? CutError)?.code, "cut_project_source_collision")
+        }
+    }
+
     func testJSONNumbersCannotRoundIntoAnIntegerField() throws {
         func project(_ version: String, track: String) -> Data {
             Data("""
-            {"format":"mpcut","schemaVersion":\(version),"kind":"sequence",
-             "clips":[{"id":"a","file":"shot.mov","from":"0","to":"1","audioTrack":\(track)}]}
+            {"format":"mpcut","schema_version":\(version),"kind":"sequence",
+             "clips":[{"id":"a","file":"shot.mov","from":"0","to":"1","track_ordinal":\(track)}]}
             """.utf8)
         }
-        for version in ["1.00000000000000000001", "100000000000000000001e-20"] {
+        for version in ["3.00000000000000000001", "300000000000000000001e-20"] {
             XCTAssertThrowsError(try CutProject.decode(project(version, track: "0")))
         }
-        XCTAssertThrowsError(try CutProject.decode(project("1", track: "1e-1000")))
-        XCTAssertNoThrow(try CutProject.decode(project("10e-1", track: "1.00e1")))
+        XCTAssertThrowsError(try CutProject.decode(project("3", track: "1e-1000")))
+        XCTAssertNoThrow(try CutProject.decode(project("30e-1", track: "1.00e1")))
+    }
+
+    func testRetiredProjectsRejectBeforeReadingTimelineContents() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let url = folder.appendingPathComponent("original.cut")
+        for kind in ["sequence", "multicam"] {
+            for version in [1, 2] {
+                for key in ["schemaVersion", "schema_version"] {
+                    let input = Data(#"{"format":"mpcut","\#(key)":\#(version),"kind":"\#(kind)","clips":false}"#.utf8)
+                    try input.write(to: url)
+                    XCTAssertThrowsError(try CutProject.loadDocument(from: url, limit: 5)) {
+                        XCTAssertEqual(($0 as? CutError)?.code, "unsupported_cut_version")
+                    }
+                    XCTAssertEqual(try Data(contentsOf: url), input)
+                }
+            }
+        }
+    }
+
+    func testCurrentVersionRejectsRetiredFieldsAndItemWrappers() {
+        let header = #""format":"mpcut","schema_version":3,"kind":"sequence""#
+        let clip = #""id":"a","file":"offline.wav","from":"0","to":"1""#
+        let inputs = [
+            "{\(header),\"schemaVersion\":3,\"clips\":[]}",
+            "{\(header),\"clips\":[{\(clip),\"audioTrack\":0}]}",
+            "{\(header),\"clips\":[{\"kind\":\"source\",\"source\":{\(clip)}}]}",
+            "{\(header),\"clips\":[],\"history\":{\"undo\":[{\"action\":\"Edit\",\"sequenceItems\":[]}]}}"
+        ]
+        for input in inputs {
+            XCTAssertThrowsError(try CutProject.decodeDocument(Data(input.utf8), limit: 5), input)
+        }
     }
 
     func testRejectsMalformedAndIncompatibleDocuments() throws {
-        let header = #""format":"mpcut","schemaVersion":1,"kind":"sequence""#
+        let header = #""format":"mpcut","schema_version":3,"kind":"sequence""#
         let cases = [
             "{\(header),\"clips\":[],\"clips\":[]}",
             "{\(header),\"clips\":[],\"unknown\":true}",
-            #"{"schemaVersion":1,"kind":"sequence","clips":[]}"#,
-            #"{"schemaVersion":3,"format":"mpcut","kind":"sequence","clips":[]}"#,
+            #"{"schema_version":3,"kind":"sequence","clips":[]}"#,
+            #"{"schema_version":5,"format":"mpcut","kind":"sequence","clips":[]}"#,
             "{\(header),\"clips\":[{\"id\":\"a\",\"file\":\"file\",\"from\":\"1\",\"to\":\"1\"}]}",
         ]
         for document in cases {

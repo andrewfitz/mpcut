@@ -12,11 +12,10 @@ struct SidecarGenerationRefresh {
 
 extension AnalysisSidecar {
     static let evidenceKey = MediaRefreshEvidence.sectionKey
-    private static let thresholdOverridesKey = "thresholdOverrides.v1"
+    package static let silenceThresholdOverridesKey = "silence_threshold_overrides_db.v1"
     private static let evidenceLimit = 16 * 1024 * 1024
 
-    func migrateManifest(_ db: SidecarDatabase) throws {
-        guard try db.integer("PRAGMA user_version") < 2 else { return }
+    func createManifest(_ db: SidecarDatabase) throws {
         try db.execute("""
             CREATE TABLE source_generations(
                 id INTEGER PRIMARY KEY, stamp TEXT NOT NULL, reason TEXT NOT NULL
@@ -44,7 +43,7 @@ extension AnalysisSidecar {
                 PRIMARY KEY(generation, scope)
             );
             CREATE INDEX scene_report_attempt ON scene_reports(attempt);
-            PRAGMA user_version = 2;
+            PRAGMA user_version = \(Self.schemaVersion);
             """)
     }
 
@@ -121,7 +120,7 @@ extension AnalysisSidecar {
         let previous = try generation(db)
         try db.execute("CREATE TEMP TABLE retained_sections(name TEXT PRIMARY KEY)")
         if let refresh {
-            for key in refresh.preserving.sorted() where key != Self.evidenceKey && key != Self.thresholdOverridesKey {
+            for key in refresh.preserving.sorted() where key != Self.evidenceKey && key != Self.silenceThresholdOverridesKey {
                 if let bytes = try verifiedSection(key, in: db, stamp: saved, maxBytes: nil, cancelled: cancelled) {
                     try writeSection(key, value: bytes, db: db, stamp: stamp, cancelled: cancelled)
                     try db.update("INSERT INTO retained_sections(name) VALUES(?)", [key])
@@ -134,17 +133,17 @@ extension AnalysisSidecar {
             INSERT INTO archived_sections(generation, name, digest, value)
             SELECT ?, name, digest, value FROM sections
             WHERE name NOT IN (SELECT name FROM retained_sections)
-              AND (name IN (?, ?, ?, ?) OR name LIKE 'silence.%' OR name LIKE 'calibration.%')
+              AND (name IN (?, ?, ?, ?) OR name GLOB 'silence_pauses.*' OR name GLOB 'silence_automatic_threshold_db.*')
             """, [String(previous), Self.evidenceKey, Self.sceneSectionKey, Self.viewNameSectionKey,
-                  Self.thresholdOverridesKey])
+                  Self.silenceThresholdOverridesKey])
         try db.execute("DELETE FROM sections WHERE name NOT IN (SELECT name FROM retained_sections)")
         if let refresh, !refresh.preservingThresholdStreams.isEmpty,
-           let data = try verifiedSection(Self.thresholdOverridesKey, in: db, stamp: saved, maxBytes: nil,
+           let data = try verifiedSection(Self.silenceThresholdOverridesKey, in: db, stamp: saved, maxBytes: nil,
                                           cancelled: cancelled, generation: String(previous)),
            let overrides = try? JSONDecoder().decode([Int: Double].self, from: data) {
             let retained = overrides.filter { refresh.preservingThresholdStreams.contains($0.key) }
             if !retained.isEmpty {
-                try writeSection(Self.thresholdOverridesKey, value: JSONEncoder().encode(retained), db: db, stamp: stamp,
+                try writeSection(Self.silenceThresholdOverridesKey, value: JSONEncoder().encode(retained), db: db, stamp: stamp,
                                  cancelled: cancelled)
             }
         }
@@ -181,6 +180,7 @@ extension AnalysisSidecar {
             guard let stamp = try currentStamp(db) else { return (false, nil) }
             let evidence = try? verifiedSection(Self.evidenceKey, in: db, stamp: stamp,
                                                 maxBytes: Self.evidenceLimit, cancelled: { Task.isCancelled })
+            try checkSource()
             return (true, evidence)
         } catch { return (false, nil) }
     }
@@ -248,9 +248,6 @@ extension AnalysisSidecar {
     }
 
     static func persistedGenerations(in db: SidecarDatabase, current: Bool) throws -> [PersistedGeneration] {
-        guard try db.integer("PRAGMA user_version") >= 2 else {
-            return [PersistedGeneration(id: 1, reason: "legacy", current: current)]
-        }
         return try db.statement("SELECT id, reason FROM source_generations ORDER BY id DESC") { query in
             var result: [PersistedGeneration] = []
             var step = sqlite3_step(query)
@@ -298,7 +295,6 @@ extension AnalysisSidecar {
             let db = try SidecarDatabase(url, writing: false)
             try db.execute("BEGIN")
             try validate(db)
-            guard try db.integer("PRAGMA user_version") >= 2 else { return nil }
             let stamp = try db.statement("SELECT stamp FROM source_generations WHERE id = ?", [String(generation)]) { query in
                 sqlite3_step(query) == SQLITE_ROW ? sqlite3_column_text(query, 0).map(String.init(cString:)) : nil
             }

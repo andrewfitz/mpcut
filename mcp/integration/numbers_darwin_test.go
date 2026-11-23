@@ -38,12 +38,12 @@ func checkExactNumbers(t *testing.T, project any, call func(string, object) (*mc
 		}
 		t.Fatalf("%s did not identify fractional %s: %v %v", name, field, result.StructuredContent, result.Content)
 	}
-	checkInvalid("get_editor_state", "offset", object{"project": project, "offset": fraction})
-	checkInvalid("file_inspect", "project_data", object{"operationID": fileOperationID(), "project_data": object{
-		"format": "mpcut", "schemaVersion": fraction, "kind": "sequence", "clips": []object{},
+	checkInvalid("project_editor_state_read", "offset", object{"project_handle": project, "offset": fraction})
+	checkInvalid("project_file_inspect", "project_data", object{"operation_id": fileOperationID(), "project_data": object{
+		"format": "mpcut", "schema_version": fraction, "kind": "sequence", "clips": []object{},
 	}})
 
-	result, err := call("get_editor_state", object{"project": project, "offset": json.Number("9007199254740993.0")})
+	result, err := call("project_editor_state_read", object{"project_handle": project, "offset": json.Number("9007199254740993.0")})
 	if err != nil || result.IsError || len(result.Content) != 1 {
 		t.Fatalf("exact integer page request failed: %v %v", result, err)
 	}

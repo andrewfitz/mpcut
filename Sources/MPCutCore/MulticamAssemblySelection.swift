@@ -8,7 +8,7 @@ extension MulticamProject {
         for item in assemblyItems ?? [.group(range)] {
             let length: RationalTime
             switch item {
-            case .group(let group): length = try group.to.subtracting(group.from)
+            case .group(let group, _): length = try group.to.subtracting(group.from)
             case .still(let insert): length = insert.duration
             }
             let end = try cursor.adding(length)
@@ -18,8 +18,8 @@ extension MulticamProject {
                 let lower = try from.subtracting(cursor)
                 let upper = try to.subtracting(cursor)
                 switch item {
-                case .group(let group):
-                    items.append(try .group(.init(from: group.from.adding(lower), to: group.from.adding(upper))))
+                case .group(let group, let angle):
+                    items.append(try .group(.init(from: group.from.adding(lower), to: group.from.adding(upper)), angle: angle))
                 case .still(var insert):
                     var prefix = insert
                     prefix.duration = lower
@@ -40,5 +40,16 @@ extension MulticamProject {
         snapshot.assemblyItems = items
         try snapshot.validate()
         return snapshot
+    }
+}
+
+extension MulticamProject {
+    package func pictureAngle(at group: RationalTime, in occurrence: Int? = nil,
+                              exclusiveEnd: Bool = false) -> String? {
+        if let occurrence, let assemblyItems, assemblyItems.indices.contains(occurrence),
+           let angle = assemblyItems[occurrence].angleOverride {
+            return angle
+        }
+        return exclusiveEnd ? switches.last(where: { $0.at < group })?.angle : selection(at: group)?.angle
     }
 }

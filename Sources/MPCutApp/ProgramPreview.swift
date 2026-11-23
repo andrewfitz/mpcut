@@ -5,7 +5,9 @@ struct ProgramPreviewStills: Equatable, Sendable {
     struct Picture: Equatable, Sendable {
         let output: MulticamRange
         let asset: StillAsset
+        let placementID: String
         let url: URL
+        let document: URL?
         let framing: StillImageFraming
     }
 
@@ -24,18 +26,18 @@ struct ProgramPreviewStills: Equatable, Sendable {
             guard let id = span.placementID, let (assetID, framing) = inserts[id] ?? replacements[id],
                   let asset = assets[assetID] else { return nil }
             let url = document.map { CutProject.mediaURL(asset.file, relativeTo: $0) } ?? URL(fileURLWithPath: asset.file)
-            return Picture(output: span.output, asset: asset, url: url, framing: framing)
+            return Picture(output: span.output, asset: asset, placementID: id, url: url, document: document, framing: framing)
         }
         guard !pictures.isEmpty else { return nil }
         let stream = reference?.videoStream
-        let width = max(1, stream?.displayWidth ?? project.stillFormat?.width ?? 1920)
-        let height = max(1, stream?.displayHeight ?? project.stillFormat?.height ?? 1080)
+        let geometry = project.stillReviewGeometry(reference: reference) ?? (1920, 1080, 16.0 / 9)
+        let (width, height, aspect) = geometry
         let scale = min(1, 1920.0 / Double(max(width, height)))
         let transfer = project.programColorPolicy?.transfer ?? stream?.colorTransfer
         let primaries = project.programColorPolicy?.primaries ?? stream?.colorPrimaries
         canvas = StillImageCanvas(width: max(1, Int(Double(width) * scale)),
                                   height: max(1, Int(Double(height) * scale)),
-                                  displayAspect: Double(width) / Double(height),
+                                  displayAspect: aspect,
                                   transfer: transfer == "unknown" ? "bt709" : transfer ?? "bt709",
                                   primaries: primaries == "unknown" ? "bt709" : primaries ?? "bt709",
                                   diffuseWhiteNits: project.programColorPolicy?.diffuseWhiteNits ?? 203)
@@ -99,12 +101,20 @@ final class ProgramStillPreview {
     }
 }
 
-private actor ProgramPreviewRenderer {
+actor ProgramPreviewRenderer {
     func render(_ picture: ProgramPreviewStills.Picture, canvas: StillImageCanvas) throws -> PreviewFrame {
         try Task.checkCancellation()
-        let surface = try StillImage.render(picture.url, canvas: canvas, framing: picture.framing, preview: true)
+        let review = try StillReviewFrame(asset: picture.asset, placementID: picture.placementID,
+                                         framing: picture.framing, interval: picture.output, document: picture.document,
+                                         width: canvas.width, height: canvas.height,
+                                         displayAspect: canvas.displayAspect ?? Double(canvas.width) / Double(canvas.height))
+        try review.validateAsset(cancelled: { Task.isCancelled })
+        let surface = try StillImage.render(review.url, canvas: canvas, framing: picture.framing, preview: true, expectedIdentity: review.identity,
+                                            cancelled: { Task.isCancelled })
+        let buffer = try surface.pixelBuffer
         try Task.checkCancellation()
-        return PreviewFrame(buffer: try surface.pixelBuffer, time: previewTime(picture.output.from), transform: .identity,
+        try review.validateIdentity()
+        return PreviewFrame(buffer: buffer, time: previewTime(picture.output.from), transform: .identity,
                             programTransfer: canvas.transfer, sourceRendition: label(surface.sourceInfo.rendition))
     }
 

@@ -14,6 +14,7 @@ struct PreviewRange: Equatable, Sendable {
     let exactEnd: RationalTime
     var isAudioOnly = false
     var audioOrigin: RationalTime?
+    var assetClockOrigin: RationalTime?
     var usesMP3GaplessClock = false
     var audioTrack: Int?
     var audioTrackIDs: [CMPersistentTrackID]?
@@ -80,10 +81,12 @@ struct PreviewFrame: @unchecked Sendable {
     let transform: CGAffineTransform
     var programTransfer: String? = nil
     var sourceRendition: String? = nil
+    var cameraTransfer: String? = nil
 
-    func tagged(transfer: String?) -> Self {
+    func tagged(transfer: String?, cameraTransfer: String? = nil) -> Self {
         var result = self
         result.programTransfer = transfer ?? programTransfer
+        result.cameraTransfer = cameraTransfer ?? self.cameraTransfer
         return result
     }
 
@@ -103,6 +106,8 @@ final class HardwareFrames: @unchecked Sendable {
     private let generator: AVSampleBufferGenerator
     private var session: VTDecompressionSession?
     private var cursor: AVSampleCursor?
+    /// The decode time of the keyframe the session began at.
+    private var sessionStart: CMTime = .invalid
     private var frames: [PreviewFrame] = []
     private let frameLock = NSLock()
     private var requestedPicture: CMTime = .invalid
@@ -161,6 +166,7 @@ final class HardwareFrames: @unchecked Sendable {
         session = nil
         sessionFormat = nil
         cursor = nil
+        sessionStart = .invalid
         frameLock.withLock {
             frames.removeAll()
             decodeError = noErr
@@ -179,6 +185,7 @@ final class HardwareFrames: @unchecked Sendable {
         releaseSession()
         frameLock.withLock { requestedPicture = picture }
         cursor = start
+        sessionStart = start.decodeTimeStamp
 
         let specification = [
             kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder as String: true
@@ -256,6 +263,18 @@ final class HardwareFrames: @unchecked Sendable {
         if let cached {
             return cached
         }
+        /// A picture rejected in an earlier group, in this request or a cancelled one, does not stop a picture of
+        /// a later group: the session starts again at that picture's own keyframe, once.
+        func restartsAtOwnKeyframe() throws -> Bool {
+            let sync = desired.copy() as! AVSampleCursor
+            while !sync.currentSampleSyncInfo.sampleIsFullSync.boolValue {
+                if cancelled() { throw CancellationError() }
+                if sync.stepInDecodeOrder(byCount: -1) == 0 { break }
+            }
+            guard sessionStart.isValid, sync.decodeTimeStamp > sessionStart else { return false }
+            try reset(at: sync, requesting: desiredTime)
+            return true
+        }
         if session == nil || !request.isValid || desiredTime < request || (desiredTime - request).seconds > 0.5 {
             let sync = desired.copy() as! AVSampleCursor
             while !sync.currentSampleSyncInfo.sampleIsFullSync.boolValue {
@@ -276,7 +295,10 @@ final class HardwareFrames: @unchecked Sendable {
             let matching = frames.first { $0.time == desiredTime }
             let error = decodeError
             frameLock.unlock()
-            if error != noErr { throw decodeFailure(error) }
+            if error != noErr {
+                if try restartsAtOwnKeyframe() { continue }
+                throw decodeFailure(error)
+            }
             if let matching { return matching }
             guard let cursor else { return nil }
             if hasMultipleDescriptions, let format = sessionFormat,
@@ -297,7 +319,10 @@ final class HardwareFrames: @unchecked Sendable {
                 session, sampleBuffer: sample, flags: [],
                 frameRefcon: nil, infoFlagsOut: nil
             )
-            if status != noErr { throw decodeFailure(status) }
+            if status != noErr {
+                if try restartsAtOwnKeyframe() { continue }
+                throw decodeFailure(status)
+            }
             if cursor.stepInDecodeOrder(byCount: 1) == 0 {
                 self.cursor = nil
                 let finishStatus = VTDecompressionSessionFinishDelayedFrames(session)
@@ -355,8 +380,49 @@ struct ScrubFrameCache {
     }
 }
 
+/// Coalesces pending picture work on a serial decoder queue. Maintenance
+/// seals the current slot so later requests cannot overtake it.
+final class LatestPreviewWork: @unchecked Sendable {
+    private final class Slot: @unchecked Sendable {
+        var work: @Sendable () -> Void
+
+        init(_ work: @escaping @Sendable () -> Void) {
+            self.work = work
+        }
+    }
+
+    private let lock = NSLock()
+    private var pending: Slot?
+
+    func submit(on queue: DispatchQueue, _ work: @escaping @Sendable () -> Void) {
+        lock.withLock {
+            if let pending {
+                pending.work = work
+                return
+            }
+            let slot = Slot(work)
+            pending = slot
+            queue.async {
+                let work = self.lock.withLock {
+                    if self.pending === slot { self.pending = nil }
+                    return slot.work
+                }
+                work()
+            }
+        }
+    }
+
+    func enqueueMaintenance(on queue: DispatchQueue, _ work: @escaping @Sendable () -> Void) {
+        lock.withLock {
+            pending = nil
+            queue.async(execute: work)
+        }
+    }
+}
+
 private final class DecodeRequests: @unchecked Sendable {
     let queue: DispatchQueue
+    let pictureWork = LatestPreviewWork()
     private let lock = NSLock()
     private var generation = 0
     private var decoder: HardwareFrames?
@@ -381,7 +447,7 @@ private final class DecodeRequests: @unchecked Sendable {
     }
 
     func releaseDecoder() {
-        queue.async {
+        pictureWork.enqueueMaintenance(on: queue) {
             self.decoder = nil
             self.decoderURL = nil
             self.recent = ScrubFrameCache()
@@ -539,9 +605,9 @@ final class SequencePreview: ObservableObject {
     private var offsets: [Double] = []
     private var duration = 0.0
     private var playable = false
-    private var readyForTransport: Bool {
+    var readyForTransport: Bool {
         frame != nil || (canPlayWithoutPicture && fallback != nil)
-            || (ranges.first?.isAudioOnly == true && (playable || fallback != nil))
+            || (currentRange?.isAudioOnly == true && (playable || fallback != nil))
     }
     // The position has no picture to show. The fallback transport can still play on from it.
     private var canPlayWithoutPicture = false
@@ -558,7 +624,7 @@ final class SequencePreview: ObservableObject {
     private var sequenceGeneration = 0
     private var audioSeekGeneration = 0
     private var audioSeeking = false
-    private var auditionPosition: (url: URL, time: Double)?
+    private var auditionPosition: (range: PreviewRange, time: Double)?
     private var frame: PreviewFrame?
     private var programStills: ProgramPreviewStills?
     private var programTransfer: String?
@@ -605,6 +671,9 @@ final class SequencePreview: ObservableObject {
     func invalidateMedia(alsoFilmstrip: Bool) {
         _ = requests.next()
         requests.releaseDecoder()
+        rendering = false
+        stillPreview.cancel()
+        showingProgramStill = false
         if alsoFilmstrip { thumbnails = ThumbnailDecoder() }
         clearPicture()
     }
@@ -729,7 +798,9 @@ final class SequencePreview: ObservableObject {
             assets[range.url] = asset
             var audio = try await asset.loadTracks(withMediaType: .audio)
             let origin: CMTime
-            if range.isAudioOnly {
+            if let explicitOrigin = range.assetClockOrigin {
+                origin = previewTime(explicitOrigin)
+            } else if range.isAudioOnly {
                 var earliest: CMTime?
                 for track in audio {
                     let start = try await track.load(.timeRange).start
@@ -841,8 +912,7 @@ final class SequencePreview: ObservableObject {
             self.programPictureIssue = nil
             self.issueAllowsRetry = false
             self.canPlayWithoutPicture = false
-            let transfer = self.programTransfer ?? frame.programTransfer ?? self.currentRange?.programTransfer
-            let tagged = frame.tagged(transfer: self.auditionPosition == nil ? transfer : nil)
+            let tagged = frame.tagged(transfer: self.auditionPosition == nil ? self.programTransfer : nil)
             self.frame = tagged
             self.surfaces.allObjects.forEach { $0.display(tagged) }
         }, onTime: { [weak self] position in
@@ -850,7 +920,7 @@ final class SequencePreview: ObservableObject {
             let time = min(max(0, position), self.duration)
             if self.time != time { self.time = time }
             if self.auditionPosition == nil {
-                if self.programStills != nil {
+                if self.programStills != nil || self.currentRange?.isAudioOnly == true {
                     self.renderTimeline(immediate: !self.isPlaying || time == self.duration)
                 } else if let reason = self.currentRange?.unavailablePicture {
                     self.reportPictureFailure(reason, independent: true)
@@ -879,8 +949,9 @@ final class SequencePreview: ObservableObject {
         alternative.setGain(isMuted ? 0 : volume)
         fallback = alternative
         if let auditionPosition {
-            if programStills == nil { alternative.audition(url: auditionPosition.url, at: auditionPosition.time) }
-            else { render(url: auditionPosition.url, time: auditionPosition.time) }
+            if !auditionPosition.range.isAudioOnly && auditionPosition.range.unavailablePicture == nil {
+                displayAuditionPicture(auditionPosition.range, at: auditionPosition.time)
+            }
         } else {
             alternative.seek(to: time)
         }
@@ -898,19 +969,25 @@ final class SequencePreview: ObservableObject {
         audioPlayer?.pause()
         ticker?.cancel()
         ticker = nil
-        playbackRate = 0
+        if playbackRate != 0 { playbackRate = 0 }
     }
 
     func audition(_ range: PreviewRange, at sourceTime: Double, sourceDuration: Double? = nil, reverse: Bool = false) {
-        if !range.isAudioOnly || auditionPosition?.url != range.url || isPlaying { pause() }
+        if !range.isAudioOnly || auditionPosition?.range != range || isPlaying { pause() }
         if showingProgramStill {
             showingProgramStill = false
             stillPreview.cancel()
             programPictureIssue = nil
             clearPicture()
         }
-        auditionPosition = (range.url, sourceTime)
+        auditionPosition = (range, sourceTime)
+        if let reason = range.unavailablePicture {
+            cancelPictureRequest()
+            reportPictureFailure(reason, independent: true)
+            return
+        }
         if range.isAudioOnly {
+            clearAudioOnlyPicture()
             // A handle can be dragged into previously excluded material. Use the
             // source clock here even when playback currently has a composition.
             if scrubSoundEnabled, !isMuted, volume > 0, let end = sourceDuration, end > 0,
@@ -921,8 +998,12 @@ final class SequencePreview: ObservableObject {
             }
             return
         }
+        displayAuditionPicture(range, at: sourceTime)
+    }
+
+    private func displayAuditionPicture(_ range: PreviewRange, at sourceTime: Double) {
         if let fallback, programStills == nil {
-            fallback.audition(url: range.url, at: sourceTime)
+            fallback.audition(url: range.url, at: sourceTime, transfer: range.programTransfer)
         } else {
             render(url: range.url, time: sourceTime, transfer: range.programTransfer)
         }
@@ -946,12 +1027,20 @@ final class SequencePreview: ObservableObject {
         scrubRangeIndex = rangeIndex
         auditionPosition = nil
         time = target
-        if !showProgramStill(at: target), !range.isAudioOnly && (scrubPicture?.source != range.url || scrubPicture?.pts != sourceFrame || scrubPicture?.end != range.end) {
-            scrubPicture = (range.url, sourceFrame, range.end)
-            if let fallback, programStills == nil { fallback.audition(url: range.url, at: sourceFrame, before: range.end) }
-            else {
-                render(url: range.url, time: sourceFrame, before: range.end,
-                       transfer: programTransfer ?? range.programTransfer)
+        if !showProgramStill(at: target) {
+            if let reason = range.unavailablePicture {
+                cancelPictureRequest()
+                reportPictureFailure(reason, independent: true)
+            } else if range.isAudioOnly {
+                clearAudioOnlyPicture()
+            } else if scrubPicture?.source != range.url || scrubPicture?.pts != sourceFrame || scrubPicture?.end != range.end {
+                scrubPicture = (range.url, sourceFrame, range.end)
+                if let fallback, programStills == nil {
+                    fallback.audition(url: range.url, at: sourceFrame, before: range.end, transfer: range.programTransfer)
+                } else {
+                    render(url: range.url, time: sourceFrame, before: range.end,
+                           transfer: programTransfer ?? range.programTransfer, cameraTransfer: range.programTransfer ?? "unknown")
+                }
             }
         }
         guard scrubSoundEnabled, !isMuted, volume > 0 else { return }
@@ -1079,7 +1168,7 @@ final class SequencePreview: ObservableObject {
             if time == 0 {
                 pause()
                 seek(to: 0)
-            } else if let fallback, programStills == nil, currentRange?.unavailablePicture == nil {
+            } else if let fallback, programStills == nil, currentRange?.isAudioOnly == false, currentRange?.unavailablePicture == nil {
                 fallback.displayStill(at: time)
             } else {
                 renderTimeline(immediate: false)
@@ -1165,25 +1254,45 @@ final class SequencePreview: ObservableObject {
         guard !showProgramStill(at: time), let index = currentRangeIndex else { return }
         let range = ranges[index]
         if let reason = range.unavailablePicture {
-            _ = requests.next()
-            rendering = false
+            cancelPictureRequest()
             reportPictureFailure(reason, independent: true)
             return
         }
-        guard immediate || !rendering, !range.isAudioOnly else { return }
+        if range.isAudioOnly {
+            clearAudioOnlyPicture()
+            return
+        }
+        guard immediate || !rendering else { return }
         let sourceTime = time == duration ? range.end
             : min(range.end, range.start + (time - offsets[index]))
         render(url: range.url, time: sourceTime, before: range.end, scrubbing: immediate,
-               transfer: programTransfer ?? range.programTransfer)
+               transfer: programTransfer ?? range.programTransfer, cameraTransfer: range.programTransfer ?? "unknown")
+    }
+
+    private func cancelPictureRequest() {
+        if rendering {
+            _ = requests.next()
+            rendering = false
+        }
+        fallback?.cancelStill()
+        scrubPicture = nil
+    }
+
+    private func clearAudioOnlyPicture() {
+        cancelPictureRequest()
+        if frame != nil || programPictureIssue != nil {
+            programPictureIssue = nil
+            clearPicture()
+        }
     }
 
     private func render(url: URL, time: Double, before end: Double? = nil, scrubbing: Bool = true,
-                        transfer: String? = nil) {
+                        transfer: String? = nil, cameraTransfer: String? = nil) {
         let serial = requests.next()
         rendering = true
         let requests = requests
         let independentPicture = programStills != nil
-        requests.queue.async { [weak self] in
+        requests.pictureWork.submit(on: requests.queue) { [weak self] in
             guard requests.current(serial) else { return }
             let result = Result {
                 try requests.frame(url: url, time: time, before: end, scrubbing: scrubbing,
@@ -1194,9 +1303,11 @@ final class SequencePreview: ObservableObject {
                 self.rendering = false
                 switch result {
                 case .success(let decoded?):
-                    let frame = decoded.tagged(transfer: transfer)
+                    let frame = decoded.tagged(transfer: transfer, cameraTransfer: cameraTransfer)
                     if self.programPictureIssue != nil { self.programPictureIssue = nil }
-                    if self.displayedURL != url || self.frame?.time != frame.time {
+                    if self.displayedURL != url || self.frame?.time != frame.time
+                        || self.frame?.buffer !== frame.buffer || self.frame?.programTransfer != frame.programTransfer
+                        || self.frame?.cameraTransfer != frame.cameraTransfer {
                         self.displayedURL = url
                         self.frame = frame
                         self.surfaces.allObjects.forEach { $0.display(frame) }

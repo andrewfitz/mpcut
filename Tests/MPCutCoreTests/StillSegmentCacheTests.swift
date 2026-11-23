@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import MPCutCore
@@ -88,6 +89,27 @@ final class StillSegmentCacheTests: XCTestCase {
                 XCTFail("Media from a changed input was used.")
             })) { XCTAssertEqual(($0 as? CutError)?.code, "source_changed") }
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.appendingPathComponent("0").path), [])
+        }
+    }
+
+    func testInputRewriteWithRestoredModificationTimeIsRejected() throws {
+        try withDirectory { directory in
+            let source = directory.appendingPathComponent("image")
+            try Data([0]).write(to: source)
+            var times = [timespec(tv_sec: 1_700_000_000, tv_nsec: 0),
+                         timespec(tv_sec: 1_700_000_000, tv_nsec: 0)]
+            XCTAssertEqual(utimensat(AT_FDCWD, source.path, &times, 0), 0)
+            let original = try SourceIdentity(source)
+            let key = try StillSegmentCache.Key(files: [source], parameters: 1)
+            let cache = StillSegmentCache(directory: directory, shardCount: 1)
+            try Data([1]).write(to: source)
+            XCTAssertEqual(utimensat(AT_FDCWD, source.path, &times, 0), 0)
+            XCTAssertEqual(try SourceIdentity(source), original)
+            XCTAssertThrowsError(try cache.withSegment(key: key, outputExtension: "mov", generate: { _ in
+                XCTFail("An outdated input fingerprint reached generation.")
+            }, validate: { _ in }, use: { _ in })) {
+                XCTAssertEqual(($0 as? CutError)?.code, "source_changed")
+            }
         }
     }
 

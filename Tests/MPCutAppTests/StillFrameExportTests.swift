@@ -131,8 +131,11 @@ final class StillFrameExportTests: XCTestCase {
         XCTAssertThrowsError(try JPEGExport.writeStill(media, at: .zero, to: cancelled, cancelled: { true })) {
             XCTAssertEqual(($0 as? CutError)?.code, "cancelled")
         }
+        // Adding a hard link advances ctime on the ProRes source. Acquire a
+        // current index before independently racing publication.
+        let currentMedia = try CutEngine(useSidecar: false).inspect(source, keyframes: true)
         let concurrent = directory.appendingPathComponent("concurrent.jpg")
-        XCTAssertThrowsError(try JPEGExport.writeStill(media, at: .zero, to: concurrent, cancelled: {
+        XCTAssertThrowsError(try JPEGExport.writeStill(currentMedia, at: .zero, to: concurrent, cancelled: {
             let contents = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
             if contents?.contains(where: { $0.hasPrefix(".mpcut-frame-") }) == true {
                 try? previous.write(to: concurrent, options: .withoutOverwriting)

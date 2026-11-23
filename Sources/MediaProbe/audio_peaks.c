@@ -1,5 +1,6 @@
 #include "audio_envelope.h"
 #include "wave_pcm.h"
+#include "transcript_pcm.h"
 #include <Accelerate/Accelerate.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -116,7 +117,7 @@ int mp_float_pcm_peaks(const float *samples, int frames, int channels, int rate,
 
 static int read_peaks(const char *path, int stream, double origin, double duration, MPAudioEnvelope *window, int seek, int ordered_clock,
                    MPProbeCancelled cancelled, MPPeakVisit visit, void *context,
-                   char *error, size_t capacity)
+                   char *error, size_t capacity, MPTranscriptPCM *pcm)
 {
     AVFormatContext *input = avformat_alloc_context();
     AVCodecContext *decoder = NULL;
@@ -126,7 +127,7 @@ static int read_peaks(const char *path, int stream, double origin, double durati
     int ret = AVERROR(ENOMEM);
     if (!input) goto done;
     input->interrupt_callback = (AVIOInterruptCB){.callback = cancelled, .opaque = context};
-    if (cancelled(context)) { ret = AVERROR_EXIT; goto done; }
+    if (cancelled && cancelled(context)) { ret = AVERROR_EXIT; goto done; }
     ret = avformat_open_input(&input, path, NULL, NULL);
     if (ret < 0) goto done;
     // MOV and Matroska usually describe the audio decoder in the header.
@@ -160,7 +161,7 @@ static int read_peaks(const char *path, int stream, double origin, double durati
         decoder->thread_count = FFMIN(8, av_cpu_count());
     if ((ret = avcodec_open2(decoder, codec, NULL)) < 0) goto done;
     const double timestamp_tick = av_q2d(audio->time_base);
-    const int coarse_clock = (int64_t)audio->time_base.num * decoder->sample_rate > audio->time_base.den;
+    const int coarse_header_clock = (int64_t)audio->time_base.num * decoder->sample_rate > audio->time_base.den;
     int64_t wave_start, wave_sample = 0, wave_end = 0;
     const int wave_align = seek && window && window->from > 0 && origin == 0 ?
         mp_wave_pcm_layout(input, &wave_start) : 0;
@@ -183,7 +184,7 @@ static int read_peaks(const char *path, int stream, double origin, double durati
     // seeking disabled so VBR MP3's approximate Xing TOC isn't used as a clock.
     // With samples finer than the container clock, a seek loses
     // the continuous sample position carried forward from the first frame.
-    if (!wave_align && seek && window && !coarse_clock && window->from > 2 &&
+    if (!wave_align && seek && window && !coarse_header_clock && window->from > 2 &&
         input->pb && (input->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
         const double seconds = origin + window->from - 1; // Decoder preroll for AAC/Opus.
         if (seconds > (double)INT64_MIN / AV_TIME_BASE && seconds < (double)INT64_MAX / AV_TIME_BASE) {
@@ -204,7 +205,7 @@ static int read_peaks(const char *path, int stream, double origin, double durati
     int decoded = 0, damaged = 0;
 
     for (;;) {
-        if (cancelled(context)) { ret = AVERROR_EXIT; break; }
+        if (cancelled && cancelled(context)) { ret = AVERROR_EXIT; break; }
         ret = wave_align ? read_wave_packet(input->pb, packet, &wave_sample, wave_end, wave_align)
                          : av_read_frame(input, packet);
         int eof = ret == AVERROR_EOF;
@@ -212,26 +213,38 @@ static int read_peaks(const char *path, int stream, double origin, double durati
         if (!eof && packet->stream_index != stream) { av_packet_unref(packet); continue; }
         ret = avcodec_send_packet(decoder, eof ? NULL : packet);
         av_packet_unref(packet);
-        if (ret == AVERROR_INVALIDDATA && !eof) { damaged++; ret = 0; }
+        if (ret == AVERROR_INVALIDDATA && !eof) {
+            damaged = 1;
+            run_rate = 0;
+            ret = 0;
+        }
         if (ret < 0) break;
         int failures = 0;
         for (;;) {
             ret = avcodec_receive_frame(decoder, frame);
             // The decoder has dropped the packet it could not decode.
-            if (ret == AVERROR_INVALIDDATA && ++failures <= 64) { damaged++; continue; }
+            if (ret == AVERROR_INVALIDDATA && ++failures <= 64) {
+                damaged = 1;
+                run_rate = 0;
+                continue;
+            }
             if (ret < 0) break;
             failures = 0;
-            if (frame->best_effort_timestamp == AV_NOPTS_VALUE) damaged++;
-            else {
-                decoded++;
+            if (frame->best_effort_timestamp == AV_NOPTS_VALUE ||
+                frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT)) {
+                damaged = 1;
+                run_rate = 0;
+            } else {
+                decoded = 1;
                 const double timestamp = frame->best_effort_timestamp * timestamp_tick - origin;
                 double start = timestamp;
                 // A millisecond container clock can round neighboring PCM blocks in opposite
                 // directions. Keep a sample-continuous clock within its timestamp precision.
                 // On an exact sample clock even a one-sample gap is meaningful.
+                const int rate = frame->sample_rate;
+                if (rate <= 0) { ret = AVERROR_INVALIDDATA; goto done; }
+                const int coarse_clock = (int64_t)audio->time_base.num * rate > audio->time_base.den;
                 if (coarse_clock) {
-                    const int rate = frame->sample_rate;
-                    if (rate <= 0) { ret = AVERROR_INVALIDDATA; goto done; }
                     const double next_time = run_start + (double)run_samples / rate;
                     if (rate == run_rate && fabs(start - next_time) <= timestamp_tick + 0.5 / rate) {
                         start = next_time;
@@ -241,15 +254,19 @@ static int read_peaks(const char *path, int stream, double origin, double durati
                         run_samples = 0;
                     }
                     run_samples += frame->nb_samples;
+                } else {
+                    run_rate = 0;
                 }
                 // On a coarse clock the next corrected sample time can precede its rounded PTS.
                 // Wait until even that earliest time is outside the peak collection interval.
-                double tolerance = coarse_clock ? timestamp_tick + 0.5 / frame->sample_rate : 0;
+                double tolerance = coarse_clock ? timestamp_tick + 0.5 / rate : 0;
                 if ((window && start >= duration) || (ordered_clock && timestamp - tolerance >= duration)) {
                     ret = 0;
                     goto done;
                 }
-                if (window) {
+                if (pcm) {
+                    ret = mp_transcript_frame(pcm, frame, start);
+                } else if (window) {
                     ret = mp_envelope_frame(frame->extended_data, frame->format, frame->nb_samples,
                                             frame->ch_layout.nb_channels, frame->sample_rate, start, window);
                 } else {
@@ -271,7 +288,7 @@ done:
     avcodec_free_context(&decoder);
     avformat_close_input(&input);
     if (retry_from_start)
-        return read_peaks(path, stream, origin, duration, window, 0, ordered_clock, cancelled, visit, context, error, capacity);
+        return read_peaks(path, stream, origin, duration, window, 0, ordered_clock, cancelled, visit, context, error, capacity, pcm);
     return ret;
 }
 
@@ -279,11 +296,18 @@ int mp_audio_peaks(const char *path, int stream, double origin, double duration,
                    MPProbeCancelled cancelled, MPPeakVisit visit, void *context,
                    char *error, size_t capacity)
 {
-    return read_peaks(path, stream, origin, duration, NULL, 0, ordered_clock, cancelled, visit, context, error, capacity);
+    return read_peaks(path, stream, origin, duration, NULL, 0, ordered_clock, cancelled, visit, context, error, capacity, NULL);
 }
 
 int mp_audio_envelope(const char *path, int stream, double origin, MPAudioEnvelope *window,
                       MPProbeCancelled cancelled, void *context, char *error, size_t capacity)
 {
-    return read_peaks(path, stream, origin, window->to, window, 1, 0, cancelled, NULL, context, error, capacity);
+    return read_peaks(path, stream, origin, window->to, window, 1, 0, cancelled, NULL, context, error, capacity, NULL);
+}
+
+int mp_transcript_decode(MPTranscriptPCM *pcm, const char *path, int stream, double origin, double duration,
+                         MPProbeCancelled cancelled, void *context, char *error, size_t capacity)
+{
+    return read_peaks(path, stream, origin, duration, NULL, 0, 0, cancelled, NULL, context,
+                      error, capacity, pcm);
 }

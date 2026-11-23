@@ -72,12 +72,12 @@ class TrackEditing(unittest.TestCase):
             return {"numerator": n, "denominator": 48000}
         request = {"file": str(self.sound), "clips": [{"from": rational(a), "to": rational(b)} for a,b in bounds],
                    "order": [2, 1, 2], "output": str(output)}
-        dry = self.cli("export", "--stdin", "--dry-run", request=request)
+        dry = self.cli("export", "clips", "join", "--stdin", "--dry-run", request=request)
         self.assertFalse(output.exists())
-        result = self.cli("export", "--stdin", request=request)
+        result = self.cli("export", "clips", "join", "--stdin", request=request)
         self.assertEqual(dry["segments"], result["segments"])
         self.assertEqual(result["mode"], "copy")
-        self.assertEqual(time(result["encodedDuration"]), 0)
+        self.assertEqual(time(result["encoded_duration"]), 0)
         with wave.open(str(self.sound)) as original, wave.open(str(output)) as assembled:
             audio = original.readframes(original.getnframes())
             self.assertEqual(assembled.getsampwidth(), 2)
@@ -90,7 +90,7 @@ class TrackEditing(unittest.TestCase):
         ffmpeg("-f", "lavfi", "-i", "testsrc2=size=128x64:rate=25:duration=2",
                "-f", "lavfi", "-i", "sine=f=650:r=48000:d=3.2",
                "-c:v", "libx264", "-c:a", "ac3", source)
-        args = ["export", "--audio-only", "--clip", source, "--from", "358/375", "--output", output]
+        args = ["export", "clips", "join", "--tracks", "audio", "--clip", source, "--from", "358/375", "--output", output]
         report = self.cli(*args, "--to", "2", ok=False)
         self.assertEqual(report["error"]["code"], "unsafe_boundary")
         self.assertEqual(report["error"]["boundary"], "to")
@@ -107,7 +107,7 @@ class TrackEditing(unittest.TestCase):
                "-f", "lavfi", "-i", "sine=d=2:f=660:r=48000",
                "-filter:a:0", "asetpts=0", "-map", "0:a", "-map", "1:a",
                "-c:a:0", "aac", "-c:a:1", "pcm_s16le", source)
-        flags = ("export", "--clip", source, "--tracks", "audio", "--mode", "copy")
+        flags = ("export", "clips", "join", "--clip", source, "--tracks", "audio", "--mode", "copy")
         rejected = self.cli(*flags, "--output", self.root / "Both.mka", ok=False)
         self.assertEqual(rejected["error"]["code"], "unsupported_tracks")
         self.assertIn("non-increasing presentation timestamps", rejected["error"]["message"])
@@ -119,7 +119,7 @@ class TrackEditing(unittest.TestCase):
         for label in ("Fresh", "Cached"):
             with self.subTest(index=label):
                 if label == "Cached":
-                    self.assertTrue(self.cli("sidecar", "--only", "index", source)["inventory"]["hasIndex"])
+                    self.assertTrue(self.cli("analysis", "sidecar", "build", "--only", "index", source)["inventory"]["has_index"])
                 output = self.root / f"{label} second track.wav"
                 self.cli(*flags, "--audio-stream", "1", "--output", output)
                 with wave.open(str(output)) as written:
@@ -135,23 +135,23 @@ class TrackEditing(unittest.TestCase):
                "-f", "lavfi", "-i", "sine=f=750:r=48000:d=0.25",
                "-map", "0:v", "-map", "1:a", "-map", "2:a",
                "-c:v", "libx264", "-g", "25", "-c:a", "aac", source)
-        self.cli("export", "--clip", source, "--clip", source, "--output", joined)
+        self.cli("export", "clips", "join", "--clip", source, "--clip", source, "--output", joined)
         ffmpeg("-f", "lavfi", "-i", "sine=f=500:r=48000:d=1",
                "-f", "lavfi", "-i", "sine=f=750:r=48000:d=1",
                "-map", "0:a", "-map", "1:a", "-c:a", "aac", audio)
         # The second AAC track is stream 2 in the movie and stream 1 in
         # the audio file. Its first edit is empty, but the next is audible.
-        result = self.cli("export", "--audio-only", "--clip", joined, "--from", "2.1", "--to", "2.5",
+        result = self.cli("export", "clips", "join", "--tracks", "audio", "--clip", joined, "--from", "2.1", "--to", "2.5",
                           "--clip", audio, "--from", "0.2", "--to", "0.6", "--output", output)
         self.assertEqual(time(result["duration"]), Fraction(4, 5))
         self.assertEqual(len(probe(output, "-show_streams")["streams"]), 2)
 
     def test_rearrange_and_bulk_use_audio_copy_and_infer_wav(self):
         output = self.root / "Rearranged.wav"
-        self.cli("rearrange", self.sound, "--output", output, "2.3-2.6,0.1-0.2")
+        self.cli("export", "ranges", "join", self.sound, "--output", output, "2.3-2.6,0.1-0.2")
         original = pcm(self.sound)
         self.assertEqual(pcm(output), original[110400*2:124800*2] + original[4800*2:9600*2])
-        report = self.cli("bulk", "--stdin", request={"file":str(self.sound), "outputDirectory":str(self.root),
+        report = self.cli("export", "ranges", "separate", "--stdin", request={"file":str(self.sound), "output_directory":str(self.root),
                           "ranges":[{"from": "0.1","to":"0.2"},{"from":"3.1","to":"3.3"}]})
         self.assertEqual(len(report["outputs"]), 2)
         for index,item in enumerate(report["outputs"]):
@@ -166,7 +166,7 @@ class TrackEditing(unittest.TestCase):
         ranges = [(12123, 14231), (121, 231)]
         args = [arg for start, end in ranges for arg in
                 ("--clip", source, "--from", f"{start}/48000", "--to", f"{end}/48000")]
-        report = self.cli("export", "--output", output, *args)
+        report = self.cli("export", "clips", "join", "--output", output, *args)
         self.assertEqual(report["mode"], "copy")
         self.assertEqual(time(report["duration"]), Fraction(2218, 48000))
         original = ffmpeg("-i", source, "-c:a", "pcm_f32le", "-f", "f32le", "-")
@@ -178,11 +178,11 @@ class TrackEditing(unittest.TestCase):
         ffmpeg("-f", "lavfi", "-i", "testsrc2=s=96x64:r=25:d=3", "-i", self.sound, "-t", "3",
                "-c:v", "libx264", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0",
                "-c:a", "pcm_s16le", source)
-        refused = self.cli("export", "--clip", source, "--from", "0", "--to", "1", "--mode", "copy",
+        refused = self.cli("export", "clips", "join", "--clip", source, "--from", "0", "--to", "1", "--mode", "copy",
                            "--output", self.root / "Explicit.mp4", "--dry-run", ok=False)["error"]
         self.assertEqual((refused["code"], refused["segment"], refused["track"]), ("unsupported_tracks", 1, 1), refused)
-        report = self.cli("bulk", "--stdin", "--mode", "copy",
-                          request={"file": str(source), "outputDirectory": str(self.root),
+        report = self.cli("export", "ranges", "separate", "--stdin", "--mode", "copy",
+                          request={"file": str(source), "output_directory": str(self.root),
                                    "ranges": [{"from": "0", "to": "1"}]})
         output = Path(report["outputs"][0]["output"])
         self.assertEqual(output.suffix, ".mov")
@@ -190,11 +190,11 @@ class TrackEditing(unittest.TestCase):
         self.assertEqual(hashes(output, "v:0"), hashes(source, "v:0")[:25])
 
     def test_silence_strip_join_and_replay_on_sound_file(self):
-        report = self.cli("silence", "--leave","0.25","--waveform","8",self.sound)
+        report = self.cli("silence", "scan", "--padding-per-side-seconds","0.125","--waveform","8",self.sound)
         self.assertEqual(time(report["pauses"][0]["from"]),1)
         self.assertEqual(time(report["pauses"][0]["to"]),3)
         output = self.root / "Joined.wav"
-        self.cli("silence","--stdin","--output",output,request=report)
+        self.cli("silence", "export","--stdin","--output",output,request=report)
         audio = pcm(self.sound)
         self.assertEqual(pcm(output), audio[:54000*2] + audio[138000*2:])
 
@@ -202,14 +202,14 @@ class TrackEditing(unittest.TestCase):
         source = self.root / "Two sample rates.mov"
         ffmpeg("-i", self.sound, "-f", "lavfi", "-i", "sine=f=880:r=44100:d=4",
                "-map", "0:a", "-map", "1:a", "-c:a", "pcm_s16le", source)
-        report = self.cli("silence", "--leave", "0.407", source)
+        report = self.cli("silence", "scan", "--padding-per-side-seconds", "0.2035", source)
         start, end = (time(report["removals"][0][key]) for key in ("from", "to"))
         self.assertEqual((start, end), (Fraction(362, 300), Fraction(838, 300)))
 
         output = self.root / "Joined.mov"
-        dry = self.cli("silence", "--stdin", "--output", output, "--dry-run", request=report)
+        dry = self.cli("silence", "plan", "--stdin", "--output", output, "--dry-run", request=report)
         self.assertFalse(output.exists())
-        written = self.cli("silence", "--stdin", "--output", output, request=report)
+        written = self.cli("silence", "export", "--stdin", "--output", output, request=report)
         self.assertEqual(dry["segments"], written["segments"])
         self.assertEqual(time(written["duration"]), 4 - (end - start))
         for index, rate in enumerate((48000, 44100)):
@@ -224,40 +224,40 @@ class TrackEditing(unittest.TestCase):
                "-f", "lavfi", "-i", "sine=f=440:r=48000:d=5",
                "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-c:a", "pcm_s16le", source)
         output = self.root / "Uncut track.wav"
-        written = self.cli("silence", "--tracks", "audio", "--output", output, source)
+        written = self.cli("silence", "export", "--tracks", "audio", "--output", output, source)
         self.assertEqual(time(written["duration"]), 5)
-        self.assertEqual(written["silence"]["detectedPauses"], 0)
-        self.assertEqual(time(written["silence"]["removedDuration"]), 0)
+        self.assertEqual(written["silence"]["detected_pauses"], 0)
+        self.assertEqual(time(written["silence"]["removed_duration"]), 0)
         self.assertEqual(pcm(output), pcm(source))
 
         source_with_pause = self.root / "Longer soundtrack with pause.mov"
         signal = r"if(lt(t\,1)+gte(t\,3)\,0.25*sin(2*PI*(400+100*gte(t\,4))*t)\,0)"
         ffmpeg("-i", source, "-f", "lavfi", "-i", f"aevalsrc={signal}:s=48000:d=5",
                "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "pcm_s16le", source_with_pause)
-        report = self.cli("silence", "--tracks", "audio", source_with_pause)
+        report = self.cli("silence", "scan", "--tracks", "audio", source_with_pause)
         self.assertEqual(time(report["duration"]), 5)
-        self.assertEqual(time(report["removedDuration"]), Fraction(8, 5))
+        self.assertEqual(time(report["removed_duration"]), Fraction(8, 5))
         output = self.root / "Soundtrack without pause.wav"
-        written = self.cli("silence", "--stdin", "--output", output, request=report)
+        written = self.cli("silence", "export", "--stdin", "--output", output, request=report)
         self.assertEqual(time(written["duration"]), Fraction(17, 5))
-        self.assertEqual(time(written["silence"]["removedDuration"]), Fraction(8, 5))
+        self.assertEqual(time(written["silence"]["removed_duration"]), Fraction(8, 5))
         original = pcm(source_with_pause)
         self.assertEqual(pcm(output), original[:2 * 57600] + original[2 * 134400:])
 
     def test_sidecar_build_reuse_and_no_video_queries(self):
         source = self.root / "Speech.wav"
         source.write_bytes(self.sound.read_bytes())
-        base = self.cli("inspect", source)
-        self.assertFalse(base["media"]["hasVideo"])
+        base = self.cli("media", "inspect", source)
+        self.assertFalse(base["media"]["has_video"])
         self.assertEqual(base["media"]["frames"], [])
         self.assertIn("wav",base["copy"]["containers"])
-        saved = self.cli("sidecar",source)
-        self.assertTrue(saved["inventory"]["hasIndex"])
-        self.assertFalse(saved["inventory"]["hasScenes"])
-        self.assertEqual(saved["inventory"]["waveformStreams"],[0])
-        self.assertEqual(saved["inventory"]["envelopeStreams"],[0])
-        self.assertEqual(self.cli("inspect",source),base)
-        for command in [["frames","--output",self.root/"Images"],["scenes"],["inspect","--keyframes"]]:
+        saved = self.cli("analysis", "sidecar", "build",source)
+        self.assertTrue(saved["inventory"]["has_index"])
+        self.assertFalse(saved["inventory"]["has_scenes"])
+        self.assertEqual(saved["inventory"]["waveform_streams"],[0])
+        self.assertEqual(saved["inventory"]["envelope_streams"],[0])
+        self.assertEqual(self.cli("media", "inspect",source),base)
+        for command in [["review", "frames", "export","--output",self.root/"Images"],["scenes", "scan"],["media", "inspect","--keyframes"]]:
             self.assertEqual(self.cli(*command,source,ok=False)["error"]["code"],"no_video")
         self.assertFalse((self.root / "Images").exists())
 
@@ -265,15 +265,15 @@ class TrackEditing(unittest.TestCase):
         video = self.root / "Picture.mov"
         aac = self.root / "Sound.m4a"
         wav = self.root / "Effect input.wav"
-        self.cli("export","--video-only","--clip",self.movie,"--output",video)
+        self.cli("export", "clips", "join","--tracks", "video","--clip",self.movie,"--output",video)
         self.assertEqual([s["codec_type"] for s in probe(video,"-show_streams")["streams"]],["video"])
         self.assertEqual(hashes(video,"v:0"), hashes(self.movie,"v:0"))
         for index,output in [(1,aac),(2,wav)]:
-            options = self.cli("inspect","--tracks","audio","--audio-stream",str(index),self.movie)
+            options = self.cli("media", "inspect","--tracks","audio","--audio-stream",str(index),self.movie)
             self.assertIn(output.suffix[1:],options["copy"]["containers"])
-            result = self.cli("export","--stdin",request={"tracks":"audio","audioStream":index,
+            result = self.cli("export", "clips", "join","--stdin",request={"tracks":"audio","audio_stream":index,
                               "clips":[{"file":str(self.movie)}],"output":str(output)})
-            self.assertEqual(result["segments"][0]["trackActions"],
+            self.assertEqual(result["segments"][0]["track_actions"],
                              [{"action": "copy", "index": index, "kind": "audio"}])
             self.assertEqual(len(probe(output,"-show_streams")["streams"]),1)
         self.assertEqual(hashes(aac,"a:0"),hashes(self.movie,"a:0"))
@@ -281,14 +281,14 @@ class TrackEditing(unittest.TestCase):
 
     def test_replacement_keeps_original_video_and_other_soundtracks(self):
         output = self.root / "Replaced.mov"
-        args = ["export","--clip",self.movie,"--replace-audio",self.processed,
+        args = ["export", "soundtrack", "replace","--clip",self.movie,"--replace-audio",self.processed,
                 "--replace-track","2","--replacement-stream","0","--output",output]
         dry = self.cli(*args,"--dry-run")
         self.assertFalse(output.exists())
-        result = self.cli("export","--stdin",request={"replaceAudio":str(self.processed),"replaceTrack":2,
-                          "replacementStream":0,"file":str(self.movie),"clips":[{}],"output":str(output)})
+        result = self.cli("export", "soundtrack", "replace","--stdin",request={"replace_audio":str(self.processed),"replace_track":2,
+                          "replacement_stream":0,"file":str(self.movie),"clips":[{}],"output":str(output)})
         self.assertEqual(result["replacement"],dry["replacement"])
-        self.assertEqual(time(result["encodedDuration"]),0)
+        self.assertEqual(time(result["encoded_duration"]),0)
         self.assertEqual(hashes(output,"v:0"),hashes(self.movie,"v:0"))
         self.assertEqual(hashes(output,"a:0"),hashes(self.movie,"a:0"))
         self.assertEqual(pcm(output,"0:a:1"),pcm(self.processed))
@@ -300,24 +300,24 @@ class TrackEditing(unittest.TestCase):
                 source = self.root / f"Input.{extension}"
                 output = self.root / f"Full.{extension}"
                 ffmpeg("-i", self.sound, "-c:a", codec, source)
-                info = self.cli("inspect",source)
-                self.assertFalse(info["media"]["hasVideo"])
+                info = self.cli("media", "inspect",source)
+                self.assertFalse(info["media"]["has_video"])
                 self.assertTrue(info["copy"]["eligible"], info)
-                self.cli("export","--clip",source,"--output",output)
+                self.cli("export", "clips", "join","--clip",source,"--output",output)
                 self.assertEqual(hashes(output,"a:0"), hashes(source,"a:0"))
                 self.assertEqual(len(pcm(output)), len(pcm(source)))
 
     def test_bulk_edited_flac_picks_a_timestamped_audio_container(self):
         source = self.root/"Interview.flac"
         ffmpeg("-i",self.sound,"-c:a","flac",source)
-        bounds = self.cli("inspect","--audio-packets","--stream","0","--from","1","--to","2",source)["media"]["audioPackets"]
+        bounds = self.cli("media", "inspect","--audio-packets","--stream","0","--from","1","--to","2",source)["media"]["audio_packets"]
         self.assertGreater(len(bounds), 2)
         self.assertTrue(all(1 <= time(row["time"]) < 2 and row["stream"] == 0 for row in bounds))
-        report = self.cli("bulk","--stdin",request={"file":str(source), "outputDirectory":str(self.root),
+        report = self.cli("export", "ranges", "separate","--stdin",request={"file":str(source), "output_directory":str(self.root),
                           "ranges":[{"from":bounds[0]["time"],"to":bounds[-1]["time"]}]})
         item = report["outputs"][0]
         self.assertEqual(item["container"],"mka")
-        self.assertEqual(time(item["encodedDuration"]),0)
+        self.assertEqual(time(item["encoded_duration"]),0)
         selected = hashes(item["output"],"a:0")
         originals = hashes(source,"a:0")
         start = originals.index(selected[0])
@@ -335,7 +335,8 @@ class TrackEditing(unittest.TestCase):
             ("invalid_arguments", ["--replace-track","1","--clip",self.movie]),
         ]:
             with self.subTest(args=args[:4]):
-                report = self.cli("export",*args,"--output",output,ok=False)
+                path = ["soundtrack", "replace"] if "--replace-audio" in args else ["clips", "join"]
+                report = self.cli("export", *path, *args, "--output", output, ok=False)
                 self.assertEqual(report["error"]["code"], code, report)
                 self.assertFalse(output.exists())
 

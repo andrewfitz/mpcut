@@ -9,7 +9,7 @@ struct MCPNativeOperation {
     let cancelling: Bool
 
     var state: [String: Any] {
-        var result: [String: Any] = ["nativeOperation": id.uuidString, "kind": kind,
+        var result: [String: Any] = ["native_operation_id": id.uuidString, "kind": kind,
                                       "label": label, "state": cancelling ? "cancelling" : "running"]
         result["progress"] = progress
         return result
@@ -38,11 +38,11 @@ extension ProjectSessions {
             MCPNativeOperation(id: $0.id, kind: "conversion", label: "Project conversion", progress: nil,
                                cancelling: $0.isCancelled)
         } : nil
-        if tool == "get_native_operations" {
+        if tool == "project_operations_list" {
             return ["operations": [worker, sidecars, conversion].compactMap { $0?.state }]
         }
-        guard let raw = arguments["nativeOperation"] as? String, let id = UUID(uuidString: raw) else {
-            throw MCPFailure("invalid_arguments", "Supply a native operation ID from get_native_operations.")
+        guard let raw = arguments["native_operation_id"] as? String, let id = UUID(uuidString: raw) else {
+            throw MCPFailure("invalid_arguments", "Supply a native operation ID from project_operations_list.")
         }
         if id == conversion?.id {
             cancelProjectConversion()
@@ -53,6 +53,6 @@ extension ProjectSessions {
         } else {
             throw MCPFailure("operation_ended", "This native operation is no longer active in the requested scope.")
         }
-        return ["nativeOperation": id.uuidString, "cancellationRequested": true]
+        return ["native_operation_id": id.uuidString, "cancellation_requested": true]
     }
 }

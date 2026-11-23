@@ -48,8 +48,10 @@ final class ProjectHistoryViewTests: XCTestCase {
     func testHistoryOpensAtCurrentStateAndReturnRestoresSelectedRow() async throws {
         _ = NSApplication.shared
         var restored: Int?
-        let history = ProjectHistoryView(actions: ["Add Clip", "Split Clip", "Move Clip"], cursor: 2,
-                                         disabled: false) { restored = $0 }
+        let actions = [ProjectHistoryAction(name: "Add Clip", origin: .unknown),
+                       ProjectHistoryAction(name: "Split Clip", origin: .user),
+                       ProjectHistoryAction(name: "Move Clip", origin: .agent)]
+        let history = ProjectHistoryView(actions: actions, cursor: 2, disabled: false) { restored = $0 }
         let host = NSHostingView(rootView: history)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 430, height: 390),
                               styleMask: .titled, backing: .buffered, defer: false)

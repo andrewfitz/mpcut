@@ -37,13 +37,13 @@ struct FrameExportOptions {
             case "--output": output = try value(flag)
             case "--project": project = try value(flag)
             case "--clock":
-                guard let requested = StillOptions.Clock(rawValue: try value(flag)) else {
+                guard let requested = StillOptions.Clock(rawValue: try value(flag)), requested != .source else {
                     throw invalid("Choose sequence, group or assembly.")
                 }
                 clock = requested
             case "--at", "--at-file":
                 let raw = try value(flag)
-                let entries = flag == "--at-file" || ListFile.isListPath(raw) ? try ListFile.scalars(raw, header: "time") : [raw]
+                let entries = flag == "--at-file" ? try ListFile.scalars(raw, header: "time") : [raw]
                 times += try entries.map(RationalTime.init(parsing:))
             case "--select":
                 let choice = try value(flag)
@@ -63,7 +63,7 @@ struct FrameExportOptions {
                     throw invalid("Use a threshold between −120 and 0 dBFS.")
                 }
                 threshold = n
-            case "--min-pause":
+            case "--min-pause-seconds":
                 guard let n = Double(try value(flag)), n.isFinite, n > 0 else { throw invalid("Use a positive minimum pause length.") }
                 minimum = n
             case "--limit":

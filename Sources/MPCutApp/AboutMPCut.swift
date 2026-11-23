@@ -68,9 +68,10 @@ struct AboutMPCut: View {
                 Text("Command-line help").font(.headline)
                 Text(cliURL.path)
                     .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .textSelection(.enabled)
-                Text("Run mpcut help --json to list commands.")
+                (Text("Run ") + Text("mpcut help --json").font(.system(.callout, design: .monospaced)) + Text(" to list commands."))
                     .font(.callout)
                 Button(copied ? "CLI Path Copied" : "Copy CLI Path") {
                     let pasteboard = NSPasteboard.general

@@ -61,7 +61,7 @@ class DamagedPackets(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, path)
 
     def test_waveform_reads_around_a_damaged_audio_packet(self):
-        code, report = self.mpcut("waveform", "--json", "--no-sidecar", "--columns", "60", self.audio)
+        code, report = self.mpcut("waveform", "envelope", "read", "--json", "--no-sidecar", "--columns", "60", self.audio)
         self.assertEqual(code, 0, report)
         self.assertTrue(report["ok"])
         high = report["envelope"]["high"]
@@ -71,13 +71,13 @@ class DamagedPackets(unittest.TestCase):
             self.assertGreater(high[column], 0.25, column)
         self.assertLess(max(high[32:38]), 0.01)
         # A window that opens with a seek also decodes through the damage.
-        code, window = self.mpcut("waveform", "--json", "--no-sidecar", "--from", "0.5", "--to", "5.5",
+        code, window = self.mpcut("waveform", "envelope", "read", "--json", "--no-sidecar", "--from", "0.5", "--to", "5.5",
                                   "--columns", "50", self.audio)
         self.assertEqual(code, 0, window)
         self.assertGreater(window["envelope"]["high"][45], 0.25)
 
     def test_silence_reads_around_a_damaged_audio_packet(self):
-        code, report = self.mpcut("silence", "--json", "--no-sidecar", "--min-pause", "0.5", self.audio)
+        code, report = self.mpcut("silence", "scan", "--json", "--no-sidecar", "--min-pause-seconds", "0.5", self.audio)
         self.assertEqual(code, 0, report)
         # The unobserved packet is far shorter than a pause and must not become one.
         pauses = [(p["from"]["numerator"] / p["from"]["denominator"],
@@ -87,9 +87,9 @@ class DamagedPackets(unittest.TestCase):
         self.assertAlmostEqual(pauses[0][1], 4, delta=0.05)
 
     def test_scenes_read_around_a_damaged_picture(self):
-        code, report = self.mpcut("scenes", "--json", "--no-sidecar", self.video)
+        code, report = self.mpcut("scenes", "scan", "--json", "--no-sidecar", self.video)
         self.assertEqual(code, 0, report)
-        starts = [s["startSeconds"] for s in report["scenes"]]
+        starts = [s["start_seconds"] for s in report["scenes"]]
         self.assertEqual(starts[0], 0)
         self.assertIn(3, starts)
 
@@ -97,19 +97,19 @@ class DamagedPackets(unittest.TestCase):
         audio = self.root / "garbage.m4a"
         audio.write_bytes(self.audio.read_bytes())
         damage(audio, packets(audio, "a:0"))
-        for command in [["waveform", "--columns", "60"], ["silence"]]:
+        for command in [["waveform", "envelope", "read", "--columns", "60"], ["silence", "scan"]]:
             code, report = self.mpcut(*command, "--json", "--no-sidecar", audio)
             self.assertEqual((code, report["ok"], report["error"]["code"]),
                              (1, False, "audio_analysis_failed"), command)
         video = self.root / "garbage.mp4"
         video.write_bytes(self.video.read_bytes())
         damage(video, packets(video, "v:0"))
-        code, report = self.mpcut("scenes", "--json", "--no-sidecar", video)
+        code, report = self.mpcut("scenes", "scan", "--json", "--no-sidecar", video)
         self.assertEqual((code, report["ok"], report["error"]["code"]), (1, False, "scene_analysis_failed"))
         noise = self.root / "noise.m4a"
         noise.write_bytes(bytes((i * 131 + 17) & 255 for i in range(65536)))
-        for command in ["waveform", "silence", "scenes"]:
-            result = run([CLI, command, "--json", "--no-sidecar", noise], check=False)
+        for command in ["waveform envelope read", "silence scan", "scenes scan"]:
+            result = run([CLI, *command.split(), "--json", "--no-sidecar", noise], check=False)
             self.assertEqual(result.returncode, 1, command)
             self.assertFalse(json.loads(result.stdout)["ok"])
 

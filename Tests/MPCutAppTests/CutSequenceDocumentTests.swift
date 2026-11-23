@@ -201,6 +201,7 @@ final class CutSequenceDocumentTests: XCTestCase {
         XCTAssertEqual(editor.historyActions, ["Add Clip", "Delete Clip"])
         XCTAssertEqual(editor.historyCursor, 1)
         let stored = try CutProject.loadDocument(from: draft, limit: 100)
+        XCTAssertEqual(prefs.recentFiles.urls.map(\.lastPathComponent), [file.lastPathComponent])
         XCTAssertEqual(stored.undo.map(\.action), ["Add Clip"])
         XCTAssertEqual(stored.redo.map(\.action), ["Delete Clip"])
         XCTAssertTrue(editor.saveProject(to: url))
@@ -212,6 +213,7 @@ final class CutSequenceDocumentTests: XCTestCase {
         guard case .sequence(let clips) = try CutProject.load(from: url) else { return XCTFail("Expected a sequence") }
         try reopened.openProject(clips, at: url)
         try await waitForImport(reopened)
+        XCTAssertEqual(prefs.recentFiles.urls.map(\.lastPathComponent), [url.lastPathComponent, file.lastPathComponent])
         XCTAssertEqual(reopened.historyActions, editor.historyActions)
         XCTAssertEqual(reopened.historyCursor, 1)
         XCTAssertFalse(reopened.isProjectChanged)
@@ -308,7 +310,7 @@ final class CutSequenceDocumentTests: XCTestCase {
         }
         let draftURL: URL = try {
             let interrupted = ProjectDraft()
-            try interrupted.write { try CutProject.sequence(clips).save(to: $0, undo: undo, redo: []) }
+            try interrupted.write { try CutProject.sequence(clips).saveStaged(to: $0, undo: undo, redo: []) }
             return try XCTUnwrap(interrupted.url)
         }()
         let prefs = EditorPreferences()

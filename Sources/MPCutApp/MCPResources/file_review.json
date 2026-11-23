@@ -1,0 +1,80 @@
+[
+  {
+    "name": "timeline_file_range_map",
+    "description": "Map an exact half-open range of a saved project between source and sequence or group and assembly clocks. Repeated occurrences appear separately.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."},
+        "project_path": {"type": "string", "description": "Absolute path to the saved .cut project."},
+        "space": {"type": "string", "enum": ["source", "sequence", "group", "assembly"]},
+        "from": {"type": "string", "description": "Inclusive rational time in the selected clock."},
+        "to": {"type": "string", "description": "Exclusive rational time in the selected clock."},
+        "file": {"type": "string", "description": "Absolute path identifying one source file."},
+        "occurrence_index": {"type": "integer", "minimum": 0, "description": "Zero-based occurrence index in the saved project."}
+      },
+      "required": ["operation_id", "project_path", "space", "from", "to"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "history_file_compare",
+    "description": "Compare two saved .cut projects and report project fields and occurrence ranges that changed.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."},
+        "before_project_path": {"type": "string", "description": "Absolute path to the earlier saved .cut."},
+        "project_path": {"type": "string", "description": "Absolute path to the later saved .cut."}
+      },
+      "required": ["operation_id", "before_project_path", "project_path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "multicam_file_sync_suggest",
+    "description": "Analyze a saved multicam project for offsets, waveform matches and drift. With a replacement file and explicit stream indices, also report offsets relative to the selected camera recording.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."},
+        "project_path": {"type": "string", "description": "Absolute path to the saved multicam .cut."},
+        "source_id": {"type": "string", "minLength": 1, "description": "Analyze one recording other than the reference. Defaults to all other recordings."},
+        "reference_source_id": {"type": "string", "minLength": 1, "description": "Choose a recording on the reference camera for group sync, or any camera recording for replacement sync."},
+        "reference_stream": {"type": "integer", "minimum": 0, "description": "Absolute scratch stream index for replacement sync."},
+        "replacement": {"type": "string", "pattern": "^/", "description": "Absolute path to a replacement recording."},
+        "replacement_stream": {"type": "integer", "minimum": 0, "description": "Absolute audio stream index in the replacement recording."},
+        "program": {"type": "boolean", "description": "Evaluate coverage across the entire program. Omit reference_stream for a video-only reference."},
+        "seed": {"type": "string", "minLength": 1, "description": "Optional starting offset relative to the scratch recording."},
+        "metadata_only": {"type": "boolean", "description": "Skip waveform analysis and drift checks."}
+      },
+      "required": ["operation_id", "project_path"],
+      "oneOf": [
+        {"required": ["replacement", "replacement_stream", "reference_source_id"], "not": {"required": ["source_id"]}},
+        {"allOf": [{"not": {"required": ["replacement"]}}, {"not": {"required": ["reference_stream"]}}, {"not": {"required": ["replacement_stream"]}}, {"not": {"required": ["seed"]}}, {"not": {"required": ["program"]}}]}
+      ],
+      "if": {"allOf": [{"required": ["replacement"]}, {"not": {"properties": {"program": {"const": true}}, "required": ["program"]}}]},
+      "then": {"required": ["reference_stream"]},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "multicam_file_switch_coverage_read",
+    "description": "Check picture and routed sound through the proposed group switch interval in a saved multicam project.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."},
+        "project_path": {"type": "string", "description": "Absolute path to the saved multicam .cut."},
+        "angle_id": {"type": "string", "minLength": 1, "description": "Camera angle ID for the proposed switch."},
+        "group_time": {"type": "string", "description": "Exact proposed group time in rational seconds."}
+      },
+      "required": ["operation_id", "project_path", "angle_id", "group_time"],
+      "additionalProperties": false
+    }
+  }
+]

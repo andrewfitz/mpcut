@@ -1,6 +1,6 @@
 [
   {
-    "name": "list_stills",
+    "name": "still_editor_placements_list",
     "description": "Read a page of image placements, including authored and visible ranges and asset availability.",
     "annotations": {
       "readOnlyHint": true,
@@ -9,11 +9,11 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
@@ -28,14 +28,14 @@
         }
       },
       "required": [
-        "project"
+        "project_handle"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "add_still",
-    "description": "Import an image and replace program picture or insert a duration-bearing card. Inserts ripple the program. Replacements keep the underlying sound.",
+    "name": "timeline_clips_space",
+    "description": "Set the gaps between consecutive picture items in one native undo step. Use a uniform duration or restore spacing from the source time between clips. Existing leading and trailing gaps are retained.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false
@@ -43,24 +43,78 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1
         },
-        "operation": {
+        "duration": {
           "type": "string",
-          "enum": [
-            "insert",
-            "replace"
+          "description": "Nonnegative uniform gap duration in exact rational seconds. Zero removes gaps between picture items."
+        },
+        "source_timing": {
+          "type": "boolean",
+          "const": true,
+          "description": "Use source timing between chronologically ordered, nonoverlapping ranges of the same media file or multicam group. Use a uniform duration when spacing photo stills."
+        },
+        "cadence": {
+          "type": "string",
+          "description": "Positive frame interval in exact rational seconds, for example 1001/30000. Defaults to the timeline cadence when available. Omit it when removing gaps with duration zero."
+        },
+        "background": {
+          "type": "string",
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "description": "Gap color. Defaults to black."
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "duration"
           ]
+        },
+        {
+          "required": [
+            "source_timing"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "still_editor_placement_insert",
+    "description": "Insert the source image at the requested time, extending the timeline.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
         },
         "path": {
           "type": "string",
@@ -71,7 +125,6 @@
           "type": "string",
           "enum": [
             "sequence",
-            "group",
             "assembly"
           ]
         },
@@ -86,6 +139,89 @@
         "cadence": {
           "type": "string",
           "description": "Positive frame interval, for example 1001/30000. Exact rational seconds."
+        },
+        "fit": {
+          "type": "string",
+          "enum": [
+            "fit",
+            "fill"
+          ]
+        },
+        "crop": {
+          "type": "object",
+          "description": "Normalized crop rectangle as exact rational coordinates.",
+          "properties": {
+            "x": {
+              "type": "string"
+            },
+            "y": {
+              "type": "string"
+            },
+            "width": {
+              "type": "string"
+            },
+            "height": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "x",
+            "y",
+            "width",
+            "height"
+          ],
+          "additionalProperties": false
+        },
+        "background": {
+          "type": "string",
+          "pattern": "^#[0-9A-Fa-f]{6}$"
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "space",
+        "at",
+        "duration",
+        "path"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "still_editor_picture_replace",
+    "description": "Replace picture over the requested range, preserving the soundtrack and timeline duration.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute local image path."
+        },
+        "space": {
+          "type": "string",
+          "enum": [
+            "sequence",
+            "group"
+          ]
         },
         "from": {
           "type": "string",
@@ -133,54 +269,76 @@
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
-        "operation",
-        "path",
-        "space"
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "space",
+        "from",
+        "to",
+        "path"
       ],
-      "additionalProperties": false,
-      "oneOf": [
-        {
-          "properties": {
-            "operation": {
-              "const": "insert"
-            },
-            "space": {
-              "enum": [
-                "sequence",
-                "assembly"
-              ]
-            }
-          },
-          "required": [
-            "at",
-            "duration"
-          ]
-        },
-        {
-          "properties": {
-            "operation": {
-              "const": "replace"
-            },
-            "space": {
-              "enum": [
-                "sequence",
-                "group"
-              ]
-            }
-          },
-          "required": [
-            "from",
-            "to"
-          ]
-        }
-      ]
+      "additionalProperties": false
     }
   },
   {
-    "name": "update_still",
+    "name": "timeline_gap_insert",
+    "description": "Insert a generated color gap at the requested timeline time.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "space": {
+          "type": "string",
+          "enum": [
+            "sequence",
+            "assembly"
+          ]
+        },
+        "at": {
+          "type": "string",
+          "description": "Placement position in the selected clock. Exact rational seconds."
+        },
+        "duration": {
+          "type": "string",
+          "description": "Positive duration. Exact rational seconds."
+        },
+        "cadence": {
+          "type": "string",
+          "description": "Positive frame interval, for example 1001/30000. Exact rational seconds."
+        },
+        "background": {
+          "type": "string",
+          "pattern": "^#[0-9A-Fa-f]{6}$"
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "space",
+        "at",
+        "duration"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "still_editor_placement_update",
     "description": "Edit framing, move or resize an insert, or change the bounds of a replacement. Supply sequence time for ordinary projects, assembly time for multicam inserts, and group time for multicam replacements.",
     "annotations": {
       "readOnlyHint": false,
@@ -189,15 +347,15 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1
         },
@@ -206,26 +364,30 @@
           "minLength": 1,
           "description": "Use another existing still asset for this placement."
         },
-        "clearCrop": {
+        "clear_crop": {
           "type": "boolean",
           "description": "Clear the existing crop rectangle."
         },
         "clock": {
           "type": "string",
-          "enum": ["sequence", "source", "group"],
+          "enum": [
+            "sequence",
+            "source",
+            "group"
+          ],
           "description": "Clock of replacement bounds or destination. Defaults to sequence or group."
         },
-        "fragmentIndex": {
+        "fragment_index": {
           "type": "integer",
           "minimum": 0,
           "description": "Current index of the sequence replacement fragment to edit."
         },
-        "duplicateID": {
+        "duplicate_id": {
           "type": "string",
           "minLength": 1,
           "description": "New replacement ID when duplicating to the supplied destination."
         },
-        "detachID": {
+        "detach_id": {
           "type": "string",
           "minLength": 1,
           "description": "New replacement ID when detaching the selected source fragment."
@@ -292,16 +454,27 @@
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
+        "project_handle",
+        "expected_revision",
+        "operation_id",
         "placement"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "not": {
+        "properties": {
+          "clear_crop": {
+            "const": true
+          }
+        },
+        "required": [
+          "crop",
+          "clear_crop"
+        ]
+      }
     }
   },
   {
-    "name": "remove_still",
+    "name": "still_editor_placement_remove",
     "description": "Remove a placement. Deleting a replacement reveals the underlying picture. Deleting an insert ripples the sequence or assembly.",
     "annotations": {
       "readOnlyHint": false,
@@ -310,15 +483,15 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1
         },
@@ -328,16 +501,16 @@
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
+        "project_handle",
+        "expected_revision",
+        "operation_id",
         "placement"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "relink_still",
+    "name": "still_editor_asset_relink",
     "description": "Update all uses of a still asset in one native undo step.",
     "annotations": {
       "readOnlyHint": false,
@@ -346,15 +519,15 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
           "minLength": 1
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "minLength": 1
         },
@@ -369,9 +542,9 @@
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
+        "project_handle",
+        "expected_revision",
+        "operation_id",
         "asset",
         "path"
       ],

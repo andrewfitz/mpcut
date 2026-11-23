@@ -90,7 +90,8 @@ enum {
 int mpcut_check_mp3_crop(const char *path, int stream_index, int64_t start_sample, int64_t end_sample,
                          MPCutMP3Anchor anchor, MPCutProgress progress, void *context, char *error, size_t capacity);
 
-/* Checks the selected tracks against the output container without creating a file. */
+/* Checks the selected tracks against the output container without creating a file.
+ * All audio-only selections use the same track compatibility checks. */
 int mpcut_check_mux(const char *input_path, const char *output_path, int padded_opus_track, int tracks, int audio_stream,
                     char *error, size_t error_capacity);
 
@@ -101,7 +102,8 @@ void mpcut_check_muxes(const char *input_path, const char *const *output_paths, 
 /* Write presentation end times (nanoseconds) into a staged WebM or MKV. */
 int mpcut_set_matroska_durations(const char *path, const int64_t *ends, size_t count);
 
-/* Validates an edit's timecode continuity and the first retained timecode sample. */
+/* Validates an edit's timecode continuity and the first retained timecode sample.
+ * On a segment-specific failure, failed_segment receives its one-based index. */
 int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime duration,
                          const char *output_path, size_t *failed_segment,
                          MPCutProgress progress, void *context, char *error, size_t error_capacity);

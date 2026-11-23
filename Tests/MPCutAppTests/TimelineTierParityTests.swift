@@ -74,7 +74,7 @@ final class TimelineTierParityTests: XCTestCase {
         let gop = try fixture("SmartTrim-GOP", "mp4"), webm = try fixture("WebM-Opus-GOP", "webm"), mp3 = try fixture("Gapless-Crop", "mp3")
         // Each timeline with a mode that writes it and a container for the output name.
         let timelines: [(clips: [ClipRequest], mode: String, container: String, tier: String)] = [
-            ([ClipRequest(file: gop, from: .zero, to: t(2))], "copy", "mp4", "trueLossless"),
+            ([ClipRequest(file: gop, from: .zero, to: t(2))], "copy", "mp4", "true_lossless"),
             ([ClipRequest(file: gop, from: t(7, 25), to: t(1)), ClipRequest(file: gop, from: t(31, 25), to: t(2))], "smart", "mp4", "lossless"),
             ([ClipRequest(file: webm, from: t(1), to: t(2)), ClipRequest(file: webm, from: t(3), to: t(4))], "encode", "mp4", "reencode"),
             ([ClipRequest(file: mp3, from: t(1, 10), to: t(3, 10)), ClipRequest(file: mp3, from: t(1, 2), to: t(7, 10))], "encode", "wav", "lossless")
@@ -84,39 +84,40 @@ final class TimelineTierParityTests: XCTestCase {
             XCTAssertEqual(app.id, timeline.tier)
             let needsHelper = timeline.mode == "encode"
             if needsHelper, ProcessInfo.processInfo.environment["MPCUT_FFMPEG_HELPER"] == nil { continue }
-            let result = try run(["export", "--json", "--no-sidecar", "--dry-run", "--mode", timeline.mode,
+            let result = try run(["export", "clips", "join", "--json", "--no-sidecar", "--dry-run", "--mode", timeline.mode,
                                   "--output", scratch.appendingPathComponent("\(UUID().uuidString).\(timeline.container)").path] + flags(timeline.clips))
             XCTAssertEqual(result.json["ok"] as? Bool, true, String(decoding: result.data, as: UTF8.self))
             XCTAssertEqual(try tier(result.json["tier"]), app, "\(timeline.tier): the CLI and the app evaluator disagree.")
         }
 
         // inspect reports the tier of the whole source, or of the range it is asked about, once the cut index is read.
-        let whole = try run(["inspect", "--json", "--no-sidecar", "--keyframes", gop.path])
+        let whole = try run(["media", "inspect", "--json", "--no-sidecar", "--keyframes", gop.path])
         XCTAssertEqual(try tier(whole.json["tier"]), try expected([ClipRequest(file: gop)]))
-        let range = try run(["inspect", "--json", "--no-sidecar", "--keyframes", "--from", "7/25", "--to", "2", gop.path])
+        let range = try run(["media", "inspect", "--json", "--no-sidecar", "--keyframes", "--from", "7/25", "--to", "2", gop.path])
         let cut = try tier(range.json["tier"])
         XCTAssertEqual(cut, try expected([ClipRequest(file: gop, from: t(7, 25), to: t(2))]))
         XCTAssertEqual([cut.id, cut.name, cut.mode?.rawValue ?? ""], ["lossless", "Lossless", "smart"])
         XCTAssertEqual(cut.factors.map(\.id), [.cutVideoStart])
         XCTAssertEqual(cut.raise.first?.arguments, ["--mode", "copy", "--snap", "nearest"])
-        XCTAssertNil(try run(["inspect", "--json", "--no-sidecar", gop.path]).json["tier"], "A summary read has no cut index to check.")
+        XCTAssertEqual(try tier(try run(["media", "inspect", "--json", "--no-sidecar", gop.path]).json["tier"]), try tier(whole.json["tier"]),
+                       "A bare inspect reports the same tier.")
 
         // The arguments that raise the tier do raise it.
-        let raised = try run(["export", "--json", "--no-sidecar", "--dry-run", "--output", scratch.appendingPathComponent("raised.mp4").path]
+        let raised = try run(["export", "clips", "join", "--json", "--no-sidecar", "--dry-run", "--output", scratch.appendingPathComponent("raised.mp4").path]
                              + (cut.raise.first?.arguments ?? []) + ["--clip", gop.path, "--from", "7/25", "--to", "2"])
         XCTAssertEqual(raised.json["mode"] as? String, "copy", String(decoding: raised.data, as: UTF8.self))
 
         // A batch reports the tier of each range.
-        let request: [String: Any] = ["file": gop.path, "outputDirectory": scratch.path,
+        let request: [String: Any] = ["file": gop.path, "output_directory": scratch.path,
                                       "ranges": [["from": "0", "to": "1"], ["from": "7/25", "to": "2"]]]
-        let bulk = try run(["bulk", "--stdin", "--json", "--no-sidecar", "--dry-run"], stdin: JSONSerialization.data(withJSONObject: request))
+        let bulk = try run(["export", "ranges", "separate", "--stdin", "--json", "--no-sidecar", "--dry-run"], stdin: JSONSerialization.data(withJSONObject: request))
         let outputs = try XCTUnwrap(bulk.json["outputs"] as? [[String: Any]], String(decoding: bulk.data, as: UTF8.self))
-        XCTAssertEqual(try outputs.map { try tier($0["tier"]).id }, ["trueLossless", "lossless"])
+        XCTAssertEqual(try outputs.map { try tier($0["tier"]).id }, ["true_lossless", "lossless"])
 
         // A project lists the tier of its sequence.
         let project = scratch.appendingPathComponent("edit.cut")
         try CutProject.sequence([CutSequenceClip(id: "a", file: gop.path, from: t(7, 25), to: t(2))]).save(to: project)
-        let inspected = try run(["inspect", "--project", project.path, "--json", "--no-sidecar"])
+        let inspected = try run(["project", "inspect", "--project", project.path, "--json", "--no-sidecar"])
         if inspected.json["ok"] as? Bool == true {
             XCTAssertEqual(try tier(inspected.json["tier"]).id, "lossless")
         } else {
@@ -133,7 +134,7 @@ final class TimelineTierParityTests: XCTestCase {
 
         // rearrange: the ranges as given, without its default snap, are the clips whose tier is reported.
         let ranges = [ClipRequest(file: gop, from: t(7, 25), to: t(1)), ClipRequest(file: gop, from: .zero, to: t(7, 25))]
-        let rearranged = try run(["rearrange", "--json", "--no-sidecar", "--dry-run", "--snap", "exact", gop.path, "--output", output("mp4"), "7/25-1,0-7/25"])
+        let rearranged = try run(["export", "ranges", "join", "--json", "--no-sidecar", "--dry-run", "--snap", "exact", gop.path, "--output", output("mp4"), "7/25-1,0-7/25"])
         XCTAssertEqual(rearranged.json["ok"] as? Bool, true, String(decoding: rearranged.data, as: UTF8.self))
         let reported = try tier(rearranged.json["tier"])
         XCTAssertEqual(reported, try expected(ranges))
@@ -141,7 +142,7 @@ final class TimelineTierParityTests: XCTestCase {
 
         // silence: the tier of the retained ranges, which the report lists as segments.
         for mode in ["smart", "copy"] {
-            let shortened = try run(["silence", "--json", "--no-sidecar", "--dry-run", "--min-pause", "0.3", "--leave", "0.1", "--mode", mode,
+            let shortened = try run(["silence", "plan", "--json", "--no-sidecar", "--dry-run", "--min-pause-seconds", "0.3", "--padding-per-side-seconds", "0.05", "--mode", mode,
                                      "--output", output("mov"), talk.path])
             XCTAssertEqual(shortened.json["ok"] as? Bool, true, String(decoding: shortened.data, as: UTF8.self))
             let segments = try XCTUnwrap(shortened.json["segments"] as? [[String: Any]])
@@ -156,23 +157,41 @@ final class TimelineTierParityTests: XCTestCase {
             let silenceTier = try tier(shortened.json["tier"])
             XCTAssertEqual(silenceTier.id, try expected(retained).id, mode)
             // The same clips through export report the same tier.
-            let exported = try run(["export", "--json", "--no-sidecar", "--dry-run", "--mode", mode, "--output", output("mov")] + flags(retained))
+            let exported = try run(["export", "clips", "join", "--json", "--no-sidecar", "--dry-run", "--mode", mode, "--output", output("mov")] + flags(retained))
             XCTAssertEqual(try tier(exported.json["tier"]).id, silenceTier.id, mode)
         }
 
-        // inspect: the tier needs the cut index. A bare inspection of a movie does not read it.
-        let bare = try run(["inspect", "--json", "--no-sidecar", gop.path])
+        // inspect: a bare inspection reads the cut index for the tier and lists no pictures.
+        let bare = try run(["media", "inspect", "--json", "--no-sidecar", gop.path])
         XCTAssertEqual(bare.json["ok"] as? Bool, true)
-        XCTAssertNil(bare.json["tier"], "A bare inspect stays a metadata read.")
+        XCTAssertEqual(try tier(bare.json["tier"]).id, FidelityTier.trueLossless.rawValue)
+        XCTAssertEqual(((bare.json["media"] as? [String: Any])?["frames"] as? [Any])?.count, 0)
         for flag in ["--keyframes", "--frames"] {
-            let indexed = try run(["inspect", "--json", "--no-sidecar", flag, gop.path])
+            let indexed = try run(["media", "inspect", "--json", "--no-sidecar", flag, gop.path])
             XCTAssertEqual(try tier(indexed.json["tier"]).id, FidelityTier.trueLossless.rawValue, flag)
+            // The index changes nothing else that a bare inspection reports.
+            var listed = indexed.json, plain = bare.json
+            var media = listed["media"] as? [String: Any] ?? [:]
+            XCTAssertFalse((media["frames"] as? [Any] ?? []).isEmpty, flag)
+            media["frames"] = [Any]()
+            listed["media"] = media
+            plain["media"] = (plain["media"] as? [String: Any]).map { body -> [String: Any] in
+                var body = body
+                body["frames"] = [Any]()
+                return body
+            }
+            XCTAssertEqual(listed as NSDictionary, plain as NSDictionary, flag)
         }
-        let sound = try run(["inspect", "--json", "--no-sidecar", try fixture("Covered-Audio", "mp3").path])
+        // One track on its own has no tier.
+        for tracks in ["video", "audio"] {
+            let single = try run(["media", "inspect", "--json", "--no-sidecar", "--tracks", tracks, gop.path])
+            XCTAssertNil(single.json["tier"], tracks)
+        }
+        let sound = try run(["media", "inspect", "--json", "--no-sidecar", try fixture("Covered-Audio", "mp3").path])
         XCTAssertNotNil(sound.json["tier"], "A sound-only source always reads its packets.")
-        let help = try run(["help", "inspect", "--json"])
+        let help = try run(["help", "media", "inspect", "--json"])
         XCTAssertTrue((help.json["result"] as? String ?? "").contains(ExportRules.tierReportingHelp))
-        for command in ["rearrange", "silence --output", "export --project", "--keyframes"] {
+        for command in ["export ranges join", "silence export", "export project render", "--keyframes"] {
             XCTAssertTrue(ExportRules.tierReportingHelp.contains(command), command)
         }
     }
@@ -184,7 +203,7 @@ final class TimelineTierParityTests: XCTestCase {
         let gop = try fixture("SmartTrim-GOP", "mp4")
         let media = try CutEngine(useSidecar: false).inspect(gop, keyframes: true)
         let cases: [(from: RationalTime, id: String, factor: TierFactorID?)] = [
-            (.zero, "trueLossless", nil), (t(7, 25), "lossless", .cutVideoStart), (t(1, 3), "unavailable", .cutOffFrame)
+            (.zero, "true_lossless", nil), (t(7, 25), "lossless", .cutVideoStart), (t(1, 3), "unavailable", .cutOffFrame)
         ]
         for (from, id, factor) in cases {
             var project = MulticamProject(referenceAngle: "a", range: MulticamRange(from: .zero, to: media.duration),
@@ -201,18 +220,18 @@ final class TimelineTierParityTests: XCTestCase {
                 XCTAssertEqual(engine.factors.first?.boundary, "from")
                 XCTAssertFalse((engine.factors.first?.nearest ?? []).isEmpty, "\(factor.rawValue) offers verified times.")
             }
-            let inspected = try run(["inspect", "--project", file.path, "--json", "--no-sidecar"])
+            let inspected = try run(["project", "inspect", "--project", file.path, "--json", "--no-sidecar"])
             XCTAssertEqual(try tier(inspected.json["tier"]), engine, "inspect --project, \(id)")
             guard id != "unavailable" else { continue }
             // The tier's own mode plans, and the report carries the same tier whatever mode was asked.
             let mode = try XCTUnwrap(engine.mode)
-            let planned = try run(["export", "--project", file.path, "--json", "--no-sidecar", "--dry-run", "--mode", mode.rawValue,
+            let planned = try run(["export", "project", "render", "--project", file.path, "--json", "--no-sidecar", "--dry-run", "--mode", mode.rawValue,
                                    "--output", scratch.appendingPathComponent("\(UUID().uuidString).mov").path])
             XCTAssertEqual(planned.json["ok"] as? Bool, true, String(decoding: planned.data, as: UTF8.self))
             XCTAssertEqual(try tier(planned.json["tier"]), engine, "export --project, \(id)")
             // The next better mode does not plan, and its failure names the factor.
             if let factor {
-                let better = try run(["export", "--project", file.path, "--json", "--no-sidecar", "--dry-run", "--mode", "copy",
+                let better = try run(["export", "project", "render", "--project", file.path, "--json", "--no-sidecar", "--dry-run", "--mode", "copy",
                                       "--output", scratch.appendingPathComponent("\(UUID().uuidString).mov").path])
                 let error = try XCTUnwrap(better.json["error"] as? [String: Any])
                 XCTAssertEqual(error["reason"] as? String, factor.rawValue)
@@ -228,7 +247,7 @@ final class TimelineTierParityTests: XCTestCase {
                                       switches: [.init(at: .zero, angle: "a")])
         let file = scratch.appendingPathComponent("talk.cut")
         try CutProject.multicam(program).save(to: file)
-        let shortened = try run(["silence", "--project", file.path, "--json", "--no-sidecar", "--min-pause", "0.3", "--leave", "0.1",
+        let shortened = try run(["silence", "plan", "--project", file.path, "--json", "--no-sidecar", "--min-pause-seconds", "0.3", "--padding-per-side-seconds", "0.05",
                                  "--output", scratch.appendingPathComponent("talk.mov").path, "--dry-run"])
         XCTAssertEqual(shortened.json["ok"] as? Bool, true, String(decoding: shortened.data, as: UTF8.self))
         let reported = try tier(shortened.json["tier"])
@@ -247,31 +266,31 @@ final class TimelineTierParityTests: XCTestCase {
         try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: cli.path), "The mpcut binary is not built at \(cli.path).")
         let gop = try fixture("SmartTrim-GOP", "mp4"), other = try fixture("VFR-PTS", "mp4")
         func refusal(_ arguments: [String]) throws -> [String: Any] {
-            let result = try run(["export", "--json", "--no-sidecar", "--dry-run", "--output", scratch.appendingPathComponent("\(UUID().uuidString).mp4").path] + arguments)
+            let result = try run(["export", "clips", "join", "--json", "--no-sidecar", "--dry-run", "--output", scratch.appendingPathComponent("\(UUID().uuidString).mp4").path] + arguments)
             return try XCTUnwrap(result.json["error"] as? [String: Any], String(decoding: result.data, as: UTF8.self))
         }
         let unsafe = try refusal(["--mode", "copy", "--clip", gop.path, "--from", "7/25"])
-        XCTAssertEqual([unsafe["code"] as? String, unsafe["reason"] as? String], ["unsafe_boundary", "cut.videoStart"])
-        XCTAssertEqual((unsafe["alternatives"] as? [[String: Any]])?.compactMap { $0["id"] as? String }, ["smartTrim", "reencode"],
+        XCTAssertEqual([unsafe["code"] as? String, unsafe["reason"] as? String], ["unsafe_boundary", "cut_video_start"])
+        XCTAssertEqual((unsafe["alternatives"] as? [[String: Any]])?.compactMap { $0["id"] as? String }, ["smart_trim", "reencode"],
                        "The reason is added. What the failure offers is unchanged.")
 
         // Clips that do not match (a mixed timeline) are refused by the modes that join packets, which say why in terms
         // of the tier and offer the re-encode. Re-encode writes them, so the tier is Re-encode.
         for mode in ["copy", "smart"] {
             let mismatch = try refusal(["--mode", mode, "--clip", gop.path, "--clip", other.path])
-            XCTAssertEqual([mismatch["code"] as? String, mismatch["reason"] as? String], ["incompatible_clip", "join.streamMismatch"], mode)
+            XCTAssertEqual([mismatch["code"] as? String, mismatch["reason"] as? String], ["incompatible_clip", "join_stream_mismatch"], mode)
             XCTAssertEqual((mismatch["alternatives"] as? [[String: Any]])?.compactMap { $0["id"] as? String }, ["reencode"], mode)
         }
         XCTAssertEqual(try expected([ClipRequest(file: gop), ClipRequest(file: other)]).mode, .encode)
         XCTAssertEqual(try expected([ClipRequest(file: gop), ClipRequest(file: other)]).factors.map(\.id), [.joinStreamMismatch])
 
         // Without --json the failure names the tier of the clips.
-        let human = try run(["export", "--no-sidecar", "--dry-run", "--mode", "copy", "--output", scratch.appendingPathComponent("human.mp4").path,
+        let human = try run(["export", "clips", "join", "--no-sidecar", "--dry-run", "--mode", "copy", "--output", scratch.appendingPathComponent("human.mp4").path,
                              "--clip", gop.path, "--from", "7/25"])
         XCTAssertTrue(human.text.contains("Timeline tier: Lossless"), human.text)
 
         // Without --mode, export uses the table's default, as the app does. The tier never changes what is written.
-        let plain = try run(["export", "--json", "--no-sidecar", "--dry-run", "--output", scratch.appendingPathComponent("plain.mp4").path, "--clip", gop.path])
+        let plain = try run(["export", "clips", "join", "--json", "--no-sidecar", "--dry-run", "--output", scratch.appendingPathComponent("plain.mp4").path, "--clip", gop.path])
         XCTAssertEqual(plain.json["mode"] as? String, ExportRules.defaultMode(for: .movie).rawValue)
         XCTAssertEqual(try tier(plain.json["tier"]).mode, .copy)
     }

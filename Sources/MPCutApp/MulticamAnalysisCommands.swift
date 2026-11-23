@@ -4,8 +4,8 @@ import MPCutCore
 extension MulticamEditorModel {
     private var currentScene: MulticamAnalysisStore.ScenePosition? {
         let output = preview.currentTime()
-        guard let interval = interval(at: output) else { return nil }
-        return analysis.currentScene(at: groupTime(at: output), angle: interval.angle,
+        guard let source = interval(at: output)?.pictureSourceID else { return nil }
+        return analysis.currentScene(at: groupTime(at: output), angle: source,
                                      exclusiveEnd: output == mapping?.duration)
     }
 
@@ -97,7 +97,9 @@ extension MulticamEditorModel {
         let output = preview.currentTime()
         let group = groupTime(at: output)
         if assemblyPreview, output == mapping?.duration { return group }
-        return snappedAnalysisTime(group, within: activeAnalysisOccurrence(containing: group, at: output)) ?? group
+        let scope = activeAnalysisOccurrence(containing: group, at: output)
+        let angle = scope == nil ? nil : assemblyItems[occurrenceIndex(at: output)].angleOverride
+        return snappedAnalysisTime(group, within: scope, pictureAngle: angle) ?? group
     }
 
     func activeAnalysisOccurrence(containing time: RationalTime, at output: RationalTime? = nil) -> MulticamRange? {
@@ -108,14 +110,22 @@ extension MulticamEditorModel {
     }
 
     func snappedAnalysisTime(_ time: RationalTime, excludingGroupEdges: Bool = false,
-                             within scope: MulticamRange? = nil, includeEnd: Bool = false) -> RationalTime? {
+                             within scope: MulticamRange? = nil, includeEnd: Bool = false,
+                             pictureAngle: String? = nil) -> RationalTime? {
         let target = analysis.snapTarget
         guard target != .off, let project else { return nil }
-        let markers = analysis.markers(target, project: project, media: media)
+        let markers: [RationalTime]
+        if let pictureAngle, target == .scenes || target == .keyframes {
+            markers = analysis.pictureSnapMarkers(target, angle: pictureAngle, project: project,
+                                                  near: time, within: scope ?? project.range, includeEnd: includeEnd)
+        } else {
+            markers = analysis.markers(target, project: project, media: media)
+        }
         let first = scope.map { scope in markers.lowerBound { $0 >= scope.from } }
             ?? (excludingGroupEdges ? markers.lowerBound { $0 > project.range.from } : markers.startIndex)
         let end = scope.map { scope in markers.lowerBound { includeEnd ? $0 > scope.to : $0 >= scope.to } }
             ?? (excludingGroupEdges ? markers.lowerBound { $0 >= project.range.to } : markers.endIndex)
+        guard first < end else { return nil }
         let eligible = markers[first..<end]
         let next = eligible.lowerBound { $0 >= time }
         guard let previous = next > first ? markers[next - 1] : nil else { return eligible.first }
@@ -126,6 +136,9 @@ extension MulticamEditorModel {
 
     private func analysisNavigationMarkers(_ target: TimelineSnapTarget) -> [RationalTime] {
         guard let project, let mapping else { return [] }
+        if target == .scenes || target == .keyframes {
+            return analysis.pictureOutputMarkers(target, in: mapping)
+        }
         let markers = analysis.markers(target, project: project, media: media)
         return MulticamAnalysisStore.outputMarkers(markers, in: mapping)
     }
@@ -133,6 +146,11 @@ extension MulticamEditorModel {
     func canStepAnalysis(_ target: TimelineSnapTarget) -> Bool {
         guard !isBusy, let project, let mapping else { return false }
         if let cached = analysisNavigationAvailability[target] { return cached }
+        if target == .scenes || target == .keyframes {
+            let available = analysis.hasPictureMarker(target, in: mapping)
+            analysisNavigationAvailability[target] = available
+            return available
+        }
         let markers = analysis.markers(target, project: project, media: media)
         let available = !markers.isEmpty && mapping.intervals.contains { interval in
             let first = markers.lowerBound { $0 >= interval.group.from }

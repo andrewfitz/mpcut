@@ -12,15 +12,15 @@ import (
 func checkReviewFrame(t *testing.T, reply *mcp.CallToolResult, want object) {
 	t.Helper()
 	if reply.IsError {
-		t.Fatalf("review_frame: %v", reply.StructuredContent)
+		t.Fatalf("review_editor_frame_read: %v", reply.StructuredContent)
 	}
 	metadata, ok := reply.StructuredContent.(map[string]any)
 	if _, hasJPEG := metadata["jpeg"]; !ok || hasJPEG {
-		t.Fatal("review_frame returned invalid metadata")
+		t.Fatal("review_editor_frame_read returned invalid metadata")
 	}
 	for key, value := range want {
 		if metadata[key] != value {
-			t.Fatalf("review_frame %s = %v, want %v", key, metadata[key], value)
+			t.Fatalf("review_editor_frame_read %s = %v, want %v", key, metadata[key], value)
 		}
 	}
 	images := 0
@@ -33,7 +33,7 @@ func checkReviewFrame(t *testing.T, reply *mcp.CallToolResult, want object) {
 			}
 			image, err := jpeg.Decode(bytes.NewReader(c.Data))
 			if err != nil {
-				t.Fatalf("review_frame JPEG decode: %v", err)
+				t.Fatalf("review_editor_frame_read JPEG decode: %v", err)
 			}
 			bounds := image.Bounds()
 			if metadata["width"] != float64(bounds.Dx()) || metadata["height"] != float64(bounds.Dy()) {

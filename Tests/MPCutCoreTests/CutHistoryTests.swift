@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import MPCutCore
 import XCTest
@@ -13,6 +14,57 @@ final class CutHistoryTests: XCTestCase {
         CutSequenceClip(id: "clip-\(index)", file: "media/camera-\(index).mov", from: .zero, to: .init(numerator: 3))
     }
 
+    func testStagedProjectWriteFinishesWhileCallerHoldsTheDirectoryLease() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let descriptor = open(directory.path, O_SEARCH | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        guard descriptor >= 0 else { return }
+        defer { close(descriptor) }
+        XCTAssertEqual(flock(descriptor, LOCK_EX | LOCK_NB), 0)
+
+        let probe = open(directory.path, O_SEARCH | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(probe, 0)
+        guard probe >= 0 else { return }
+        let competingLock = flock(probe, LOCK_EX | LOCK_NB)
+        let lockError = errno
+        close(probe)
+        XCTAssertEqual(competingLock, -1)
+        XCTAssertEqual(lockError, EWOULDBLOCK)
+
+        let stage = directory.appendingPathComponent(".pending-\(UUID().uuidString).cut")
+        let named = directory.appendingPathComponent("Edit.cut")
+        var project = CutProject.sequence([clip(0)])
+        project.transcripts.documentID = UUID()
+        let snapshot = project
+        let stageDone = DispatchSemaphore(value: 0)
+        let namedStarted = DispatchSemaphore(value: 0)
+        let namedDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            defer { stageDone.signal() }
+            do { try snapshot.saveStaged(to: stage, undo: [], redo: []) }
+            catch { XCTFail(error.localizedDescription) }
+        }
+        DispatchQueue.global().async {
+            defer { namedDone.signal() }
+            namedStarted.signal()
+            do { try snapshot.save(to: named, undo: [], redo: []) }
+            catch { XCTFail(error.localizedDescription) }
+        }
+
+        let stagedWhileLocked = stageDone.wait(timeout: .now() + 5)
+        XCTAssertEqual(namedStarted.wait(timeout: .now() + 5), .success)
+        let namedWhileLocked = namedDone.wait(timeout: .now() + 0.1)
+        XCTAssertEqual(flock(descriptor, LOCK_UN), 0)
+        XCTAssertEqual(stagedWhileLocked, .success, "The private draft write attempted to reacquire its caller’s lease.")
+        XCTAssertEqual(namedWhileLocked, .timedOut, "A named save did not respect the directory lease.")
+        if stagedWhileLocked == .timedOut { XCTAssertEqual(stageDone.wait(timeout: .now() + 5), .success) }
+        if namedWhileLocked == .timedOut { XCTAssertEqual(namedDone.wait(timeout: .now() + 5), .success) }
+        XCTAssertEqual(try CutProject.load(from: stage), snapshot)
+        XCTAssertEqual(try CutProject.load(from: named), snapshot)
+    }
+
     func testCompactReorderAndTrimRoundTripAcrossBothBranches() throws {
         let current = (0..<1000).map(clip)
         let reordered = Array(current[1...]) + [current[0]]
@@ -22,7 +74,7 @@ final class CutHistoryTests: XCTestCase {
             .init(action: "Add Clips", project: .sequence([])),
             .init(action: "Move Clip", project: .sequence(reordered))
         ]
-        let redo: [CutHistoryState] = [.init(action: "Trim Clip", project: .sequence(trimmed))]
+        let redo: [CutHistoryState] = [.init(action: "Trim Clip", origin: .agent, project: .sequence(trimmed))]
         let url = file()
         try CutProject.sequence(current).save(to: url, undo: undo, redo: redo)
         let document = try CutProject.loadDocument(from: url, limit: 5)
@@ -38,6 +90,16 @@ final class CutHistoryTests: XCTestCase {
         XCTAssertEqual(limited.redo, redo)
         let disabled = try CutProject.loadHistory(from: url, limit: 0)
         XCTAssertTrue(disabled.undo.isEmpty && disabled.redo.isEmpty)
+    }
+
+    func testLegacyHistoryWithoutOriginRemainsUnknownAfterSaving() throws {
+        let url = file()
+        let json = #"{"format":"mpcut","schema_version":4,"kind":"sequence","clips":[],"history":{"undo":[{"action":"Earlier Edit"}]}}"#
+        try Data(json.utf8).write(to: url)
+        let loaded = try CutProject.loadDocument(from: url, limit: 5)
+        XCTAssertEqual(loaded.undo.first?.origin, .unknown)
+        try loaded.project.save(to: url, undo: loaded.undo, redo: loaded.redo)
+        XCTAssertEqual(try CutProject.loadHistory(from: url, limit: 5).undo.first?.origin, .unknown)
     }
 
     func testMulticamSettingsAndRepeatedAssembly() throws {
@@ -61,6 +123,24 @@ final class CutHistoryTests: XCTestCase {
         try CutProject.multicam(present).save(to: url, undo: undo, redo: [])
         XCTAssertEqual(try CutProject.loadHistory(from: url, limit: 2).undo, undo)
         XCTAssertEqual(try MulticamProject.load(from: url), present)
+    }
+
+    func testMulticamHistoryBudgetChargesUnchangedAdditionalRecordings() throws {
+        let duration = MulticamRange(from: .zero, to: .init(numerator: 5))
+        let present = MulticamProject(
+            referenceAngle: "A", range: duration,
+            angles: [.init(id: "A", file: "A.mov", coverage: .init(from: .zero, to: .init(numerator: 2)),
+                           additionalRecordings: [.init(id: "A2", file: "A2.mov", offset: .init(numerator: 3),
+                                                        coverage: .init(from: .init(numerator: 3), to: duration.to))])],
+            audio: .follow, switches: [.init(at: .zero, angle: "A")]
+        )
+        let previous = CutHistoryState(action: "Change Audio", project: .multicam(present))
+        var updated = present
+        updated.audio = .none
+        let url = file()
+        try CutProject.multicam(updated).save(to: url, undo: [previous], redo: [])
+        XCTAssertTrue(try CutProject.loadDocument(from: url, limit: 1, recordBudget: 2).undo.isEmpty)
+        XCTAssertEqual(try CutProject.loadDocument(from: url, limit: 1, recordBudget: 3).undo, [previous])
     }
 
     func testLimitsAndNoHistoryEncoding() throws {
@@ -164,7 +244,7 @@ final class CutHistoryTests: XCTestCase {
         let url = file()
         let copies = String(repeating: "[0,1],", count: 500_000) + "[0,1]"
         let step = #"{"action":"Edit","clips":["# + copies + "]}"
-        let document = #"{"format":"mpcut","schemaVersion":1,"kind":"sequence","clips":[],"history":{"undo":["#
+        let document = #"{"format":"mpcut","schema_version":3,"kind":"sequence","clips":[],"history":{"undo":["#
             + step + #"],"redo":["# + step + "]}}"
         try Data(document.utf8).write(to: url)
         XCTAssertThrowsError(try CutProject.loadDocument(from: url, limit: 0)) {

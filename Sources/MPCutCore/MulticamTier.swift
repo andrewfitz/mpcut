@@ -11,8 +11,13 @@ extension MulticamEngine {
     /// `preferredContainer` is used when the program plans in it, otherwise the first listed container that plans.
     public func tier(_ project: MulticamProject, relativeTo location: URL? = nil, assembly: [MulticamRange]? = nil,
                      indexedSources: [String: MediaInfo] = [:], preferredContainer: String? = nil) -> TierState {
+        if project.participants.render != nil {
+            guard assembly == nil else { return .unavailable(ParticipantProjectExport.unsupported("A range export")) }
+            return ParticipantProjectExport.tier(.multicam(project), relativeTo: location,
+                                                 preferredContainer: preferredContainer, cancelled: cancelled)
+        }
         var snapshot = project
-        if let assembly { snapshot.assemblyItems = assembly.map(StillAssemblyItem.group) }
+        if let assembly { snapshot.assemblyItems = assembly.map { .group($0) } }
         let document = CutProject.multicam(snapshot)
         if !document.stillInserts.isEmpty || !document.stillReplacements.isEmpty {
             do {
@@ -55,7 +60,8 @@ extension MulticamEngine {
             let cell = ExportRules.cell(source: .multicam, tracks: .all, mode: step.mode)
             // A container written as another one, such as M4V, is asked once.
             var containers = (cell.containers ?? ExportRules.multicamContainers).filter { ExportRules.multicamMuxContainer($0) == $0 }
-            if let preferredContainer, containers.contains(preferredContainer) {
+            if let preferredContainer = preferredContainer.map({ ExportRules.multicamMuxContainer($0.lowercased()) }),
+               containers.contains(preferredContainer) {
                 containers.removeAll { $0 == preferredContainer }
                 containers.insert(preferredContainer, at: 0)
             }

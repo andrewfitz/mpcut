@@ -34,7 +34,7 @@ extension MulticamEditorModel {
             ?? media.sorted { $0.key < $1.key }.lazy.map(\.value).first(where: \.hasVideo)
     }
 
-    func stillReviewContext(clock: String, time: RationalTime?) throws
+    func stillReviewContext(clock: String, time: RationalTime?, resolvedPlan: StillTimelinePlan? = nil) throws
         -> (project: CutProject, plan: StillTimelinePlan, index: Int, time: RationalTime) {
         guard var project else { throw MCPCommandError("no_frame", "Open a multicam project.") }
         let at: RationalTime
@@ -55,7 +55,7 @@ extension MulticamEditorModel {
             throw MCPCommandError("invalid_target", "Choose group or assembly time.")
         }
         let snapshot = CutProject.multicam(project)
-        let plan = try snapshot.resolveStills()
+        let plan = try resolvedPlan ?? snapshot.resolveStills()
         guard let index = plan.pictureIndex(at: at) else {
             throw MCPCommandError("no_frame", "No program picture covers this position.")
         }

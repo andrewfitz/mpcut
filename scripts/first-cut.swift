@@ -133,11 +133,11 @@ func walkthrough() throws {
     try run(ffmpeg, ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=6",
                      "-c:v", "prores_videotoolbox", "-pix_fmt", "yuv422p10le", media.path])
     // A named empty project keeps the edit and autosaves separate from the user's windows.
-    try Data(#"{"format":"mpcut","schemaVersion":1,"kind":"sequence","clips":[]}"#.utf8).write(to: project)
+    try Data(#"{"format":"mpcut","schema_version":4,"kind":"sequence","clips":[]}"#.utf8).write(to: project)
     let config = NSWorkspace.OpenConfiguration()
     config.createsNewApplicationInstance = true
     config.arguments = ["-ApplePersistenceIgnoreState", "YES", "-AppleLanguages", "(en)",
-                        "-defaultMovieExportMode", "copy", "-timelineSnapTarget", "off", "-localMCPEnabled", "NO"]
+                        "-export_movie_default_mode", "copy", "-timeline_snap_target", "off", "-automation_local_mcp_enabled", "NO"]
     var launched: Result<NSRunningApplication, Error>?
     NSWorkspace.shared.open([project], withApplicationAt: app, configuration: config) { application, error in
         if let application { launched = .success(application) } else { launched = .failure(error ?? Failure("Launch failed")) }

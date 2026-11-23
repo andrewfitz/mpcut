@@ -20,36 +20,19 @@ extension MediaInfo {
         let position = min(max(time, 0), duration.seconds)
         if position == 0 && (!strict || rounding == .down) { return .zero }
         if position == duration.seconds && (!strict || rounding == .up) { return duration }
-        let lower: RationalTime, upper: RationalTime
         let sampleAddressable = track.stream.isPCM || track.stream.codec == "aac"
             || (track.stream.codec == "mp3" && format == "mp3")
             || track.opusWindow?.complete == true
-        if sampleAddressable, track.stream.sampleRate > 0 {
-            let rate = Int64(track.stream.sampleRate)
-            var value = (position - track.start.seconds) * Double(rate)
-            guard abs(value) < Double(Int64.max) else { return duration }
-            // A rational time converted to seconds can land one ULP off the grid.
-            let tolerance = 4 * max(value.ulp, position.ulp * Double(rate))
-            if abs(value - value.rounded()) <= tolerance { value = value.rounded() }
-            if !strict && (rounding == .toNearestOrAwayFromZero || rounding == .toNearestOrEven) {
-                // Preserve the requested half-sample rule through the seconds conversion.
-                let halfway = value.rounded(.down) + 0.5
-                if abs(value - halfway) <= tolerance { value = halfway }
-                let nearest = track.start + RationalTime(numerator: Int64(value.rounded(rounding)), denominator: rate)
-                return min(max(nearest, .zero), duration)
-            }
-            var floor = Int64(value.rounded(.down)), ceil = Int64(value.rounded(.up))
-            if strict && floor == ceil { floor -= 1; ceil += 1 }
-            lower = track.start + RationalTime(numerator: floor, denominator: rate)
-            upper = track.start + RationalTime(numerator: ceil, denominator: rate)
-        } else {
-            // PCM grids stay implicit and compressed audio reuses the packet array.
-            let packets = track.packets
-            let before = packets.lowerBound { strict ? $0.time.seconds >= position : $0.time.seconds > position }
-            let after = packets.lowerBound { strict ? $0.time.seconds > position : $0.time.seconds >= position }
-            lower = before > 0 ? max(.zero, packets[before - 1].time) : .zero
-            upper = after < packets.count ? min(duration, packets[after].time) : duration
+        if sampleAddressable, let sample = sampleBoundary(at: position, track: track, rounding: rounding, strict: strict) {
+            return min(max(sample, .zero), duration)
         }
+
+        // Use indexed edges when a sample position has no representable rational timestamp.
+        let packets = track.packets
+        let before = packets.lowerBound { strict ? $0.time.seconds >= position : $0.time.seconds > position }
+        let after = packets.lowerBound { strict ? $0.time.seconds > position : $0.time.seconds >= position }
+        let lower = before > 0 ? max(.zero, packets[before - 1].time) : .zero
+        let upper = after < packets.count ? min(duration, packets[after].time) : duration
         let snapped: RationalTime
         switch rounding {
         case .down, .towardZero: snapped = lower
@@ -58,5 +41,35 @@ extension MediaInfo {
             snapped = position - lower.seconds <= upper.seconds - position ? lower : upper
         }
         return min(max(snapped, .zero), duration)
+    }
+
+    private func sampleBoundary(at position: Double, track: AudioIndex,
+                                rounding: FloatingPointRoundingRule, strict: Bool) -> RationalTime? {
+        let rate = Int64(track.stream.sampleRate)
+        guard rate > 0 else { return nil }
+        var value = (position - track.start.seconds) * Double(rate)
+        guard value.isFinite else { return nil }
+
+        // A rational time converted to seconds can land one ULP off the grid.
+        let tolerance = 4 * max(value.ulp, position.ulp * Double(rate))
+        if abs(value - value.rounded()) <= tolerance { value = value.rounded() }
+        let rounded: Double
+        switch rounding {
+        case .down, .towardZero: rounded = value.rounded(.down)
+        case .up, .awayFromZero: rounded = value.rounded(.up)
+        default:
+            // Preserve the requested half-sample rule through the seconds conversion.
+            let halfway = value.rounded(.down) + 0.5
+            if abs(value - halfway) <= tolerance { value = halfway }
+            rounded = value.rounded(rounding)
+        }
+
+        guard var sample = Int64(exactly: rounded) else { return nil }
+        if strict, rounded == value {
+            let (next, overflow) = sample.addingReportingOverflow(rounding == .up ? 1 : -1)
+            guard !overflow else { return nil }
+            sample = next
+        }
+        return try? track.start.adding(RationalTime(numerator: sample, denominator: rate))
     }
 }

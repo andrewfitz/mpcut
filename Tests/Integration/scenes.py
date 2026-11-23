@@ -33,7 +33,8 @@ class Scenes(unittest.TestCase):
         self.output = Path(temporary.name)
 
     def cli(self, *options, request=None, exit_code=0):
-        result = subprocess.run([CLI, "scenes", "--json", *options],
+        action = "export" if "--export-to" in options else "scan"
+        result = subprocess.run([CLI, "scenes", action, "--json", *options],
                                 input=json.dumps(request) if request is not None else None,
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
@@ -49,13 +50,13 @@ class Scenes(unittest.TestCase):
         report = self.cli(self.source)
         self.assertTrue(report["ok"])
         self.assertEqual(time(report["duration"]), Fraction(41, 25))
-        self.assertEqual(report["viewCount"], 2)
+        self.assertEqual(report["view_count"], 2)
         self.assertEqual(report["views"], [
-            {"view": 1, "label": "A", "sceneNumbers": [1, 3]},
-            {"view": 2, "label": "B", "sceneNumbers": [2]},
+            {"view": 1, "label": "A", "scene_numbers": [1, 3]},
+            {"view": 2, "label": "B", "scene_numbers": [2]},
         ])
         self.assertEqual([scene["number"] for scene in report["scenes"]], [1, 2, 3])
-        self.assertEqual([scene["viewLabel"] for scene in report["scenes"]], ["A", "B", "A"])
+        self.assertEqual([scene["view_label"] for scene in report["scenes"]], ["A", "B", "A"])
         self.assertEqual([time(scene["start"]) for scene in report["scenes"]],
                          [0, Fraction(11, 25), Fraction(24, 25)])
         self.assertEqual([time(scene["end"]) for scene in report["scenes"]],
@@ -64,9 +65,9 @@ class Scenes(unittest.TestCase):
 
     def test_scene_files_match_chronology_and_frame_counts(self):
         report = self.cli("--export-to", self.output, self.source)
-        self.assertEqual(report["groupBy"], "scene")
+        self.assertEqual(report["group_by"], "scene")
         outputs = report["outputs"]
-        self.assertEqual([item["sceneNumbers"] for item in outputs], [[1], [2], [3]])
+        self.assertEqual([item["scene_numbers"] for item in outputs], [[1], [2], [3]])
         self.assertEqual([Path(item["export"]["output"]).name for item in outputs],
                          ["Montage-scene-001-A.mp4", "Montage-scene-002-B.mp4", "Montage-scene-003-A.mp4"])
         self.assertEqual([self.frame_count(item["export"]["output"]) for item in outputs], [11, 13, 17])
@@ -85,7 +86,7 @@ class Scenes(unittest.TestCase):
         subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", graph, "-c:v", "libx264",
                         "-pix_fmt", "yuv420p", "-g", "100", "-sc_threshold", "0", source], check=True, timeout=120)
         scenes = self.cli(source)["scenes"]
-        self.assertEqual([(time(scene["start"]), scene["viewLabel"]) for scene in scenes],
+        self.assertEqual([(time(scene["start"]), scene["view_label"]) for scene in scenes],
                          [(0, "A"), (1, "B"), (Fraction(27, 25), "A")])
 
     def test_h264_mp4_preserves_cut_after_timestamp_gap(self):
@@ -95,7 +96,7 @@ class Scenes(unittest.TestCase):
                         "-c:v", "libx264", "-g", "100", "-sc_threshold", "0", source], check=True, timeout=120)
         scenes = self.cli(source)["scenes"]
         self.assertEqual([time(scene["start"]) for scene in scenes], [0, Fraction(11, 25), Fraction(31, 25)])
-        self.assertEqual([scene["viewLabel"] for scene in scenes], ["A", "B", "A"])
+        self.assertEqual([scene["view_label"] for scene in scenes], ["A", "B", "A"])
 
     def test_software_decode_tracks_vfr_offset_and_last_frame_cut(self):
         source = self.output / "vfr-offset.mkv"
@@ -109,9 +110,9 @@ class Scenes(unittest.TestCase):
         self.assertEqual(time(report["origin"]), 2)
         starts = [0, Fraction(11, 25), Fraction(31, 25), Fraction(47, 25)]
         self.assertEqual([time(scene["start"]) for scene in report["scenes"]], starts)
-        self.assertEqual([scene["startPTS"] * time(report["timeBase"]) for scene in report["scenes"]],
+        self.assertEqual([scene["start_pts"] * time(report["time_base"]) for scene in report["scenes"]],
                          [start + 2 for start in starts])
-        self.assertEqual([scene["viewLabel"] for scene in report["scenes"]], ["A", "B", "A", "C"])
+        self.assertEqual([scene["view_label"] for scene in report["scenes"]], ["A", "B", "A", "C"])
         self.assertEqual(time(report["scenes"][-1]["end"]), Fraction(48, 25))
 
     def test_full_range_luma_cut_agrees_across_readers(self):
@@ -132,14 +133,14 @@ class Scenes(unittest.TestCase):
                 report = self.cli(source)
                 self.assertEqual([time(scene["start"]) for scene in report["scenes"]],
                                  [0, Fraction(9, 25), Fraction(18, 25)])
-                self.assertEqual([scene["viewLabel"] for scene in report["scenes"]], ["A", "A", "A"])
+                self.assertEqual([scene["view_label"] for scene in report["scenes"]], ["A", "A", "A"])
                 self.assertEqual(time(report["scenes"][-1]["end"]), Fraction(27, 25))
 
     def test_saved_report_joins_each_view_in_source_order(self):
         detection = self.cli(self.source)
         flags = ("--stdin", "--group-by", "view", "--export-to", self.output)
         plan = self.cli(*flags, "--dry-run", request=detection)
-        self.assertEqual([item["sceneNumbers"] for item in plan["outputs"]], [[1, 3], [2]])
+        self.assertEqual([item["scene_numbers"] for item in plan["outputs"]], [[1, 3], [2]])
         self.assertEqual(list(self.output.iterdir()), [])
         existing = self.output / "Montage-view-002-B.mp4"
         existing.write_text("leave intact")
@@ -186,7 +187,9 @@ class Scenes(unittest.TestCase):
     def test_saved_report_rejects_stale_source_and_overlapping_ranges(self):
         detection = self.cli(self.source)
         flags = ("--stdin", "--export-to", self.output)
-        stale = {**detection, "sourceStamp": {**detection["sourceStamp"], "bytes": 1}}
+        mixed = {**detection, "sourceStamp": detection["source_stamp"]}
+        self.assertEqual(self.cli(*flags, request=mixed, exit_code=2)["error"]["code"], "invalid_json")
+        stale = {**detection, "source_stamp": {**detection["source_stamp"], "bytes": 1}}
         self.assertEqual(self.cli(*flags, request=stale, exit_code=1)["error"]["code"], "source_changed")
         detection["scenes"][1]["start"] = detection["scenes"][0]["start"]
         self.assertEqual(self.cli(*flags, request=detection, exit_code=1)["error"]["code"], "invalid_range")

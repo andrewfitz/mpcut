@@ -11,6 +11,150 @@ final class StillProjectTests: XCTestCase {
     private func time(_ seconds: Int64) -> RationalTime { .init(numerator: seconds) }
     private func range(_ from: Int64, _ to: Int64) -> MulticamRange { .init(from: time(from), to: time(to)) }
 
+    func testSourceRangeSplicePreservesHiddenStillHandlesAtSurvivingTrimEdges() throws {
+        let source = CutSequenceClip(id: "interview", file: "interview.mov", from: time(5), to: time(25))
+        let overlay = StillReplacement(id: "overlay", assetID: asset.id,
+                                       coverage: .sequence([.init(clipID: source.id, range: range(2, 28))]))
+        let project = try CutProject.sequence([source]).addingStillAsset(asset).addingStillReplacement(overlay)
+        let timeline = try TranscriptEditTimeline(project)
+        let (before, after) = try timeline.retaining(before: time(4), after: time(8))
+        let inserted = CutSequenceClip(id: "new", file: "new.mov", from: .zero, to: time(2))
+        let result = try timeline.project(project, with: before + [.sequence(inserted)] + after,
+                                          preservingHiddenStillHandles: true)
+        let clips = try XCTUnwrap(result.sequenceClips)
+        XCTAssertEqual(clips.map(\.from), [time(5), .zero, time(13)])
+        XCTAssertEqual(clips.map(\.to), [time(9), time(2), time(25)])
+        XCTAssertEqual(result.stillReplacements.first?.coverage, .sequence([
+            .init(clipID: clips[0].id, range: range(2, 9)),
+            .init(clipID: clips[2].id, range: range(13, 28))
+        ]))
+    }
+
+    func testSourceSpacingRecalculatesExistingGapsAndUsesExactSourceTime() throws {
+        let rightStart = RationalTime(numerator: 151, denominator: 10)
+        let clips = [
+            CutSequenceClip(id: "left", file: clip.file, from: time(10), to: time(12)),
+            CutSequenceClip(id: "right", file: clip.file, from: rightStart, to: time(19)),
+            CutSequenceClip(id: "touching", file: clip.file, from: time(19), to: time(20))
+        ]
+        let project = try CutProject.sequence(clips)
+            .spacingClips(duration: time(1), cadence: title.cadence, background: "#000000")
+        let firstGap = try XCTUnwrap(project.stillInserts.first)
+        let result = try project.spacingClipsUsingSourceTiming(cadence: title.cadence, background: "#ff0000")
+        XCTAssertEqual(result.sequenceClips, clips)
+        XCTAssertEqual(result.stillInserts, [
+            StillInsert(id: firstGap.id, assetID: firstGap.assetID, duration: .init(numerator: 31, denominator: 10),
+                        cadence: title.cadence, framing: .init(mode: .fit, background: "#ff0000"))
+        ])
+        XCTAssertEqual(try result.resolveStills().spans.map(\.output), [
+            range(0, 2), .init(from: time(2), to: .init(numerator: 51, denominator: 10)),
+            .init(from: .init(numerator: 51, denominator: 10), to: time(9)), range(9, 10)
+        ])
+        XCTAssertEqual(try result.spacingClipsUsingSourceTiming(cadence: title.cadence, background: "#ff0000"), result)
+        XCTAssertEqual(try CutProject.decode(JSONEncoder().encode(result)), result)
+    }
+
+    func testSourceSpacingResolvesProjectRelativeMediaWithoutRewritingPaths() throws {
+        let files = FileManager.default
+        let folder = files.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let media = folder.appendingPathComponent("Media", isDirectory: true)
+        try files.createDirectory(at: media, withIntermediateDirectories: true)
+        defer { try? files.removeItem(at: folder) }
+        let source = media.appendingPathComponent("interview.mov")
+        try Data().write(to: source)
+        try files.createSymbolicLink(atPath: media.appendingPathComponent("shortcut.mov").path,
+                                     withDestinationPath: source.lastPathComponent)
+        let projectURL = folder.appendingPathComponent("Edit.cut")
+        let clips = [
+            CutSequenceClip(id: "left", file: "Media/./interview.mov", from: time(10), to: time(12)),
+            CutSequenceClip(id: "middle", file: source.path, from: time(15), to: time(19)),
+            CutSequenceClip(id: "right", file: "Media/shortcut.mov", from: time(20), to: time(25))
+        ]
+        let project = try CutProject.sequence(clips)
+            .spacingClipsUsingSourceTiming(cadence: title.cadence, background: "#000000", relativeTo: projectURL)
+        XCTAssertEqual(project.sequenceClips, clips)
+        XCTAssertEqual(project.stillInserts.map(\.duration), [time(3), time(1)])
+        try project.save(to: projectURL)
+        let reopened = try CutProject.load(from: projectURL)
+        XCTAssertEqual(reopened, project)
+        XCTAssertEqual(try reopened.spacingClipsUsingSourceTiming(cadence: title.cadence, background: "#000000",
+                                                                   relativeTo: projectURL), reopened)
+    }
+
+    func testSpacingRetainsFirstInteriorGapIdentityAndRestoresDirectJoin() throws {
+        let primary = StillAsset(gapID: "primary")
+        let interior = StillAsset(gapID: "interior")
+        let unused = StillAsset(gapID: "unused")
+        let head = StillInsert(id: "head", assetID: primary.id, duration: time(1), cadence: title.cadence)
+        let first = StillInsert(id: "first", assetID: interior.id, duration: time(1), cadence: title.cadence)
+        let second = StillInsert(id: "second", assetID: primary.id, duration: time(1), cadence: title.cadence)
+        let tail = StillInsert(id: "tail", assetID: primary.id, duration: time(1), cadence: title.cadence)
+        let right = CutSequenceClip(id: "right", file: clip.file, from: time(32), to: time(36))
+        let project = CutProject.stillSequence(.init(
+            items: [.still(head), .source(clip), .still(first), .still(second), .source(right), .still(tail)],
+            stillAssets: [primary, interior, unused]
+        ))
+        let spaced = try project.spacingClips(duration: time(3), cadence: title.cadence, background: "#000000")
+        var updated = first
+        updated.duration = time(3)
+        XCTAssertTrue(spaced.hasInteriorSpacingGaps)
+        XCTAssertEqual(spaced.stillInserts, [head, updated, tail])
+        let joined = try spaced.spacingClips(duration: .zero, cadence: title.cadence, background: "#000000")
+        XCTAssertFalse(joined.hasInteriorSpacingGaps)
+        XCTAssertEqual(joined.stillInserts, [head, tail])
+        XCTAssertEqual(joined.stillAssets, [primary, unused])
+        XCTAssertEqual(joined.sequenceClips, [clip, right])
+    }
+
+    func testRemovingTheLastGeneratedGapRestoresAnOrdinarySequence() throws {
+        let right = CutSequenceClip(id: "right", file: clip.file, from: time(32), to: time(36))
+        let original = CutProject.sequence([clip, right])
+        let spaced = try original.spacingClips(duration: time(2), cadence: title.cadence, background: "#000000")
+        XCTAssertEqual(try spaced.spacingClips(duration: .zero, cadence: title.cadence, background: "#000000"),
+                       original)
+        let insert = try XCTUnwrap(spaced.stillInserts.first)
+        XCTAssertEqual(try spaced.removingStill(id: insert.id), original)
+        let moved = try spaced.movingStill(id: insert.id, to: .zero)
+        XCTAssertEqual(moved.stillInserts, [insert])
+        XCTAssertEqual(moved.stillAssets, spaced.stillAssets)
+        XCTAssertEqual(try moved.resolveStills().spans.first?.placementID, insert.id)
+    }
+
+    func testSourceSpacingUsesMulticamGroupTimeAndPreservesExteriorGaps() throws {
+        let group = MulticamProject(referenceAngle: "a", range: range(0, 30),
+                                    angles: [.init(id: "a", file: "a.mov"), .init(id: "b", file: "b.mov")],
+                                    audio: .fixed(.init(source: "a", stream: 1)),
+                                    switches: [.init(at: .zero, angle: "a"), .init(at: time(11), angle: "b")],
+                                    assembly: [range(8, 10), range(12, 16)])
+        let gap = StillAsset(gapID: "gap")
+        let head = StillInsert(id: "head", assetID: gap.id, duration: time(1), cadence: title.cadence)
+        let tail = StillInsert(id: "tail", assetID: gap.id, duration: time(1), cadence: title.cadence)
+        let project = try CutProject.multicam(group).addingStillAsset(gap)
+            .insertingStill(head, at: .zero).insertingStill(tail, at: time(7))
+        XCTAssertFalse(project.hasInteriorSpacingGaps)
+        let result = try project.spacingClipsUsingSourceTiming(cadence: title.cadence, background: "#000000")
+        XCTAssertTrue(result.hasInteriorSpacingGaps)
+        XCTAssertEqual(result.stillInserts.map(\.duration), [time(1), time(2), time(1)])
+        XCTAssertEqual(result.stillInserts.first, head)
+        XCTAssertEqual(result.stillInserts.last, tail)
+        XCTAssertEqual(try result.resolveStills().spans.filter { $0.placementID == nil }.map(\.output),
+                       [range(1, 3), range(5, 9)])
+    }
+
+    func testSourceSpacingRejectsJoinsWithoutAnUnambiguousSharedClock() throws {
+        let left = CutSequenceClip(id: "left", file: clip.file, from: time(10), to: time(30))
+        let sameFileOverlap = CutSequenceClip(id: "overlap", file: clip.file, from: time(29), to: time(31))
+        let sameFileReverse = CutSequenceClip(id: "reverse", file: clip.file, from: time(3), to: time(5))
+        let otherFile = CutSequenceClip(id: "other", file: "other.mov", from: time(32), to: time(34))
+        let photo = try CutProject.sequence([clip]).addingStillAsset(asset).insertingStill(title, at: clip.to)
+        for project in [CutProject.sequence([left, sameFileOverlap]), .sequence([left, sameFileReverse]),
+                        .sequence([left, otherFile]), photo] {
+            XCTAssertThrowsError(try project.spacingClipsUsingSourceTiming(cadence: title.cadence, background: "#000000")) {
+                XCTAssertEqual(($0 as? CutError)?.code, "invalid_still_project")
+            }
+        }
+    }
+
     func testHeadTitleShiftsPictureReplacementAndPreservesUnderlyingCoordinates() throws {
         let project = try CutProject.sequence([clip]).addingStillAsset(asset)
             .replacingPicture(id: "replace", assetID: asset.id, from: time(8), to: time(12))
@@ -43,6 +187,25 @@ final class StillProjectTests: XCTestCase {
         let restored = try hidden.trimmingSequenceClip(id: "right", from: time(5), to: time(10))
         XCTAssertEqual(try restored.resolveStills().spans.filter { $0.placementID == "replace" }.map(\.output),
                        [range(0, 1), range(1, 5)])
+    }
+
+    func testBatchPauseRemovalPreservesSequenceEditsAndReplacementCoverage() throws {
+        let project = try CutProject.sequence([clip]).addingStillAsset(asset)
+            .addingStillReplacement(.init(id: "replace", assetID: asset.id,
+                                          coverage: .sequence([.init(clipID: clip.id, range: range(1, 29))])))
+            .insertingStill(title, at: time(30))
+        let edited = try project.removingSequencePauses([
+            clip.id: [.init(from: .zero, to: time(2)), .init(from: time(8), to: time(12)),
+                      .init(from: time(20), to: time(30))]
+        ], checkCancellation: {})
+        let pieces = try XCTUnwrap(edited.sequenceClips)
+        XCTAssertEqual(pieces.map { MulticamRange(from: $0.from, to: $0.to) }, [range(2, 8), range(12, 20)])
+        XCTAssertFalse(pieces.contains { $0.id == clip.id })
+        XCTAssertEqual(edited.stillReplacements.first?.coverage, .sequence([
+            .init(clipID: pieces[0].id, range: range(2, 12)),
+            .init(clipID: pieces[1].id, range: range(12, 29))
+        ]))
+        XCTAssertEqual(edited.stillInserts, [title])
     }
 
     func testInsertSplitsVisibleReplacementAndMovesInPreEditTime() throws {
@@ -95,7 +258,7 @@ final class StillProjectTests: XCTestCase {
         XCTAssertThrowsError(try project.settingStillFormat(nil))
     }
 
-    func testRedoOnlyStillUsesV2AndProtectsAssetAcrossHistory() throws {
+    func testRedoOnlyStillUsesCurrentSchemaAndProtectsAssetAcrossHistory() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -109,7 +272,7 @@ final class StillProjectTests: XCTestCase {
         try current.save(to: url, undo: [], redo: history)
         let bytes = try Data(contentsOf: url)
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
-        XCTAssertEqual(root["schemaVersion"] as? Int, 2)
+        XCTAssertEqual(root["schema_version"] as? Int, 4)
         let reopened = try CutProject.decodeDocument(bytes, limit: 10)
         XCTAssertEqual(reopened.project, current)
         XCTAssertEqual(reopened.redo, history)
@@ -121,11 +284,11 @@ final class StillProjectTests: XCTestCase {
         let savedMedia = try CutProjectMedia.load(from: url)
         XCTAssertThrowsError(try savedMedia.validateDestination(symlink, relativeTo: url))
         try current.save(to: url, undo: [], redo: [])
-        let legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
-        XCTAssertEqual(legacy["schemaVersion"] as? Int, 1)
+        let withoutHistory = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        XCTAssertEqual(withoutHistory["schema_version"] as? Int, 4)
     }
 
-    func testMixedVersionMulticamHistoryRetainsRepeatedRangeIdentityAndRelink() throws {
+    func testMixedMediaMulticamHistoryRetainsRepeatedRangeIdentityAndRelink() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: folder) }

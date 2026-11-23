@@ -6,6 +6,7 @@
 #include <CoreVideo/CoreVideo.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/buffer.h>
 #include <libavutil/cpu.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
@@ -55,6 +56,13 @@ typedef struct {
     size_t width, height;
     size_t luma_x[W], chroma_x[W], sample_y[H];
     MPSceneVisit visit;
+    MPParticipantFrameVisit picture;
+    struct SwsContext *rgb_scale;
+    AVFrame *rgb_frame;
+    int rgb_source_width, rgb_source_height, rgb_source_format;
+    enum AVColorSpace rgb_source_space;
+    enum AVColorRange rgb_source_range;
+    int64_t pictures;
     MPProbeCancelled cancelled;
     void *context;
     const MPSceneScanOptions *options;
@@ -295,9 +303,95 @@ static int reconcile(Scan *scan, const ScenePicture *picture, const uint8_t dige
     return scan->saved.finished ? SCAN_RANGE_END : 0;
 }
 
+static int rgb_matrix(enum AVColorSpace space)
+{
+    switch (space) {
+        case AVCOL_SPC_BT709: return SWS_CS_ITU709;
+        case AVCOL_SPC_FCC: return SWS_CS_FCC;
+        case AVCOL_SPC_BT470BG:
+        case AVCOL_SPC_SMPTE170M: return SWS_CS_ITU601;
+        case AVCOL_SPC_SMPTE240M: return SWS_CS_SMPTE240M;
+        case AVCOL_SPC_BT2020_NCL:
+        case AVCOL_SPC_BT2020_CL: return SWS_CS_BT2020;
+        default: return SWS_CS_DEFAULT;
+    }
+}
+
+static int visit_picture(Scan *scan, const AVFrame *frame)
+{
+    const int64_t pts = frame->best_effort_timestamp;
+    const int64_t duration = frame->duration;
+    const AVRational sar = frame->sample_aspect_ratio;
+    const enum AVColorSpace color_space = frame->colorspace;
+    const enum AVColorRange color_range = frame->color_range;
+    scan->pictures++;
+    if (pts == AV_NOPTS_VALUE || frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT)) {
+        return scan->picture(scan->context, pts, duration, NULL, frame->width, frame->height,
+                             0, sar.num, sar.den) ? AVERROR_EXIT : 0;
+    }
+    AVFrame *mapped = NULL;
+    int ret = 0;
+    if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+        if (!(mapped = av_frame_alloc())) return AVERROR(ENOMEM);
+        ret = av_hwframe_map(mapped, frame, AV_HWFRAME_MAP_READ);
+        if (ret < 0) {
+            av_frame_unref(mapped);
+            if ((ret = av_hwframe_transfer_data(mapped, frame, 0)) < 0) goto done;
+        }
+        frame = mapped;
+    }
+    AVFrame *rgb = scan->rgb_frame;
+    if (rgb->width != frame->width || rgb->height != frame->height) {
+        av_frame_unref(rgb);
+        rgb->format = AV_PIX_FMT_RGB24;
+        rgb->width = frame->width;
+        rgb->height = frame->height;
+        if ((ret = av_frame_get_buffer(rgb, 32)) < 0) goto done;
+    }
+    if (!scan->rgb_scale || scan->rgb_source_width != frame->width ||
+        scan->rgb_source_height != frame->height || scan->rgb_source_format != frame->format ||
+        scan->rgb_source_space != color_space || scan->rgb_source_range != color_range) {
+        if (color_range == AVCOL_RANGE_UNSPECIFIED && scan->rgb_source_range != color_range) {
+            // Recover the format default if the preceding frame declared an override.
+            sws_freeContext(scan->rgb_scale);
+            scan->rgb_scale = NULL;
+        }
+        scan->rgb_scale = sws_getCachedContext(scan->rgb_scale, frame->width, frame->height, frame->format,
+                                               rgb->width, rgb->height, rgb->format, SWS_BILINEAR,
+                                               NULL, NULL, NULL);
+        if (!scan->rgb_scale) { ret = AVERROR(ENOMEM); goto done; }
+        int *input, *output, in_range, out_range, brightness, contrast, saturation;
+        if (sws_getColorspaceDetails(scan->rgb_scale, &input, &in_range, &output, &out_range,
+                                     &brightness, &contrast, &saturation) >= 0) {
+            if (color_range != AVCOL_RANGE_UNSPECIFIED) in_range = color_range == AVCOL_RANGE_JPEG;
+            const int *matrix = sws_getCoefficients(rgb_matrix(color_space));
+            ret = sws_setColorspaceDetails(scan->rgb_scale, matrix, in_range, matrix, 1,
+                                           brightness, contrast, saturation);
+            if (ret < 0) goto done;
+        }
+        scan->rgb_source_width = frame->width;
+        scan->rgb_source_height = frame->height;
+        scan->rgb_source_format = frame->format;
+        scan->rgb_source_space = color_space;
+        scan->rgb_source_range = color_range;
+    }
+    ret = sws_scale(scan->rgb_scale, (const uint8_t *const *)frame->data, frame->linesize,
+                    0, frame->height, rgb->data, rgb->linesize);
+    if (ret != rgb->height) { ret = AVERROR_INVALIDDATA; goto done; }
+    ret = scan->picture(scan->context, pts, duration, rgb->data[0], rgb->width, rgb->height,
+                        rgb->linesize[0], sar.num, sar.den) ? AVERROR_EXIT : 0;
+done:
+    av_frame_free(&mapped);
+    return ret;
+}
+
 static int consume(Scan *scan, AVFrame *frame)
 {
     if (scan->cancelled(scan->context)) return AVERROR_EXIT;
+    if (scan->picture) {
+        int ret = visit_picture(scan, frame);
+        if (ret < 0 || !scan->visit) return ret;
+    }
     // A picture without a timestamp cannot start a scene. Compare its neighbors instead.
     if (frame->best_effort_timestamp == AV_NOPTS_VALUE) return 0;
     const bool damaged = frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT);
@@ -492,25 +586,29 @@ static int scan_video(const char *path, int index, int allow_asset_reader,
                       MPProbeCancelled cancelled, MPSceneVisit visit, void *context,
                       MPSceneTiming *timing, const MPSceneScanOptions *options,
                       MPSceneCheckpointVisit progress, bool seek_range, bool software,
+                      MPParticipantFrameVisit picture, int *unplaced_damage,
                       char *error, size_t capacity)
 {
     AVFormatContext *format = avformat_alloc_context();
     AVCodecContext *codec = NULL;
+    AVBufferPool *packet_metadata = NULL;
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
     Scan scan = { .visit = visit, .cancelled = cancelled, .context = context,
-                  .options = options, .checkpoint = progress };
+                  .options = options, .checkpoint = progress, .picture = picture };
     int64_t first_pts = INT64_MAX, last_pts = INT64_MIN, packet_end = INT64_MIN;
     bool complete_clock = true;
     int hardware_failures = 0;
     int ret = AVERROR(ENOMEM);
     if (timing) *timing = (MPSceneTiming){0};
     if (!format || !packet || !frame) goto done;
+    if (picture && !(scan.rgb_frame = av_frame_alloc())) goto done;
     format->interrupt_callback = (AVIOInterruptCB){ cancelled, context };
     if ((ret = avformat_open_input(&format, path, NULL, NULL)) < 0 ||
         (ret = avformat_find_stream_info(format, NULL)) < 0) goto done;
     if (index < 0 || index >= format->nb_streams) { ret = AVERROR_STREAM_NOT_FOUND; goto done; }
     AVStream *stream = format->streams[index];
+    if (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) { ret = AVERROR_STREAM_NOT_FOUND; goto done; }
     if (allow_asset_reader && av_match_name("mov", format->iformat->name)) {
         int result = mp_scene_read_asset(path, stream, consume_surface, asset_cancelled, &scan);
         if (result < 0 || cancelled(context)) { ret = AVERROR_EXIT; goto done; }
@@ -578,8 +676,14 @@ static int scan_video(const char *path, int index, int allow_asset_reader,
             }
         }
         if (options && !eof && packet->pos >= 0) {
+            if (!packet_metadata && !(packet_metadata = av_buffer_pool_init(sizeof(identity), NULL))) {
+                ret = AVERROR(ENOMEM);
+                goto done;
+            }
             av_buffer_unref(&packet->opaque_ref);
-            packet->opaque_ref = av_buffer_alloc(sizeof(identity));
+            // The decoder can retain metadata across reordered pictures. The pool
+            // reuses a block after the last packet or frame reference releases it.
+            packet->opaque_ref = av_buffer_pool_get(packet_metadata);
             if (!packet->opaque_ref) { ret = AVERROR(ENOMEM); goto done; }
             memcpy(packet->opaque_ref->data, &identity, sizeof(identity));
         }
@@ -587,12 +691,19 @@ static int scan_video(const char *path, int index, int allow_asset_reader,
         av_packet_unref(packet);
         // One damaged packet must not discard the rest of the recording.
         // The scan still fails below when no picture decodes at all.
-        if (!eof && damaged_picture(codec, ret, &hardware_failures)) ret = 0;
+        if (!eof && damaged_picture(codec, ret, &hardware_failures)) {
+            if (unplaced_damage) *unplaced_damage = 1;
+            ret = 0;
+        }
         if (ret < 0) goto done;
         int failures = 0;
         for (;;) {
             ret = avcodec_receive_frame(codec, frame);
-            if (failures < 64 && damaged_picture(codec, ret, &hardware_failures)) { failures++; continue; }
+            if (failures < 64 && damaged_picture(codec, ret, &hardware_failures)) {
+                if (unplaced_damage) *unplaced_damage = 1;
+                failures++;
+                continue;
+            }
             if (ret < 0) break;
             failures = 0;
             hardware_failures = 0;
@@ -621,7 +732,7 @@ static int scan_video(const char *path, int index, int allow_asset_reader,
                                                      origin, last_pts, packet_end)
                 };
             }
-            ret = scan.count ? 0 : AVERROR_INVALIDDATA;
+            ret = scan.count || scan.pictures ? 0 : AVERROR_INVALIDDATA;
             goto done;
         }
     }
@@ -641,9 +752,12 @@ done:
     }
     if (ret < 0) av_strerror(ret, error, capacity);
     sws_freeContext(scan.scale);
+    sws_freeContext(scan.rgb_scale);
+    av_frame_free(&scan.rgb_frame);
     av_frame_free(&frame);
     av_packet_free(&packet);
     avcodec_free_context(&codec);
+    av_buffer_pool_uninit(&packet_metadata);
     avformat_close_input(&format);
     return ret;
 }
@@ -653,7 +767,7 @@ int mp_scene_scan(const char *path, int index, int allow_asset_reader,
                   void *context, MPSceneTiming *timing, char *error, size_t capacity)
 {
     return scan_video(path, index, allow_asset_reader, cancelled, visit, context, timing,
-                      NULL, NULL, false, false, error, capacity);
+                      NULL, NULL, false, false, NULL, NULL, error, capacity);
 }
 
 int mp_scene_scan_resumable(const char *path, int index, const MPSceneScanOptions *options,
@@ -666,12 +780,26 @@ int mp_scene_scan_resumable(const char *path, int index, const MPSceneScanOption
         return AVERROR(EINVAL);
     }
     int ret = scan_video(path, index, 0, cancelled, visit, context, NULL,
-                         options, progress, true, false, error, capacity);
+                         options, progress, true, false, NULL, NULL, error, capacity);
     if (ret == SCAN_RETRY_SOFTWARE)
         ret = scan_video(path, index, 0, cancelled, visit, context, NULL,
-                         options, progress, true, true, error, capacity);
+                         options, progress, true, true, NULL, NULL, error, capacity);
     if (ret == SCAN_RETRY_FROM_START)
         ret = scan_video(path, index, 0, cancelled, visit, context, NULL,
-                         options, progress, false, false, error, capacity);
+                         options, progress, false, false, NULL, NULL, error, capacity);
+    return ret == AVERROR_EXIT ? MP_SCENE_SCAN_CANCELLED : ret;
+}
+
+int mp_participant_scan(const char *path, int stream, MPProbeCancelled cancelled,
+                        MPParticipantFrameVisit frame, MPSceneVisit scene, void *context,
+                        int *unplaced_damage, char *error, size_t capacity)
+{
+    if (!path || !cancelled || !frame) {
+        av_strerror(AVERROR(EINVAL), error, capacity);
+        return AVERROR(EINVAL);
+    }
+    if (unplaced_damage) *unplaced_damage = 0;
+    int ret = scan_video(path, stream, 0, cancelled, scene, context, NULL,
+                         NULL, NULL, false, false, frame, unplaced_damage, error, capacity);
     return ret == AVERROR_EXIT ? MP_SCENE_SCAN_CANCELLED : ret;
 }

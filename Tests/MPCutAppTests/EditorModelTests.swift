@@ -43,7 +43,9 @@ final class EditorModelTests: XCTestCase {
             let frames: [Frame]
         }
         let data = try Data(contentsOf: output.appendingPathComponent("manifest.json"))
-        let manifest = try JSONDecoder().decode(Manifest.self, from: data)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let manifest = try decoder.decode(Manifest.self, from: data)
         XCTAssertEqual(manifest.frames.map(\.frameTime), [frame(5)])
         let image = try XCTUnwrap(manifest.frames.first)
         XCTAssertNotNil(NSImage(contentsOf: output.appendingPathComponent(image.file)))
@@ -368,7 +370,7 @@ final class EditorModelTests: XCTestCase {
         let model = EditorModel()
         defer { model.endSession() }
         model.minimumPause = 0.1
-        model.leavePause = 0.2
+        model.padding = 0.1
         model.importFiles([file])
         try await waitForEdit(model)
         model.manualThresholdDB = 0
@@ -403,7 +405,7 @@ final class EditorModelTests: XCTestCase {
         let model = EditorModel()
         defer { model.endSession() }
         model.minimumPause = 0.1
-        model.leavePause = 0
+        model.padding = 0
         model.importFiles([file])
         try await waitForEdit(model)
         model.manualThresholdDB = 0
@@ -429,7 +431,7 @@ final class EditorModelTests: XCTestCase {
         let model = EditorModel()
         defer { model.endSession() }
         model.minimumPause = 0.1
-        model.leavePause = 0
+        model.padding = 0
         model.importFiles([file, file])
         try await waitForEdit(model)
         model.manualThresholdDB = 0
@@ -764,7 +766,7 @@ final class EditorModelTests: XCTestCase {
         model.importFiles([file])
         try await waitForEdit(model)
         let id = try XCTUnwrap(model.selectedID)
-        model.leavePause = 1.0
+        model.padding = 0.5
         model.snapTarget = .silence
         func waitForSilence() async throws {
             let deadline = ContinuousClock.now + .seconds(5)
@@ -1179,7 +1181,7 @@ final class EditorModelTests: XCTestCase {
         let suite = "MPCut.SnapAudit.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        defaults.set("scenes", forKey: "timelineSnapTarget")
+        defaults.set("scenes", forKey: "timeline_snap_target")
         let model = EditorModel(defaults: defaults)
         defer { model.endSession() }
         model.useAnalysisSidecars = false

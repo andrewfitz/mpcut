@@ -15,6 +15,7 @@ public struct AudioSpan: Codable, Equatable, Hashable, Sendable {
 /// Source-relative peaks in 20 ms bins. Pages let the UI share completed blocks
 /// while the decoder continues, and reduce the cost of zoomed-out drawing.
 public struct AudioWaveform: Sendable {
+    public static let defaultMaxBlip = 0.06
     public static let rate = Int(MP_PEAK_RATE)
     fileprivate static let pageSize = 256
     fileprivate struct Page: Sendable {
@@ -85,6 +86,8 @@ public struct AudioWaveform: Sendable {
         count = bins
         finish(for: media, stream: stream)
     }
+
+    var syncPeaks: [Float] { pages.flatMap(\.samples) }
 
     public func peak(from: Double, to: Double) -> Float? {
         guard from.isFinite, to.isFinite, to > from else { return nil }
@@ -173,10 +176,10 @@ public struct AudioWaveform: Sendable {
         return Double(min(foreground - 5, room + min(9, upperRoom - room + 3)))
     }
 
-    public func pauses(thresholdDB: Double, minimum: Double,
+    public func pauses(thresholdDB: Double, minimum: Double, maxBlip: Double = Self.defaultMaxBlip,
                        checkingCancellation: () throws -> Void = {}) rethrows -> [AudioSpan] {
         try silenceRuns(thresholdDB: thresholdDB, checkingCancellation: checkingCancellation)
-            .pauses(minimum: minimum)
+            .pauses(minimum: minimum, maxBlip: maxBlip)
     }
 
     func silenceRuns(thresholdDB: Double, checkingCancellation: () throws -> Void) rethrows -> SilenceRuns {
@@ -226,10 +229,8 @@ struct SilenceRuns: Codable, Sendable {
     let quiet: [AudioSpan]
     let covered: [AudioSpan]
 
-    func pauses(minimum: Double) -> [AudioSpan] {
-        // Only a measured blip of at most 60 ms with 160 ms of uninterrupted
-        // quiet on each side can join two pauses.
-        let maxBlip = RationalTime(numerator: 3, denominator: Int64(AudioWaveform.rate))
+    func pauses(minimum: Double, maxBlip: Double = AudioWaveform.defaultMaxBlip) -> [AudioSpan] {
+        // Require uninterrupted quiet on both sides of each measured blip.
         let quietContext = RationalTime(numerator: 8, denominator: Int64(AudioWaveform.rate))
         var result: [AudioSpan] = []
         var first: RationalTime?
@@ -249,7 +250,7 @@ struct SilenceRuns: Codable, Sendable {
                 }
                 let joins = coverageIndex < covered.count && covered[coverageIndex].from <= last.to
                     && covered[coverageIndex].to >= run.from
-                    && (try? run.from.subtracting(last.to)).map { $0 <= maxBlip } == true
+                    && (try? run.from.subtracting(last.to)).map { $0.seconds <= maxBlip } == true
                     && (try? last.to.subtracting(last.from)).map { $0 >= quietContext } == true
                     && (try? run.to.subtracting(run.from)).map { $0 >= quietContext } == true
                 if !joins {
@@ -361,7 +362,7 @@ private let collectPeak: MPPeakVisit = { context, bin, peak in
 /// decoder preroll hidden inside an empty edit. Only presented PCM reaches the
 /// same peak reducer used for ordinary audio streams.
 func visitPresentedAudio(_ audio: AudioIndex, media: MediaInfo, window: Range<Double>?,
-                         cancelled: () -> Bool, samples: (UnsafePointer<Float>, Int32, Int32, Int32, Double) throws -> Void,
+                         duration: RationalTime? = nil, cancelled: () -> Bool, samples: (UnsafePointer<Float>, Int32, Int32, Int32, Double) throws -> Void,
                          silence: (Double, Double) throws -> Void) throws {
     let stream = audio.stream
     func failure(_ reason: String) -> CutError {
@@ -370,9 +371,13 @@ func visitPresentedAudio(_ audio: AudioIndex, media: MediaInfo, window: Range<Do
     func checkCancellation() throws {
         if cancelled() { throw CutError(code: "cancelled", message: "Audio analysis was cancelled.") }
     }
-    let clock = CMTimeScale(stream.sampleRate)
+    guard let clock = CMTimeScale(exactly: stream.sampleRate), clock > 0,
+          let channels = Int32(exactly: stream.channels), channels > 0 else {
+        throw failure("The AAC track has an invalid sample rate or channel count.")
+    }
+    let duration = duration ?? media.duration
     var first = try media.origin.roundedToSamples(stream.sampleRate)
-    var last = try media.origin.adding(media.duration).roundedToSamples(stream.sampleRate)
+    var last = try media.origin.adding(duration).roundedToSamples(stream.sampleRate)
     if let window {
         // Include the sample under the first pixel, even at sub-sample zoom.
         func clampedSample(_ second: Double, rounding: FloatingPointRoundingRule) -> Int64 {
@@ -383,8 +388,8 @@ func visitPresentedAudio(_ audio: AudioIndex, media: MediaInfo, window: Range<Do
         }
         first = clampedSample(window.lowerBound, rounding: .down)
         last = clampedSample(window.upperBound, rounding: .up)
-        guard first < last else { return }
     }
+    guard first < last else { return }
     let picture = first..<last
     let edits = audio.presentationEdits.filter { $0.samples.overlaps(picture) }
     guard !edits.isEmpty else { return }
@@ -415,7 +420,7 @@ func visitPresentedAudio(_ audio: AudioIndex, media: MediaInfo, window: Range<Do
             try checkCancellation()
             try autoreleasepool {
                 let time = CMSampleBufferGetPresentationTimeStamp(sample).seconds - media.origin.seconds
-                guard let description = CMSampleBufferGetFormatDescription(sample),
+                guard time.isFinite, let description = CMSampleBufferGetFormatDescription(sample),
                       let format = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee,
                       format.mSampleRate == Double(clock), format.mChannelsPerFrame == stream.channels,
                       format.mBytesPerFrame == MemoryLayout<Float>.size * stream.channels,
@@ -428,7 +433,7 @@ func visitPresentedAudio(_ audio: AudioIndex, media: MediaInfo, window: Range<Do
                           Int(list[0].mDataByteSize) >= Int(frames) * Int(format.mBytesPerFrame) else {
                         throw failure("Could not read the presented PCM samples.")
                     }
-                    try samples(data.assumingMemoryBound(to: Float.self), frames, Int32(stream.channels), clock, time)
+                    try samples(data.assumingMemoryBound(to: Float.self), frames, channels, clock, time)
                 }
             }
         }
@@ -438,7 +443,7 @@ func visitPresentedAudio(_ audio: AudioIndex, media: MediaInfo, window: Range<Do
     // Only declared silence is filled. Time outside these edits stays unknown.
     for edit in edits where !edit.isAudible {
         let from = max(0, Double(edit.samples.lowerBound) / Double(clock) - media.origin.seconds)
-        let to = min(media.duration.seconds, Double(edit.samples.upperBound) / Double(clock) - media.origin.seconds)
+        let to = min(duration.seconds, Double(edit.samples.upperBound) / Double(clock) - media.origin.seconds)
         guard from < to else { continue }
         try checkCancellation()
         try silence(from, to)
@@ -511,7 +516,7 @@ public enum AudioAnalysis {
 
     /// Round both edges into the removable interior, protecting the requested
     /// padding even when the caller supplies sparse lossless-copy boundaries.
-    public static func removal(in pause: AudioSpan, leave: Double, ends: [RationalTime],
+    public static func removal(in pause: AudioSpan, padding: Double, ends: [RationalTime],
                                starts: [RationalTime], clip: AudioSpan? = nil) -> AudioSpan? {
         func partition(_ times: [RationalTime], _ predicate: (Double) -> Bool) -> Int {
             var low = 0, high = times.count
@@ -522,23 +527,30 @@ public enum AudioAnalysis {
             return low
         }
         let from: RationalTime, to: RationalTime
-        if leave == 0 && pause.from == clip?.from {
+        if padding == 0 && pause.from == clip?.from {
             // Removing a leading pause creates no retained segment on its left.
             from = pause.from
         } else {
-            let left = partition(ends) { $0 >= pause.from.seconds + leave / 2 - 1e-10 }
+            let left = partition(ends) { $0 >= pause.from.seconds + padding - 1e-10 }
             guard left < ends.count else { return nil }
             from = ends[left]
         }
-        if leave == 0 && pause.to == clip?.to {
+        if padding == 0 && pause.to == clip?.to {
             to = pause.to
         } else {
-            let right = partition(starts) { $0 > pause.to.seconds - leave / 2 + 1e-10 } - 1
+            let right = partition(starts) { $0 > pause.to.seconds - padding + 1e-10 } - 1
             guard right >= 0 else { return nil }
             to = starts[right]
         }
         guard from < to else { return nil }
         return AudioSpan(from: from, to: to)
+    }
+
+    /// The shaded portion of a proposed pause, after cut points have been aligned.
+    package static func paddingSpans(in pause: AudioSpan, removal: AudioSpan?, padding: Double) -> [AudioSpan] {
+        if let removal { return retained(in: pause, removing: [removal]) }
+        let halfDuration = (pause.to.seconds - pause.from.seconds) / 2
+        return padding >= halfDuration ? [pause] : []
     }
 
     public static func retained(in span: AudioSpan, removing cuts: [AudioSpan]) -> [AudioSpan] {

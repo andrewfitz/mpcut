@@ -98,7 +98,7 @@ int mpcut_splice_check_copy(const AVPacket *packet, const AVCodecParameters *cod
         (codec->codec_id != AV_CODEC_ID_H264 || codec->codec_tag != MKTAG('a','v','c','3')))
         return 0;
     int offset = hevc ? 21 : 4;
-    if (extra_size <= offset || extra[0] != 1)
+    if (!extra || extra_size <= offset || extra[0] != 1)
         return AVERROR_INVALIDDATA;
     int width = (extra[offset] & 3) + 1;
     int pos = 0;
@@ -108,45 +108,12 @@ int mpcut_splice_check_copy(const AVPacket *packet, const AVCodecParameters *cod
         unsigned size = 0;
         for (int i = 0; i < width; i++)
             size = size << 8 | packet->data[pos++];
-        if (!size || size > (unsigned)(packet->size - pos))
+        if (size < (hevc ? 2U : 1U) || size > (unsigned)(packet->size - pos))
             return AVERROR_INVALIDDATA;
         int type = hevc ? packet->data[pos] >> 1 & 63 : packet->data[pos] & 31;
         if (hevc ? (type >= 32 && type <= 34) : (type == 7 || type == 8 || type == 13))
             return AVERROR(ENOTSUP);
         pos += (int)size;
-    }
-    return 0;
-}
-
-/* HDR10+ uses registered ITU-T T.35 SEI with the ST 2094-40 identifier.
- * Its identifier cannot contain an emulation-prevention insertion. */
-int mpcut_splice_check_still_hdr(const AVPacket *packet, const uint8_t *extra, int extra_size)
-{
-    if (extra_size < 22 || extra[0] != 1)
-        return AVERROR_INVALIDDATA;
-    const int width = (extra[21] & 3) + 1;
-    unsigned position = 0;
-    const unsigned end = packet->size;
-    while (position < end) {
-        if (end - position < width)
-            return AVERROR_INVALIDDATA;
-        unsigned size = 0;
-        for (int i = 0; i < width; i++)
-            size = size << 8 | packet->data[position++];
-        if (size < 2 || size > end - position)
-            return AVERROR_INVALIDDATA;
-        const uint8_t *nal = packet->data + position;
-        const unsigned type = (nal[0] >> 1) & 63;
-        if (type == 62 || type == 63 || ((nal[0] & 1) << 5 | nal[1] >> 3))
-            return AVERROR(ENOTSUP);
-        if (type == 39 || type == 40) {
-            static const uint8_t hdr10plus[] = {0xb5, 0, 0x3c, 0, 1, 4};
-            for (unsigned i = 2; i + sizeof(hdr10plus) <= size; i++) {
-                if (!memcmp(nal + i, hdr10plus, sizeof(hdr10plus)))
-                    return AVERROR(ENOTSUP);
-            }
-        }
-        position += size;
     }
     return 0;
 }
@@ -159,6 +126,8 @@ int mpcut_splice_restore(AVPacket *packet, const AVCodecParameters *codec,
     if (codec->codec_id == AV_CODEC_ID_AV1) {
         if (av1_sequence(packet->data, packet->size))
             return 0;
+        if (!extra)
+            return AVERROR_INVALIDDATA;
         int offset = extra_size >= 4 && extra[0] == 0x81 ? 4 : 0;
         if (extra_size <= offset ||
             !av1_sequence(extra + offset, extra_size - offset))
@@ -168,7 +137,7 @@ int mpcut_splice_restore(AVPacket *packet, const AVCodecParameters *codec,
     /* The original packets are still length-prefixed. Re-select the original
      * sample description so seeking into either run finds the right decoder
      * configuration, without changing any bytes in the copied pictures. */
-    if (extra_size <= 0 || extra[0] != 1)
+    if (!extra || extra_size <= 0 || extra[0] != 1)
         return AVERROR_INVALIDDATA;
     uint8_t *config = av_packet_new_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, extra_size);
     if (!config)

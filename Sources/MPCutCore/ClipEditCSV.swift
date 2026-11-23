@@ -14,38 +14,42 @@ public enum ClipEditCSV {
         return try ranges(in: text, clip: clip, rangesOnly: rangesOnly, cancelled: cancelled)
     }
 
-    package static func readListData(_ url: URL, kind: String, cancelled: () -> Bool = { false }) throws -> Data {
-        try checkCancellation(cancelled)
-        let expectedFile = CutError(code: "\(kind.lowercased())_read_failed", message: "Expected a regular \(kind) file at \(url.path).")
-        guard url.isFileURL else { throw expectedFile }
+    package static func readListData(_ url: URL, kind: String, maximumBytes: Int = MulticamProject.maximumFileSize,
+                                     cancelled: () -> Bool = { false }) throws -> Data {
+        try checkCancellation(cancelled, kind: kind)
+        // A two-word kind such as "Transcript plan" still yields one error-code token.
+        let code = kind.lowercased().replacingOccurrences(of: " ", with: "_")
+        let expectedFile = CutError(code: "\(code)_read_failed", message: "Expected a regular \(kind) file at \(url.path).")
+        guard url.isFileURL, url.host.map({ $0.isEmpty || $0.lowercased() == "localhost" }) ?? true,
+              url.query == nil, url.fragment == nil, !url.path.contains("\0") else { throw expectedFile }
         let fd = open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else {
-            throw CutError(code: "\(kind.lowercased())_read_failed", message: "Couldn’t open \(url.path): \(String(cString: strerror(errno)))")
+            throw CutError(code: "\(code)_read_failed", message: "Couldn’t open \(url.path): \(String(cString: strerror(errno)))")
         }
         let reader = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         defer { try? reader.close() }
         var info = stat()
         guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw expectedFile }
-        let limit = MulticamProject.maximumFileSize
-        let tooLarge = CutError(code: "invalid_\(kind.lowercased())", message: "The \(kind) exceeds the 64 MB file limit.")
-        guard info.st_size <= limit else { throw tooLarge }
+        let tooLarge = CutError(code: "invalid_\(code)",
+                               message: "The \(kind) exceeds the \(maximumBytes / (1024 * 1024)) MB file limit.")
+        guard info.st_size <= maximumBytes else { throw tooLarge }
         var data = Data()
-        while data.count <= limit {
-            try checkCancellation(cancelled)
-            let length = min(1 << 20, limit + 1 - data.count)
+        while data.count <= maximumBytes {
+            try checkCancellation(cancelled, kind: kind)
+            let length = min(1 << 20, maximumBytes + 1 - data.count)
             do {
                 guard let block = try reader.read(upToCount: length), !block.isEmpty else { break }
                 data.append(block)
             } catch {
-                throw CutError(code: "\(kind.lowercased())_read_failed", message: "Couldn’t read \(url.path): \(error.localizedDescription)")
+                throw CutError(code: "\(code)_read_failed", message: "Couldn’t read \(url.path): \(error.localizedDescription)")
             }
         }
-        guard data.count <= limit else { throw tooLarge }
+        guard data.count <= maximumBytes else { throw tooLarge }
         return data
     }
 
-    private static func checkCancellation(_ cancelled: () -> Bool) throws {
-        if cancelled() { throw CutError(code: "cancelled", message: "CSV import was cancelled.") }
+    private static func checkCancellation(_ cancelled: () -> Bool, kind: String = "CSV") throws {
+        if cancelled() { throw CutError(code: "cancelled", message: "\(kind) import was cancelled.") }
     }
 
     private static func lineError(_ line: Int, _ message: String) -> CutError {
@@ -121,7 +125,7 @@ public enum ClipEditCSV {
 
     package static func ranges(intervals: [AudioSpan], clip: AudioSpan, cancelled: () -> Bool) throws -> [AudioSpan] {
         var timeline = try Timeline(clip: clip)
-        timeline.ranges.reserveCapacity(intervals.count)
+        timeline.ranges.reserveCapacity(min(intervals.count, maximumPieces))
         for (offset, interval) in intervals.enumerated() {
             try checkCancellation(cancelled)
             let line = offset + 1

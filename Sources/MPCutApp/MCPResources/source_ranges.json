@@ -1,0 +1,229 @@
+[
+  {
+    "name": "source_selects_list",
+    "description": "List the sequence project’s named source intervals, including recordings absent from its timeline.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque live document handle from project_windows_list."
+        }
+      },
+      "required": [
+        "project_handle"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "source_select_save",
+    "description": "Save or update a named source interval by ID with native undo history.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque live document handle from project_windows_list."
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Revision observed before preparing the edit."
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique mutation ID. Reuse only for an identical retry."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "range": {
+          "type": "object",
+          "properties": {
+            "file": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^/",
+              "description": "Absolute source media file path."
+            },
+            "from": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Exact time in seconds as a decimal, timecode or fraction."
+            },
+            "to": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Exact time in seconds as a decimal, timecode or fraction."
+            }
+          },
+          "required": [
+            "file",
+            "from",
+            "to"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "id",
+        "name",
+        "range"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "source_select_remove",
+    "description": "Remove a named source interval by ID with native undo history.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque live document handle from project_windows_list."
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Revision observed before preparing the edit."
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique mutation ID. Reuse only for an identical retry."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false
+    }
+  },
+  {
+    "name": "sequence_source_ranges_apply",
+    "description": "Insert an ordered list of source intervals into a sequence when from equals to, or replace the specified sequence interval when from is less than to. Repeated ranges create independent occurrences. The whole plan commits as one undo step.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque live document handle from project_windows_list."
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Revision observed before preparing the edit."
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Unique mutation ID. Reuse only for an identical retry."
+        },
+        "from": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Destination start on the sequence clock."
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Destination end on the sequence clock."
+        },
+        "ranges": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^/",
+                    "description": "Absolute source media file path."
+                  },
+                  "from": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Exact time in seconds as a decimal, timecode or fraction."
+                  },
+                  "to": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Exact time in seconds as a decimal, timecode or fraction."
+                  }
+                },
+                "required": [
+                  "file",
+                  "from",
+                  "to"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "select_id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "select_id"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "from",
+        "to",
+        "ranges"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false
+    }
+  }
+]

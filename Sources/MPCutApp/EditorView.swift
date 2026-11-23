@@ -6,17 +6,34 @@ struct EditorView: View {
     @ObservedObject var multicam: MulticamEditorModel
     @ObservedObject var presentation: EditorPresentation
     let addMulticam: () -> Void
+    @Environment(\.transcriptSession) private var transcriptSession
     @Environment(\.openDroppedProjects) private var openDroppedProjects
+    @State private var sourceRangesPresented = false
 
     var body: some View {
         EditorWorkspace(viewer: viewer, transport: transport, timeline: timeline, status: status,
                         showsTimeline: !editor.isEmpty || editor.hasHistory,
-                        showsStatus: !editor.isEmpty || editor.isBusy || editor.lastExportedURL != nil)
+                        showsStatus: !editor.isEmpty || editor.isBusy || editor.lastExportedURL != nil,
+                        showsSidebar: (presentation.sequenceTranscriptVisible || presentation.sequenceParticipantsVisible) &&
+                            transcriptSession != nil) {
+            if let transcriptSession {
+                if presentation.sequenceParticipantsVisible {
+                    ParticipantInspector(session: transcriptSession)
+                } else {
+                    TranscriptPane(session: transcriptSession).equatable()
+                }
+            }
+        }
         .background(EditorKeyboardMonitor(handle: handleKey))
-        .navigationTitle(windowTitle)
+        .navigationTitle(editor.windowTitle)
         .navigationSubtitle(editor.formatSummary ?? "")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                EditorToolbarButton(title: "Source Ranges", symbol: "list.bullet.rectangle",
+                                    toolTip: "Save selects or apply an ordered source range plan") {
+                    sourceRangesPresented = true
+                }
+                .disabled(editor.isBusy)
                 if !editor.isEmpty || !editor.queuedRanges.isEmpty {
                     ExportQueueToolbarButton(count: editor.queuedRanges.count, action: editor.showBulkQueue)
                         .disabled(!editor.canShowBulkQueue)
@@ -24,8 +41,18 @@ struct EditorView: View {
                 StillAuthoringControls(rows: editor.stillPlacementRows, enabled: !editor.isBusy,
                                        canReplace: editor.canReplacePicture, canInsert: editor.canInsertStill,
                                        replace: editor.chooseReplacePicture, insert: editor.chooseInsertStill,
-                                       manage: editor.manageStill)
+                                       insertGap: editor.chooseInsertGap, spaceClips: editor.chooseSpaceClips, canSpace: editor.canSpaceClips, manage: editor.manageStill)
                 if !editor.isEmpty {
+                    EditorToolbarButton(title: "Transcript", symbol: "text.alignleft",
+                                        toolTip: "Show or hide the transcript (⌥⌘T)") {
+                        presentation.setTranscriptVisible(!presentation.sequenceTranscriptVisible, multicam: false)
+                    }
+                    EditorToolbarButton(title: "Participants", symbol: "person.2",
+                                        toolTip: "Review and edit recording participants") {
+                        presentation.sequenceParticipantsVisible.toggle()
+                        if presentation.sequenceParticipantsVisible { presentation.sequenceTranscriptVisible = false }
+                    }
+                    .disabled(editor.isAudioOnly)
                     SequencePreviewSoundControls(preview: editor.preview)
                     EditorToolbarButton(title: "Add Clips", symbol: "plus", toolTip: "Add clips (⌘O)",
                                         action: editor.chooseFiles)
@@ -42,17 +69,13 @@ struct EditorView: View {
         .sheet(item: $editor.cutPreview) { _ in
             CutPreviewSheet(editor: editor)
         }
+        .sheet(isPresented: $sourceRangesPresented) {
+            SourceRangesSheet(editor: editor)
+        }
         .toolbarRole(.editor)
         .alert(item: $editor.alert) { notice in
             Alert(title: Text(notice.title), message: Text(notice.message), dismissButton: .default(Text("OK"), action: editor.dismissNotice))
         }
-    }
-
-    private var windowTitle: String {
-        if let url = editor.projectURL { return url.deletingPathExtension().lastPathComponent }
-        guard let first = editor.timelineClips.first else { return "Untitled" }
-        let additionalSources = Set(editor.timelineClips.map(\.sourceID)).count - 1
-        return additionalSources > 0 ? "\(first.name) + \(additionalSources)" : first.name
     }
 
     private var viewer: some View {
@@ -66,7 +89,7 @@ struct EditorView: View {
                     .overlay(alignment: .bottom) {
                         Picker("Waveform span", selection: $presentation.waveformSpan) {
                             ForEach(AudioViewerSpan.allCases, id: \.self) { span in
-                                Text(span.rawValue).tag(span)
+                                Text(span.label).tag(span)
                             }
                         }
                         .labelsHidden()
@@ -83,6 +106,13 @@ struct EditorView: View {
                 ViewerPanel(preview: editor.preview, isEmpty: editor.isEmpty, isBusy: editor.isBusy,
                             canAddMulticam: multicam.canChooseSources, add: editor.chooseFiles,
                             addMulticam: addMulticam)
+                    .overlay {
+                        if let transcriptSession,
+                           presentation.sequenceParticipantsVisible || !editor.stillProject.participants.isEmpty {
+                            ParticipantMonitorOverlay(session: transcriptSession,
+                                                      interactive: presentation.sequenceParticipantsVisible)
+                        }
+                    }
             }
         }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -137,7 +167,7 @@ struct EditorView: View {
             showsWaveform: !editor.isAudioOnly && !editor.audioTracks.isEmpty,
             envelopeStore: editor.audioStore.detail,
             waveforms: editor.audioStore.waves, openingWaveform: editor.audioStore.openingWaveform,
-            waveformPauses: editor.sourcePauses,
+            waveformPauses: editor.sourcePauses, timelinePadding: editor.timelinePadding,
             waveformRevision: editor.waveformRevision,
             snapTarget: Binding(get: { editor.effectiveSnapTarget }, set: editor.chooseSnapTarget),
             largeThumbnails: $editor.largeThumbnails,
@@ -159,6 +189,7 @@ struct EditorView: View {
         )
         timeline.assemblyAssets = editor.stillAssetSpans
         if editor.canEdit {
+            timeline.onPreviewJoin = { _ = editor.previewExistingJoin(before: $0) }
             timeline.onClipCSV = { editor.applyClipCSV($0, to: $1) }
             timeline.audioTrackLabels = { id in
                 let tracks = editor.analysisSourceMedia[id]?.streams.filter { $0.kind == "audio" } ?? []
@@ -176,6 +207,7 @@ struct EditorView: View {
             if editor.isExporting {
                 ProgressView(value: editor.exportProgress)
                     .progressViewStyle(.linear)
+                    .barLeading()
                     .frame(width: 132)
                     .accessibilityLabel("Export progress")
                 Text(editor.isCancelling ? "Cancelling…" : "Exporting… \(progressPercent(editor.exportProgress))")
@@ -185,7 +217,7 @@ struct EditorView: View {
                     .disabled(editor.isCancelling)
                     .help("Cancel export")
             } else if let progress = editor.mediaRefreshProgress {
-                ProgressView(value: progress).frame(width: 100)
+                ProgressView(value: progress).frame(width: 100).barLeading()
                 Text("Refreshing project media…")
                 Spacer()
                 Button("Cancel", action: editor.mediaRefresh.cancel)
@@ -193,9 +225,10 @@ struct EditorView: View {
             } else if editor.isImporting {
                 ProgressView(value: editor.importProgress)
                     .progressViewStyle(.linear)
+                    .barLeading()
                     .frame(width: 132)
-                    .accessibilityLabel("Indexing frames and audio")
-                Text(editor.isCancelling ? "Cancelling…" : "Indexing frames and audio… \(progressPercent(editor.importProgress))")
+                    .accessibilityLabel("Indexing audio & video")
+                Text(editor.isCancelling ? "Cancelling…" : "Indexing audio & video… \(progressPercent(editor.importProgress))")
                     .monospacedDigit()
                 Spacer()
                 Button("Cancel", action: editor.cancelImport)
@@ -204,6 +237,7 @@ struct EditorView: View {
             } else if editor.isCheckingEdit || editor.isPreparingCopyBoundaries {
                 ProgressView()
                     .controlSize(.small)
+                    .barLeading()
                     .accessibilityHidden(true)
                 Text(editor.isPreparingCopyBoundaries ? "Preparing keyframe edit points…" : "Checking edit…")
                 Spacer()
@@ -236,19 +270,20 @@ struct EditorView: View {
                         Label(editor.useSavedMonitoringTracks ? "Source Audio" : "Track \(editor.playheadAnalysisTrack + 1)",
                               systemImage: "speaker.wave.2")
                     }
-                    .fixedSize()
+                    .barMenu()
                     .help("Monitor or replace audio")
                     silenceControls
                     StatusBarDivider()
                 } else if !editor.isEmpty {
                     Label("No audio track", systemImage: "speaker.slash")
                         .foregroundStyle(.tertiary)
+                        .barLeading()
                     StatusBarDivider()
                 }
                 if let progress = editor.sceneProgress {
                     ProgressView(value: progress).frame(width: 72)
                         .accessibilityLabel("Scene analysis progress")
-                    Text("\(editor.sceneStatus ?? "Finding scenes…") · \(progressPercent(progress))")
+                    Text("\(editor.sceneStatus ?? "Scanning for scenes…") · \(progressPercent(progress))")
                         .monospacedDigit()
                     Button("Cancel", action: editor.cancelSceneAnalysisFromEditor)
                         .accessibilityLabel("Cancel scene analysis")
@@ -259,8 +294,9 @@ struct EditorView: View {
                         Menu {
                             SequenceFindSceneCommands(editor: editor)
                         } label: {
-                            Label("Find Scenes", systemImage: "viewfinder")
+                            Label("Scan for Scenes", systemImage: "viewfinder")
                         }
+                        .barMenu()
                         .help("Find scene changes")
                         .task(id: editor.sceneInspectionKey) { await editor.inspectSceneChoices() }
                         StatusBarDivider()
@@ -270,12 +306,8 @@ struct EditorView: View {
                         StatusBarDivider()
                     }
                     if let label = editor.currentSceneLabel {
-                        Button(action: editor.renameCurrentView) {
-                            Label(label, systemImage: "rectangle.on.rectangle")
-                        }
-                            .buttonStyle(.borderless)
+                        BarButton(label, symbol: "rectangle.on.rectangle", action: editor.renameCurrentView)
                             .monospacedDigit()
-                            .lineLimit(1)
                             .disabled(!editor.canRenameCurrentView)
                             .help("Rename matching scene views")
                         StatusBarDivider()
@@ -289,7 +321,7 @@ struct EditorView: View {
                         Label(editor.mediaClipReview.isEmpty ? "Media refresh" : "Media needs review",
                               systemImage: "exclamationmark.triangle")
                     }
-                    .fixedSize()
+                    .barMenu()
                     .help("Show media refresh issues")
                     StatusBarDivider()
                 }
@@ -300,7 +332,7 @@ struct EditorView: View {
                     .help(editor.statusMessage)
                 Spacer(minLength: 8)
                 if editor.lastExportedURL != nil {
-                    Button("Show in Finder", action: editor.showExportInFinder)
+                    BarButton("Show in Finder", symbol: "folder", action: editor.showExportInFinder)
                         .help("Reveal exported file")
                 }
             }
@@ -312,13 +344,11 @@ struct EditorView: View {
         let count = editor.pausePlan.count
         let title = progress.map { "Finding silence… \(progressPercent($0))" }
             ?? (editor.pauseAnalysisReady ? (count == 1 ? "1 pause" : "\(count) pauses") : "Scan for Silence")
-        Button {
+        BarButton(title, symbol: "waveform", active: presentation.pauseControls) {
             if editor.canScanSilence && !editor.pauseAnalysisReady { editor.scanForSilence() }
             presentation.pauseControls = true
-        } label: {
-            Label(title, systemImage: "waveform")
-                .monospacedDigit()
         }
+        .monospacedDigit()
         .popover(isPresented: $presentation.pauseControls, arrowEdge: .top) { PauseControls(editor: editor) }
         .help("Find and edit pauses")
         if progress != nil {
@@ -336,6 +366,7 @@ struct EditorView: View {
     }
 
     private func handleKey(_ event: NSEvent, modifiers: NSEvent.ModifierFlags) -> NSEvent? {
+        if presentation.transcriptKeyHandler?(event, modifiers) == true { return nil }
         if modifiers == .option, event.charactersIgnoringModifiers?.lowercased() == "x", editor.canClearMarks {
             editor.clearMarks()
             return nil

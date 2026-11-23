@@ -572,8 +572,8 @@ final class MulticamEditorAuditTests: XCTestCase {
         XCTAssertEqual(model.deleteTitle, "Delete Assembly Range")
         let at = String(decoding: try JSONEncoder().encode(frames[4]), as: UTF8.self)
         let diagnostic = try JSONDecoder().decode(MulticamDiagnostic.self, from: Data("""
-            {"source":"close","group":{"from":"0","to":"1"},"sourceTime":{"from":"0","to":"1"},
-             "output":{"from":"0","to":"1"},"at":\(at)}
+            {"source_id":"close","group_range":{"from":"0","to":"1"},"source_range":{"from":"0","to":"1"},
+             "assembly_range":{"from":"0","to":"1"},"switch_group_time":\(at)}
             """.utf8))
         model.run("Check") { _, _ -> Int in
             throw CutError(code: "unsafe_switch", message: "Unsafe switch", nearest: [frames[3]], multicam: diagnostic)
@@ -643,7 +643,7 @@ final class MulticamEditorAuditTests: XCTestCase {
             XCTFail("Lossless Copy plans for a program whose tier is Lossless.")
         }
 
-        // Undo restores the program and its tier. No edit of the multicam editor asks.
+        // Undo restores the program and its tier. Only an edit made by hand asks (MulticamTierGateTests).
         model.undo()
         try await settle()
         XCTAssertEqual(model.settledTier, .trueLossless)

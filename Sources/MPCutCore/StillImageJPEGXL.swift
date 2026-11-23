@@ -4,6 +4,7 @@ extension StillImage {
     // Image I/O returns one image for animated JPEG XL, so check the
     // codestream's animation flag before accepting it as a still.
     static func jpegXLHasAnimation(_ file: FileHandle) throws -> Bool {
+        let fileSize = try file.seekToEnd()
         try file.seek(toOffset: 0)
         let signature = try file.read(upToCount: 12) ?? Data()
         var prefix = Data()
@@ -13,6 +14,7 @@ extension StillImage {
         } else if signature.elementsEqual([0, 0, 0, 12, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a]) {
             var nextPart: UInt32 = 0
             for _ in 0..<4_096 {
+                try Task.checkCancellation()
                 guard let box = try file.read(upToCount: 8), box.count == 8 else { break }
                 let type = box[4..<8]
                 var size = bigEndianInteger(box.prefix(4))
@@ -24,9 +26,12 @@ extension StillImage {
                 }
                 guard size == 0 || size >= headerSize else { break }
                 let offset = try file.offset()
-                let payloadLength = size == 0 ? UInt64.max : size - headerSize
+                guard offset <= fileSize else { break }
+                let payloadLength = size == 0 ? fileSize - offset : size - headerSize
+                guard payloadLength <= fileSize - offset else { break }
                 let remaining = UInt64(64 - prefix.count)
                 if type.elementsEqual("jxlc".utf8) {
+                    guard nextPart == 0 else { break }
                     prefix.append(try file.read(upToCount: Int(min(remaining, payloadLength))) ?? Data())
                     break
                 }
@@ -38,14 +43,18 @@ extension StillImage {
                     if prefix.count >= 64 || index & 0x8000_0000 != 0 { break }
                     nextPart += 1
                 }
-                let (nextOffset, overflow) = offset.addingReportingOverflow(payloadLength)
-                guard size != 0, !overflow else { break }
-                try file.seek(toOffset: nextOffset)
+                guard size != 0 else { break }
+                try file.seek(toOffset: offset + payloadLength)
             }
         }
-        guard prefix.starts(with: [0xff, 0x0a]) else { return false }
+        guard prefix.starts(with: [0xff, 0x0a]) else {
+            throw error("still_decode", "Cannot read the primary JPEG XL codestream.")
+        }
         var header = JPEGXLHeader(bytes: Array(prefix.dropFirst(2)))
-        return header.hasAnimation ?? false
+        guard let animated = header.hasAnimation else {
+            throw error("still_decode", "Cannot read the primary JPEG XL codestream header.")
+        }
+        return animated
     }
 
     private static func bigEndianInteger(_ bytes: Data) -> UInt64 {
@@ -61,8 +70,10 @@ private struct JPEGXLHeader {
 
     var hasAnimation: Bool? {
         mutating get {
-            guard skipSize(), let defaults = read(1), defaults == 0,
-                  let extra = read(1), extra == 1 else { return false }
+            guard skipSize(), let defaults = read(1) else { return nil }
+            if defaults == 1 { return false }
+            guard let extra = read(1) else { return nil }
+            if extra == 0 { return false }
             guard read(3) != nil, let intrinsic = read(1) else { return nil }
             if intrinsic == 1, !skipSize() { return nil }
             guard let preview = read(1) else { return nil }

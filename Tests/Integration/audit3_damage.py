@@ -53,13 +53,16 @@ def movie(path, codec, b_frames):
          *settings[codec], "-pix_fmt", "yuv420p", "-c:a", "aac", path])
 
 
-def picture_ids(path):
+def picture_ids(path, *, allow_damaged=False):
     """Software decoding conceals damage, so callers compare only intact groups."""
     width, height = 128, 16
-    data = run([FFMPEG, "-loglevel", "quiet", "-i", path, "-map", "0:v:0",
+    diagnostics = ["-loglevel", "quiet"] if allow_damaged else ["-loglevel", "error", "-xerror"]
+    data = run([FFMPEG, *diagnostics, "-i", path, "-map", "0:v:0",
                 "-vf", f"crop={width}:{height}:0:0,extractplanes=y", "-fps_mode", "passthrough",
-                "-pix_fmt", "gray", "-f", "rawvideo", "-"], check=False).stdout
+                "-pix_fmt", "gray", "-f", "rawvideo", "-"], check=not allow_damaged).stdout
     stride = width * height
+    if len(data) % stride:
+        raise AssertionError(f"incomplete picture in {path}")
     return [sum(1 << bit for bit in range(8) if data[start + 8 * width + bit * 16 + 8] > 120)
             for start in range(0, len(data) - stride + 1, stride)]
 
@@ -69,13 +72,16 @@ KEYFRAME = 50    # The keyframe of the group 50 ..< 75.
 OK, DAMAGED = "ok", "damaged"
 
 # (from, to, Smart Trim without B pictures, Smart Trim with B pictures, Re-encode, Re-encode with B pictures)
-# Re-encode decodes from a keyframe two seconds before the start. Its helper also reads a few
-# pictures past the end, on a schedule that varies between runs. None accepts either safe result.
+# Re-encode decodes from a keyframe two seconds before the start, where the sound decoder warms up.
+# When a picture there is damaged it renders once more, with the picture decoded from the last
+# keyframe at or before the start and the sound from the earlier keyframe. Its helper also reads a
+# few pictures past the end, on a schedule that varies between runs. None accepts either safe result.
 P_CASES = [
     (35, 100, DAMAGED, DAMAGED, DAMAGED, DAMAGED),  # The leading edge is re-encoded from the damaged group.
     (45, 100, DAMAGED, DAMAGED, DAMAGED, DAMAGED),  # The damage precedes the cut and is a reference for it.
     (10, 115, OK, OK, DAMAGED, DAMAGED),            # Smart Trim copies the damaged group. Re-encode decodes it.
-    (60, 115, OK, OK, DAMAGED, DAMAGED),            # A keyframe follows the damage. Re-encode's preroll reaches it.
+    # Keyframe 50 follows the damage. Re-encode's preroll reaches the damage, and its second render starts at 50.
+    (60, 115, OK, OK, OK, OK),
     (110, 140, OK, OK, OK, OK),                     # Clear of the preroll.
     (0, 12, OK, OK, OK, OK),
     (0, 35, OK, OK, None, None),                    # The trailing edge ends before the damage.
@@ -86,7 +92,7 @@ KEY_CASES = [
     (60, 115, DAMAGED, DAMAGED, DAMAGED, DAMAGED),
     (10, 115, OK, OK, DAMAGED, DAMAGED),
     (0, 30, OK, OK, OK, OK),
-    (85, 140, OK, OK, DAMAGED, DAMAGED),            # Re-encode's preroll starts at picture 25.
+    (85, 140, OK, OK, OK, OK),                      # Re-encode's preroll starts at picture 25. Its second render starts at 75.
     (130, 148, OK, OK, OK, OK),
     # The leading edge ends at the damaged keyframe, which is copied. The H.264 decoder can withhold
     # a reordered picture that was due when it read the damage, and the edge is then refused.
@@ -95,15 +101,22 @@ KEY_CASES = [
 ]
 
 
-def luma(path):
-    data = run([FFMPEG, "-loglevel", "quiet", "-i", path, "-map", "0:v:0", "-fps_mode", "passthrough",
-                "-pix_fmt", "gray", "-f", "rawvideo", "-"], check=False).stdout
+def luma(path, *, allow_damaged=False):
+    diagnostics = ["-loglevel", "quiet"] if allow_damaged else ["-loglevel", "error", "-xerror"]
+    data = run([FFMPEG, *diagnostics, "-i", path, "-map", "0:v:0", "-fps_mode", "passthrough",
+                "-pix_fmt", "gray", "-f", "rawvideo", "-"], check=not allow_damaged).stdout
     stride = 320 * 96
+    if len(data) % stride:
+        raise AssertionError(f"incomplete picture in {path}")
     return [data[start:start + stride] for start in range(0, len(data) - stride + 1, stride)]
 
 
 def difference(a, b):
-    return sum(abs(x - y) for x, y in zip(a[::7], b[::7])) / len(a[::7])
+    return sum(abs(x - y) for x, y in zip(a[::7], b[::7], strict=True)) / len(a[::7])
+
+
+def sound(path):
+    return run([FFMPEG, "-loglevel", "error", "-xerror", "-i", path, "-map", "0:a:0", "-f", "s16le", "-"]).stdout
 
 
 class DamagedExport(unittest.TestCase):
@@ -129,7 +142,7 @@ class DamagedExport(unittest.TestCase):
 
     def export(self, mode, source, start, end):
         output = Path(tempfile.mkdtemp(dir=self.root)) / ("out" + source.suffix)
-        result = run([CLI, "export", "--json", "--no-sidecar", "--mode", mode, "--output", output,
+        result = run([CLI, "export", "clips", "join", "--json", "--no-sidecar", "--mode", mode, "--output", output,
                       "--clip", source, "--from", f"{start}/{FPS}", "--to", f"{end}/{FPS}"], check=False)
         return result.returncode, json.loads(result.stdout), output
 
@@ -158,18 +171,27 @@ class DamagedExport(unittest.TestCase):
         damaged = P_PICTURE if key[3] == "p" else KEYFRAME
         skipped = group if mode == "smart" and damaged in wanted else range(0)
         self.assertEqual(len(packets(output)), len(wanted), label)
-        ids = picture_ids(output)
+        ids = picture_ids(output, allow_damaged=bool(skipped))
         self.assertEqual(len(ids), len(wanted), label)
         clean = self.sources[key[:3] + ("clean",)]
         code, report, reference = self.export(mode, clean, start, end)
         self.assertEqual(code, 0, (label, report))
-        pictures, intact = luma(output), luma(reference)
+        pictures, intact = luma(output, allow_damaged=bool(skipped)), luma(reference)
+        self.assertEqual(len(pictures), len(wanted), label)
         self.assertEqual(len(intact), len(wanted), label)
         for position, picture in enumerate(wanted):
             if picture in skipped:
                 continue
             self.assertEqual(ids[position], picture, (label, position))
-            self.assertLess(difference(pictures[position], intact[position]), 3, (label, picture))
+            # Two hardware encodes of one cut edge differ by up to about 3.7 on a busy machine,
+            # and a neighbouring picture differs by at least 7.4. The number above names the picture.
+            self.assertLess(difference(pictures[position], intact[position]), 5, (label, picture))
+        if mode == "encode":
+            # A second render moves only the picture's seek. The sound decoder starts where it does
+            # in the clean export, so the encoder receives the same samples.
+            samples = sound(output)
+            self.assertEqual(len(samples), (end - start) * 48000 // FPS * 2, label)
+            self.assertEqual(samples, sound(reference), label)
 
     def cases(self, mode, column):
         for key in self.sources:
@@ -198,7 +220,8 @@ class DamagedExport(unittest.TestCase):
                     code, report, output = self.export(mode, source, 0, 35)
                     if mode == "smart" and code == 0:
                         # The first group is copied whole and later pictures are re-encoded.
-                        self.assertEqual(picture_ids(output)[25:], list(range(25, 35)), label)
+                        self.assertEqual(len(packets(output)), 35, label)
+                        self.assertEqual(picture_ids(output, allow_damaged=True)[25:], list(range(25, 35)), label)
                         continue
                     self.assertEqual((code, report["ok"]), (1, False), label)
                     self.assertFalse(output.exists(), label)

@@ -41,7 +41,7 @@ public struct SceneScanProgress: Encodable, Equatable, Sendable {
 }
 
 public struct SceneScanOutcome: Encodable, Sendable {
-    public enum State: String, Encodable, Sendable { case upToDate, completed, paused }
+    public enum State: String, Encodable, Sendable { case upToDate = "up_to_date", completed, paused }
     public let state: State
     public let report: SceneReport?
     public let progress: SceneScanProgress
@@ -54,6 +54,11 @@ private struct SceneScanKey: Hashable, Sendable {
 }
 
 private struct SceneStart: Codable, Equatable {
+    private enum CodingKeys: String, CodingKey {
+        case pts, time, view
+        case isBoundary = "is_boundary"
+    }
+
     let pts: Int64
     let time: RationalTime
     let view: Int
@@ -150,7 +155,7 @@ private struct SceneRequest: Sendable {
     let endPTS: Int64
     let key: SceneScanKey
 
-    // The unqualified scenes.v2 and viewNames.v2 sections use the ordinary
+    // The unqualified scenes_boundaries.v1 and scenes_view_names.v1 sections use the ordinary
     // file clock. Shifted clocks persist through their scoped attempts.
     var usesCanonicalReport: Bool { scope == .fullSource && media.multicamClockOffset == .zero }
 
@@ -466,7 +471,7 @@ extension SceneAnalysis {
                                                            durable: checkpoint.decoded))
     }
 
-    private static func inspectSceneClock(_ url: URL, identity: SourceIdentity, preview: MediaInfo? = nil,
+    static func inspectSceneClock(_ url: URL, identity: SourceIdentity, preview: MediaInfo? = nil,
                                           cancelled: @escaping () -> Bool) throws -> MediaInfo {
         let header = preview ?? (try? Probe.read(url, keyframes: false, previewOnly: true,
                                                 expectedIdentity: identity, cancelled: cancelled))
@@ -618,7 +623,6 @@ extension SceneAnalysis {
                 ? cache?.restoringViewNames(to: report, cancelled: { false }) ?? report : report
             if allowRepair, restored.views.map(\.name) != report.views.map(\.name) {
                 // Rebuild the canonical report before a subsequent metadata edit.
-                // The scan restores only names whose legacy markers still match.
                 return nil
             }
             return request.cached(restored, durable: full.progress.durable != nil)
@@ -1064,5 +1068,23 @@ extension SceneAnalysis {
                 return progress
             }
         }
+    }
+}
+
+final class CombinedSceneCollector {
+    private let collector: ResumableSceneCollector
+
+    init(media: MediaInfo) throws {
+        collector = ResumableSceneCollector(request: try SceneRequest(media, scope: .fullSource),
+                                            record: SceneScanRecord(), cancelled: { false }, receive: { _, _ in })
+    }
+
+    func marker(pts: Int64, feature: UnsafePointer<UInt8>) throws {
+        try collector.marker(pts: pts, feature: feature)
+    }
+
+    var report: SceneReport? {
+        let markers = collector.record.reportMarkers
+        return markers.isEmpty ? nil : collector.request.report(markers)
     }
 }

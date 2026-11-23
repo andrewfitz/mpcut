@@ -1,0 +1,4 @@
+module CTileTrail [system] {
+    header "shim.h"
+    export *
+}

@@ -11,7 +11,7 @@ public enum ResolveNativeInterchange {
         try ProjectConverter.checkCancellation(cancelled)
         try project.validateDestination(output, relativeTo: location)
         let ext = try archiveExtension(output)
-        let conversion = try ProjectConverter.prepareStills(project, for: "DaVinci Resolve .\(ext)", allowLoss: allowLoss)
+        let conversion = try ProjectConverter.prepareForInterchange(project, for: "DaVinci Resolve .\(ext)", allowLoss: allowLoss)
         let project = conversion.project
         let files = FileManager.default
         guard !files.fileExists(atPath: output.path) else {
@@ -37,7 +37,8 @@ public enum ResolveNativeInterchange {
         let xml = media.appendingPathComponent(output.deletingPathExtension().lastPathComponent).appendingPathExtension("fcpxml")
         defer { try? files.removeItem(at: xml) }
         warnings += try ResolveExport.writeFCP(project, relativeTo: location, to: xml, package: nil,
-                                                  allowLoss: allowLoss, isolateSequenceAudio: true, cancelled: cancelled)
+                                                  allowLoss: allowLoss, isolateSequenceAudio: true,
+                                                  preserveMulticamEditing: false, cancelled: cancelled)
         let staged = media.appendingPathComponent(".mpcut-\(token).\(ext)")
         defer { try? files.removeItem(at: staged) }
         try ProjectConverter.checkCancellation(cancelled)
@@ -45,7 +46,7 @@ public enum ResolveNativeInterchange {
         try run(helper, operation: "write", native: staged, xml: xml, ext: ext, report: layoutReport, cancelled: cancelled)
         warnings += try ResolveTimelineGeometry.verify(xml: xml, report: layoutReport, allowLoss: allowLoss)
         try files.removeItem(at: layoutReport)
-        guard chmod(staged.path, 0o666 & ~creationMask) == 0 else {
+        guard chmod(staged.path, try publicationPermissions(0o666)) == 0 else {
             throw CutError(code: "resolve_publish_failed", message: "Could not prepare permissions for the Resolve archive.")
         }
         try ProjectConverter.checkCancellation(cancelled)

@@ -95,7 +95,10 @@ final class ExclusivePublishTests: XCTestCase {
         XCTAssertEqual(manifest.frames.count, 1)
         var info = stat()
         XCTAssertEqual(stat(output.path, &info), 0)
-        XCTAssertEqual(info.st_mode & 0o7777, 0o777 & ~creationMask)
-        XCTAssertNotEqual(info.st_mode & 0o7777, 0o700)
+        let ordinary = directory.appendingPathComponent("ordinary")
+        XCTAssertEqual(mkdir(ordinary.path, 0o777), 0)
+        var expected = stat()
+        XCTAssertEqual(stat(ordinary.path, &expected), 0)
+        XCTAssertEqual(info.st_mode & 0o7777, expected.st_mode & 0o7777)
     }
 }

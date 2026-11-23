@@ -103,23 +103,26 @@ static int configure_encoder(EdgeEncoder *work, const AVStream *video, int64_t t
     codec->flags |= AV_CODEC_FLAG_CLOSED_GOP;
     codec->err_recognition |= AV_EF_EXPLODE;
     AVDictionary *options = NULL;
+    int result;
     if (source->codec_id == AV_CODEC_ID_AV1) {
         codec->pix_fmt = AV_PIX_FMT_YUV420P;
-        av_dict_set(&options, "preset", "6", 0);
+        result = av_dict_set(&options, "preset", "6", 0);
         // Equal average and peak rates select SVT's low-delay CBR mode.
         codec->rc_max_rate = target_bit_rate;
         codec->qmin = 1;
         codec->qmax = max_qp;
-        av_dict_set(&options, "svtav1-params", "pred-struct=1:lookahead=0:lp=4", 0);
+        if (result >= 0)
+            result = av_dict_set(&options, "svtav1-params", "pred-struct=1:lookahead=0:lp=4", 0);
     } else {
         // FFmpeg's default inserts an extra hardware keyframe every 12 pictures.
         // Each edge already starts independently and ends at the next copy seam.
         codec->gop_size = (int)FFMIN(work->edge->count, INT_MAX);
         codec->pix_fmt = AV_PIX_FMT_VIDEOTOOLBOX;
         codec->sw_pix_fmt = main10 ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
-        av_dict_set(&options, "allow_sw", "0", 0);
+        result = av_dict_set(&options, "allow_sw", "0", 0);
     }
-    int result = avcodec_open2(codec, encoder, &options);
+    if (result >= 0)
+        result = avcodec_open2(codec, encoder, &options);
     if (result >= 0 && av_dict_count(options))
         result = AVERROR_OPTION_NOT_FOUND;
     av_dict_free(&options);
@@ -449,7 +452,7 @@ MPCutEdge *mpcut_edge_open(const char *path, const AVStream *video, int64_t orig
             mpcut_edge_free(edge);
             return NULL;
         }
-        if (capacity)
+        if (error && capacity)
             error[0] = '\0';
         return edge;
     }

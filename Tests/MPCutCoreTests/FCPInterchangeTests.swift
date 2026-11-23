@@ -3,6 +3,21 @@ import XCTest
 @testable import MPCutCore
 
 final class FCPInterchangeTests: XCTestCase {
+    func testDuplicateUsedStillAssetIDsFailWithoutPublishingXML() throws {
+        let output = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathExtension("fcpxml")
+        defer { try? FileManager.default.removeItem(at: output) }
+        let cadence = RationalTime(numerator: 1, denominator: 24)
+        let still = StillAsset(id: "card", file: "card.jpeg", displayName: "Card", fingerprint: "unused")
+        let insert = StillInsert(id: "head", assetID: still.id, duration: cadence, cadence: cadence)
+        let project = CutProject.stillSequence(.init(items: [.still(insert)], stillAssets: [still, still]))
+        XCTAssertThrowsError(try ResolveExport.writeFCP(project, relativeTo: output, to: output,
+                                                        package: nil, allowLoss: false)) {
+            XCTAssertTrue($0.localizedDescription.contains("Invalid or repeated still asset"))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
     func testInlineStillRoundTripsWithOriginalImageAndExactTimelineGeometry() throws {
         let tests = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().standardizedFileURL
         let camera = tests.appendingPathComponent("MPCutAppTests/Fixtures/Shuttle-Chirp.mov")
@@ -112,8 +127,8 @@ final class FCPInterchangeTests: XCTestCase {
 
     func testSplitClipGetsDistinctIDAndRetainsReplacementMetadata() throws {
         let metadata = """
-        <metadata><md key="com.mpcut.clip.v1"
-            value='{&quot;id&quot;:&quot;clip-1&quot;,&quot;audioTrack&quot;:1,&quot;originalFile&quot;:&quot;/raw.mov&quot;,&quot;replacementNames&quot;:{&quot;1&quot;:&quot;Boom&quot;}}'/></metadata>
+        <metadata><md key="com.mpcut.sequence_clip.v2"
+            value='{&quot;clip_id&quot;:&quot;clip-1&quot;,&quot;track_ordinal&quot;:1,&quot;original_file&quot;:&quot;/raw.mov&quot;,&quot;replacement_names&quot;:{&quot;1&quot;:&quot;Boom&quot;}}'/></metadata>
         """
         let (project, warnings) = try read("""
         <asset-clip ref="a" start="3600s" duration="1s"/>
@@ -246,6 +261,121 @@ final class FCPInterchangeTests: XCTestCase {
             XCTAssertEqual(($0 as? CutError)?.code, "cancelled")
         }
         XCTAssertLessThan(ContinuousClock.now - start, .seconds(5))
+    }
+
+    func testSplitCameraAndReplayOverrideRoundTripWithOriginalAudioAndARecordingGap() throws {
+        let developmentHelper = "/opt/homebrew/bin/ffmpeg"
+        let configureHelper = ProcessInfo.processInfo.environment["MPCUT_FFMPEG_HELPER"] == nil
+            && FileManager.default.isExecutableFile(atPath: developmentHelper)
+        if configureHelper { setenv("MPCUT_FFMPEG_HELPER", developmentHelper, 0) }
+        defer { if configureHelper { unsetenv("MPCUT_FFMPEG_HELPER") } }
+        try XCTSkipUnless((try? ReencodeEngine.findHelper(override: nil)) != nil, "Requires an FFmpeg helper")
+
+        let tests = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().standardizedFileURL
+        let fixture = tests.appendingPathComponent("MPCutAppTests/Fixtures/Shuttle-Chirp.mov")
+        let photo = tests.appendingPathComponent("Integration/fixtures/stills/patch.jpeg")
+        let info = try CutEngine(useSidecar: false).inspectSummary(fixture)
+        let stream = try XCTUnwrap(info.streams.first(where: { $0.kind == "audio" })).index
+        let rate = try XCTUnwrap(info.videoStream?.frameRate)
+        let frame = RationalTime(numerator: rate.denominator, denominator: rate.numerator)
+        let two = try frame.adding(frame)
+        let three = try two.adding(frame)
+        let range = MulticamRange(from: .zero, to: three)
+        let first = MulticamRange(from: .zero, to: frame)
+        let second = MulticamRange(from: two, to: three)
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let restart = folder.appendingPathComponent("restart.mov")
+        try FileManager.default.copyItem(at: fixture, to: restart)
+        let camera = MulticamSource(id: "wide", file: fixture.path, name: "Wide", audioStream: stream,
+                                   coverage: first, additionalRecordings: [
+                                    .init(id: "restart", file: restart.path, offset: two, audioStream: stream, coverage: second)
+                                   ])
+        let close = MulticamSource(id: "close", file: fixture.path)
+        let image = StillAsset(id: "card-source", file: photo.path, displayName: "Card",
+                               fingerprint: try StillImage.fingerprint(photo))
+        let insert = StillInsert(id: "replay-card", assetID: image.id, duration: frame, cadence: frame)
+        let group = MulticamProject(referenceAngle: camera.id, range: range, angles: [camera, close], audio: .follow,
+                                    switches: [.init(at: .zero, angle: camera.id)],
+                                    assemblyItems: [.group(range), .still(insert), .group(first, angle: close.id)],
+                                    stillAssets: [image])
+        let input = folder.appendingPathComponent("Source.cut")
+        for ext in ["fcpxml", "fcpxmld"] {
+            let output = folder.appendingPathComponent("Edit." + ext)
+            XCTAssertEqual(try ProjectConverter.write(.multicam(group), relativeTo: input, to: output), [])
+            let (reopened, warnings) = try FCPInterchange.read(output)
+            guard case .multicam(let restored) = reopened else { return XCTFail("Expected multicam") }
+            XCTAssertEqual(warnings, [])
+            XCTAssertEqual(restored.referenceAngle, group.referenceAngle)
+            XCTAssertEqual(restored.range, group.range)
+            XCTAssertEqual(restored.angles, group.angles)
+            XCTAssertEqual(restored.audioSources, [])
+            XCTAssertEqual(restored.audio, group.audio)
+            XCTAssertEqual(restored.switches, group.switches)
+            XCTAssertEqual(restored.assemblyItems, group.assemblyItems)
+            XCTAssertEqual(restored.stillAssets, group.stillAssets)
+            let plan = try restored.plan()
+            XCTAssertEqual(plan.intervals.map(\.pictureSourceID), [camera.id, nil, "restart", close.id])
+            XCTAssertEqual(plan.intervals.map { $0.audio?.source }, [camera.id, nil, "restart", camera.id])
+
+            let xml = ext == "fcpxml" ? output : output.appendingPathComponent("Info.fcpxml")
+            let document = try FCPInterchange.loadDocument(xml)
+            let nodes = try document.nodes(forXPath: "//mc-angle[@angleID='wide']/*")
+            XCTAssertEqual(nodes.map(\.name), ["asset-clip", "gap", "asset-clip"])
+
+            let helperID = try XCTUnwrap((document.nodes(forXPath: "(//sequence/spine/mc-clip)[1]/mc-source[@srcEnable='audio']")
+                .first as? XMLElement)?.attribute(forName: "angleID")?.stringValue)
+            let helper = try XCTUnwrap(document.nodes(forXPath: "//mc-angle[@angleID='\(helperID)']/asset-clip")
+                .first as? XMLElement)
+            let helperRef = try XCTUnwrap(helper.attribute(forName: "ref"))
+            let originalRef = helperRef.stringValue
+            helperRef.stringValue = (nodes.last as? XMLElement)?.attribute(forName: "ref")?.stringValue
+            try document.xmlData.write(to: xml)
+            guard case .multicam(let relinked) = try FCPInterchange.read(output).0 else { return XCTFail("Expected multicam") }
+            let relinkedAudio = try XCTUnwrap(relinked.plan().audio.first?.source)
+            XCTAssertEqual(relinked.audioSources.first { $0.id == relinkedAudio }?.file, restart.path)
+            helperRef.stringValue = originalRef
+
+            let replay = try XCTUnwrap(document.nodes(forXPath: "(//sequence/spine/mc-clip)[last()]/mc-source[@srcEnable='video']")
+                .first as? XMLElement)
+            replay.attribute(forName: "angleID")?.stringValue = camera.id
+            try document.xmlData.write(to: xml)
+            guard case .multicam(let edited) = try FCPInterchange.read(output).0 else { return XCTFail("Expected multicam") }
+            XCTAssertEqual(try edited.plan().intervals.last?.angle, camera.id)
+        }
+    }
+
+    func testAllStillAssemblyRestoresItsGroupOnlyWhenEditingMetadataMatches() throws {
+        let tests = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().standardizedFileURL
+        let camera = tests.appendingPathComponent("MPCutAppTests/Fixtures/Shuttle-Chirp.mov")
+        let photo = tests.appendingPathComponent("Integration/fixtures/stills/patch.jpeg")
+        let rate = try XCTUnwrap(CutEngine(useSidecar: false).inspectSummary(camera).videoStream?.frameRate)
+        let frame = RationalTime(numerator: rate.denominator, denominator: rate.numerator)
+        let range = MulticamRange(from: .zero, to: frame)
+        let image = StillAsset(id: "card-source", file: photo.path, displayName: "Card",
+                               fingerprint: try StillImage.fingerprint(photo))
+        let card = StillInsert(id: "card", assetID: image.id, duration: frame, cadence: frame)
+        let group = MulticamProject(referenceAngle: "wide", range: range,
+                                    angles: [.init(id: "wide", file: camera.path)],
+                                    audio: .none, switches: [.init(at: .zero, angle: "wide")],
+                                    assemblyItems: [.still(card)], stillAssets: [image])
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let output = folder.appendingPathComponent("Card.fcpxml")
+        XCTAssertEqual(try ProjectConverter.write(.multicam(group), relativeTo: folder.appendingPathComponent("Source.cut"),
+                                                 to: output), [])
+        XCTAssertEqual(try FCPInterchange.read(output).0, .multicam(group))
+
+        let document = try FCPInterchange.loadDocument(output)
+        let unrelatedMetadata = try XCTUnwrap(document.nodes(forXPath: "//multicam/metadata/md[@key='\(FCPGroupMetadata.editing)']").first)
+        unrelatedMetadata.detach()
+        try document.xmlData.write(to: output)
+        guard case .stillSequence(let standalone) = try FCPInterchange.read(output).0 else {
+            return XCTFail("Expected the still sequence to ignore an unrelated multicam resource")
+        }
+        XCTAssertEqual(standalone.items, [.still(card)])
     }
 
     func testPackageMulticamRoundTrip() throws {

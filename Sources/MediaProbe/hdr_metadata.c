@@ -1,4 +1,5 @@
 #include "MediaProbe.h"
+#include "../CFFmpeg/copy_probe.h"
 #include <libavformat/avformat.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/mastering_display_metadata.h>
@@ -165,7 +166,7 @@ static int nal(MPProbeHDR *result, int hevc, const uint8_t *data, size_t size)
 
 static int annex_start(const uint8_t *data, int size, int *start)
 {
-    for (int i = *start; i + 2 < size; i++) {
+    for (int i = *start; i < size - 2; i++) {
         if (!data[i] && !data[i + 1] && data[i + 2] == 1) {
             *start = i;
             return i + 3;
@@ -184,6 +185,8 @@ static int annex(MPProbeHDR *result, int hevc, const uint8_t *data, int size)
     while (payload < size) {
         start = payload;
         int next = annex_start(data, size, &start);
+        if (next == size && start != size)
+            return AVERROR_INVALIDDATA;
         while (start > payload && data[start - 1] == 0)
             start--;
         int ret = nal(result, hevc, data + payload, start - payload);
@@ -298,29 +301,43 @@ static int configuration(MPProbeHDR *result, enum AVCodecID codec, const uint8_t
     return codec == AV_CODEC_ID_HEVC ? hevc_config(result, data, size) : 0;
 }
 
-static int picture(MPProbeHDR *result, enum AVCodecID codec, const AVPacket *packet, int width)
+static int picture(MPProbeHDR *result, enum AVCodecID codec, const uint8_t *data, int size, int width)
 {
     if (codec == AV_CODEC_ID_AV1)
-        return av1_metadata(result, packet->data, packet->size);
+        return av1_metadata(result, data, size);
     int hevc = codec == AV_CODEC_ID_HEVC;
     if (!hevc && codec != AV_CODEC_ID_H264)
         return 0;
     if (!width)
-        return annex(result, hevc, packet->data, packet->size);
-    for (int pos = 0; pos < packet->size;) {
-        if (packet->size - pos < width)
+        return annex(result, hevc, data, size);
+    for (int pos = 0; pos < size;) {
+        if (size - pos < width)
             return AVERROR_INVALIDDATA;
-        unsigned size = 0;
+        unsigned length = 0;
         for (int i = 0; i < width; i++)
-            size = size << 8 | packet->data[pos++];
-        if (size > (unsigned)(packet->size - pos))
+            length = length << 8 | data[pos++];
+        if (length > (unsigned)(size - pos))
             return AVERROR_INVALIDDATA;
-        int ret = nal(result, hevc, packet->data + pos, size);
+        int ret = nal(result, hevc, data + pos, length);
         if (ret < 0)
             return ret;
-        pos += (int)size;
+        pos += (int)length;
     }
     return 0;
+}
+
+int mp_probe_check_still_hevc(const uint8_t *data, int size, const uint8_t *config, int config_size)
+{
+    if (!data || size <= 0 || !config || config_size < 23 || config[0] != 1)
+        return AVERROR_INVALIDDATA;
+    MPProbeHDR result = {0};
+    int ret = hevc_config(&result, config, config_size);
+    if (ret < 0)
+        return ret;
+    ret = picture(&result, AV_CODEC_ID_HEVC, data, size, (config[21] & 3) + 1);
+    if (ret < 0)
+        return ret;
+    return result.dolby_vision || result.hdr10plus || result.additional_layers ? AVERROR(ENOTSUP) : 0;
 }
 
 static int retained(int64_t pts, AVRational time_base, const MPProbeHDRRange *ranges, size_t count)
@@ -357,9 +374,22 @@ int mp_probe_hdr(const char *path, int stream, const MPProbeHDRRange *ranges, si
     ret = avformat_open_input(&file, path, NULL, NULL);
     if (ret < 0)
         goto done;
-    ret = AVERROR_INVALIDDATA;
-    if (stream < 0 || (unsigned)stream >= file->nb_streams)
+    if (stream >= 0 && ((unsigned)stream >= file->nb_streams ||
+                        file->streams[stream]->codecpar->codec_id == AV_CODEC_ID_NONE)) {
+        ret = mpcut_probe_decoder_policy(file);
+        if (ret < 0)
+            goto done;
+        ret = avformat_find_stream_info(file, NULL);
+        if (ret < 0)
+            goto done;
+    }
+    if (stream < 0 || (unsigned)stream >= file->nb_streams ||
+        file->streams[stream]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
+        ret = AVERROR_STREAM_NOT_FOUND;
         goto done;
+    }
+    for (unsigned i = 0; i < file->nb_streams; i++)
+        if (i != (unsigned)stream) file->streams[i]->discard = AVDISCARD_ALL;
 
     const AVStream *video = file->streams[stream];
     const AVCodecParameters *codec = video->codecpar;
@@ -408,7 +438,7 @@ int mp_probe_hdr(const char *path, int stream, const MPProbeHDRRange *ranges, si
             size_t display_size = 0;
             const uint8_t *value = av_packet_get_side_data(packet, AV_PKT_DATA_MASTERING_DISPLAY_METADATA, &display_size);
             side_mastering(result, value, display_size);
-            ret = picture(result, codec->codec_id, packet, width);
+            ret = picture(result, codec->codec_id, packet->data, packet->size, width);
             if (ret < 0)
                 goto done;
             if (!prior_content_light && result->inband_content_light &&

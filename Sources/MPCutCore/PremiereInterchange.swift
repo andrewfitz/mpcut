@@ -2,6 +2,8 @@ import Foundation
 
 /// Premiere owns the native project codec. Its UXP companion handles open, import and save.
 public enum PremiereInterchange {
+    private static let protocolVersion = 3
+
     public static func read(_ url: URL, allowLoss: Bool) throws -> (CutProject, [String]) {
         let source = url.resolvingSymlinksInPath()
         guard url.pathExtension.lowercased() == "prproj",
@@ -50,11 +52,10 @@ public enum PremiereInterchange {
         guard output.pathExtension.lowercased() == "prproj" else {
             throw CutError(code: "invalid_premiere_project", message: "Choose a .prproj destination.")
         }
-        let conversion = try ProjectConverter.prepareStills(project, for: "Adobe Premiere Pro .prproj", allowLoss: allowLoss)
+        let conversion = try ProjectConverter.prepareForInterchange(project, for: "Adobe Premiere Pro .prproj", allowLoss: allowLoss)
         guard !FileManager.default.fileExists(atPath: output.path) else {
             throw CutError(code: "output_exists", message: "The destination already exists at \(output.path).")
         }
-        let mailbox = try activeMailbox()
         return try withStage(in: output.deletingLastPathComponent()) { stage in
             let native = stage.appendingPathComponent(output.lastPathComponent)
             let xml = stage.appendingPathComponent("sequence.xml")
@@ -63,6 +64,7 @@ public enum PremiereInterchange {
                                                      allowLoss: allowLoss, flattenMulticam: flattenMulticam)
             let expected = try PremiereTimeline.nativeAngles(in: xml)
             try ProjectConverter.checkCancellation(cancelled)
+            let mailbox = try activeMailbox()
             warnings += try request("write", project: native, xml: xml, mailbox: mailbox, allowLoss: allowLoss, expectedAngles: expected)
             guard (try native.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) > 0 else {
                 throw CutError(code: "premiere_save_failed", message: "Premiere returned an empty project.")
@@ -94,7 +96,7 @@ public enum PremiereInterchange {
             ["External", "Developer"].map { version.appendingPathComponent("\($0)/com.mpcut.project-converter/PluginData") }
         }
         for mailbox in candidates {
-            let ready = mailbox.appendingPathComponent("ready")
+            let ready = mailbox.appendingPathComponent("ready-v\(protocolVersion)")
             if let modified = try? ready.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
                abs(modified.timeIntervalSinceNow) < 10 { return mailbox }
         }
@@ -103,7 +105,15 @@ public enum PremiereInterchange {
     }
 
     private struct Request: Encodable {
-        let `protocol` = 2
+        enum CodingKeys: String, CodingKey {
+            case protocolVersion = "protocol_version"
+            case operation
+            case project = "project_path"
+            case timeline = "timeline_xml_path"
+            case allowLoss = "allow_loss"
+            case expectedAngles = "expected_angle_numbers"
+        }
+        let protocolVersion = PremiereInterchange.protocolVersion
         let operation: String
         let project: String
         let timeline: String
@@ -130,7 +140,7 @@ public enum PremiereInterchange {
         repeat {
             if let data = try? Data(contentsOf: response), let result = try? JSONDecoder().decode(Result.self, from: data) {
                 if let error = result.error { throw CutError(code: "premiere_conversion_failed", message: error) }
-                return result.warnings ?? []
+                if let warnings = result.warnings { return warnings }
             }
             Thread.sleep(forTimeInterval: 0.15)
         } while ProcessInfo.processInfo.systemUptime < deadline

@@ -6,7 +6,7 @@ struct BulkQueueView: View {
     @State private var options: ExportSheetOptions
     /// The failure of the last check, with the alternatives the export rules report for it.
     @State private var issue: CutError?
-    @State private var isChecking = false
+    @State private var preflight: Task<Void, Never>?
 
     init(editor: EditorModel) {
         self.editor = editor
@@ -34,14 +34,15 @@ struct BulkQueueView: View {
     private var hasAudio: Bool { choices.hasAudio }
     private var tracks: ExportTracks { choices.tracks(options.tracks) }
     private var audioStreams: [StreamInfo] {
-        guard let first = editor.queuedRanges.first else { return [] }
-        if let clip = first.clips.first {
-            return first.media[clip.file]?.streams.filter { $0.kind == "audio" } ?? []
+        let layouts = editor.queuedRanges.flatMap { range -> [[StreamInfo]] in
+            var sources = range.clips.map(\.file)
+            if let reference = range.stillProject?.stillAudioReference {
+                sources.append(URL(fileURLWithPath: reference.file).standardizedFileURL)
+            }
+            return sources.map { source in range.media[source]?.streams.filter { $0.kind == "audio" } ?? [] }
         }
-        if let reference = first.stillProject?.stillAudioReference {
-            return first.media[URL(fileURLWithPath: reference.file).standardizedFileURL]?.streams.filter { $0.kind == "audio" } ?? []
-        }
-        return []
+        guard let first = layouts.first else { return [] }
+        return Array(first.prefix(layouts.map(\.count).min() ?? 0))
     }
     private var exportOptions: ExportSheetOptions {
         var result = options
@@ -63,14 +64,13 @@ struct BulkQueueView: View {
 
     private func export() {
         let requested = exportOptions
-        let ranges = editor.queuedRanges.map(\.id)
-        isChecking = true
-        Task {
+        let ranges = editor.queuedRanges.map(\.contentID)
+        preflight = Task {
             // Plan every range first, so that a range that cannot be written shows the offers of the Export sheet.
             let failure = await editor.checkQueuedRanges(options: requested)
-            guard isChecking else { return }
-            isChecking = false
-            guard requested == exportOptions, ranges == editor.queuedRanges.map(\.id) else { return }
+            guard !Task.isCancelled else { return }
+            preflight = nil
+            guard requested == exportOptions, ranges == editor.queuedRanges.map(\.contentID) else { return }
             issue = failure
             if failure == nil { editor.chooseBulkDestination(options: requested) }
         }
@@ -89,8 +89,17 @@ struct BulkQueueView: View {
             } else {
                 ExportQueueList(count: editor.queuedRanges.count) {
                     ForEach(Array(editor.queuedRanges.enumerated()), id: \.element.id) { index, range in
-                        ExportQueueRangeRow(index: index, title: range.clips.first?.file.lastPathComponent ?? "",
-                                            start: range.start, end: range.end) {
+                        ExportQueueRangeRow(index: index, title: range.name ?? range.clips.first?.file.lastPathComponent ?? "Stills",
+                                            start: range.start, end: range.end,
+                                            details: {
+                                                QueueSnapshotDetails(title: range.name ?? "", contentID: range.contentID, canRevise: editor.canReviseQueuedRange, hasExcerpt: range.excerpt != nil,
+                                                                     items: range.snapshotItems,
+                                                                     rename: { try editor.renameQueuedRange(range.id, to: $0) },
+                                                                     revise: { try editor.reviseQueuedRange(range.id, extending: $0) })
+                                            },
+                                            saveExcerpt: range.excerpt.map { excerpt in
+                                                { excerpt.presentSave(in: editor.editorWindow, canSave: editor.canSaveProjectTo) }
+                                            }) {
                             editor.removeQueuedRange(range.id)
                         }
                     }
@@ -124,8 +133,8 @@ struct BulkQueueView: View {
                     .disabled(modes.count < 2)
                     .help("Choose export mode")
                     if placements != .none && tracks != .audio {
-                        Toggle("Preserve camera picture", isOn: $options.requireCameraCopy)
-                            .help("Copy camera footage")
+                        Toggle("Require Camera Video Copy", isOn: $options.requireCameraCopy)
+                            .help("Require stream copy for retained camera video")
                     }
                     if exportOptions.convertsAudio {
                         Picker("Audio", selection: Binding(get: { options.audioFormat },
@@ -180,7 +189,7 @@ struct BulkQueueView: View {
                     }
                 }
                 ExportOrganizationFields(organization: $options.organization,
-                                         stem: editor.queuedRanges.first?.clips.first?.file.deletingPathExtension().lastPathComponent ?? "Clip",
+                                         stem: editor.queuedRanges.first?.name ?? editor.queuedRanges.first?.clips.first?.file.deletingPathExtension().lastPathComponent ?? "Clip",
                                          container: exportOptions.container)
                 if let issue {
                     ExportOffersView(message: ExportRules.describe(issue, clips: []), alternatives: ExportQueueChoices.offers(for: issue)) {
@@ -193,18 +202,21 @@ struct BulkQueueView: View {
             Button("Close") { editor.isBulkQueuePresented = false }.keyboardShortcut(.cancelAction)
                 .help("Close export queue")
             Button(editor.queuedRanges.count == 1 ? "Export File…" : "Export \(editor.queuedRanges.count) Files…", action: export)
-                .keyboardShortcut(.defaultAction).disabled(editor.queuedRanges.isEmpty || isChecking)
+                .keyboardShortcut(.defaultAction).disabled(editor.queuedRanges.isEmpty || preflight != nil)
                 .help("Export queued ranges")
         }
         .onChange(of: options) { _, _ in issue = nil }
-        .onChange(of: editor.queuedRanges.map(\.id)) { _, _ in
+        .onChange(of: editor.queuedRanges.map(\.contentID)) { _, _ in
             issue = nil
             if tracks != options.tracks { chooseTracks(tracks) }
             if let stream = options.audioTrackOrdinal, !audioStreams.indices.contains(stream) {
                 options.audioTrackOrdinal = nil
             }
         }
-        .onDisappear { isChecking = false }
+        .onDisappear {
+            preflight?.cancel()
+            preflight = nil
+        }
         .frame(width: 500)
     }
 }
@@ -232,7 +244,8 @@ struct ExportQueueList<Rows: View>: View {
         // Hug a short queue; scroll a long one.
         List { rows }
             .listStyle(.inset(alternatesRowBackgrounds: true))
-            .frame(height: min(228, CGFloat(max(2, count)) * 44 + 8))
+            // The inset list pads its rows by ten points above and below.
+            .frame(height: min(240, CGFloat(max(2, count)) * 44 + 20))
             .modifier(InsetPanel())
     }
 }
@@ -242,6 +255,9 @@ struct ExportQueueRangeRow: View {
     let title: String
     let start: RationalTime
     let end: RationalTime
+    var details: (() -> QueueSnapshotDetails)? = nil
+    var saveExcerpt: (() -> Void)? = nil
+    @State private var isShowingDetails = false
     let remove: () -> Void
 
     var body: some View {
@@ -260,6 +276,23 @@ struct ExportQueueRangeRow: View {
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .accessibilityLabel("Duration")
+            if let details {
+                Button { isShowingDetails.toggle() } label: {
+                    Image(systemName: "info.circle")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Inspect queued range \(index + 1)")
+                .help("Inspect or edit the captured range")
+                .popover(isPresented: $isShowingDetails) { details() }
+            }
+            if let saveExcerpt {
+                Button(action: saveExcerpt) {
+                    Image(systemName: "square.and.arrow.down")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Save Excerpt Project")
+                .help("Save Excerpt Project…")
+            }
             Button(action: remove) {
                 Image(systemName: "minus.circle")
             }
@@ -268,6 +301,94 @@ struct ExportQueueRangeRow: View {
             .help("Remove queued range")
         }
         .padding(.vertical, 2)
+    }
+}
+
+struct QueueSnapshotDetails: View {
+    let title: String
+    let contentID: UUID
+    let canRevise: Bool
+    let hasExcerpt: Bool
+    let items: () throws -> [QueueSnapshotItem]
+    let rename: (String) throws -> Void
+    let revise: (Bool) throws -> Void
+    @State private var name = ""
+    @State private var issue: String?
+    @State private var captured: [QueueSnapshotItem] = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                TextField("Queue entry name", text: $name, prompt: Text("Queue entry name"))
+                Button("Rename") { perform { try rename(name) } }
+                    .disabled((try? QueueEdit.name(name)) == nil || name == title)
+            }
+            Text("Captured contents").font(.headline)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(captured.enumerated()), id: \.offset) { _, item in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.file)
+                                .font(.callout)
+                                .textSelection(.enabled)
+                            HStack {
+                                if let slot = item.laneColorSlot { MulticamLaneChip(slot: slot) }
+                                Text(item.laneLabel ?? item.kind.capitalized)
+                                if !item.trim.isEmpty { Text(item.trim) }
+                                if let stream = item.stream { Text("Stream \(stream)") }
+                                if let output = item.output {
+                                    Text("Output \(timelineTime(output.from.seconds, milliseconds: true)) – \(timelineTime(output.to.seconds, milliseconds: true))")
+                                }
+                            }
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            .frame(height: 150)
+            Text(canRevise
+                 ? "Both actions capture the live edit within the marks. Extend requires wider marks that enclose the original range."
+                 : "Close the queue and mark a range to revise this entry.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if hasExcerpt && canRevise {
+                Text("Recapturing removes the option to save this entry as an excerpt project.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            HStack {
+                Button("Replace with Marked Range") { perform { try revise(false) } }
+                Button("Extend to Marked Range") { perform { try revise(true) } }
+            }
+            .disabled(!canRevise)
+            if let issue { IssueLabel(issue) }
+        }
+        .padding()
+        .frame(width: 415)
+        .onAppear {
+            name = title
+            refreshItems()
+        }
+        .onChange(of: contentID) { _, _ in
+            name = title
+            refreshItems()
+        }
+    }
+
+    private func refreshItems() {
+        captured = []
+        perform { captured = try items() }
+    }
+
+    private func perform(_ action: () throws -> Void) {
+        do {
+            try action()
+            issue = nil
+        } catch {
+            issue = error.localizedDescription
+        }
     }
 }
 
@@ -287,8 +408,16 @@ struct ExportOrganizationFields: View {
                     IssueLabel(error)
                 } else {
                     let file = organization.filename(stem: stem, suffix: "001", container: container)
-                    LabeledContent(container.isEmpty ? "First file (before extension)" : "First file", value: organization.subfolder.isEmpty ? file : "\(organization.subfolder)/\(file)")
-                        .font(.caption)
+                    // A short label keeps this column as wide as the options above it.
+                    LabeledContent("Preview") {
+                        Text(organization.subfolder.isEmpty ? file : "\(organization.subfolder)/\(file)")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                    .help(container.isEmpty ? "The first file's name. Its extension follows the source." : "The first file's name")
                 }
             }
         } label: {

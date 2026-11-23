@@ -1,27 +1,27 @@
 [
   {
-    "name": "set_camera_at",
+    "name": "multicam_camera_take",
     "description": "Take a camera by angle ID or displayed number at an explicit group time with native snapping and history. Returns the actual time and end of the affected switch interval.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
-          "description": "Live project handle returned by list_projects."
+          "description": "Live project handle returned by project_windows_list."
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
-          "description": "Revision from get_editor_state."
+          "description": "Revision from project_editor_state_read."
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "description": "Unique operation ID for this edit. Retry the same request with the same ID."
         },
-        "angle": {
+        "angle_id": {
           "type": "string",
           "description": "Stable camera source ID from the live project."
         },
-        "number": {
+        "camera_number": {
           "type": "integer",
           "minimum": 1,
           "description": "One-based displayed camera number from the current revision."
@@ -31,39 +31,47 @@
           "minimum": 0,
           "description": "Optional source-backed assembly occurrence from the current revision."
         },
-        "time": {
+        "group_time": {
           "type": "string",
           "description": "Exact rational seconds on the multicam group clock."
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
-        "time"
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "group_time"
       ],
       "oneOf": [
-        { "required": ["angle"] },
-        { "required": ["number"] }
+        {
+          "required": [
+            "angle_id"
+          ]
+        },
+        {
+          "required": [
+            "camera_number"
+          ]
+        }
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "multicam_switch",
+    "name": "multicam_switch_edit",
     "description": "Edit an existing group switch at time. move/apply_suggestion require to, angle requires angle, audio requires source and stream. default_audio restores project routing.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
-          "description": "Live project handle returned by list_projects."
+          "description": "Live project handle returned by project_windows_list."
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
-          "description": "Revision from get_editor_state."
+          "description": "Revision from project_editor_state_read."
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "description": "Unique operation ID for this edit. Retry the same request with the same ID."
         },
@@ -86,23 +94,23 @@
           "type": "string",
           "description": "Exact rational seconds on the multicam group clock."
         },
-        "angle": {
+        "angle_id": {
           "type": "string",
           "description": "Stable camera source ID from the live project."
         },
-        "source": {
+        "source_id": {
           "type": "string",
           "description": "Stable ID of a camera or separate audio source."
         },
-        "stream": {
+        "audio_stream_index": {
           "type": "integer",
           "description": "Absolute audio stream index in the indicated source."
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
+        "project_handle",
+        "expected_revision",
+        "operation_id",
         "action",
         "time"
       ],
@@ -110,20 +118,20 @@
     }
   },
   {
-    "name": "multicam_source",
-    "description": "Edit a camera or recorder. rename requires name; offset requires offset; nudge/move require direction; nudge also accepts a group time; microphone sets stream (omit to clear); relink requires an absolute path.",
+    "name": "multicam_source_edit",
+    "description": "Edit a camera or recorder. rename requires name; offset requires offset; nudge/move require direction; nudge also accepts a group time; microphone sets stream (omit to clear); relink requires an absolute path; add_recording requires angle_id, an absolute path and group_start.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
-          "description": "Live project handle returned by list_projects."
+          "description": "Live project handle returned by project_windows_list."
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
-          "description": "Revision from get_editor_state."
+          "description": "Revision from project_editor_state_read."
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "description": "Unique operation ID for this edit. Retry the same request with the same ID."
         },
@@ -135,12 +143,21 @@
             "nudge",
             "move",
             "microphone",
-            "relink"
+            "relink",
+            "add_recording"
           ]
         },
-        "source": {
+        "source_id": {
           "type": "string",
-          "description": "Stable ID of a camera or separate audio source."
+          "description": "Stable recording ID. Required except for add_recording."
+        },
+        "angle_id": {
+          "type": "string",
+          "description": "Camera angle ID for add_recording."
+        },
+        "group_start": {
+          "type": "string",
+          "description": "Exact group time at which the new recording’s first picture appears."
         },
         "name": {
           "type": "string",
@@ -161,40 +178,39 @@
             1
           ]
         },
-        "stream": {
+        "audio_stream_index": {
           "type": "integer",
           "description": "Absolute audio stream index in the indicated source."
         },
         "path": {
           "type": "string",
-          "description": "Absolute replacement file path."
+          "description": "Absolute replacement or additional recording path."
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
-        "action",
-        "source"
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "action"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "multicam_audio",
-    "description": "Set program audio routing. A fixed master requires a source ID and an absolute audio stream.",
+    "name": "multicam_program_audio_set",
+    "description": "Set Fixed, Follow, None or Mix audio. Mix accepts an ordered lane list. Replace applies one soundtrack and clears switch overrides. For an external replacement, supply a reference_source_id and confirmed relative_offset to align the incoming sound.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
-          "description": "Live project handle returned by list_projects."
+          "description": "Live project handle returned by project_windows_list."
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
-          "description": "Revision from get_editor_state."
+          "description": "Revision from project_editor_state_read."
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "description": "Unique operation ID for this edit. Retry the same request with the same ID."
         },
@@ -203,42 +219,384 @@
           "enum": [
             "fixed",
             "follow",
-            "none"
+            "none",
+            "replace",
+            "mix"
           ]
         },
-        "source": {
+        "source_id": {
           "type": "string",
           "description": "Stable ID of a camera or separate audio source."
         },
-        "stream": {
+        "audio_stream_index": {
           "type": "integer",
           "description": "Absolute audio stream index in the indicated source."
+        },
+        "replacement": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute path to an external replacement recording."
+        },
+        "replacement_audio_stream_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lanes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "color_slot": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 7
+              },
+              "target": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "camera"
+                        ]
+                      },
+                      "angle_id": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "angle_id"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "recording"
+                        ]
+                      },
+                      "source_id": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "audio_stream_index": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "source_id",
+                      "audio_stream_index"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "label",
+              "color_slot",
+              "target"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "reference_source_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Camera recording ID for an aligned program replacement."
+        },
+        "relative_offset": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Confirmed rational offset relative to the reference recording."
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
+        "project_handle",
+        "expected_revision",
+        "operation_id",
         "mode"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "enum": [
+                "none",
+                "follow"
+              ]
+            }
+          },
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "source_id"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "audio_stream_index"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement_audio_stream_index"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "lanes"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "properties": {
+            "mode": {
+              "enum": [
+                "fixed",
+                "replace"
+              ]
+            }
+          },
+          "required": [
+            "source_id",
+            "audio_stream_index"
+          ],
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "replacement"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement_audio_stream_index"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "lanes"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "replace"
+            }
+          },
+          "required": [
+            "replacement"
+          ],
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "source_id"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "audio_stream_index"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "lanes"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "mix"
+            }
+          },
+          "required": [],
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "source_id"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "audio_stream_index"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement_audio_stream_index"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "fixed"
+            }
+          },
+          "required": [],
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "source_id"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "audio_stream_index"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement_audio_stream_index"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "lanes"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "reference_source_id"
+            ]
+          },
+          "then": {
+            "required": [
+              "reference_source_id",
+              "relative_offset",
+              "replacement",
+              "replacement_audio_stream_index"
+            ],
+            "properties": {
+              "mode": {
+                "const": "replace"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "relative_offset"
+            ]
+          },
+          "then": {
+            "required": [
+              "reference_source_id",
+              "relative_offset",
+              "replacement",
+              "replacement_audio_stream_index"
+            ],
+            "properties": {
+              "mode": {
+                "const": "replace"
+              }
+            }
+          }
+        }
+      ]
     }
   },
   {
-    "name": "multicam_group",
+    "name": "multicam_group_end_set",
     "description": "Set the group end using time or extend to the last available camera.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
-          "description": "Live project handle returned by list_projects."
+          "description": "Live project handle returned by project_windows_list."
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
-          "description": "Revision from get_editor_state."
+          "description": "Revision from project_editor_state_read."
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "description": "Unique operation ID for this edit. Retry the same request with the same ID."
         },
@@ -255,29 +613,29 @@
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
+        "project_handle",
+        "expected_revision",
+        "operation_id",
         "action"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "multicam_assembly",
-    "description": "Edit retained occurrences. append requires group from/to; trim requires occurrence and from or to; move requires occurrence and before; remove requires an explicit occurrence. Removing the last explicit occurrence restores the implicit full group. Selection actions require space, from and to matching the selected range; read those values from multicam_select. Use trim_edge or preview_trim with occurrence, edge and group time for native handle snapping.",
+    "name": "multicam_assembly_edit",
+    "description": "Edit retained occurrences. append requires group from/to; trim requires occurrence and from or to; move requires occurrence and before; remove requires an explicit occurrence. Removing the last explicit occurrence restores the implicit full group. Selection actions require space, from and to matching the selected range; read those values from multicam_selection_set. Use trim_edge or preview_trim with occurrence, edge and group time for native handle snapping. apply_edge_suggestion moves the unsafe range edge reported by multicam_state_read suggestions to one of its verified times in to. Set a picture-only occurrence override with angle_set (occurrence and angle_id), or restore group picture switches with angle_clear (occurrence).",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
-          "description": "Live project handle returned by list_projects."
+          "description": "Live project handle returned by project_windows_list."
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
-          "description": "Revision from get_editor_state."
+          "description": "Revision from project_editor_state_read."
         },
-        "operationID": {
+        "operation_id": {
           "type": "string",
           "description": "Unique operation ID for this edit. Retry the same request with the same ID."
         },
@@ -291,7 +649,10 @@
             "split_selection",
             "subtract_selection",
             "trim_edge",
-            "preview_trim"
+            "preview_trim",
+            "apply_edge_suggestion",
+            "angle_set",
+            "angle_clear"
           ]
         },
         "occurrence": {
@@ -327,28 +688,32 @@
             "group",
             "assembly"
           ]
+        },
+        "angle_id": {
+          "type": "string",
+          "description": "Camera angle ID for angle_set."
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID",
+        "project_handle",
+        "expected_revision",
+        "operation_id",
         "action"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "multicam_select",
+    "name": "multicam_selection_set",
     "description": "Select a switch at group time, occurrence by index, a range with from/to in the named clock, tool or marks in this window.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
-          "description": "Live project handle returned by list_projects."
+          "description": "Live project handle returned by project_windows_list."
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0,
           "description": "Required when selecting an occurrence from an assembly with still inserts."
@@ -385,21 +750,21 @@
         }
       },
       "required": [
-        "project",
+        "project_handle",
         "action"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "multicam_preview",
+    "name": "multicam_preview_control",
     "description": "Set preview mode or transport. audition takes angle; speed takes a rate; shuttle and step actions take direction; snap takes target.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string",
-          "description": "Live project handle returned by list_projects."
+          "description": "Live project handle returned by project_windows_list."
         },
         "action": {
           "type": "string",
@@ -422,7 +787,7 @@
             "end_scrub"
           ]
         },
-        "angle": {
+        "angle_id": {
           "type": "string",
           "description": "Stable camera source ID from the live project."
         },
@@ -463,19 +828,19 @@
         }
       },
       "required": [
-        "project",
+        "project_handle",
         "action"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "get_multicam",
-    "description": "Inspect the live group, program audio and reference camera. Page sources with offsets, index issues and stream IDs, switches with overrides, suggested switch boundaries, assembly occurrences, or still placements.",
+    "name": "multicam_state_read",
+    "description": "Inspect the live group, program audio and reference camera. Page sources with offsets, index issues and stream IDs, switches with overrides, suggested switch boundaries and range edges, assembly occurrences, or still placements. For switch_coverage, supply group_time and angle_id to check the proposed snapped interval before committing a take. The audio section gives the saved Mix lanes and bindings and the resolved program spans and gaps.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
         "section": {
@@ -485,7 +850,9 @@
             "switches",
             "suggestions",
             "assembly",
-            "stills"
+            "stills",
+            "switch_coverage",
+            "audio"
           ]
         },
         "offset": {
@@ -497,16 +864,404 @@
           "minimum": 1,
           "maximum": 200
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
+        },
+        "angle_id": {
+          "type": "string",
+          "description": "Camera angle ID for switch_coverage."
+        },
+        "group_time": {
+          "type": "string",
+          "description": "Requested exact group time for switch_coverage."
         }
       },
       "required": [
-        "project",
+        "project_handle",
         "section"
       ],
       "additionalProperties": false
+    }
+  },
+  {
+    "name": "multicam_track_audio_edit",
+    "description": "Apply a confirmed rational replacement offset relative to a recording, or remove its binding. Applies to the selected original stream across audio policies.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "description": "Live project handle returned by project_windows_list."
+        },
+        "expected_revision": {
+          "type": "integer",
+          "description": "Revision from project_editor_state_read."
+        },
+        "operation_id": {
+          "type": "string",
+          "description": "Unique operation ID for this edit. Retry the same request with the same ID."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "set",
+            "remove"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "original": {
+          "type": "object",
+          "properties": {
+            "source_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "audio_stream_index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "source_id",
+            "audio_stream_index"
+          ],
+          "additionalProperties": false
+        },
+        "replacement": {
+          "type": "object",
+          "properties": {
+            "source_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "audio_stream_index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "source_id",
+            "audio_stream_index"
+          ],
+          "additionalProperties": false
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/"
+        },
+        "replacement_stream_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "replacement_source_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "relative_offset": {
+          "type": "string",
+          "minLength": 1
+        },
+        "uncovered": {
+          "type": "string",
+          "enum": [
+            "keep_original",
+            "leave_uncovered"
+          ]
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "action",
+        "id"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "action": {
+              "const": "remove"
+            }
+          },
+          "required": [],
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "original"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "path"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement_stream_index"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement_source_id"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "relative_offset"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "uncovered"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "set"
+            }
+          },
+          "required": [
+            "original",
+            "replacement",
+            "relative_offset",
+            "uncovered"
+          ],
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "path"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement_stream_index"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement_source_id"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "set"
+            }
+          },
+          "required": [
+            "original",
+            "path",
+            "replacement_stream_index",
+            "replacement_source_id",
+            "relative_offset",
+            "uncovered"
+          ],
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "replacement"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "multicam_track_audio_sync_suggest",
+    "description": "Compare an original scratch stream with a replacement stream and report metadata alignment, waveform alignment and drift. The optional seed is a rational offset relative to the original recording. Set program for program-wide replacement coverage.",
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "description": "Live project handle returned by project_windows_list."
+        },
+        "expected_revision": {
+          "type": "integer",
+          "description": "Revision from project_editor_state_read."
+        },
+        "operation_id": {
+          "type": "string",
+          "description": "Unique operation ID for this edit. Retry the same request with the same ID."
+        },
+        "original": {
+          "type": "object",
+          "properties": {
+            "source_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "audio_stream_index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "source_id"
+          ],
+          "additionalProperties": false
+        },
+        "replacement": {
+          "type": "object",
+          "properties": {
+            "source_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "audio_stream_index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "source_id",
+            "audio_stream_index"
+          ],
+          "additionalProperties": false
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^/"
+        },
+        "replacement_stream_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "replacement_source_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seed": {
+          "type": "string",
+          "minLength": 1
+        },
+        "metadata_only": {
+          "type": "boolean"
+        },
+        "program": {
+          "type": "boolean",
+          "description": "Evaluate coverage across the program. The original stream index is optional with a video-only reference."
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "original"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "replacement"
+          ],
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "path"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement_stream_index"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "replacement_source_id"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "required": [
+            "path",
+            "replacement_stream_index"
+          ],
+          "not": {
+            "required": [
+              "replacement"
+            ]
+          }
+        }
+      ],
+      "if": {
+        "not": {
+          "properties": {
+            "program": {
+              "const": true
+            }
+          },
+          "required": [
+            "program"
+          ]
+        }
+      },
+      "then": {
+        "properties": {
+          "original": {
+            "properties": {
+              "audio_stream_index": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "audio_stream_index"
+            ]
+          }
+        }
+      }
     }
   }
 ]

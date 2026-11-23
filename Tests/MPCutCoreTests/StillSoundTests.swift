@@ -69,6 +69,131 @@ final class StillSoundTests: XCTestCase {
         }
     }
 
+    func testMixStillInsertAndRecordingGapGiveEachLaneItsOwnTreatment() throws {
+        try withDirectory { folder, helper in
+            func recording(_ name: String, samples: Int) throws -> String {
+                let file = folder.appendingPathComponent(name + ".wav")
+                try run(helper, ["-f", "lavfi", "-i", "sine=r=48000",
+                                 "-af", "atrim=end_sample=\(samples)", "-c:a", "pcm_s24le", file.path], in: folder)
+                return file.lastPathComponent
+            }
+            let a = try MulticamSource(id: "a", file: recording("a", samples: 48_000), audioStream: 0)
+            let second = try MulticamSource(id: "b2", file: recording("b2", samples: 12_000),
+                                           offset: t(3, 4), audioStream: 0, coverage: .init(from: t(3, 4), to: t(1)))
+            let b = try MulticamSource(id: "b", file: recording("b", samples: 12_000), audioStream: 0,
+                                      coverage: .init(from: .zero, to: t(1, 4)), additionalRecordings: [second])
+            let asset = StillAsset(id: "title", file: "offline.png", displayName: "Title", fingerprint: "offline")
+            let title = StillInsert(id: "insert", assetID: asset.id, duration: t(1, 10), cadence: t(1, 30))
+            let project = CutProject.multicam(.init(
+                referenceAngle: a.id, range: .init(from: .zero, to: t(1)), angles: [a, b], audio: .mix,
+                switches: [.init(at: .zero, angle: a.id)],
+                assemblyItems: [.group(.init(from: .zero, to: t(1))), .still(title)], stillAssets: [asset],
+                mixLanes: [
+                    .init(id: "mic-a", target: .camera(a.id), label: "Microphone A", colorSlot: 0),
+                    .init(id: "mic-b", target: .camera(b.id), label: "Microphone B", colorSlot: 1),
+                ]))
+            let planner = StillExportPlanner()
+            let document = folder.appendingPathComponent("show.cut")
+            XCTAssertThrowsError(try planner.resolve(project, relativeTo: document, tracks: .audio, mode: .copy,
+                                                     container: "mov", offerAlternatives: false)) {
+                let issue = $0 as? CutError
+                XCTAssertEqual(issue?.code, "generated_audio_required")
+                XCTAssertEqual(issue?.laneID, "mic-a")
+                XCTAssertTrue(issue?.message.contains("1–11/10") == true)
+            }
+            let plan = try planner.resolve(project, relativeTo: document, tracks: .audio, mode: .copy,
+                                           container: "mov", audioAction: .auto)
+            let actions = plan.report.soundActions
+            XCTAssertEqual(actions.compactMap(\.laneID), ["mic-a", "mic-b"])
+            XCTAssertEqual(actions.compactMap(\.codec), ["pcm_s24le", "pcm_s24le"])
+            XCTAssertEqual(actions.compactMap(\.treatment), Array(repeating: "retained PCM samples + generated silence", count: 2))
+            XCTAssertEqual(actions.map(\.generatedSilence), [
+                [.init(from: t(1), to: t(11, 10))],
+                [.init(from: t(1, 4), to: t(3, 4)), .init(from: t(1), to: t(11, 10))],
+            ])
+            let rendered = folder.appendingPathComponent("separate.mov")
+            try planner.write(plan, to: rendered)
+            XCTAssertEqual(try Probe.read(rendered).audio.map(\.end), [t(11, 10), t(11, 10)])
+
+            let downmix = try planner.resolve(project, relativeTo: document, tracks: .audio, mode: .copy,
+                                              container: "mov", audioOutput: .downmixMono, audioAction: .pcm)
+            XCTAssertEqual(downmix.report.soundActions.compactMap(\.channelLayout), ["mono"])
+            XCTAssertEqual(downmix.report.soundActions.first?.generatedSilence, [.init(from: t(1), to: t(11, 10))])
+            let output = folder.appendingPathComponent("downmix.mov")
+            try planner.write(downmix, to: output)
+            XCTAssertEqual(try Probe.read(output).audio.first?.end, t(11, 10))
+
+        }
+    }
+
+    func testMixStillExportDoesNotOpenReplacedOffAirScratch() throws {
+        try withDirectory { folder, helper in
+            let audio = folder.appendingPathComponent("replacement.wav")
+            try run(helper, ["-f", "lavfi", "-i", "sine=r=48000:d=1", "-c:a", "pcm_s16le", audio.path], in: folder)
+            let recorded = MulticamSource(id: "recorded", file: audio.lastPathComponent, audioStream: 0)
+            let scratch = MulticamSource(id: "scratch", file: "unavailable.wav", audioStream: 0)
+            let primary = MulticamSource(id: "main", file: audio.lastPathComponent)
+            let asset = StillAsset(id: "title", file: "offline.png", displayName: "Title", fingerprint: "offline")
+            let title = StillInsert(id: "insert", assetID: asset.id, duration: t(1, 10), cadence: t(1, 30))
+            let range = MulticamRange(from: .zero, to: t(1))
+            var multicam = MulticamProject(referenceAngle: primary.id, range: range, angles: [primary, scratch],
+                audioSources: [recorded], audio: .mix, switches: [.init(at: .zero, angle: primary.id)],
+                assemblyItems: [.group(range), .still(title)], stillAssets: [asset],
+                mixLanes: [.init(id: "selected", target: .camera(scratch.id), label: "Microphone", colorSlot: 0)],
+                audioReplacements: [.init(id: "binding", original: .init(source: scratch.id, stream: 0),
+                    replacement: .init(source: recorded.id, stream: 0), relativeOffset: .zero, uncovered: .leaveUncovered)])
+            let planner = StillExportPlanner()
+            let document = folder.appendingPathComponent("show.cut")
+            let plan = try planner.resolve(multicam, relativeTo: document, tracks: .audio, mode: .copy,
+                                           container: "mov", audioAction: .auto)
+            XCTAssertEqual(plan.report.soundActions.first?.sources.map(\.file.lastPathComponent), [audio.lastPathComponent])
+            let output = folder.appendingPathComponent("resolved.mov")
+            try planner.write(plan, to: output)
+            XCTAssertEqual(try Probe.read(output).audio.first?.end, t(11, 10))
+
+            multicam.audioReplacements[0].uncovered = .keepOriginal
+            _ = try planner.resolve(multicam, relativeTo: document, tracks: .audio, mode: .copy,
+                                    container: "mov", audioAction: .auto)
+            multicam.audioReplacements[0].relativeOffset = t(1, 4)
+            XCTAssertThrowsError(try planner.resolve(multicam, relativeTo: document, tracks: .audio, mode: .copy,
+                                                    container: "mov", offerAlternatives: false, audioAction: .auto)) {
+                let issue = $0 as? CutError
+                XCTAssertEqual(issue?.laneID, "selected")
+                XCTAssertTrue(issue?.message.contains("0–1/4") == true)
+            }
+        }
+    }
+
+    func testStillPictureReplacementKeepsBoundPCMDeclaredLeadingDelay() throws {
+        try withDirectory { folder, helper in
+            let file = folder.appendingPathComponent("delayed.mov")
+            try run(helper, ["-itsoffset", "0.125", "-f", "lavfi", "-i", "sine=r=48000:d=0.875",
+                             "-c:a", "pcm_s16le", "-movie_timescale", "705600000", file.path], in: folder)
+            let replacement = MulticamSource(id: "recorded", file: file.lastPathComponent, audioStream: 0)
+            let original = MulticamSource(id: "scratch", file: "unavailable.wav", audioStream: 0)
+            let range = MulticamRange(from: .zero, to: t(1))
+            let asset = StillAsset(id: "still", file: "offline.png", displayName: "Still", fingerprint: "offline")
+            let project = MulticamProject(referenceAngle: original.id, range: range, angles: [original],
+                audioSources: [replacement], audio: .mix, switches: [.init(at: .zero, angle: original.id)],
+                stillAssets: [asset], stillReplacements: [
+                    .init(id: "cover", assetID: asset.id, coverage: .group(.init(from: t(1, 3), to: t(2, 3)))),
+                ], mixLanes: [.init(id: "selected", target: .camera(original.id), label: "Microphone", colorSlot: 0)],
+                audioReplacements: [.init(id: "binding", original: .init(source: original.id, stream: 0),
+                    replacement: .init(source: replacement.id, stream: 0), relativeOffset: .zero, uncovered: .leaveUncovered)])
+            let planner = StillExportPlanner()
+            let document = folder.appendingPathComponent("show.cut")
+            let plan = try planner.resolve(project, relativeTo: document, tracks: .audio, mode: .copy,
+                                           container: "mov", audioAction: .copyOriginal)
+            XCTAssertEqual(plan.report.soundActions.map(\.audio), [.copyOriginal])
+            XCTAssertEqual(plan.report.soundActions.first?.generatedSilence, [])
+            let output = folder.appendingPathComponent("sound.mov")
+            try planner.write(plan, to: output)
+            let track = try XCTUnwrap(CutEngine().inspectMulticamSource(output).audio.first)
+            XCTAssertEqual(track.start, t(1, 8))
+            XCTAssertEqual(track.end, t(1))
+        }
+    }
+
     func testPictureReplacementPreservesBothAACTracksAndTheirPresentation() throws {
         try withDirectory { folder, helper in
             let source = folder.appendingPathComponent("source.mov")
@@ -216,6 +341,114 @@ final class StillSoundTests: XCTestCase {
             let streams = try Probe.read(result).audio
             XCTAssertEqual(streams.map(\.end), [t(2), t(2)])
             XCTAssertEqual(streams.map { $0.stream.sampleRate }, [48_000, 48_000])
+        }
+    }
+
+    func testConversionCanFillAnIntervalBeforeTheSelectedSoundBegins() throws {
+        try withDirectory { folder, helper in
+            let source = folder.appendingPathComponent("offset.mov")
+            try run(helper, ["-f", "lavfi", "-i", "color=s=96x64:r=30:d=2",
+                             "-itsoffset", "1", "-f", "lavfi", "-i", "sine=r=48000:d=1",
+                             "-map", "0:v", "-map", "1:a", "-c:v", "h264_videotoolbox", "-allow_sw", "1",
+                             "-c:a", "pcm_s16le", source.path], in: folder)
+            let asset = StillAsset(id: "title", file: "offline.png", displayName: "Title", fingerprint: "offline")
+            let clip = CutSequenceClip(id: "take", file: source.lastPathComponent, from: .zero, to: t(1, 2))
+            let title = StillInsert(id: "insert", assetID: asset.id, duration: t(1, 2), cadence: t(1, 30))
+            let project = CutProject.stillSequence(StillSequenceProject(items: [.source(clip), .still(title)], stillAssets: [asset]))
+            let planner = StillSoundPlanner()
+            let plan = try planner.resolve(project, relativeTo: folder.appendingPathComponent("show.cut"),
+                                           timeline: project.resolveStills(), tracks: .audio, audioStream: nil,
+                                           mode: .encode, audio: .pcm, container: "mov")
+            XCTAssertEqual(plan.actions.first?.generatedSilence, [MulticamRange(from: .zero, to: t(1, 2)),
+                                                                  MulticamRange(from: t(1, 2), to: t(1))])
+            let output = try XCTUnwrap(planner.write(plan, in: folder).first)
+            let raw = folder.appendingPathComponent("silence.raw")
+            try run(helper, ["-i", output.path, "-c:a", "pcm_s32le", "-f", "s32le", raw.path], in: folder)
+            XCTAssertEqual(try Data(contentsOf: raw), Data(repeating: 0, count: 48_000 * 4))
+        }
+    }
+
+    func testSmartSilencePreservesSamplesFromBigEndianPCM() throws {
+        try withDirectory { folder, helper in
+            let source = folder.appendingPathComponent("recording.aiff")
+            do {
+                let recording = try AVAudioFile(forWriting: source, settings: [
+                    AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 1,
+                    AVLinearPCMBitDepthKey: 16, AVLinearPCMIsBigEndianKey: true
+                ], commonFormat: .pcmFormatInt16, interleaved: true)
+                let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: recording.processingFormat, frameCapacity: 4800))
+                buffer.frameLength = 4800
+                let samples = try XCTUnwrap(buffer.int16ChannelData?[0])
+                for index in 0..<4800 { samples[index] = Int16(index) - 2400 }
+                try recording.write(from: buffer)
+            }
+            XCTAssertEqual(try Probe.read(source).audio.first?.stream.codec, "pcm_s16be")
+            let asset = StillAsset(id: "title", file: "offline.png", displayName: "Title", fingerprint: "offline")
+            let title = StillInsert(id: "insert", assetID: asset.id, duration: t(1, 10), cadence: t(1, 30))
+            let clip = CutSequenceClip(id: "take", file: source.lastPathComponent, from: .zero, to: t(1, 10))
+            let project = CutProject.stillSequence(StillSequenceProject(items: [.still(title), .source(clip)], stillAssets: [asset]))
+            let planner = StillSoundPlanner()
+            let plan = try planner.resolve(project, relativeTo: folder.appendingPathComponent("show.cut"),
+                                           timeline: project.resolveStills(), tracks: .audio, audioStream: nil,
+                                           mode: .smart, audio: .auto, container: "mov")
+            XCTAssertEqual(plan.actions.map(\.audio), [.pcm])
+            let output = try XCTUnwrap(planner.write(plan, in: folder).first)
+            XCTAssertEqual(try Probe.read(output).audio.first?.stream.codec, "pcm_s16le")
+            let reference = folder.appendingPathComponent("reference.raw")
+            let written = folder.appendingPathComponent("written.raw")
+            for (input, raw) in [(source, reference), (output, written)] {
+                try run(helper, ["-i", input.path, "-c:a", "pcm_s16le", "-f", "s16le", raw.path], in: folder)
+            }
+            let expected = try Data(repeating: 0, count: 4800 * 2) + Data(contentsOf: reference)
+            XCTAssertEqual(try Data(contentsOf: written), expected)
+        }
+    }
+
+    func testCombineRetainsEditLengthsWithIncompatibleStagingClocks() throws {
+        try withDirectory { folder, helper in
+            let first = folder.appendingPathComponent("first.mov")
+            let second = folder.appendingPathComponent("second.mov")
+            for (file, clock, samples) in [(first, 705_600_002, 24_000), (second, 705_600_003, 16_000)] {
+                try run(helper, ["-f", "lavfi", "-i", "sine=r=48000",
+                                 "-af", "atrim=end_sample=\(samples)", "-c:a", "aac",
+                                 "-movie_timescale", "\(clock)", file.path], in: folder)
+            }
+            let output = folder.appendingPathComponent("program.mov")
+            try MulticamMOV.combine(picture: nil, sounds: [first, second], output: output) { _ in }
+            let inputs = try [first, second].map { try XCTUnwrap(Probe.read($0).audio.first) }
+            let tracks = try Probe.read(output).audio
+            XCTAssertEqual(tracks.map(\.start), [.zero, .zero])
+            XCTAssertEqual(tracks.map(\.end), [t(1, 2), t(1, 3)])
+            XCTAssertEqual(tracks.map { $0.presentationEdits.map(\.samples) },
+                           inputs.map { $0.presentationEdits.map(\.samples) })
+            XCTAssertEqual(tracks.map { $0.presentationEdits.map(\.isAudible) },
+                           inputs.map { $0.presentationEdits.map(\.isAudible) })
+        }
+    }
+
+    func testAutomaticConversionPreservesSideSpeakerLayoutWithPCM() throws {
+        try withDirectory { folder, helper in
+            let source = folder.appendingPathComponent("surround.mov")
+            try run(helper, ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=5.1(side):d=1",
+                             "-c:a", "pcm_s24le", source.path], in: folder)
+            let asset = StillAsset(id: "title", file: "offline.png", displayName: "Title", fingerprint: "offline")
+            let title = StillInsert(id: "insert", assetID: asset.id, duration: t(1, 10), cadence: t(1, 30))
+            let clip = CutSequenceClip(id: "take", file: source.lastPathComponent, from: .zero, to: t(1))
+            let project = CutProject.stillSequence(StillSequenceProject(items: [.still(title), .source(clip)], stillAssets: [asset]))
+            let planner = StillSoundPlanner()
+            let timeline = try project.resolveStills()
+            let document = folder.appendingPathComponent("show.cut")
+            XCTAssertThrowsError(try planner.resolve(project, relativeTo: document, timeline: timeline,
+                tracks: .audio, audioStream: nil, mode: .encode, audio: .aac, container: "mov")) {
+                XCTAssertEqual(($0 as? CutError)?.code, "unsupported_audio")
+            }
+            let plan = try planner.resolve(project, relativeTo: document, timeline: timeline,
+                                           tracks: .audio, audioStream: nil, mode: .encode, audio: .auto, container: "mov")
+            XCTAssertEqual(plan.actions.map(\.audio), [.pcm])
+            let output = try XCTUnwrap(planner.write(plan, in: folder).first)
+            let track = try XCTUnwrap(Probe.read(output).audio.first)
+            XCTAssertEqual(track.stream.channelLayout, "5.1(side)")
+            XCTAssertEqual(track.end, t(11, 10))
         }
     }
 }

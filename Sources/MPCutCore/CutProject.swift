@@ -23,7 +23,12 @@ public struct CutSequenceClip: Hashable, Codable, Sendable, Identifiable {
         self.to = to
     }
 
-    private enum CodingKeys: String, CodingKey { case id, file, from, to, audioTrack, originalFile, replacementNames }
+    private enum CodingKeys: String, CodingKey {
+        case id, file, from, to
+        case audioTrack = "track_ordinal"
+        case originalFile = "original_file"
+        case replacementNames = "replacement_names"
+    }
 
     public init(from decoder: Decoder) throws {
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_cut_project")
@@ -58,22 +63,72 @@ public struct CutSequenceClip: Hashable, Codable, Sendable, Identifiable {
 
 public enum CutProject: Equatable, Codable, Sendable {
     public static let format = "mpcut"
-    public static let schemaVersion = 1
-    public static let stillSchemaVersion = 2
+    public static let schemaVersion = 4
+    package static let readableSchemaVersions: Set<Int> = [3, schemaVersion]
 
     case sequence([CutSequenceClip])
     case multicam(MulticamProject)
     case stillSequence(StillSequenceProject)
 
     private enum CodingKeys: String, CodingKey {
-        case format, schemaVersion, kind, clips, history, stillAssets, stillReplacements, programColorPolicy, stillFormat
+        case format
+        case schemaVersion = "schema_version"
+        case kind, clips, history
+        case stillAssets = "still_assets"
+        case stillReplacements = "still_replacements"
+        case programColorPolicy = "program_color_policy"
+        case stillFormat = "still_format"
+        case transcripts, participants
+        case sourceSelects = "source_selects"
     }
 
-    var requiresV2: Bool {
-        switch self {
-        case .sequence: false
-        case .stillSequence(let project): project.requiresV2
-        case .multicam(let project): project.requiresV2
+    public var transcripts: ProjectTranscripts {
+        get {
+            switch self {
+            case .sequence: .init()
+            case .stillSequence(let project): project.transcripts
+            case .multicam(let project): project.transcripts
+            }
+        }
+        set {
+            switch self {
+            case .sequence(let clips):
+                if !newValue.isEmpty {
+                    self = .stillSequence(StillSequenceProject(items: clips.map(StillSequenceItem.source), transcripts: newValue))
+                }
+            case .stillSequence(var project):
+                project.transcripts = newValue
+                self = newValue.isEmpty && !project.hasStillContent && project.sourceSelects.isEmpty && project.stillAudioReference == nil && project.participants.isEmpty
+                    ? .sequence(project.items.compactMap(\.source)) : .stillSequence(project)
+            case .multicam(var project):
+                project.transcripts = newValue
+                self = .multicam(project)
+            }
+        }
+    }
+
+    public var participants: ParticipantProject {
+        get {
+            switch self {
+            case .sequence: .init()
+            case .stillSequence(let project): project.participants
+            case .multicam(let project): project.participants
+            }
+        }
+        set {
+            switch self {
+            case .sequence(let clips):
+                guard !newValue.isEmpty else { return }
+                self = .stillSequence(.init(items: clips.map(StillSequenceItem.source), participants: newValue))
+            case .stillSequence(var project):
+                project.participants = newValue
+                self = newValue.isEmpty && !project.hasStillContent && project.transcripts.isEmpty
+                    && project.sourceSelects.isEmpty && project.stillAudioReference == nil
+                    ? .sequence(project.items.compactMap(\.source)) : .stillSequence(project)
+            case .multicam(var project):
+                project.participants = newValue
+                self = .multicam(project)
+            }
         }
     }
 
@@ -82,33 +137,34 @@ public enum CutProject: Equatable, Codable, Sendable {
         guard try values.decode(String.self, forKey: .format) == Self.format else {
             throw CutError(code: "invalid_cut_project", message: "Expected an MPCut project document")
         }
-        let version = try values.decode(Int.self, forKey: .schemaVersion)
-        guard version == Self.schemaVersion || version == Self.stillSchemaVersion else {
-            throw CutError(code: "unsupported_cut_version", message: "Unsupported MPCut schema version \(version)")
+        guard let version = try values.decodeIfPresent(Int.self, forKey: .schemaVersion),
+              Self.readableSchemaVersions.contains(version) else {
+            throw CutError(code: "unsupported_cut_version", message: "Expected MPCut project schema_version 3 or \(Self.schemaVersion)")
         }
         switch try values.decode(String.self, forKey: .kind) {
         case "sequence":
             try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_cut_project")
             let stillFields: [CodingKeys] = [.stillAssets, .stillReplacements, .programColorPolicy, .stillFormat]
-            if version == Self.schemaVersion {
-                guard !stillFields.contains(where: values.contains) else {
-                    throw stillError("Still fields require schema v2")
+            for key in stillFields where values.contains(key) {
+                guard try !values.decodeNil(forKey: key) else {
+                    throw stillError("Null value in still project field ‘\(key.stringValue)’")
                 }
-                self = .sequence(try values.decode([CutSequenceClip].self, forKey: .clips))
-            } else {
-                for key in stillFields where values.contains(key) {
-                    guard try !values.decodeNil(forKey: key) else {
-                        throw stillError("Null value in still project field ‘\(key.stringValue)’")
-                    }
-                }
-                let project = try StillSequenceProject(
-                    items: values.decode([StillSequenceItem].self, forKey: .clips),
-                    stillAssets: values.decodeIfPresent([StillAsset].self, forKey: .stillAssets) ?? [],
-                    stillReplacements: values.decodeIfPresent([StillReplacement].self, forKey: .stillReplacements) ?? [],
-                    programColorPolicy: values.decodeIfPresent(StillProgramColorPolicy.self, forKey: .programColorPolicy),
-                    stillFormat: values.decodeIfPresent(StillTimelineFormat.self, forKey: .stillFormat)
-                )
-                self = project.requiresV2 ? .stillSequence(project) : .sequence(project.items.compactMap(\.source))
+            }
+            let project = try StillSequenceProject(
+                items: values.decode([StillSequenceItem].self, forKey: .clips),
+                stillAssets: values.decodeIfPresent([StillAsset].self, forKey: .stillAssets) ?? [],
+                stillReplacements: values.decodeIfPresent([StillReplacement].self, forKey: .stillReplacements) ?? [],
+                programColorPolicy: values.decodeIfPresent(StillProgramColorPolicy.self, forKey: .programColorPolicy),
+                stillFormat: values.decodeIfPresent(StillTimelineFormat.self, forKey: .stillFormat),
+                sourceSelects: values.contains(.sourceSelects) ? values.decode([NamedSourceSelect].self, forKey: .sourceSelects) : []
+            )
+            self = project.hasStillContent || !project.sourceSelects.isEmpty ? .stillSequence(project) : .sequence(project.items.compactMap(\.source))
+            if values.contains(.transcripts) {
+                transcripts = try values.decode(ProjectTranscripts.self, forKey: .transcripts)
+            }
+            if values.contains(.participants) {
+                guard version >= 4 else { throw invalidParticipantProject("Participant metadata requires project schema version 4.") }
+                participants = try values.decode(ParticipantProject.self, forKey: .participants)
             }
             try validate()
         case "multicam": self = .multicam(try MulticamProject(from: decoder))
@@ -117,39 +173,42 @@ public enum CutProject: Equatable, Codable, Sendable {
     }
 
     public func encode(to encoder: Encoder) throws {
-        try encode(to: encoder, forceV2: false)
-    }
-
-    func encode(to encoder: Encoder, forceV2: Bool) throws {
         try validate()
         guard stillAudioReference == nil else {
             throw CutError(code: "transient_selection", message: "A still selection with inherited audio is an export snapshot.")
         }
         if case .multicam(let project) = self {
-            try project.encode(to: encoder, forceV2: forceV2)
+            try project.encode(to: encoder)
             return
         }
         var values = encoder.container(keyedBy: CodingKeys.self)
-        let v2 = requiresV2 || forceV2
         try values.encode(Self.format, forKey: .format)
-        try values.encode(v2 ? Self.stillSchemaVersion : Self.schemaVersion, forKey: .schemaVersion)
+        try values.encode(Self.schemaVersion, forKey: .schemaVersion)
         try values.encode("sequence", forKey: .kind)
-        if v2 {
-            let project = stillSequenceValue!
-            try values.encode(project.items, forKey: .clips)
-            if !project.stillAssets.isEmpty { try values.encode(project.stillAssets, forKey: .stillAssets) }
-            if !project.stillReplacements.isEmpty { try values.encode(project.stillReplacements, forKey: .stillReplacements) }
-            try values.encodeIfPresent(project.programColorPolicy, forKey: .programColorPolicy)
-            try values.encodeIfPresent(project.stillFormat, forKey: .stillFormat)
-        } else {
-            try values.encode(sequenceClips!, forKey: .clips)
-        }
+        if !transcripts.isEmpty { try values.encode(transcripts, forKey: .transcripts) }
+        if !participants.isEmpty { try values.encode(participants, forKey: .participants) }
+        let project = stillSequenceValue!
+        try values.encode(project.items, forKey: .clips)
+        if !project.sourceSelects.isEmpty { try values.encode(project.sourceSelects, forKey: .sourceSelects) }
+        if !project.stillAssets.isEmpty { try values.encode(project.stillAssets, forKey: .stillAssets) }
+        if !project.stillReplacements.isEmpty { try values.encode(project.stillReplacements, forKey: .stillReplacements) }
+        try values.encodeIfPresent(project.programColorPolicy, forKey: .programColorPolicy)
+        try values.encodeIfPresent(project.stillFormat, forKey: .stillFormat)
     }
 
     public func validate() throws {
         switch self {
         case .multicam(let project): try project.validate()
         case .stillSequence(let project):
+            try project.transcripts.validate()
+            try project.participants.validate()
+            guard project.participants.protectedMediaPaths.allSatisfy({ ProjectFile.validMediaPath($0.1) }) else {
+                throw invalidParticipantProject("Invalid participant media path.")
+            }
+            guard Set(project.sourceSelects.map(\.id)).count == project.sourceSelects.count else {
+                throw CutError(code: "invalid_source_select", message: "Source select IDs must be unique.")
+            }
+            for select in project.sourceSelects { try select.validate() }
             let clips = project.items.compactMap(\.source)
             try Self.sequence(clips).validate()
             if let reference = project.stillAudioReference {
@@ -174,7 +233,10 @@ public enum CutProject: Equatable, Codable, Sendable {
             } else if clips.isEmpty && !inserts.isEmpty {
                 throw stillError("A still-only sequence requires an explicit program format")
             }
-            try validateStillTimelineDuration()
+            let duration = try stillTimelineDuration()
+            if let format = project.stillFormat, !inserts.isEmpty {
+                _ = try format.frameCount(for: duration)
+            }
         case .sequence(let clips):
             var ids = Set<String>()
             var duration = RationalTime.zero
@@ -195,11 +257,11 @@ public enum CutProject: Equatable, Codable, Sendable {
     }
 
     public static func load(from url: URL) throws -> Self {
-        try ProjectFile.read(Self.self, from: url)
+        try Self.loadDocument(from: url, limit: 0).project
     }
 
     public static func decode(_ data: Data) throws -> Self {
-        try ProjectFile.decode(Self.self, data: data)
+        try Self.decodeDocument(data, limit: 0).project
     }
 
     var mediaPaths: [(String, String)] {
@@ -210,14 +272,24 @@ public enum CutProject: Equatable, Codable, Sendable {
             }
         case .multicam(let project):
             return project.sources.map { ($0.id, $0.file) } + project.stillAssets.map { ($0.id, $0.file) }
+                + project.transcripts.protectedPaths
         case .stillSequence(let project):
             let references = project.stillAudioReference.map { [$0] } ?? []
             return Self.sequence(project.items.compactMap(\.source) + references).mediaPaths + project.stillAssets.map { ($0.id, $0.file) }
+                + project.transcripts.protectedPaths + project.sourceSelects.map { ($0.id, $0.range.file) }
+                + project.participants.protectedMediaPaths
         }
     }
 
     public func validateDestination(_ output: URL, relativeTo projectURL: URL, includesContents: Bool = false) throws {
         try validateDestination(output, sourceDirectory: ProjectFile.directory(of: projectURL), includesContents: includesContents)
+        let assets = transcripts.attachments.compactMap { attachment in
+            TranscriptStore.assetLocation(attachment.asset, relativeTo: projectURL).map { (attachment.id, $0.path) }
+        }
+        if !assets.isEmpty {
+            try ProjectFile.validateDestination(output, sourceDirectory: ProjectFile.directory(of: projectURL), sources: assets,
+                                                prefix: "cut", includesContents: includesContents)
+        }
     }
 
     package func validateDestination(_ output: URL, sourceDirectory: URL, includesContents: Bool = false) throws {
@@ -233,7 +305,11 @@ public enum CutProject: Equatable, Codable, Sendable {
     }
 
     public func save(to url: URL) throws {
-        try ProjectFile.write(self, to: url, sources: mediaPaths)
+        if transcripts.isEmpty, !TranscriptStore.hasStore(relativeTo: url) {
+            try ProjectFile.write(self, to: url, sources: mediaPaths)
+        } else {
+            _ = try saveRevision(to: url, undo: [], redo: [], expected: nil)
+        }
     }
 
     public static func mediaURL(_ path: String, relativeTo projectURL: URL) -> URL {
@@ -251,17 +327,32 @@ public enum CutProject: Equatable, Codable, Sendable {
         return try rebased(from: sourceURL, to: destinationURL, paths: &paths)
     }
 
-    func rebased(from sourceURL: URL, to destinationURL: URL, paths: inout [String: String]) throws -> Self {
+    package func rebased(from sourceURL: URL, to destinationURL: URL, paths: inout [String: String],
+                 makeRelative: Bool = false) throws -> Self {
         try validate()
         let sourceDirectory = ProjectFile.directory(of: sourceURL)
-        if sourceDirectory == ProjectFile.directory(of: destinationURL) { return self }
-        func rebase(_ path: String) -> String {
+        if !makeRelative && sourceDirectory == ProjectFile.directory(of: destinationURL) { return self }
+        return mapMediaPaths { path in
             if let cached = paths[path] { return cached }
             let file = ProjectFile.sourceURL(file: path, in: sourceDirectory)
             let relative = Self.relativeMediaPath(file.path, to: destinationURL)
             paths[path] = relative
             return relative
         }
+    }
+
+    package func withAbsoluteMediaPaths(relativeTo projectURL: URL) -> Self {
+        let directory = ProjectFile.directory(of: projectURL)
+        var paths: [String: String] = [:]
+        return mapMediaPaths { path in
+            if let cached = paths[path] { return cached }
+            let absolute = ProjectFile.sourceURL(file: path, in: directory).path
+            paths[path] = absolute
+            return absolute
+        }
+    }
+
+    private func mapMediaPaths(_ rebase: (String) -> String) -> Self {
         switch self {
         case .sequence(let clips):
             return .sequence(clips.map {
@@ -283,16 +374,15 @@ public enum CutProject: Equatable, Codable, Sendable {
                 reference.originalFile = reference.originalFile.map(rebase)
                 project.stillAudioReference = reference
             }
+            project.sourceSelects = project.sourceSelects.map { $0.mapPath(rebase) }
+            project.participants = project.participants.mapSourcePaths(rebase)
+            project.transcripts = project.transcripts.mapSourcePaths(rebase)
             return .stillSequence(project)
         case .multicam(var project):
-            func rebasedSource(_ source: MulticamSource) -> MulticamSource {
-                var copy = source
-                copy.file = rebase(source.file)
-                return copy
-            }
-            project.angles = project.angles.map(rebasedSource)
-            project.audioSources = project.audioSources.map(rebasedSource)
+            project.angles = project.angles.map { $0.mappingFiles(rebase) }
+            project.audioSources = project.audioSources.map { $0.mappingFiles(rebase) }
             for index in project.stillAssets.indices { project.stillAssets[index].file = rebase(project.stillAssets[index].file) }
+            project.transcripts = project.transcripts.mapSourcePaths(rebase)
             return .multicam(project)
         }
     }
@@ -328,10 +418,10 @@ public enum CutProject: Equatable, Codable, Sendable {
 
     /// Resolve media relative to the containing project document's URL.
     public func requests(relativeTo projectURL: URL) throws -> [ClipRequest] {
-        if case .stillSequence = self {
+        if case .stillSequence(let project) = self, project.hasStillContent || project.stillAudioReference != nil {
             throw stillError("A still sequence requires the still timeline planner", code: "still_timeline_required")
         }
-        guard case .sequence(let clips) = self else {
+        guard let clips = sequenceClips else {
             throw CutError(code: "expected_sequence", message: "A multicam project uses the multicam timeline planner")
         }
         try validate()
@@ -452,11 +542,35 @@ enum ProjectFile {
         }
         do {
             let project = try JSONDecoder().decode(type, from: data)
-            if let issue = jsonInputIssue(data, integerNumbersOnly: true) { throw CutError(code: code, message: "Project \(issue)") }
+            if let issue = jsonInputIssue(data, integerNumbersOnly: true, allowsFraction: participantFraction) {
+                throw CutError(code: code, message: "Project \(issue)")
+            }
             return project
         } catch let error as DecodingError {
             throw CutError(code: code, message: "Invalid project JSON: \(error)")
         }
+    }
+
+    private static func participantFraction(_ locations: [JSONInputLocation]) -> Bool {
+        let keys = locations.compactMap { location -> String? in
+            guard case .key(let key) = location else { return nil }
+            return key
+        }
+        let fields: ArraySlice<String>
+        if keys.first == "participants" {
+            fields = keys.dropFirst()
+        } else if keys.starts(with: ["history", "undo", "participants"]) || keys.starts(with: ["history", "redo", "participants"]) {
+            fields = keys.dropFirst(3)
+        } else {
+            return false
+        }
+        guard let last = fields.last else { return false }
+        let parent = fields.dropLast()
+        if parent.elementsEqual(["sources", "appearances", "bounds"])
+            || parent.elementsEqual(["sources", "appearances", "label_bounds"]) {
+            return ["x", "y", "width", "height"].contains(last)
+        }
+        return parent.elementsEqual(["render", "shots", "slots"]) && ["anchor_x", "anchor_y"].contains(last)
     }
 
     static func write<T: Encodable>(_ project: T, to url: URL, sources: [(String, String)],
@@ -479,22 +593,42 @@ enum ProjectFile {
 
     static func write(_ bytes: Data, to url: URL, sources: [(String, String)], prefix: String,
                       replacingExisting: Bool = true) throws {
-        let data = try diskBytes(bytes, prefix: prefix)
-        try validateDestination(url, sourceDirectory: directory(of: url), sources: sources, prefix: prefix)
-        try publishProject(data, to: replacingExisting ? documentURL(url) : url, prefix: prefix, replacingExisting: replacingExisting)
+        _ = try writeRevision(bytes, to: url, sources: sources, prefix: prefix,
+                              replacingExisting: replacingExisting, expected: nil)
+    }
+
+    /// The caller holds the draft lease and publishes this private stage.
+    static func writeStaged(_ bytes: Data, to url: URL, sources: [(String, String)], replacingExisting: Bool) throws {
+        let data = try diskBytes(bytes, prefix: "cut")
+        try validateDestination(url, sourceDirectory: directory(of: url), sources: sources, prefix: "cut")
+        try publishProject(data, to: url, prefix: "cut", replacingExisting: replacingExisting)
     }
 
     static func writeRevision(_ bytes: Data, to url: URL, sources: [(String, String)], prefix: String,
-                              replacingExisting: Bool, expected: ProjectDiskRevision?) throws -> ProjectDiskRevision {
+                              replacingExisting: Bool, expected: ProjectDiskRevision?,
+                              transcriptAssets: [TranscriptAsset]? = nil, hasTranscriptMetadata: Bool = false,
+                              beforePublish: () throws -> Void = {}) throws -> ProjectDiskRevision {
         let data = try diskBytes(bytes, prefix: prefix)
-        return try coordinatedWrite(to: url, prefix: prefix, expected: expected, data: data) { destination in
+        return try coordinatedWrite(to: url, prefix: prefix, expected: expected) { destination, verifyDestination in
             let target = replacingExisting ? destination : url
             try validateDestination(target, sourceDirectory: directory(of: target), sources: sources, prefix: prefix)
-            try publishProject(data, to: target, prefix: prefix, replacingExisting: replacingExisting)
+            func publish() throws {
+                try publishProject(data, to: target, prefix: prefix, replacingExisting: replacingExisting) {
+                    try beforePublish()
+                    try verifyDestination()
+                }
+            }
+            if let transcriptAssets {
+                try TranscriptStore.publish(relativeTo: target, keeping: transcriptAssets,
+                                            hasTranscriptMetadata: hasTranscriptMetadata, publish)
+            } else {
+                try publish()
+            }
+            return data
         }
     }
 
-    private static func diskBytes(_ bytes: Data, prefix: String) throws -> Data {
+    static func diskBytes(_ bytes: Data, prefix: String) throws -> Data {
         guard bytes.count <= MulticamProject.maximumFileSize else {
             throw CutError(code: "invalid_\(prefix)_project", message: "Project exceeds the 64 MB limit")
         }
@@ -504,11 +638,13 @@ enum ProjectFile {
         return data
     }
 
-    private static func publishProject(_ data: Data, to url: URL, prefix: String, replacingExisting: Bool) throws {
+    static func publishProject(_ data: Data, to url: URL, prefix: String, replacingExisting: Bool,
+                               beforePublish: () throws -> Void = {}) throws {
         if !replacingExisting {
             let stage = url.deletingLastPathComponent().appendingPathComponent(".mpcut-" + UUID().uuidString)
-            try data.write(to: stage, options: .withoutOverwriting)
             defer { try? FileManager.default.removeItem(at: stage) }
+            try data.write(to: stage, options: .withoutOverwriting)
+            try beforePublish()
             let error = publishExclusively(from: stage, to: url)
             guard error == 0 else {
                 if error == EEXIST { throw CutError(code: "destination_exists", message: "The destination already exists at " + url.path) }
@@ -520,6 +656,7 @@ enum ProjectFile {
         if lstat(url.path, &info) == 0, info.st_mode & S_IFMT != S_IFREG {
             throw CutError(code: "\(prefix)_project_write_failed", message: "Choose a regular project file at \(url.path)")
         }
+        try beforePublish()
         do { try data.write(to: url, options: .atomic) }
         catch {
             throw CutError(code: "\(prefix)_project_write_failed", message: "Could not save \(url.path): \(error.localizedDescription)")
@@ -589,8 +726,14 @@ enum ProjectFile {
         return url.url!
     }
 
-    private static func canonicalFileURL(_ url: URL, remainingLinks: Int = 32) -> URL {
-        var resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+    static func canonicalFileURL(_ url: URL, remainingLinks: Int = 32) -> URL {
+        let path = url.path
+        let location = path.split(separator: "/").contains("..")
+            ? sourceURL(file: path, in: url.deletingLastPathComponent()) : url
+        // An unavailable parent does not identify the file that a lexical
+        // normalization would produce.
+        guard !location.path.split(separator: "/").contains("..") else { return location }
+        var resolved = location.standardizedFileURL.resolvingSymlinksInPath()
         if (try? resolved.resourceValues(forKeys: [.isAliasFileKey]).isAliasFile) == true,
            let target = try? URL(resolvingAliasFileAt: resolved, options: [.withoutUI, .withoutMounting]) {
             resolved = target.standardizedFileURL.resolvingSymlinksInPath()

@@ -8,6 +8,7 @@ struct StillPlacementRow: Identifiable {
     var title: String
     var details: String
     var isInsert: Bool
+    var isGap = false
     var fragmentCount = 0
 }
 
@@ -21,6 +22,7 @@ enum StillPlacementAction: String, CaseIterable {
     case relink = "Relink Image…"
 
     func title(for row: StillPlacementRow) -> String {
+        if self == .frame && row.isGap { return "Gap Color…" }
         if self == .resize && !row.isInsert { return "Trim…" }
         if self == .duplicate && row.isInsert { return "Duplicate" }
         return rawValue
@@ -34,6 +36,9 @@ struct StillAuthoringControls: View {
     var canInsert: Bool
     var replace: () -> Void
     var insert: () -> Void
+    var insertGap: () -> Void
+    var spaceClips: () -> Void
+    var canSpace: Bool
     var manage: (StillPlacementRow, StillPlacementAction) -> Void
 
     var body: some View {
@@ -42,12 +47,14 @@ struct StillAuthoringControls: View {
                 .help("Replace picture with still")
             Button("Insert Still…", action: insert).disabled(!canInsert)
                 .help("Insert a still image")
+            Button("Space Clips…", action: spaceClips).disabled(!canSpace)
+            Button("Insert Color Gap…", action: insertGap).disabled(!canInsert)
             if !rows.isEmpty {
                 Divider()
                 ForEach(rows) { row in
                     Menu(row.title) {
                         Text(row.details)
-                        ForEach(StillPlacementAction.allCases.filter { $0 != .detach || row.fragmentCount > 1 }, id: \.self) { action in
+                        ForEach(StillPlacementAction.allCases.filter { ($0 != .detach || row.fragmentCount > 1) && ($0 != .relink || !row.isGap) }, id: \.self) { action in
                             Button(action.title(for: row), role: action == .remove ? .destructive : nil) {
                                 manage(row, action)
                             }
@@ -58,10 +65,32 @@ struct StillAuthoringControls: View {
                 }
             }
         } label: {
-            Label("Stills", systemImage: "photo.on.rectangle")
+            Label("Stills", systemImage: "photo.on.rectangle").labelStyle(.titleAndIcon)
         }
+        .accessibilityLabel("Stills")
         .disabled(!enabled)
         .help("Manage still images")
+    }
+}
+
+enum ClipSpacingTiming {
+    case fixed(RationalTime)
+    case source
+
+    func applying(to project: CutProject, cadence: RationalTime, background: String,
+                  relativeTo projectURL: URL?) throws -> CutProject {
+        switch self {
+        case .fixed(let duration):
+            return try project.spacingClips(duration: duration, cadence: cadence, background: background)
+        case .source:
+            return try project.spacingClipsUsingSourceTiming(cadence: cadence, background: background, relativeTo: projectURL)
+        }
+    }
+}
+
+private final class SpacingDurationField: NSTextField {
+    @objc func updateAvailability(_ timing: NSPopUpButton) {
+        isEnabled = timing.indexOfSelectedItem == 0
     }
 }
 
@@ -73,14 +102,10 @@ enum StillPanels {
         StillImage.isImageInput(url)
     }
 
-    nonisolated static func asset(for url: URL, existing: [StillAsset] = []) throws -> StillAsset {
+    nonisolated static func asset(for url: URL, existing: [StillAsset] = [],
+                                  cancelled: (() -> Bool)? = nil) throws -> StillAsset {
         let path = url.standardizedFileURL.resolvingSymlinksInPath()
-        let identity = try SourceIdentity(path)
-        _ = try StillImage.inspect(path)
-        let fingerprint = try StillImage.fingerprint(path)
-        guard try SourceIdentity(path) == identity else {
-            throw CutError(code: "source_changed", message: "The image changed while importing it.")
-        }
+        let fingerprint = try StillImage.inspectAndFingerprint(path, cancelled: cancelled).fingerprint
         if let asset = existing.first(where: { $0.file == path.path && $0.fingerprint == fingerprint }) {
             return asset
         }
@@ -88,7 +113,17 @@ enum StillPanels {
                           displayName: url.lastPathComponent, fingerprint: fingerprint)
     }
 
-    static func frame(title: String, framing: StillImageFraming, in window: NSWindow?,
+    nonisolated static func assets(for urls: [URL], existing: [StillAsset],
+                                   cancelled: (() -> Bool)? = nil) throws -> [StillAsset] {
+        var known = existing
+        return try urls.map { url in
+            let image = try asset(for: url, existing: known, cancelled: cancelled)
+            if !known.contains(where: { $0.id == image.id }) { known.append(image) }
+            return image
+        }
+    }
+
+    static func frame(title: String, framing: StillImageFraming, gap: Bool = false, in window: NSWindow?,
                       completion: @escaping (StillImageFraming) -> Void) {
         let mode = NSPopUpButton()
         mode.toolTip = "Fit or fill canvas"
@@ -99,6 +134,12 @@ enum StillPanels {
         let hex = UInt32(framing.background.dropFirst(), radix: 16) ?? 0
         color.color = NSColor(srgbRed: CGFloat((hex >> 16) & 255) / 255,
                               green: CGFloat((hex >> 8) & 255) / 255, blue: CGFloat(hex & 255) / 255, alpha: 1)
+        if gap {
+            present(title: "Gap Color", fields: [("Color", color)], in: window) {
+                completion(StillImageFraming(mode: .fit, background: rgbHex(color)))
+            }
+            return
+        }
         let crop = framing.crop
         let x = NSTextField(string: crop?.x.description ?? "0")
         x.toolTip = "Set horizontal crop offset"
@@ -116,9 +157,7 @@ enum StillPanels {
                     try RationalTime(parsing: field.stringValue.trimmingCharacters(in: .whitespaces))
                 }
                 let rect = try StillImageFraming.Crop(x: number(x), y: number(y), width: number(width), height: number(height))
-                let rgb = color.color.usingColorSpace(.sRGB) ?? .black
-                let background = String(format: "#%02X%02X%02X", Int((rgb.redComponent * 255).rounded()),
-                                        Int((rgb.greenComponent * 255).rounded()), Int((rgb.blueComponent * 255).rounded()))
+                let background = rgbHex(color)
                 let unit = RationalTime(numerator: 1)
                 let isIdentity = rect.x == .zero && rect.y == .zero && rect.width == unit && rect.height == unit
                 let result = StillImageFraming(mode: mode.indexOfSelectedItem == 0 ? .fit : .fill,
@@ -150,15 +189,91 @@ enum StillPanels {
 
     static func duration(title: String, duration: RationalTime, cadence: RationalTime, in window: NSWindow?,
                          completion: @escaping (RationalTime, RationalTime) -> Void) {
-        let length = NSTextField(string: duration.description)
-        length.toolTip = "Set duration in seconds"
+        durationFields(title: title, duration: duration, cadence: cadence, color: nil, in: window, completion: completion)
+    }
+
+    private static func rgbHex(_ well: NSColorWell) -> String {
+        let rgb = well.color.usingColorSpace(.sRGB) ?? .black
+        return String(format: "#%02X%02X%02X", Int((rgb.redComponent * 255).rounded()),
+                      Int((rgb.greenComponent * 255).rounded()), Int((rgb.blueComponent * 255).rounded()))
+    }
+
+    static func gap(cadence: RationalTime?, in window: NSWindow?,
+                    completion: @escaping (RationalTime, RationalTime, StillImageFraming) -> Void) {
+        let well = NSColorWell()
+        well.color = .black
+        let (duration, interval) = defaultGapTiming(cadence: cadence)
+        durationFields(title: "Insert Color Gap", duration: duration, cadence: interval, color: well, in: window) { length, rate in
+            completion(length, rate, StillImageFraming(mode: .fit, background: rgbHex(well)))
+        }
+    }
+
+    static func spaceClips(cadence: RationalTime?, in window: NSWindow?,
+                           completion: @escaping (ClipSpacingTiming, RationalTime, String) -> Void) {
+        let (duration, interval) = defaultGapTiming(cadence: cadence)
+        let length = SpacingDurationField(string: duration.description)
+        length.toolTip = "Set the same duration in seconds for every gap"
+        let timing = NSPopUpButton()
+        timing.addItems(withTitles: ["Fixed Duration", "Source Timing"])
+        timing.selectItem(at: 0)
+        timing.toolTip = "Use a fixed duration or restore the elapsed time between consecutive source ranges"
+        timing.target = length
+        timing.action = #selector(SpacingDurationField.updateAvailability(_:))
+        let fps = frameRateField(cadence: interval)
+        let color = NSColorWell()
+        color.color = .black
+        present(title: "Space Clips", fields: [
+            ("Gap timing", timing), ("Duration (seconds)", length), ("Frames per second", fps), ("Color", color)
+        ], in: window) {
+            do {
+                let rate = try readTime(fps)
+                guard rate > .zero else {
+                    throw CutError(code: "invalid_still_time", message: "Enter a positive frame rate.")
+                }
+                let choice: ClipSpacingTiming
+                if timing.indexOfSelectedItem == 0 {
+                    let duration = try readTime(length)
+                    guard duration >= .zero else {
+                        throw CutError(code: "invalid_still_time", message: "Enter a nonnegative duration.")
+                    }
+                    choice = .fixed(duration)
+                } else {
+                    choice = .source
+                }
+                completion(choice, RationalTime(numerator: rate.denominator, denominator: rate.numerator), rgbHex(color))
+            } catch { ProjectPanels.present(NSAlert(error: error), in: window) }
+        }
+    }
+
+    private static func defaultGapTiming(cadence: RationalTime?) -> (duration: RationalTime, cadence: RationalTime) {
+        let interval = cadence ?? RationalTime(numerator: 1, denominator: 30)
+        let frames = Int64(max(1, min(1_000, (2 / interval.seconds).rounded())))
+        let duration = (try? interval.multiplied(by: .init(numerator: frames))) ?? interval
+        return (duration, interval)
+    }
+
+    private static func frameRateField(cadence: RationalTime) -> NSTextField {
         let rate = RationalTime(numerator: cadence.denominator, denominator: cadence.numerator)
         let fps = NSTextField(string: rate.description)
         fps.toolTip = "Set frame rate"
-        present(title: title, fields: [("Duration (seconds)", length), ("Frames per second", fps)], in: window) {
+        return fps
+    }
+
+    private static func readTime(_ field: NSTextField) throws -> RationalTime {
+        try RationalTime(parsing: field.stringValue.trimmingCharacters(in: .whitespaces))
+    }
+
+    private static func durationFields(title: String, duration: RationalTime, cadence: RationalTime, color: NSColorWell?,
+                                       in window: NSWindow?, completion: @escaping (RationalTime, RationalTime) -> Void) {
+        let length = NSTextField(string: duration.description)
+        length.toolTip = "Set duration in seconds"
+        let fps = frameRateField(cadence: cadence)
+        var fields: [(String, NSControl)] = [("Duration (seconds)", length), ("Frames per second", fps)]
+        if let color { fields.append(("Color", color)) }
+        present(title: title, fields: fields, in: window) {
             do {
-                let length = try RationalTime(parsing: length.stringValue.trimmingCharacters(in: .whitespaces))
-                let rate = try RationalTime(parsing: fps.stringValue.trimmingCharacters(in: .whitespaces))
+                let length = try readTime(length)
+                let rate = try readTime(fps)
                 guard length > .zero, rate > .zero else {
                     throw CutError(code: "invalid_still_time", message: "Enter a positive duration and frame rate.")
                 }

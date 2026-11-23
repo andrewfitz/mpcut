@@ -31,20 +31,24 @@ public struct StillImageFrame: Sendable {
                 throw StillImage.error("still_surface", "Cannot address the still image display buffer.")
             }
             let stride = CVPixelBufferGetBytesPerRow(output)
-            encoded.withUnsafeBytes { bytes in
+            let isHDR = target.isHDR
+            try encoded.withUnsafeBytes { bytes in
                 let source = bytes.bindMemory(to: UInt16.self)
+                guard var rgb = source.baseAddress else {
+                    throw StillImage.error("still_surface", "Cannot address the encoded still frame.")
+                }
                 for row in 0..<height {
                     let pixels = base.advanced(by: row * stride).assumingMemoryBound(to: UInt32.self)
                     for column in 0..<width {
-                        let index = (row * width + column) * 3
-                        let red = UInt32(UInt16(littleEndian: source[index]))
-                        let green = UInt32(UInt16(littleEndian: source[index + 1]))
-                        let blue = UInt32(UInt16(littleEndian: source[index + 2]))
-                        if target.isHDR {
+                        let red = UInt32(UInt16(littleEndian: rgb[0]))
+                        let green = UInt32(UInt16(littleEndian: rgb[1]))
+                        let blue = UInt32(UInt16(littleEndian: rgb[2]))
+                        if isHDR {
                             pixels[column] = 0xc0000000 | ((red >> 6) << 20) | ((green >> 6) << 10) | (blue >> 6)
                         } else {
                             pixels[column] = 0xff000000 | ((red >> 8) << 16) | ((green >> 8) << 8) | (blue >> 8)
                         }
+                        rgb += 3
                     }
                 }
             }
@@ -143,7 +147,25 @@ extension StillImage {
         _ url: URL, canvas: StillImageCanvas, framing: StillImageFraming = .fit,
         forceSDR: Bool = false, preview: Bool = false, cancelled: (() -> Bool)? = nil
     ) throws -> StillImageFrame {
-        if cancelled?() == true { throw CancellationError() }
+        try render(url, canvas: canvas, framing: framing, forceSDR: forceSDR, preview: preview,
+                   expectedIdentity: nil, cancelled: cancelled)
+    }
+
+    package static func render(
+        _ url: URL, canvas: StillImageCanvas, framing: StillImageFraming = .fit,
+        forceSDR: Bool = false, preview: Bool = false, expectedIdentity: SourceIdentity?,
+        cancelled: (() -> Bool)? = nil
+    ) throws -> StillImageFrame {
+        try withStableFile(url, expectedIdentity: expectedIdentity, cancelled: cancelled) { file, _ in
+            try render(file, name: url.lastPathComponent, isGap: url.lastPathComponent == "Gap.png" && url.standardizedFileURL == StillAsset.gapImage.standardizedFileURL, canvas: canvas, framing: framing,
+                       forceSDR: forceSDR, preview: preview, cancelled: cancelled)
+        }
+    }
+
+    private static func render(
+        _ file: FileHandle, name: String, isGap: Bool, canvas: StillImageCanvas, framing: StillImageFraming,
+        forceSDR: Bool, preview: Bool, cancelled: (() -> Bool)?
+    ) throws -> StillImageFrame {
         try validateDimensions(canvas.width, canvas.height, maximumPixels: 8_192 * 4_320)
         let aspect = canvas.displayAspect ?? Double(canvas.width) / Double(canvas.height)
         guard aspect.isFinite, (0.01...100).contains(aspect) else {
@@ -155,7 +177,24 @@ extension StillImage {
         let largestDimension = max(canvas.width, canvas.height)
         let cropFraction = framing.crop.map { min($0.width.seconds, $0.height.seconds) } ?? 1
         let decodeDimension = preview ? Int(min(32_768, Double(largestDimension) / cropFraction * 2)) : nil
-        let decoded = try decode(url, previewDimension: decodeDimension)
+        let decoded = try decode(file, name: name, previewDimension: decodeDimension, forceISOGainMapFallback: false)
+        if isGap {
+            // Convert the uniform fill once. The sample generator repeats this
+            // frame on the output clock and can reuse an identical encoded span.
+            let rgb = target.encode(.zero, alpha: 0, background: background, isHDRSource: false)
+            let pixel = [rgb.x.littleEndian, rgb.y.littleEndian, rgb.z.littleEndian]
+            var row = Data(capacity: canvas.width * 6)
+            pixel.withUnsafeBytes { bytes in
+                for _ in 0..<canvas.width { row.append(contentsOf: bytes) }
+            }
+            var raster = Data(capacity: canvas.width * canvas.height * 6)
+            for _ in 0..<canvas.height {
+                if Task.isCancelled || cancelled?() == true { throw CancellationError() }
+                raster.append(row)
+            }
+            return StillImageFrame(sourceInfo: decoded.info, width: canvas.width, height: canvas.height,
+                                   encoded: raster, target: target, pixelAspect: aspect * Double(canvas.height) / Double(canvas.width))
+        }
         let image = try sourceImage(decoded.image, colorSpace: decoded.colorSpace)
             .oriented(forExifOrientation: Int32(decoded.info.orientation))
         let placed = place(image, width: canvas.width, height: canvas.height, aspect: aspect, framing: framing)

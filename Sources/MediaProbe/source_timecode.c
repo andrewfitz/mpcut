@@ -7,9 +7,9 @@
 #include <libavutil/timecode.h>
 
 // Source timecode lives in media metadata, independently of presentation PTS.
-// Read it at interchange time, including for projects with older analysis sidecars.
-int mp_source_timecode(const char *path, int stream, int rate_num, int rate_den,
-                       int64_t *units, int *scale_num, int *scale_den)
+// Read it directly, including for projects with older analysis sidecars.
+int mp_source_sync_stamp(const char *path, int stream, int rate_num, int rate_den,
+                         int64_t *units, int *scale_num, int *scale_den)
 {
     AVFormatContext *input = NULL;
     int status = avformat_open_input(&input, path, NULL, NULL);
@@ -29,6 +29,7 @@ int mp_source_timecode(const char *path, int stream, int rate_num, int rate_den,
         status = AVERROR_INVALIDDATA;
         goto done;
     }
+    status = 0;
     AVStream *track = input->streams[stream];
     const AVDictionaryEntry *tag = av_dict_get(track->metadata, "timecode", NULL, 0);
     if (!tag)
@@ -40,21 +41,31 @@ int mp_source_timecode(const char *path, int stream, int rate_num, int rate_den,
             *units = tc.start;
             *scale_num = rate_den;
             *scale_den = rate_num;
+            status = MP_SOURCE_SYNC_TIMECODE;
         }
     } else if (track->codecpar->sample_rate > 0 &&
                (tag = av_dict_get(input->metadata, "time_reference", NULL, 0))) {
         char *end;
         errno = 0;
-        *units = strtoll(tag->value, &end, 10);
+        int64_t reference = strtoll(tag->value, &end, 10);
         if (end == tag->value || *end || errno) {
             status = AVERROR_INVALIDDATA;
             goto done;
         }
+        *units = reference;
         *scale_num = 1;
         *scale_den = track->codecpar->sample_rate;
+        status = MP_SOURCE_SYNC_BWF;
     }
 
 done:
     avformat_close_input(&input);
     return status;
+}
+
+int mp_source_timecode(const char *path, int stream, int rate_num, int rate_den,
+                       int64_t *units, int *scale_num, int *scale_den)
+{
+    int status = mp_source_sync_stamp(path, stream, rate_num, rate_den, units, scale_num, scale_den);
+    return status > 0 ? 0 : status;
 }

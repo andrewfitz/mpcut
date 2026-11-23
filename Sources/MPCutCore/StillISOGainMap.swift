@@ -112,11 +112,14 @@ enum StillISOGainMap {
         """)
 
     static func decode(
-        _ url: URL, codec: StillImageInfo.Codec, base: CGImage
+        _ file: FileHandle, name: String, codec: StillImageInfo.Codec, base: CGImage
     ) throws -> (CGImage, CGColorSpace, Float) {
         do {
-            let data = try Data(contentsOf: url, options: .alwaysMapped)
-            guard data.count <= 256 * 1_024 * 1_024 else { throw Invalid() }
+            let maximumBytes = 256 * 1_024 * 1_024
+            let size = try file.seekToEnd()
+            guard size > 0, size <= maximumBytes else { throw Invalid() }
+            try file.seek(toOffset: 0)
+            guard let data = try file.read(upToCount: Int(size)), data.count == size else { throw Invalid() }
             let (metadataBytes, gainData, alternateSpace): (Data, Data, CGColorSpace?)
             switch codec {
             case .jpeg:
@@ -172,7 +175,7 @@ enum StillISOGainMap {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            throw StillImage.error("still_gain_map", "Cannot reconstruct the ISO HDR gain map in \(url.lastPathComponent).")
+            throw StillImage.error("still_gain_map", "Cannot reconstruct the ISO HDR gain map in \(name).")
         }
     }
 
@@ -184,8 +187,8 @@ enum StillISOGainMap {
 }
 
 extension StillISOGainMap {
-    private static func jpegSegments(_ data: Data) throws -> [(Int, Range<Int>)] {
-        var reader = Reader(data)
+    private static func jpegSegments(_ data: Data, range: Range<Int>? = nil) throws -> [(Int, Range<Int>)] {
+        var reader = Reader(data, range)
         guard try reader.integer(2) == 0xffd8 else { throw Invalid() }
         var segments: [(Int, Range<Int>)] = []
         while reader.offset < reader.end {
@@ -239,10 +242,12 @@ extension StillISOGainMap {
             _ = try index.take(4)
             guard offset > 0, length > 0, tiff + offset <= data.count,
                   length <= data.count - tiff - offset else { continue }
-            let gain = data.subdata(in: (tiff + offset)..<(tiff + offset + length))
-            for (marker, range) in try jpegSegments(gain) where marker == 0xe2 {
-                if gain[range].starts(with: jpegNamespace) {
-                    return (gain.subdata(in: (range.lowerBound + jpegNamespace.count)..<range.upperBound), gain)
+            let gain = (tiff + offset)..<(tiff + offset + length)
+            guard let segments = try? jpegSegments(data, range: gain) else { continue }
+            for (marker, range) in segments where marker == 0xe2 {
+                if data[range].starts(with: jpegNamespace) {
+                    let metadata = data.subdata(in: (range.lowerBound + jpegNamespace.count)..<range.upperBound)
+                    return (metadata, data.subdata(in: gain))
                 }
             }
         }
@@ -337,21 +342,26 @@ extension StillISOGainMap {
         let lengthSize = sizes >> 8 & 15
         let baseSize = sizes >> 4 & 15
         let indexSize = version == 0 ? 0 : sizes & 15
+        guard offsetSize <= 8, lengthSize <= 8, baseSize <= 8, indexSize <= 8 else { throw Invalid() }
         let itemIDSize = version < 2 ? 2 : 4
         let itemCount = try reader.integer(itemIDSize)
         guard itemCount <= 65_536 else { throw Invalid() }
         for _ in 0..<itemCount {
+            try Task.checkCancellation()
             let itemID = try reader.integer(itemIDSize)
             let method = version == 0 ? 0 : try reader.integer(2) & 15
             let dataReference = try reader.integer(2)
             let base = try reader.integer(baseSize)
             let extentCount = try reader.integer(2)
+            if itemID != id {
+                _ = try reader.take(extentCount * (indexSize + offsetSize + lengthSize))
+                continue
+            }
             var result = Data()
             for _ in 0..<extentCount {
                 _ = try reader.take(indexSize)
                 let offset = try reader.integer(offsetSize)
                 let length = try reader.integer(lengthSize)
-                guard itemID == id else { continue }
                 let storage: Range<Int>
                 if method == 1, let idat {
                     storage = idat.payload
@@ -365,7 +375,7 @@ extension StillISOGainMap {
                 let start = storage.lowerBound + base + offset
                 result.append(data[start..<(start + length)])
             }
-            if itemID == id, !result.isEmpty { return result }
+            if !result.isEmpty { return result }
         }
         throw Invalid()
     }

@@ -3,6 +3,11 @@ import Foundation
 /// The exact presentation clock used when measuring this track. Preview timing
 /// and a fully indexed MOV with audio edits can differ for the same source.
 struct AudioAnalysisClock: Codable, Equatable, Sendable {
+    private enum CodingKeys: String, CodingKey {
+        case stream, duration, origin, indexed
+        case usesPresentationEdits = "uses_presentation_edits"
+    }
+
     let stream: Int
     let duration: RationalTime
     let origin: RationalTime
@@ -35,8 +40,12 @@ public struct SilenceAnalysisResult: Codable, Sendable {
     public let minimum: Double
     public let automaticThresholdDB: Double
     public let pauses: [AudioSpan]
-    let runs: SilenceRuns?
-    package var hasRouting: Bool { runs != nil }
+    let runs: SilenceRuns
+    package func pauses(maxBlip: Double) -> [AudioSpan] {
+        if maxBlip == AudioWaveform.defaultMaxBlip { return pauses }
+        return runs.pauses(minimum: minimum, maxBlip: maxBlip)
+    }
+
     public var thresholdDB: Double { requestedThresholdDB ?? automaticThresholdDB }
     fileprivate var sourceIdentity: SourceIdentity?
     fileprivate var sourceClock: AudioAnalysisClock?
@@ -53,11 +62,15 @@ public struct SilenceAnalysisResult: Codable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case stream, requestedThresholdDB, minimum, automaticThresholdDB, pauses, runs
+        case stream = "audio_stream_index"
+        case requestedThresholdDB = "silence_threshold_db"
+        case minimum = "silence_min_pause_seconds"
+        case automaticThresholdDB = "silence_automatic_threshold_db"
+        case pauses, runs
     }
 
     init(media: MediaInfo, stream: Int, requestedThresholdDB: Double?, minimum: Double,
-                     automaticThresholdDB: Double, pauses: [AudioSpan], runs: SilenceRuns? = nil) {
+                     automaticThresholdDB: Double, pauses: [AudioSpan], runs: SilenceRuns) {
         self.stream = stream
         self.requestedThresholdDB = requestedThresholdDB
         self.minimum = minimum
@@ -69,6 +82,7 @@ public struct SilenceAnalysisResult: Codable, Sendable {
     }
 
     public init(from decoder: Decoder) throws {
+        try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_sidecar_analysis")
         let values = try decoder.container(keyedBy: CodingKeys.self)
         stream = try values.decode(Int.self, forKey: .stream)
         requestedThresholdDB = try values.decodeIfPresent(Double.self, forKey: .requestedThresholdDB)
@@ -82,7 +96,7 @@ public struct SilenceAnalysisResult: Codable, Sendable {
             spans.append(try saved.decode(AudioSpan.self))
         }
         pauses = spans
-        runs = try values.decodeIfPresent(SilenceRuns.self, forKey: .runs)
+        runs = try values.decode(SilenceRuns.self, forKey: .runs)
     }
 }
 
@@ -91,23 +105,6 @@ private let silenceCancellationKey = CodingUserInfoKey(rawValue: "mpcut.silence.
 private struct CachedAudio<Value: Codable>: Codable {
     let clock: AudioAnalysisClock
     let value: Value
-    var sampleAlignedPeaks: Bool?
-    var hasSourceCalibration: Bool?
-}
-
-private func needsSourceCalibration(_ key: String) -> Bool {
-    // Earlier records could contain a caller-supplied override under a
-    // source-wide calibration key. Recompute them before normal reuse.
-    key.hasPrefix("silence.") || key.hasPrefix("calibration.")
-}
-
-// Earlier peak scans used each block's rounded container timestamp directly.
-// Signed envelopes already tracked the continuous sample clock.
-private func needsSampleAlignedPeaks(_ media: MediaInfo, stream: Int, key: String) -> Bool {
-    guard AnalysisSidecar.savedEnvelopeStream(forKey: key) == nil,
-          !media.requiresPresentationAudioAnalysis(stream: stream),
-          let track = media.streams.first(where: { $0.index == stream }), track.sampleRate > 0 else { return false }
-    return track.timeBase > RationalTime(numerator: 1, denominator: Int64(track.sampleRate))
 }
 
 // The display overview has a fixed upper bound. Store planar float bytes so a
@@ -137,6 +134,11 @@ private struct CachedEnvelope: Codable {
 }
 
 private struct CachedScenes: Codable, Equatable {
+    private enum CodingKeys: String, CodingKey {
+        case origin, duration, markers
+        case timeBase = "time_base"
+    }
+
     struct Marker: Codable, Equatable {
         let pts: Int64
         let view: Int
@@ -194,7 +196,7 @@ private struct CachedScenes: Codable, Equatable {
 private func silenceKey(stream: Int, thresholdDB: Double?, minimum: Double) -> String {
     // Exact floating-point settings, independent of locale or display precision.
     let threshold = thresholdDB.map { String(($0 == 0 ? 0.0 : $0).bitPattern, radix: 16) } ?? "auto"
-    return "silence.v1.\(stream).\(threshold).\(String(minimum.bitPattern, radix: 16))"
+    return "silence_pauses.v1.\(stream).\(threshold).\(String(minimum.bitPattern, radix: 16))"
 }
 
 private func valid(_ result: SilenceAnalysisResult, for media: MediaInfo, cancelled: () -> Bool) -> Bool {
@@ -212,18 +214,18 @@ private func valid(_ result: SilenceAnalysisResult, for media: MediaInfo, cancel
         return true
     }
     guard validSpans(result.pauses, minimum: result.minimum) else { return false }
-    guard let runs = result.runs else { return true }
+    let runs = result.runs
     return validSpans(runs.quiet, minimum: 0) && validSpans(runs.covered, minimum: 0)
 }
 
 extension AnalysisSidecar {
     // Revise these together when detection can change marker timing or view IDs.
-    public static let sceneSectionKey = "scenes.v2"
-    public static let viewNameSectionKey = "viewNames.v2"
+    public static let sceneSectionKey = "scenes_boundaries.v1"
+    public static let viewNameSectionKey = "scenes_view_names.v1"
 
     public static func savedSilenceSettings(forKey key: String) -> (stream: Int, thresholdDB: Double?, minimum: Double)? {
         let parts = key.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count == 5, parts[0] == "silence", parts[1] == "v1", let stream = Int(parts[2]), stream >= 0,
+        guard parts.count == 5, parts[0] == "silence_pauses", parts[1] == "v1", let stream = Int(parts[2]), stream >= 0,
               let bits = UInt64(parts[4], radix: 16) else { return nil }
         let minimum = Double(bitPattern: bits)
         guard minimum.isFinite, minimum > 0 else { return nil }
@@ -239,14 +241,14 @@ extension AnalysisSidecar {
     }
 
     public static func savedWaveformStream(forKey key: String) -> Int? {
-        guard key.hasPrefix("wave.v1."), let stream = Int(key.dropFirst("wave.v1.".count)), stream >= 0,
-              key == "wave.v1.\(stream)" else { return nil }
+        guard key.hasPrefix("waveform_peaks.v1."), let stream = Int(key.dropFirst("waveform_peaks.v1.".count)), stream >= 0,
+              key == "waveform_peaks.v1.\(stream)" else { return nil }
         return stream
     }
 
     public static func savedEnvelopeStream(forKey key: String) -> Int? {
-        guard key.hasPrefix("envelope.v2."), let stream = Int(key.dropFirst("envelope.v2.".count)),
-              stream >= 0, key == "envelope.v2.\(stream)" else { return nil }
+        guard key.hasPrefix("waveform_envelope.v1."), let stream = Int(key.dropFirst("waveform_envelope.v1.".count)),
+              stream >= 0, key == "waveform_envelope.v1.\(stream)" else { return nil }
         return stream
     }
 
@@ -269,23 +271,15 @@ extension AnalysisSidecar {
         return try JSONEncoder().encode(cleaned)
     }
 
-    private func viewNames(matching cached: @autoclosure () -> CachedScenes, read: (String) -> Data?) -> [Int: String] {
-        // An explicitly empty current map clears all names, including legacy names.
-        if let data = read(Self.viewNameSectionKey) {
-            return (try? JSONDecoder().decode([Int: String].self, from: data)) ?? [:]
-        }
-        guard let data = read("viewNames.v1"),
-              let names = try? JSONDecoder().decode([Int: String].self, from: data), !names.isEmpty,
-              let markers = read("scenes.v1"),
-              let legacy = try? JSONDecoder().decode(CachedScenes.self, from: markers), legacy == cached()
-        else { return [:] }
-        return names
+    private func viewNames(read: (String) -> Data?) -> [Int: String] {
+        guard let data = read(Self.viewNameSectionKey) else { return [:] }
+        return (try? JSONDecoder().decode([Int: String].self, from: data)) ?? [:]
     }
 
     func restoringViewNames(to report: SceneReport, cancelled: () -> Bool) -> SceneReport {
         guard report.sourceStamp == SceneSourceStamp(identity: identity) else { return report }
         return (try? withReadSnapshot(cancelled: cancelled) { read in
-            let names = viewNames(matching: CachedScenes(report), read: read)
+            let names = viewNames(read: read)
             var updated = report
             for (view, name) in names { updated.setViewName(name, for: view) }
             return updated
@@ -300,11 +294,20 @@ extension AnalysisSidecar {
         }
     }
 
+    func sceneSectionMatches(_ data: Data, replacement: Data, cancelled: () -> Bool) -> Bool {
+        let decoder = JSONDecoder()
+        guard let cached = try? decoder.decode(CachedScenes.self, from: data),
+              let rebuilt = try? decoder.decode(CachedScenes.self, from: replacement),
+              cached.timeBase == rebuilt.timeBase, cached.duration == rebuilt.duration,
+              cached.origin == rebuilt.origin else { return false }
+        return (try? cached.report(source: source, identity: identity, names: [:], cancelled: cancelled)) != nil
+    }
+
     private func decodeSceneReport(read: (String) -> Data?, cancelled: () -> Bool) throws -> SceneReport? {
         guard let data = read(Self.sceneSectionKey),
               let cached = try? JSONDecoder().decode(CachedScenes.self, from: data)
         else { return nil }
-        let names = viewNames(matching: cached, read: read)
+        let names = viewNames(read: read)
         return try cached.report(source: source, identity: identity, names: names, cancelled: cancelled)
     }
 
@@ -325,7 +328,7 @@ extension AnalysisSidecar {
             let report = media.hasVideo
                 ? matchingSceneReport(try? decodeSceneReport(read: read, cancelled: cancelled), media: media)
                 : nil
-            let thresholds = read("thresholdOverrides.v1").flatMap {
+            let thresholds = read(AnalysisSidecar.silenceThresholdOverridesKey).flatMap {
                 try? JSONDecoder().decode([Int: Double].self, from: $0)
             } ?? [:]
             return (report, thresholds)
@@ -341,9 +344,7 @@ extension AnalysisSidecar {
         let decoder = PropertyListDecoder()
         decoder.userInfo[silenceCancellationKey] = cancelled
         guard let record = try? decoder.decode(CachedAudio<Value>.self, from: data),
-              record.clock == clock, !cancelled(),
-              record.hasSourceCalibration == true || !needsSourceCalibration(key),
-              record.sampleAlignedPeaks == true || !needsSampleAlignedPeaks(media, stream: stream, key: key) else { return nil }
+              record.clock == clock, !cancelled() else { return nil }
         return record.value
     }
 
@@ -351,14 +352,14 @@ extension AnalysisSidecar {
         let bins = ceil(media.duration.seconds * Double(AudioWaveform.rate)) + 1
         // Include space for the clock and binary property list metadata.
         guard let maxBytes = Int(exactly: bins * Double(MemoryLayout<Float>.stride) + 4096),
-              let bytes = audioRecord(Data.self, key: "wave.v1.\(stream)", media: media,
+              let bytes = audioRecord(Data.self, key: "waveform_peaks.v1.\(stream)", media: media,
                                      stream: stream, maxBytes: maxBytes, cancelled: cancelled) else { return nil }
         return AudioWaveform(peakBytes: bytes, media: media, stream: stream, cancelled: cancelled)
     }
 
     public func envelopeOverview(for media: MediaInfo, stream: Int, cancelled: @escaping () -> Bool = { Task.isCancelled }) -> AudioEnvelope? {
         let maxBytes = AudioEnvelope.maxColumns * 2 * MemoryLayout<Float>.stride + 4096
-        guard let saved = audioRecord(CachedEnvelope.self, key: "envelope.v2.\(stream)", media: media,
+        guard let saved = audioRecord(CachedEnvelope.self, key: "waveform_envelope.v1.\(stream)", media: media,
                                       stream: stream, maxBytes: maxBytes, cancelled: cancelled),
               var overview = saved.overview(duration: media.duration.seconds), !cancelled() else { return nil }
         overview.sourceIdentity = media.identity
@@ -369,7 +370,7 @@ extension AnalysisSidecar {
     func saveOverviewAutomatically(_ overview: AudioEnvelope, for media: MediaInfo, stream: Int,
                                    cancelled: () -> Bool) {
         guard Self.readsEnabled, Self.automaticWritesEnabled, !isExcluded, !cancelled() else { return }
-        let key = "envelope.v2.\(stream)"
+        let key = "waveform_envelope.v1.\(stream)"
         guard let data = try? Self.sections(media: media, envelopeOverviews: [stream: overview], cancelled: cancelled)[key] else { return }
         try? save([:], updating: [key: { current in
             // Another process can finish a finer overview while this one is decoding.
@@ -385,18 +386,16 @@ extension AnalysisSidecar {
     }
 
     public func automaticThresholdDB(for media: MediaInfo, stream: Int, cancelled: @escaping () -> Bool = { Task.isCancelled }) -> Double? {
-        guard let db = audioRecord(Double.self, key: "calibration.v1.\(stream)", media: media, stream: stream, cancelled: cancelled),
+        guard let db = audioRecord(Double.self, key: "silence_automatic_threshold_db.v1.\(stream)", media: media, stream: stream, cancelled: cancelled),
               (-120...0).contains(db) else { return nil }
         return db
     }
 
     public func silence(for media: MediaInfo, stream: Int, thresholdDB: Double?, minimum: Double,
-                        requireRouting: Bool = false,
                         cancelled: @escaping () -> Bool = { Task.isCancelled }) -> SilenceAnalysisResult? {
         let key = silenceKey(stream: stream, thresholdDB: thresholdDB, minimum: minimum)
         guard var result = audioRecord(SilenceAnalysisResult.self, key: key, media: media, stream: stream, cancelled: cancelled),
               result.stream == stream, result.requestedThresholdDB == thresholdDB, result.minimum == minimum,
-              !requireRouting || result.hasRouting,
               valid(result, for: media, cancelled: cancelled) else { return nil }
         result.sourceIdentity = identity
         result.sourceClock = AudioAnalysisClock(media: media, stream: stream)
@@ -415,9 +414,7 @@ extension AnalysisSidecar {
         let encoder = PropertyListEncoder()
         encoder.outputFormat = .binary
         func encode<Value: Codable>(_ key: String, _ clock: AudioAnalysisClock, _ value: Value) throws {
-            let aligned = needsSampleAlignedPeaks(media, stream: clock.stream, key: key)
-            sections[key] = try encoder.encode(CachedAudio(clock: clock, value: value, sampleAlignedPeaks: aligned ? true : nil,
-                                                           hasSourceCalibration: needsSourceCalibration(key) ? true : nil))
+            sections[key] = try encoder.encode(CachedAudio(clock: clock, value: value))
         }
         try checkCancellation()
         if let scenes {
@@ -434,7 +431,7 @@ extension AnalysisSidecar {
                   overview.from == 0, overview.to == media.duration.seconds,
                   overview.low.count == overview.high.count, (1...AudioEnvelope.maxColumns).contains(overview.low.count),
                   zip(overview.low, overview.high).allSatisfy({ $0.isFinite && $1.isFinite && $0 <= $1 }) else { throw mismatch }
-            try encode("envelope.v2.\(stream)", clock, CachedEnvelope(overview))
+            try encode("waveform_envelope.v1.\(stream)", clock, CachedEnvelope(overview))
         }
         for result in silence {
             try checkCancellation()
@@ -447,15 +444,15 @@ extension AnalysisSidecar {
             guard result.hasSourceCalibration else { continue }
             try encode(silenceKey(stream: result.stream, thresholdDB: result.requestedThresholdDB,
                                   minimum: result.minimum), clock, result)
-            try encode("calibration.v1.\(result.stream)", clock, result.automaticThresholdDB)
+            try encode("silence_automatic_threshold_db.v1.\(result.stream)", clock, result.automaticThresholdDB)
         }
         for (stream, wave) in waveforms {
             try checkCancellation()
             guard wave.matches(media, stream: stream) else { throw mismatch }
             let clock = AudioAnalysisClock(media: media, stream: stream)
             guard clock.indexed else { throw mismatch }
-            try encode("wave.v1.\(stream)", clock, wave.peakBytes(checkingCancellation: checkCancellation))
-            let key = "calibration.v1.\(stream)"
+            try encode("waveform_peaks.v1.\(stream)", clock, wave.peakBytes(checkingCancellation: checkCancellation))
+            let key = "silence_automatic_threshold_db.v1.\(stream)"
             if sections[key] == nil {
                 let db = try wave.automaticThresholdDB(checkingCancellation: checkCancellation)
                 try encode(key, clock, db)
@@ -471,7 +468,7 @@ extension AudioAnalysis {
     /// be evaluated from saved peaks without decoding the audio track again.
     public static func silence(_ media: MediaInfo, stream: Int, thresholdDB: Double? = nil, minimum: Double = 1.5,
                                waveform: AudioWaveform? = nil, automaticThresholdDB: Double? = nil,
-                               useSidecar: Bool = true, requireRouting: Bool = false,
+                               useSidecar: Bool = true,
                                cancelled: @escaping () -> Bool = { false }) throws -> SilenceAnalysisResult {
         func checkCancellation() throws {
             if cancelled() { throw CutError(code: "cancelled", message: "Silence analysis was cancelled.") }
@@ -488,8 +485,7 @@ extension AudioAnalysis {
         try checkSource()
         let sidecar = useSidecar ? AnalysisSidecar(media: media) : nil
         let suppliedCalibration = automaticThresholdDB.flatMap { (-120...0).contains($0) ? $0 : nil }
-        if let saved = sidecar?.silence(for: media, stream: stream, thresholdDB: thresholdDB, minimum: minimum,
-                                        requireRouting: requireRouting, cancelled: cancelled),
+        if let saved = sidecar?.silence(for: media, stream: stream, thresholdDB: thresholdDB, minimum: minimum, cancelled: cancelled),
            suppliedCalibration.map({ saved.automaticThresholdDB == $0 }) ?? true {
             try checkCancellation()
             try checkSource()

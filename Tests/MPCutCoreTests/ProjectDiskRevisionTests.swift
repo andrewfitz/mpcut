@@ -3,6 +3,85 @@ import XCTest
 @testable import MPCutCore
 
 final class ProjectDiskRevisionTests: XCTestCase {
+    func testRevisionPreservesExternalSaveDuringPublicationPreparation() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("Project.cut")
+        let externalURL = directory.appendingPathComponent("External.cut")
+        try CutProject.sequence([]).save(to: url)
+        let revision = try XCTUnwrap(CutProjectMedia.load(from: url).diskRevision)
+        let external = CutProject.sequence([.init(id: "other", file: "other.mov", from: .zero, to: .init(numerator: 1))])
+        try external.save(to: externalURL)
+        let data = try Data(contentsOf: externalURL)
+
+        XCTAssertThrowsError(try CutProject.sequence([]).saveRevision(to: url, undo: [], redo: [], expected: revision) {
+            try data.write(to: url, options: .atomic)
+        }) {
+            XCTAssertEqual(($0 as? CutError)?.code, "project_save_conflict")
+        }
+        XCTAssertEqual(try CutProject.load(from: url), external)
+    }
+
+    func testUnversionedSaveWaitsForRevisionPublication() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let files = FileManager.default
+        try files.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? files.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("Project.cut")
+        let original = CutProject.sequence([])
+        try original.save(to: url)
+        let revision = try XCTUnwrap(CutProjectMedia.load(from: url).diskRevision)
+        let first = CutProject.sequence([.init(id: "first", file: "first.mov", from: .zero, to: .init(numerator: 1))])
+        let second = CutProject.sequence([.init(id: "second", file: "second.mov", from: .zero, to: .init(numerator: 1))])
+        let started = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+
+        _ = try first.saveRevision(to: url, undo: [], redo: [], expected: revision) {
+            DispatchQueue.global().async {
+                started.signal()
+                do {
+                    try second.save(to: url)
+                } catch {
+                    XCTFail("Ordinary save failed: \(error)")
+                }
+                finished.signal()
+            }
+            XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
+            XCTAssertEqual(finished.wait(timeout: .now() + 0.25), .timedOut)
+            XCTAssertEqual(try CutProject.load(from: url), original)
+        }
+
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(try CutProject.load(from: url), second)
+    }
+
+    func testRevisionResolvesParentTraversalAfterDirectorySymlink() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let files = FileManager.default
+        let physical = directory.appendingPathComponent("physical")
+        let child = physical.appendingPathComponent("child")
+        try files.createDirectory(at: child, withIntermediateDirectories: true)
+        defer { try? files.removeItem(at: directory) }
+        try files.createSymbolicLink(at: directory.appendingPathComponent("shortcut"), withDestinationURL: child)
+        let traversal = directory.appendingPathComponent("shortcut/../Project.cut")
+        let project = physical.appendingPathComponent("Project.cut")
+        let lexical = directory.appendingPathComponent("Project.cut")
+        let original = CutProject.sequence([])
+        try original.save(to: traversal)
+
+        let opened = try CutProjectMedia.load(from: traversal)
+        let revision = try XCTUnwrap(opened.diskRevision)
+        XCTAssertFalse(files.fileExists(atPath: lexical.path))
+        XCTAssertTrue(revision.matchesDestination(project))
+        XCTAssertFalse(revision.matchesDestination(lexical))
+
+        let edited = CutProject.sequence([.init(id: "clip", file: "offline.mov", from: .zero, to: .init(numerator: 1))])
+        _ = try edited.saveRevision(to: traversal, undo: [], redo: [], expected: revision)
+        XCTAssertEqual(try CutProject.load(from: project), edited)
+        XCTAssertFalse(files.fileExists(atPath: lexical.path))
+    }
+
     func testConcurrentSavesThroughProjectAndSymlinkPublishExactlyOneRevision() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let files = FileManager.default

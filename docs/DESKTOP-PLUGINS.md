@@ -1,6 +1,6 @@
 # Edit with MPCut in a desktop conversation
 
-Install a helper-enabled build of **MPCut.app** in **/Applications** on your Apple Silicon Mac. Launch it and turn on **Settings → General → Automation → Enable local MCP control**. The desktop plugin starts the helper inside this copy of MPCut. The editor owns the timeline, media, undo history and exports.
+Install a helper-enabled build of **MPCut.app** in **/Applications** on your Apple Silicon Mac. Launch it and turn on **Settings → General → Automation → Enable local MCP control**. Local control starts off in 2.0, including after an upgrade from 1.x. The desktop plugin starts the helper inside this copy of MPCut. The editor owns the timeline, media, undo history and exports.
 
 ## Install in your desktop app
 
@@ -10,18 +10,30 @@ Install a helper-enabled build of **MPCut.app** in **/Applications** on your App
 | Claude Desktop, Chat | Upload **MPCut.plugin** for the editing skill. To connect the tools in Chat, open **Settings → Desktop app → Extensions → Manage → Advanced settings → Install Extension** and select **MPCut.mcpb**. Enable the extension and start a new desktop chat. Older versions put Extensions directly under Settings. [Claude local extensions](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop) |
 | ChatGPT Desktop, Work or Codex | Open this checkout as a local project in the desktop app. Restart the app after adding the repository marketplace. In **Plugins**, select the **MPCut Desktop** source, open **MPCut** and install it. Start a local thread and mention **@mpcut**. The repository supplies the plugin and its stdio connection. [OpenAI local marketplaces](https://developers.openai.com/plugins/build/plugins#build-your-own-curated-plugin-list) · [Desktop-only plugins](https://developers.openai.com/plugins/deploy/desktop-only) |
 
+**Grok and Grok Bot** use the **MPCut-Grok.zip** download. Expand it on the editing Mac. It includes a Finder launcher, the HTTPS connector setup for each host, and a self-contained copy of the shared skill to attach in Grok or save as a private skill in Grok Bot. The bridge binds to loopback and requires a bearer key. Connect your own HTTPS route for remote access. [Grok setup](../packaging/grok/Setup.md)
+
 ## Try it
 
 Start with “List my open MPCut timelines and tell me which have unsaved edits.” An empty list is a successful connection to an editor with no windows. Seeing a skill in the menu only confirms its instructions loaded. If the host shows the skill but offers no MPCut tools, check the local session, plugin or extension listed above. If the tools report the app is unavailable, check the running app and its Automation setting.
 
 With a project open, try “Show me the picture at the playhead,” “Find the long pauses in this interview and leave them in place for review,” or “Check whether this cut will export to a MOV using packet copy.” For an edit, specify the clock if it matters, for example “In Interview selects, split at 12 seconds on the edited timeline and leave it open.”
 
-## Packaging and verification plan
+For a review or delivery task, try “Show me every place this source interval appears in the current cut,” “Check picture and microphone coverage if I switch to Wide at 12 seconds group time,” or “Tell me which files and trims the first queued excerpt contains.”
 
-1. Maintain one editing skill and one stdio launch configuration in [plugins/mpcut](../plugins/mpcut/). Both desktop plugins use the app-bundled helper so a new MPCut build supplies its own tool schemas and guides.
-2. For a source build, run `python3 scripts/package-desktop-plugins.py` from the repository root to produce `dist/desktop-plugins/MPCut.plugin` and `MPCut.mcpb` in the same folder. The ChatGPT Desktop marketplace reads the source directory directly. If distributing a build with a different app location, change the command in [the shared connection](../plugins/mpcut/.mcp.json) and rebuild the Claude downloads.
-3. Test discovery and a read in each desktop surface. With a disposable sequence, ask for a frame, split inside a clip, check the actual boundary in MPCut and undo it. Preflight a copy export and check the returned eligibility. Request an export to a fresh destination, wait for the job and open the result. Record the desktop app version and workflow outcome for each host before claiming end-to-end support.
+## Check the connection
 
-The first local check passed Claude's plugin validator and the MCPB manifest schema. ChatGPT Desktop's bundled Codex 0.169.1 backend listed the plugin for this checkout. Both packaged launch commands discovered 83 tools and read an open timeline. The installed helper lacked the still-placement tools in the source tree. Installation, edits and exports through the conversation UIs remain to be tested.
+Compare the host’s `tools/list` response with the installed reference. Read the advertised schemas and check that the host can retrieve the agent guide and tool reference. Some saved-file operations, including creating or revising a saved still placement, use the bundled CLI. [Tool reference](MCP-REFERENCE.md) · [File workflows and CLI options](../plugins/mpcut/skills/mpcut-editing/references/files.md)
 
-For the full workflow catalog and recovery behavior, see the [MPCut agent guide](MCP-AGENT-GUIDE.md).
+For unattended review of saved cuts, a local stdio host can register a separate `--files-only` connection. It exposes file jobs and their documentation independently of the desktop editor. [Headless setup](HEADLESS.md)
+
+Local tests cover helper discovery, reads, editing and export. The Grok bridge test also checks bearer authentication and JPEG responses. Installation and editing in each desktop conversation UI, and the remote xAI account connection, still need host-level verification. [MCP integration coverage](MCP-COVERAGE.md)
+
+## Build the plugin packages
+
+Run `python3 scripts/package-desktop-plugins.py` from the repository root. It writes `MPCut.plugin`, `MPCut.mcpb` and `MPCut-Grok.zip` to `dist/desktop-plugins/`. The ChatGPT Desktop marketplace reads [the plugin source](../plugins/mpcut/) directly. If MPCut lives outside Applications, update [the shared connection](../plugins/mpcut/.mcp.json) before packaging.
+
+To test the packaged Grok bridge locally, run the following from the checkout. Add `--live` with a build supporting isolated test sockets to exercise an edit.
+
+```sh
+python3 Tests/Integration/grok_connector.py dist/desktop-plugins/MPCut-Grok.zip /Applications/MPCut.app
+```

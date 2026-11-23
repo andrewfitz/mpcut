@@ -37,6 +37,16 @@
             <array>
                 <string>public.movie</string>
                 <string>public.video</string>
+                <string>com.apple.quicktime-movie</string>
+                <string>public.mpeg-4</string>
+                <string>com.apple.m4v-video</string>
+                <string>org.matroska.mkv</string>
+                <string>org.webmproject.webm</string>
+                <string>public.avi</string>
+                <string>org.smpte.mxf</string>
+                <string>public.mpeg-2-transport-stream</string>
+                <string>public.avchd-mpeg-2-transport-stream</string>
+                <string>public.mpeg</string>
             </array>
         </dict>
         <dict>
@@ -49,6 +59,16 @@
             <key>LSItemContentTypes</key>
             <array>
                 <string>public.audio</string>
+                <string>com.microsoft.waveform-audio</string>
+                <string>public.aiff-audio</string>
+                <string>com.apple.coreaudio-format</string>
+                <string>com.apple.m4a-audio</string>
+                <string>public.aac-audio</string>
+                <string>public.mp3</string>
+                <string>org.xiph.flac</string>
+                <string>org.xiph.ogg-audio</string>
+                <string>org.xiph.ogg-opus</string>
+                <string>org.matroska.mka</string>
             </array>
         </dict>
         <dict>
@@ -81,6 +101,49 @@
             <array>
                 <string>com.mpcut.project</string>
             </array>
+        </dict>
+    </array>
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.matroska.mkv</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.movie</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>mkv</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.matroska.mka</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.audio</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>mka</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.webmproject.webm</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.movie</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>webm</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.xiph.ogg-audio</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.audio</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>ogg</string><string>oga</string></array></dict>
+        </dict>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>org.xiph.ogg-opus</string>
+            <key>UTTypeConformsTo</key>
+            <array><string>public.audio</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>opus</string></array></dict>
         </dict>
     </array>
     <key>UTExportedTypeDeclarations</key>

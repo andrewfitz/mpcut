@@ -1,4 +1,5 @@
 import CoreGraphics
+import Darwin
 import Foundation
 import MPCutCore
 import SQLite3
@@ -128,6 +129,104 @@ final class FilmstripSidecarTests: XCTestCase {
         XCTAssertLessThan(start.duration(to: .now), .seconds(4))
         XCTAssertEqual(sqlite3_exec(db, "COMMIT", nil, nil, nil), SQLITE_OK)
         try await wait { keys.allSatisfy { $0.image(in: sidecar) != nil } }
+    }
+
+    @MainActor
+    func testFilmstripWriterKeepsRecentTilesAndSkipsCancelledRequests() async throws {
+        let runs = Int(ProcessInfo.processInfo.environment["MPCUT_FILMSTRIP_WRITE_BENCHMARK_RUNS"] ?? "") ?? 1
+        let size = CGSize(width: 320, height: 180)
+        let context = try XCTUnwrap(CGContext(data: nil, width: 320, height: 180, bitsPerComponent: 8,
+                                              bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let image = try XCTUnwrap(context.makeImage())
+        let keys = try (0..<32).map { try XCTUnwrap(FilmstripTileKey(time: Double($0), size: size)) }
+        let prefix = FilmstripTileKey.sectionPrefix
+        let old = Dictionary(uniqueKeysWithValues: (0..<FilmstripTileBuffer.countLimit).map {
+            ("\(prefix)old.\($0)", Data([1]))
+        })
+        var timings: [Double] = []
+        for _ in 0..<max(runs, 1) {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let source = directory.appendingPathComponent("source")
+            try Data([1]).write(to: source)
+            let sidecar = try AnalysisSidecar(source: source)
+            try sidecar.save(old.merging(["unrelated": Data([2])]) { _, new in new })
+            var db: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(sidecar.url.path, &db), SQLITE_OK)
+            defer { sqlite3_close(db) }
+            XCTAssertEqual(sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil), SQLITE_OK)
+            let writer = FilmstripTileWriter()
+            for (index, key) in keys.enumerated() {
+                writer.submit(image, key: key, sidecar: sidecar, preserveAlpha: false, cancelled: { index == 8 })
+            }
+            let start = ProcessInfo.processInfo.systemUptime
+            XCTAssertEqual(sqlite3_exec(db, "COMMIT", nil, nil, nil), SQLITE_OK)
+            let last = try XCTUnwrap(keys.last)
+            let deadline = ContinuousClock.now + .seconds(8)
+            while sidecar.read(last.section) == nil, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            timings.append((ProcessInfo.processInfo.systemUptime - start) * 1000)
+            for (index, key) in keys.enumerated() {
+                XCTAssertEqual(sidecar.read(key.section), index == 8 ? nil : key.encoded(image, preserveAlpha: false))
+            }
+            XCTAssertEqual(sidecar.keys().filter { $0.hasPrefix(prefix) }.count, FilmstripTileBuffer.countLimit)
+            XCTAssertEqual(sidecar.read("unrelated"), Data([2]))
+            let later = Dictionary(uniqueKeysWithValues: (0..<(FilmstripTileBuffer.countLimit - 30)).map {
+                ("\(prefix)later.\($0)", Data([3]))
+            })
+            try sidecar.save(later, retainingLatest: [prefix: FilmstripTileBuffer.countLimit])
+            XCTAssertNil(sidecar.read(keys[0].section))
+            XCTAssertEqual(keys.dropFirst().filter { sidecar.read($0.section) != nil }.count, 30)
+        }
+        if runs > 1 {
+            print("MPCUT_FILMSTRIP_WRITE_MILLISECONDS \(timings)")
+        }
+    }
+
+    @MainActor
+    func testFilmstripWriterKeepsCurrentTileAfterSameStampSourceChange() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source")
+        try Data([1]).write(to: source)
+        let oldIdentity = try SourceIdentity(source)
+        let old = try AnalysisSidecar(source: source)
+        var info = stat()
+        XCTAssertEqual(stat(source.path, &info), 0)
+        try await Task.sleep(for: .milliseconds(20))
+        let handle = try FileHandle(forWritingTo: source)
+        try handle.write(contentsOf: Data([2]))
+        try handle.close()
+        let times = [info.st_atimespec, info.st_mtimespec]
+        XCTAssertEqual(times.withUnsafeBufferPointer { utimensat(AT_FDCWD, source.path, $0.baseAddress, 0) }, 0)
+        let current = try AnalysisSidecar(source: source)
+        XCTAssertEqual(oldIdentity, try SourceIdentity(source))
+        XCTAssertThrowsError(try old.checkSource())
+        XCTAssertNoThrow(try current.checkSource())
+
+        let size = CGSize(width: 4, height: 4)
+        let context = try XCTUnwrap(CGContext(data: nil, width: 4, height: 4, bitsPerComponent: 8,
+                                              bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let image = try XCTUnwrap(context.makeImage())
+        let keys = try (0..<3).map { try XCTUnwrap(FilmstripTileKey(time: Double($0), size: size)) }
+        let writer = FilmstripTileWriter()
+        let release = DispatchSemaphore(value: 0)
+        writer.submit(image, key: keys[0], sidecar: current, preserveAlpha: true, cancelled: {
+            _ = release.wait(timeout: .now() + 2)
+            return true
+        })
+        writer.submit(image, key: keys[1], sidecar: old, preserveAlpha: true, cancelled: { false })
+        writer.submit(image, key: keys[2], sidecar: current, preserveAlpha: true, cancelled: { false })
+        release.signal()
+        try await wait { current.read(keys[2].section) != nil }
+        XCTAssertNil(current.read(keys[0].section))
+        XCTAssertNil(current.read(keys[1].section))
+        XCTAssertEqual(current.read(keys[2].section), keys[2].encoded(image, preserveAlpha: true))
     }
 
     private func centerPixel(_ image: CGImage) throws -> UInt32 {

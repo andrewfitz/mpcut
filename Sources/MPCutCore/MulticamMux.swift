@@ -10,14 +10,21 @@ struct MulticamMux {
     static var movieContainers: [String] { ExportRules.multicamMovieContainers }
 
     func check(container: String) throws {
-        if Self.movieContainers.contains(container) { return }
-        guard ExportRules.multicamContainers.contains(container) else { throw ExportRules.multicamContainerRefusal }
+        if Self.movieContainers.contains(container) || container == "m4a" { return }
+        guard ExportRules.multicamContainers.contains(container) || container == "mka" else { throw ExportRules.multicamContainerRefusal }
         _ = try ReencodeEngine.findHelper(override: nil)
     }
 
     func export(picture: URL, sound: URL, to output: URL, container: String, duration: RationalTime,
                 progress: ((Double) -> Bool)? = nil, verifySources: () throws -> Void = {}) throws {
-        try check(container: container)
+        try export(picture: picture, sounds: [sound], to: output, container: container, duration: duration,
+                   progress: progress, verifySources: verifySources)
+    }
+
+    func export(picture: URL?, sounds: [URL], to output: URL, container: String, duration: RationalTime,
+                audio: [MulticamExportAudioLane] = [], progress: ((Double) -> Bool)? = nil, verifySources: () throws -> Void = {}) throws {
+        let written = ExportRules.multicamMuxContainer(container)
+        try check(container: written)
         let process = ReencodeEngine(cancelled: cancelled)
         try process.checkCancellation()
         try process.checkDestination(output, container: container)
@@ -44,18 +51,26 @@ struct MulticamMux {
         }
         do {
             try update(0)
-            if Self.movieContainers.contains(container) {
-                try MulticamMOV.combine(picture: picture, sound: sound, output: partial, progress: update)
+            if Self.movieContainers.contains(written) || written == "m4a" {
+                try MulticamMOV.combine(picture: picture, sounds: sounds, output: partial, progress: update)
             } else {
                 let helper = try ReencodeEngine.findHelper(override: nil)
-                let muxer = container == "mkv" ? "matroska" : container
-                try runner.runHelper(helper, arguments: [
-                    "-xerror", "-copyts", "-i", picture.path, "-i", sound.path,
-                    "-map", "0:v:0", "-map", "1:a:0", "-map_chapters", "-1",
-                    "-c", "copy", "-copyinkf", "-avoid_negative_ts", "disabled", "-f", muxer, "-n", partial.path
-                ], in: staging, duration: duration) { fraction in
+                let muxer = written == "mkv" || written == "mka" ? "matroska" : written
+                var arguments = ["-xerror", "-copyts"]
+                for input in [picture].compactMap({ $0 }) + sounds { arguments += ["-i", input.path] }
+                if picture != nil { arguments += ["-map", "0:v:0"] }
+                for index in sounds.indices {
+                    arguments += ["-map", "\(index + (picture == nil ? 0 : 1)):a:0",
+                                  "-disposition:a:\(index)", index == 0 ? "default" : "0"]
+                }
+                arguments += ["-map_chapters", "-1", "-c", "copy", "-copyinkf", "-avoid_negative_ts",
+                              "disabled", "-f", muxer, "-n", partial.path]
+                try runner.runHelper(helper, arguments: arguments, in: staging, duration: duration) { fraction in
                     if progress?(fraction) == false { interruption.stop() }
                 }
+            }
+            if audio.count > 1 {
+                try verifyAudio(audio, in: partial)
             }
             try update(1)
         } catch let error as CutError {
@@ -67,7 +82,7 @@ struct MulticamMux {
         try verifySources()
         try runner.checkCancellation()
         // The movie is staged private. Publish it with the permissions of any other export.
-        guard chmod(partial.path, 0o666 & ~creationMask) == 0 else {
+        guard chmod(partial.path, try publicationPermissions(0o666)) == 0 else {
             throw CutError(code: "write_failed", message: String(cString: strerror(errno)))
         }
         let failure = publishExclusively(from: partial, to: destination)
@@ -78,6 +93,23 @@ struct MulticamMux {
             throw CutError(code: "write_failed", message: String(cString: strerror(failure)))
         }
     }
+    private func verifyAudio(_ planned: [MulticamExportAudioLane], in file: URL) throws {
+        let streams = try Probe.read(file, keyframes: false, previewOnly: true, cancelled: cancelled)
+            .streams.filter { $0.kind == "audio" }
+        guard streams.count == planned.count else {
+            throw CutError(code: "write_failed", message: "The multiplexed file did not retain every planned audio track.")
+        }
+        for (index, pair) in zip(streams, planned).enumerated() {
+            let (stream, lane) = pair
+            guard stream.codec == lane.codec, stream.sampleRate == lane.sampleRate,
+                  stream.canonicalChannelLayout == lane.channelLayout,
+                  (stream.disposition & 1 != 0) == (index == 0) else {
+                throw CutError(code: "write_failed", message: "The multiplexed file changed lane \(lane.label) (\(lane.id)).",
+                               track: stream.index, laneID: lane.id)
+            }
+        }
+    }
+
 }
 
 private final class MuxInterruption: @unchecked Sendable {

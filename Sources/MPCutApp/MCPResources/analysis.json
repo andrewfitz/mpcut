@@ -1,11 +1,11 @@
 [
   {
-    "name": "analysis_state",
-    "description": "Read scene and silence scan status, scene coverage, current scene selection, media refresh status and issues, settings, and a bounded page of source IDs and audio streams.",
+    "name": "analysis_editor_state_read",
+    "description": "Read scene and silence scan status, scene coverage, current scene selection, media refresh status and issues, settings, and a bounded page of source IDs and absolute audio stream indices.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
         "offset": {
@@ -19,18 +19,18 @@
         }
       },
       "required": [
-        "project"
+        "project_handle"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "list_pauses",
+    "name": "silence_editor_pauses_list",
     "description": "Read detected pauses, proposed removals, clock and protection state from the current sequence or multicam assembly. Use the returned pause ID for review.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
         "offset": {
@@ -44,21 +44,21 @@
         }
       },
       "required": [
-        "project"
+        "project_handle"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "list_scenes",
+    "name": "scenes_editor_boundaries_list",
     "description": "Read exact source-relative scene boundaries and recurring views for a source or a sequence clip.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "source": {
+        "source_id": {
           "type": "string"
         },
         "offset": {
@@ -70,47 +70,47 @@
           "minimum": 1,
           "maximum": 500
         },
-        "clip": {
+        "clip_id": {
           "type": "string",
           "format": "uuid",
           "description": "Sequence occurrence ID. Read the report that covers the clip’s current source interval."
         },
-        "includeStale": {
+        "include_stale": {
           "type": "boolean",
           "description": "Prefer the archived report from a prior source generation when available. Archived rows carry their stale reason and original source stamp."
         }
       },
       "required": [
-        "project"
+        "project_handle"
       ],
       "additionalProperties": false,
       "oneOf": [
         {
           "required": [
-            "source"
+            "source_id"
           ]
         },
         {
           "required": [
-            "clip"
+            "clip_id"
           ]
         }
       ]
     }
   },
   {
-    "name": "get_waveform_peaks",
-    "description": "Read linear-amplitude peak bins from a completed native waveform on the selected sequence track or a routed multicam track. Unobserved bins are null. Stream uses an absolute stream index. Use get_waveform for a signed envelope or another indexed stream.",
+    "name": "waveform_editor_peaks_read",
+    "description": "Read linear-amplitude peak bins from a completed native waveform on the selected sequence track or a routed multicam track. Unobserved bins are null. Stream uses an absolute stream index. Use waveform_editor_envelope_read for a signed envelope or another indexed stream.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "source": {
+        "source_id": {
           "type": "string"
         },
-        "stream": {
+        "audio_stream_index": {
           "type": "integer",
           "minimum": 0
         },
@@ -119,43 +119,36 @@
           "minimum": 1,
           "maximum": 2048
         },
-        "from": {
+        "source_from": {
           "type": "string"
         },
-        "to": {
+        "source_to": {
           "type": "string"
         }
       },
       "required": [
-        "project",
-        "source",
-        "stream"
+        "project_handle",
+        "source_id",
+        "audio_stream_index"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "scan_analysis",
-    "description": "Start native background scene or silence analysis. Scene scans default to all sources with reuse. Poll analysis_job_status using the returned job ID.",
+    "name": "scenes_editor_scan",
+    "description": "Scan scenes in the open editor. Select the whole project or a source using scope and target.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string"
-        },
-        "kind": {
-          "type": "string",
-          "enum": [
-            "scenes",
-            "silence"
-          ]
         },
         "scope": {
           "type": "string",
@@ -168,7 +161,7 @@
         "target": {
           "type": "string",
           "minLength": 1,
-          "description": "Clip UUID from get_editor_state or camera ID from get_multicam. Applies to selected scope and defaults to the current editor selection."
+          "description": "Clip UUID from project_editor_state_read or camera ID from multicam_state_read. Applies to selected scope and defaults to the current editor selection."
         },
         "policy": {
           "type": "string",
@@ -177,85 +170,142 @@
             "resume",
             "restart"
           ],
-          "description": "Reuse returns current results or resumes unfinished analysis. Resume prefers a saved replacement attempt. Restart begins a replacement identified by operationID."
+          "description": "Reuse returns current results or resumes unfinished analysis. Resume prefers a saved replacement attempt. Restart begins a replacement identified by operation_id."
         }
       },
       "required": [
-        "project",
-        "kind",
-        "expectedRevision",
-        "operationID"
+        "project_handle",
+        "expected_revision",
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "cancel_analysis",
-    "description": "Cancel the active native scene or silence scan in this project.",
+    "name": "silence_editor_scan",
+    "description": "Scan the open editor for pauses using its current silence preferences.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string"
-        },
-        "kind": {
-          "type": "string",
-          "enum": [
-            "scenes",
-            "silence"
-          ]
         }
       },
       "required": [
-        "project",
-        "kind",
-        "expectedRevision",
-        "operationID"
+        "project_handle",
+        "expected_revision",
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "configure_silence",
-    "description": "Set at least one native silence option. Sequence trackOrdinal is zero-based. A sequence threshold applies to the named source, or the source at the playhead when omitted. A null threshold restores automatic detection. Minimum and retained padding are shared editor preferences.",
+    "name": "scenes_editor_scan_cancel",
+    "description": "Cancel the active scene scan for the target project.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "silence_editor_scan_cancel",
+    "description": "Cancel the active pause scan for the target project.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
           "type": "string"
         },
-        "trackOrdinal": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "source": {
+        "operation_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "silence_editor_track_select",
+    "description": "Select the zero-based analysis track ordinal in a sequence.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
           "type": "string"
         },
-        "minimumPause": {
-          "type": "number",
-          "minimum": 0.02,
-          "maximum": 86400
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
         },
-        "leavePause": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 86400
+        "operation_id": {
+          "type": "string"
         },
-        "thresholdDB": {
+        "track_ordinal": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "track_ordinal"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "silence_editor_threshold_set",
+    "description": "Set the silence threshold in dBFS. A null threshold selects automatic detection. A sequence threshold applies to the named source or the source at the playhead.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "silence_threshold_db": {
           "type": [
             "number",
             "null"
@@ -265,55 +315,56 @@
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID"
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "silence_threshold_db"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "use_room_tone",
+    "name": "silence_threshold_calibrate_from_marks",
     "description": "Calibrate manual thresholds from measured audio in the marked sequence, group, or assembly range and clear the consumed marks.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string"
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID"
+        "project_handle",
+        "expected_revision",
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "rename_view",
+    "name": "scenes_view_rename",
     "description": "Set the name for every matching view in an analyzed source. An empty name restores the default.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string"
         },
-        "source": {
+        "source_id": {
           "type": "string"
         },
         "view": {
@@ -326,30 +377,30 @@
         }
       },
       "required": [
-        "project",
-        "source",
+        "project_handle",
+        "source_id",
         "view",
         "name",
-        "expectedRevision",
-        "operationID"
+        "expected_revision",
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "review_pause",
-    "description": "Seek, preview, protect or unprotect a pause by its list_pauses ID. Multicam protection applies to the group-time pause across repeated occurrences. Protecting the auditioned multicam pause closes its review. Done closes the review. NextCut and keepAndAdvance operate on an open sequence review.",
+    "name": "silence_editor_pause_review",
+    "description": "Seek, preview, protect or unprotect a pause by its silence_editor_pauses_list ID. Multicam protection applies to the group-time pause across repeated occurrences. Protecting the auditioned multicam pause closes its review. Done closes the review. Use set_retained with a nonnegative total duration in seconds, or reset_retained, for one detected pause in its occurrence. next_cut and keep_and_advance operate on an open detected-pause review.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string"
         },
         "pause": {
@@ -362,35 +413,142 @@
             "preview",
             "protect",
             "unprotect",
-            "nextCut",
-            "keepAndAdvance",
+            "set_retained",
+            "reset_retained",
+            "next_cut",
+            "keep_and_advance",
             "done"
           ]
+        },
+        "retained_seconds": {
+          "type": "number",
+          "minimum": 0
         }
       },
       "required": [
-        "project",
+        "project_handle",
         "action",
-        "expectedRevision",
-        "operationID"
+        "expected_revision",
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "set_skip_pauses",
+    "name": "silence_editor_take_candidates_list",
+    "description": "List take candidates after detected removals and manual dividers. Each item has an exact range and a manual_start indicator. The response clock is sequence or assembly.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        }
+      },
+      "required": [
+        "project_handle"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "silence_editor_take_boundary_edit",
+    "description": "Add a divider inside a take, resolving to an edit boundary, or remove a manual divider by the exact candidate start. Queueing uses these dividers without trimming media.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "add",
+            "remove"
+          ]
+        },
+        "position": {
+          "type": "string",
+          "description": "Exact sequence or assembly time as rational seconds or timecode."
+        }
+      },
+      "required": [
+        "project_handle",
+        "action",
+        "position",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "timeline_editor_join_preview",
+    "description": "Open a short replayable audition around an existing join. Specify one of before_clip_id for a sequence item, before_occurrence for a multicam assembly item, or switch_time for a saved multicam switch. Close it with silence_editor_pause_review action done.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string"
+        },
+        "before_clip_id": {
+          "type": "string",
+          "description": "Sequence timeline item ID immediately after the join."
+        },
+        "before_occurrence": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Zero-based multicam assembly index immediately after the join."
+        },
+        "switch_time": {
+          "type": "string",
+          "description": "Exact group time of a saved multicam switch."
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "playback_pause_skipping_set",
     "description": "Enable or disable native skipping of detected pauses during playback.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string"
         },
         "enabled": {
@@ -398,125 +556,142 @@
         }
       },
       "required": [
-        "project",
+        "project_handle",
         "enabled",
-        "expectedRevision",
-        "operationID"
+        "expected_revision",
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "apply_pauses",
-    "description": "Shorten detected pauses using the native timeline edit and history, or queue retained takes using the native export queue.",
+    "name": "silence_editor_pauses_shorten",
+    "description": "Shorten the reviewed pauses on the open timeline, respecting protection and retained padding.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
-          "type": "string"
-        },
-        "mode": {
-          "type": "string",
-          "enum": [
-            "shorten",
-            "queue"
-          ]
-        }
-      },
-      "required": [
-        "project",
-        "mode",
-        "expectedRevision",
-        "operationID"
-      ],
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "save_analysis_sidecars",
-    "description": "Save completed analysis beside the project sources using the native save operation. Poll the returned job with analysis_job_status.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "project": {
-          "type": "string"
-        },
-        "expectedRevision": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "operationID": {
+        "operation_id": {
           "type": "string"
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID"
+        "project_handle",
+        "expected_revision",
+        "operation_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "analysis_job_status",
+    "name": "silence_editor_takes_queue",
+    "description": "Add the audible ranges between reviewed pauses to the native export queue.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "analysis_editor_sidecars_save",
+    "description": "Save completed analysis beside the project sources using the native save operation. Poll the returned job with analysis_job_status_read.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "analysis_job_status_read",
     "description": "Read a retained scene, silence, sidecar save or media refresh job. Scene jobs include requested, decoded, confirmed and durable source coverage as available.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "job": {
+        "job_id": {
           "type": "string"
         }
       },
       "required": [
-        "project",
-        "job"
+        "project_handle",
+        "job_id"
       ],
       "additionalProperties": false
     }
   },
   {
     "name": "analysis_job_cancel",
-    "description": "Request cancellation of this specific MCP-started scan, sidecar save or media refresh. Poll analysis_job_status for its terminal state.",
+    "description": "Request cancellation of this specific MCP-started scan, sidecar save or media refresh. Poll analysis_job_status_read for its terminal state.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "job": {
+        "job_id": {
           "type": "string"
         }
       },
       "required": [
-        "project",
-        "job"
+        "project_handle",
+        "job_id"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "get_waveform",
-    "description": "Read signed minimum and maximum sample amplitudes for equal-width source-time bins using the same envelope decoder as the GUI and CLI. Use source IDs and absolute stream indices from analysis_state.",
+    "name": "waveform_editor_envelope_read",
+    "description": "Read signed minimum and maximum sample amplitudes for equal-width source-time bins using the same envelope decoder as the GUI and CLI. Use source IDs and absolute stream indices from analysis_editor_state_read.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "source": {
+        "source_id": {
           "type": "string"
         },
-        "stream": {
+        "audio_stream_index": {
           "type": "integer",
           "minimum": 0
         },
@@ -525,35 +700,35 @@
           "minimum": 1,
           "maximum": 2048
         },
-        "from": {
+        "source_from": {
           "type": "string"
         },
-        "to": {
+        "source_to": {
           "type": "string"
         }
       },
       "required": [
-        "project",
-        "source",
-        "stream"
+        "project_handle",
+        "source_id",
+        "audio_stream_index"
       ],
       "additionalProperties": false
     }
   },
   {
-    "name": "refresh_project_media",
-    "description": "Check indexed project recordings and refresh changed sources using the native editor. Poll analysis_job_status for updated sources and review issues.",
+    "name": "project_editor_media_refresh",
+    "description": "Check indexed project recordings and refresh changed sources using the native editor. Poll analysis_job_status_read for updated sources and review issues.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "project": {
+        "project_handle": {
           "type": "string"
         },
-        "expectedRevision": {
+        "expected_revision": {
           "type": "integer",
           "minimum": 0
         },
-        "operationID": {
+        "operation_id": {
           "type": "string"
         },
         "deep": {
@@ -562,9 +737,9 @@
         }
       },
       "required": [
-        "project",
-        "expectedRevision",
-        "operationID"
+        "project_handle",
+        "expected_revision",
+        "operation_id"
       ],
       "additionalProperties": false
     }

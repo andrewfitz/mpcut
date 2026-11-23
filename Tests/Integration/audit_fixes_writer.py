@@ -45,7 +45,7 @@ class WriterAuditFixes(unittest.TestCase):
         self.root = Path(directory.name)
 
     def export(self, source, destination, *extra):
-        process = subprocess.run([str(CLI), "export", "--json", "--mode", "copy", "--output", str(destination),
+        process = subprocess.run([str(CLI), "export", "clips", "join", "--json", "--mode", "copy", "--output", str(destination),
                                   "--clip", str(source), *extra], capture_output=True, text=True, timeout=60)
         self.assertEqual(process.returncode, 0, process.stderr + process.stdout)
         report = json.loads(process.stdout)
@@ -70,9 +70,9 @@ class WriterAuditFixes(unittest.TestCase):
 
                 plan = self.export(source, output, "--dry-run")
                 segment = plan["segments"][0]
-                self.assertLess(abs(ratio(segment["outputStart"]) - lead), Fraction(1, 500), segment)
+                self.assertLess(abs(ratio(segment["output_start"]) - lead), Fraction(1, 500), segment)
                 for track in segment["tracks"]:
-                    self.assertGreaterEqual(ratio(track["outputStart"]), 0, track)
+                    self.assertGreaterEqual(ratio(track["output_start"]), 0, track)
                 self.assertFalse(output.exists())
 
                 self.export(source, output)

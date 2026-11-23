@@ -1,0 +1,187 @@
+[
+  {
+    "name": "participants_file_scan",
+    "description": "Scan a video recording for participant observations, tracks, change events and coverage. By default a completed scan is cached in the source’s analysis sidecar. Poll file_job_status_read and fetch the JSON with file_job_result_read.",
+    "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
+        "file": {"type": "string", "pattern": "^/", "description": "Absolute input recording path."},
+        "backend": {"type": "string", "enum": ["auto", "cpu-only", "gpu-required"]},
+        "sampling": {"type": "string", "enum": ["every-frame", "sparse"]},
+        "include_scenes": {"type": "boolean"},
+        "no_sidecar": {"type": "boolean"},
+        "output": {"type": "string", "pattern": "^/", "description": "Optional absolute path for a new scan JSON file. Pass this file to participant project accept or marker building."},
+        "resume_file": {"type": "string", "pattern": "^/", "description": "Optional absolute path to a compatible saved partial scan to resume."}
+      },
+      "required": ["operation_id", "file"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "participants_file_markers_build",
+    "description": "Generate participant scene candidates from saved scan events without rescanning media. Poll file_job_status_read and fetch the JSON with file_job_result_read.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "Absolute path to the scan JSON."},
+        "rule": {"type": "object", "description": "Optional ParticipantMarkerRule. Defaults to any participant change."}
+      },
+      "required": ["operation_id", "analysis_file"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "participants_file_project_inspect",
+    "description": "Read the portable participant roster, accepted geometry, overrides and render plan of a saved project. Poll file_job_status_read and fetch the JSON with file_job_result_read.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to an existing .cut project."}
+      },
+      "required": ["operation_id", "project_path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "participants_file_project_accept",
+    "description": "Import a saved participant scan into a specific project recording. Verify and correct the accepted associations before rendering. Poll file_job_status_read and fetch the JSON with file_job_result_read.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to an existing .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "Multicam recording ID or a sequence source path from the project."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "Absolute path to the scan JSON."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Absolute path for a new .cut project."},
+        "in_place": {"type": "boolean", "const": true, "description": "Replace the project using its current disk revision."}
+      },
+      "required": ["operation_id", "project_path", "source_id", "analysis_file"],
+      "additionalProperties": false,
+      "oneOf": [{"required": ["out_project"]}, {"required": ["in_place"]}]
+    }
+  },
+  {
+    "name": "participants_file_project_apply",
+    "description": "Replace the accepted participant edit of a saved project. Use project inspect to retrieve the editable participant document. Poll file_job_status_read and fetch the JSON with file_job_result_read.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to an existing .cut project."},
+        "participants": {"type": "object", "description": "The complete ParticipantProject object returned by participants_file_project_inspect."},
+        "participants_file": {"type": "string", "pattern": "^/", "description": "Absolute path to a saved participant object. Use this for edits larger than a tool request."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Absolute path for a new .cut project."},
+        "in_place": {"type": "boolean", "const": true, "description": "Replace the project using its current disk revision."}
+      },
+      "required": ["operation_id", "project_path"],
+      "additionalProperties": false,
+      "oneOf": [{"required": ["out_project"]}, {"required": ["in_place"]}],
+      "allOf": [{"oneOf": [{"required": ["participants"]}, {"required": ["participants_file"]}]}]
+    }
+  },
+  {
+    "name": "participants_file_render_plan",
+    "description": "Report the shot canvas, duration, audio and coverage for a participant render. Poll file_job_status_read and fetch the JSON with file_job_result_read.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to an existing .cut project."},
+        "plan": {"type": "object", "description": "Optional ParticipantRenderPlan. Omit this to use the saved participant plan."},
+        "output": {"type": "string", "pattern": "^/", "description": "Optional absolute output path to check without writing a movie."}
+      },
+      "required": ["operation_id", "project_path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "participants_file_render_export",
+    "description": "Render participant shots to a new movie. Unresolved privacy intervals follow the plan’s explicit stop or full-frame cover policy. Poll file_job_status_read and fetch the JSON with file_job_result_read.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to an existing .cut project."},
+        "plan": {"type": "object", "description": "Optional ParticipantRenderPlan. Omit this to use the saved participant plan."},
+        "output": {"type": "string", "pattern": "^/", "description": "Absolute path for a new movie."}
+      },
+      "required": ["operation_id", "project_path", "output"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "participants_file_angles_list",
+    "description": "Plan virtual angles for selected participants on a common source clock. Poll file_job_status_read and fetch the JSON with file_job_result_read.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to an existing .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "Multicam recording ID or a sequence source path from the project."},
+        "participant_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "description": "Accepted participant ID."}, "uniqueItems": true},
+        "range": {"type": "object", "properties": {"from": {"type": "string", "minLength": 1, "description": "Exact rational seconds in the source clock."}, "to": {"type": "string", "minLength": 1, "description": "Exact rational seconds in the source clock."}}, "required": ["from", "to"], "additionalProperties": false, "description": "Half-open interval in source-relative seconds."},
+        "include_original": {"type": "boolean", "description": "Include an original gallery angle."},
+        "presentation_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "description": "Accepted presentation appearance IDs."}
+      },
+      "required": ["operation_id", "project_path", "source_id", "range"],
+      "additionalProperties": false,
+      "anyOf": [{"required": ["participant_ids"], "properties": {"participant_ids": {"minItems": 1}}}, {"required": ["include_original"], "properties": {"include_original": {"const": true}}}, {"required": ["presentation_ids"], "properties": {"presentation_ids": {"minItems": 1}}}]
+    }
+  },
+  {
+    "name": "participants_file_angles_plan",
+    "description": "Report picture coverage, duration and audio routing before rendering aligned angle media. Poll file_job_status_read and fetch the JSON with file_job_result_read.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to an existing .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "Multicam recording ID or a sequence source path from the project."},
+        "participant_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "description": "Accepted participant ID."}, "uniqueItems": true},
+        "range": {"type": "object", "properties": {"from": {"type": "string", "minLength": 1, "description": "Exact rational seconds in the source clock."}, "to": {"type": "string", "minLength": 1, "description": "Exact rational seconds in the source clock."}}, "required": ["from", "to"], "additionalProperties": false, "description": "Half-open interval in source-relative seconds."},
+        "canvas": {"type": "object", "description": "ParticipantCanvas with dimensions, frame rate and RGB background."},
+        "audio": {"type": "object", "description": "Optional ParticipantMulticamAudioRouting. Defaults to one gallery mix lane."},
+        "include_original": {"type": "boolean", "description": "Include an original gallery angle."},
+        "presentation_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "description": "Accepted presentation appearance IDs."}
+      },
+      "required": ["operation_id", "project_path", "source_id", "range", "canvas"],
+      "additionalProperties": false,
+      "anyOf": [{"required": ["participant_ids"], "properties": {"participant_ids": {"minItems": 1}}}, {"required": ["include_original"], "properties": {"include_original": {"const": true}}}, {"required": ["presentation_ids"], "properties": {"presentation_ids": {"minItems": 1}}}]
+    }
+  },
+  {
+    "name": "participants_file_angles_render",
+    "description": "Write aligned participant angle movies and multicam.cut to a new directory. Poll file_job_status_read and fetch the JSON with file_job_result_read.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to an existing .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "Multicam recording ID or a sequence source path from the project."},
+        "participant_ids": {"type": "array", "items": {"type": "string", "minLength": 1, "description": "Accepted participant ID."}, "uniqueItems": true},
+        "range": {"type": "object", "properties": {"from": {"type": "string", "minLength": 1, "description": "Exact rational seconds in the source clock."}, "to": {"type": "string", "minLength": 1, "description": "Exact rational seconds in the source clock."}}, "required": ["from", "to"], "additionalProperties": false, "description": "Half-open interval in source-relative seconds."},
+        "canvas": {"type": "object", "description": "ParticipantCanvas with dimensions, frame rate and RGB background."},
+        "audio": {"type": "object", "description": "Optional ParticipantMulticamAudioRouting. Defaults to one gallery mix lane."},
+        "output_directory": {"type": "string", "pattern": "^/", "description": "Absolute path of a new directory for the angle movies and project."},
+        "include_original": {"type": "boolean", "description": "Include an original gallery angle."},
+        "presentation_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "description": "Accepted presentation appearance IDs."}
+      },
+      "required": ["operation_id", "project_path", "source_id", "range", "canvas", "output_directory"],
+      "additionalProperties": false,
+      "anyOf": [{"required": ["participant_ids"], "properties": {"participant_ids": {"minItems": 1}}}, {"required": ["include_original"], "properties": {"include_original": {"const": true}}}, {"required": ["presentation_ids"], "properties": {"presentation_ids": {"minItems": 1}}}]
+    }
+  }
+]

@@ -48,6 +48,30 @@ final class StillEditorModelTests: XCTestCase {
     }
 
     @MainActor
+    func testMarkedRangeSplitsBothEdgesOfAStillInOneUndoStep() throws {
+        let editor = EditorModel()
+        defer { editor.endSession() }
+        let asset = StillAsset(id: "title", file: "/offline.png", displayName: "Title", fingerprint: String(repeating: "a", count: 64))
+        let format = StillTimelineFormat(width: 640, height: 360, cadence: RationalTime(numerator: 1, denominator: 30), codec: .h264, container: "mp4")
+        let project = try CutProject.makeStillTimeline(format: format, asset: asset, placementID: "card", duration: RationalTime(numerator: 3))
+        try editor.applyStillProject(project, action: "Insert Still")
+        editor.selectRange(1, 2)
+        editor.splitSelectedRange()
+        XCTAssertEqual(editor.stillProject.stillInserts.map(\.duration), Array(repeating: RationalTime(numerator: 1), count: 3))
+        XCTAssertFalse(editor.canSplitSelectedRange)
+        editor.undo()
+        XCTAssertEqual(editor.stillProject, project)
+        editor.selectRange(1, 2)
+        editor.deleteSelection()
+        XCTAssertEqual(editor.stillProject.stillInserts.map(\.duration), [RationalTime(numerator: 2)])
+        XCTAssertNil(editor.markIn)
+        XCTAssertNil(editor.markOut)
+        XCTAssertEqual(editor.playhead, 1)
+        editor.undo()
+        XCTAssertEqual(editor.stillProject, project)
+    }
+
+    @MainActor
     func testSourceOffsetsAccountForAnInlineStillAfterReordering() async throws {
         let source = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov",
                                                      subdirectory: "Fixtures"))

@@ -89,6 +89,74 @@ final class AudioWaveformDisplayTests: XCTestCase {
         store.setVisibleTimelineSurfaces([])
     }
 
+    @MainActor
+    func testHidingOneMixLaneKeepsTheOtherLaneWaveformRequest() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspect(url, keyframes: true)
+        let store = WaveformEnvelopeStore<String>()
+        let first = WaveformSurface.multicam(.zero, laneID: "wide")
+        let second = WaveformSurface.multicam(.zero, laneID: "close")
+        XCTAssertNotEqual(first, second)
+        store.update(sources: ["wide": media, "close": media], track: 0, readSidecars: false)
+        XCTAssertNil(store.envelope(for: "wide", surface: first, from: 0.9, to: 1.1, pixels: 320))
+        store.setVisibleTimelineSurfaces([first], laneID: "wide")
+        XCTAssertNil(store.envelope(for: "close", surface: second, from: 0.95, to: 1.05, pixels: 160))
+        store.setVisibleTimelineSurfaces([second], laneID: "close")
+        store.setVisibleTimelineSurfaces([], laneID: "wide")
+        let deadline = ContinuousClock.now + .seconds(5)
+        while store.windowRevision == 0 && .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(store.windowRevision, 1)
+        XCTAssertNotNil(store.envelope(for: "close", surface: second, from: 0.95, to: 1.05, pixels: 160))
+        store.setVisibleTimelineSurfaces([], laneID: "close")
+    }
+
+    @MainActor
+    func testMixWindowUpdatesOnlyItsLanesIncludingSharedConsumers() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspect(url, keyframes: true)
+        let store = WaveformEnvelopeStore<String>()
+        let laneIDs = (0..<8).map { "lane-\($0)" }
+        var revisions: [String: [Int]] = [:]
+        let subscriptions = laneIDs.map { id in
+            store.multicamWindowChanges(for: id).sink { revisions[id, default: []].append($0) }
+        }
+        defer { for subscription in subscriptions { subscription.cancel() } }
+        store.update(sources: ["source": media], track: 0, readSidecars: false)
+        for id in laneIDs.prefix(2) {
+            let surface = WaveformSurface.multicam(.zero, laneID: id)
+            XCTAssertNil(store.envelope(for: "source", surface: surface, from: 0.9, to: 1.1, pixels: 320))
+            store.setVisibleTimelineSurfaces([surface], laneID: id)
+        }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while store.windowRevision == 0 && .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(revisions, [laneIDs[0]: [1], laneIDs[1]: [1]])
+        store.refresh("source", media: media, preserving: [], visibleOnly: true)
+        for (index, id) in laneIDs.enumerated() {
+            XCTAssertEqual(revisions[id], index < 2 ? [1, 2] : [2])
+        }
+    }
+
+    @MainActor
+    func testUnchangedMixVisibilityStillCancelsNewUnreportedRequests() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspect(url, keyframes: true)
+        let store = WaveformEnvelopeStore<String>()
+        let visible = WaveformSurface.multicam(.zero, laneID: "visible")
+        let hidden = WaveformSurface.multicam(.zero, laneID: "hidden")
+        store.update(sources: ["visible": media, "hidden": media], track: 0, readSidecars: false)
+        store.setVisibleTimelineSurfaces([visible], laneID: "visible")
+        XCTAssertNil(store.envelope(for: "visible", surface: visible, from: 0.9, to: 1.1, pixels: 320))
+        XCTAssertNil(store.envelope(for: "hidden", surface: hidden, from: 0.9, to: 1.1, pixels: 320))
+        for _ in 0..<100 { store.setVisibleTimelineSurfaces([visible], laneID: "visible") }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while store.windowRevision == 0 && .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        try await Task.sleep(for: .milliseconds(120))
+        XCTAssertEqual(store.windowRevision, 1)
+        XCTAssertNotNil(store.envelope(for: "visible", surface: visible, from: 0.9, to: 1.1, pixels: 320))
+        XCTAssertNil(store.envelope(for: "hidden", surface: hidden, from: 0.9, to: 1.1, pixels: 320))
+        store.setVisibleTimelineSurfaces([], laneID: "visible")
+    }
+
     func testEnvelopeLevelOfDetailPreservesSignedExtrema() throws {
         let lows = (0..<681).map { Float(($0 * 19) % 71 - 59) / 100 }
         let highs = (0..<681).map { Float(($0 * 11) % 37 + 30) / 100 }
@@ -114,6 +182,40 @@ final class AudioWaveformDisplayTests: XCTestCase {
             let bin = try XCTUnwrap(display.range(from: start + step * Double(index),
                                                   to: start + step * Double(index + 1)))
             XCTAssertEqual(bin.1, 0, "Adjacent samples leaked into bin \(index)")
+        }
+    }
+
+    @MainActor
+    func testTimelineWaveformPartialRepaintKeepsTheFullPathSamplingGrid() throws {
+        let area = CGRect(x: 0.25, y: 0, width: 256, height: 40)
+        let repaint: Range<CGFloat> = 110..<142
+        let lows = (0..<800).map { -Float($0 % 13) / 16 }
+        let highs = (0..<800).map { Float($0 % 17) / 20 }
+        let detail = DisplayEnvelope(AudioEnvelope(from: 0.23, to: 2.23, low: lows, high: highs))
+
+        for scale: CGFloat in [1, 2] {
+            func render(dirty: Range<CGFloat>?) throws -> Data {
+                let path = WaveformDrawing.timelinePath(in: area, sourceStart: 0, pointsPerSecond: 110,
+                                                        displayScale: scale, detail: detail, coarse: nil, dirtyX: dirty)
+                if dirty != nil {
+                    XCTAssertLessThanOrEqual(path.boundingBox.width, 36)
+                }
+                let width = Int((repaint.upperBound - repaint.lowerBound) * scale)
+                let height = Int(area.height * scale)
+                let context = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                                      bytesPerRow: width, space: CGColorSpaceCreateDeviceGray(),
+                                                      bitmapInfo: CGImageAlphaInfo.none.rawValue))
+                context.scaleBy(x: scale, y: scale)
+                context.translateBy(x: -repaint.lowerBound, y: 0)
+                context.setFillColor(gray: 1, alpha: 1)
+                context.addPath(path)
+                context.fillPath()
+                return Data(bytes: try XCTUnwrap(context.data), count: height * context.bytesPerRow)
+            }
+
+            let full = try render(dirty: nil)
+            XCTAssertTrue(full.contains { $0 > 0 })
+            XCTAssertEqual(try render(dirty: repaint), full)
         }
     }
 

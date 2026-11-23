@@ -10,8 +10,14 @@ private struct IndexStream: Codable {
     init(_ value: StreamInfo) { self.value = value }
 
     private enum Keys: String, CodingKey {
-        case info, trackID, rotationOnly, hasDeclaredStart, configuration, codecMetadata
-        case multipleDescriptions, complexPicture, reconstructedDTS
+        case info, configuration
+        case trackID = "track_id"
+        case rotationOnly = "rotation_only"
+        case hasDeclaredStart = "has_declared_start"
+        case codecMetadata = "codec_metadata"
+        case multipleDescriptions = "multiple_descriptions"
+        case complexPicture = "complex_picture"
+        case reconstructedDTS = "reconstructed_dts"
     }
 
     func encode(to encoder: Encoder) throws {
@@ -53,8 +59,22 @@ private struct IndexStream: Codable {
 }
 
 private struct IndexHeader: Codable {
-    private static let currentProbeRevision = 5
-    let probeRevision: Int?
+    private enum CodingKeys: String, CodingKey {
+        case identity, format, duration, origin, streams, audio
+        case probeRevision = "probe_revision"
+        case sourceExtension = "source_extension"
+        case muxerBuild = "muxer_build"
+        case reportedContainers = "reported_containers"
+        case videoIndex = "video_index"
+        case frameCount = "frame_count"
+        case copyIssue = "copy_issue"
+        case audioIssues = "audio_issues"
+        case timelineIssue = "timeline_issue"
+        case sourceStartSafe = "source_start_safe"
+    }
+
+    private static let currentProbeRevision = 7
+    let probeRevision: Int
     let identity: SourceIdentity
     let sourceExtension: String
     let muxerBuild: String
@@ -73,6 +93,17 @@ private struct IndexHeader: Codable {
     let sourceStartSafe: Bool
 
     struct Track: Codable {
+        private enum CodingKeys: String, CodingKey {
+            case index, start, end, opus
+            case hasPriming = "has_priming"
+            case pcmContinuity = "pcm_continuity"
+            case packetCount = "packet_count"
+            case editCount = "edit_count"
+            case mp3Anchors = "mp3_anchors"
+            case pcmGaps = "pcm_gaps"
+            case codedBytes = "coded_bytes"
+        }
+
         let index: Int
         let start: RationalTime
         let end: RationalTime
@@ -82,9 +113,17 @@ private struct IndexHeader: Codable {
         let editCount: Int
         let opus: OpusHeader?
         let mp3Anchors: [MP3Anchor]?
+        let pcmGaps: [MulticamRange]?
+        let codedBytes: Int64?
     }
 
     struct OpusHeader: Codable {
+        private enum CodingKeys: String, CodingKey {
+            case start, end, complete, count
+            case firstPacketEnd = "first_packet_end"
+            case initialPadding = "initial_padding"
+        }
+
         let start: Int64
         let firstPacketEnd: Int64
         let end: Int64
@@ -113,7 +152,8 @@ private struct IndexHeader: Codable {
             return Track(index: track.stream.index, start: track.start, end: track.end, hasPriming: track.hasPriming,
                          pcmContinuity: track.pcmContinuity, packetCount: track.packets.count,
                          editCount: track.presentationEdits.count, opus: opus,
-                         mp3Anchors: track.mp3Anchors.isEmpty ? nil : track.mp3Anchors)
+                         mp3Anchors: track.mp3Anchors.isEmpty ? nil : track.mp3Anchors,
+                         pcmGaps: track.pcmGaps.isEmpty ? nil : track.pcmGaps, codedBytes: track.codedBytes)
         }
         copyIssue = media.copyIssue
         audioIssues = media.audioIssues.isEmpty ? nil : media.audioIssues
@@ -123,28 +163,19 @@ private struct IndexHeader: Codable {
 
     var isUsable: Bool {
         let descriptions = streams.map(\.value)
-        let revision = probeRevision ?? 1
-        guard (1...Self.currentProbeRevision).contains(revision) else { return false }
-        if revision < 2 {
-            // The auxiliary-track advisory could previously hide a packet defect.
-            // These standalone audio codecs also gained corrected clocks or preroll.
-            if copyIssue == MediaInfo.auxiliaryTrackIssue { return false }
-            if videoIndex == -1, descriptions.contains(where: { ["mp3", "vorbis", "opus"].contains($0.codec) }) { return false }
-        }
-        if revision < 3, videoIndex == -1, descriptions.contains(where: {
-            ($0.isPCM || $0.codec == "flac") && $0.sampleRate > 0 &&
-                $0.timeBase > RationalTime(numerator: 1, denominator: Int64($0.sampleRate))
-        }) { return false }
-        // A per-track issue used to be recorded for the first affected track only.
-        if revision < 4, audio.count > 1, let copyIssue,
-           copyIssue.hasPrefix("Audio track ") || copyIssue.hasPrefix("AAC track ") { return false }
-        // Older indexes recorded these audio clock defects without a stream index.
-        if revision < 5,
-           copyIssue == "An audio track has non-increasing presentation timestamps." ||
-           copyIssue == "An audio packet is missing its duration." { return false }
+        guard probeRevision == Self.currentProbeRevision else { return false }
         guard duration > .zero, descriptions.enumerated().allSatisfy({ $0.offset == $0.element.index }),
               audio.map(\.index) == descriptions.filter({ $0.kind == "audio" }).map(\.index),
               audio.allSatisfy({ $0.packetCount >= 0 && $0.editCount >= 0 }) else { return false }
+        for track in audio {
+            var cursor = track.start
+            for gap in track.pcmGaps ?? [] {
+                guard descriptions[track.index].isPCM, cursor <= gap.from, gap.from < gap.to, gap.to <= track.end else {
+                    return false
+                }
+                cursor = gap.to
+            }
+        }
         if videoIndex == -1 {
             guard frameCount == 0, let first = audio.first else { return false }
             return descriptions[first.index].timeBase > .zero && descriptions[first.index].sampleRate > 0 &&
@@ -166,6 +197,12 @@ private enum IndexCodingError: Error { case invalid }
 enum SidecarIndexDetail { case preview, summary, analysis, audio, full }
 
 private struct CachedSceneClock: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case format, duration, origin, video
+        case changedSeconds = "changed_seconds"
+        case changedNanoseconds = "changed_nanoseconds"
+    }
+
     let format: String
     let duration: RationalTime
     let origin: RationalTime
@@ -177,7 +214,7 @@ private struct CachedSceneClock: Codable {
 extension AnalysisSidecar {
     // A scene-only sidecar can resolve later ranges and resumes without
     // opening the media or storing the editor's complete packet index.
-    static let sceneClockKey = "scene.clock.v1"
+    static let sceneClockKey = "scenes_clock.v1"
 
     static func encodeSceneClock(_ media: MediaInfo) throws -> Data? {
         guard let video = media.videoStream, !media.hasProvisionalClock,
@@ -235,7 +272,12 @@ private struct IndexWriter {
 private struct IndexReader {
     let bytes: UnsafeRawBufferPointer
     var position = 0
+    private var lastDuration: RationalTime?
     var remaining: Int { bytes.count - position }
+
+    init(bytes: UnsafeRawBufferPointer) {
+        self.bytes = bytes
+    }
 
     mutating func byte() throws -> UInt8 {
         guard position < bytes.count else { throw IndexCodingError.invalid }
@@ -265,10 +307,27 @@ private struct IndexReader {
         return Int64(bitPattern: n >> 1) ^ -Int64(n & 1)
     }
 
-    mutating func time() throws -> RationalTime {
+    private mutating func timeParts() throws -> (numerator: Int64, denominator: Int64) {
         let top = try signed()
         guard let bottom = Int64(exactly: try unsigned()), bottom > 0 else { throw IndexCodingError.invalid }
+        return (top, bottom)
+    }
+
+    mutating func time() throws -> RationalTime {
+        let (top, bottom) = try timeParts()
         return RationalTime(numerator: top, denominator: bottom)
+    }
+
+    mutating func duration() throws -> RationalTime {
+        let (top, bottom) = try timeParts()
+        // The writer stores reduced rationals. Repeated durations are common
+        // even when presentation timestamps differ on every row.
+        if let lastDuration, lastDuration.numerator == top, lastDuration.denominator == bottom {
+            return lastDuration
+        }
+        let value = RationalTime(numerator: top, denominator: bottom)
+        lastDuration = value
+        return value
     }
 
     mutating func timestamps(allowedFlags: UInt8) throws -> (UInt8, RationalTime, RationalTime?) {
@@ -290,7 +349,7 @@ private func checkIndexCancellation(_ cancelled: () -> Bool) throws {
 }
 
 extension AnalysisSidecar {
-    public static var indexKeys: Set<String> { ["index.v1", "index.frames.v1", "index.audio.v1"] }
+    public static var indexKeys: Set<String> { ["media_index.v1", "media_index_frames.v1", "media_index_audio.v1"] }
 
     /// Archive a fully inspected source. Merge all returned sections in one save.
     public static func indexSections(for media: MediaInfo, progress: ((Double) -> Void)? = nil, cancelled: () -> Bool = { false }) throws -> [String: Data] {
@@ -302,7 +361,7 @@ extension AnalysisSidecar {
         let encoder = PropertyListEncoder()
         encoder.outputFormat = .binary
         // Each row stores absolute timestamps. Encoded batches can be joined
-        // directly, including on older sidecars that use this same byte layout.
+        // directly without rebasing any row.
         let total = max(1, media.audio.reduce(Double(media.frames.count)) { sum, track in
             sum + Double(track.packets.count) + Double(track.presentationEdits.count) + Double(track.opusWindow?.packetStarts.count ?? 0)
         })
@@ -346,7 +405,7 @@ extension AnalysisSidecar {
             }
         }
         try checkIndexCancellation(cancelled)
-        var sections = ["index.v1": try encoder.encode(header), "index.frames.v1": frames, "index.audio.v1": audio]
+        var sections = ["media_index.v1": try encoder.encode(header), "media_index_frames.v1": frames, "media_index_audio.v1": audio]
         if let evidence = media.refreshEvidence {
             sections[MediaRefreshEvidence.sectionKey] = try evidence.encoded()
         }
@@ -361,7 +420,7 @@ extension AnalysisSidecar {
 
     private func decodeIndex(detail: SidecarIndexDetail, read: (String) -> Data?, progress: ((Double) -> Void)?,
                              cancelled: () -> Bool) throws -> MediaInfo? {
-        guard let metadata = read("index.v1"),
+        guard let metadata = read("media_index.v1"),
               let header = try? PropertyListDecoder().decode(IndexHeader.self, from: metadata),
               identity.matches(saved: header.identity), header.isUsable
         else { return nil }
@@ -377,7 +436,7 @@ extension AnalysisSidecar {
         var audio: [AudioIndex] = []
         do {
             if detail == .full {
-                guard let data = read("index.frames.v1") else { return nil }
+                guard let data = read("media_index_frames.v1") else { return nil }
                 frames = try data.withUnsafeBytes { bytes in
                     var reader = IndexReader(bytes: bytes)
                     try reader.checkCount(header.frameCount, minimumBytes: 6)
@@ -389,7 +448,7 @@ extension AnalysisSidecar {
                             progress?(Double(i) / total)
                         }
                         let (flags, pts, dts) = try reader.timestamps(allowedFlags: 28)
-                        let duration = try reader.time()
+                        let duration = try reader.duration()
                         guard let size = UInt32(exactly: try reader.unsigned()), duration > .zero,
                               rows.last.map({ $0.time <= pts }) ?? true else { throw IndexCodingError.invalid }
                         rows.append(FrameInfo(dts: dts, time: pts, duration: duration, keyframe: flags & 4 != 0,
@@ -415,14 +474,16 @@ extension AnalysisSidecar {
             if useHeaderOnly {
                 audio = header.audio.map {
                     AudioIndex(stream: streams[$0.index], packets: [], start: $0.start, end: $0.end,
-                               hasPriming: $0.hasPriming, pcmContinuity: $0.pcmContinuity, presentationEdits: [])
+                               hasPriming: $0.hasPriming, pcmContinuity: $0.pcmContinuity, presentationEdits: [],
+                               pcmGaps: $0.pcmGaps ?? [], codedBytes: $0.codedBytes)
                 }
             } else if detail != .preview {
-                guard let data = read("index.audio.v1") else { return nil }
+                guard let data = read("media_index_audio.v1") else { return nil }
                 audio = try data.withUnsafeBytes { bytes in
                     var reader = IndexReader(bytes: bytes)
                     let tracks = try header.audio.map { track in
-                        let result = try reader.audio(track, stream: streams[track.index], keepOpusWindow: detail == .full || (detail == .audio && header.videoIndex < 0),
+                        let result = try reader.audio(track, stream: streams[track.index], keepPackets: detail != .analysis,
+                                         keepOpusWindow: detail == .full || (detail == .audio && header.videoIndex < 0),
                                          progress: { progress?((done + $0) / total) }, cancelled: cancelled)
                         done += Double(track.packetCount) + Double(track.editCount) + Double(track.opus?.count ?? 0)
                         return result
@@ -444,24 +505,26 @@ extension AnalysisSidecar {
 }
 
 private extension IndexReader {
-    mutating func audio(_ track: IndexHeader.Track, stream: StreamInfo, keepOpusWindow: Bool,
+    mutating func audio(_ track: IndexHeader.Track, stream: StreamInfo, keepPackets: Bool, keepOpusWindow: Bool,
                         progress: (Double) -> Void, cancelled: () -> Bool) throws -> AudioIndex {
         try checkCount(track.packetCount, minimumBytes: 8)
         var packets: [AudioPacket] = []
-        packets.reserveCapacity(track.packetCount)
+        if keepPackets { packets.reserveCapacity(track.packetCount) }
         for i in 0..<track.packetCount {
             if i.isMultiple(of: 1024) {
                 try checkIndexCancellation(cancelled)
                 progress(Double(i))
             }
             let (_, pts, dts) = try timestamps(allowedFlags: 0)
-            let duration = try time()
+            let duration = try duration()
             let skip = Int(try signed()), discard = Int(try signed()), decoded = Int(try signed())
             guard (0...Int(UInt32.max)).contains(skip), (0...Int(UInt32.max)).contains(discard) else {
                 throw IndexCodingError.invalid
             }
-            packets.append(AudioPacket(time: pts, dts: dts, duration: duration, skipSamples: skip,
-                                       discardSamples: discard, decodedSamples: decoded))
+            if keepPackets {
+                packets.append(AudioPacket(time: pts, dts: dts, duration: duration, skipSamples: skip,
+                                           discardSamples: discard, decodedSamples: decoded))
+            }
         }
         try checkCount(track.editCount, minimumBytes: 3)
         var edits: [AACPresentationEdit] = []
@@ -479,8 +542,8 @@ private extension IndexReader {
         var window: OpusTrimWindow?
         if let opus = track.opus {
             try checkCount(opus.count, minimumBytes: 1)
-            guard opus.count > 0, opus.count <= packets.count,
-                  opus.complete == (opus.count == packets.count), (0...65_535).contains(opus.initialPadding),
+            guard opus.count > 0, opus.count <= track.packetCount,
+                  opus.complete == (opus.count == track.packetCount), (0...65_535).contains(opus.initialPadding),
                   opus.firstPacketEnd <= opus.end else { throw IndexCodingError.invalid }
             var starts: [Int64] = []
             if keepOpusWindow { starts.reserveCapacity(opus.count) }
@@ -502,6 +565,7 @@ private extension IndexReader {
         }
         return AudioIndex(stream: stream, packets: packets, start: track.start, end: track.end,
                           hasPriming: track.hasPriming, pcmContinuity: track.pcmContinuity,
-                          presentationEdits: edits, mp3Anchors: track.mp3Anchors ?? [], opusWindow: window)
+                          presentationEdits: edits, mp3Anchors: track.mp3Anchors ?? [], opusWindow: window,
+                          pcmGaps: track.pcmGaps ?? [], codedBytes: track.codedBytes)
     }
 }

@@ -33,8 +33,13 @@ public struct CutEngine: Sendable {
 
     /// Read a complete editing index if one was saved alongside the source.
     public func cachedIndex(_ file: URL, progress: ((Double) -> Void)? = nil) throws -> MediaInfo? {
+        try cachedIndex(file, expectedIdentity: nil, progress: progress)
+    }
+
+    package func cachedIndex(_ file: URL, expectedIdentity: SourceIdentity?,
+                             progress: ((Double) -> Void)? = nil) throws -> MediaInfo? {
         try checkCancellation()
-        return try cachedMedia(file.standardizedFileURL, detail: .full, progress: progress)
+        return try cachedMedia(file.standardizedFileURL, detail: .full, expectedIdentity: expectedIdentity, progress: progress)
     }
 
     /// Report metadata and mux eligibility. Sample indexes may be omitted.
@@ -336,13 +341,15 @@ public struct CutEngine: Sendable {
         for (index, clip) in clips.enumerated() {
             try checkCancellation()
             let file = clip.file.standardizedFileURL
+            if let first = firstOccurrence[file] {
+                sequence.append(sequence[first - 1])
+                continue
+            }
             let info: MediaInfo
             do {
                 let original: MediaInfo
                 if let cached = indexed[file], cached.url == file, cached.hasFullEditIndex {
-                    if firstOccurrence[file] == nil {
-                        try verifyIdentity(file, identity: cached.identity)
-                    }
+                    try verifyIdentity(file, identity: cached.identity)
                     original = cached
                 } else {
                     original = try inspect(file, keyframes: true)
@@ -352,7 +359,7 @@ public struct CutEngine: Sendable {
                 if let issue = info.copyIssue {
                     throw CutError(code: "unsupported_tracks", message: issue)
                 }
-                if firstOccurrence[file] == nil, let reference = sequence.first {
+                if let reference = sequence.first {
                     try checkCompatibility(info, with: reference)
                 }
             } catch let issue as CutError {
@@ -360,10 +367,8 @@ public struct CutEngine: Sendable {
                 throw CutError(code: issue.code, message: issue.message, segment: index + 1,
                                boundary: issue.boundary, nearest: issue.nearest, track: issue.track).because(issue.reason)
             }
-            if firstOccurrence[file] == nil {
-                firstOccurrence[file] = index + 1
-                uniqueMedia.append(info)
-            }
+            firstOccurrence[file] = index + 1
+            uniqueMedia.append(info)
             sequence.append(info)
         }
 
@@ -523,6 +528,8 @@ public struct CutEngine: Sendable {
         let needsMatroskaDTS = uniqueMedia.contains { $0.video.reconstructedDTS }
         let canScheduleVideo = needsMatroskaDTS || (smartTrim && ["mov", "mp4", "m4v"].contains(container)
             && ["h264", "hevc"].contains(sequence[0].video.codec))
+        var videoFrameRanges: [Range<Int>] = []
+        if canScheduleVideo { videoFrameRanges.reserveCapacity(effective.count) }
         var decodeOverlap = false
         var duration = RationalTime.zero
         for (offset, request) in effective.enumerated() {
@@ -563,6 +570,7 @@ public struct CutEngine: Sendable {
             let lower = info.frames.lowerBound { $0.time >= from }
             let upper = info.frames.lowerBound { $0.time >= to }
             let retainedFrames = info.frames[lower..<upper]
+            if canScheduleVideo { videoFrameRanges.append(retainedFrames.indices) }
             guard let lastFrame = retainedFrames.last else {
                 throw CutError(code: "invalid_range", message: "The range does not contain a video frame.", segment: index)
             }
@@ -643,6 +651,7 @@ public struct CutEngine: Sendable {
                                             reachesEnd: to == info.duration,
                                             multipleDescriptions: info.video.multipleDescriptions,
                                             sourceClipIndex: index - 1,
+                                            sourceClipSeams: clips[(index - 1)..<(endIndex - 1)].compactMap(\.to),
                                             encodedEdges: edges.isEmpty ? nil : edges))
             duration = end
         }
@@ -652,24 +661,35 @@ public struct CutEngine: Sendable {
             for (index, request) in effective.enumerated() {
                 let frames = request.info.frames
                 let segment = segments[index]
-                let lower = frames.lowerBound { $0.time >= segment.from }
-                let upper = frames.lowerBound { $0.time >= segment.to }
-                let kept = frames[lower..<upper]
-                let decodeTimes = kept.compactMap(\.dts).sorted()
+                let kept = frames[videoFrameRanges[index]]
+                var decodeTimes = kept.compactMap(\.dts)
                 guard decodeTimes.count == kept.count else {
                     throw CutError(code: "unsupported_container", message: "Missing video decode timestamps.", segment: request.startIndex)
                 }
+                decodeTimes.sort()
                 // Leave at least the source decoder's lead at every retained packet slot,
                 // including reordered B pictures. Replacing an edge sorts its PTS within
                 // those slots. Sorted PTS remain at or after the corresponding sorted DTS.
-                for (picture, dts) in zip(kept, decodeTimes) {
+                var presentationTimes: [RationalTime] = []
+                presentationTimes.reserveCapacity(kept.count)
+                for (position, pair) in zip(kept, decodeTimes).enumerated() {
+                    if position.isMultiple(of: 1_024) { try checkCancellation() }
+                    let (picture, dts) = pair
                     delay = max(delay, try picture.time.subtracting(dts))
+                    presentationTimes.append(try segment.outputStart.adding(picture.time.subtracting(segment.from)))
                 }
-                segments[index].videoDecodeTimes = try kept.map { try segment.outputStart.adding($0.time.subtracting(segment.from)) }
+                segments[index].videoDecodeTimes = presentationTimes
                 try checkCancellation()
             }
             for index in segments.indices {
-                segments[index].videoDecodeTimes = try segments[index].videoDecodeTimes.map { try $0.subtracting(delay) }
+                if delay != .zero {
+                    try segments[index].videoDecodeTimes.withUnsafeMutableBufferPointer { times in
+                        for position in times.indices {
+                            if position.isMultiple(of: 1_024) { try checkCancellation() }
+                            times[position] = try times[position].subtracting(delay)
+                        }
+                    }
+                }
                 try checkCancellation()
             }
         }
