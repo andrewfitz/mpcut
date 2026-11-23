@@ -160,52 +160,58 @@ struct SidecarOptions {
 
     func run(source: URL, cancelled: @escaping @Sendable () -> Bool) async throws -> SidecarResult {
         if statusOnly {
-            do {
-                var store = try AnalysisSidecar(source: source)
-                var status = store.status()
-                // A scene scan can store an alias's result beside the recording it resolves to.
-                if status == "missing" {
-                    let resolved = source.resolvingSymlinksInPath()
-                    if resolved != source, let alternate = try? AnalysisSidecar(source: resolved) {
-                        let alternateStatus = alternate.status()
-                        if alternateStatus != "missing" {
-                            store = alternate
-                            status = alternateStatus
-                        }
+            var location = source
+            var snapshot = AnalysisSidecar.inventorySnapshot(source: location)
+            // A scene scan can store an alias's result beside the recording it resolves to.
+            if snapshot.status == "missing" {
+                let resolved = source.resolvingSymlinksInPath()
+                if resolved != source {
+                    let alternate = AnalysisSidecar.inventorySnapshot(source: resolved)
+                    if alternate.status != "missing" {
+                        location = resolved
+                        snapshot = alternate
                     }
                 }
-                return SidecarResult(file: source.path, sidecar: store.url.path,
-                                     status: status, sections: store.keys().sorted(), saved: nil,
-                                     generations: store.persistedGenerations(), sceneAttempts: store.persistedSceneAttempts())
-            } catch let issue as CutError where issue.code == "invalid_input" {
-                let offline = AnalysisSidecar.offlineInventory(source: source)
-                return SidecarResult(file: source.path, sidecar: AnalysisSidecar.url(for: source).path,
-                                     status: offline.status, sections: [], saved: nil,
-                                     generations: offline.generations, sceneAttempts: offline.attempts)
             }
+            return SidecarResult(file: source.path, sidecar: AnalysisSidecar.url(for: location).path,
+                                 status: snapshot.status, sections: snapshot.sections, saved: nil,
+                                 generations: snapshot.generations, sceneAttempts: snapshot.attempts)
         }
         let store = try AnalysisSidecar(source: source)
         let sections: [String: Data]
         if contents == [.scenes] {
             sections = try AnalysisSidecar.sceneSections(for: SceneAnalysis.scan(source, cancelled: cancelled))
         } else {
-            sections = try await indexedSections(source: source, cancelled: cancelled)
+            sections = try await indexedSections(source: source, store: store, cancelled: cancelled)
         }
         guard !sections.isEmpty else {
             throw CutError(code: "no_audio", message: "There are no audio streams to save in this source.")
         }
-        try store.save(sections, cancelled: cancelled)
-        let keys = AnalysisSidecar.$readsEnabled.withValue(true) { store.keys().sorted() }
+        try store.saveAnalysisSections(sections, cancelled: cancelled)
+        let inventory = AnalysisSidecar.$readsEnabled.withValue(true) { store.savedSectionInventory() }
         return SidecarResult(file: source.path, sidecar: store.url.path,
-                             status: store.status(), sections: keys, saved: sections.keys.sorted())
+                             status: inventory.status, sections: inventory.sections, saved: sections.keys.sorted())
     }
 
-    private func indexedSections(source: URL, cancelled: @escaping @Sendable () -> Bool) async throws -> [String: Data] {
+    private func indexedSections(source: URL, store: AnalysisSidecar, cancelled: @escaping @Sendable () -> Bool) async throws -> [String: Data] {
         let engine = CutEngine(cancelled: cancelled)
-        let media = try contents.contains(.index) ? engine.inspect(source, keyframes: true) : engine.inspectForAudioAnalysis(source)
+        let media: MediaInfo
+        var sections: [String: Data] = [:]
+        if contents.contains(.index) {
+            if let cached = try store.indexForSaving(cancelled: cancelled) {
+                (media, sections) = cached
+            } else {
+                media = try engine.inspectFresh(source, keyframes: true, expectedIdentity: store.identity)
+            }
+        } else {
+            media = try engine.inspectForAudioAnalysis(source)
+        }
         let tracks = media.streams.filter { $0.kind == "audio" && (audioStream == nil || $0.index == audioStream) }
         if audioStream != nil, tracks.isEmpty {
             throw CutError(code: "no_audio", message: "The source has no matching audio stream.")
+        }
+        if explicitSections && contents.contains(.audio) && tracks.isEmpty {
+            throw CutError(code: "no_audio", message: "There are no audio streams to save in this source.")
         }
         if explicitSections && contents.contains(.scenes) && !media.hasVideo {
             throw CutError(code: "no_video", message: "Scene analysis requires a video stream.")
@@ -217,8 +223,7 @@ struct SidecarOptions {
             return try AnalysisSidecar.sections(media: media, scenes: scenes, cancelled: stop)
         }
         async let sceneData = sceneSections()
-        var sections: [String: Data] = [:]
-        if contents.contains(.index) {
+        if contents.contains(.index) && sections.isEmpty {
             sections = try AnalysisSidecar.indexSections(for: media, cancelled: cancelled)
         }
         if contents.contains(.audio) {

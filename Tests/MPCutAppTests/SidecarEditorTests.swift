@@ -4,6 +4,23 @@ import XCTest
 @testable import MPCutApp
 
 final class SidecarEditorTests: XCTestCase {
+    func testManualSaveRetainsFinerWaveformOverview() throws {
+        let source = try scratchRecording("Pause-Quiet")
+        let media = try CutEngine(useSidecar: false).inspect(source, keyframes: true)
+        let stream = try XCTUnwrap(media.audio.first?.stream.index)
+        let coarse = try AudioAnalysis.envelope(media, stream: stream, from: 0, to: media.duration.seconds,
+                                                columns: 16, useSidecar: false)
+        let snapshot = DesktopAnalysisSnapshot(sourceID: UUID(), media: media, scenes: nil, viewNames: [:],
+                                               thresholdOverrides: [:], edits: EditorMetadataEdits(), waveforms: [:],
+                                               envelopeOverviews: [stream: coarse], silence: [], filmstrip: [])
+        let fine = try AudioAnalysis.envelope(media, stream: stream, from: 0, to: media.duration.seconds, columns: 64)
+        try snapshot.save(cancelled: { false })
+        let saved = try XCTUnwrap(AnalysisSidecar(media: media).envelopeOverview(for: media, stream: stream))
+        XCTAssertEqual(saved.low, fine.low)
+        XCTAssertEqual(saved.high, fine.high)
+        XCTAssertNotNil(try CutEngine().cachedIndex(source))
+    }
+
     @MainActor
     func testJPEGRangeExportRetainsAnalysisForSidecarSave() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

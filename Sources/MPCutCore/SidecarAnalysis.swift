@@ -26,10 +26,12 @@ struct AudioAnalysisClock: Codable, Equatable, Sendable {
 /// Identifies an in-memory result independently of a clip's editor UUID.
 package struct AudioAnalysisCacheKey: Equatable, Sendable {
     private let identity: SourceIdentity
+    private let changeTime: SourceIdentity.ChangeTime?
     private let clock: AudioAnalysisClock
 
     package init(media: MediaInfo, stream: Int) {
         identity = media.identity
+        changeTime = media.identity.changeTime
         clock = AudioAnalysisClock(media: media, stream: stream)
     }
 }
@@ -253,7 +255,10 @@ extension AnalysisSidecar {
     }
 
     public static func sceneSections(for report: SceneReport) throws -> [String: Data] {
-        [sceneSectionKey: try JSONEncoder().encode(CachedScenes(report))]
+        guard report.scenes.first?.start == .zero, report.scenes.last?.end == report.duration else {
+            throw CutError(code: "invalid_sidecar_analysis", message: "Full-source scene boundaries require a report covering the entire recording.")
+        }
+        return [sceneSectionKey: try JSONEncoder().encode(CachedScenes(report))]
     }
 
     /// Names use source-local view IDs. Saving an empty map also clears
@@ -271,17 +276,17 @@ extension AnalysisSidecar {
         return try JSONEncoder().encode(cleaned)
     }
 
-    private func viewNames(read: (String) -> Data?) -> [Int: String] {
-        guard let data = read(Self.viewNameSectionKey) else { return [:] }
-        return (try? JSONDecoder().decode([Int: String].self, from: data)) ?? [:]
+    private func viewNames(read: (String) -> Data?) -> [Int: String]? {
+        guard let data = read(Self.viewNameSectionKey) else { return nil }
+        return try? JSONDecoder().decode([Int: String].self, from: data)
     }
 
     func restoringViewNames(to report: SceneReport, cancelled: () -> Bool) -> SceneReport {
         guard report.sourceStamp == SceneSourceStamp(identity: identity) else { return report }
         return (try? withReadSnapshot(cancelled: cancelled) { read in
-            let names = viewNames(read: read)
+            guard let names = viewNames(read: read) else { return report }
             var updated = report
-            for (view, name) in names { updated.setViewName(name, for: view) }
+            updated.restoreViewNames(names)
             return updated
         }) ?? report
     }
@@ -308,11 +313,11 @@ extension AnalysisSidecar {
               let cached = try? JSONDecoder().decode(CachedScenes.self, from: data)
         else { return nil }
         let names = viewNames(read: read)
-        return try cached.report(source: source, identity: identity, names: names, cancelled: cancelled)
+        return try cached.report(source: source, identity: identity, names: names ?? [:], cancelled: cancelled)
     }
 
     public func sceneReport(for media: MediaInfo, cancelled: () -> Bool = { Task.isCancelled }) -> SceneReport? {
-        guard media.hasVideo, identity == media.identity else { return nil }
+        guard media.hasVideo, identity.matchesSnapshot(media.identity) else { return nil }
         return matchingSceneReport(sceneReport(cancelled: cancelled), media: media)
     }
 
@@ -323,7 +328,7 @@ extension AnalysisSidecar {
     }
 
     package func editorMetadata(for media: MediaInfo, cancelled: () -> Bool) -> (SceneReport?, [Int: Double])? {
-        guard identity == media.identity else { return nil }
+        guard identity.matchesSnapshot(media.identity) else { return nil }
         return try? withReadSnapshot(cancelled: cancelled) { read in
             let report = media.hasVideo
                 ? matchingSceneReport(try? decodeSceneReport(read: read, cancelled: cancelled), media: media)
@@ -339,7 +344,7 @@ extension AnalysisSidecar {
                                              stream: Int, maxBytes: Int? = nil,
                                              cancelled: @escaping () -> Bool = { Task.isCancelled }) -> Value? {
         let clock = AudioAnalysisClock(media: media, stream: stream)
-        guard media.identity == identity, clock.indexed, !cancelled(),
+        guard media.identity.matchesSnapshot(identity), clock.indexed, !cancelled(),
               let data = read(key, maxBytes: maxBytes, cancelled: cancelled), !cancelled() else { return nil }
         let decoder = PropertyListDecoder()
         decoder.userInfo[silenceCancellationKey] = cancelled
@@ -367,22 +372,36 @@ extension AnalysisSidecar {
         return overview
     }
 
+    /// Save prepared analysis and metadata together. Another writer may have
+    /// published a finer whole-track overview since these sections were prepared.
+    package func saveAnalysisSections(_ sections: [String: Data], updating: [String: (Data?) throws -> Data] = [:],
+                                      retainingLatest: [String: Int] = [:], cancelled: () -> Bool = { false }) throws {
+        var replacements = sections
+        var updates = updating
+        for (key, data) in sections where Self.savedEnvelopeStream(forKey: key) != nil {
+            guard updates[key] == nil else {
+                throw CutError(code: "invalid_sidecar_analysis", message: "Two updates target the same waveform overview.")
+            }
+            replacements.removeValue(forKey: key)
+            updates[key] = { current in
+                guard let current, current != data else { return data }
+                let decoder = PropertyListDecoder()
+                guard let saved = try? decoder.decode(CachedAudio<CachedEnvelope>.self, from: current),
+                      let incoming = try? decoder.decode(CachedAudio<CachedEnvelope>.self, from: data),
+                      saved.clock == incoming.clock,
+                      saved.value.low.count >= incoming.value.low.count,
+                      saved.value.overview(duration: saved.clock.duration.seconds) != nil else { return data }
+                return current
+            }
+        }
+        try save(replacements, updating: updates, retainingLatest: retainingLatest, cancelled: cancelled)
+    }
+
     func saveOverviewAutomatically(_ overview: AudioEnvelope, for media: MediaInfo, stream: Int,
                                    cancelled: () -> Bool) {
         guard Self.readsEnabled, Self.automaticWritesEnabled, !isExcluded, !cancelled() else { return }
-        let key = "waveform_envelope.v1.\(stream)"
-        guard let data = try? Self.sections(media: media, envelopeOverviews: [stream: overview], cancelled: cancelled)[key] else { return }
-        try? save([:], updating: [key: { current in
-            // Another process can finish a finer overview while this one is decoding.
-            if let current,
-               let saved = try? PropertyListDecoder().decode(CachedAudio<CachedEnvelope>.self, from: current),
-               saved.clock == overview.analysisClock,
-               saved.value.low.count >= overview.low.count * MemoryLayout<Float>.stride,
-               saved.value.overview(duration: media.duration.seconds) != nil {
-                return current
-            }
-            return data
-        }], cancelled: cancelled)
+        let sections = try? Self.sections(media: media, envelopeOverviews: [stream: overview], cancelled: cancelled)
+        if let sections { try? saveAnalysisSections(sections, cancelled: cancelled) }
     }
 
     public func automaticThresholdDB(for media: MediaInfo, stream: Int, cancelled: @escaping () -> Bool = { Task.isCancelled }) -> Double? {
@@ -427,7 +446,7 @@ extension AnalysisSidecar {
         for (stream, overview) in envelopeOverviews {
             try checkCancellation()
             let clock = AudioAnalysisClock(media: media, stream: stream)
-            guard clock.indexed, overview.sourceIdentity == media.identity, overview.analysisClock == clock,
+            guard clock.indexed, overview.sourceIdentity?.matchesSnapshot(media.identity) == true, overview.analysisClock == clock,
                   overview.from == 0, overview.to == media.duration.seconds,
                   overview.low.count == overview.high.count, (1...AudioEnvelope.maxColumns).contains(overview.low.count),
                   zip(overview.low, overview.high).allSatisfy({ $0.isFinite && $1.isFinite && $0 <= $1 }) else { throw mismatch }
@@ -436,7 +455,7 @@ extension AnalysisSidecar {
         for result in silence {
             try checkCancellation()
             let clock = AudioAnalysisClock(media: media, stream: result.stream)
-            guard clock.indexed, result.sourceIdentity == media.identity,
+            guard clock.indexed, result.sourceIdentity?.matchesSnapshot(media.identity) == true,
                   result.sourceClock == clock, valid(result, for: media, cancelled: cancelled) else {
                 try checkCancellation()
                 throw mismatch
@@ -478,7 +497,7 @@ extension AudioAnalysis {
             throw CutError(code: "invalid_arguments", message: "Use a positive minimum pause and a threshold between −120 and 0 dBFS.")
         }
         func checkSource() throws {
-            guard try SourceIdentity(media.url) == media.identity else {
+            guard media.identity.isCurrentSnapshot(at: media.url) else {
                 throw CutError(code: "source_changed", message: "The source changed since inspection.")
             }
         }

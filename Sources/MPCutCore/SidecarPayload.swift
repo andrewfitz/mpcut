@@ -10,6 +10,7 @@ struct SidecarPayload {
     static let minimumSize = 4096
 
     static func encode(_ value: Data, key: String = "", cancelled: () -> Bool) throws -> Self {
+        guard value.count <= Int(Int32.max) else { throw sidecarError("Section exceeds the maximum logical size.") }
         let raw = Self(bytes: value, logicalSize: 0)
         guard value.count >= minimumSize else { return raw }
         let packed: Data?
@@ -26,8 +27,8 @@ struct SidecarPayload {
         }
         let input = packed ?? value
         // Avoid spending space on framing for incompressible data such as JPEGs.
-        if let compressed = try filter(input, operation: .compress, limit: input.count - input.count / 50,
-                                       tag: packed == nil ? 1 : tag + 1, cancelled: cancelled) {
+        if let compressed = try compress(input, limit: input.count - input.count / 50,
+                                         tag: packed == nil ? 1 : tag + 1, cancelled: cancelled) {
             return Self(bytes: compressed, logicalSize: value.count)
         }
         if let packed, packed.count + 1 < value.count {
@@ -52,15 +53,14 @@ struct SidecarPayload {
         guard logicalSize > bytes.count, logicalSize <= Int(Int32.max), let tag = bytes.first else { return nil }
         switch tag {
         case 1:
-            let result = try Self.filter(bytes.dropFirst(), operation: .decompress, limit: logicalSize, cancelled: cancelled)
+            let result = try Self.decompress(bytes.dropFirst(), limit: logicalSize, cancelled: cancelled)
             return result?.count == logicalSize ? result : nil
         case 2...5:
             let packed: Data
             if tag.isMultiple(of: 2) {
                 packed = bytes.dropFirst()
             } else {
-                guard let value = try Self.filter(bytes.dropFirst(), operation: .decompress, limit: logicalSize,
-                                                  cancelled: cancelled) else { return nil }
+                guard let value = try Self.decompress(bytes.dropFirst(), limit: logicalSize, cancelled: cancelled) else { return nil }
                 packed = value
             }
             if tag < 4 {
@@ -72,14 +72,52 @@ struct SidecarPayload {
         }
     }
 
+    private static func decompress(_ input: Data, limit: Int, cancelled: () -> Bool) throws -> Data? {
+        try input.withUnsafeBytes { source in
+            guard source.count > 1, let base = source.bindMemory(to: UInt8.self).baseAddress else { return nil }
+            let capacity = min(limit + 1, 64 * 1024)
+            let scratch = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
+            defer { scratch.deallocate() }
+            var stream = compression_stream(dst_ptr: scratch, dst_size: 0, src_ptr: base, src_size: 0, state: nil)
+            guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_LZFSE) == COMPRESSION_STATUS_OK else {
+                return nil
+            }
+            defer { compression_stream_destroy(&stream) }
+            // The framework can consume bytes beyond the end marker into its own
+            // buffer. Withhold the last byte to detect a stream that ends early.
+            stream.src_ptr = base
+            stream.src_size = source.count - 1
+            var final = false
+            var output = Data()
+            while true {
+                try checkSidecarCancellation(cancelled)
+                stream.dst_ptr = scratch
+                stream.dst_size = capacity
+                let before = stream.src_size
+                let status = compression_stream_process(&stream, final ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0)
+                let produced = capacity - stream.dst_size
+                guard status != COMPRESSION_STATUS_ERROR, produced <= limit - output.count else { return nil }
+                output.append(scratch, count: produced)
+                if status == COMPRESSION_STATUS_END { return final ? output : nil }
+                if !final && stream.src_size == 0 && stream.dst_size > 0 {
+                    stream.src_ptr = base + source.count - 1
+                    stream.src_size = 1
+                    final = true
+                } else if produced == 0 && stream.src_size == before {
+                    return nil
+                }
+            }
+        }
+    }
+
     private enum FilterError: Error { case exceedsLimit }
 
-    private static func filter(_ input: Data, operation: FilterOperation, limit: Int, tag: UInt8? = nil,
-                               cancelled: () -> Bool) throws -> Data? {
+    private static func compress(_ input: Data, limit: Int, tag: UInt8,
+                                 cancelled: () -> Bool) throws -> Data? {
         try withoutActuallyEscaping(cancelled) { check in
-            var output = tag.map { Data([$0]) } ?? Data()
+            var output = Data([tag])
             do {
-                let stream = try OutputFilter(operation, using: .lzfse, bufferCapacity: 64 * 1024) { chunk in
+                let stream = try OutputFilter(.compress, using: .lzfse, bufferCapacity: 64 * 1024) { chunk in
                     try checkSidecarCancellation(check)
                     guard let chunk else { return }
                     guard chunk.count <= limit - output.count else { throw FilterError.exceedsLimit }

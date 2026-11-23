@@ -49,7 +49,7 @@ public struct AudioWaveform: Sendable {
     }
 
     func matches(_ media: MediaInfo, stream: Int) -> Bool {
-        sourceIdentity == media.identity && sourceClock == AudioAnalysisClock(media: media, stream: stream)
+        sourceIdentity?.matchesSnapshot(media.identity) == true && sourceClock == AudioAnalysisClock(media: media, stream: stream)
     }
 
     func peakBytes(checkingCancellation: () throws -> Void) rethrows -> Data {
@@ -461,7 +461,7 @@ public enum AudioAnalysis {
             throw CutError(code: "no_audio", message: "Select an available audio stream for analysis.")
         }
         func checkSource() throws {
-            guard (try? SourceIdentity(media.url)) == media.identity else {
+            guard media.identity.isCurrentSnapshot(at: media.url) else {
                 throw CutError(code: "source_changed", message: "The source changed since inspection.")
             }
         }

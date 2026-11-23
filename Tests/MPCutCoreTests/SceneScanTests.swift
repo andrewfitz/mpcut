@@ -46,6 +46,9 @@ final class SceneScanTests: XCTestCase {
         XCTAssertEqual(report.scenes.map(\.end), [end])
         XCTAssertEqual(report.scenes.map(\.view), [first.view])
         XCTAssertTrue(markers.isEmpty)
+        XCTAssertThrowsError(try AnalysisSidecar.sceneSections(for: report)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "invalid_sidecar_analysis")
+        }
     }
 
     func testRestartReplayDoesNotReturnNewerReport() throws {
@@ -63,6 +66,21 @@ final class SceneScanTests: XCTestCase {
         XCTAssertEqual(replay.state, .upToDate)
         XCTAssertEqual(replay.report?.views.first?.name, first.views.first?.name)
         XCTAssertEqual(sidecar.sceneReport()?.views.first?.name, "Wide")
+    }
+
+    func testRecoveringSceneCheckpointHonorsClearedViewNames() throws {
+        let source = try copyFixture()
+        let first = try XCTUnwrap(SceneAnalysis.run(source, session: SceneScanSession()).report)
+        let sidecar = try AnalysisSidecar(source: source)
+        try sidecar.save(AnalysisSidecar.viewNameSections([1: "Wide"], for: first))
+        let named = try XCTUnwrap(SceneAnalysis.run(source, policy: .restart(operationID: "named"),
+                                                    session: SceneScanSession()).report)
+        XCTAssertEqual(named.views.first?.name, "Wide")
+        var sections = try AnalysisSidecar.viewNameSections([:], for: named)
+        sections[AnalysisSidecar.sceneSectionKey] = Data("{}".utf8)
+        try sidecar.save(sections)
+        let recovered = try XCTUnwrap(SceneAnalysis.run(source, session: SceneScanSession()).report)
+        XCTAssertNil(try XCTUnwrap(recovered.views.first).name)
     }
 
     func testOneSubscriberCanCancelWhileCompatibleWorkContinues() throws {

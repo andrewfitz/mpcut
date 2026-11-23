@@ -88,6 +88,16 @@ final class MulticamThumbnailTests: XCTestCase {
         let warm = await service.image(media: media, key: key, reuseSidecar: false)
         XCTAssertTrue(rendered === warm)
 
+        // The persisted identity ignores ctime. Live tiles must still belong to the indexed snapshot.
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: source.path)
+        let changed = try CutEngine(useSidecar: false).inspect(source, keyframes: true)
+        XCTAssertEqual(changed.identity, media.identity)
+        XCTAssertNotEqual(changed.identity.changeTime, media.identity.changeTime)
+        XCTAssertTrue(service.snapshot(for: changed).isEmpty)
+        let newRender = await service.image(media: changed, key: key, reuseSidecar: false)
+        XCTAssertNotNil(newRender)
+        XCTAssertFalse(rendered === newRender)
+
         // A source relinked at the same path has a different identity.
         try FileManager.default.removeItem(at: source)
         try FileManager.default.copyItem(at: fixture, to: source)

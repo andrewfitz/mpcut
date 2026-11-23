@@ -322,7 +322,8 @@ extension EditorSceneScan {
                 guard states[key] == nil else { continue }
                 let disk = preference.permits(request.media.url)
                 let latest = SceneAnalysis.lookup(request.media, scope: request.scope, useSidecar: disk)
-                let pending = latest?.state == .paused ? latest
+                // A reuse lookup already checks pending work when it finds no completed report.
+                let pending = latest?.report == nil ? latest
                     : SceneAnalysis.lookup(request.media, scope: request.scope, useSidecar: disk, policy: .resume)
                 states[key] = SceneRequestInspection(completed: latest?.report == nil ? nil : latest?.progress, pending: pending?.progress)
             }

@@ -162,23 +162,44 @@ public struct AnalysisSidecar: Sendable {
         }
     }
 
+    static func sectionNames(in db: SidecarDatabase) throws -> [String] {
+        try db.statement("SELECT name FROM sections ORDER BY name") { query in
+            var names = [String]()
+            var step = sqlite3_step(query)
+            while step == SQLITE_ROW, let value = sqlite3_column_text(query, 0) {
+                names.append(String(cString: value))
+                step = sqlite3_step(query)
+            }
+            guard step == SQLITE_DONE else { throw db.error() }
+            return names
+        }
+    }
+
     public func keys() -> [String] {
         guard Self.readsEnabled else { return [] }
         do {
             guard let db = try openReadSnapshot(), try currentStamp(db) != nil else { return [] }
-            let result = try db.statement("SELECT name FROM sections ORDER BY name") { query in
-                var names = [String]()
-                var step = sqlite3_step(query)
-                while step == SQLITE_ROW, let value = sqlite3_column_text(query, 0) {
-                    names.append(String(cString: value))
-                    step = sqlite3_step(query)
-                }
-                guard step == SQLITE_DONE else { throw db.error() }
-                return names
-            }
+            let result = try Self.sectionNames(in: db)
             try checkSource()
             return result
         } catch { return [] }
+    }
+
+    /// Check membership using the section-name index without loading unrelated keys or payloads.
+    package func containsSections(_ keys: Set<String>, cancelled: () -> Bool = { Task.isCancelled }) -> Bool {
+        if keys.isEmpty { return true }
+        guard Self.readsEnabled, !cancelled() else { return false }
+        do {
+            guard let db = try openReadSnapshot(), try currentStamp(db) != nil else { return false }
+            for key in keys {
+                guard !cancelled(), Self.validKey(key),
+                      try db.statement("SELECT 1 FROM sections WHERE name = ?", [key], {
+                          sqlite3_step($0) == SQLITE_ROW
+                      }) else { return false }
+            }
+            try checkSource()
+            return !cancelled()
+        } catch { return false }
     }
 
     public func read(_ key: String, maxBytes: Int? = nil, cancelled: () -> Bool = { Task.isCancelled }) -> Data? {
@@ -219,16 +240,18 @@ public struct AnalysisSidecar: Sendable {
     }
 
     func verifiedSection(_ key: String, in db: SidecarDatabase, stamp saved: String, maxBytes: Int?,
-                         cancelled: () -> Bool, generation: String? = nil) throws -> Data? {
+                         cancelled: () -> Bool, generation: String? = nil, matchingDigest: SHA256.Digest? = nil) throws -> Data? {
         let table = generation == nil ? "sections" : "archived_sections"
         let predicate = generation == nil ? "name = ?" : "name = ? AND generation = ?"
         let bindings = [key] + (generation.map { [$0] } ?? [])
-        return try db.statement("SELECT digest, rowid, \(db.logicalSizeColumn) FROM \(table) WHERE \(predicate)", bindings) { query in
+        return try db.statement("SELECT digest, rowid, \(db.logicalSizeColumn) FROM \(table) WHERE \(predicate) AND typeof(value) = 'blob'", bindings) { query in
             let step = sqlite3_step(query)
             if step == SQLITE_DONE { return nil }
             guard step == SQLITE_ROW else { throw db.error() }
             guard sqlite3_column_bytes(query, 0) == 32,
                   let expected = sqlite3_column_blob(query, 0) else { return nil }
+            let expectedBytes = UnsafeRawBufferPointer(start: expected, count: 32)
+            if let matchingDigest, !matchingDigest.elementsEqual(expectedBytes) { return nil }
             // Read into the destination allocation directly. Materializing
             // sqlite3_column_blob would also keep a full SQLite-owned copy.
             let size = Int(sqlite3_column_int64(query, 2))
@@ -239,7 +262,6 @@ public struct AnalysisSidecar: Sendable {
                 if size == 0 { hash.update(bufferPointer: chunk) }
             }
             guard let data else { return nil }
-            let expectedBytes = UnsafeRawBufferPointer(start: expected, count: 32)
             if size == 0 { return hash.finalize().elementsEqual(expectedBytes) ? data : nil }
             guard let decoded = try SidecarPayload(bytes: data, logicalSize: size).decode(cancelled: cancelled) else { return nil }
             let digest = try decoded.withUnsafeBytes { try checksum(key, stamp: saved, $0, cancelled: cancelled) }
@@ -257,7 +279,7 @@ public struct AnalysisSidecar: Sendable {
         return hash
     }
 
-    private func checksum(_ key: String, stamp: String, _ bytes: UnsafeRawBufferPointer,
+    func checksum(_ key: String, stamp: String, _ bytes: UnsafeRawBufferPointer,
                           cancelled: () -> Bool) throws -> SHA256.Digest {
         var hash = checksumSeed(key, stamp: stamp)
         for offset in stride(from: 0, to: bytes.count, by: 1 << 20) {
@@ -449,8 +471,21 @@ public struct AnalysisSidecar: Sendable {
                       cancelled: () -> Bool) throws {
         guard Self.validKey(key) else { throw sidecarError("Invalid section name.") }
         try checkSidecarCancellation(cancelled)
-        let payload = try SidecarPayload.encode(value, key: key, cancelled: cancelled)
         let digest = try value.withUnsafeBytes { try checksum(key, stamp: saved, $0, cancelled: cancelled) }
+        if value.count >= SidecarPayload.minimumSize,
+           (try? verifiedSection(key, in: db, stamp: saved, maxBytes: value.count,
+                                 cancelled: cancelled, matchingDigest: digest)) != nil {
+            // A repeated save still counts as the newest use. Copy the existing
+            // encoding inside SQLite only if another section was written since.
+            try db.update("""
+                INSERT OR REPLACE INTO sections(name, digest, value, logical_size)
+                SELECT name, digest, value, logical_size FROM sections
+                WHERE name = ? AND rowid < (SELECT max(rowid) FROM sections)
+                """, [key])
+            return
+        }
+        try checkSidecarCancellation(cancelled)
+        let payload = try SidecarPayload.encode(value, key: key, cancelled: cancelled)
         try payload.bytes.withUnsafeBytes { bytes in
             try digest.withUnsafeBytes { digestBytes in
                 try db.statement("INSERT OR REPLACE INTO sections(name, digest, value, logical_size) VALUES(?, ?, ?, ?)", [key]) { query in

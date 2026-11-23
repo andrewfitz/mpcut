@@ -104,6 +104,15 @@ public struct SceneReport: Codable, Sendable {
                            syntheticLeading: syntheticLeading)
     }
 
+    mutating func restoreViewNames(_ names: [Int: String]) {
+        for index in views.indices {
+            let view = views[index]
+            guard view.name != names[view.view] else { continue }
+            views[index] = SceneView(view: view.view, label: view.label, sceneNumbers: view.sceneNumbers,
+                                     name: names[view.view])
+        }
+    }
+
     public mutating func setViewName(_ name: String?, for view: Int) {
         guard let index = views.firstIndex(where: { $0.view == view }) else { return }
         let existing = views[index]

@@ -71,7 +71,7 @@ extension TranscriptJobStore {
                        let stream = track.streamIndex, let stamp = stamps[track.file] {
                         let sidecar = AnalysisSidecar(source: track.file, identity: stamp)
                         if !sidecar.isExcluded {
-                            caches[track.id] = .init(sidecar: sidecar, key: key, evidence: track.evidence, stream: stream)
+                            caches[track.id] = .init(sidecar: sidecar, key: key, evidence: track.evidence, stream: stream, channel: track.stagedChannel)
                         }
                     }
                 }
@@ -137,7 +137,7 @@ extension TranscriptJobStore {
                         track.state = .recognized
                     } else if policy != .restart, let cache = caches[track.id],
                               let hit = cache.read(cancelled: cancelled),
-                              hit.matches(key: cache.key, evidence: cache.evidence, needsActivity: track.activity != nil) {
+                              track.activity == nil || hit.activity != nil {
                         try hit.write(result: result, activity: track.activity)
                         track.recognitionKey = cache.key
                         track.recognitionSettingsKey = scope
@@ -379,7 +379,7 @@ extension TranscriptJobStore {
 
     private func cacheTrack(_ track: TranscriptJobTrack, cache: TranscriptRecognitionCache?,
                             cancelled: @escaping @Sendable () -> Bool, warnings: inout [String]) {
-        guard AnalysisSidecar.automaticWritesEnabled, let cache, let result = track.result,
+        guard !cancelled(), AnalysisSidecar.automaticWritesEnabled, let cache, let result = track.result,
               let artifacts = TranscriptRecognitionCache.Artifacts(result: result, activity: track.activity),
               artifacts.matches(key: cache.key, evidence: cache.evidence, needsActivity: track.activity != nil) else { return }
         do {

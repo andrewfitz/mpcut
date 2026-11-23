@@ -92,6 +92,6 @@ struct DesktopAnalysisSnapshot: Sendable {
             }
         }
         let retention = filmstrip.isEmpty ? [:] : [FilmstripTileKey.sectionPrefix: FilmstripTileBuffer.countLimit]
-        try AnalysisSidecar(media: media).save(sections, updating: updates, retainingLatest: retention, cancelled: cancelled)
+        try AnalysisSidecar(media: media).saveAnalysisSections(sections, updating: updates, retainingLatest: retention, cancelled: cancelled)
     }
 }

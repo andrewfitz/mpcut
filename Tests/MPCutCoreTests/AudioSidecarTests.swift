@@ -90,6 +90,12 @@ final class AudioSidecarTests: XCTestCase {
         let restored = try XCTUnwrap(store.envelopeOverview(for: cached, stream: stream))
         XCTAssertEqual(restored.low, envelope.low)
         XCTAssertEqual(restored.high, envelope.high)
+        let coarseOverview = try AudioAnalysis.envelope(media, stream: stream, from: 0, to: media.duration.seconds,
+                                                       columns: 128, useSidecar: false)
+        let olderSections = try AnalysisSidecar.sections(media: media, envelopeOverviews: [stream: coarseOverview])
+        try store.saveAnalysisSections(olderSections, updating: ["metadata": { _ in Data([1]) }])
+        XCTAssertEqual(store.envelopeOverview(for: media, stream: stream)?.low, envelope.low)
+        XCTAssertEqual(store.read("metadata"), Data([1]))
         XCTAssertNoThrow(try AnalysisSidecar.sections(media: cached, envelopeOverviews: [stream: restored]))
         let subrange = try AudioAnalysis.envelope(media, stream: stream, from: 0.1, to: 0.3, columns: 1024)
         XCTAssertThrowsError(try AnalysisSidecar.sections(media: cached, envelopeOverviews: [stream: subrange]))

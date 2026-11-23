@@ -357,9 +357,6 @@ extension AnalysisSidecar {
         guard media.hasFullEditIndex else {
             throw CutError(code: "incomplete_index", message: "A full editing index is required to save analysis.")
         }
-        let header = IndexHeader(media)
-        let encoder = PropertyListEncoder()
-        encoder.outputFormat = .binary
         // Each row stores absolute timestamps. Encoded batches can be joined
         // directly without rebasing any row.
         let total = max(1, media.audio.reduce(Double(media.frames.count)) { sum, track in
@@ -405,11 +402,38 @@ extension AnalysisSidecar {
             }
         }
         try checkIndexCancellation(cancelled)
-        var sections = ["media_index.v1": try encoder.encode(header), "media_index_frames.v1": frames, "media_index_audio.v1": audio]
+        return try Self.indexArchive(media, frames: frames, audio: audio)
+    }
+
+    private static func indexArchive(_ media: MediaInfo, frames: Data, audio: Data) throws -> [String: Data] {
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .binary
+        var sections = ["media_index.v1": try encoder.encode(IndexHeader(media)), "media_index_frames.v1": frames,
+                        "media_index_audio.v1": audio]
         if let evidence = media.refreshEvidence {
             sections[MediaRefreshEvidence.sectionKey] = try evidence.encoded()
         }
         return sections
+    }
+
+    /// An explicit build needs both the typed index and its serialized rows. Keep the bytes
+    /// validated by the full decoder so publishing the archive need not serialize every row again.
+    package func indexForSaving(cancelled: () -> Bool) throws -> (MediaInfo, [String: Data])? {
+        try withReadSnapshot(cancelled: cancelled) { read in
+            var frames: Data?
+            var audio: Data?
+            let media = try decodeIndex(detail: .full, read: { key in
+                let value = read(key)
+                switch key {
+                case "media_index_frames.v1": frames = value
+                case "media_index_audio.v1": audio = value
+                default: break
+                }
+                return value
+            }, progress: nil, cancelled: cancelled)
+            guard let media, let frames, let audio, media.refreshEvidence != nil else { return nil }
+            return (media, try Self.indexArchive(media, frames: frames, audio: audio))
+        }
     }
 
     func loadIndex(detail: SidecarIndexDetail, progress: ((Double) -> Void)? = nil, cancelled: () -> Bool) throws -> MediaInfo? {
@@ -582,14 +606,16 @@ enum SidecarPacketPacking {
 
         init(_ reader: inout IndexReader) throws {
             flag = try reader.byte()
-            guard flag <= 1 else { throw IndexCodingError.invalid }
+            guard flag <= 2 else { throw IndexCodingError.invalid }
             time = try reader.time()
+            if flag == 2 { _ = try reader.time() }
             let start = reader.position
             duration = try reader.time()
-            guard duration > .zero else { throw IndexCodingError.invalid }
             for _ in 0..<3 { _ = try reader.signed() }
             fields = start..<reader.position
         }
+
+        var predictable: Bool { flag <= 1 && duration > .zero }
 
         mutating func next(_ writer: inout IndexWriter, bytes: UnsafeRawBufferPointer) throws {
             time = try time.adding(duration)
@@ -619,6 +645,9 @@ enum SidecarPacketPacking {
                 if rows.isMultiple(of: 1024) { try checkSidecarCancellation(cancelled) }
                 let seed = input.position
                 guard var sequence = try? Sequence(&input) else { break }
+                rows += 1
+                // Keep an exceptional packet literal and resume on the following row.
+                guard sequence.predictable else { continue }
                 let seedEnd = input.position
                 var count = 1
                 while input.remaining > 0 {
@@ -636,7 +665,6 @@ enum SidecarPacketPacking {
                     output.bytes.append(contentsOf: bytes[seed..<seedEnd])
                     literalStart = input.position
                 }
-                rows += 1
             }
             guard literalStart > 0 else { return nil }
             literal(to: bytes.count)
@@ -662,6 +690,7 @@ enum SidecarPacketPacking {
                 } else {
                     guard count >= 4, count <= (logicalSize - output.count) / 8 else { return nil }
                     var sequence = try Sequence(&input)
+                    guard sequence.predictable else { return nil }
                     output.append(contentsOf: bytes[seed..<input.position])
                     for i in 1..<count {
                         if i.isMultiple(of: 1024) { try checkSidecarCancellation(cancelled) }

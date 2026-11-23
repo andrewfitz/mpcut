@@ -107,6 +107,23 @@ class Sidecar(unittest.TestCase):
         self.assertEqual(replaced["status"], "current")
         self.assertIn("scenes_boundaries.v1", replaced["sections"])
 
+    def test_rebuild_repairs_missing_evidence_and_invalid_serialized_index(self):
+        expected = self.save("--only", "index")
+        evidence_key = "media_refresh_evidence.v1"
+        frame_key = "media_index_frames.v1"
+        with sqlite3.connect(self.sidecar) as db:
+            frames = section_bytes(db, frame_key)
+            db.execute("DELETE FROM sections WHERE name=?", (evidence_key,))
+        self.assertEqual(self.save("--only", "index")["saved"], expected["saved"])
+        with sqlite3.connect(self.sidecar) as db:
+            stamp = db.execute("SELECT stamp FROM source WHERE id=1").fetchone()[0]
+            invalid = b"invalid frame rows"
+            digest = hashlib.sha256(stamp.encode() + b"\0" + frame_key.encode() + b"\0" + invalid).digest()
+            db.execute("UPDATE sections SET logical_size=0, value=?, digest=? WHERE name=?", (invalid, digest, frame_key))
+        self.assertEqual(self.save("--only", "index")["saved"], expected["saved"])
+        with sqlite3.connect(self.sidecar) as db:
+            self.assertEqual(section_bytes(db, frame_key), frames)
+
     def test_foreign_neighbor_is_a_read_miss_and_survives_save(self):
         self.sidecar.write_bytes(b"user-owned file")
         self.assertEqual(self.status()["status"], "unreadable")
@@ -279,9 +296,10 @@ class Sidecar(unittest.TestCase):
             self.assertEqual(failure["error"]["code"], "invalid_arguments")
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", FIXTURES / "Pause-Quiet.mov",
                         "-map", "0:v:0", "-c", "copy", self.source], check=True, timeout=120)
-        result = self.cli("analysis", "sidecar", "build", "--json", "--only", "audio", self.source, success=False)
-        self.assertEqual(result["error"]["code"], "no_audio")
-        self.assertFalse(self.sidecar.exists())
+        for selection in ("audio", "index,audio", "scenes,audio"):
+            result = self.cli("analysis", "sidecar", "build", "--json", "--only", selection, self.source, success=False)
+            self.assertEqual(result["error"]["code"], "no_audio")
+            self.assertFalse(self.sidecar.exists())
         self.assertIn("scenes_boundaries.v1", self.save()["sections"])
 
     def test_rearranged_video_and_linked_audio_match_with_saved_index(self):

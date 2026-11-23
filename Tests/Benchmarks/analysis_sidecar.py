@@ -40,7 +40,20 @@ def compare(cli, source, arguments, runs):
 def benchmark(cli, file, directory, runs):
     source = directory / file.name
     shutil.copy2(file, source)
-    _, build = report(cli, source, "analysis", "sidecar", "build")
+    first, build = report(cli, source, "analysis", "sidecar", "build")
+    cache = source.with_name(source.name + ".cutdb")
+    initial_size = cache.stat().st_size
+    save_times = []
+    inspect_times = []
+    for _ in range(runs):
+        saved, elapsed = report(cli, source, "analysis", "sidecar", "build")
+        if saved["sections"] != first["sections"] or saved["status"] != "current":
+            raise RuntimeError("Repeating a sidecar save changed the inventory")
+        save_times.append(elapsed)
+        inspected, elapsed = report(cli, source, "analysis", "sidecar", "inspect")
+        if inspected["sections"] != saved["sections"] or inspected["status"] != "current":
+            raise RuntimeError("Sidecar inspection and save disagree")
+        inspect_times.append(elapsed)
     info, _ = report(cli, source, "media", "inspect")
     duration = info["media"]["duration"]
     end = min(1, Fraction(duration["numerator"], duration["denominator"]))
@@ -58,11 +71,14 @@ def benchmark(cli, file, directory, runs):
             middle = Fraction(duration["numerator"], duration["denominator"]) / 2
             operations["signedDetail"] = ["waveform", "envelope", "read", "--columns", "1024", "--from", str(middle),
                                           "--to", str(middle + min(middle, Fraction(1, 10)))]
+    reports = {name: compare(cli, source, arguments, runs) for name, arguments in operations.items()}
     return {
         "source": file.name, "sourceBytes": source.stat().st_size,
-        "sidecarBytes": source.with_name(source.name + ".cutdb").stat().st_size,
+        "sidecarBytes": initial_size, "afterQueriesBytes": cache.stat().st_size,
+        "repeatBuildSeconds": round(statistics.median(save_times), 4),
+        "inventorySeconds": round(statistics.median(inspect_times), 4),
         "buildSeconds": round(build, 4), "measuredRuns": runs,
-        "reports": {name: compare(cli, source, arguments, runs) for name, arguments in operations.items()},
+        "reports": reports,
     }
 
 

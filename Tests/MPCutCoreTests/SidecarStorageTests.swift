@@ -43,6 +43,22 @@ final class SidecarStorageTests: XCTestCase {
         XCTAssertEqual(sidecar.keys(), ["a", "b"])
     }
 
+    func testContainsSectionsChecksMembershipInCurrentSidecar() throws {
+        let store = try makeSidecar()
+        XCTAssertTrue(store.containsSections([]))
+        XCTAssertFalse(store.containsSections(["one"]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.url.path))
+        try store.save(["one": Data(), "two": Data(), "unrelated": Data()])
+        XCTAssertTrue(store.containsSections(["one", "two"]))
+        XCTAssertFalse(store.containsSections(["one", "missing"]))
+        XCTAssertFalse(store.containsSections(["one"], cancelled: { true }))
+        AnalysisSidecar.$readsEnabled.withValue(false) {
+            XCTAssertFalse(store.containsSections(["one"]))
+        }
+        try Data([9, 8, 7, 6]).write(to: store.source)
+        XCTAssertFalse(store.containsSections(["one"]))
+    }
+
     func testPackedActivityPreservesExactProviderBytesAndReadLimit() throws {
         let store = try makeSidecar()
         let key = "transcript_activity.v1.0.track"
@@ -124,7 +140,16 @@ final class SidecarStorageTests: XCTestCase {
         XCTAssertEqual(try db.integer("PRAGMA user_version"), 3)
         XCTAssertEqual(store.read(key), value)
 
-        try store.save(["another": Data([8])])
+        let lock = NSLock()
+        var failures: [Error] = []
+        DispatchQueue.concurrentPerform(iterations: 4) { index in
+            do { try store.save(["writer.\(index)": Data([UInt8(index)])]) }
+            catch { lock.withLock { failures.append(error) } }
+        }
+        XCTAssertTrue(failures.isEmpty, "\(failures)")
+        for index in 0..<4 {
+            XCTAssertEqual(store.read("writer.\(index)"), Data([UInt8(index)]))
+        }
         XCTAssertEqual(try db.integer("PRAGMA user_version"), 4)
         XCTAssertEqual(store.read(key), value)
         XCTAssertEqual(store.read("small"), Data([7]))
@@ -261,6 +286,43 @@ final class SidecarStorageTests: XCTestCase {
         }
         XCTAssertEqual(rows, old)
         XCTAssertEqual(sidecar.read("header"), new)
+    }
+
+    func testRefreshingPreservedSectionsKeepsRetentionOrder() throws {
+        let old = try makeSidecar()
+        let value = Data(repeating: 65, count: 8192)
+        try old.save(["tile.z": value])
+        try old.save(["tile.a": value])
+        try Data([4, 5, 6, 7]).write(to: old.source)
+        let fresh = try AnalysisSidecar(source: old.source)
+        try fresh.refreshGeneration(evidence: Data([1]), preserving: ["tile.a", "tile.z"])
+        XCTAssertEqual(fresh.read("tile.z"), value)
+        try fresh.save(["tile.b": value], retainingLatest: ["tile.": 2])
+        XCTAssertNil(fresh.read("tile.z"))
+        XCTAssertEqual(fresh.read("tile.a"), value)
+    }
+
+    func testRepeatedLargeSaveRefreshesRetentionAndRepairsDamage() throws {
+        let store = try makeSidecar()
+        let value = Data(repeating: 7, count: 100_000)
+        try store.save(["tile.a": value])
+        try store.save(["tile.b": value])
+        try store.save(["tile.a": value])
+        try store.save(["tile.c": value], retainingLatest: ["tile.": 2])
+        XCTAssertEqual(store.keys(), ["tile.a", "tile.c"])
+        let db = try SidecarDatabase(store.url, writing: true)
+        for damage in ["value = X'0102'", "value = 17", "digest = zeroblob(32)"] {
+            try db.execute("UPDATE sections SET \(damage) WHERE name = 'tile.a'")
+            XCTAssertNil(store.read("tile.a"))
+            try store.save(["tile.a": value])
+            XCTAssertEqual(store.read("tile.a"), value)
+        }
+        try db.execute("UPDATE sections SET value = 17 WHERE name = 'tile.a'")
+        try store.save([:], updating: ["tile.a": { current in
+            XCTAssertNil(current)
+            return value
+        }])
+        XCTAssertEqual(store.read("tile.a"), value)
     }
 
     func testRetentionOnlyPrunesOldRowsWithTheLiteralPrefix() throws {

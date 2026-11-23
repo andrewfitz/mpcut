@@ -142,6 +142,87 @@ final class TranscriptMaintenanceTests: XCTestCase {
         }
     }
 
+    func testTranscriptSavesRejectEvidenceFromRewrittenMedia() throws {
+        let folder = try directory()
+        let file = try wave(in: folder)
+        let original = try CutEngine(useSidecar: false).inspectMulticamSource(file)
+        var statBefore = stat()
+        XCTAssertEqual(stat(file.path, &statBefore), 0)
+        _ = try wave(in: folder) { _, _ in 1 }
+        let times = [statBefore.st_atimespec, statBefore.st_mtimespec]
+        XCTAssertEqual(times.withUnsafeBufferPointer { utimensat(AT_FDCWD, file.path, $0.baseAddress, 0) }, 0)
+        let sidecar = try AnalysisSidecar(source: file)
+        XCTAssertEqual(original.identity, sidecar.identity)
+        XCTAssertFalse(original.identity.matchesSnapshot(sidecar.identity))
+        let key = TranscriptActivityKey(stream: 0)
+        XCTAssertThrowsError(try sidecar.saveTranscriptActivity(Data(), key: key, media: original))
+        let recognition = TranscriptRecognitionCache(sidecar: sidecar, key: String(repeating: "a", count: 64),
+                                                     evidence: "old evidence", stream: 0)
+        let artifacts = TranscriptRecognitionCache.Artifacts(result: Data(), activity: nil)
+        XCTAssertThrowsError(try recognition.saveSidecar(artifacts, media: original, cancelled: { false }))
+        XCTAssertNil(sidecar.readTranscriptActivity(key))
+        XCTAssertNil(sidecar.read(recognition.section))
+    }
+
+    func testRecognitionSettingsShareExactLevelsAndReadLegacyArtifacts() throws {
+        let folder = try directory()
+        let source = try wave(in: folder)
+        let media = try CutEngine().inspectMulticamSource(source)
+        let sidecar = AnalysisSidecar(media: media)
+        let evidence = String(repeating: "c", count: 64)
+        let count = 18_000
+        let duration = Int64(count * 320)
+        let levels = try transcriptActivityDocument(levels: (0..<count).map { Float(($0 * 37) % 1009) / 1009 },
+                                                    duration: duration, evidence: evidence)
+        let activityKey = TranscriptActivityKey(stream: 0)
+        try sidecar.saveTranscriptActivity(levels, key: activityKey, media: media)
+        let caches = ["a", "b"].map {
+            TranscriptRecognitionCache(sidecar: sidecar, key: String(repeating: $0, count: 64), evidence: evidence, stream: 0)
+        }
+        let artifacts = caches.map { cache in
+            let result = Data("""
+            {"version":1,"sample_rate":16000,"recognition_key":"\(cache.key)","stream_evidence":"\(evidence)","duration_samples":\(duration),"words":[],"activity":[]}
+            """.utf8)
+            return TranscriptRecognitionCache.Artifacts(result: result, activity: levels)
+        }
+        for (cache, artifact) in zip(caches, artifacts) {
+            try cache.saveSidecar(artifact, media: media, cancelled: { false })
+            XCTAssertEqual(cache.readSidecar(cancelled: { false })?.result, artifact.result)
+        }
+        let newSize = try sidecar.url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+        let keys = Set(sidecar.keys().filter { $0.hasPrefix("transcript_") })
+        XCTAssertEqual(MediaRefreshEvidence.Comparison(audio: [0]).preservedSectionKeys(keys), keys)
+        XCTAssertTrue(MediaRefreshEvidence.Comparison(audio: [1]).preservedSectionKeys(keys).isEmpty)
+        let content = "transcript_activity.v1.0." + TranscriptStore.digest(levels)
+        XCTAssertNotNil(sidecar.read(content))
+        XCTAssertEqual(sidecar.keys().filter { $0.hasPrefix("transcript_activity.") }.count, 2)
+        let originalKeys = sidecar.keys()
+        let competing = TranscriptRecognitionCache.Artifacts(result: artifacts[0].result, activity: levels + Data([10]))
+        try caches[0].saveSidecar(competing, media: media, cancelled: { false })
+        XCTAssertEqual(sidecar.keys(), originalKeys)
+        XCTAssertEqual(caches[0].readSidecar(cancelled: { false })?.activity, levels)
+        try sidecar.saveTranscriptActivity(Data("updated levels".utf8), key: activityKey, media: media, replacing: true)
+        for cache in caches {
+            XCTAssertEqual(cache.readSidecar(cancelled: { false })?.activity, levels)
+            XCTAssertNil(cache.readSidecar(cancelled: { true }))
+        }
+        try sidecar.save([content: Data("corrupt".utf8)])
+        XCTAssertNil(caches[0].readSidecar(cancelled: { false }))
+        try sidecar.saveTranscriptActivity(levels, key: activityKey, media: media, replacing: true)
+        XCTAssertEqual(caches[0].readSidecar(cancelled: { false })?.activity, levels)
+
+        try FileManager.default.removeItem(at: sidecar.url)
+        try sidecar.saveTranscriptActivity(levels, key: activityKey, media: media)
+        for (cache, artifact) in zip(caches, artifacts) {
+            let legacy = "transcript_recognition.v1.0." + cache.key
+            try sidecar.saveTranscript(JSONEncoder().encode(artifact), name: legacy, media: media, cancelled: { false })
+            XCTAssertEqual(cache.readSidecar(cancelled: { false })?.activity, levels)
+        }
+        let oldSize = try sidecar.url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+        print("Two recognition settings, six-minute activity: legacy=\(try XCTUnwrap(oldSize)) shared=\(try XCTUnwrap(newSize)) bytes")
+        XCTAssertLessThan(try XCTUnwrap(newSize), try XCTUnwrap(oldSize))
+    }
+
     func testProviderCheckFailsBeforeAnyAudioIsStaged() throws {
         let folder = try directory()
         let provider = try helper(in: folder, session: "exit 1")

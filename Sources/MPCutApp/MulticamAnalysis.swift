@@ -73,12 +73,14 @@ final class MulticamAnalysisStore: ObservableObject {
     private struct SourceVersion: Hashable {
         let url: URL
         let identity: SourceIdentity
+        let changeTime: SourceIdentity.ChangeTime?
         let origin: RationalTime
         let duration: RationalTime
 
         init(_ media: MediaInfo) {
             url = media.url
             identity = media.identity
+            changeTime = media.identity.changeTime
             origin = media.origin
             duration = media.duration
         }
@@ -930,13 +932,13 @@ final class MulticamAnalysisStore: ObservableObject {
                         minimum: minimum, waveform: cached, useSidecar: useSidecars && !rescan,
                         cancelled: { token.isCancelled })
                     if useSidecars && rescan {
-                        let sections = try AnalysisSidecar.sections(media: audioMedia, silence: [detection],
-                                                                     cancelled: { token.isCancelled })
-                        AnalysisSidecar(media: audioMedia).saveAutomatically(sections, cancelled: { token.isCancelled })
+                        AnalysisSidecar(media: audioMedia).saveAutomatically(
+                            try AnalysisSidecar.sections(media: audioMedia, silence: [detection], cancelled: { token.isCancelled }),
+                            cancelled: { token.isCancelled })
                     }
                     return .silence(detection)
                 case .savedScenes:
-                    return .scenes(SceneAnalysis.lookup(media, useSidecar: useSidecars)?.report)
+                    return .scenes(SceneAnalysis.lookup(media, useSidecar: useSidecars, includePartial: false)?.report)
                 }
             }
             DispatchQueue.main.async { [weak self] in

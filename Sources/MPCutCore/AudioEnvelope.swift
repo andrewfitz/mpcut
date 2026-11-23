@@ -85,7 +85,7 @@ extension AudioAnalysis {
         }
         func checkSource() throws {
             if cancelled() { throw CutError(code: "cancelled", message: "Waveform analysis was cancelled.") }
-            guard try SourceIdentity(media.url) == media.identity else {
+            guard media.identity.isCurrentSnapshot(at: media.url) else {
                 throw CutError(code: "source_changed", message: "The source changed since inspection.")
             }
         }

@@ -36,6 +36,33 @@ final class MediaRefreshTests: XCTestCase {
         XCTAssertEqual(try MediaRefresh.check(file, verification: .deep).state, .unchanged)
     }
 
+    func testAudioAnalysisRejectsLiveResultsAfterRewriteWithRestoredStamp() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appendingPathComponent("recording.wav")
+        try wave(samples: 16_000, amplitude: 100).write(to: file)
+        let engine = CutEngine(useSidecar: false)
+        let original = try engine.inspect(file, keyframes: true)
+        let stream = try XCTUnwrap(original.audio.first?.stream.index)
+        let waveform = try AudioAnalysis.scan(original, stream: stream, useSidecar: false)
+        let envelope = try AudioAnalysis.envelope(original, stream: stream, from: 0, to: original.duration.seconds,
+                                                  columns: 16, useSidecar: false)
+        let silence = try AudioAnalysis.silence(original, stream: stream, waveform: waveform, useSidecar: false)
+
+        try rewritePreservingStamp(file, with: wave(samples: 16_000, amplitude: 300))
+        let current = try engine.inspect(file, keyframes: true)
+        XCTAssertEqual(original.identity, current.identity)
+        XCTAssertNotEqual(AudioAnalysisCacheKey(media: original, stream: stream),
+                          AudioAnalysisCacheKey(media: current, stream: stream))
+        XCTAssertThrowsError(try AudioAnalysis.scan(original, stream: stream, useSidecar: false))
+        XCTAssertThrowsError(try AudioAnalysis.silence(original, stream: stream, waveform: waveform, useSidecar: false))
+        XCTAssertThrowsError(try AudioAnalysis.envelope(original, stream: stream, from: 0, to: original.duration.seconds,
+                                                        columns: 16, useSidecar: false))
+        XCTAssertThrowsError(try AnalysisSidecar.sections(media: current, waveforms: [stream: waveform]))
+        XCTAssertThrowsError(try AnalysisSidecar.sections(media: current, envelopeOverviews: [stream: envelope]))
+        XCTAssertThrowsError(try AnalysisSidecar.sections(media: current, silence: [silence]))
+    }
+
     func testProjectRefreshKeepsShortenedRangeWarningOnWarmCheck() throws {
         let folder = try temporaryFolder()
         defer { try? FileManager.default.removeItem(at: folder) }

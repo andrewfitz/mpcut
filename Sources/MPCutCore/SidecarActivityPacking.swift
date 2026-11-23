@@ -50,6 +50,7 @@ enum SidecarActivityPacking {
                 let first = position
                 var high: UInt8?
                 while position < bytes.count {
+                    if position.isMultiple(of: 65536) { try checkSidecarCancellation(cancelled) }
                     let code = symbol[Int(bytes[position])]
                     if code == 255 { break }
                     if let top = high {
@@ -85,15 +86,18 @@ enum SidecarActivityPacking {
             result.reserveCapacity(min(logicalSize, 8 << 20))
             var position = 8
             var cursor: Int64 = 0
+            var startText = "0"
             while cursor < duration {
                 if (cursor / 320).isMultiple(of: 1024) { try checkSidecarCancellation(cancelled) }
                 let end = cursor + min(320, duration - cursor)
                 if cursor > 0 { result.append(44) }
                 result.append(contentsOf: frame)
-                result.append(contentsOf: String(end).utf8)
+                let endText = String(end)
+                result.append(contentsOf: endText.utf8)
                 result.append(contentsOf: level)
                 while true {
                     guard position < bytes.count, result.count < logicalSize else { return nil }
+                    if position.isMultiple(of: 65536) { try checkSidecarCancellation(cancelled) }
                     let byte = bytes[position]
                     position += 1
                     if byte >> 4 < 15 { result.append(alphabet[Int(byte >> 4)]) }
@@ -102,7 +106,8 @@ enum SidecarActivityPacking {
                     result.append(alphabet[Int(byte & 15)])
                 }
                 result.append(contentsOf: start)
-                result.append(contentsOf: String(cursor).utf8)
+                result.append(contentsOf: startText.utf8)
+                startText = endText
                 result.append(125)
                 cursor = end
             }

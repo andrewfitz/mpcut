@@ -425,7 +425,7 @@ final class SourceIndexLoader {
                             return
                         }
                         // Check the section names before occupying a slot that restores packet indexes.
-                        guard AnalysisSidecar.indexKeys.isSubset(of: cache.keys()) else {
+                        guard cache.containsSections(AnalysisSidecar.indexKeys, cancelled: { token.isCancelled }) else {
                             work()
                             return
                         }

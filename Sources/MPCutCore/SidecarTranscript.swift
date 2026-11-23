@@ -42,8 +42,12 @@ extension AnalysisSidecar {
         return "\(prefix)\(stream).\(digest)"
     }
 
+    static func transcriptActivitySection(_ key: TranscriptActivityKey) throws -> String {
+        try transcriptSection(activityPrefix, stream: key.stream, digest: key.digest())
+    }
+
     public func readTranscriptActivity(_ key: TranscriptActivityKey, cancelled: () -> Bool = { Task.isCancelled }) -> Data? {
-        guard let name = try? Self.transcriptSection(Self.activityPrefix, stream: key.stream, digest: key.digest()) else { return nil }
+        guard let name = try? Self.transcriptActivitySection(key) else { return nil }
         return read(name, cancelled: cancelled)
     }
 
@@ -53,13 +57,13 @@ extension AnalysisSidecar {
     public func saveTranscriptActivity(_ data: Data, key: TranscriptActivityKey, media: MediaInfo,
                                        replacing: Bool = false,
                                        cancelled: () -> Bool = { Task.isCancelled }) throws {
-        let name = try Self.transcriptSection(Self.activityPrefix, stream: key.stream, digest: key.digest())
+        let name = try Self.transcriptActivitySection(key)
         try saveTranscript(data, name: name, media: media, replacing: replacing, cancelled: cancelled)
     }
 
     func saveTranscript(_ data: Data, name: String, media: MediaInfo, replacing: Bool = false,
                         cancelled: () -> Bool) throws {
-        guard media.identity == identity, let evidence = media.refreshEvidence else {
+        guard media.identity.matchesSnapshot(identity), let evidence = media.refreshEvidence else {
             throw transcriptError("Fully indexed stream evidence is required to cache transcript results.",
                                   code: "missing_stream_evidence")
         }

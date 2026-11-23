@@ -110,7 +110,7 @@ final class MulticamThumbnailService: ObservableObject {
 
     func pictureGaps(in media: MediaInfo) -> [Range<Double>] {
         guard !media.frames.isEmpty else { return [] }
-        if let entry = coverage[media.url], entry.identity == media.identity,
+        if let entry = coverage[media.url], entry.identity.matchesSnapshot(media.identity),
            entry.clockOffset == media.multicamClockOffset {
             return entry.gaps
         }
@@ -123,7 +123,7 @@ final class MulticamThumbnailService: ObservableObject {
         guard !Task.isCancelled else { return nil }
         let url = media.url
         let sourceID: UUID
-        if let current = sources[url], current.identity == media.identity {
+        if let current = sources[url], current.identity.matchesSnapshot(media.identity) {
             sourceID = current.id
         } else {
             // A view can encounter a relinked file before it receives an explicit invalidation.
@@ -225,7 +225,7 @@ final class MulticamThumbnailService: ObservableObject {
     }
 
     func displayIdentity(for media: MediaInfo) -> SourceIdentity {
-        guard sources[media.url]?.identity == media.identity else { return media.identity }
+        guard sources[media.url]?.identity.matchesSnapshot(media.identity) == true else { return media.identity }
         return displayIdentity[media.url] ?? media.identity
     }
 
@@ -275,7 +275,7 @@ final class MulticamThumbnailService: ObservableObject {
     }
 
     func snapshot(for media: MediaInfo) -> [FilmstripTile] {
-        guard let source = sources[media.url], source.identity == media.identity else { return [] }
+        guard let source = sources[media.url], source.identity.matchesSnapshot(media.identity) else { return [] }
         var seen = Set<String>()
         return imageOrder.reversed().compactMap { key in
             guard key.source == source.id, key.indexed, let entry = images[key], entry.rendered,
@@ -377,9 +377,13 @@ struct MulticamThumbnail: View {
         let tile: FilmstripTileKey?
         let useAnalysisSidecars: Bool
 
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.indexed == rhs.indexed && lhs.displaysSameTile(as: rhs)
+        }
+
         func displaysSameTile(as other: Self) -> Bool {
-            url == other.url && identity == other.identity && revision == other.revision && tile == other.tile
-                && useAnalysisSidecars == other.useAnalysisSidecars
+            url == other.url && identity == other.identity && identity.changeTime == other.identity.changeTime
+                && revision == other.revision && tile == other.tile && useAnalysisSidecars == other.useAnalysisSidecars
         }
     }
 

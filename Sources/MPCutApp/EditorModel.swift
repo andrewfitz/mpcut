@@ -5420,14 +5420,16 @@ extension EditorModel {
             guard readSaved || (wave != nil && (requested || calibrated == nil)) else { continue }
             // This job restores saved results even before the waveform has arrived.
             // Fresh detection shares the waveform decoder and runs only on request.
-            let worker = Task.detached(priority: .utility) { () throws -> (Double?, SilenceAnalysisResult?) in
+            let worker = Task.detached(priority: .utility) { [sidecarPreference] () throws -> (Double?, SilenceAnalysisResult?) in
+                let skipSidecar = { @Sendable in Task.isCancelled || !sidecarPreference.permits(media.url) }
                 var level = calibrated
                 if readSaved {
                     let sidecar = AnalysisSidecar(media: media)
-                    if let result = sidecar.silence(for: media, stream: stream, thresholdDB: manual, minimum: profile.minimum) {
+                    if let result = sidecar.silence(for: media, stream: stream, thresholdDB: manual, minimum: profile.minimum,
+                                                   cancelled: skipSidecar) {
                         return (result.automaticThresholdDB, result)
                     }
-                    if level == nil { level = sidecar.automaticThresholdDB(for: media, stream: stream) }
+                    if level == nil { level = sidecar.automaticThresholdDB(for: media, stream: stream, cancelled: skipSidecar) }
                 }
                 try Task.checkCancellation()
                 guard let wave else { return (level, nil) }
@@ -5437,8 +5439,8 @@ extension EditorModel {
                                                            cancelled: { Task.isCancelled })
                     if persist {
                         AnalysisSidecar(media: media).saveAutomatically(try AnalysisSidecar.sections(media: media, silence: [result],
-                                                                                                      cancelled: { Task.isCancelled }),
-                                                                      cancelled: { Task.isCancelled })
+                                                                                                      cancelled: skipSidecar),
+                                                                      cancelled: skipSidecar)
                     }
                     return (result.automaticThresholdDB, result)
                 }

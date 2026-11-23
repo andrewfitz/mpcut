@@ -2264,7 +2264,7 @@ final class MulticamEditorModel: ObservableObject {
                 let indexed = try AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
                     try ordinary ?? engine.inspect(info.url, keyframes: true)
                 }
-                guard indexed.identity == info.identity else {
+                guard indexed.identity.matchesSnapshot(info.identity) else {
                     throw CutError(code: "source_changed", message: "Source \(info.url.lastPathComponent) changed. Relink it before saving its analysis.")
                 }
                 var sections = try AnalysisSidecar.indexSections(for: indexed, cancelled: cancelled)
@@ -2273,12 +2273,14 @@ final class MulticamEditorModel: ObservableObject {
                 if let video = info.videoStream {
                     for tile in tiles {
                         if token.isCancelled { throw CancellationError() }
-                        sections[tile.key.section] = tile.key.encoded(tile.image,
-                            preserveAlpha: video.hasAlpha || video.hasAdditionalVideoLayers)
+                        sections[tile.key.section] = autoreleasepool {
+                            tile.key.encoded(tile.image, preserveAlpha: video.hasAlpha || video.hasAdditionalVideoLayers)
+                        }
                     }
                 }
                 try AnalysisSidecar(media: info).save(sections, updating: snapshot.metadataUpdates,
-                    retainingLatest: [FilmstripTileKey.sectionPrefix: FilmstripTileBuffer.countLimit], cancelled: cancelled)
+                    retainingLatest: tiles.isEmpty ? [:] : [FilmstripTileKey.sectionPrefix: FilmstripTileBuffer.countLimit],
+                    cancelled: cancelled)
                 for item in checkpointRequests[indexed.identity] ?? [] {
                     if token.isCancelled { throw CancellationError() }
                     if let progress = try SceneAnalysis.saveCheckpoint(for: indexed, scope: item.scope, session: sceneCache) {

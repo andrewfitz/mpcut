@@ -455,11 +455,12 @@ extension SceneAnalysis {
 
     public static func lookup(_ media: MediaInfo, scope: SceneScanScope = .fullSource,
                               useSidecar: Bool = true, session: SceneScanSession = .shared,
-                              policy: SceneScanPolicy = .reuse) -> SceneScanOutcome? {
+                              policy: SceneScanPolicy = .reuse, includePartial: Bool = true) -> SceneScanOutcome? {
         guard let request = try? SceneRequest(media, scope: scope),
               (try? checkSnapshot(media)) != nil else { return nil }
         let cache = sidecar(for: media, enabled: useSidecar)
         if let report = cachedResult(request, cache: cache, session: session, policy: policy) { return report }
+        guard includePartial else { return nil }
         session.lock.lock()
         let local = session.partial[request.key]?.outcome
         session.lock.unlock()

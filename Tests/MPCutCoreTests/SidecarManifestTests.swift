@@ -121,6 +121,30 @@ final class SidecarManifestTests: XCTestCase {
         }
     }
 
+    func testInventoryReadsOnlyCommittedGenerationsAndSections() throws {
+        try withStore { store in
+            try store.save(["before": Data()])
+            let writer = try SidecarDatabase(store.url, writing: true)
+            try writer.execute("BEGIN IMMEDIATE")
+            try writer.execute("INSERT INTO source_generations(stamp, reason) SELECT stamp, 'content_changed' FROM source")
+            try writer.execute("DELETE FROM sections WHERE name = 'before'")
+
+            let before = AnalysisSidecar.inventorySnapshot(source: store.source)
+            XCTAssertEqual(before.status, "current")
+            XCTAssertEqual(before.generations.first?.id, 1)
+            XCTAssertEqual(before.sections, ["before"])
+            try writer.execute("COMMIT")
+            let after = AnalysisSidecar.inventorySnapshot(source: store.source)
+            XCTAssertEqual(after.generations.first?.id, 2)
+            XCTAssertTrue(after.sections.isEmpty)
+
+            try Data([1, 2, 3, 4, 5]).write(to: store.source)
+            let stale = AnalysisSidecar.inventorySnapshot(source: store.source)
+            XCTAssertEqual(stale.status, "stale")
+            XCTAssertFalse(stale.generations.contains(where: \.current))
+        }
+    }
+
     func testMarkerIntegrityAndOfflineInspection() throws {
         try withStore { store in
             let claim = try XCTUnwrap(store.claimSceneAttempt(scope: "full", operationID: nil, restart: false, owner: "owner"))

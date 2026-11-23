@@ -3,7 +3,8 @@ import Darwin
 import Foundation
 
 struct TranscriptRecognitionCache {
-    private static let prefix = "transcript_recognition.v1."
+    private static let legacyPrefix = "transcript_recognition.v1."
+    private static let prefix = "transcript_recognition.v2."
 
     struct Artifacts: Codable {
         let result: Data
@@ -148,7 +149,11 @@ struct TranscriptRecognitionCache {
         let digest: String
 
         static func digest(result: Data, activity: Data?) -> String {
-            TranscriptStore.digest(result + Data([0]) + (activity ?? Data()))
+            var hash = SHA256()
+            hash.update(data: result)
+            hash.update(data: Data([0]))
+            if let activity { hash.update(data: activity) }
+            return hash.finalize().map { String(format: "%02x", $0) }.joined()
         }
 
         init(_ artifacts: Artifacts) {
@@ -185,6 +190,7 @@ struct TranscriptRecognitionCache {
     let key: String
     let evidence: String
     let stream: Int
+    var channel: Int? = nil
 
     var section: String { "\(Self.prefix)\(stream).\(key)" }
     var claimID: String {
@@ -193,7 +199,7 @@ struct TranscriptRecognitionCache {
     }
 
     static func stream(forKey key: String) -> Int? {
-        guard key.hasPrefix(prefix) else { return nil }
+        guard let prefix = [prefix, legacyPrefix].first(where: { key.hasPrefix($0) }) else { return nil }
         let components = key.dropFirst(prefix.count).split(separator: ".", omittingEmptySubsequences: false)
         guard components.count == 2, let stream = Int(components[0]), stream >= 0,
               TranscriptStore.validDigest(String(components[1])) else { return nil }
@@ -202,18 +208,87 @@ struct TranscriptRecognitionCache {
 
     func read(cancelled: () -> Bool) -> Artifacts? {
         guard AnalysisSidecar.readsEnabled, !sidecar.isExcluded else { return nil }
-        if let data = sidecar.read(section, cancelled: cancelled),
-           let artifacts = try? JSONDecoder().decode(Artifacts.self, from: data),
-           artifacts.matches(key: key, evidence: evidence) { return artifacts }
+        if let hit = readSidecar(cancelled: cancelled) { return hit }
         return readExchange(cancelled: cancelled)
+    }
+
+    private var legacySection: String { "\(Self.legacyPrefix)\(stream).\(key)" }
+
+    // An empty first line means the result contains its levels. Otherwise the first
+    // line identifies an immutable activity section shared by recognition settings.
+    // The rest is the exact original result, including its provider-specific fields.
+    private func artifacts(from record: Data, read: (String) -> Data?) -> Artifacts? {
+        guard let split = record.prefix(65).firstIndex(of: 10) else { return nil }
+        let result = Data(record.suffix(from: split + 1))
+        if split == record.startIndex { return Artifacts(result: result, activity: nil) }
+        let digest = String(decoding: record[..<split], as: UTF8.self)
+        guard TranscriptStore.validDigest(digest) else { return nil }
+        if let levels = read(activitySection(digest)), TranscriptStore.digest(levels) == digest {
+            return Artifacts(result: result, activity: levels)
+        }
+        let key = TranscriptActivityKey(stream: stream, channel: channel)
+        guard let name = try? AnalysisSidecar.transcriptActivitySection(key),
+              let alternate = read(name), TranscriptStore.digest(alternate) == digest else { return nil }
+        return Artifacts(result: result, activity: alternate)
+    }
+
+    func readSidecar(cancelled: () -> Bool) -> Artifacts? {
+        enum Record {
+            case current(Artifacts)
+            case legacy(Data)
+        }
+        let record: Record? = try? sidecar.withReadSnapshot(cancelled: cancelled) { read in
+            if let data = read(section), let current = artifacts(from: data, read: read) { return .current(current) }
+            return read(legacySection).map(Record.legacy)
+        }
+        // Release the SQLite read transaction before parsing long provider documents.
+        let legacy: Data?
+        switch record {
+        case .current(let artifacts):
+            if artifacts.matches(key: key, evidence: evidence), !cancelled() { return artifacts }
+            legacy = sidecar.read(legacySection, cancelled: cancelled)
+        case .legacy(let data): legacy = data
+        case nil: return nil
+        }
+        guard !cancelled(), let legacy, let artifacts = try? JSONDecoder().decode(Artifacts.self, from: legacy),
+              artifacts.matches(key: key, evidence: evidence), !cancelled() else { return nil }
+        return artifacts
+    }
+
+    private func activitySection(_ digest: String) -> String {
+        "transcript_activity.v1.\(stream).\(digest)"
+    }
+
+    func saveSidecar(_ artifacts: Artifacts, media: MediaInfo, cancelled: () -> Bool) throws {
+        try checkSidecarCancellation(cancelled)
+        guard media.identity.matchesSnapshot(sidecar.identity), let evidence = media.refreshEvidence else {
+            throw transcriptError("Fully indexed stream evidence is required to cache transcript results.",
+                                  code: "missing_stream_evidence")
+        }
+        let digest = artifacts.activity.map(TranscriptStore.digest) ?? ""
+        var record = Data(digest.utf8)
+        record.append(10)
+        record.append(artifacts.result)
+        try sidecar.transact([AnalysisSidecar.evidenceKey: evidence.encoded()], cancelled: cancelled) { db, stamp in
+            if let prior = try sidecar.verifiedSection(section, in: db, stamp: stamp, maxBytes: nil, cancelled: cancelled) {
+                // Preserve the first published result. A retry can repair its missing levels.
+                guard prior == record else { return }
+            } else {
+                try sidecar.writeSection(section, value: record, db: db, stamp: stamp, cancelled: cancelled)
+            }
+            if let levels = artifacts.activity,
+               try sidecar.verifiedSection(activitySection(digest), in: db, stamp: stamp, maxBytes: nil, cancelled: cancelled) != levels {
+                try sidecar.writeSection(activitySection(digest), value: levels, db: db, stamp: stamp, cancelled: cancelled)
+            }
+        }
     }
 
     private func readExchange(cancelled: () -> Bool = { false }) -> Artifacts? {
         guard !cancelled(), let url = exchangeURL,
               let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-              let exchange = try? JSONDecoder().decode(Exchange.self, from: data),
-              let artifacts = exchange.artifacts,
-              artifacts.matches(key: key, evidence: evidence) else { return nil }
+              !cancelled(), let exchange = try? JSONDecoder().decode(Exchange.self, from: data),
+              !cancelled(), let artifacts = exchange.artifacts,
+              !cancelled(), artifacts.matches(key: key, evidence: evidence), !cancelled() else { return nil }
         return artifacts
     }
 
@@ -233,14 +308,14 @@ struct TranscriptRecognitionCache {
                   let local = Artifacts(result: result, activity: track.activity),
                   let key = local.recognitionKey, TranscriptStore.validDigest(key) else { continue }
             let sidecar = AnalysisSidecar(source: track.file, identity: stamp)
-            let cache = Self(sidecar: sidecar, key: key, evidence: track.evidence, stream: stream)
-            guard let shared = cache.readExchange(), shared.result == local.result,
-                  shared.activity == local.activity, sidecar.read(cache.section) == nil else { continue }
+            let cache = Self(sidecar: sidecar, key: key, evidence: track.evidence, stream: stream, channel: track.stagedChannel)
+            guard cache.readSidecar(cancelled: { false }) == nil,
+                  let shared = cache.readExchange(), shared.result == local.result,
+                  shared.activity == local.activity else { continue }
             do {
                 let media = try CutEngine().inspectMulticamSource(track.file)
                 guard track.sourceIsCurrent else { continue }
-                try sidecar.saveTranscript(JSONEncoder().encode(shared), name: cache.section,
-                                           media: media, cancelled: { false })
+                try cache.saveSidecar(shared, media: media, cancelled: { false })
             } catch {
                 // The independent result remains importable if its source folder is read-only.
             }
@@ -248,19 +323,21 @@ struct TranscriptRecognitionCache {
     }
 
     func save(_ artifacts: Artifacts, media: MediaInfo, cancelled: () -> Bool) throws {
+        try checkSidecarCancellation(cancelled)
         guard artifacts.matches(key: key, evidence: evidence) else {
             throw transcriptError("The recognition result does not match its stream evidence or settings.")
         }
-        guard media.identity == sidecar.identity, sidecar.identity.isCurrentSnapshot(at: sidecar.source),
+        guard media.identity.matchesSnapshot(sidecar.identity), sidecar.identity.isCurrentSnapshot(at: sidecar.source),
               media.refreshEvidence != nil else {
             throw transcriptError("Fully indexed stream evidence is required to cache transcript results.",
                                   code: "missing_stream_evidence")
         }
-        let encoded = try JSONEncoder().encode(artifacts)
+        try checkSidecarCancellation(cancelled)
         if !cancelled(), let url = exchangeURL, let exchange = try? JSONEncoder().encode(Exchange(artifacts)) {
+            try checkSidecarCancellation(cancelled)
             try? exchange.write(to: url, options: .atomic)
         }
-        try sidecar.saveTranscript(encoded, name: section, media: media, cancelled: cancelled)
+        try saveSidecar(artifacts, media: media, cancelled: cancelled)
     }
 }
 
