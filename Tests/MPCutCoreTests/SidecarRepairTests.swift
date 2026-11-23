@@ -47,7 +47,12 @@ final class SidecarRepairTests: XCTestCase {
         let device = try XCTUnwrap(Int32(fields[0])) &+ 7
         stamp = (["\(device)"] + fields.dropFirst().map(String.init)).joined(separator: ":")
         var sections: [(String, Data)] = []
-        rows("SELECT name, value FROM sections") { sections.append((String(cString: sqlite3_column_text($0, 0)), data($0, 1))) }
+        rows("SELECT name, value, logical_size FROM sections") { query in
+            let stored = SidecarPayload(bytes: data(query, 1), logicalSize: Int(sqlite3_column_int64(query, 2)))
+            if let value = try? stored.decode(cancelled: { false }) {
+                sections.append((String(cString: sqlite3_column_text(query, 0)), value))
+            } else { XCTFail("Unreadable fixture section") }
+        }
         for (name, saved) in sections {
             var value = saved
             if name == "media_index.v1" {
@@ -60,7 +65,7 @@ final class SidecarRepairTests: XCTestCase {
                 value = try PropertyListSerialization.data(fromPropertyList: header, format: .binary, options: 0)
             }
             let digest = Data(SHA256.hash(data: Data((stamp + "\0" + name + "\0").utf8) + value))
-            rows("UPDATE sections SET digest = ?, value = ? WHERE name = CAST(? AS TEXT)", [digest, value, Data(name.utf8)])
+            rows("UPDATE sections SET logical_size = 0, digest = ?, value = ? WHERE name = CAST(? AS TEXT)", [digest, value, Data(name.utf8)])
         }
         rows("UPDATE source SET stamp = CAST(? AS TEXT)", [Data(stamp.utf8)])
     }

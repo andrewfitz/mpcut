@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Smaller analysis sidecars.** MPCut packs regular audio packet timing and transcription levels, and compresses individual analysis sections losslessly. Format 3 sidecars upgrade on the next analysis write. [Desktop guide](docs/USAGE.md)
+
 - **Multicam Mix.** Select which tracks play together on the timeline. Export copies each selected track in its original format by default. Choose mono or stereo to deliver the combined sound as one track. [Desktop guide](docs/USAGE.md#edit-a-multicam-project)
 - **Synced track replacement.** Replace a camera recording’s microphone track with an external stream using timecode, waveform matching, or manually paired points. Projects open from v3 and save as v4. [Project format](docs/CUT-FORMAT.md)
 

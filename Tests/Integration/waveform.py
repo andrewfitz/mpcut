@@ -12,6 +12,8 @@ import struct
 import subprocess
 import tempfile
 import unittest
+
+from sidecar_payload import section_bytes
 import wave
 
 
@@ -147,12 +149,12 @@ class Waveform(unittest.TestCase):
                 with sqlite3.connect(path.with_suffix(".mka.cutdb")) as cache:
                     key = "media_index.v1"
                     stamp = cache.execute("SELECT stamp FROM source WHERE id = 1").fetchone()[0]
-                    saved = cache.execute("SELECT value FROM sections WHERE name = ?", (key,)).fetchone()[0]
+                    saved = section_bytes(cache, key)
                     header = plistlib.loads(saved)
                     header.update(probe_revision=2, duration={"numerator": 1, "denominator": 1})
                     saved = plistlib.dumps(header, fmt=plistlib.FMT_BINARY)
                     digest = hashlib.sha256(stamp.encode() + b"\0" + key.encode() + b"\0" + saved).digest()
-                    cache.execute("UPDATE sections SET value = ?, digest = ? WHERE name = ?", (saved, digest, key))
+                    cache.execute("UPDATE sections SET logical_size=0, value = ?, digest = ? WHERE name = ?", (saved, digest, key))
                 self.assertEqual(json.loads(check_output(inspect))["media"]["duration"], duration)
                 envelope = json.loads(check_output(
                     [CLI, "waveform", "envelope", "read", "--json", "--from", f"{samples - 10}/{rate}", "--to", f"{samples}/{rate}",
@@ -208,14 +210,14 @@ class Waveform(unittest.TestCase):
         key = "waveform_envelope.v1.0"
         with sqlite3.connect(sidecar) as db:
             stamp = db.execute("SELECT stamp FROM source WHERE id=1").fetchone()[0]
-            payload = bytearray(db.execute("SELECT value FROM sections WHERE name=?", (key,)).fetchone()[0])
+            payload = bytearray(section_bytes(db, key))
             header = bytes.fromhex("4f1200040000")  # property-list data of 65,536 float32 columns
             self.assertEqual(payload.count(header), 2)
             first = payload.index(header) + len(header)
             payload[first:first + 4 * 4096] = struct.pack("<f", -1.0) * 4096
             encoded = bytes(payload)
             digest = hashlib.sha256(stamp.encode() + b"\0" + key.encode() + b"\0" + encoded).digest()
-            db.execute("UPDATE sections SET value=?, digest=? WHERE name=?", (encoded, digest, key))
+            db.execute("UPDATE sections SET logical_size=0, value=?, digest=? WHERE name=?", (encoded, digest, key))
         self.assertEqual(status()["status"], "current")
         cached = window()["envelope"]
         self.assertEqual(cached["low"][:8], [-1] * 8)

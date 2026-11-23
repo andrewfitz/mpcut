@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 import unittest
 
+from sidecar_payload import section_bytes
+
 from audio_tracks import ffmpeg, hashes, pcm, probe, time
 
 
@@ -135,7 +137,7 @@ class CopyEdges(unittest.TestCase):
                 with self.subTest(name=name, mode=mode):
                     if mode != "indexed":
                         with sqlite3.connect(str(source) + ".cutdb") as db:
-                            value, = db.execute("SELECT value FROM sections WHERE name='media_index.v1'").fetchone()
+                            value = section_bytes(db, "media_index.v1")
                             stamp, = db.execute("SELECT stamp FROM source").fetchone()
                             header = plistlib.loads(value)
                             anchors = header["audio"][0]["mp3_anchors"]
@@ -147,7 +149,7 @@ class CopyEdges(unittest.TestCase):
                                 del header["audio"][0]["mp3_anchors"]
                             value = plistlib.dumps(header, fmt=plistlib.FMT_BINARY)
                             digest = hashlib.sha256(stamp.encode() + b"\0media_index.v1\0" + value).digest()
-                            db.execute("UPDATE sections SET value=?, digest=? WHERE name='media_index.v1'", (value, digest))
+                            db.execute("UPDATE sections SET logical_size=0, value=?, digest=? WHERE name='media_index.v1'", (value, digest))
                     output = self.root / f"{name}-{mode}.mp3"
                     self.run_cli("export", "clips", "join", "--clip", source, "--from", f"{start}/44100",
                                  "--to", f"{end}/44100", "--output", output)

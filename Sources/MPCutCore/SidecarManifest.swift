@@ -23,20 +23,20 @@ extension AnalysisSidecar {
             INSERT INTO source_generations(id, stamp, reason) SELECT 1, stamp, 'initial' FROM source;
             CREATE TABLE archived_sections(
                 generation INTEGER NOT NULL, name TEXT NOT NULL, digest BLOB NOT NULL, value BLOB NOT NULL,
-                PRIMARY KEY(generation, name)
+                logical_size INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(generation, name)
             );
             CREATE TABLE scene_attempts(
                 ordinal INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, generation INTEGER NOT NULL,
                 scope TEXT NOT NULL, operation TEXT, owner TEXT, fence INTEGER NOT NULL,
                 expires REAL NOT NULL, state INTEGER NOT NULL DEFAULT 0,
                 covered REAL NOT NULL DEFAULT 0, marker_count INTEGER NOT NULL DEFAULT 0,
-                checkpoint BLOB, checkpoint_digest BLOB,
+                checkpoint BLOB, checkpoint_digest BLOB, logical_size INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(generation, scope, operation)
             );
             CREATE INDEX scene_attempt_scope ON scene_attempts(generation, scope, ordinal);
             CREATE TABLE scene_markers(
                 attempt TEXT NOT NULL, ordinal INTEGER NOT NULL, value BLOB NOT NULL, digest BLOB NOT NULL,
-                PRIMARY KEY(attempt, ordinal)
+                logical_size INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(attempt, ordinal)
             );
             CREATE TABLE scene_reports(
                 generation INTEGER NOT NULL, scope TEXT NOT NULL, attempt TEXT NOT NULL,
@@ -130,8 +130,8 @@ extension AnalysisSidecar {
         // Archive inspectable reports at their original stamp. Preview and index
         // payloads can be rebuilt and are only kept when certified for reuse.
         try db.update("""
-            INSERT INTO archived_sections(generation, name, digest, value)
-            SELECT ?, name, digest, value FROM sections
+            INSERT INTO archived_sections(generation, name, digest, value, logical_size)
+            SELECT ?, name, digest, value, logical_size FROM sections
             WHERE name NOT IN (SELECT name FROM retained_sections)
               AND (name IN (?, ?, ?, ?) OR name GLOB 'silence_pauses.*' OR name GLOB 'silence_automatic_threshold_db.*')
             """, [String(previous), Self.evidenceKey, Self.sceneSectionKey, Self.viewNameSectionKey,

@@ -18,6 +18,8 @@ import tempfile
 import time
 import unittest
 
+from sidecar_payload import section_bytes
+
 from media_regression import audio, ffmpeg, probe, run
 
 CLI = None
@@ -771,7 +773,7 @@ class AudioConversionTests(unittest.TestCase):
         """The saved index header of a source. `change` edits it in place, as an earlier build's index."""
         key = "media_index.v1"
         with sqlite3.connect(str(source) + ".cutdb") as db:
-            value, = db.execute("SELECT value FROM sections WHERE name=?", (key,)).fetchone()
+            value = section_bytes(db, key)
             header = plistlib.loads(value)
             if change is not None:
                 change(header)
@@ -779,7 +781,7 @@ class AudioConversionTests(unittest.TestCase):
                 value = plistlib.dumps(header, fmt=plistlib.FMT_BINARY)
                 # A section's digest covers the source stamp, its own name and its bytes.
                 digest = hashlib.sha256(stamp.encode() + b"\0" + key.encode() + b"\0" + value).digest()
-                db.execute("UPDATE sections SET value=?, digest=? WHERE name=?", (value, digest, key))
+                db.execute("UPDATE sections SET logical_size=0, value=?, digest=? WHERE name=?", (value, digest, key))
         return header
 
     def test_saved_index_gives_the_same_layout_and_rate_as_a_fresh_one(self):

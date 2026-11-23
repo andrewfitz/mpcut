@@ -569,3 +569,109 @@ private extension IndexReader {
                           pcmGaps: track.pcmGaps ?? [], codedBytes: track.codedBytes)
     }
 }
+
+/// Regular audio packets differ only in their timestamp. Store a seed packet and
+/// a run length. Literal spans cover discontinuities, edits, trim data and any
+/// unfamiliar bytes. Match the predicted serialization before eliding any row.
+enum SidecarPacketPacking {
+    private struct Sequence {
+        let flag: UInt8
+        var time: RationalTime
+        let duration: RationalTime
+        let fields: Range<Int>
+
+        init(_ reader: inout IndexReader) throws {
+            flag = try reader.byte()
+            guard flag <= 1 else { throw IndexCodingError.invalid }
+            time = try reader.time()
+            let start = reader.position
+            duration = try reader.time()
+            guard duration > .zero else { throw IndexCodingError.invalid }
+            for _ in 0..<3 { _ = try reader.signed() }
+            fields = start..<reader.position
+        }
+
+        mutating func next(_ writer: inout IndexWriter, bytes: UnsafeRawBufferPointer) throws {
+            time = try time.adding(duration)
+            writer.bytes.removeAll(keepingCapacity: true)
+            writer.bytes.append(flag)
+            writer.time(time)
+            writer.bytes.append(contentsOf: bytes[fields])
+        }
+    }
+
+    // An even token carries literal bytes. An odd token carries a packet count
+    // followed by its self-delimiting seed in the existing index representation.
+    static func pack(_ data: Data, cancelled: () -> Bool) throws -> Data? {
+        try data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            var input = IndexReader(bytes: bytes)
+            var output = IndexWriter()
+            var prediction = IndexWriter()
+            var literalStart = 0
+            func literal(to end: Int) {
+                if end > literalStart {
+                    output.unsigned(UInt64(end - literalStart) << 1)
+                    output.bytes.append(contentsOf: bytes[literalStart..<end])
+                }
+            }
+            var rows = 0
+            while input.remaining > 0 {
+                if rows.isMultiple(of: 1024) { try checkSidecarCancellation(cancelled) }
+                let seed = input.position
+                guard var sequence = try? Sequence(&input) else { break }
+                let seedEnd = input.position
+                var count = 1
+                while input.remaining > 0 {
+                    if count.isMultiple(of: 1024) { try checkSidecarCancellation(cancelled) }
+                    guard (try? sequence.next(&prediction, bytes: bytes)) != nil,
+                          input.remaining >= prediction.bytes.count else { break }
+                    let end = input.position + prediction.bytes.count
+                    guard bytes[input.position..<end].elementsEqual(prediction.bytes) else { break }
+                    input.position = end
+                    count += 1
+                }
+                if count >= 4 {
+                    literal(to: seed)
+                    output.unsigned(UInt64(count) << 1 | 1)
+                    output.bytes.append(contentsOf: bytes[seed..<seedEnd])
+                    literalStart = input.position
+                }
+                rows += 1
+            }
+            guard literalStart > 0 else { return nil }
+            literal(to: bytes.count)
+            return output.bytes.count < bytes.count ? Data(output.bytes) : nil
+        }
+    }
+
+    static func unpack(_ data: Data, logicalSize: Int, cancelled: () -> Bool) throws -> Data? {
+        try data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            var input = IndexReader(bytes: bytes)
+            var output = [UInt8]()
+            var prediction = IndexWriter()
+            while input.remaining > 0 {
+                try checkSidecarCancellation(cancelled)
+                let token = try input.unsigned()
+                let count = Int(token >> 1)
+                guard count > 0, count <= logicalSize - output.count else { return nil }
+                let seed = input.position
+                if token & 1 == 0 {
+                    guard count <= input.remaining else { return nil }
+                    input.position += count
+                    output.append(contentsOf: bytes[seed..<input.position])
+                } else {
+                    guard count >= 4, count <= (logicalSize - output.count) / 8 else { return nil }
+                    var sequence = try Sequence(&input)
+                    output.append(contentsOf: bytes[seed..<input.position])
+                    for i in 1..<count {
+                        if i.isMultiple(of: 1024) { try checkSidecarCancellation(cancelled) }
+                        try sequence.next(&prediction, bytes: bytes)
+                        guard prediction.bytes.count <= logicalSize - output.count else { return nil }
+                        output.append(contentsOf: prediction.bytes)
+                    }
+                }
+            }
+            return output.count == logicalSize ? Data(output) : nil
+        }
+    }
+}

@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import SQLite3
@@ -40,6 +41,97 @@ final class SidecarStorageTests: XCTestCase {
         try sidecar.save(["a": Data([3, 4])])
         XCTAssertEqual(sidecar.read("a"), Data([3, 4]))
         XCTAssertEqual(sidecar.keys(), ["a", "b"])
+    }
+
+    func testPackedActivityPreservesExactProviderBytesAndReadLimit() throws {
+        let store = try makeSidecar()
+        let key = "transcript_activity.v1.0.track"
+        let levels = ["0", "-0", "1.0000000000000001", "4.513611e-05", "3E+00"]
+        let rows = (0..<1200).map { index in
+            let end = (index + 1) * 320 - (index == 1199 ? 63 : 0)
+            return #"{"end_sample":\#(end),"level":\#(levels[index % levels.count]),"start_sample":\#(index * 320)}"#
+        }
+        let value = Data((#"{"activity":["# + rows.joined(separator: ",") + #"],"extra":"☀"}"#).utf8)
+        try store.save([key: value])
+        let db = try SidecarDatabase(store.url, writing: false)
+        XCTAssertLessThan(try db.integer("SELECT length(value) FROM sections"), Int32(value.count / 10))
+        XCTAssertEqual(try db.integer("SELECT hex(substr(value, 1, 1)) = '03' FROM sections"), 1)
+        XCTAssertNil(store.read(key, maxBytes: value.count - 1))
+        XCTAssertEqual(store.read(key, maxBytes: value.count), value)
+        let irregular = Data(String(decoding: value, as: UTF8.self)
+            .replacingOccurrences(of: "end_sample\":320,", with: "end_sample\":300,").utf8)
+        try store.save([key: irregular])
+        XCTAssertEqual(try db.integer("SELECT hex(substr(value, 1, 1)) = '01' FROM sections"), 1)
+        XCTAssertEqual(store.read(key), irregular)
+        try db.execute("UPDATE sections SET value = X'017F'")
+        XCTAssertNil(store.read(key))
+        try store.save([:], updating: [key: { previous in
+            XCTAssertNil(previous)
+            return value
+        }])
+        XCTAssertEqual(store.read(key), value)
+    }
+
+    func testPacketRunsPreserveClockChangesFlagsAndOpaqueTail() throws {
+        var value = Data()
+        for i in 0..<1700 {
+            let timestamp = UInt16(i * 2)  // Zigzag, then unsigned LEB128.
+            var row: [UInt8] = [i < 500 ? 1 : 0]
+            if timestamp < 128 { row.append(UInt8(timestamp)) }
+            else { row += [UInt8(timestamp & 127) | 128, UInt8(timestamp >> 7)] }
+            row += [1, 2, 1, 0, 0, i == 800 ? 6 : 8]
+            value.append(contentsOf: row)
+        }
+        value.append(contentsOf: [255, 255, 0, 2])
+        let payload = try SidecarPayload.encode(value, key: "media_index_audio.v1", cancelled: { false })
+        XCTAssertTrue([4, 5].contains(try XCTUnwrap(payload.bytes.first)))
+        XCTAssertLessThan(payload.bytes.count, 256)
+        XCTAssertEqual(try payload.decode(cancelled: { false }), value)
+    }
+
+    func testCheckpointAndMarkerCompressionPreserveResumption() throws {
+        let store = try makeSidecar()
+        let claim = try XCTUnwrap(store.claimSceneAttempt(scope: "full", operationID: nil, restart: false, owner: "a"))
+        let checkpoint = Data(repeating: 7, count: 8000)
+        let markers = Data(repeating: 4, count: 9000)
+        try store.commitSceneAttempt(claim, checkpoint: checkpoint, markerBatch: markers, coveredThrough: 1, complete: false)
+        XCTAssertEqual(store.sceneAttempt(claim)?.checkpoint, checkpoint)
+        XCTAssertEqual(store.sceneAttempt(claim)?.markerBatches, [markers])
+        let db = try SidecarDatabase(store.url, writing: false)
+        XCTAssertLessThan(try db.integer("SELECT length(checkpoint) FROM scene_attempts"), 500)
+        XCTAssertLessThan(try db.integer("SELECT length(value) FROM scene_markers"), 500)
+    }
+
+    func testFormatThreeIsReadOnlyUntilAnAtomicWriteCompactsIt() throws {
+        let store = try makeSidecar()
+        let key = AnalysisSidecar.viewNameSectionKey
+        let value = Data(repeating: 65, count: 300_000)
+        try store.save(["small": Data([7])])
+        let db = try SidecarDatabase(store.url, writing: true)
+        for table in ["sections", "archived_sections", "scene_markers", "scene_attempts"] {
+            try db.execute("ALTER TABLE \(table) DROP COLUMN logical_size")
+        }
+        try db.execute("PRAGMA user_version = 3")
+        let stamp = try store.storedStamp(db)
+        let digest = Data(SHA256.hash(data: Data((stamp + "\0" + key + "\0").utf8) + value))
+        try db.updateBlobs("INSERT INTO sections(name, value, digest) VALUES (?, ?, ?)", [key], blobs: [value, digest])
+        try db.update("INSERT INTO archived_sections SELECT 1, name, digest, value FROM sections WHERE name = ?", [key])
+        let before = try Data(contentsOf: store.url)
+        XCTAssertEqual(store.read(key), value)
+        XCTAssertEqual(try Data(contentsOf: store.url), before)
+        // Fail after the migration, before committing the caller's update.
+        XCTAssertThrowsError(try store.save([:], updating: ["small": { _ in throw CancellationError() }]))
+        XCTAssertEqual(try db.integer("PRAGMA user_version"), 3)
+        XCTAssertEqual(store.read(key), value)
+
+        try store.save(["another": Data([8])])
+        XCTAssertEqual(try db.integer("PRAGMA user_version"), 4)
+        XCTAssertEqual(store.read(key), value)
+        XCTAssertEqual(store.read("small"), Data([7]))
+        let reader = try XCTUnwrap(store.openReadSnapshot())
+        XCTAssertEqual(try store.verifiedSection(key, in: reader, stamp: stamp, maxBytes: nil,
+                                                cancelled: { false }, generation: "1"), value)
+        XCTAssertLessThan(try Data(contentsOf: store.url).count, before.count / 2)
     }
 
     func testProjectHistoryExcludesOnlyCollidingCachesEvenWhenNoStepsAreRestored() throws {

@@ -61,7 +61,7 @@ public struct AnalysisSidecar: Sendable {
     }
 
     private static let applicationID: Int32 = 0x4d504354 // MPCT
-    static let schemaVersion: Int32 = 3
+    static let schemaVersion: Int32 = 4
 
     package func checkSource() throws {
         guard identity.isCurrentSnapshot(at: source) else {
@@ -100,11 +100,13 @@ public struct AnalysisSidecar: Sendable {
             throw sidecarError("The sidecar has no readable SQLite header.")
         }
         guard !header.usesWriteAheadLog, header.applicationID == Self.applicationID,
-              header.userVersion == Self.schemaVersion else { throw unsupported }
+              (3...Self.schemaVersion).contains(header.userVersion) else { throw unsupported }
         let kind = try db.integer("PRAGMA application_id")
-        guard kind == Self.applicationID, try db.integer("PRAGMA user_version") == Self.schemaVersion else {
+        let version = try db.integer("PRAGMA user_version")
+        guard kind == Self.applicationID, (3...Self.schemaVersion).contains(version) else {
             throw CutError(code: "unsupported_sidecar", message: "This file is not a supported MPCut analysis sidecar.")
         }
+        db.hasCompactStorage = version >= 4
     }
 
     func storedStamp(_ db: SidecarDatabase) throws -> String {
@@ -221,7 +223,7 @@ public struct AnalysisSidecar: Sendable {
         let table = generation == nil ? "sections" : "archived_sections"
         let predicate = generation == nil ? "name = ?" : "name = ? AND generation = ?"
         let bindings = [key] + (generation.map { [$0] } ?? [])
-        return try db.statement("SELECT digest, rowid FROM \(table) WHERE \(predicate)", bindings) { query in
+        return try db.statement("SELECT digest, rowid, \(db.logicalSizeColumn) FROM \(table) WHERE \(predicate)", bindings) { query in
             let step = sqlite3_step(query)
             if step == SQLITE_DONE { return nil }
             guard step == SQLITE_ROW else { throw db.error() }
@@ -229,12 +231,19 @@ public struct AnalysisSidecar: Sendable {
                   let expected = sqlite3_column_blob(query, 0) else { return nil }
             // Read into the destination allocation directly. Materializing
             // sqlite3_column_blob would also keep a full SQLite-owned copy.
+            let size = Int(sqlite3_column_int64(query, 2))
+            guard size >= 0, maxBytes.map({ size <= $0 }) ?? true else { return nil }
+            let storedLimit = size == 0 ? maxBytes : size - 1
             var hash = checksumSeed(key, stamp: saved)
-            let data = try db.readBlob(table: table, row: sqlite3_column_int64(query, 1), maxBytes: maxBytes, cancelled: cancelled) { chunk in
-                hash.update(bufferPointer: chunk)
+            let data = try db.readBlob(table: table, row: sqlite3_column_int64(query, 1), maxBytes: storedLimit, cancelled: cancelled) { chunk in
+                if size == 0 { hash.update(bufferPointer: chunk) }
             }
             guard let data else { return nil }
-            return hash.finalize().elementsEqual(UnsafeRawBufferPointer(start: expected, count: 32)) ? data : nil
+            let expectedBytes = UnsafeRawBufferPointer(start: expected, count: 32)
+            if size == 0 { return hash.finalize().elementsEqual(expectedBytes) ? data : nil }
+            guard let decoded = try SidecarPayload(bytes: data, logicalSize: size).decode(cancelled: cancelled) else { return nil }
+            let digest = try decoded.withUnsafeBytes { try checksum(key, stamp: saved, $0, cancelled: cancelled) }
+            return digest.elementsEqual(expectedBytes) ? decoded : nil
         }
     }
 
@@ -386,11 +395,20 @@ public struct AnalysisSidecar: Sendable {
                 try db.execute("""
                     PRAGMA application_id = \(Self.applicationID);
                     CREATE TABLE source(id INTEGER PRIMARY KEY CHECK(id = 1), stamp TEXT NOT NULL);
-                    CREATE TABLE sections(name TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL, value BLOB NOT NULL);
+                    CREATE TABLE sections(name TEXT PRIMARY KEY NOT NULL, digest BLOB NOT NULL, value BLOB NOT NULL, logical_size INTEGER NOT NULL DEFAULT 0);
                     """)
                 try db.update("INSERT INTO source(id, stamp) VALUES(1, ?)", [stamp])
                 try createManifest(db)
+            } else {
+                // Re-read under the writer lock in case another process upgraded first.
+                let version = try db.integer("PRAGMA user_version")
+                if version == 3 {
+                    try db.upgradePayloadStorage(cancelled: cancelled)
+                } else if version != Self.schemaVersion {
+                    throw CutError(code: "unsupported_sidecar", message: "The sidecar format changed while saving.")
+                }
             }
+            db.hasCompactStorage = true
             let indexUpdate = try refresh == nil
                 ? prepareIndexEvidence(sections[Self.evidenceKey], in: db, cancelled: cancelled)
                 : (refresh: nil, evidence: sections[Self.evidenceKey])
@@ -431,17 +449,19 @@ public struct AnalysisSidecar: Sendable {
                       cancelled: () -> Bool) throws {
         guard Self.validKey(key) else { throw sidecarError("Invalid section name.") }
         try checkSidecarCancellation(cancelled)
-        try value.withUnsafeBytes { bytes in
-            let digest = try checksum(key, stamp: saved, bytes, cancelled: cancelled)
+        let payload = try SidecarPayload.encode(value, key: key, cancelled: cancelled)
+        let digest = try value.withUnsafeBytes { try checksum(key, stamp: saved, $0, cancelled: cancelled) }
+        try payload.bytes.withUnsafeBytes { bytes in
             try digest.withUnsafeBytes { digestBytes in
-                try db.statement("INSERT OR REPLACE INTO sections(name, digest, value) VALUES(?, ?, ?)", [key]) { query in
+                try db.statement("INSERT OR REPLACE INTO sections(name, digest, value, logical_size) VALUES(?, ?, ?, ?)", [key]) { query in
                     guard sqlite3_bind_blob(query, 2, digestBytes.baseAddress, Int32(digestBytes.count), nil) == SQLITE_OK
                     else { throw db.error() }
                     // SQLITE_STATIC is safe until this statement is finalized,
                     // inside both withUnsafeBytes scopes. Avoid another payload copy.
                     let bound = bytes.isEmpty ? sqlite3_bind_zeroblob(query, 3, 0)
                         : sqlite3_bind_blob64(query, 3, bytes.baseAddress, UInt64(bytes.count), nil)
-                    guard bound == SQLITE_OK, sqlite3_step(query) == SQLITE_DONE else { throw db.error() }
+                    guard bound == SQLITE_OK, sqlite3_bind_int64(query, 4, Int64(payload.logicalSize)) == SQLITE_OK,
+                          sqlite3_step(query) == SQLITE_DONE else { throw db.error() }
                 }
             }
         }
@@ -458,6 +478,8 @@ func sidecarError(_ message: String) -> CutError {
 
 final class SidecarDatabase {
     private let handle: OpaquePointer
+    var hasCompactStorage = false
+    var logicalSizeColumn: String { hasCompactStorage ? "logical_size" : "0" }
 
     init(_ url: URL, writing: Bool) throws {
         var connection: OpaquePointer?
@@ -572,11 +594,11 @@ final class SidecarDatabase {
         }
     }
 
-    func readBlob(table: String = "sections", row: Int64, maxBytes: Int?, cancelled: () -> Bool,
+    func readBlob(table: String = "sections", column: String = "value", row: Int64, maxBytes: Int?, cancelled: () -> Bool,
                   visit: (UnsafeRawBufferPointer) -> Void) throws -> Data? {
         try checkSidecarCancellation(cancelled)
         var blob: OpaquePointer?
-        guard sqlite3_blob_open(handle, "main", table, "value", row, 0, &blob) == SQLITE_OK,
+        guard sqlite3_blob_open(handle, "main", table, column, row, 0, &blob) == SQLITE_OK,
               let blob else { throw error() }
         defer { sqlite3_blob_close(blob) }
         let size = Int(sqlite3_blob_bytes(blob))

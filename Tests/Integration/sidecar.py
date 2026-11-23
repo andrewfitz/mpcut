@@ -15,6 +15,8 @@ import tempfile
 import time
 import unittest
 
+from sidecar_payload import section_bytes
+
 
 FIXTURES = Path(__file__).resolve().parents[1] / "MPCutAppTests" / "Fixtures"
 
@@ -159,7 +161,7 @@ class Sidecar(unittest.TestCase):
             for job in jobs:
                 _, err = job.communicate(timeout=30)
                 self.assertEqual(job.returncode, 0, err)
-            overview, = db.execute("SELECT value FROM sections WHERE name='waveform_envelope.v1.1'").fetchone()
+            overview = section_bytes(db, "waveform_envelope.v1.1")
             self.assertEqual(len(plistlib.loads(overview)["value"]["low"]), 65536 * 4)
 
     def test_damaged_section_is_recomputed_and_can_be_repaired(self):
@@ -189,7 +191,7 @@ class Sidecar(unittest.TestCase):
         with sqlite3.connect(self.sidecar) as db:
             stamp = db.execute("SELECT stamp FROM source WHERE id=1").fetchone()[0]
             key = "scenes_boundaries.v1"
-            payload = json.loads(db.execute("SELECT value FROM sections WHERE name=?", (key,)).fetchone()[0])
+            payload = json.loads(section_bytes(db, key))
             # Write a valid, distinguishable marker set so comparing two equal
             # fresh scans cannot accidentally pass this read-through test.
             if len(payload["markers"]) > 1:
@@ -201,7 +203,7 @@ class Sidecar(unittest.TestCase):
                 payload["markers"].append({"pts": pts.numerator, "view": 2})
             encoded = json.dumps(payload).encode()
             digest = hashlib.sha256(stamp.encode() + b"\0" + key.encode() + b"\0" + encoded).digest()
-            db.execute("UPDATE sections SET value=?, digest=? WHERE name=?", (encoded, digest, key))
+            db.execute("UPDATE sections SET logical_size=0, value=?, digest=? WHERE name=?", (encoded, digest, key))
         self.assertNotEqual(self.cli("scenes", "scan", "--json", self.source)["scenes"], original["scenes"])
         self.assertEqual(self.cli("scenes", "scan", "--no-sidecar", "--json", self.source), original)
         with sqlite3.connect(self.sidecar) as db:
@@ -223,7 +225,7 @@ class Sidecar(unittest.TestCase):
         self.save("--only", "scenes")
         with sqlite3.connect(self.sidecar) as db:
             stamp = db.execute("SELECT stamp FROM source WHERE id=1").fetchone()[0]
-            payload = db.execute("SELECT value FROM sections WHERE name='scenes_boundaries.v1'").fetchone()[0]
+            payload = section_bytes(db, "scenes_boundaries.v1")
             db.execute("DELETE FROM sections WHERE name='scenes_boundaries.v1'")
             for key, value in [("scenes.v1", payload), ("viewNames.v1", b'{"1":"Wide shot"}')]:
                 digest = hashlib.sha256(stamp.encode() + b"\0" + key.encode() + b"\0" + value).digest()

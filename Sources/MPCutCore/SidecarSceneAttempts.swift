@@ -186,18 +186,21 @@ extension AnalysisSidecar {
             var count = attempt.markerCount
             if let markerBatch {
                 count += 1
-                try db.updateBlobs("INSERT INTO scene_markers(attempt, ordinal, value, digest) VALUES(?, ?, ?, ?)",
+                let payload = try SidecarPayload.encode(markerBatch, cancelled: cancelled)
+                try db.updateBlobs("INSERT INTO scene_markers(attempt, ordinal, value, digest, logical_size) VALUES(?, ?, ?, ?, ?)",
                                    [claim.attemptID, String(count)],
-                                   blobs: [markerBatch, Self.sceneDigest(markerBatch, context: attempt.markerContext(count))])
+                                   blobs: [payload.bytes, Self.sceneDigest(markerBatch, context: attempt.markerContext(count))],
+                                   trailing: [String(payload.logicalSize)])
             }
             let expires = Date().timeIntervalSince1970 + Self.sceneLeaseDuration
+            let payload = try SidecarPayload.encode(checkpoint, cancelled: cancelled)
             try db.updateBlobs("""
                 UPDATE scene_attempts SET state = ?, covered = ?, owner = NULLIF(?, ''), expires = ?,
-                    marker_count = ?, checkpoint = ?, checkpoint_digest = ? WHERE id = ?
+                    marker_count = ?, checkpoint = ?, checkpoint_digest = ?, logical_size = ? WHERE id = ?
                 """, [complete ? "1" : "0", String(coveredThrough), release || complete ? "" : claim.owner,
                       String(expires), String(count)],
-                blobs: [checkpoint, Self.sceneDigest(checkpoint, context: attempt.checkpointContext(count))],
-                trailing: [claim.attemptID])
+                blobs: [payload.bytes, Self.sceneDigest(checkpoint, context: attempt.checkpointContext(count))],
+                trailing: [String(payload.logicalSize), claim.attemptID])
             if complete {
                 try db.update("INSERT OR REPLACE INTO scene_reports(generation, scope, attempt) VALUES(?, ?, ?)",
                               [String(claim.generation), claim.scope, claim.attemptID])
@@ -226,7 +229,7 @@ extension AnalysisSidecar {
             DELETE FROM scene_markers WHERE attempt IN (
                 SELECT id FROM scene_attempts WHERE state = 2 AND checkpoint IS NOT NULL
             );
-            UPDATE scene_attempts SET checkpoint = NULL, checkpoint_digest = NULL, marker_count = 0
+            UPDATE scene_attempts SET checkpoint = NULL, checkpoint_digest = NULL, logical_size = 0, marker_count = 0
             WHERE state = 2 AND checkpoint IS NOT NULL;
             """)
     }
@@ -243,7 +246,7 @@ extension AnalysisSidecar {
         try transact(cancelled: { false }) { db, _ in
             _ = try requireClaim(claim, db: db)
             try db.update("DELETE FROM scene_markers WHERE attempt = ?", [claim.attemptID])
-            try db.update("UPDATE scene_attempts SET covered = 0, marker_count = 0, checkpoint = NULL, checkpoint_digest = NULL WHERE id = ?",
+            try db.update("UPDATE scene_attempts SET covered = 0, marker_count = 0, checkpoint = NULL, checkpoint_digest = NULL, logical_size = 0 WHERE id = ?",
                           [claim.attemptID])
         }
     }
@@ -330,7 +333,7 @@ extension AnalysisSidecar {
     }
 
     private func checkpoint(_ attempt: AttemptRow, db: SidecarDatabase) throws -> Data? {
-        try db.statement("SELECT checkpoint, checkpoint_digest FROM scene_attempts WHERE id = ?",
+        try db.statement("SELECT checkpoint, checkpoint_digest, \(db.logicalSizeColumn) FROM scene_attempts WHERE id = ?",
                          [attempt.id]) { query in
             guard sqlite3_step(query) == SQLITE_ROW else { throw db.error() }
             return Self.readVerifiedSceneBlob(query, context: attempt.checkpointContext(attempt.markerCount))
@@ -339,7 +342,7 @@ extension AnalysisSidecar {
 
     private func snapshot(_ attempt: AttemptRow, db: SidecarDatabase) throws -> SceneAttemptSnapshot? {
         guard let checkpoint = try checkpoint(attempt, db: db) else { return nil }
-        return try db.statement("SELECT value, digest FROM scene_markers WHERE attempt = ? ORDER BY ordinal", [attempt.id]) { query in
+        return try db.statement("SELECT value, digest, \(db.logicalSizeColumn) FROM scene_markers WHERE attempt = ? ORDER BY ordinal", [attempt.id]) { query in
             var markers: [Data] = []
             var step = sqlite3_step(query)
             while step == SQLITE_ROW {
@@ -366,8 +369,10 @@ extension AnalysisSidecar {
         if size == 0 { bytes = Data() }
         else if let value = sqlite3_column_blob(query, 0) { bytes = Data(bytes: value, count: size) }
         else { return nil }
-        return sceneDigest(bytes, context: context).elementsEqual(
-            UnsafeRawBufferPointer(start: digest, count: SHA256.byteCount)) ? bytes : nil
+        let payload = SidecarPayload(bytes: bytes, logicalSize: Int(sqlite3_column_int64(query, 2)))
+        guard let decoded = try? payload.decode(cancelled: { Task.isCancelled }) else { return nil }
+        return sceneDigest(decoded, context: context).elementsEqual(
+            UnsafeRawBufferPointer(start: digest, count: SHA256.byteCount)) ? decoded : nil
     }
 
     private static func sceneDigest(_ bytes: Data, context: String) -> Data {
