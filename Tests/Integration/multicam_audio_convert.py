@@ -84,6 +84,47 @@ class MulticamAudioConversionTests(unittest.TestCase):
         cut = 48 * 44100 // 25 * 2
         self.assertEqual(audio(output), decoded[cut:] + decoded[:cut])
 
+    def test_pcm_lane_keeps_lossy_peaks_and_double_float_and_reports_its_format(self):
+        def peak(path):
+            decoded = array("f", ffmpeg("-i", path, "-map", "0:a:0", "-c:a", "pcm_f32le", "-f", "f32le", "-"))
+            return max(abs(value) for value in decoded)
+
+        # A full-scale square wave at a low rate decodes well above full scale.
+        hot = self.root / "hot.m4a"
+        ffmpeg("-f", "lavfi", "-i", "aevalsrc=0.999*sgn(sin(2*PI*997*t))|0.999*sgn(sin(2*PI*1499*t)):s=48000:d=3",
+               "-c:a", "aac", "-b:a", "64k", hot)
+        self.assertGreater(peak(hot), 1.2)
+        for suffix in ("mov", "mkv"):
+            with self.subTest(source="lossy", suffix=suffix):
+                output, report = self.export(hot, first=hot, treatment="pcm", suffix=suffix)
+                lane, = report["audio_lanes"]
+                self.assertEqual((lane["action"], lane["codec"], lane["bit_depth"]), ("pcm", "pcm_f32le", 32))
+                self.assertEqual(probe(output, "-select_streams", "a:0", "-show_streams")["streams"][0]["codec_name"], "pcm_f32le")
+                self.assertAlmostEqual(peak(output), peak(hot), delta=0.05)
+        # A rendered AAC lane reports the rate it is encoded at.
+        output, report = self.export(hot, first=hot, treatment="aac")
+        lane, = report["audio_lanes"]
+        self.assertEqual((lane["action"], lane["codec"], lane["bit_rate"]), ("aac", "aac", 192000))
+        written = int(probe(output, "-select_streams", "a:0", "-show_streams")["streams"][0]["bit_rate"])
+        self.assertLess(abs(written - 192000), 192000 // 10)
+
+        # 64-bit float sound stays 64-bit float, sample for sample.
+        double = self.root / "double.wav"
+        ffmpeg("-f", "lavfi", "-i", "aevalsrc=0.3*sin(2*PI*441*t)+0.000000001*sin(2*PI*7919*t)|0.2*sin(2*PI*659*t):s=48000:d=3",
+               "-c:a", "pcm_f64le", double)
+
+        def doubles(path):
+            return ffmpeg("-i", path, "-map", "0:a:0", "-c:a", "pcm_f64le", "-f", "f64le", "-")
+
+        expected = doubles(double)
+        cut = 48 * RATE // 25 * 2 * 8
+        for suffix in ("mov", "mkv"):
+            with self.subTest(source="double", suffix=suffix):
+                output, report = self.export(double, first=double, treatment="pcm", suffix=suffix)
+                lane, = report["audio_lanes"]
+                self.assertEqual((lane["codec"], lane["bit_depth"], lane["warnings"]), ("pcm_f64le", 64, []))
+                self.assertEqual(doubles(output), expected[cut:] + expected[:cut])
+
     def test_shared_compressed_decode_matches_individual_reordered_ranges(self):
         coarse = self.root / "shared-aac.mka"
         ffmpeg("-i", self.aac, "-c:a", "copy", coarse)

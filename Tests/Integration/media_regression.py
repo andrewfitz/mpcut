@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import select
 import signal
+import struct
 import subprocess
 import tempfile
 import time
@@ -71,6 +72,50 @@ def timestamped_hashes(path):
 
 def ratio(value):
     return Fraction(value["numerator"], value["denominator"])
+
+
+def boxes(data, start, end):
+    while start + 8 <= end:
+        size, kind = struct.unpack(">I4s", data[start:start + 8])
+        head = 8
+        if size == 1:
+            size, head = struct.unpack(">Q", data[start + 8:start + 16])[0], 16
+        elif size == 0:
+            size = end - start
+        yield kind, start + head, start + size
+        start += size
+
+
+def box(data, span, *path):
+    for kind in path:
+        span = next((first, end) for found, first, end in boxes(data, *span) if found == kind)
+    return span
+
+
+def presented_ticks(path, handler=b"soun"):
+    """The media that a MOV track's edit list presents, counted on the track's clock.
+
+    FFmpeg 9.1 writes the trim after a compressed track's last packet into the edit list only, where 9.0 also
+    shortened the last sample, and its ffprobe reports such a track with several edits at its untrimmed length.
+    """
+    data = Path(path).read_bytes()
+    movie = box(data, (0, len(data)), b"moov")
+
+    def clock(span):  # mvhd and mdhd place their timescale alike.
+        return struct.unpack(">I", data[span[0] + (20 if data[span[0]] else 12):][:4])[0]
+
+    for kind, first, end in boxes(data, *movie):
+        if kind != b"trak" or data[box(data, (first, end), b"mdia", b"hdlr")[0] + 8:][:4] != handler:
+            continue
+        edits = box(data, (first, end), b"edts", b"elst")[0]
+        wide = data[edits]
+        total = 0
+        for index in range(struct.unpack(">I", data[edits + 4:edits + 8])[0]):
+            entry = edits + 8 + index * (20 if wide else 12)
+            duration, media_time = struct.unpack(">Qq" if wide else ">Ii", data[entry:entry + (16 if wide else 8)])
+            total += duration if media_time >= 0 else 0
+        return total * Fraction(clock(box(data, (first, end), b"mdia", b"mdhd")), clock(box(data, movie, b"mvhd")))
+    raise AssertionError(f"{path} has no such track")
 
 
 class MediaRegression(unittest.TestCase):
@@ -236,19 +281,22 @@ class MediaRegression(unittest.TestCase):
 
     def test_unsafe_start_suggests_starts_when_the_end_is_also_unsafe(self):
         source = self.root / "gop.mp4"
+        # A fixed I B B P pattern: a copy can start at pictures 0 and 60 and end before every third picture after 1.
         ffmpeg("-f", "lavfi", "-i", "testsrc2=s=64x64:r=30:d=6", "-c:v", "libx264", "-g", "60",
-               "-pix_fmt", "yuv420p", source)
+               "-x264-params", "bframes=2:b-adapt=0:b-pyramid=0", "-pix_fmt", "yuv420p", source)
         output = self.root / "both-unsafe.mp4"
         report = self.export(output, [self.edit(source, "1/2", "21/20")], dry_run=True, ok=False)
         self.assertEqual(report["error"]["boundary"], "from")
         self.assertEqual(list(map(ratio, report["error"]["nearest"])), [0])
         fixed = self.export(output, [self.edit(source, "0", "21/20")], dry_run=True, ok=False)
         self.assertEqual(fixed["error"]["boundary"], "to")
-        self.assertEqual(list(map(ratio, fixed["error"]["nearest"])), [2])
+        # 21/20 lies inside picture 31. The copy can end before picture 31 or before picture 34.
+        ends = [Fraction(31, 30), Fraction(34, 30)]
+        self.assertEqual(list(map(ratio, fixed["error"]["nearest"])), ends)
         later = self.export(output, [self.edit(source, "0", "21/20"), self.edit(source, "4", "21/4")],
                             dry_run=True, ok=False)
         self.assertEqual((later["error"]["segment"], later["error"]["boundary"]), (1, "to"))
-        self.assertEqual(list(map(ratio, later["error"]["nearest"])), [2])
+        self.assertEqual(list(map(ratio, later["error"]["nearest"])), ends)
 
     def test_prores_reorder_repeated_ranges_and_pcm(self):
         a, b, c = [self.prores(f"{label}.mov", hue=hue, sample_rate=44100)
@@ -477,7 +525,9 @@ class MediaRegression(unittest.TestCase):
         data = source.read_bytes()
         self.assertIn(b"00:00:08.000000000", data)
         stale.write_bytes(data.replace(b"00:00:08.000000000", b"00:00:18.000000000"))
-        self.assertEqual(ratio(self.cli("media", "inspect", "--json", str(stale))["media"]["duration"]), Fraction(7999, 1000))
+        # The stale tag is ignored and the last block ends the track. Its duration is the track's default of
+        # 41.67 ms, which FFmpeg 9.0 truncates to 41 ms and FFmpeg 9.1 rounds to 42 ms.
+        self.assertIn(ratio(self.cli("media", "inspect", "--json", str(stale))["media"]["duration"]), (Fraction(7999, 1000), 8))
 
     def test_interlaced_avc_preserves_copy_only_cut_boundaries(self):
         source = self.fixture("fields.mp4", ["-c:v", "libx264", "-x264-params",
@@ -850,7 +900,7 @@ class MediaRegression(unittest.TestCase):
         source_audio, output_audio = source_streams[1], output_streams[1]
         self.assertGreater(Fraction(source_audio["start_time"]), 0)
         self.assertEqual(Fraction(output_audio["start_time"]), 0)
-        self.assertEqual(output_audio["duration_ts"], source_audio["duration_ts"])
+        self.assertEqual(output_audio["duration_ts"], presented_ticks(source))
         source_offset = Fraction(source_streams[0]["start_time"]) - Fraction(source_audio["start_time"])
         output_offset = Fraction(output_streams[0]["start_time"])
         self.assertLessEqual(abs(source_offset - output_offset), Fraction(output_streams[0]["time_base"]))

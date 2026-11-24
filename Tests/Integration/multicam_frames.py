@@ -102,6 +102,34 @@ class MulticamFrames(unittest.TestCase):
         self.assertEqual(files[0].read_bytes(), files[3].read_bytes())
         self.assertEqual(files[1].read_bytes(), files[2].read_bytes())
 
+    def test_png_and_tiff_cover_the_group_and_assembly_clocks(self):
+        project, document = self.restart_project("lossless-review")
+        document["assembly"] = [{"from": "2", "to": "3"}, {"from": "0", "to": "2"}]
+        project.write_text(json.dumps(document))
+        dest = self.root / "lossless-group"
+        report = json.loads(run([CLI, "review", "frames", "export", "--json", "--project", project,
+                                 "--format", "png", "--output", dest, "--at", "1/2", "--at", "5/2"]))
+        self.assertEqual(report["format"], "png")
+        self.assertEqual([row["file"] for row in report["frames"]],
+                         ["frame-000001-angle-001.png", "frame-000002-angle-001.png"])
+        for row, channel in zip(report["frames"], (0, 2), strict=True):
+            self.assertEqual((dest / row["file"]).read_bytes()[:4], b"\x89PNG")
+            self.assertGreater(rgb(dest / row["file"])[channel], 200)
+        # The assembly clock mixes camera pictures with a generated gap picture.
+        dest = self.root / "lossless-assembly"
+        report = json.loads(run([CLI, "review", "frames", "export", "--json", "--project", project,
+                                 "--clock", "assembly", "--format", "tiff", "--output", dest,
+                                 "--at", "0", "--at", "5/2", "--at", "3/2"]))
+        self.assertEqual(report["format"], "tiff")
+        rows = report["frames"]
+        self.assertEqual([row.get("generated_gap", False) for row in rows], [False, True, False])
+        self.assertEqual([row["file"] for row in rows], [f"frame-00000{n}.tiff" for n in (1, 2, 3)])
+        for row in rows:
+            self.assertIn((dest / row["file"]).read_bytes()[:4], (b"II*\x00", b"MM\x00*"))
+        self.assertGreater(rgb(dest / rows[0]["file"])[2], 200)
+        self.assertLess(max(rgb(dest / rows[1]["file"])), 10)
+        self.assertGreater(rgb(dest / rows[2]["file"])[0], 200)
+
     def test_project_edit_adds_recording_without_adding_camera(self):
         restart = self.media / "authored-restart.mkv"
         run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=blue:s=160x96:r=4:d=1",

@@ -89,11 +89,24 @@ package struct StillReviewFrame: Sendable {
         return (data as Data, image.width, image.height)
     }
 
+    /// The review picture in the requested file format. PNG and TIFF hold the 16-bit sRGB rendition
+    /// that the JPEG is compressed from.
+    package func encoded(preset: JPEGPreset, format: FrameImageFormat,
+                         cancelled: @escaping () -> Bool) throws -> (data: Data, width: Int, height: Int) {
+        guard format != .jpeg else { return try jpeg(preset: preset, cancelled: cancelled) }
+        let image = try image(maximumDimension: preset == .review ? 640 : nil, cancelled: cancelled)
+        let data = try format.encode(image)
+        try checkCancellation(cancelled)
+        try validateIdentity()
+        return (data, image.width, image.height)
+    }
+
     package func write(to output: URL, replacing identity: SourceIdentity? = nil,
-                       preset: JPEGPreset = .full, cancelled: @escaping @Sendable () -> Bool) throws {
+                       preset: JPEGPreset = .full, format: FrameImageFormat = .jpeg,
+                       cancelled: @escaping @Sendable () -> Bool) throws {
         try checkCancellation(cancelled)
         try JPEGExport.validateStillDestination(output, source: url, sourceIdentity: self.identity, replacing: identity)
-        let jpeg = try jpeg(preset: preset, cancelled: cancelled)
+        let jpeg = try encoded(preset: preset, format: format, cancelled: cancelled)
         try JPEGExport.publishStillJPEG(jpeg.data, source: url, sourceIdentity: self.identity, to: output,
                                         replacing: identity, cancelled: cancelled, validate: validateIdentity)
     }
@@ -165,18 +178,20 @@ extension StillReviewFrame {
         let schemaVersion = 2
         let selection = "program"
         let preset: JPEGPreset
+        let format: FrameImageFormat?
         let frames: [Frame]
     }
 
-    package func writeDirectory(to directory: URL, preset: JPEGPreset,
+    package func writeDirectory(to directory: URL, preset: JPEGPreset, format: FrameImageFormat = .jpeg,
                                 cancelled: @escaping @Sendable () -> Bool) throws {
         _ = try JPEGExport.writeProgramFrameDirectory(to: directory, cancelled: cancelled, validate: validateIdentity) { staging in
-            let jpeg = try jpeg(preset: preset, cancelled: cancelled)
-            let name = "000001.jpg"
+            let jpeg = try encoded(preset: preset, format: format, cancelled: cancelled)
+            let name = "000001." + format.fileExtension
             try jpeg.data.write(to: staging.appendingPathComponent(name), options: .withoutOverwriting)
-            return Manifest(preset: preset, frames: [.init(file: name, asset: asset.id, placement: placementID,
-                                                           from: interval.from, to: interval.to,
-                                                           width: jpeg.width, height: jpeg.height)])
+            return Manifest(preset: preset, format: format == .jpeg ? nil : format,
+                            frames: [.init(file: name, asset: asset.id, placement: placementID,
+                                           from: interval.from, to: interval.to,
+                                           width: jpeg.width, height: jpeg.height)])
         }
     }
 }

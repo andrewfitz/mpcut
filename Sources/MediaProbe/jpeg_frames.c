@@ -4,6 +4,7 @@
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_videotoolbox.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 #include <math.h>
@@ -20,6 +21,8 @@ struct MPJPEGReader {
     bool draining;
     bool saw_frame;
     bool sought;
+    // Deliver software pictures deeper than 8 bits as 16-bit RGB.
+    bool deep;
     int64_t first_dts;
     // Pictures before this time may depend on a packet that failed to decode.
     int64_t clean_pts;
@@ -100,6 +103,11 @@ fail:
     av_strerror(ret, error, capacity);
     mp_jpeg_close(r);
     return NULL;
+}
+
+void mp_jpeg_set_deep(MPJPEGReader *r, bool deep)
+{
+    r->deep = deep;
 }
 
 CGAffineTransform mp_jpeg_transform(MPJPEGReader *r)
@@ -210,6 +218,74 @@ static int seek(MPJPEGReader *r, int64_t dts)
     return 0;
 }
 
+// swscale's table-driven RGB output darkens a limited-range picture by about two
+// code values (white 235 becomes 253). Its full-chroma output and its NEON
+// converter are exact, so every conversion below takes one of those two.
+#define SOFTWARE_SCALER_FLAGS (SWS_BICUBIC | SWS_FULL_CHR_H_INT)
+
+static int expand_gray(const AVFrame *f, uint8_t *out, int stride)
+{
+    uint8_t expanded[256];
+    for (int i = 0; i < 256; i++)
+        expanded[i] = av_clip_uint8((int)lrint((i - 16) * 255.0 / 219.0));
+    for (int y = 0; y < f->height; y++) {
+        const uint8_t *in = f->data[0] + (ptrdiff_t)y * f->linesize[0];
+        uint8_t *row = out + (ptrdiff_t)y * stride;
+        for (int x = 0; x < f->width; x++, row += 4) {
+            row[0] = row[1] = row[2] = expanded[in[x]];
+            row[3] = 255;
+        }
+    }
+    return f->height;
+}
+
+// The unscaled 8-bit 4:2:0 and 4:2:2 converter has its exact NEON form only for
+// widths in whole blocks of 16 and falls back to the table-driven one otherwise.
+// Convert a copy widened to the next block and keep the picture's own columns.
+static int convert_in_blocks(MPJPEGReader *r, const int *matrix, uint8_t *out, int stride)
+{
+    const AVFrame *f = r->frame;
+    const int w = f->width, h = f->height, wide = FFALIGN(w, 16);
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(f->format);
+    uint8_t *planes[4] = { NULL }, *rgb[4] = { NULL };
+    int lines[4] = { 0 }, rgb_lines[4] = { 0 };
+    int ret = av_image_alloc(planes, lines, wide, h, f->format, 32);
+    if (ret >= 0) ret = av_image_alloc(rgb, rgb_lines, wide, h, AV_PIX_FMT_BGRA, 32);
+    if (ret >= 0) {
+        r->scaler = sws_getCachedContext(r->scaler, wide, h, f->format, wide, h, AV_PIX_FMT_BGRA,
+                                         SOFTWARE_SCALER_FLAGS, NULL, NULL, NULL);
+        if (!r->scaler) ret = AVERROR(ENOMEM);
+    }
+    if (ret >= 0) {
+        for (int p = 0; p < 4 && planes[p]; p++) {
+            const bool chroma = p == 1 || p == 2;
+            const int columns = chroma ? AV_CEIL_RSHIFT(w, desc->log2_chroma_w) : w;
+            const int padded = chroma ? AV_CEIL_RSHIFT(wide, desc->log2_chroma_w) : wide;
+            const int rows = chroma ? AV_CEIL_RSHIFT(h, desc->log2_chroma_h) : h;
+            for (int y = 0; y < rows; y++) {
+                uint8_t *row = planes[p] + (ptrdiff_t)y * lines[p];
+                memcpy(row, f->data[p] + (ptrdiff_t)y * f->linesize[p], columns);
+                memset(row + columns, row[columns - 1], padded - columns);
+            }
+        }
+        sws_setColorspaceDetails(r->scaler, matrix, 0, matrix, 1, 0, 1<<16, 1<<16);
+        ret = sws_scale(r->scaler, (const uint8_t *const *)planes, lines, 0, h, rgb, rgb_lines);
+        for (int y = 0; y < ret && y < h; y++)
+            memcpy(out + (ptrdiff_t)y * stride, rgb[0] + (ptrdiff_t)y * rgb_lines[0], (size_t)w * 4);
+    }
+    av_freep(&planes[0]);
+    av_freep(&rgb[0]);
+    return ret;
+}
+
+// A picture without a recorded matrix is BT.709 when it is larger than 704x576
+// and BT.601 otherwise. VideoToolbox tags its untagged output by this rule, so
+// the native preview shows the same colors.
+static bool untagged_is_bt709(const AVFrame *f)
+{
+    return f->width > 704 || f->height > 576;
+}
+
 static int software_image(MPJPEGReader *r, int max_edge, CVPixelBufferRef *image)
 {
     AVFrame *f = r->frame;
@@ -229,14 +305,15 @@ static int software_image(MPJPEGReader *r, int max_edge, CVPixelBufferRef *image
             h = FFMAX(1, (int)FFMIN(h, ceil(samples_h)));
         }
     }
-    r->scaler = sws_getCachedContext(r->scaler, f->width, f->height, f->format, w, h, AV_PIX_FMT_BGRA,
-                                     SWS_BICUBIC, NULL, NULL, NULL);
-    if (!r->scaler) return AVERROR(ENOMEM);
-    const int *matrix = sws_getCoefficients(f->colorspace == AVCOL_SPC_UNSPECIFIED
-        ? SWS_CS_DEFAULT : f->colorspace);
-    sws_setColorspaceDetails(r->scaler, matrix, f->color_range == AVCOL_RANGE_JPEG, matrix, 1, 0, 1<<16, 1<<16);
+    const int *matrix = sws_getCoefficients(f->colorspace != AVCOL_SPC_UNSPECIFIED ? f->colorspace
+        : untagged_is_bt709(f) ? SWS_CS_ITU709 : SWS_CS_DEFAULT);
+    const bool limited = f->color_range != AVCOL_RANGE_JPEG;
+    const bool unscaled = w == f->width && h == f->height;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(f->format);
+    const bool deep = r->deep && desc && desc->comp[0].depth > 8;
     CVPixelBufferRef buffer = NULL;
-    if (CVPixelBufferCreate(NULL, w, h, kCVPixelFormatType_32BGRA, NULL, &buffer) != kCVReturnSuccess)
+    if (CVPixelBufferCreate(NULL, w, h, deep ? kCVPixelFormatType_64RGBALE : kCVPixelFormatType_32BGRA,
+                            NULL, &buffer) != kCVReturnSuccess)
         return AVERROR(ENOMEM);
     if (CVPixelBufferLockBaseAddress(buffer, 0) != kCVReturnSuccess) {
         CVPixelBufferRelease(buffer);
@@ -244,9 +321,42 @@ static int software_image(MPJPEGReader *r, int max_edge, CVPixelBufferRef *image
     }
     uint8_t *out[] = { CVPixelBufferGetBaseAddress(buffer), NULL, NULL, NULL };
     int stride[] = { (int)CVPixelBufferGetBytesPerRow(buffer), 0, 0, 0 };
-    int written = sws_scale(r->scaler, (const uint8_t *const *)f->data, f->linesize, 0, f->height, out, stride);
+    int written;
+    if (unscaled && limited && f->format == AV_PIX_FMT_GRAY8) {
+        // swscale copies unscaled 8-bit gray as if it were full range.
+        written = expand_gray(f, out[0], stride[0]);
+    } else if (unscaled && limited && !(h & 1) && (w & 15) &&
+               (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUV422P ||
+                f->format == AV_PIX_FMT_YUVA420P)) {
+        written = convert_in_blocks(r, matrix, out[0], stride[0]);
+    } else {
+        r->scaler = sws_getCachedContext(r->scaler, f->width, f->height, f->format, w, h,
+                                         deep ? AV_PIX_FMT_RGBA64LE : AV_PIX_FMT_BGRA,
+                                         SOFTWARE_SCALER_FLAGS, NULL, NULL, NULL);
+        if (!r->scaler) {
+            CVPixelBufferUnlockBaseAddress(buffer, 0);
+            CVPixelBufferRelease(buffer);
+            return AVERROR(ENOMEM);
+        }
+        sws_setColorspaceDetails(r->scaler, matrix, !limited, matrix, 1, 0, 1<<16, 1<<16);
+        written = sws_scale(r->scaler, (const uint8_t *const *)f->data, f->linesize, 0, f->height, out, stride);
+        // swscale computes 16-bit RGB from YCbCr on its 8-bit scale times 256: limited-range
+        // white arrives as 65280, and a full-range sample as its code shifted up to 16 bits
+        // (10-bit peak 1023 as 65472). Stretch either scale to the full 16 bits.
+        if (deep && !(desc->flags & AV_PIX_FMT_FLAG_RGB)) {
+            const int depth = FFMIN(desc->comp[0].depth, 16);
+            const uint64_t numerator = limited ? 257 : 65535;
+            const uint64_t denominator = limited ? 256 : (uint64_t)((1 << depth) - 1) << (16 - depth);
+            for (int y = 0; y < written; y++) {
+                uint16_t *row = (uint16_t *)(out[0] + (ptrdiff_t)y * stride[0]);
+                for (int x = 0; x < w; x++, row += 4)
+                    for (int c = 0; c < 3; c++)
+                        row[c] = (uint16_t)FFMIN(65535, (row[c] * numerator + denominator / 2) / denominator);
+            }
+        }
+    }
     CVPixelBufferUnlockBaseAddress(buffer, 0);
-    if (written != h) { CVPixelBufferRelease(buffer); return AVERROR_INVALIDDATA; }
+    if (written != h) { CVPixelBufferRelease(buffer); return written < 0 ? written : AVERROR_INVALIDDATA; }
     av_vt_pixbuf_set_attachments(r->codec, buffer, f);
     *image = buffer;
     return 0;
@@ -287,10 +397,12 @@ int mp_jpeg_frame(MPJPEGReader *r, int64_t pts, int64_t seek_dts, int max_edge,
             if (buffer) {
                 av_vt_pixbuf_set_attachments(r->codec, buffer, r->frame);
                 // Core Image and swscale use different defaults for untagged
-                // YUV. Match swscale's BT.601 when no matrix was recorded.
+                // YUV. Give both decoders the same matrix when none was recorded.
                 if (r->frame->colorspace == AVCOL_SPC_UNSPECIFIED)
                     CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey,
-                                          kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
+                                          untagged_is_bt709(r->frame) ? kCVImageBufferYCbCrMatrix_ITU_R_709_2
+                                                                      : kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+                                          kCVAttachmentMode_ShouldPropagate);
                 *image = CVPixelBufferRetain(buffer);
             } else ret = AVERROR_INVALIDDATA;
         } else ret = software_image(r, max_edge, image);

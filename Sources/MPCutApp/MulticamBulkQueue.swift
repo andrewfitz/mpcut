@@ -163,7 +163,7 @@ extension MulticamBulkExport {
                                        cancelled: cancelled, audioOutput: choices.audioOutput, audioAction: choices.requestedAudioAction,
                                        pictureTiming: choices.pictureTiming)
             return .success(batch.items.map {
-                "\($0.output.lastPathComponent)\n\($0.audioDeliverySummary)"
+                "\($0.output.lastPathComponent)\n\($0.review)"
             }.joined(separator: "\n\n"))
         } catch let issue as CutError {
             return .failure(issue)

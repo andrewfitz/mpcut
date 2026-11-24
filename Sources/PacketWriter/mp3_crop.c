@@ -33,9 +33,19 @@ static AVFormatContext *seek_anchor(AVFormatContext *input, int index, int64_t s
     return NULL;
 }
 
+/* The first frame a crop keeps: as much original history before the start as the encoder-delay field can hide. */
+static int64_t first_kept(int64_t pts, int64_t start, int spf) {
+    int64_t distance = start - pts;
+    return pts + (distance > max_skip ? (distance - max_skip + spf - 1) / spf : 0) * spf;
+}
+
+int64_t mpcut_mp3_crop_lead(int64_t start, int rate) {
+    return start < 0 || rate <= 0 ? 0 : start - first_kept(0, start, rate > 24000 ? 1152 : 576);
+}
+
 static int crop(AVFormatContext *input, int index, AVFormatContext *output,
                 int64_t start, int64_t end, MPCutMP3Anchor anchor, MPCutProgress progress, void *context,
-                char *error, size_t capacity) {
+                unsigned *lead, unsigned *tail, char *error, size_t capacity) {
     if (index < 0 || (unsigned)index >= input->nb_streams || end <= start || start < 0 ||
         strcmp(input->iformat->name, "mp3") || input->streams[index]->codecpar->codec_id != AV_CODEC_ID_MP3)
         return crop_error(error, capacity, "A standalone Layer III track and a positive sample range are required.");
@@ -76,10 +86,7 @@ static int crop(AVFormatContext *input, int index, AVFormatContext *output,
         next = pts + spf;
         if (!seen++) {
             if (pts > start || end > INT64_MAX - 2 * spf) break;
-            int64_t distance = start - pts;
-            // Include as much original history as the encoder-delay field can hide.
-            int64_t offset = distance > max_skip ? (distance - max_skip + spf - 1) / spf : 0;
-            first = pts + offset * spf;
+            first = first_kept(pts, start, spf);
             from_source_head = !seek && first == pts;
             stable_after = first;
             if (start - first < decoder_delay) {
@@ -121,6 +128,8 @@ static int crop(AVFormatContext *input, int index, AVFormatContext *output,
                 AV_WL32(side + 4, is_last ? stop - end : 0);
                 side[8] = side[9] = 0;
             }
+            if (is_first && lead) *lead = (unsigned)(start - first);
+            if (is_last && tail) *tail = (unsigned)(stop - end);
             packet->pts = packet->dts = pts - first;
             packet->duration = spf;
             packet->stream_index = 0;
@@ -158,13 +167,13 @@ int mpcut_check_mp3_crop(const char *path, int index, int64_t start, int64_t end
         avformat_close_input(&input);
         return crop_error(error, capacity, "Cannot open the MP3 source to verify decoder preroll.");
     }
-    result = crop(input, index, NULL, start, end, anchor, progress, context, error, capacity);
+    result = crop(input, index, NULL, start, end, anchor, progress, context, NULL, NULL, error, capacity);
     avformat_close_input(&input);
     return result;
 }
 
 int mpcut_write_mp3_crop(AVFormatContext *input, int index, AVFormatContext *output,
                          int64_t start, int64_t end, MPCutMP3Anchor anchor, MPCutProgress progress, void *context,
-                         char *error, size_t capacity) {
-    return crop(input, index, output, start, end, anchor, progress, context, error, capacity);
+                         unsigned *lead, unsigned *tail, char *error, size_t capacity) {
+    return crop(input, index, output, start, end, anchor, progress, context, lead, tail, error, capacity);
 }

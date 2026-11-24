@@ -8,6 +8,16 @@ import Metal
 public enum JPEGPreset: String, CaseIterable, Sendable, Encodable { case review, full }
 public enum JPEGSample: String, CaseIterable, Sendable, Encodable { case first, midpoint }
 
+/// The file format of an exported frame. JPEG is the 8-bit sRGB review rendition. PNG and TIFF are
+/// lossless: they keep the decoder's R′G′B′ values unchanged, with 16 bits per channel when the source
+/// has more than 8, and embed the profile that describes them (the source's gamut and transfer,
+/// including PQ and HLG, which are not tone-mapped).
+public enum FrameImageFormat: String, CaseIterable, Sendable, Encodable {
+    case jpeg, png, tiff
+
+    public var fileExtension: String { self == .jpeg ? "jpg" : rawValue }
+}
+
 public enum JPEGSelection: Sendable {
     case scenes
     case sceneReport(SceneReport)
@@ -43,11 +53,13 @@ public struct JPEGManifest: Encodable, Sendable {
     public let thresholdDB, minimumPause: Double?
     public let rangeCount: Int
     public let frames: [JPEGFrame]
+    /// Present for PNG and TIFF exports. A JPEG manifest omits it.
+    public var format: FrameImageFormat? = nil
 
     private enum CodingKeys: String, CodingKey {
         case ok, schemaVersion, file, outputDirectory, selection, sourceStamp, timeBase, origin, duration
         case preset, sample, stream = "detection_audio_stream_index", thresholdDB, rangeCount, frames
-        case minimumPause = "min_pause_seconds"
+        case minimumPause = "min_pause_seconds", format
     }
 }
 
@@ -60,6 +72,8 @@ public struct MulticamJPEGManifest: Encodable, Sendable {
     public let preset: JPEGPreset
     public let angles: [MulticamJPEGAngle]
     public let frames: [MulticamJPEGFrame]
+    /// Present for PNG and TIFF exports. A JPEG manifest omits it.
+    public var format: FrameImageFormat? = nil
 }
 
 public struct MulticamJPEGAngle: Encodable, Sendable {
@@ -117,8 +131,9 @@ final class JPEGControl {
 
 public enum JPEGExport {
     public static func writeStill(_ media: MediaInfo, at time: RationalTime, to output: URL,
+                                  format: FrameImageFormat = .jpeg,
                                   cancelled: @escaping @Sendable () -> Bool = { false }) throws {
-        try writeStill(media, at: time, to: output, replacing: nil, cancelled: cancelled)
+        try writeStill(media, at: time, to: output, replacing: nil, format: format, cancelled: cancelled)
     }
 
     package static func stillFrameTime(in media: MediaInfo, at time: RationalTime,
@@ -141,7 +156,7 @@ public enum JPEGExport {
 
     package static func writeStill(_ media: MediaInfo, at time: RationalTime, to output: URL,
                                    replacing confirmed: SourceIdentity?, exclusiveEnd: Bool = false,
-                                   preset: JPEGPreset = .full,
+                                   preset: JPEGPreset = .full, format: FrameImageFormat = .jpeg,
                                    cancelled: @escaping @Sendable () -> Bool) throws {
         let control = JPEGControl(cancelled)
         try control.check()
@@ -166,7 +181,7 @@ public enum JPEGExport {
         }
         let frameTime = try stillFrameTime(in: media, at: time, exclusiveEnd: exclusiveEnd)
         let plan = try plan(media, .times([frameTime]), useSidecar: false, cancelled: cancelled)
-        _ = try render(media, ranges: plan.ranges, sample: .first, preset: preset, control: control,
+        _ = try render(media, ranges: plan.ranges, sample: .first, preset: preset, format: format, control: control,
                        fileName: { _ in output.lastPathComponent }, progress: { _, _ in }) { jpeg, _ in
             try publishStillJPEG(jpeg, source: media.url, sourceIdentity: sourceIdentity,
                                  to: output, replacing: confirmed, cancelled: cancelled) {
@@ -228,6 +243,7 @@ public enum JPEGExport {
     /// refers to the picture on screen at that time, including a held VFR picture.
     public static func write(_ media: MediaInfo, to directory: URL, selection: JPEGSelection,
                              sample: JPEGSample = .midpoint, preset: JPEGPreset = .review,
+                             format: FrameImageFormat = .jpeg,
                              limit: Int? = nil, useSidecar: Bool = true,
                              cancelled: @escaping @Sendable () -> Bool = { false },
                              progress: @escaping (Int, Int) -> Void = { _, _ in }) throws -> JPEGManifest {
@@ -247,21 +263,22 @@ public enum JPEGExport {
         return try writeDirectory(to: directory, control: control, validate: { try checkSource(media) }) { staging, destination in
             let plan = try plan(media, selection, useSidecar: useSidecar, cancelled: cancelled)
             let frames = try render(media, ranges: subset(plan.ranges, limit: limit), sample: sample,
-                                    preset: preset, control: control,
-                                    fileName: { String(format: "frame-%06ld.jpg", $0 + 1) }, progress: progress) { jpeg, name in
+                                    preset: preset, format: format, control: control,
+                                    fileName: { String(format: "frame-%06ld.", $0 + 1) + format.fileExtension }, progress: progress) { jpeg, name in
                 try writing(name) { try jpeg.write(to: staging.appendingPathComponent(name)) }
             }
             return JPEGManifest(file: media.url.path, outputDirectory: destination.path, selection: plan.kind,
                 sourceStamp: SceneSourceStamp(media: media), timeBase: media.video.timeBase, origin: media.origin,
                 duration: media.duration, preset: preset, sample: plan.kind == "times" ? nil : sample,
                 stream: plan.stream, thresholdDB: plan.thresholdDB, minimumPause: plan.minimumPause,
-                rangeCount: plan.ranges.count, frames: frames)
+                rangeCount: plan.ranges.count, frames: frames, format: format == .jpeg ? nil : format)
         }
     }
 
     /// Review each project's camera on the original group clock.
     public static func writeMulticam(project projectURL: URL, at times: [RationalTime], to directory: URL,
-                                     preset: JPEGPreset = .review, useSidecar: Bool = true,
+                                     preset: JPEGPreset = .review, format: FrameImageFormat = .jpeg,
+                                     useSidecar: Bool = true,
                                      cancelled: @escaping @Sendable () -> Bool = { false }) throws -> MulticamJPEGManifest {
         try JPEGControl(cancelled).check()
         let projectURL = projectURL.standardizedFileURL
@@ -280,13 +297,15 @@ public enum JPEGExport {
         let exclusions = AnalysisSidecar.excludedSources.union(media.sidecarExclusions(relativeTo: projectURL))
         return try AnalysisSidecar.$excludedSources.withValue(exclusions) {
             try writeMulticam(project, document: projectURL, at: times, to: directory, preset: preset,
+                              format: format,
                               useSidecar: useSidecar, documentIdentity: identity, projectMedia: media, cancelled: cancelled)
         }
     }
 
     /// The editor renders its current decisions, including changes that have not been saved yet.
     package static func writeMulticam(_ project: MulticamProject, document: URL?, at times: [RationalTime],
-                                      to directory: URL, preset: JPEGPreset, useSidecar: Bool,
+                                      to directory: URL, preset: JPEGPreset, format: FrameImageFormat = .jpeg,
+                                      useSidecar: Bool,
                                       indexedSources: [String: MediaInfo] = [:], documentIdentity: SourceIdentity? = nil,
                                       projectMedia: CutProjectMedia? = nil,
                                       cancelled: @escaping @Sendable () -> Bool) throws -> MulticamJPEGManifest {
@@ -383,8 +402,10 @@ public enum JPEGExport {
                         let plan = try plan(media, .times(availableIndices.map { sourceTimes[$0] }),
                                             useSidecar: useSidecar, cancelled: cancelled)
                         let frames = try render(media, ranges: plan.ranges, sample: .first, preset: preset,
+                                                format: format,
                                                 control: control, fileName: { index in
-                            String(format: "frame-%06ld-angle-%03ld.jpg", availableIndices[index] + 1, angleIndex + 1)
+                            String(format: "frame-%06ld-angle-%03ld.", availableIndices[index] + 1, angleIndex + 1)
+                                + format.fileExtension
                         }, progress: { _, _ in }) { jpeg, name in
                             try writing(name) { try jpeg.write(to: staging.appendingPathComponent(name)) }
                         }
@@ -417,7 +438,8 @@ public enum JPEGExport {
                 })
             }
             return MulticamJPEGManifest(projectPath: document?.path, outputDirectory: destination.path, preset: preset,
-                angles: angles, frames: times.indices.flatMap { index in byAngle.map { $0[index] } })
+                angles: angles, frames: times.indices.flatMap { index in byAngle.map { $0[index] } },
+                format: format == .jpeg ? nil : format)
         }
     }
 
@@ -494,7 +516,7 @@ public enum JPEGExport {
     }
 
     private static func render(_ media: MediaInfo, ranges: [JPEGRange], sample: JPEGSample,
-                               preset: JPEGPreset, control: JPEGControl,
+                               preset: JPEGPreset, format: FrameImageFormat = .jpeg, control: JPEGControl,
                                fileName: (Int) -> String, progress: (Int, Int) -> Void,
                                write: (Data, String) throws -> Void) throws -> [JPEGFrame] {
         struct Request {
@@ -539,7 +561,7 @@ public enum JPEGExport {
         var ordered = Array<JPEGFrame?>(repeating: nil, count: requests.count)
         var completed = 0
         if !requests.isEmpty {
-            let renderer = try JPEGRenderer(media: media, control: control)
+            let renderer = try JPEGRenderer(media: media, control: control, lossless: format != .jpeg)
             let inverse = RationalTime(numerator: media.video.timeBase.denominator, denominator: media.video.timeBase.numerator)
             func ticks(_ time: RationalTime) throws -> Int64 {
                 let pts = try time.adding(media.origin).multiplied(by: inverse)
@@ -549,6 +571,7 @@ public enum JPEGExport {
                 return pts.numerator
             }
             struct Job {
+                var profile: CGColorSpace? = nil
                 let picture: CIImage
                 let requests: Range<Int>
                 let pts: Int64
@@ -581,14 +604,23 @@ public enum JPEGExport {
                             }
                         }
                     }
-                    let picture = try autoreleasepool { try renderer.picture(at: pts, seekDTS: seekDTS, preset: preset) }
+                    var profile: CGColorSpace?
+                    let picture = try autoreleasepool {
+                        guard format != .jpeg else { return try renderer.picture(at: pts, seekDTS: seekDTS, preset: preset) }
+                        let source = try renderer.sourcePicture(at: pts, seekDTS: seekDTS, preset: preset)
+                        profile = source.profile
+                        return source.image
+                    }
                     previous = frame
                     repeat { next += 1 } while next < requests.count && requests[next].frame == frame
-                    jobs.append(Job(picture: picture, requests: first..<next, pts: pts))
+                    jobs.append(Job(profile: profile, picture: picture, requests: first..<next, pts: pts))
                 }
                 try forEachOrderedBatch(count: jobs.count, batchSize: 1, workerLimit: workers, check: control.check, transform: { range in
                     let job = jobs[range.lowerBound]
-                    return (job, try autoreleasepool { try renderer.encode(job.picture, preset: preset) })
+                    return (job, try autoreleasepool {
+                        guard let profile = job.profile else { return try renderer.encode(job.picture, preset: preset) }
+                        return try renderer.encode(job.picture, profile: profile, format: format)
+                    })
                 }, consume: { job, jpeg in
                     for i in job.requests {
                         try control.check()
@@ -693,8 +725,12 @@ final class JPEGRenderer {
     }()
     private static let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 
-    init(media: MediaInfo, control: JPEGControl) throws {
+    /// Lossless output renders at 16 bits per channel when the source has more than 8.
+    private let deep: Bool
+
+    init(media: MediaInfo, control: JPEGControl, lossless: Bool = false) throws {
         self.control = control
+        deep = lossless && media.video.bitDepth > 8
         var error = [CChar](repeating: 0, count: 256)
         let state = Unmanaged.passUnretained(control).toOpaque()
         guard let decoder = mp_jpeg_open(media.url.path, Int32(media.video.index), {
@@ -704,6 +740,7 @@ final class JPEGRenderer {
             throw CutError(code: "frame_export_failed", message: "Could not open the picture decoder: " + String(cString: error))
         }
         reader = decoder
+        if deep { mp_jpeg_set_deep(decoder, true) }
     }
     deinit { mp_jpeg_close(reader) }
 
@@ -748,6 +785,91 @@ final class JPEGRenderer {
     }
 }
 
+extension JPEGRenderer {
+    // Without a working space Core Image leaves R′G′B′ values as decoded, and a
+    // 32-bit float intermediate carries every 16-bit value through the geometry.
+    private static let sourceContext: CIContext = {
+        let options: [CIContextOption: Any] = [.cacheIntermediates: false, .workingColorSpace: NSNull(),
+                                               .workingFormat: CIFormat.RGBAf, .name: "MPCut Lossless Frame Export"]
+        guard let device = MTLCreateSystemDefaultDevice() else { return CIContext(options: options) }
+        return CIContext(mtlDevice: device, options: options)
+    }()
+
+    /// The decoded picture in display geometry, without tone mapping, and the profile that
+    /// describes its values: the color space Core Image reads from the source's color tags.
+    func sourcePicture(at pts: Int64, seekDTS: Int64, preset: JPEGPreset) throws -> (image: CIImage, profile: CGColorSpace) {
+        var buffer: CVPixelBuffer?
+        var error = [CChar](repeating: 0, count: 256)
+        guard mp_jpeg_frame(reader, pts, seekDTS, preset == .review ? 640 : 0, &buffer, &error, error.count) >= 0,
+              let buffer else {
+            try control.check()
+            throw CutError(code: "frame_export_failed", message: "Could not decode source picture at PTS \(pts): " + String(cString: error))
+        }
+        var image = CIImage(cvPixelBuffer: buffer)
+        func tag(_ key: CFString) -> String? { CVBufferCopyAttachment(buffer, key, nil) as? String }
+        let primaries = tag(kCVImageBufferColorPrimariesKey), transfer = tag(kCVImageBufferTransferFunctionKey)
+        let profile: CGColorSpace
+        // Name the two common still-image spaces. Core Image describes them as video profiles.
+        if transfer == (kCVImageBufferTransferFunction_sRGB as String),
+           primaries == (kCVImageBufferColorPrimaries_P3_D65 as String), let space = CGColorSpace(name: CGColorSpace.displayP3) {
+            profile = space
+        } else if transfer == (kCVImageBufferTransferFunction_sRGB as String),
+                  primaries == (kCVImageBufferColorPrimaries_ITU_R_709_2 as String) {
+            profile = StillImage.sRGB
+        } else {
+            profile = image.colorSpace ?? StillImage.sRGB
+        }
+        let display = mp_jpeg_display_size(reader)
+        let natural = CGAffineTransform(scaleX: display.width / image.extent.width,
+                                       y: display.height / image.extent.height)
+        let placement = natural.concatenating(displayTransform)
+        if !placement.isIdentity { image = image.transformed(by: placement) }
+        let extent = image.extent
+        guard extent.width.isFinite, extent.height.isFinite, extent.width >= 0.5, extent.height >= 0.5 else { throw Self.failure }
+        let scale = preset == .review ? min(1, 640 / max(extent.width, extent.height)) : 1
+        let width = max(1, (extent.width * scale).rounded()), height = max(1, (extent.height * scale).rounded())
+        guard width <= 65535, height <= 65535 else { throw Self.failure }
+        let rect = CGRect(x: 0, y: 0, width: width, height: height)
+        let fit = CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
+            .concatenating(CGAffineTransform(scaleX: width / extent.width, y: height / extent.height))
+        if !fit.isIdentity { image = image.transformed(by: fit, highQualityDownsample: true) }
+        return (image.cropped(to: rect), profile)
+    }
+
+    func encode(_ image: CIImage, profile: CGColorSpace, format: FrameImageFormat) throws -> Data {
+        let width = Int(image.extent.width), height = Int(image.extent.height)
+        let rowBytes = width * (deep ? 8 : 4)
+        var pixels = Data(count: rowBytes * height)
+        pixels.withUnsafeMutableBytes { bytes in
+            Self.sourceContext.render(image, toBitmap: bytes.baseAddress!, rowBytes: rowBytes, bounds: image.extent,
+                                      format: deep ? .RGBA16 : .RGBA8, colorSpace: nil)
+        }
+        var layout = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue)
+        if deep { layout.formUnion(.byteOrder16Little) }
+        guard let provider = CGDataProvider(data: pixels as CFData),
+              let picture = CGImage(width: width, height: height, bitsPerComponent: deep ? 16 : 8,
+                                    bitsPerPixel: deep ? 64 : 32, bytesPerRow: rowBytes, space: profile,
+                                    bitmapInfo: layout, provider: provider, decode: nil,
+                                    shouldInterpolate: false, intent: .defaultIntent) else { throw Self.failure }
+        return try format.encode(picture)
+    }
+}
+
+extension FrameImageFormat {
+    /// Writes a PNG or an LZW-compressed TIFF with the image's own depth and profile.
+    func encode(_ image: CGImage) throws -> Data {
+        let failure = CutError(code: "frame_export_failed", message: "Could not encode the selected picture as \(rawValue.uppercased()).")
+        let type = self == .png ? "public.png" : "public.tiff"
+        let data = NSMutableData()
+        guard self != .jpeg, let destination = CGImageDestinationCreateWithData(data, type as CFString, 1, nil) else { throw failure }
+        let properties: [CFString: Any] = self == .tiff
+            ? [kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFCompression: 5]] : [:]
+        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { throw failure }
+        return data as Data
+    }
+}
+
 extension JPEGExport {
     package static func writeProgramFrameDirectory<Manifest: Encodable>(
         to directory: URL, cancelled: @escaping @Sendable () -> Bool, validate: () throws -> Void,
@@ -760,15 +882,15 @@ extension JPEGExport {
 
     /// Renders one bounded review image using the same decoder, transforms and frame rules as JPEG export.
     package static func reviewFrame(_ media: MediaInfo, at time: RationalTime, exclusiveEnd: Bool,
-                                    preset: JPEGPreset = .review,
+                                    preset: JPEGPreset = .review, format: FrameImageFormat = .jpeg,
                                     cancelled: @escaping @Sendable () -> Bool) throws -> (Data, JPEGFrame) {
         let control = JPEGControl(cancelled)
         try control.check()
         try checkSource(media)
         let target = try stillFrameTime(in: media, at: time, exclusiveEnd: exclusiveEnd)
         var bytes: Data?
-        let frames = try renderReviewFrames(media, at: [target], preset: preset, control: control,
-                                            fileName: { _ in "review.jpg" }) { data, _ in
+        let frames = try renderReviewFrames(media, at: [target], preset: preset, format: format, control: control,
+                                            fileName: { _ in "review." + format.fileExtension }) { data, _ in
             bytes = data
         }
         guard let bytes, let frame = frames.first else { throw CutError(code: "no_frame", message: "No review frame was available.") }
@@ -778,24 +900,27 @@ extension JPEGExport {
     /// Writes requests in decode order while returning metadata in request order.
     /// Times are source frame starts selected by `stillFrameTime`.
     package static func writeReviewFrames(
-        _ media: MediaInfo, at times: [RationalTime], preset: JPEGPreset,
+        _ media: MediaInfo, at times: [RationalTime], preset: JPEGPreset, format: FrameImageFormat = .jpeg,
         cancelled: @escaping @Sendable () -> Bool, fileName: (Int) -> String,
         write: (Data, String) throws -> Void
     ) throws -> [JPEGFrame] {
         let control = JPEGControl(cancelled)
         try control.check()
         try checkSource(media)
-        return try renderReviewFrames(media, at: times, preset: preset, control: control, fileName: fileName, write: write)
+        return try renderReviewFrames(media, at: times, preset: preset, format: format, control: control,
+                                      fileName: fileName, write: write)
     }
 
     private static func renderReviewFrames(
-        _ media: MediaInfo, at times: [RationalTime], preset: JPEGPreset,
+        _ media: MediaInfo, at times: [RationalTime], preset: JPEGPreset, format: FrameImageFormat = .jpeg,
         control: JPEGControl, fileName: (Int) -> String, write: (Data, String) throws -> Void
     ) throws -> [JPEGFrame] {
         let selected = try plan(media, .times(times), useSidecar: false, cancelled: control.cancelled)
-        let frames = try render(media, ranges: selected.ranges, sample: .first, preset: preset, control: control,
+        let frames = try render(media, ranges: selected.ranges, sample: .first, preset: preset, format: format,
+                                control: control,
                                 fileName: fileName, progress: { _, _ in }) { data, name in
-            guard preset != .review || data.count <= 1_048_576 else {
+            // The review size limit belongs to the JPEG that tools return inline.
+            guard format != .jpeg || preset != .review || data.count <= 1_048_576 else {
                 throw CutError(code: "image_too_large", message: "The review JPEG exceeds 1 MiB.")
             }
             try write(data, name)

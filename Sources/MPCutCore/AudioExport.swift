@@ -220,13 +220,14 @@ public struct AudioExportEngine: Sendable {
         let (lane, duration) = try soundLane()
 
         var plan = try MulticamEngine(cancelled: cancelled)
-            .resolveConvertedSound(lane, duration: duration, container: container, action: action) { issue, index in
+            .resolveConvertedSound(lane, duration: duration, container: container, action: action,
+                                   keepsDoublePrecision: false) { issue, index in
                 guard issue.code != "cancelled", issue.code != "source_changed" else { return issue }
                 return CutError(code: issue.code, message: issue.message, segment: index + 1, boundary: issue.boundary,
                                 nearest: issue.nearest, track: issue.track ?? lane[index].stream).because(issue.reason)
             }
         let streams = sources.map(\.audio.stream)
-        let resampled = !plan.warnings.isEmpty
+        let resampled = plan.conformsSources
         let samples = try duration.roundedToSamples(plan.sampleRate)
         let seconds = Double(samples) / Double(plan.sampleRate)
         func estimatedSize(at bitRate: Int) -> Int64? {
@@ -250,14 +251,26 @@ public struct AudioExportEngine: Sendable {
                 if streams.contains(where: { $0.codec.hasPrefix("pcm_f64") }) {
                     warnings.append("The 64-bit floating-point source will be reduced to 32-bit float.")
                 }
+                if let wide = streams.compactMap(Self.integerDepth).max(), wide > 24 {
+                    warnings.append("The \(wide)-bit integer source is written as 32-bit float beside the floating-point source, which keeps 24 bits of it.")
+                }
             } else if let integerDepth {
                 codec = integerDepth <= 16 ? "pcm_s16le" : integerDepth <= 24 ? "pcm_s24le" : "pcm_s32le"
                 lossless = integerDepth <= 32
                 if integerDepth > 32 {
                     warnings.append("The \(integerDepth)-bit source will be reduced to 32-bit PCM.")
                 }
+            } else if streams.contains(where: { !Self.decodesToInteger($0) }) {
+                // A lossy decoder works in floating point and can exceed full scale. Integer PCM would clip there.
+                codec = "pcm_f32le"
+                if let wide = streams.compactMap(Self.integerDepth).max(), wide > 24 {
+                    warnings.append("The \(wide)-bit integer source is written as 32-bit float beside the decoded source, which keeps 24 bits of it.")
+                }
             } else {
                 codec = "pcm_s24le"
+                if let wide = streams.compactMap(Self.integerDepth).max(), wide > 24 {
+                    warnings.append("The \(wide)-bit source is resampled or remixed and will be reduced to 24-bit PCM.")
+                }
             }
             let bytes = codec == "pcm_s16le" ? 2 : codec == "pcm_s24le" ? 3 : 4
             written.codec = codec
@@ -282,6 +295,8 @@ public struct AudioExportEngine: Sendable {
                 lossless = true
             } else if streams.contains(where: { $0.codec.hasPrefix("pcm_f") }) {
                 warnings.append("FLAC stores integer samples. The floating-point source will be reduced to 24 bits, and samples above full scale will clip. Choose PCM to keep them.")
+            } else if let decoded = streams.first(where: { !Self.decodesToInteger($0) }) {
+                warnings.append("FLAC stores integer samples. Peaks of the decoded \(decoded.codec) source above full scale will clip. Choose PCM to keep them.")
             }
             written.codec = "flac"
             written.bitDepth = depth
@@ -294,6 +309,7 @@ public struct AudioExportEngine: Sendable {
             written.codec = "aac"
             written.bitRate = rate
             estimate = estimatedSize(at: rate)
+            if let note = Self.aacProfileChange(streams, bitRate: rate) { warnings.append(note) }
             plan.encoderArguments = ["-c:a", "aac", "-b:a", "\(rate)"]
         case .mp3:
             let profiles = native == .mp3 ? sources.compactMap { MP3Profile(media: $0.media, sound: $0.audio) } : []
@@ -320,6 +336,21 @@ public struct AudioExportEngine: Sendable {
             if plan.channels > 2 { plan.encoderArguments? += ["-mapping_family", "1"] }
         default:
             throw CutError(code: "invalid_arguments", message: "Choose auto, copy, aac, pcm, mp3, flac or opus for audio conversion.")
+        }
+        // The first source with a cover picture supplies it, where the output format holds one.
+        for (media, _) in sources {
+            let pictures = (indexed[media.url] ?? media).streams.filter { $0.kind == "attachment" && $0.disposition & 0x400 != 0 }
+            guard let picture = pictures.first else { continue }
+            if ["m4a", "mp4", "mp3", "flac"].contains(container), ["mjpeg", "png"].contains(picture.codec) {
+                plan.coverArt = .init(file: media.url, stream: picture.index)
+                // An MP3 file holds its picture in an ID3v2 tag.
+                if action == .mp3, let version = plan.encoderArguments?.firstIndex(of: "-id3v2_version") {
+                    plan.encoderArguments?[version + 1] = "3"
+                }
+            } else {
+                warnings.append("The cover art of \(media.url.lastPathComponent) cannot be carried in .\(container) and will be omitted.")
+            }
+            break
         }
         plan.muxer = container == "m4a" ? "ipod" : container == "mka" ? "matroska" : muxerName(container)
         plan.verifiesSampleRange = true
@@ -397,6 +428,60 @@ public struct AudioExportEngine: Sendable {
         }
         guard stream.codec == "flac" || stream.codec == "alac" else { return nil }
         return declaredDepth(stream) ?? 24
+    }
+
+    /// True when the decoder returns integer samples: integer and companded PCM and the lossless codecs.
+    /// Every other decoder works in floating point, so its output can exceed full scale and integer PCM would clip it.
+    static func decodesToInteger(_ stream: StreamInfo) -> Bool {
+        if stream.codec.hasPrefix("pcm_") { return !stream.codec.hasPrefix("pcm_f") }
+        return ExportRules.losslessAudioCodecs.contains(stream.codec)
+    }
+
+    /// The bit depth of a PCM codec name such as `pcm_s24le` or `pcm_f64le`.
+    static func pcmDepth(codec: String) -> Int? {
+        guard codec.hasPrefix("pcm_"), !codec.contains("law") else { return nil }
+        return Int(codec.dropFirst(5).prefix { $0.isNumber })
+    }
+
+    /// The built-in AAC encoder writes AAC-LC. Says so when a source uses a High Efficiency profile, whose
+    /// spectral band replication and parametric stereo are decoded and not written again.
+    static func aacProfileChange(_ streams: [StreamInfo], bitRate: Int) -> String? {
+        guard let name = streams.lazy.compactMap(highEfficiencyProfile).first else { return nil }
+        return "The \(name) source is re-encoded as AAC-LC at \(bitRate / 1000) kbps. The encoder does not write \(name)."
+    }
+
+    /// "HE-AAC" or "HE-AAC v2" when the AudioSpecificConfig of an AAC stream signals spectral band replication
+    /// or parametric stereo. A stream that signals neither, or only inside its frames, gives nil.
+    static func highEfficiencyProfile(_ stream: StreamInfo) -> String? {
+        guard stream.codec == "aac" else { return nil }
+        // FFmpeg profile numbers, when a decoder has stated one: 4 is HE-AAC and 28 is HE-AAC v2.
+        if stream.profile == 4 { return "HE-AAC" }
+        if stream.profile == 28 { return "HE-AAC v2" }
+        let bytes = [UInt8](stream.configuration)
+        var position = 0
+        func read(_ count: Int) -> Int? {
+            guard position + count <= bytes.count * 8 else { return nil }
+            var value = 0
+            for bit in position..<(position + count) { value = value << 1 | Int(bytes[bit / 8] >> (7 - bit % 8) & 1) }
+            position += count
+            return value
+        }
+        func objectType() -> Int? {
+            guard let short = read(5) else { return nil }
+            return short == 31 ? read(6).map { $0 + 32 } : short
+        }
+        func skipRate() -> Bool {
+            guard let index = read(4) else { return false }
+            return index != 15 || read(24) != nil
+        }
+        guard let type = objectType(), skipRate(), let channels = read(4) else { return nil }
+        if type == 5 { return "HE-AAC" }
+        if type == 29 { return "HE-AAC v2" }
+        // GASpecificConfig of AAC-LC and its relatives, then the backward-compatible extension.
+        guard [1, 2, 3, 4, 6, 7].contains(type), channels != 0, read(1) != nil, let core = read(1),
+              core == 0 || read(14) != nil, let extended = read(1), extended == 0,
+              read(11) == 0x2B7, objectType() == 5, read(1) == 1, skipRate() else { return nil }
+        return read(11) == 0x548 && read(1) == 1 ? "HE-AAC v2" : "HE-AAC"
     }
 
     /// The word length a stream states: its own field, or the codec header of FLAC and ALAC. Nil when neither states one.

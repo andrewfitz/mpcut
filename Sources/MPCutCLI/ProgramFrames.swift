@@ -25,11 +25,13 @@ struct ProgramFrameManifest: Encodable {
     let outputDirectory: String
     let duration: RationalTime
     let preset: JPEGPreset
+    var format: FrameImageFormat? = nil
     let frames: [Frame]
 }
 
 func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPath: String, location: URL,
                         at times: [RationalTime], clock: StillOptions.Clock?, to output: URL, preset: JPEGPreset,
+                        format: FrameImageFormat = .jpeg,
                         documentIdentity: SourceIdentity?,
                         useSidecar: Bool, cancelled: @escaping @Sendable () -> Bool) throws -> ProgramFrameManifest {
     guard project.participants.render == nil else {
@@ -117,7 +119,7 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
                 throw CutError(code: "invalid_range", message: "Frame time \(time) is outside the program.")
             }
             let span = timeline.spans[index]
-            let name = String(format: "frame-%06d.jpg", ordinal + 1)
+            let name = String(format: "frame-%06d.", ordinal + 1) + format.fileExtension
             let destination = staging.appendingPathComponent(name)
             if let placement = span.placementID {
                 if let rendered = renderedStills[placement] {
@@ -128,7 +130,7 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
                 }
                 let frame = try project.stillReviewFrame(placementID: placement, interval: span.output, document: location,
                                                          canvas: project.stillFormat == nil ? reference() : nil)
-                let jpeg = try frame.jpeg(preset: preset, cancelled: cancelled)
+                let jpeg = try frame.encoded(preset: preset, format: format, cancelled: cancelled)
                 try jpeg.data.write(to: destination, options: .withoutOverwriting)
                 renderedStills[placement] = (destination, frame.asset.id, jpeg.width, jpeg.height)
                 try record(frame.identity, at: frame.url)
@@ -182,7 +184,7 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
                         let frame = try StillReviewFrame(asset: asset, placementID: asset.id, framing: .fit,
                                                         interval: span.output, document: location, width: geometry.width,
                                                         height: geometry.height, displayAspect: geometry.aspect)
-                        let jpeg = try frame.jpeg(preset: preset, cancelled: cancelled)
+                        let jpeg = try frame.encoded(preset: preset, format: format, cancelled: cancelled)
                         try jpeg.data.write(to: destination, options: .withoutOverwriting)
                         try record(frame.identity, at: frame.url)
                         rendered = (destination, jpeg.width, jpeg.height)
@@ -218,6 +220,7 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
         }
         for (media, requests) in sourceBatches {
             let rendered = try JPEGExport.writeReviewFrames(media, at: requests.map(\.frameTime), preset: preset,
+                                                            format: format,
                                                             cancelled: cancelled, fileName: { requests[$0].name }) { jpeg, name in
                 try jpeg.write(to: staging.appendingPathComponent(name), options: .withoutOverwriting)
             }
@@ -229,6 +232,7 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
             }
         }
         return ProgramFrameManifest(clock: requiredClock.rawValue, projectPath: projectPath, outputDirectory: output.path,
-                                    duration: timeline.duration, preset: preset, frames: frames.compactMap { $0 })
+                                    duration: timeline.duration, preset: preset,
+                                    format: format == .jpeg ? nil : format, frames: frames.compactMap { $0 })
     }
 }

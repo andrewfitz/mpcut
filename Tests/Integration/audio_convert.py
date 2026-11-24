@@ -86,7 +86,7 @@ def six_tones(layout="5.1", tones=SPEAKER_TONES):
 
 
 class Wave:
-    """An integer PCM WAVE file, read without a decoder."""
+    """An integer or 32-bit float PCM WAVE file, read without a decoder."""
 
     def __init__(self, path):
         data = Path(path).read_bytes()
@@ -98,6 +98,8 @@ class Wave:
                 tag, self.channels, _, _, self.align, bits = struct.unpack_from("<HHIIHH", body)
                 self.width = bits // 8
                 self.mask = struct.unpack_from("<I", body, 20)[0] if tag == 0xFFFE else None
+                # Format 3 is IEEE float. An extensible header states it in the first word of its subformat.
+                self.floating = (struct.unpack_from("<H", body, 24)[0] if tag == 0xFFFE else tag) == 3
             elif name == b"data":
                 self.body = body
                 self.frames = len(body) // self.align
@@ -108,6 +110,8 @@ class Wave:
     def window(self, channel, start, count):
         scale = float(1 << (8 * self.width - 1))
         first = start * self.align + channel * self.width
+        if self.floating:
+            return [struct.unpack_from("<f", self.body, at)[0] for at in range(first, first + count * self.align, self.align)]
         return [int.from_bytes(self.body[at:at + self.width], "little", signed=True) / scale
                 for at in range(first, first + count * self.align, self.align)]
 
@@ -229,9 +233,10 @@ class AudioConversionTests(unittest.TestCase):
         self.assertEqual({**planned, "dry_run": False}, report)
         self.assertEqual((report["mode"], report["tracks"], report["container"]), ("encode", "audio", "wav"))
         action = report["audio_actions"][0]
-        self.assertEqual((action["action"], action["codec"], action["bit_depth"]), ("pcm", "pcm_s24le", 24))
+        # A lossy decoder works in floating point, so its PCM is written as float and keeps peaks above full scale.
+        self.assertEqual((action["action"], action["codec"], action["bit_depth"]), ("pcm", "pcm_f32le", 32))
         self.assertEqual([s["track_actions"][0]["action"] for s in report["segments"]], ["encode", "encode"])
-        self.assertEqual(self.stream(result)["codec_name"], "pcm_s24le")
+        self.assertEqual(self.stream(result)["codec_name"], "pcm_f32le")
         expected = kept(pcm16(self.mp3), CUTS)
         decoded = pcm16(result)
         self.assertEqual(len(decoded), len(expected))
@@ -247,6 +252,113 @@ class AudioConversionTests(unittest.TestCase):
         mask = os.umask(0)
         os.umask(mask)
         return mask
+
+    @staticmethod
+    def peak(path):
+        decoded = array("f", ffmpeg("-i", path, "-map", "0:a:0", "-c:a", "pcm_f32le", "-f", "f32le", "-"))
+        return max(abs(value) for value in decoded)
+
+    def test_pcm_from_a_lossy_source_keeps_peaks_above_full_scale(self):
+        # A full-scale square wave at a low rate decodes well above full scale.
+        square = "aevalsrc=0.999*sgn(sin(2*PI*997*t))|0.999*sgn(sin(2*PI*1499*t)):s=48000:d=3"
+        hot = self.root / "hot.m4a"
+        ffmpeg("-f", "lavfi", "-i", square, "-c:a", "aac", "-b:a", "64k", hot)
+        self.assertGreater(self.peak(hot), 1.2)
+        cuts = [("0", "3")]
+        result, report = self.export(hot, "hot.wav", "--audio", "pcm", cuts=cuts)
+        action = report["audio_actions"][0]
+        self.assertEqual((action["codec"], action["bit_depth"]), ("pcm_f32le", 32))
+        self.assertEqual(report["warnings"], [])
+        self.assertAlmostEqual(self.peak(result), self.peak(hot), places=4)
+        # FLAC holds integers, so the plan says that the peaks clip there.
+        result, report = self.export(hot, "hot.flac", "--audio", "flac", cuts=cuts)
+        self.assertTrue(any("above full scale will clip" in warning for warning in report["warnings"]), report["warnings"])
+        self.assertLessEqual(self.peak(result), 1.0)
+        # Integer and lossless sources keep their integer word length.
+        _, report = self.export(self.flac24, "integer.wav", "--audio", "pcm", cuts=cuts)
+        self.assertEqual((report["audio_actions"][0]["codec"], report["warnings"]), ("pcm_s24le", []))
+
+    def test_pcm_join_states_each_reduction_of_word_length(self):
+        tones = TONES.format(rate=48_000, length=2)
+        wide, other, floating = self.root / "wide.wav", self.root / "wide-44k.wav", self.root / "floating.wav"
+        ffmpeg("-f", "lavfi", "-i", tones, "-c:a", "pcm_s32le", wide)
+        ffmpeg("-f", "lavfi", "-i", TONES.format(rate=44_100, length=2), "-c:a", "pcm_s32le", other)
+        ffmpeg("-f", "lavfi", "-i", tones, "-c:a", "pcm_f32le", floating)
+
+        def join(name, *sources):
+            clips = [item for source in sources for item in ("--clip", source)]
+            return self.cli("export", "clips", "join", "--json", "--no-sidecar", "--dry-run", "--mode", "encode",
+                            "--audio", "pcm", "--output", self.root / name, *clips)
+
+        same = join("same.wav", wide, wide)
+        self.assertEqual((same["audio_actions"][0]["codec"], same["warnings"]), ("pcm_s32le", []))
+        resampled = join("resampled.wav", wide, other)
+        self.assertEqual(resampled["audio_actions"][0]["codec"], "pcm_s24le")
+        self.assertTrue(any("32-bit source" in warning and "24-bit PCM" in warning for warning in resampled["warnings"]),
+                        resampled["warnings"])
+        mixed = join("mixed.wav", wide, floating)
+        self.assertEqual(mixed["audio_actions"][0]["codec"], "pcm_f32le")
+        self.assertTrue(any("32-bit integer source" in warning and "keeps 24 bits" in warning for warning in mixed["warnings"]),
+                        mixed["warnings"])
+
+    def test_aac_conversion_names_a_high_efficiency_source(self):
+        source, high = self.root / "plain.wav", self.root / "high.m4a"
+        ffmpeg("-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=4", "-ac", "2", "-c:a", "pcm_s16le", source)
+        # The system encoder writes HE-AAC, which the FFmpeg build under test may not.
+        run(["afconvert", "-f", "m4af", "-d", "aach", "-b", "48000", source, high])
+        self.assertEqual(self.stream(high)["profile"], "HE-AAC")
+        result, report = self.export(high, "low.m4a", "--audio", "aac", cuts=[("0", "2")])
+        self.assertTrue(any("HE-AAC source is re-encoded as AAC-LC" in warning for warning in report["warnings"]),
+                        report["warnings"])
+        self.assertEqual(self.stream(result)["profile"], "LC")
+        # An AAC-LC source is written in its own profile, and nothing is said.
+        _, report = self.export(self.m4a, "plain.m4a", "--audio", "aac", dry_run=True)
+        self.assertFalse(any("AAC-LC" in warning for warning in report["warnings"]), report["warnings"])
+
+    def test_cover_art_follows_a_conversion_into_formats_that_hold_it(self):
+        cover = self.root / "cover.png"
+        ffmpeg("-f", "lavfi", "-i", "color=c=blue:s=64x36:d=1", "-frames:v", "1", cover)
+
+        def picture(path):
+            return ffmpeg("-i", path, "-map", "0:v:0", "-c", "copy", "-f", "image2pipe", "-")
+
+        def covered(source, name, *muxer):
+            target = self.root / name
+            ffmpeg("-i", source, "-i", cover, "-map", "0:a", "-map", "1:v", "-c:a", "copy", "-c:v", "mjpeg",
+                   "-disposition:v", "attached_pic", *muxer, target)
+            return target
+
+        cuts = [("0", "2")]
+        art_mp3 = covered(self.mp3, "art.mp3", "-id3v2_version", "3")
+        art_m4a = covered(self.m4a, "art.m4a")
+        for source, plain, treatment, name in ((art_mp3, self.mp3, "aac", "art-out.m4a"), (art_m4a, self.m4a, "mp3", "art-out.mp3"),
+                                               (art_m4a, self.m4a, "flac", "art-out.flac"), (art_mp3, self.mp3, "mp3", "art-same.mp3")):
+            with self.subTest(source=source.name, output=name):
+                result, report = self.export(source, name, "--audio", treatment, cuts=cuts)
+                streams = probe(result, "-show_streams")["streams"]
+                self.assertEqual([stream["codec_type"] for stream in streams], ["audio", "video"])
+                self.assertEqual(streams[1]["disposition"]["attached_pic"], 1)
+                self.assertEqual(picture(result), picture(source))
+                self.assertFalse(any("cover art" in warning for warning in report["warnings"]), report["warnings"])
+                # The picture changes nothing in the sound: the same conversion of the bare source decodes alike.
+                bare, _ = self.export(plain, "bare-" + name, "--audio", treatment, cuts=cuts)
+                self.assertEqual(pcm16(result), pcm16(bare))
+        # A source that has chapters too lends only its picture. Its chapter times belong to the source timeline.
+        listed, book = self.root / "book.ffmeta", self.root / "book.m4a"
+        listed.write_text(";FFMETADATA1\n" + "".join(
+            f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={start + 6000}\ntitle=Part {start // 6000 + 1}\n" for start in (0, 6000)))
+        ffmpeg("-i", art_m4a, "-i", listed, "-map", "0", "-map_chapters", "1", "-c", "copy", book)
+        self.assertEqual(len(probe(book, "-show_chapters")["chapters"]), 2)
+        for treatment, name in (("aac", "book-out.m4a"), ("mp3", "book-out.mp3")):
+            with self.subTest(source=book.name, output=name):
+                result, _ = self.export(book, name, "--audio", treatment, cuts=cuts)
+                self.assertEqual(probe(result, "-show_chapters")["chapters"], [])
+                self.assertEqual([stream["codec_type"] for stream in probe(result, "-show_streams")["streams"]], ["audio", "video"])
+        # WAV holds no picture, and the plan says that it is left out.
+        result, report = self.export(art_mp3, "art-out.wav", "--audio", "pcm", cuts=cuts)
+        self.assertTrue(any("cover art of art.mp3 cannot be carried in .wav" in warning for warning in report["warnings"]),
+                        report["warnings"])
+        self.assertEqual([stream["codec_type"] for stream in probe(result, "-show_streams")["streams"]], ["audio"])
 
     def test_reordered_and_repeated_ranges_keep_their_samples(self):
         cuts = [("9", "11.5"), ("1", "3"), ("9", "10")]
@@ -861,12 +973,12 @@ class AudioConversionTests(unittest.TestCase):
         self.index_header(surround, earlier)
         self.assertEqual(self.layout(surround), (6, "5.1"))
         renewed = self.index_header(surround)
-        self.assertEqual((renewed["probe_revision"], renewed["streams"][0]["info"]["channel_layout"]), (9, "5.1"))
+        self.assertEqual((renewed["probe_revision"], renewed["streams"][0]["info"]["channel_layout"]), (10, "5.1"))
         self.assertGreater(renewed["audio"][0]["coded_bytes"], 0)
         # Every retired probe revision is rebuilt, including ordinary AAC movies.
         self.index_header(aac, earlier)
         self.assertEqual(rate(aac, "aac"), 96_000)
-        self.assertEqual(self.index_header(aac)["probe_revision"], 9)
+        self.assertEqual(self.index_header(aac)["probe_revision"], 10)
 
         # Revision 8 adds decoded packet counts to lossless tracks. Revision 9
         # changes the end points of H.264 and HEVC and reads MOV-family files
@@ -874,7 +986,7 @@ class AudioConversionTests(unittest.TestCase):
         flac = folder / "soundtrack.flac"
         ffmpeg("-i", aac, "-map", "0:a:0", "-c:a", "flac", flac)
         self.layout(flac)
-        for source, expected in [(surround, 7), (flac, 9), (aac, 9)]:
+        for source, expected in [(surround, 7), (flac, 10), (aac, 10)]:
             self.index_header(source, lambda header: header.update(probe_revision=7))
             self.layout(source)
             self.assertEqual(self.index_header(source)["probe_revision"], expected)

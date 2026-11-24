@@ -197,18 +197,20 @@ class MulticamTests(unittest.TestCase):
     def test_copy_alternatives_validate_ranges_clipped_at_the_original_switch(self):
         wide = self.root / "select-wide.mov"
         close = self.root / "select-close.mov"
-        # Reordered pictures keep both edges of a copy on keyframes: an outgoing angle ends only before one.
-        # Without them every picture is a verified end, and only the incoming start would restrict the switch.
-        for source, keyframes in [(wide, "0,1,2,3"), (close, "0,1,1.04,2,3")]:
+        # With three B pictures between anchors, a copy of a camera whose keyframe is at picture 25 can end
+        # before pictures 25, 26 and 30, but not before 27: the B picture 26 is coded after picture 29.
+        # The switch at 1.08, picture 27, is therefore an end only for the camera with a keyframe there.
+        # Without reordering every picture is a verified end, and only the incoming start would restrict it.
+        for source, keyframes in [(wide, "0,1,2,3"), (close, "0,1,1.08,2,3")]:
             ffmpeg("-f", "lavfi", "-i", "testsrc2=d=4:s=320x96:r=25", "-c:v", "libx264",
                    "-threads", "1", "-x264-params", "keyint=100:min-keyint=1:scenecut=0:open-gop=0:bframes=3:b-adapt=0",
                    "-force_key_frames", keyframes, source)
             self.assertIn("B", picture_types(source))
         first = {"group_time": "0", "angle_id": "wide"}
-        switch = {"group_time": "1.04", "angle_id": "close"}
+        switch = {"group_time": "1.08", "angle_id": "close"}
         for outgoing, incoming, clipped, expected in [
-            (wide, close, {"from": "1.04", "to": "3"}, 1),
-            (close, wide, {"from": "0", "to": "1.04"}, 2),
+            (wide, close, {"from": "1.08", "to": "3"}, 1),
+            (close, wide, {"from": "0", "to": "1.08"}, 2),
         ]:
             with self.subTest(clipped=clipped):
                 ranges = [{"from": "0", "to": "3"}, clipped]
@@ -436,7 +438,10 @@ class MulticamTests(unittest.TestCase):
                 self.assertEqual(failure["code"], "invalid_cut_project")
 
     def test_smart_trim_encodes_edges_and_keeps_interior_video(self):
-        # Cameras that reorder pictures end a copy only before a keyframe, so both sides of each switch are encoded.
+        # Cameras that reorder pictures end a copy only where every earlier-coded picture also presents earlier:
+        # with three B pictures that is before pictures 25, 26, 30, 34 and so on of a group that starts at 25.
+        # The outgoing side of each switch is encoded from its last such point, 30 and 67, and the incoming side
+        # up to its next keyframe.
         # The class cameras do not reorder: each may end at any picture, and only the two starts inside a picture
         # group are encoded, up to the next keyframe. Rows: cameras, encoded duration, encoded edges and action of
         # each picture interval, then the copied and the encoded pictures as (camera, picture numbers).
@@ -448,10 +453,11 @@ class MulticamTests(unittest.TestCase):
             ([self.wide, self.close], Fraction(24, 25),
              [[], [(Fraction(32, 25), 2)], [(Fraction(69, 25), 3)]], ["copy", "copy_and_encode", "copy_and_encode"],
              [(0, range(32)), (1, range(50, 69)), (0, range(75, 100))], [(1, 32), (0, 69)]),
-            (reordered, 2,
-             [[(1, Fraction(32, 25))], [(Fraction(32, 25), Fraction(69, 25))], [(Fraction(69, 25), 3)]],
-             ["copy_and_encode", "encode", "copy_and_encode"],
-             [(0, range(25)), (0, range(75, 100))], [(0, 25), (1, 32), (1, 50), (0, 69)]),
+            (reordered, Fraction(28, 25),
+             [[(Fraction(30, 25), Fraction(32, 25))], [(Fraction(32, 25), 2), (Fraction(67, 25), Fraction(69, 25))],
+              [(Fraction(69, 25), 3)]],
+             ["copy_and_encode", "copy_and_encode", "copy_and_encode"],
+             [(0, range(30)), (1, range(50, 67)), (0, range(75, 100))], [(0, 30), (1, 32), (1, 67), (0, 69)]),
         ]:
             with self.subTest(wide=cameras[0].name):
                 self.output = self.root / f"program-{cameras[0].stem}.mov"

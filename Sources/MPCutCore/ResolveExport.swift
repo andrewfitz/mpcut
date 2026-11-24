@@ -70,41 +70,46 @@ public final class ResolveExport {
         _ = try ProjectConverter.prepareForInterchange(project, for: "DaVinci Resolve timeline handoff", allowLoss: false)
     }
 
+    /// Each `write` returns what the timeline could not keep exactly, such as a cut rounded to the frame grid.
+    @discardableResult
     public static func write(_ project: CutProject, relativeTo location: URL, to output: URL,
                              useSidecar: Bool = true, matching imported: [MediaInfo] = [],
                              matchingMulticam indexed: [String: MediaInfo] = [:],
                              auxiliaryOutput: ((URL) -> Void)? = nil,
-                             cancelled: (@Sendable () -> Bool)? = nil) throws {
+                             cancelled: (@Sendable () -> Bool)? = nil) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled ?? { false })
         switch project {
         case .multicam(let group):
-            try write(group, relativeTo: location, to: output, useSidecar: useSidecar, matching: indexed,
-                      auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
+            return try write(group, relativeTo: location, to: output, useSidecar: useSidecar, matching: indexed,
+                             auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
         case .sequence, .stillSequence:
             try validateTimelineHandoff(project)
             let clips = project.sequenceClips ?? []
             let sequence = CutProject.sequence(clips)
             try InterchangeMediaPreflight.require(clips.map(\.file), relativeTo: location)
-            try write(sequence.requests(relativeTo: location), to: output, useSidecar: useSidecar, matching: imported,
-                      auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
+            return try write(sequence.requests(relativeTo: location), to: output, useSidecar: useSidecar, matching: imported,
+                             auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
         }
     }
 
+    @discardableResult
     public static func write(_ project: MulticamProject, relativeTo location: URL, to output: URL,
                              useSidecar: Bool = true, matching imported: [String: MediaInfo] = [:],
                              auxiliaryOutput: ((URL) -> Void)? = nil,
-                             cancelled: (@Sendable () -> Bool)? = nil) throws {
+                             cancelled: (@Sendable () -> Bool)? = nil) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled ?? { false })
         try validateTimelineHandoff(.multicam(project))
         let writer = try ResolveExport(output, useSidecar: useSidecar, cancelled: cancelled)
         try InterchangeMediaPreflight.require(project.sources.map(\.file), relativeTo: location)
         try writer.multicam(project, location: location, imported: imported)
         if let audio = writer.audioDirectory { auxiliaryOutput?(audio) }
+        return writer.warnings
     }
 
+    @discardableResult
     public static func write(_ clips: [ClipRequest], to output: URL, useSidecar: Bool = true, matching imported: [MediaInfo] = [],
                              auxiliaryOutput: ((URL) -> Void)? = nil,
-                             cancelled: (@Sendable () -> Bool)? = nil) throws {
+                             cancelled: (@Sendable () -> Bool)? = nil) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled ?? { false })
         let writer = try ResolveExport(output, useSidecar: useSidecar, cancelled: cancelled)
         try InterchangeMediaPreflight.require(clips.map(\.file))
@@ -112,6 +117,7 @@ public final class ResolveExport {
         try writer.remember(imported.filter { dependencies.contains($0.url.standardizedFileURL) })
         try writer.sequence(clips)
         if let audio = writer.audioDirectory { auxiliaryOutput?(audio) }
+        return writer.warnings
     }
 
     static func writeFCP(_ project: CutProject, relativeTo location: URL, to xml: URL,
@@ -208,7 +214,8 @@ public final class ResolveExport {
 
     private func framePosition(_ time: RationalTime, rate: RationalTime) throws -> RationalTime {
         let aligned = try time.onFrameGrid(rate)
-        if aligned != time && fcpDocument {
+        if aligned != time {
+            // A Resolve timeline is rounded the same way as a Final Cut Pro document, so it says so too.
             let message = "Timeline cut at \(time)s rounds to \(aligned)s at \(rate) fps."
             try warnLoss(message)
         }
@@ -313,8 +320,18 @@ public final class ResolveExport {
         let stem = media.url.deletingPathExtension().lastPathComponent
         let file = directory.appendingPathComponent("\(assets.count + 1) \(stem) - stream \(stream.index).wav")
         let helper = try ReencodeEngine.findHelper(override: nil)
+        // Integer and lossless sound keeps its word length, and 64-bit float stays 64-bit. Decoded lossy sound and
+        // 32-bit float are written as 32-bit float, which holds a lossy decoder's peaks above full scale.
+        var codec = AudioExportEngine.moviePCM([stream]).codec
+        if stream.codec.hasPrefix("pcm_f64") {
+            if (try? AudioExportEngine.requireEncoder(named: "pcm_f64le", helper: helper)) != nil {
+                codec = "pcm_f64le"
+            } else {
+                try warnLoss("The 64-bit floating-point audio of \(media.url.lastPathComponent) stream \(stream.index) is isolated as 32-bit float.")
+            }
+        }
         try ReencodeEngine(cancelled: cancelled).runHelper(helper, arguments: [
-            "-n", "-i", media.url.path, "-map", "0:\(stream.index)", "-c:a", "pcm_f32le", "-rf64", "auto", file.path
+            "-n", "-i", media.url.path, "-map", "0:\(stream.index)", "-c:a", codec, "-rf64", "auto", file.path
         ], in: directory)
         let result = try AnalysisSidecar.$automaticWritesEnabled.withValue(false) { try engine.inspectSummary(file) }
         soundFiles[media.url, default: [:]][stream.index] = result

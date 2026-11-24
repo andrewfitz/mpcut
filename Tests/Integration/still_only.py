@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify standalone still authoring, exact picture timing, and tagged delivery."""
 import argparse
+from array import array
 from fractions import Fraction
 import json
 import os
@@ -11,7 +12,7 @@ import unittest
 import wave
 from xml.etree import ElementTree
 
-from media_regression import ffmpeg, probe, run
+from media_regression import ffmpeg, probe, run, sample_hashes
 from saved_project import read_project, saved_file, saved_text
 
 CLI = None
@@ -97,7 +98,7 @@ class StillOnlyTests(unittest.TestCase):
             restored = nested / "Restored.cut"
             run([CLI, "project", "convert", xml, "--output", restored])
             original = read_project(cut)
-            result = json.loads(restored.read_text())
+            result = read_project(restored)
             for project in (original, result):
                 for clip in project["clips"]:
                     still = clip["still"]
@@ -152,6 +153,31 @@ class StillOnlyTests(unittest.TestCase):
             result = subprocess.run([*command, "1001/15000", "--json"], capture_output=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(cut.read_bytes(), original)
+
+    def test_gain_map_still_shows_its_sdr_base_on_an_sdr_timeline(self):
+        # The fixtures' SDR base holds linear 0.5 and SDR white. Their HDR rendition holds 0.5 and 4.0,
+        # which the SDR shoulder would put at 248 instead of white.
+        fixtures = Path(__file__).with_name("fixtures") / "stills"
+        with tempfile.TemporaryDirectory(prefix="mpcut-gain-map-sdr-") as directory:
+            root = Path(directory)
+            for suffix in ("jpeg", "heic"):
+                with self.subTest(codec=suffix):
+                    cut = root / f"{suffix}.cut"
+                    run([CLI, "still", "project", "create", "--out-project", cut, "--image", fixtures / f"gain-map.{suffix}",
+                         "--width", "64", "--height", "64", "--rate", "30", "--codec", "h264", "--container", "mp4",
+                         "--color", "sdr", "--frames", "30", "--json"])
+                    review = root / f"{suffix}-review"
+                    report = json.loads(run([CLI, "review", "frames", "export", "--json", "--project", cut,
+                                             "--preset", "full", "--at", "0", "--output", review]))
+                    movie = root / f"{suffix}.mp4"
+                    run([CLI, "export", "project", "render", "--project", cut, "--output", movie, "--json"],
+                        allow_diagnostics=True)
+                    for picture in (review / report["frames"][0]["file"], movie):
+                        pixels = ffmpeg("-i", picture, "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-")
+                        self.assertEqual(len(pixels), 64 * 64 * 3)
+                        middle, white = (pixels[(32 * 64 + x) * 3] for x in (16, 48))
+                        self.assertAlmostEqual(middle, 185, delta=6, msg=picture.name)
+                        self.assertGreaterEqual(white, 253, msg=picture.name)
 
     def test_generated_delivery(self):
         with tempfile.TemporaryDirectory(prefix="mpcut-still-only-") as directory:
@@ -230,6 +256,113 @@ class StillOnlyTests(unittest.TestCase):
             self.assertEqual(stream["color_transfer"], "smpte2084")
             self.assertEqual(int(stream["nb_read_frames"]), 5)
             self.assertEqual(Fraction(stream["time_base"]) * int(stream["duration_ts"]), Fraction(1001, 6000))
+
+    def soundtrack_export(self, root, cover, recording, container, *options, codec="h264"):
+        """Renders a one-picture project whose soundtrack is `recording`, and returns the movie and its sound action."""
+        folder = Path(tempfile.mkdtemp(dir=root))
+        project = folder / "cover.cut"
+        run([CLI, "still", "project", "create", "--out-project", project, "--image", cover, "--width", "64", "--height", "36",
+             "--rate", "30", "--codec", codec, "--container", container, "--soundtrack", recording, "--fit-soundtrack", "--json"],
+            allow_diagnostics=True)
+        output = folder / f"cover.{container}"
+        report = json.loads(run([CLI, "export", "project", "render", "--project", project, "--output", output,
+                                 "--no-sidecar", "--json", *options], allow_diagnostics=True, timeout=120))
+        action, = report["sound_actions"]
+        return output, action
+
+    def test_lossless_soundtracks_keep_every_sample_in_each_still_target(self):
+        def samples(path):
+            return ffmpeg("-i", path, "-map", "0:a:0", "-c:a", "pcm_s32le", "-f", "s32le", "-")
+
+        with tempfile.TemporaryDirectory(prefix="mpcut-still-lossless-soundtrack-") as directory:
+            root = Path(directory)
+            cover = root / "cover.png"
+            ffmpeg("-f", "lavfi", "-i", "color=blue:size=64x36", "-frames:v", "1", cover)
+            # Each channel has its own tone, and detail below 16 bits that a 24-bit path must keep.
+            tones = ("aevalsrc=0.6*sin(2*PI*440*t)+0.0000311*sin(2*PI*7919*t)"
+                     "|0.5*sin(2*PI*661*t)+0.0000207*sin(2*PI*5003*t):s=48000:d=1")
+            wide = ["-sample_fmt", "s32", "-bits_per_raw_sample", "24"]
+            planar = ["-sample_fmt", "s32p", "-bits_per_raw_sample", "24"]
+            recordings = [("flac16.mka", 16, ["-c:a", "flac", "-sample_fmt", "s16"]),
+                          ("flac24.mka", 24, ["-c:a", "flac", *wide]),
+                          ("flac24.m4a", 24, ["-c:a", "flac", *wide, "-strict", "-2", "-f", "mp4"]),
+                          ("alac16.m4a", 16, ["-c:a", "alac", "-sample_fmt", "s16p"]),
+                          ("alac24.mov", 24, ["-c:a", "alac", *planar]),
+                          ("alac24.mka", 24, ["-c:a", "alac", *planar])]
+            targets = [("mov", [], "alac"), ("mov", ["--audio", "pcm"], "pcm_s{depth}le"), ("mp4", [], "alac"),
+                       ("m4v", ["--audio", "alac"], "alac"), ("mp4", ["--audio", "flac"], "flac"), ("mkv", [], "flac")]
+            for name, depth, encoder in recordings:
+                recording = root / name
+                ffmpeg("-f", "lavfi", "-i", tones, *encoder, recording)
+                expected = samples(recording)
+                self.assertEqual(len(expected), 48000 * 2 * 4)
+                if depth == 24:
+                    # The fixture uses the low byte of its 24 bits, so a 16-bit path would fail the comparison.
+                    self.assertTrue(any(expected[1::4]))
+                for container, options, codec in targets:
+                    with self.subTest(recording=name, container=container, options=options):
+                        output, action = self.soundtrack_export(root, cover, recording, container, *options)
+                        written = probe(output, "-select_streams", "a:0", "-show_streams")["streams"][0]
+                        self.assertEqual(written["codec_name"], codec.format(depth=depth))
+                        self.assertEqual(samples(output), expected)
+                        self.assertEqual(action["warnings"], [])
+                        if action["audio"] != "copy":
+                            self.assertEqual((action["codec"], action["bit_depth"]), (codec.format(depth=depth), depth))
+
+    def test_lossy_soundtrack_is_copied_by_default_and_converted_without_clipping(self):
+        with tempfile.TemporaryDirectory(prefix="mpcut-still-lossy-soundtrack-") as directory:
+            root = Path(directory)
+            cover = root / "cover.png"
+            recording = root / "recording.m4a"
+            ffmpeg("-f", "lavfi", "-i", "color=blue:size=64x36", "-frames:v", "1", cover)
+            # A full-scale square wave at a low rate decodes well above full scale.
+            ffmpeg("-f", "lavfi", "-i", "aevalsrc=0.999*sgn(sin(2*PI*997*t))|0.999*sgn(sin(2*PI*1499*t)):s=48000:d=2",
+                   "-c:a", "aac", "-b:a", "64k", recording)
+
+            def peak(path):
+                decoded = array("f", ffmpeg("-i", path, "-map", "0:a:0", "-c:a", "pcm_f32le", "-f", "f32le", "-"))
+                return max(abs(value) for value in decoded)
+
+            self.assertGreater(peak(recording), 1.2)
+            source_packets = sample_hashes(recording, "a:0")
+            for container in ("mov", "mp4", "mkv"):
+                with self.subTest(container=container):
+                    output, action = self.soundtrack_export(root, cover, recording, container)
+                    self.assertEqual((action["audio"], action["codec"], action["treatment"]), ("copy", "aac", "copied packets"))
+                    self.assertEqual(sample_hashes(output, "a:0"), source_packets)
+            # AC-3 is copied too, from a raw stream and from a transport stream.
+            for name, muxer in (("dolby.ac3", []), ("dolby.ts", ["-f", "mpegts"])):
+                dolby = root / name
+                ffmpeg("-f", "lavfi", "-i", "aevalsrc=0.4*sin(2*PI*440*t)|0.3*sin(2*PI*661*t):s=48000:d=2", "-c:a", "ac3", *muxer, dolby)
+                dolby_packets = sample_hashes(dolby, "a:0")
+                for container in ("mov", "mkv"):
+                    with self.subTest(recording=name, container=container):
+                        output, action = self.soundtrack_export(root, cover, dolby, container)
+                        self.assertEqual((action["audio"], action["codec"]), ("copy", "ac3"))
+                        self.assertEqual(sample_hashes(output, "a:0"), dolby_packets)
+
+            # PCM from a lossy decoder is float, so the peaks above full scale survive.
+            output, action = self.soundtrack_export(root, cover, recording, "mov", "--audio", "pcm")
+            self.assertEqual((action["audio"], action["codec"], action["bit_depth"]), ("pcm", "pcm_f32le", 32))
+            self.assertEqual(probe(output, "-select_streams", "a:0", "-show_streams")["streams"][0]["codec_name"], "pcm_f32le")
+            self.assertAlmostEqual(peak(output), peak(recording), places=4)
+            # ALAC and FLAC hold integers. The plan says that the peaks clip there.
+            for container, treatment in (("mov", "alac"), ("mkv", "flac")):
+                output, action = self.soundtrack_export(root, cover, recording, container, "--audio", treatment)
+                self.assertEqual((action["audio"], action["bit_depth"]), (treatment, 24))
+                self.assertTrue(any("Peaks above full scale clip" in warning for warning in action["warnings"]), action["warnings"])
+                self.assertLessEqual(peak(output), 1.0)
+            # A converted AAC track reports the rate it is encoded at.
+            output, action = self.soundtrack_export(root, cover, recording, "mov", "--audio", "aac")
+            self.assertEqual((action["audio"], action["codec"]), ("aac", "aac"))
+            self.assertEqual(action["bit_rate"], 192000)
+
+            # A lossy codec outside the measured set is decoded as before, and the action says so.
+            other = root / "recording.mp3"
+            ffmpeg("-i", recording, "-c:a", "libmp3lame", "-b:a", "128k", other)
+            output, action = self.soundtrack_export(root, cover, other, "mov")
+            self.assertEqual((action["audio"], action["treatment"]), ("alac", "decoded source audio"))
+            self.assertTrue(any("mp3 source is decoded" in warning for warning in action["warnings"]), action["warnings"])
 
 
 if __name__ == "__main__":

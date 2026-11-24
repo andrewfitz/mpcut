@@ -1183,7 +1183,8 @@ public struct ExportPlanner: Sendable {
                 let container = request.container ?? ExportRules.defaultReencodeContainer(request.codec)
                 let settings = ReencodeSettings(codec: request.codec, quality: request.quality, audio: request.audio)
                 return .conversion(try ReencodeEngine(cancelled: cancelled)
-                    .resolve(request.clips, output: output, media: media, container: container, settings: settings))
+                    .resolve(request.clips, output: output, media: media, container: container, settings: settings,
+                             carryingChapters: true))
             case .copy, .smart:
                 let engine = CutEngine(cancelled: cancelled, smartTrim: cell.resolvedMode == .smart, useSidecar: useSidecar,
                                        tracks: request.tracks, audioStream: request.audioStream,

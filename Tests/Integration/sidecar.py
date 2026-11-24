@@ -462,7 +462,9 @@ os._exit(0)
             digest = subprocess.check_output(["ffmpeg", "-v", "error", "-i", output, "-map", "0:v:0", "-map", "0:a",
                                               "-f", "streamhash", "-hash", "sha256", "-"], text=True,
                                              timeout=120)
-            self.assertEqual(len(digest.splitlines()), 3)
+            # FFmpeg 9.1 prints "#" header lines before the per-stream hashes.
+            digest = [line for line in digest.splitlines() if line and not line.startswith("#")]
+            self.assertEqual(len(digest), 3)
             hashes.append(digest)
         self.assertEqual(hashes[0], hashes[1])
 

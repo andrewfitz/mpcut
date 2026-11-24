@@ -177,7 +177,8 @@ extension StillImage {
         let largestDimension = max(canvas.width, canvas.height)
         let cropFraction = framing.crop.map { min($0.width.seconds, $0.height.seconds) } ?? 1
         let decodeDimension = preview ? Int(min(32_768, Double(largestDimension) / cropFraction * 2)) : nil
-        let decoded = try decode(file, name: name, previewDimension: decodeDimension, forceISOGainMapFallback: false)
+        let decoded = try decode(file, name: name, previewDimension: decodeDimension, forceISOGainMapFallback: false,
+                                 sdrBase: !target.isHDR)
         if isGap {
             // Convert the uniform fill once. The sample generator repeats this
             // frame on the output clock and can reuse an identical encoded span.
@@ -204,7 +205,8 @@ extension StillImage {
         // raster in addition to the encoded frame.
         let bandHeight = min(height, max(1, 8_388_608 / (width * 16)))
         var linear = [Float](repeating: 0, count: width * bandHeight * 4)
-        let isHDRSource = decoded.info.rendition != .sdr
+        // On an SDR program a gain-map image was decoded as its SDR base.
+        let isHDRSource = decoded.info.rendition != .sdr && (target.isHDR || decoded.info.rendition != .gainMap)
         var encoded = Data(count: width * height * 6)
         try encoded.withUnsafeMutableBytes { bytes in
             let words = bytes.bindMemory(to: UInt16.self)

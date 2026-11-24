@@ -418,6 +418,166 @@ class WriterRegression(unittest.TestCase):
                 self.assertEqual(report["error"]["code"], "unsupported_tracks")
                 self.assertEqual(report["error"]["reason"], "source_unsupported_tracks")
 
+    def test_sound_only_copy_keeps_attached_files(self):
+        # Matroska can hold any file beside the sound: fonts, notes. They travel as cover art does.
+        font, notes = self.root / "font.ttf", self.root / "notes.txt"
+        font.write_bytes(bytes(range(256)) * 12)
+        notes.write_text("liner notes\n")
+        source = self.root / "album.mka"
+        ffmpeg("-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=4", "-c:a", "libopus",
+               "-attach", font, "-metadata:s:t:0", "mimetype=application/x-truetype-font",
+               "-attach", notes, "-metadata:s:t:1", "mimetype=text/plain", source)
+
+        def files(path):
+            listed = []
+            for index, track in enumerate(probe(path, "-show_streams")["streams"]):
+                if track["codec_type"] != "attachment":
+                    continue
+                dumped = self.root / "dumped"
+                dumped.unlink(missing_ok=True)
+                # This form of the command writes the file and then stops for want of an output.
+                subprocess.run(["ffmpeg", "-v", "quiet", f"-dump_attachment:{index}", dumped, "-i", path], timeout=30)
+                listed.append((track["tags"]["filename"], track["tags"]["mimetype"], dumped.read_bytes()))
+            return listed
+
+        expected = [("font.ttf", "application/x-truetype-font", font.read_bytes()), ("notes.txt", "text/plain", notes.read_bytes())]
+        self.assertEqual(files(source), expected)
+        whole = self.root / "copy.mka"
+        self.assertNotIn("warnings", self.export(source, whole))
+        self.assertEqual(files(whole), expected)
+        self.assertEqual(sample_hashes(whole, "a:0"), sample_hashes(source, "a:0"))
+        trimmed = self.root / "trim.mka"
+        self.assertNotIn("warnings", self.export(source, trimmed, "--from", "1", "--to", "3"))
+        self.assertEqual(files(trimmed), expected)
+        # No other container stores them, and one chosen track is copied without them. Both reports say so.
+        for dry_run in [True, False]:
+            report = self.export(source, self.root / "copy.opus", dry_run=dry_run)
+            self.assertEqual(report["warnings"], ["Attached files cannot be written to OPUS. 2 attached files are not copied."])
+            report = self.export(source, self.root / "one.mka", "--tracks", "audio", "--audio-stream", "0", dry_run=dry_run)
+            self.assertEqual(report["warnings"], ["Attached files are copied only with all the audio tracks of a sound-only file. "
+                                                  "2 attached files are not copied."])
+        self.assertEqual(files(self.root / "one.mka"), [])
+
+    def test_explicit_selection_reports_cover_art_left_behind(self):
+        cover = self.root / "cover.jpg"
+        album = self.root / "album.m4a"
+        film = self.root / "film.mp4"
+        ffmpeg("-f", "lavfi", "-i", "color=c=red:s=96x96:d=1", "-frames:v", "1", cover)
+        ffmpeg("-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=3", "-i", cover,
+               "-map", "0:a", "-map", "1:v", "-c:a", "aac", "-c:v", "copy", "-disposition:v", "attached_pic", album)
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=25:d=3", "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=3", "-i", cover,
+               "-map", "0:v", "-map", "1:a", "-map", "2:v", "-c:v:0", "libx264", "-g", "25", "-pix_fmt", "yuv420p", "-c:a", "aac",
+               "-c:v:1", "copy", "-disposition:v:1", "attached_pic", film)
+        note = "Cover art is copied only with all the audio tracks of a sound-only file. 1 embedded picture is not copied."
+        for source, name, selection in [(album, "one-track.m4a", ["--tracks", "audio", "--audio-stream", "0"]),
+                                        (film, "film-sound.m4a", ["--tracks", "audio"]),
+                                        (film, "film-picture.mp4", ["--tracks", "video"])]:
+            for dry_run in [True, False]:
+                with self.subTest(name=name, dry_run=dry_run):
+                    report = self.export(source, self.root / name, *selection, dry_run=dry_run)
+                    self.assertEqual(report["warnings"], [note])
+            kinds = [track["disposition"]["attached_pic"] for track in probe(self.root / name, "-show_streams")["streams"]]
+            self.assertEqual(kinds, [0])
+
+    def test_join_reports_timecode_that_counts_on(self):
+        source = self.root / "timecode.mov"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=30:d=6", "-f", "lavfi", "-i", "sine=d=6:r=48000",
+               "-c:v", "libx264", "-g", "30", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", "-timecode", "01:00:00:00", source)
+
+        def timecode(path):
+            return probe(path, "-select_streams", "v:0", "-show_streams")["streams"][0]["tags"]["timecode"]
+
+        # One run of the source keeps a true timecode, in one range or in two that meet.
+        self.assertNotIn("warnings", self.export(source, self.root / "trim.mov", "--from", "1", "--to", "3"))
+        self.assertNotIn("warnings", self.export(source, self.root / "meeting.mov", "--from", "1", "--to", "2",
+                                                 "--clip", source, "--from", "2", "--to", "3"))
+        # The output has one timecode track. After a jump in the source it no longer states the source's timecode.
+        note = "The timecode track counts on from the first range. 1 later range does not keep its source timecode."
+        for name, selection in [("join.mov", []), ("join-picture.mov", ["--tracks", "video"])]:
+            for dry_run in [True, False]:
+                with self.subTest(name=name, dry_run=dry_run):
+                    report = self.export(source, self.root / name, *selection, "--from", "1", "--to", "2",
+                                         "--clip", source, "--from", "4", "--to", "5", dry_run=dry_run)
+                    self.assertEqual(report["warnings"], [note])
+            self.assertEqual(timecode(self.root / name), "01:00:01:00")
+
+    def test_chapter_gap_is_reported_where_a_chapter_cannot_end_early(self):
+        spans = [(0, 3, "One"), (5, 8, "Two"), (8, 12, "Three")]
+        listing = self.chapter_list(*spans)
+
+        def rounded(path):
+            return [(round(start, 2), round(end, 2), title) for start, end, title in self.chapters(path)]
+
+        for codec, kept, others in [("aac", "gap.mka", ["gap.m4a", "gap.mov"]), ("libopus", "gap-opus.mka", ["gap.opus"])]:
+            source = self.root / f"source-{codec}.mka"
+            ffmpeg("-f", "lavfi", "-i", "sine=frequency=330:sample_rate=48000:duration=12", "-i", listing, "-map", "0:a",
+                   "-map_metadata", "1", "-map_chapters", "1", "-c:a", codec, source)
+            self.assertNotIn("warnings", self.export(source, self.root / kept))
+            self.assertEqual(rounded(self.root / kept), spans)
+            for name in others:
+                with self.subTest(name=name):
+                    container = name.rsplit(".", 1)[1].upper()
+                    for dry_run in [True, False]:
+                        report = self.export(source, self.root / name, dry_run=dry_run)
+                        self.assertEqual(report["warnings"], [f"{container} chapters follow one another without a gap, "
+                                                              "so 1 chapter runs on to the start of the next."])
+                    self.assertEqual(rounded(self.root / name)[:2], [(0, 5, "One"), (5, 8, "Two")])
+
+    def test_opus_copy_keeps_chapters(self):
+        spans = [(0, 4, "One"), (4, 8, "Two"), (8, 12, "Three")]
+        listing = self.chapter_list(*spans)
+        sources = {}
+        for name in ["book.mka", "book.opus"]:
+            sources[name] = self.root / name
+            ffmpeg("-f", "lavfi", "-i", "sine=frequency=330:sample_rate=48000:duration=12", "-i", listing,
+                   "-map", "0:a", "-map_metadata", "1", "-map_chapters", "1", "-c:a", "libopus", sources[name])
+        for origin, name in [("book.mka", "from-matroska.opus"), ("book.opus", "from-ogg.opus")]:
+            with self.subTest(name=name):
+                source, output = sources[origin], self.root / name
+                self.assertNotIn("warnings", self.export(source, output))
+                # An Ogg chapter states its start. It lasts until the next one, and the last until the sound ends.
+                placed = self.chapters(output)
+                self.assertEqual([(start, title) for start, _, title in placed], [(start, title) for start, _, title in spans])
+                self.assertEqual([end for _, end, _ in placed[:-1]], [4, 8])
+                self.assertEqual(sample_hashes(output, "a:0"), sample_hashes(source, "a:0"))
+                if origin == "book.opus":
+                    self.assertEqual(audio(output), audio(source))
+        # mpcut reads them back: a second copy into Matroska still has every chapter.
+        back = self.root / "back.mka"
+        self.export(self.root / "from-matroska.opus", back)
+        self.assertEqual([(round(start, 2), title) for start, _, title in self.chapters(back)], [(0, "One"), (4, "Two"), (8, "Three")])
+        # FFmpeg lists chapters for an Opus stream and for no other Ogg codec. Only .opus is sure to hold
+        # Opus, so a general Ogg file still leaves the chapters out and says so.
+        report = self.export(sources["book.opus"], self.root / "plain.ogg")
+        self.assertEqual(report["warnings"], ["Chapters cannot be written to OGG. 3 chapters are not copied."])
+        self.assertEqual(self.chapters(self.root / "plain.ogg"), [])
+
+    def test_cropped_mp3_places_chapters_on_its_audible_samples(self):
+        spans = [(0, 4, "One"), (4, 8, "Two"), (8, 12, "Three")]
+        source = self.root / "book.mp3"
+        ffmpeg("-f", "lavfi", "-i", "sine=frequency=330:sample_rate=44100:duration=12", "-i", self.chapter_list(*spans),
+               "-map", "0:a", "-map_metadata", "1", "-map_chapters", "1", "-c:a", "libmp3lame", "-b:a", "128k", source)
+
+        def marks(path):
+            # MP3 chapter times count from the first frame, and the track's start time is its first audible sample.
+            audible = Fraction(probe(path, "-select_streams", "a:0", "-show_streams")["streams"][0]["start_time"])
+            return [(start, start - audible, title) for start, _, title in self.chapters(path)]
+
+        original = marks(source)
+        self.assertEqual([title for _, _, title in original], ["One", "Two", "Three"])
+        crop = self.root / "crop.mp3"
+        self.assertNotIn("warnings", self.export(source, crop, "--from", "2", "--to", "10"))
+        again = self.root / "again.mp3"
+        self.assertNotIn("warnings", self.export(crop, again))
+        for output in [crop, again]:
+            with self.subTest(output=output.name):
+                placed = marks(output)
+                self.assertEqual([title for _, _, title in placed], ["One", "Two", "Three"])
+                # The chapter that is playing at the cut starts with the file, hidden decoder history included.
+                self.assertEqual(placed[0][0], 0)
+                for (_, expected, _), (_, found, _) in zip(original[1:], placed[1:]):
+                    self.assertLess(abs(found - (expected - 2)), Fraction(1, 1000))
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

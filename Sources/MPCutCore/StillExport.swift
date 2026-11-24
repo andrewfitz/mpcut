@@ -190,7 +190,8 @@ public struct StillExportPlanner: Sendable {
                             container: container, settings: settings,
                             audioOutput: audioOutput, independentAudio: independentAudio,
                             pictureTiming: timing, videoCodec: videoCodec,
-                            defaultSoundtrackPCM: soundtrackAudio == .alac && container == "mov")
+                            defaultSoundtrackPCM: soundtrackAudio == .alac && container == "mov",
+                            defaultSoundtrackCodec: soundtrackAudio != nil)
         } catch {
             let join = error as? StillUnsafeJoin
             guard var failure = join?.issue ?? (error as? CutError) else { throw error }
@@ -283,7 +284,7 @@ public struct StillExportPlanner: Sendable {
                                 alternatives.append(offer(alternative.report, settings: options, requireCameraCopy: alternateCopy,
                                                           relaxesCameraCopy: requireCameraCopy && !alternateCopy,
                                                           audioStream: audioStream, independentAudio: independentAudio,
-                                                          explicitCodec: videoCodec))
+                                                          explicitCodec: videoCodec, explicitTiming: pictureTiming != nil))
                                 found = true
                                 break
                             } catch let issue as CutError where issue.code == "cancelled" || issue.code == "source_changed" {
@@ -305,7 +306,7 @@ public struct StillExportPlanner: Sendable {
                     alternatives.append(offer(cadence.report, settings: settings, requireCameraCopy: requireCameraCopy,
                                               relaxesCameraCopy: false, audioStream: audioStream,
                                               independentAudio: independentAudio, explicitCodec: videoCodec,
-                                              timingFallback: true))
+                                              explicitTiming: pictureTiming != nil, timingFallback: true))
                 } catch let issue as CutError where issue.code == "cancelled" || issue.code == "source_changed" {
                     throw issue
                 } catch {
@@ -319,7 +320,7 @@ public struct StillExportPlanner: Sendable {
 
     private func offer(_ report: StillExportReport, settings: ReencodeSettings, requireCameraCopy: Bool,
                        relaxesCameraCopy: Bool, audioStream: Int?, independentAudio: Bool,
-                       explicitCodec: ReencodeCodec?, timingFallback: Bool = false) -> ExportAlternative {
+                       explicitCodec: ReencodeCodec?, explicitTiming: Bool, timingFallback: Bool = false) -> ExportAlternative {
         let mode = report.mode
         let audio = settings.audio == .removeAudio && report.tracks != .video ? .removeAudio :
             report.soundActions.first(where: { $0.audio != .copyOriginal })?.audio ?? report.soundActions.first?.audio
@@ -355,7 +356,8 @@ public struct StillExportPlanner: Sendable {
             arguments += ["--video", codec.rawValue]
             if mode == .encode { arguments += ["--quality", settings.quality.rawValue] }
         }
-        if report.tracks != .audio { arguments += ["--still-timing", report.pictureTiming.rawValue] }
+        // A request that names no still timing keeps its default, and a clip join accepts no timing option.
+        if report.tracks != .audio, explicitTiming || timingFallback { arguments += ["--still-timing", report.pictureTiming.rawValue] }
         if requireCameraCopy { arguments.append("--require-camera-copy") }
         let id = "still-\(mode.rawValue)-\(report.container)" + (timingFallback ? "-cadence" : "")
         return ExportAlternative(id: id, rung: rung, label: label,
@@ -371,7 +373,7 @@ public struct StillExportPlanner: Sendable {
                       requireCameraCopy: Bool, container: String, settings: ReencodeSettings,
                       audioOutput: MulticamAudioOutput, independentAudio: Bool,
                       pictureTiming: StillPictureTiming, videoCodec: ReencodeCodec?,
-                      defaultSoundtrackPCM: Bool = false) throws -> StillExportPlan {
+                      defaultSoundtrackPCM: Bool = false, defaultSoundtrackCodec: Bool = false) throws -> StillExportPlan {
         if tracks != .audio {
             guard ExportRules.stillMovieContainers.contains(container) else {
                 throw CutError(code: "unsupported_container", message: "Still-bearing movie export requires MOV, MP4, M4V or MKV.")
@@ -414,7 +416,7 @@ public struct StillExportPlanner: Sendable {
                          tracks: tracks, audioStream: audioStream, audioTrackOrdinal: audioTrackOrdinal,
                          mode: mode, audio: settings.audio, container: container,
                          audioOutput: audioOutput, independentAudio: independentAudio,
-                         defaultSoundtrackPCM: defaultSoundtrackPCM)
+                         defaultSoundtrackPCM: defaultSoundtrackPCM, defaultSoundtrackCodec: defaultSoundtrackCodec)
         let actions = try pictureActions(picture?.pictures ?? [])
         func total(_ action: StillPictureAction.Action) throws -> RationalTime {
             try actions.lazy.filter { $0.action == action }.reduce(.zero) {

@@ -19,19 +19,22 @@ struct ExactSoundEncoding: Sendable {
         let decodedSources = sources.filter { AudioExportEngine.integerDepth($0) == nil && !$0.codec.hasPrefix("pcm_f") }
         let maximumIntegerDepth = integerDepths.max() ?? 0
         let codecName = ExportRules.displayName(audio: action)
+        // A lossy decoder works in floating point and can exceed full scale, where integer samples clip.
+        let lossySources = decodedSources.filter { !AudioExportEngine.decodesToInteger($0) }
+        let floating = !floatSources.isEmpty || (action == .pcm && !lossySources.isEmpty)
         if action == .pcm {
-            switch (floatSources.isEmpty, maximumIntegerDepth, decodedSources.isEmpty) {
-            case (true, 1...16, true): bitDepth = 16
-            case (true, 17...24, true): bitDepth = 24
-            case (true, _, true): bitDepth = 32
-            case (true, _, false): bitDepth = 32
+            switch (floating, maximumIntegerDepth, decodedSources.isEmpty) {
+            case (false, 1...16, true): bitDepth = 16
+            case (false, 17...24, true): bitDepth = 24
+            case (false, _, true): bitDepth = 32
+            case (false, _, false): bitDepth = 32
             default: bitDepth = maximumIntegerDepth > 24 || floatSources.contains { $0.codec.hasPrefix("pcm_f64") } ? 64 : 32
             }
             guard maximumIntegerDepth <= 32 else {
                 throw CutError(code: "unsupported_audio", message: "PCM MOV conversion cannot preserve \(maximumIntegerDepth)-bit integer samples.")
             }
-            rawFormat = floatSources.isEmpty ? "s32le" : "f\(bitDepth)le"
-            codec = floatSources.isEmpty ? "pcm_s\(bitDepth)le" : "pcm_\(rawFormat)"
+            rawFormat = floating ? "f\(bitDepth)le" : "s32le"
+            codec = floating ? "pcm_\(rawFormat)" : "pcm_s\(bitDepth)le"
             arguments = ["-c:a", codec]
         } else {
             // FFmpeg's FLAC STREAMINFO clock has a 20-bit sample-rate field.
@@ -59,8 +62,12 @@ struct ExactSoundEncoding: Sendable {
                          "-bits_per_raw_sample", "\(bitDepth)"] + blockSize
         }
         let decodedCodecs = Set(decodedSources.map(\.codec)).sorted().joined(separator: ", ")
+        let precision = floating ? "\(bitDepth)-bit float" : "\(bitDepth)-bit"
+        // FLAC and ALAC hold integers only, so a peak that a lossy decoder returns above full scale clips there.
+        let clips = action != .pcm && !lossySources.isEmpty
+            ? " Peaks above full scale clip. Choose PCM in MOV to keep them." : ""
         warnings = decodedSources.isEmpty ? [] :
-            ["The \(decodedCodecs) source is decoded to \(bitDepth)-bit PCM for \(codecName) delivery."]
+            ["The \(decodedCodecs) source is decoded to \(precision) PCM for \(codecName) delivery.\(clips)"]
     }
 }
 

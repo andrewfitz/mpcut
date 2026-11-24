@@ -425,6 +425,8 @@ extension ProjectSessions {
                     result["audio_actions"] = try Self.outputJSON(audio.actions)
                     result["warnings"] = audio.warnings
                 }
+                // An encode's warnings and audio actions and what a copy leaves behind, as `mpcut export` lists them.
+                for (key, value) in try plan.mcpNotes() { result[key] = value }
                 return result
             }
         }
@@ -729,6 +731,7 @@ extension ProjectSessions {
         guard !multi || options.audioTrackOrdinal == nil else { throw MCPCommandError("invalid_arguments", "Multicam uses routed program audio.") }
 
         return { progress in
+            var rangePlans: [[String: Any]] = []
             let outputs: [URL]
             let write: (Int, @escaping @Sendable (Double) -> Void) throws -> Void
             var plans: [[String: Any]] = []
@@ -757,6 +760,7 @@ extension ProjectSessions {
                     let batch = try SequenceQueuePlan(ranges, directory: output, options: options, useSidecar: sidecars,
                                                       ordinaryModeWhenUnspecified: mode == nil ? defaultOrdinaryMode : nil,
                                                       audioAction: audioAction, cancelled: outputCancelled)
+                    rangePlans = try batch.items.compactMap { try $0.rangePlan() }
                     outputs = batch.items.map(\.output)
                     plans = try batch.items.compactMap { item in
                         guard case .still(let plan) = item.payload else { return nil }
@@ -790,6 +794,7 @@ extension ProjectSessions {
                 }
             }
             var result: [String: Any] = ["dry_run": dryRun, "destinations": outputs.map(\.path)]
+            if !rangePlans.isEmpty { result["range_plans"] = rangePlans }
             if !skippedIDs.isEmpty { result["skipped_needs_replan"] = skippedIDs }
             if !plans.isEmpty { result["still_plans"] = plans }
             if !multicamPlans.isEmpty { result["multicam_plans"] = multicamPlans }

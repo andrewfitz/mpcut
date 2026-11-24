@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **More copied, less re-encoded.** H.264 and HEVC in MOV, MP4 and MKV can end a copied section between keyframes, including constant-rate footage with B-frames, so Lossless Copy accepts more cuts and Smart Trim re-encodes less at the end of a clip. A copied section still starts on a keyframe. With **Snap To → Keyframes**, an end handle on such footage lands on these points too. Cached indexes of H.264, HEVC and MOV-family files are rebuilt once. [Export modes](docs/EXPORT-MODES.md)
+
+- **Copies keep more, and say what they leave out.** Chapters, the timecode track of a picture-only copy, and the cover art and Matroska attachments of a recording without picture now travel with Lossless Copy and Smart Trim. A re-encode keeps chapters, a sound-only conversion keeps cover art, and a movie with a QuickTime chapter track can be copied again. Anything the chosen container cannot hold appears under the summary in the export sheet and queue and as `warnings` in CLI and MCP results. The Export Queue and the tier details also show how much video Smart Trim encodes.
+
+- **Lossless sound stays lossless.** When Re-encode has to convert a track, Auto writes PCM at the source word length for PCM, FLAC, ALAC, TrueHD and MLP sources in MOV and MKV in place of AAC, and a converted AAC track is never written below the bit rate of its source. Sound decoded from a lossy or floating-point source is written as floating-point PCM, so peaks above full scale are no longer clipped, and reports state each track’s codec, bit rate and bit depth. Still projects accept FLAC and ALAC soundtracks from M4A, MOV and MKA and copy AAC, AC-3 and E-AC-3 soundtracks.
+
+- **Lossless frames and truer colour.** `review frames export --format png` or `tiff` writes frames that keep the source’s bit depth and colour profile, including PQ and HLG signal. JPEG stays the default. Exported HLG frames are tone-mapped like the SDR preview, software-decoded limited-range frames keep full black and white levels, untagged HD frames are read as BT.709 as the native preview shows them, and a gain-map photo on an SDR timeline uses its own SDR rendition.
+
+- **FFmpeg 9.1.** MP3 copies write their gapless header fields themselves, so a cropped MP3 keeps its exact length when it is copied again with either FFmpeg 9.0 or 9.1.
+
 - **Leaner analysis sidecars.** Frame indexes, waveforms and silence results are stored in packed forms. A sidecar left by an early build is replaced the next time analysis is saved and can be removed with Clear Caches, older files are repacked in the background after they are read, and silence results and timeline thumbnails are kept within a fixed budget. [Desktop guide](docs/USAGE.md#save-and-reuse-analysis)
 
 - **Lighter transcription leftovers and transcript memory.** A finished job keeps each track’s result and levels packed, recognition shared with Transcriberrr is stored about twenty times smaller once both apps are updated, and an open transcript builds only the view being read. [Transcript guide](docs/TRANSCRIPTS.md)

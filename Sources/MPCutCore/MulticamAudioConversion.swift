@@ -40,9 +40,55 @@ struct MulticamAudioConversionPlan: Sendable {
     var muxer: String? = nil
     var verifiesSampleRange = false
     var exactEncoding: ExactSoundEncoding? = nil
+    /// Float PCM is staged and written in 64 bits when 32-bit float would narrow a source: 64-bit float sound,
+    /// or integers longer than 24 bits beside sound that needs floating point.
+    var doublePrecision = false
+    /// True when a source is resampled or remixed to the output format, so its samples are not kept as they are.
+    var conformsSources = false
+    /// A cover picture copied into a sound-only file: the source file and the index of its picture stream.
+    var coverArt: CoverArt? = nil
 
-    var rawFormat: String { exactEncoding?.rawFormat ?? (floatingPoint ? "f32le" : "s32le") }
+    struct CoverArt: Sendable {
+        let file: URL
+        let stream: Int
+    }
+
+    var rawFormat: String { exactEncoding?.rawFormat ?? (floatingPoint ? (doublePrecision ? "f64le" : "f32le") : "s32le") }
     var bytesPerSample: Int { rawFormat == "f64le" ? 8 : 4 }
+    /// The codec this plan writes: the final encoder a caller chose, or the staging format for PCM.
+    var writtenCodec: String {
+        if let chosen = encoderArguments.flatMap({ arguments in
+            arguments.firstIndex(of: "-c:a").flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil }
+        }) { return chosen }
+        return action == .aac ? "aac" : "pcm_\(rawFormat)"
+    }
+    /// The word length of written PCM, FLAC and ALAC. Nil for a codec that has none.
+    var writtenBitDepth: Int? {
+        if let exactEncoding { return exactEncoding.bitDepth }
+        let codec = writtenCodec
+        if let depth = AudioExportEngine.pcmDepth(codec: codec) { return depth }
+        guard codec == "flac" || codec == "alac", let arguments = encoderArguments,
+              let index = arguments.firstIndex(of: "-bits_per_raw_sample"), arguments.indices.contains(index + 1) else {
+            return codec == "flac" && encoderArguments?.contains("s16") == true ? 16 : nil
+        }
+        return Int(arguments[index + 1])
+    }
+    /// The rate of written AAC. As in a movie re-encode, the track follows the rate of AAC sources whose channels it
+    /// keeps. A downmix, and a track with any other source, gets the default for its channels.
+    var writtenBitRate: Int? {
+        if let arguments = encoderArguments {
+            guard let index = arguments.firstIndex(of: "-b:a"), arguments.indices.contains(index + 1) else { return nil }
+            return Int(arguments[index + 1])
+        }
+        guard action == .aac else { return nil }
+        let sources = inputs.filter { !$0.silence }
+        let measured = sources.compactMap { input in
+            input.audio.stream.codec == "aac" && input.layoutFilter.isEmpty && input.audio.stream.channels == channels
+                ? input.audio.averageBitRate : nil
+        }
+        return AudioExportEngine.aacBitRate(matching: !sources.isEmpty && measured.count == sources.count ? measured.max() : nil,
+                                            channels: channels, neverBelowSource: true)
+    }
     // N is an integer sample count. Dividing by SR*TB can round long timestamps one tick early.
     var exactSamplePTS: String { "asettb=1/\(sampleRate),asetpts=N" }
 }
@@ -68,6 +114,7 @@ extension MulticamEngine {
                                silenceFormat: ConvertedSoundFormat? = nil,
                                downmixChannels: Int? = nil,
                                preserveSamples: Bool = false,
+                               keepsDoublePrecision: Bool = true,
                                contextual: (CutError, Int) throws -> CutError) throws -> MulticamAudioConversionPlan {
         struct SourceRange {
             let media: MediaInfo
@@ -190,12 +237,15 @@ extension MulticamEngine {
             throw CutError(code: "unsupported_audio",
                            message: "Opus conversion writes mono, stereo, 3.0, quad, 5.0, 5.1, 6.1 or 7.1 sound. Choose PCM for this channel layout.")
         }
+        // PCM written from a lossy decoder stays float: the decoder can exceed full scale, where integer PCM would clip.
         let floatingPoint = downmixChannels != nil || action == .aac || action == .mp3 || action == .opus || audible.contains {
             $0.audio.stream.codec.hasPrefix("pcm_f") || !$0.audio.presentationEdits.isEmpty
+                || (action == .pcm && !AudioExportEngine.decodesToInteger($0.audio.stream))
         }
         var warnings = exactEncoding?.warnings ?? []
         if downmixChannels == nil && !commonLayout { warnings.append("The selected soundtracks have different channel layouts and will be mixed to stereo.") }
         if audible.contains(where: { $0.audio.stream.sampleRate != rate }) { warnings.append("The program soundtrack will be resampled to 48 kHz.") }
+        let conformsSources = (downmixChannels == nil && !commonLayout) || audible.contains { $0.audio.stream.sampleRate != rate }
 
         var segments: [ResolvedSegment] = []
         var inputs: [MulticamAudioConversionPlan.Input] = []
@@ -269,10 +319,25 @@ extension MulticamEngine {
                                 identities: identities, tracks: .audio)
         let helper = try ReencodeEngine.findHelper(override: nil)
         if let exactEncoding { try AudioExportEngine.requireEncoder(named: exactEncoding.codec, helper: helper) }
-        return MulticamAudioConversionPlan(edit: edit, inputs: inputs, action: action, warnings: warnings,
-                                           helper: helper, sampleRate: rate, channels: channels, layout: layout,
-                                           floatingPoint: floatingPoint, encoderArguments: exactEncoding?.arguments,
-                                           exactEncoding: exactEncoding)
+        // 32-bit float holds 24 bits. Program PCM that would lose more is staged and written as 64-bit float.
+        var doublePrecision = false
+        if keepsDoublePrecision, action == .pcm, floatingPoint, downmixChannels == nil, exactEncoding == nil, !silenceOnly {
+            let streams = audible.map(\.audio.stream)
+            let wide = streams.compactMap(AudioExportEngine.integerDepth).max().map { $0 > 24 } ?? false
+            if wide || streams.contains(where: { $0.codec.hasPrefix("pcm_f64") }) {
+                doublePrecision = (try? AudioExportEngine.requireEncoder(named: "pcm_f64le", helper: helper)) != nil
+                if !doublePrecision {
+                    warnings.append("The installed FFmpeg helper has no 64-bit float PCM encoder. The soundtrack will be reduced to 32-bit float.")
+                }
+            }
+        }
+        var plan = MulticamAudioConversionPlan(edit: edit, inputs: inputs, action: action, warnings: warnings,
+                                               helper: helper, sampleRate: rate, channels: channels, layout: layout,
+                                               floatingPoint: floatingPoint, encoderArguments: exactEncoding?.arguments,
+                                               exactEncoding: exactEncoding)
+        plan.doublePrecision = doublePrecision
+        plan.conformsSources = conformsSources
+        return plan
     }
 
     private func usesContinuousAACClock(_ audio: AudioIndex, engine: CutEngine) throws -> Bool {
@@ -535,6 +600,12 @@ extension MulticamEngine {
         let rawFormat = plan.rawFormat
         let container = plan.edit.container
         var arguments = ["-xerror"] + inputArguments
+        if let art = plan.coverArt, let firstMap = arguments.firstIndex(of: "-map") {
+            // The picture is a second input, copied as it is. Its input precedes the output options.
+            arguments.insert(contentsOf: ["-i", art.file.path], at: firstMap)
+            // Only the picture is taken from that source. Its chapters are on the source timeline, not this one.
+            arguments += ["-map", "1:\(art.stream)", "-c:v", "copy", "-disposition:v:0", "attached_pic", "-map_chapters", "-1"]
+        }
         if container == "caf", plan.layout == "7.1" {
             // FFmpeg tags 7.1 in CAF as side surrounds then back surrounds but writes the samples in its own
             // order, back then side. Writing them in the order of the tag keeps each sound on its speaker.
@@ -542,16 +613,8 @@ extension MulticamEngine {
         }
         if let custom = plan.encoderArguments {
             arguments += custom
-        } else if plan.action == .aac {
-            // As in a movie re-encode, the track follows the rate of AAC sources whose channels it keeps.
-            // A downmix, and a track with any other source, gets the default for its channels.
-            let sources = plan.inputs.filter { !$0.silence }
-            let measured = sources.compactMap { input in
-                input.audio.stream.codec == "aac" && input.layoutFilter.isEmpty && input.audio.stream.channels == plan.channels
-                    ? input.audio.averageBitRate : nil
-            }
-            let rate = AudioExportEngine.aacBitRate(matching: !sources.isEmpty && measured.count == sources.count ? measured.max() : nil,
-                                                    channels: plan.channels, neverBelowSource: true)
+        } else if plan.action == .aac, let rate = plan.writtenBitRate {
+            // The plan reports this rate, so the report states what is encoded here.
             arguments += ["-c:a", "aac", "-b:a", "\(rate)"]
         } else {
             if container == "mkv" {

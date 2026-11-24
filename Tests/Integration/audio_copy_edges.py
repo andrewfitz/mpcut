@@ -14,6 +14,17 @@ import unittest
 from sidecar_payload import section_bytes
 
 from audio_tracks import ffmpeg, hashes, pcm, probe, time
+from media_regression import presented_ticks
+
+
+def lame_counts(path):
+    """The frame count, encoder delay and end padding in an MP3's Xing or Info frame."""
+    data = Path(path).read_bytes()
+    first = 10 + (data[6] << 21 | data[7] << 14 | data[8] << 7 | data[9]) if data[:3] == b"ID3" else 0
+    tag = max(data.find(b"Xing", first, first + 64), data.find(b"Info", first, first + 64))
+    assert tag > 0, path
+    delays = int.from_bytes(data[tag + 141:tag + 144], "big")
+    return int.from_bytes(data[tag + 8:tag + 12], "big"), delays >> 12, delays & 4095
 
 
 class CopyEdges(unittest.TestCase):
@@ -126,6 +137,28 @@ class CopyEdges(unittest.TestCase):
             self.assertEqual(error["error"]["code"], "unsafe_boundary")
             self.assertFalse(output.exists())
 
+    def test_mp3_header_counts_exactly_the_audible_samples(self):
+        # The LAME delay and padding fields describe the kept samples whichever FFmpeg release muxes them:
+        # with a tail padding that spans two frames, and with a crop that ends where its last frame ends.
+        source = self.root / "cbr.mp3"
+        ffmpeg("-i", self.wave, "-c:a", "libmp3lame", "-b:a", "128k", source)
+        original = ffmpeg("-i", source, "-f", "f32le", "-")
+        skipped = lame_counts(source)[1] + 529
+        for start, end in [(0, 3), (0, 2 * 1152 - skipped), (44223, 47556)]:
+            with self.subTest(start=start, end=end):
+                output = self.root / f"crop-{start}-{end}.mp3"
+                saved = self.root / f"saved-{start}-{end}.mp3"
+                self.run_cli("export", "clips", "join", "--clip", source, "--from", f"{start}/44100",
+                             "--to", f"{end}/44100", "--output", output)
+                self.run_cli("export", "clips", "join", "--clip", output, "--output", saved)
+                for written in [output, saved]:
+                    frames, delay, padding = lame_counts(written)
+                    self.assertEqual(frames * 1152 - delay - padding, end - start, written.name)
+                    described = probe(written, "-show_entries", "stream=duration_ts,time_base")["streams"][0]
+                    self.assertEqual(described["duration_ts"] * Fraction(described["time_base"]), Fraction(end - start, 44100))
+                    self.assertEqual(ffmpeg("-i", written, "-f", "f32le", "-"), original[4 * start:4 * end])
+                self.assertEqual(lame_counts(saved), lame_counts(output))
+
     def test_indexed_mp3_seek_matches_sequential_decode_and_old_sidecars(self):
         for name, options in [("cbr", ["-b:a", "128k"]), ("vbr", ["-q:a", "2"])]:
             source = self.root / f"{name}.mp3"
@@ -195,12 +228,14 @@ class CopyEdges(unittest.TestCase):
         fields = ("-select_streams", "a:0", "-show_streams", "-show_entries", "stream=start_pts,duration_ts,time_base")
         original = probe(movie, *fields)["streams"][0]
         self.assertGreater(original["start_pts"], 0)
-        self.assertNotEqual(original["duration_ts"] % 1024, 0)
+        # The track ends inside its last packet. The movie's edit list says where on every FFmpeg version.
+        presented = presented_ticks(movie)
+        self.assertNotEqual(presented % 1024, 0)
         result = self.run_cli("export", "clips", "join", "--tracks", "audio", "--audio-stream", "1", "--clip", movie, "--output", output)
         extracted = probe(output, *fields)["streams"][0]
         self.assertEqual(extracted["start_pts"], 0)
-        self.assertEqual(extracted["duration_ts"], original["duration_ts"])
-        self.assertEqual(time(result["duration"]), original["duration_ts"] * Fraction(original["time_base"]))
+        self.assertEqual(extracted["duration_ts"], presented)
+        self.assertEqual(time(result["duration"]), presented * Fraction(original["time_base"]))
         self.assertEqual(hashes(output, "a:0"), hashes(movie, "a:0"))
 
     def test_one_opus_packet_with_both_trims_keeps_its_audible_extent(self):

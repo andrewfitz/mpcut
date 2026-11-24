@@ -87,6 +87,29 @@ def vcl_hashes(path, codec):
     return hashes
 
 
+def partition_ends(path):
+    """Picture numbers where the decode order is split by presentation time, from the packet order alone.
+
+    Every packet before such a point presents before every packet from it on, so the pictures
+    before it are a complete decode prefix. Picture 0 is the source start."""
+    order = [int(packet["pts"]) for packet in
+             probe(path, "-select_streams", "v:0", "-show_packets", "-show_entries", "packet=pts")["packets"]]
+    number = {pts: index for index, pts in enumerate(sorted(order))}
+    ends = []
+    for index in range(len(order)):
+        if index == 0 or max(order[:index]) < min(order[index:]):
+            ends.append(number[min(order[index:])])
+    return ends
+
+
+def hardware_frames(path):
+    """Hash each picture from VideoToolbox. Requiring hardware surfaces makes a software fallback fail."""
+    output = ffmpeg("-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld", "-i", path,
+                    "-map", "0:v:0", "-vf", "hwdownload,format=nv12", "-fps_mode", "passthrough",
+                    "-f", "framehash", "-")
+    return [line.split(b",", 6)[5].strip() for line in output.splitlines() if line and not line.startswith(b"#")]
+
+
 class SmartTrimTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -222,14 +245,18 @@ class SmartTrimTests(unittest.TestCase):
     def test_edges_for_each_codec(self):
         for codec in self.sources:
             with self.subTest(codec=codec):
-                self.check_trim(codec, [(7, 88)], [[(7, 25), (75, 88)]])
+                # Picture 87 follows a B picture that is coded after it, so no copy can stop there.
+                # Reordered H.264 and HEVC copy up to the last point before it where the decode
+                # order is split, 84. AV1 copies up to the keyframe at 75.
+                tail = (75, 87) if codec == "av1" else (84, 87)
+                self.check_trim(codec, [(7, 87)], [[(7, 25), tail]])
 
     def test_edge_bitrate_uses_surrounding_source_video_packets(self):
         for codec, source in self.sources.items():
             with self.subTest(codec=codec):
                 packets = probe(source, "-select_streams", "v:0", "-show_packets",
                                 "-show_entries", "packet=pts_time,size")["packets"]
-                report = self.export(self.root / ("rate" + source.suffix), [(source, 7, 88)], dry=True)
+                report = self.export(self.root / ("rate" + source.suffix), [(source, 7, 87)], dry=True)
                 for edge, second in zip(report["segments"][0]["encoded_edges"], [0, 3], strict=True):
                     # These fixtures have one-second closed GOPs and a separate audio track.
                     size = sum(int(p["size"]) for p in packets if second <= Fraction(p["pts_time"]) < second + 1)
@@ -246,11 +273,13 @@ class SmartTrimTests(unittest.TestCase):
         self.assertLess(output.stat().st_size, source.stat().st_size)
 
     def test_only_the_unsafe_end_is_encoded(self):
-        self.check_trim("h264", [(0, 88)], [[(75, 88)]])
+        self.check_trim("h264", [(0, 87)], [[(84, 87)]])
         self.check_trim("h264", [(7, 125)], [[(7, 25)]])
 
     def test_h264_reordered_join_and_short_same_gop_range(self):
-        self.check_trim("h264", [(35, 86), (5, 13)], [[(35, 50), (75, 86)], [(5, 13)]])
+        # The first range copies 50 to 84 and encodes the two pictures after that end point.
+        # The second has no start-safe keyframe, so all of it is encoded.
+        self.check_trim("h264", [(35, 86), (5, 13)], [[(35, 50), (84, 86)], [(5, 13)]])
 
     def test_lossless_default_and_aligned_smart_range(self):
         src = self.sources["av1"]
@@ -285,13 +314,65 @@ class SmartTrimTests(unittest.TestCase):
                 self.assertEqual((refused["error"]["boundary"], refused["error"]["reason"]), ("from", "cut_video_start"))
                 self.check_trim(codec, [(7, 88)], [[(7, 25)]])
 
-    def test_reordered_or_hidden_pictures_end_a_copy_at_keyframes_only(self):
-        # Reordered pictures can need a packet past the cut. An AV1 packet can carry a picture that is shown later.
+    def test_reordered_pictures_end_a_copy_where_decode_order_is_split_and_hidden_ones_at_keyframes(self):
+        # A reordered H.264 or HEVC copy can stop wherever every earlier packet also presents earlier.
+        # A B picture coded after the cut would otherwise be kept without the picture it predicts from.
+        # An AV1 packet can carry a picture that is shown later, so AV1 stops at keyframes only.
         for codec, source in self.sources.items():
             with self.subTest(codec=codec):
-                self.assertEqual(self.end_points(source), list(range(0, 5 * FPS, FPS)))
-                rejected = self.export(self.root / ("end" + source.suffix), [(source, 0, 88)], smart=False, ok=False)
+                if codec == "av1":
+                    self.assertEqual(self.end_points(source), list(range(0, 5 * FPS, FPS)))
+                    unsafe = 88
+                else:
+                    ends = partition_ends(source)
+                    # Three B pictures between anchors: after the keyframe alone, then every fourth picture.
+                    self.assertEqual(ends[:8], [0, 1, 5, 9, 13, 17, 21, 25])
+                    self.assertEqual(self.end_points(source), ends)
+                    unsafe = 87
+                rejected = self.export(self.root / ("end" + source.suffix), [(source, 0, unsafe)], smart=False, ok=False)
                 self.assertEqual((rejected["error"]["boundary"], rejected["error"]["reason"]), ("to", "cut_video_end"))
+                if codec != "av1":
+                    self.assertEqual([ratio(time) * FPS for time in rejected["error"]["nearest"]], [84, 88])
+
+    def test_lossless_copy_joins_ranges_that_end_inside_picture_groups(self):
+        # Every range starts on a keyframe and ends inside a picture group, out of source order: the
+        # keyframe alone, a range that crosses a keyframe, and ends early and late in a group.
+        ordered = {codec: movie(self.root / ("ordered-" + codec + ext), codec, bframes=0)
+                   for codec, ext in [("h264", ".mp4"), ("hevc", ".mov")]}
+        cases = [(codec, source, [(50, 62), (0, 20), (75, 76), (25, 57)]) for codec, source in ordered.items()]
+        cases += [(codec, self.sources[codec], [(50, 63), (0, 21), (75, 76), (25, 55)]) for codec in ("h264", "hevc")]
+        for codec, source, ranges in cases:
+            with self.subTest(codec=codec, source=source.name):
+                ends = partition_ends(source)
+                for start, end in ranges:
+                    self.assertEqual(start % FPS, 0)
+                    self.assertNotEqual(end % FPS, 0, "the range must end inside a picture group")
+                    self.assertIn(end, ends)
+                output = self.root / ("lossless-" + source.name)
+                requests = [(source, start, end) for start, end in ranges]
+                dry = self.export(output, requests, smart=False, dry=True)
+                report = self.export(output, requests, smart=False)
+                self.assertEqual(report["segments"], dry["segments"])
+                self.assertEqual(report["mode"], "copy")
+                self.assertEqual(ratio(report["encoded_duration"]), 0)
+                self.assertEqual(report["copied_duration"], report["duration"])
+                self.assertFalse(any(segment.get("encoded_edges") for segment in report["segments"]))
+                sequence = [index for start, end in ranges for index in range(start, end)]
+                self.assertEqual(ratio(report["duration"]), Fraction(len(sequence), FPS))
+                # Every video packet is the source packet, byte for byte, at its place on the new timeline.
+                source_packets, output_packets = dict(timestamped_hashes(source)), dict(timestamped_hashes(output))
+                self.assertEqual(len(timestamped_hashes(output)), len(sequence))
+                self.assertEqual(output_packets, {Fraction(position, FPS): source_packets[Fraction(index, FPS)]
+                                                  for position, index in enumerate(sequence)})
+                self.assertEqual(Fraction(probe(output, "-show_format")["format"]["duration"]),
+                                 Fraction(len(sequence), FPS))
+                # Each decoder returns exactly the source's own pictures, including those before each join.
+                source_frames, source_hardware = frames(source), hardware_frames(source)
+                self.assertEqual(len(source_hardware), 5 * FPS)
+                self.assertEqual(frames(output), [source_frames[index] for index in sequence])
+                self.assertEqual(hardware_frames(output), [source_hardware[index] for index in sequence])
+                self.assertEqual(picture_ids(output), bytes(sequence))
+                self.assertEqual(run([self.fixtures / "DecodeFrameIDs", output]), bytes(sequence))
 
     def test_adjacent_source_ranges_copy_through_a_nonkeyframe_seam(self):
         for codec in ["av1", "h264"]:
@@ -313,6 +394,11 @@ class SmartTrimTests(unittest.TestCase):
                "-x264-params", "keyint=25:min-keyint=25:scenecut=0:open-gop=0:bframes=3", source)
         timestamps = sorted(dict(timestamped_hashes(source)))
         self.assertGreater(len(set(b-a for a, b in zip(timestamps, timestamps[1:]))), 1)
+        # The decode order is split inside every picture group, but a copy of this source ends on keyframes
+        # only. MOV times a track by decode intervals, and after a held picture the decode clock of a
+        # prefix that stops inside a group ends before its presentation does.
+        self.assertGreater(len(partition_ends(source)), 5)
+        self.assertEqual(self.end_points(source), list(range(0, 5 * FPS, FPS)))
         start, end = timestamps[6], timestamps[88]
         self.export(output, [(source, start * FPS, end * FPS)])
         self.assertEqual(sorted(dict(timestamped_hashes(output))), [t - start for t in timestamps[6:88]])
@@ -324,16 +410,19 @@ class SmartTrimTests(unittest.TestCase):
             with self.subTest(codec=codec):
                 source = self.sources[codec]
                 mixed = self.root / ("mixed-" + codec + source.suffix)
-                self.export(mixed, [(source, 7, 88)])
+                plan = self.export(mixed, [(source, 7, 87)])
+                # The tail is encoded from picture 84, the last end point before 87.
+                self.assertEqual([(ratio(edge["from"]) * FPS, ratio(edge["to"]) * FPS)
+                                  for edge in plan["segments"][0]["encoded_edges"]], [(7, 25), (84, 87)])
                 info = json.loads(run([CLI, "media", "inspect", "--json", "--keyframes", mixed]))
                 self.assertTrue(info["ok"], info)
                 self.assertFalse(info["media"].get("copy_issue"), info.get("copy"))
                 # Start at each description: head encoder, original camera, tail encoder.
-                for offset in [0, 18, 68]:
+                for offset in [0, 18, 77]:
                     reopened = self.root / (f"reopen-{codec}-{offset}" + source.suffix)
-                    result = self.export(reopened, [(mixed, offset, 81)], smart=False)
+                    result = self.export(reopened, [(mixed, offset, 80)], smart=False)
                     self.assertFalse(result["segments"][0].get("encoded_edges"))
-                    self.assertEqual(run([self.fixtures / "DecodeFrameIDs", reopened]), bytes(range(7 + offset, 88)))
+                    self.assertEqual(run([self.fixtures / "DecodeFrameIDs", reopened]), bytes(range(7 + offset, 87)))
                     expected = {t - Fraction(offset, FPS): data for t, data in timestamped_hashes(mixed)
                                 if t >= Fraction(offset, FPS)}
                     self.assertEqual(dict(timestamped_hashes(reopened)), expected, "re-open changed picture packets")
@@ -341,23 +430,26 @@ class SmartTrimTests(unittest.TestCase):
     def test_main10_hevc_smart_edges_keep_the_source_profile_and_frame_order(self):
         source = movie(self.root / "main10.mov", "hevc", pixel_format="yuv420p10le")
         self.sources = {**self.sources, "hevc": source}
-        self.check_trim("hevc", [(7, 88)], [[(7, 25), (75, 88)]])
-        output = self.root / "hevc-7-88.mov"
+        self.check_trim("hevc", [(7, 87)], [[(7, 25), (84, 87)]])
+        output = self.root / "hevc-7-87.mov"
         pictures = probe(output, "-select_streams", "v:0", "-show_frames",
                          "-show_entries", "frame=pix_fmt")["frames"]
-        self.assertEqual([picture["pix_fmt"] for picture in pictures], ["yuv420p10le"] * 81)
+        self.assertEqual([picture["pix_fmt"] for picture in pictures], ["yuv420p10le"] * 80)
 
     def test_hevc_bottom_padding_change_decodes_seeks_and_reopens(self):
         source = movie(self.root / "unpadded-hevc.mov", "hevc", width=640, height=360)
         output = self.root / "cut.mov"
-        self.export(output, [(source, 7, 88)])
-        sequence = bytes(range(7, 88))
-        for offset in (0, 18, 68):
+        plan = self.export(output, [(source, 7, 87)])
+        # Both encoded runs change the padding: the head before picture 25 and the tail from picture 84.
+        self.assertEqual([(ratio(edge["from"]) * FPS, ratio(edge["to"]) * FPS)
+                          for edge in plan["segments"][0]["encoded_edges"]], [(7, 25), (84, 87)])
+        sequence = bytes(range(7, 87))
+        for offset in (0, 18, 77):
             self.assertEqual(run([self.fixtures / "DecodeFrameIDs", output, str(offset)]), sequence[offset:])
         # Independently decoded copied pictures retain all visible luma and chroma.
-        self.assertEqual(frames(output)[18:68], frames(source)[25:75])
+        self.assertEqual(frames(output)[18:77], frames(source)[25:84])
         reopened = self.root / "reopened.mov"
-        self.export(reopened, [(output, 18, 81)], smart=False)
+        self.export(reopened, [(output, 18, 80)], smart=False)
         self.assertEqual(run([self.fixtures / "DecodeFrameIDs", reopened]), sequence[18:])
 
     def test_hardware_splices_keep_independent_starts_and_copied_keyframes(self):
@@ -365,13 +457,14 @@ class SmartTrimTests(unittest.TestCase):
             with self.subTest(codec=codec):
                 source = self.sources[codec]
                 output = self.root / (codec + source.suffix)
-                self.export(output, [(source, 7, 88)])
+                self.export(output, [(source, 7, 87)])
                 packets = probe(output, "-select_streams", "v:0", "-show_packets",
                                 "-show_entries", "packet=pts_time,flags")["packets"]
                 keys = sorted(Fraction(p["pts_time"]) * FPS for p in packets if "K" in p["flags"])
                 self.assertIn(0, keys)
-                self.assertEqual([key for key in keys if 18 <= key < 68], [18, 43])
-                self.assertIn(68, keys)
+                # The copied run keeps its three source keyframes. The encoded tail starts its own at picture 84.
+                self.assertEqual([key for key in keys if 18 <= key < 77], [18, 43, 68])
+                self.assertIn(77, keys)
 
     def test_hardware_edges_avoid_periodic_keyframes_inside_short_gops(self):
         for codec in ("h264", "hevc"):

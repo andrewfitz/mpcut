@@ -567,10 +567,12 @@ final class MulticamTierGateTests: XCTestCase {
         try await settle(model)
         XCTAssertEqual(asked.prompts.count, 1)
         let prompt = try XCTUnwrap(asked.prompts.first)
+        // The range must start on the keyframe. It can end inside the picture group, before picture 42.
+        let verifiedEnd = RationalTime(numerator: 42, denominator: 25)
         XCTAssertEqual(prompt.moves, [.edge(MulticamEdge(range: 1, boundary: "from", at: late), to: keyframe),
-                                      .edge(MulticamEdge(range: 1, boundary: "to", at: early), to: end)])
+                                      .edge(MulticamEdge(range: 1, boundary: "to", at: early), to: verifiedEnd)])
         XCTAssertTrue(prompt.message.contains("Move the cuts to the nearest keyframe to keep True Lossless."), prompt.message)
-        XCTAssertEqual(model.project?.assembly, [.init(from: keyframe, to: end)])
+        XCTAssertEqual(model.project?.assembly, [.init(from: keyframe, to: verifiedEnd)])
         XCTAssertEqual(model.historyActions, ["Add Marked Range", "Move Cuts to Verified Times"])
         XCTAssertEqual(model.settledTier, .trueLossless)
         XCTAssertEqual(asked.prompts.count, 1)

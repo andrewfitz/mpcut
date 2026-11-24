@@ -471,6 +471,76 @@ class ReencodeTests(unittest.TestCase):
         self.assertEqual(stream(output, "a:0")["codec_name"], "pcm_f32le")
         self.assertEqual(pcm(output, 44100), pcm(source, 44100))
 
+    def test_double_float_warning_looks_at_every_clip(self):
+        integer, double = self.root / "integer.mov", self.root / "double.mov"
+        ffmpeg("-i", self.stereo, "-map", "0:v", "-map", "0:a:0", "-c", "copy", integer)
+        ffmpeg("-i", self.stereo, "-map", "0:v", "-map", "0:a:0", "-c:v", "copy", "-c:a", "pcm_f64le", double)
+        for name, clips in (("integer-first.mov", [(integer, 0, 2), (double, 2, 4)]),
+                            ("double-first.mov", [(double, 0, 2), (integer, 2, 4)])):
+            with self.subTest(order=name):
+                report = self.export(self.root / name, clips, audio="pcm", dry=True)
+                self.assertEqual(report["audio_actions"][0]["codec"], "pcm_f32le")
+                self.assertTrue(any("reduced to 32-bit float" in warning for warning in report["warnings"]), report["warnings"])
+
+    @staticmethod
+    def chapters(path):
+        return [(Fraction(chapter["start_time"]), Fraction(chapter["end_time"]), chapter["tags"]["title"])
+                for chapter in probe(path, "-show_chapters")["chapters"]]
+
+    def test_chapters_follow_the_kept_ranges(self):
+        listed = self.root / "chapters.ffmeta"
+        titles = ["Intro", "Middle; with = signs", "Late", "End"]
+        listed.write_text(";FFMETADATA1\ntitle=Chaptered\n" + "".join(
+            f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={index * 1500}\nEND={(index + 1) * 1500}\n"
+            f"title={title.replace(';', chr(92) + ';').replace('=', chr(92) + '=')}\n" for index, title in enumerate(titles)))
+        plain, source = self.root / "plain.mp4", self.root / "chaptered.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=25:d=6", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+               "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0", "-bf", "0",
+               "-c:a", "aac", "-b:a", "96k", plain)
+        ffmpeg("-i", plain, "-i", listed, "-map", "0:v", "-map", "0:a", "-map_chapters", "1", "-c", "copy", source)
+        whole = [(Fraction(index * 3, 2), Fraction((index + 1) * 3, 2), title) for index, title in enumerate(titles)]
+        self.assertEqual(self.chapters(source), whole)
+        half = Fraction(1, 2)
+        for container in ("mp4", "mov", "mkv"):
+            with self.subTest(container=container):
+                output = self.root / f"whole.{container}"
+                self.export(output, [(source, 0, 6)], audio="aac")
+                self.assertEqual(self.chapters(output), whole)
+                # A chapter is clipped to each kept range and moved by that range's output offset.
+                output = self.root / f"trimmed.{container}"
+                self.export(output, [(source, 1, 2), (source, 4, "28/5")], audio="aac")
+                self.assertEqual(self.chapters(output), [(0 * half, 1 * half, titles[0]), (1 * half, 2 * half, titles[1]),
+                                                         (2 * half, 3 * half, titles[2]), (3 * half, Fraction(13, 5), titles[3])])
+                # A chapter wholly inside removed material is dropped.
+                output = self.root / f"skipped.{container}"
+                self.export(output, [(source, 0, 1), (source, 5, 6)], audio="aac")
+                self.assertEqual(self.chapters(output), [(Fraction(0), Fraction(1), titles[0]), (Fraction(1), Fraction(2), titles[3])])
+                self.assertEqual(len(packets(output)), 50)
+        # The same ranges through a packet copy carry the same chapters.
+        copied = self.root / "copied.mp4"
+        run([CLI, "export", "clips", "join", "--json", "--mode", "copy", "--output", copied,
+             "--clip", source, "--from", "1", "--to", "2", "--clip", source, "--from", "4", "--to", "5"], allow_diagnostics=True)
+        encoded = self.root / "encoded.mp4"
+        self.export(encoded, [(source, 1, 2), (source, 4, 5)], audio="aac")
+        self.assertEqual(self.chapters(encoded), self.chapters(copied))
+        # A source without chapters gets none, and no chapter track.
+        output = self.root / "plain-out.mp4"
+        report = self.export(output, [(plain, 0, 6)], audio="aac")
+        self.assertEqual((self.chapters(output), report["warnings"]), ([], []))
+        self.assertEqual([item["codec_type"] for item in probe(output, "-show_streams")["streams"]], ["video", "audio"])
+
+    def test_damaged_sound_is_named_as_sound(self):
+        good, damaged = self.root / "good.mp4", self.root / "damaged.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=25:d=3", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+               "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-c:a", "flac", "-strict", "-2", good)
+        ffmpeg("-i", good, "-c", "copy", "-bsf:a", "noise=amount=1:drop=0", "-strict", "-2", damaged, allow_diagnostics=True)
+        output = self.root / "damaged-out.mov"
+        report = self.export(output, [(damaged, 1, 2)], audio="pcm", ok=False)
+        self.assertEqual(report["error"]["code"], "encode_failed")
+        self.assertTrue(report["error"]["message"].startswith("The sound of damaged.mp4 (audio track 1) is damaged"), report["error"])
+        self.assertNotIn("picture", report["error"]["message"])
+        self.assertFalse(any(self.root.glob(".mpcut-*")))
+
     def test_chroma_reduction_is_reported_before_export(self):
         source = self.root / "prores-4444.mov"
         ffmpeg("-f", "lavfi", "-i", "testsrc2=s=128x96:r=25:d=1", "-c:v", "prores_ks", "-profile:v", "4",

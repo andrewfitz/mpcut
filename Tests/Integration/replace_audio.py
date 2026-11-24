@@ -293,9 +293,10 @@ class Replacement(unittest.TestCase):
         donor = self.folder / "donor.wav"
         ffmpeg("-f", "lavfi", "-i", "testsrc2=d=3:s=160x96:r=25",
                "-f", "lavfi", "-i", "sine=d=3:f=440:r=48000", "-c:v", "libx264", "-g", "25",
-               "-c:a", "pcm_s16le", self.movie)
+               "-x264-params", "bframes=3:b-adapt=0:b-pyramid=0", "-c:a", "pcm_s16le", self.movie)
         ffmpeg("-f", "lavfi", "-i", "sine=d=3:f=660:r=48000", "-c:a", "pcm_s16le", donor)
-        span = ("--from", "0.8", "--to", "2.12")
+        # With a fixed I B B B P pattern a copy can end before pictures 46 and 50, so 1.96 snaps to the keyframe at 2.
+        span = ("--from", "0.8", "--to", "1.96")
         report = self.replace(replacement=donor, target=1, extra=(*span, "--snap", "nearest", "--dry-run"))
         raises = report["tier"]["raise"]
         self.assertEqual([offer["tier"] for offer in raises], ["true_lossless"])

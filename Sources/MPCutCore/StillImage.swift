@@ -188,7 +188,8 @@ public enum StillImage {
     }
 
     static func decode(
-        _ file: FileHandle, name: String, previewDimension: Int?, forceISOGainMapFallback: Bool
+        _ file: FileHandle, name: String, previewDimension: Int?, forceISOGainMapFallback: Bool,
+        sdrBase: Bool = false
     ) throws -> (image: CGImage, info: StillImageInfo, colorSpace: CGColorSpace) {
         let header = try file.read(upToCount: 32) ?? Data()
         let brands = try imageFileBrands(file, header: header)
@@ -338,6 +339,22 @@ public enum StillImage {
                thumbnail.colorSpace == colorSpace {
                 return (thumbnail, info, colorSpace)
             }
+        }
+        // An SDR program shows a gain-map image's own SDR base, which its author graded
+        // for SDR white. The HDR rendition above validates the gain map and reports the
+        // headroom, and `info` describes the file either way.
+        if sdrBase, rendition == .gainMap {
+            let baseOptions: [CFString: Any] = [
+                kCGImageSourceShouldCache: true,
+                kCGImageSourceShouldCacheImmediately: previewDimension == nil,
+                kCGImageSourceDecodeRequest: kCGImageSourceDecodeToSDR,
+            ]
+            guard let base = CGImageSourceCreateImageAtIndex(source, index, baseOptions as CFDictionary),
+                  CGImageSourceGetStatusAtIndex(source, index) == .statusComplete else {
+                throw error("still_decode", "Cannot decode the base image in \(name).")
+            }
+            try validateDimensions(base.width, base.height, maximumPixels: 64_000_000)
+            return (base, info, base.colorSpace ?? sRGB)
         }
         return (image, info, colorSpace)
     }

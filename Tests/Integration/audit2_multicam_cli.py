@@ -118,7 +118,7 @@ class MulticamCLITests(unittest.TestCase):
             "assembly empty": lambda d: d.update(assembly=[{"from": "3", "to": "3"}]),
             "repeated id": lambda d: d["audio_sources"][0].update(id="wide"),
             "blank id": lambda d: d["angles"][1].update(id=" "),
-            "future version": lambda d: d.update(schema_version=8),
+            "future version": lambda d: d.update(schema_version=99),
             "wrong kind": lambda d: d.update(kind="edit"),
             "unknown field": lambda d: d.update(extra=True),
             "video stream as sound": lambda d: d.update(audio={"mode": "fixed", "source_id": "wide", "audio_stream_index": 0}),
@@ -293,14 +293,16 @@ class MulticamCLITests(unittest.TestCase):
         sources = Path(__file__).resolve().parents[2] / "Sources/MPCutCLI"
         parsed = set()
         for file in sources.glob("*.swift"):
-            if file.name not in {"CommandHelp.swift", "Transcript.swift"}:
+            if file.name not in {"CommandHelp.swift", "Transcript.swift", "Participants.swift"}:
                 parsed.update(re.findall(r'"(--[a-z][a-z-]*)"', file.read_text()))
-        # The transcript command maps flags to request fields by name instead of listing them
-        # as literals. transcript_cli.py covers its flags.
+        # The transcript and participants commands map flags to request fields by name instead of listing them
+        # as literals. transcript_cli.py and the participant suites cover their flags.
+        mapped = ("transcript", "participants")
         listed = dict(overview,
-                      usage=[line for line in overview["usage"].splitlines() if "mpcut transcript " not in line],
+                      usage=[line for line in overview["usage"].splitlines()
+                             if not any(f"mpcut {family} " in line for family in mapped)],
                       commands={name: topic for name, topic in overview["commands"].items()
-                                if not name.startswith("transcript ")})
+                                if name.split()[0] not in mapped})
         documented = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", json.dumps(listed, ensure_ascii=False)))
         self.assertEqual(documented - parsed, set())
         self.assertEqual(parsed - documented, set())

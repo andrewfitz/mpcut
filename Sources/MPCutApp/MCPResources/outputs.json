@@ -165,7 +165,7 @@
   },
   {
     "name": "export_editor_project_plan",
-    "description": "Plan the open project export and report eligible ranges, review findings and the occurrence-level cut map when available.",
+    "description": "Plan the open project export and report eligible ranges, review findings and the occurrence-level cut map when available. An ordinary plan lists under warnings what the output does not keep: reductions made by an encode, and cover art, chapters or timecode that a copy leaves behind. A plain copy that keeps everything has no warnings field. A re-encode lists each audio track under audio_actions with its codec, bit_rate or bit_depth and reason. Multicam and still plans carry their warnings inside plan.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -306,7 +306,7 @@
   },
   {
     "name": "export_editor_project_render",
-    "description": "Render the open project to the output path and report its occurrence-level cut map when available.",
+    "description": "Render the open project to the output path and report its occurrence-level cut map when available. The result reports warnings and audio_actions as export_editor_project_plan does.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -600,7 +600,7 @@
   },
   {
     "name": "export_queue_plan",
-    "description": "Plan exports of queued entries using their captured ranges.",
+    "description": "Plan exports of queued entries using their captured ranges. range_plans has one row for each ordinary sequence entry: destination, mode, tracks, container, duration, copied_video_duration and encoded_video_duration for picture, audio_actions for converted sound, a summary, and warnings for what the output does not keep, such as cover art, chapters or timecode that a copy leaves behind. Still and multicam entries report under still_plans and multicam_plans.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -725,7 +725,7 @@
   },
   {
     "name": "export_queue_render",
-    "description": "Render the queued entries to the output directory.",
+    "description": "Render the queued entries to the output directory. The result reports range_plans as export_queue_plan does.",
     "inputSchema": {
       "type": "object",
       "properties": {

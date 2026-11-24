@@ -102,7 +102,10 @@ class ResolveExportTests(unittest.TestCase):
     def test_cumulative_frame_positions_and_tracks(self):
         output = self.folder / "Ordinary.fcpxml"
         request = dict(output=str(output), file=str(self.camera), clips=[{"from": "1", "to": "1.06"}], order=[1] * 8)
-        run([CLI, "project", "resolve", "export", "--stdin", "--no-sidecar"], input=json.dumps(request).encode())
+        report = json.loads(run([CLI, "project", "resolve", "export", "--stdin", "--no-sidecar", "--json"],
+                                input=json.dumps(request).encode()))
+        # The cuts fall between frames, and the report says where each one moved to.
+        self.assertIn("Timeline cut at 3/50s rounds to 1/24s at 24 fps.", report["warnings"])
         sequence = ET.parse(output).find(".//sequence")
         cursor = Fraction(0)
         clips = sequence.findall("spine/clip")
@@ -114,6 +117,31 @@ class ResolveExportTests(unittest.TestCase):
             self.assertEqual([audio.get("lane") for audio in clip.findall("audio")], ["-2", "-1"])
         self.assertEqual(cursor, Fraction(12, 24))
         self.assertEqual(cursor, Fraction(sequence.get("duration")[:-1]))
+
+    def test_isolated_streams_keep_their_sample_format(self):
+        source = self.folder / "four tracks.mov"
+        # Detail far below 24 bits, which 32-bit float cannot hold beside a loud tone.
+        tones = "aevalsrc=0.6*sin(2*PI*440*t)+0.0000000311*sin(2*PI*7919*t):s=48000:d=2"
+        formats = [("pcm_s32le", "s32le"), ("pcm_f64le", "f64le"), ("pcm_s16le", "s16le"), ("pcm_s24le", "s24le")]
+        inputs = [item for _ in formats for item in ("-f", "lavfi", "-i", tones)]
+        maps = [item for index in range(len(formats)) for item in ("-map", f"{index + 1}:a")]
+        codecs = [item for index, (codec, _) in enumerate(formats) for item in (f"-c:a:{index}", codec)]
+        ffmpeg("-f", "lavfi", "-i", "color=s=160x90:r=24:d=2", *inputs, "-map", "0:v", *maps, "-c:v", "prores_ks", *codecs, source)
+        output = self.folder / "Isolated.fcpxml"
+        request = dict(output=str(output), file=str(source), clips=[{"from": "0", "to": "1"}, {"from": "1", "to": "2"}])
+        report = json.loads(run([CLI, "project", "resolve", "export", "--stdin", "--no-sidecar", "--json"],
+                                input=json.dumps(request).encode()))
+        self.assertEqual(report["warnings"], [])
+        files = {Path(unquote(urlparse(rep.get("src")).path)) for rep in ET.parse(output).findall(".//media-rep")}
+        for index, (codec, raw) in enumerate(formats, start=1):
+            with self.subTest(codec=codec):
+                wav, = [file for file in files if file.name.endswith(f"stream {index}.wav")]
+                written = json.loads(run(["ffprobe", "-v", "error", "-of", "json", "-show_streams", wav]))["streams"][0]
+                self.assertEqual(written["codec_name"], codec)
+                self.assertEqual(ffmpeg("-i", wav, "-f", raw, "-"), ffmpeg("-i", source, "-map", f"0:{index}", "-f", raw, "-"))
+        narrowed = ffmpeg("-i", source, "-map", "0:1", "-c:a", "pcm_f32le", "-f", "f32le", "-")
+        self.assertNotEqual(ffmpeg("-f", "f32le", "-ar", "48000", "-ac", "1", "-i", "-", "-f", "s32le", "-", input=narrowed),
+                            ffmpeg("-i", source, "-map", "0:1", "-f", "s32le", "-"))
 
 
 if __name__ == "__main__":

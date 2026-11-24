@@ -19,9 +19,13 @@ public struct MulticamExportAudioLane: Encodable, Sendable, Identifiable {
     public let generatedSilence: [MulticamRange]
     public let retainedPCM: Bool
     public let warnings: [String]
+    /// The rate of a rendered AAC lane and the word length of a rendered PCM lane, as they are encoded.
+    public var bitRate: Int? = nil
+    public var bitDepth: Int? = nil
 
     private enum CodingKeys: String, CodingKey {
         case id, label, colorSlot, segments, action, codec, sampleRate, channelLayout, generatedSilence, retainedPCM, warnings
+        case bitRate, bitDepth
         case sourceLaneIDs = "source_lane_ids"
     }
 }
@@ -92,7 +96,8 @@ extension MulticamEngine {
             let report = MulticamExportAudioLane(id: output.rawValue, label: channels == 1 ? "Mono downmix" : "Stereo downmix",
                 colorSlot: nil, sourceLaneIDs: lanes.map(\.id), segments: mix.lanes.compactMap { $0 }.flatMap { $0.edit.segments }, action: codec,
                 codec: codec == .aac ? "aac" : "pcm_f32le", sampleRate: mix.sampleRate, channelLayout: layout,
-                generatedSilence: commonGaps(lanes, duration: mapping.duration), retainedPCM: false, warnings: mix.warnings)
+                generatedSilence: commonGaps(lanes, duration: mapping.duration), retainedPCM: false, warnings: mix.warnings,
+                bitRate: mix.output.writtenBitRate, bitDepth: mix.output.writtenBitDepth)
             return [.init(report: report, treatment: .downmix(mix))]
         }
 
@@ -310,11 +315,9 @@ extension MulticamEngine {
 
     private func renderedLane(_ lane: MulticamPlannedAudioLane, plan: MulticamAudioConversionPlan,
                               retained: Bool, warning: String?) throws -> MulticamExportSound {
-        let codec = plan.encoderArguments.flatMap { arguments in arguments.firstIndex(of: "-c:a").flatMap {
-            arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil
-        } } ?? (plan.action == .aac ? "aac" : plan.floatingPoint ? "pcm_f32le" : "pcm_s32le")
+        let codec = plan.writtenCodec
         if plan.action == .pcm && ["wav", "wave"].contains(plan.edit.container) {
-            let bytesPerSample = codec == "pcm_s16le" ? 2 : codec == "pcm_s24le" ? 3 : 4
+            let bytesPerSample = (plan.writtenBitDepth ?? 32) / 8
             let frames = try plan.edit.duration.roundedToSamples(plan.sampleRate)
             guard frames <= 0xFFFF_F000 / (Int64(plan.channels) * Int64(bytesPerSample)) else {
                 throw CutError(code: "unsupported_container", message: "This PCM audio exceeds the 4 GB limit of WAV. Choose CAF.")
@@ -323,7 +326,8 @@ extension MulticamEngine {
         let report = MulticamExportAudioLane(id: lane.id, label: lane.label, colorSlot: lane.colorSlot,
             sourceLaneIDs: [lane.id], segments: plan.edit.segments, action: plan.action, codec: codec,
             sampleRate: plan.sampleRate, channelLayout: plan.layout, generatedSilence: lane.gaps,
-            retainedPCM: retained, warnings: [warning].compactMap { $0 } + plan.warnings)
+            retainedPCM: retained, warnings: [warning].compactMap { $0 } + plan.warnings,
+            bitRate: plan.writtenBitRate, bitDepth: plan.writtenBitDepth)
         return .init(report: report, treatment: .render(plan))
     }
 

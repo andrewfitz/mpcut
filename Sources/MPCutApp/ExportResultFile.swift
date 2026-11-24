@@ -86,12 +86,12 @@ extension ExportPlan {
         case .packets(let edit, let mode, let tracks):
             return try ExportResultFile(output: output,
                                         plan: ExportResultFile.PacketPlan(edit: edit, mode: mode, tracks: tracks,
-                                                                          audioActions: nil, warnings: warnings),
+                                                                          audioActions: nil, warnings: reportedWarnings),
                                         cutMap: cutMap)
         case .audio(let audio):
             return try ExportResultFile(output: output,
                                         plan: ExportResultFile.PacketPlan(edit: audio.edit, mode: audio.mode, tracks: .audio,
-                                                                          audioActions: audio.actions, warnings: audio.warnings),
+                                                                          audioActions: audio.actions, warnings: reportedWarnings),
                                         cutMap: cutMap)
         }
     }

@@ -246,6 +246,8 @@ struct TimelineTierDetails: View {
     @ObservedObject var editor: EditorModel
     let state: TierState
     let dismiss: () -> Void
+    /// How much of the timeline Smart Trim encodes, once it has been planned for a Lossless tier.
+    @State private var smartTrimShare: String?
 
     private var summary: String {
         switch state {
@@ -256,7 +258,7 @@ struct TimelineTierDetails: View {
                 ? TierFactorID.placementPicture.summary : ExportRules.summary(tier: tier, source: source)
             let mode = ExportRules.bestMode(for: tier, source: source)
             let name = ExportRules.cell(source: source, tracks: .all, mode: mode).displayName
-            return description + "\n\n\(name) · .\(container)"
+            return description + (smartTrimShare.map { " " + $0 } ?? "") + "\n\n\(name) · .\(container)"
         case .unavailable(let issue): return ExportRules.displayMessage(issue.message)
         }
     }
@@ -290,5 +292,7 @@ struct TimelineTierDetails: View {
                 }
             }
         }
+        // The tier carries no durations: plan Smart Trim once the details are open to say how much it encodes.
+        .task(id: editor.mcpRevision) { smartTrimShare = await editor.smartTrimShare() }
     }
 }

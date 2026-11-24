@@ -202,7 +202,8 @@ struct StillVideoGenerator {
     }
 
     private struct CacheParameters: Encodable {
-        let policyVersion = 5
+        // 6: a gain-map image on an SDR program renders its SDR base.
+        let policyVersion = 6
         let framing: StillImageFraming
         let width: Int
         let height: Int

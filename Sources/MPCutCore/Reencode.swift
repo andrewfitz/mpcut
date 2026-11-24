@@ -77,6 +77,8 @@ public struct ReencodePlan: Encodable, Sendable {
     let exactPCM: Set<Int>
 
     var movieTimeScale = 1_000_000
+    /// Source chapters on the output timeline. The final mux writes them.
+    var chapters: [ReencodeChapter] = []
     var assemblesStillHDR = false
     var independentStillInputs: Set<URL> = []
     var matroskaStillTiming: [MulticamRange] = []
@@ -93,9 +95,13 @@ public struct ReencodeEngine: Sendable {
         self.helper = helper
     }
 
+    /// `carryingChapters` places the chapters of the sources on the output timeline. A movie export asks for it.
+    /// A picture rendered for a multicam or still program does not, because that program has its own timeline.
     public func resolve(_ clips: [ClipRequest], output: URL? = nil, media cached: [URL: MediaInfo] = [:],
-                        container: String = "mp4", settings: ReencodeSettings = .init()) throws -> ReencodePlan {
-        try plan(clips, output: output, media: cached, container: container, settings: settings, verifyingEncoder: true)
+                        container: String = "mp4", settings: ReencodeSettings = .init(),
+                        carryingChapters: Bool = false) throws -> ReencodePlan {
+        try plan(clips, output: output, media: cached, container: container, settings: settings, verifyingEncoder: true,
+                 carryingChapters: carryingChapters)
     }
 
     func resolveStillPictures(_ clips: [ClipRequest], output: URL, media: [URL: MediaInfo],
@@ -114,7 +120,7 @@ public struct ReencodeEngine: Sendable {
     /// A plan made with `verifyingEncoder` false has no helper and is never written.
     private func plan(_ clips: [ClipRequest], output: URL?, media cached: [URL: MediaInfo],
                       container: String, settings: ReencodeSettings, verifyingEncoder: Bool,
-                      normalizedStills: Set<URL> = []) throws -> ReencodePlan {
+                      normalizedStills: Set<URL> = [], carryingChapters: Bool = false) throws -> ReencodePlan {
         try checkCancellation()
         guard !clips.isEmpty else { throw CutError(code: "empty_edit", message: "Add at least one clip before exporting.") }
         let container = container.lowercased()
@@ -218,9 +224,14 @@ public struct ReencodeEngine: Sendable {
                             segments: segments, media: media, engine: engine,
                             container: container)
         if mixed == nil {
-            for action in actions where action.action == .pcm {
-                if reference.audio.contains(where: { $0.stream.index == action.track && $0.stream.codec.hasPrefix("pcm_f64") }) {
+            // One output track decodes the track at its position in every clip, so every clip is examined.
+            for (position, action) in actions.enumerated() {
+                let streams = media.values.compactMap { $0.audio.indices.contains(position) ? $0.audio[position].stream : nil }
+                if action.action == .pcm, streams.contains(where: { $0.codec.hasPrefix("pcm_f64") }) {
                     warnings.append("The 64-bit floating-point audio of track \(action.track) will be reduced to 32-bit float.")
+                }
+                if action.action == .aac, let note = AudioExportEngine.aacProfileChange(streams, bitRate: action.bitRate ?? 0) {
+                    warnings.append("Audio track \(action.track): \(note)")
                 }
             }
         }
@@ -259,12 +270,22 @@ public struct ReencodeEngine: Sendable {
             try verifyHardware(executable, encoding: encoding, container: container, actions: actions,
                                audio: reference.audio.map(\.stream), exactPCM: exactPCM, canvas: mixed?.canvas)
         }
+        // Chapters follow the kept ranges onto the output timeline. The plan that the timeline asks for on every
+        // edit opens no source for them.
+        var chapters: [ReencodeChapter] = []
+        if verifyingEncoder, carryingChapters {
+            let carried = try ReencodeChapter.remapped(segments, media: media, cancelled: cancelled)
+            chapters = carried.chapters
+            warnings += carried.warnings
+        }
         let identities = media.mapValues(\.identity)
         for (file, identity) in identities { try verifyIdentity(file, identity) }
         let edit = ResolvedEdit(segments: segments, duration: duration, container: container, identities: identities)
-        return ReencodePlan(edit: edit, settings: settings, audioActions: actions, width: encoding.width,
-                            height: encoding.height, warnings: warnings, canvas: mixed?.canvas, media: media, helper: executable, encoding: encoding,
-                            audioCopy: audioCopy, timeScale: timeScale, exactPCM: exactPCM)
+        var plan = ReencodePlan(edit: edit, settings: settings, audioActions: actions, width: encoding.width,
+                                height: encoding.height, warnings: warnings, canvas: mixed?.canvas, media: media, helper: executable, encoding: encoding,
+                                audioCopy: audioCopy, timeScale: timeScale, exactPCM: exactPCM)
+        plan.chapters = chapters
+        return plan
     }
 
     package func conversionMedia(_ file: URL, indexed: MediaInfo? = nil) throws -> MediaInfo {

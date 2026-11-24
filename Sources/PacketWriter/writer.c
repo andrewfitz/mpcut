@@ -19,6 +19,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avstring.h>
+#include <libavutil/crc.h>
 #include <libavutil/dovi_meta.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/mem.h>
@@ -63,7 +64,8 @@ typedef struct {
     AVPacket *packet;
     int has_first_packet;
     enum { MP3_HEADER_DEFAULT, MP3_HEADER_UNTAGGED, MP3_HEADER_GAPLESS } mp3_header;
-    unsigned mp3_end_discard;
+    unsigned mp3_skip;        /* Samples a gapless header hides before the first audible one. */
+    unsigned mp3_end_discard; /* Samples it hides after the last audible one. */
     MPCutAAC *aac_edits;
     MPCutAACSource *aac_source;
     OpusTrim *opus_trim;
@@ -558,7 +560,7 @@ static int drop_statistics_tags(AVDictionary **metadata)
  * zero LAME delay field hides 529 samples. Use the source packet's actual skip
  * so this also works for MP3 tracks extracted from another container. A source
  * without a skip still gets a Xing frame for its duration and seek table; its
- * LAME extension is cleared afterwards (mp3_clear_lame_extension). */
+ * LAME extension is cleared afterwards (mp3_finish_header). */
 static int configure_whole_mp3(Writer *writer, AVFormatContext *input, const AVStream *source) {
     AVPacket *packet = writer->packet;
     int code;
@@ -577,15 +579,21 @@ static int configure_whole_mp3(Writer *writer, AVFormatContext *input, const AVS
     if (skip && (skip < 529 || skip > 529 + 4095))
         return fail(writer, "The MP3 header cannot preserve the original leading delay on track %d.", source->index);
     writer->mp3_header = skip ? MP3_HEADER_GAPLESS : MP3_HEADER_UNTAGGED;
+    writer->mp3_skip = skip;
     return 0;
 }
 
-/* Turn the muxer's Xing frame into a plain one: frame count, byte count and
- * seek table, with no encoder ID or delay fields for a reader to act on. */
-static int mp3_clear_lame_extension(Writer *writer) {
-    enum { XING_FIELDS = 4 + 4 + 4 + 4 + 100 + 4, LAME_FIELDS = 36 };
+/* Finish the muxer's Xing frame. A source without a delay gets a plain one: frame count,
+ * byte count and seek table, with no encoder ID or delay fields for a reader to act on.
+ * A gapless header gets its two 12-bit LAME fields from the writer's own counts, because
+ * the muxer's count of the trailing padding depends on the FFmpeg release: 9.0 stores the
+ * last packet's value and always adds the decoder's 529 samples, 9.1 adds up consecutive
+ * packets and stores zero when the last packet discards nothing. */
+static int mp3_finish_header(Writer *writer) {
+    enum { XING_FIELDS = 4 + 4 + 4 + 4 + 100 + 4, LAME_FIELDS = 36, LAME_DELAYS = 21, LAME_CHECKSUM = 34, CHECKED = 190 };
     static const uint8_t blank[LAME_FIELDS] = {0};
     uint8_t bytes[10];
+    int gapless = writer->mp3_header == MP3_HEADER_GAPLESS;
     int failed = 1;
     FILE *file = fopen(writer->output_path, "r+b");
     if (!file)
@@ -596,7 +604,7 @@ static int mp3_clear_lame_extension(Writer *writer) {
             + (bytes[5] & 0x10 ? 10 : 0);
     }
     if (fseek(file, frame, SEEK_SET) || fread(bytes, 1, 4, file) != 4 || bytes[0] != 0xff || (bytes[1] & 0xe0) != 0xe0) {
-        failed = 0; // No leading frame to finish.
+        failed = gapless; // No leading frame to finish.
         goto done;
     }
     int mpeg1 = (bytes[1] & 0x18) == 0x18;
@@ -604,10 +612,24 @@ static int mp3_clear_lame_extension(Writer *writer) {
     long tag = frame + 4 + (mpeg1 ? (mono ? 17 : 32) : (mono ? 9 : 17));
     if (fseek(file, tag, SEEK_SET) || fread(bytes, 1, 8, file) != 8
         || (memcmp(bytes, "Xing", 4) && memcmp(bytes, "Info", 4)) || AV_RB32(bytes + 4) != 0x0f) {
-        failed = 0; // The muxer wrote no Xing frame.
+        failed = gapless; // The muxer wrote no Xing frame.
         goto done;
     }
-    failed = fseek(file, tag + XING_FIELDS, SEEK_SET) || fwrite(blank, 1, LAME_FIELDS, file) != LAME_FIELDS;
+    if (!gapless) {
+        failed = fseek(file, tag + XING_FIELDS, SEEK_SET) || fwrite(blank, 1, LAME_FIELDS, file) != LAME_FIELDS;
+        goto done;
+    }
+    /* The muxer's checksum covers 190 bytes of its own frame: everything before the checksum
+     * field, then the zeros that fill the field and the rest of the frame at that moment. */
+    uint8_t checked[CHECKED] = {0};
+    size_t covered = (size_t)(tag - frame) + XING_FIELDS + LAME_CHECKSUM;
+    AV_WB24(bytes, (writer->mp3_skip - 529) << 12 | (writer->mp3_end_discard + 529));
+    if (writer->mp3_skip < 529 || writer->mp3_skip > 529 + 4095 || writer->mp3_end_discard > 4095 - 529
+        || covered > CHECKED || fseek(file, tag + XING_FIELDS + LAME_DELAYS, SEEK_SET) || fwrite(bytes, 1, 3, file) != 3
+        || fseek(file, frame, SEEK_SET) || fread(checked, 1, covered, file) != covered)
+        goto done;
+    AV_WB16(bytes, av_crc(av_crc_get_table(AV_CRC_16_ANSI_LE), 0, checked, CHECKED));
+    failed = fseek(file, tag + XING_FIELDS + LAME_CHECKSUM, SEEK_SET) || fwrite(bytes, 1, 2, file) != 2;
 done:
     if (fclose(file))
         failed = 1;
@@ -788,6 +810,30 @@ static unsigned plan_art(const Writer *writer, const AVFormatContext *input, uin
     return dropped;
 }
 
+/* A file attached to a Matroska file that is not a picture, such as a font. */
+static int attached_file(const AVStream *stream) {
+    return stream->codecpar->codec_type == AVMEDIA_TYPE_ATTACHMENT;
+}
+
+/* Attached files travel as cover art does, and only Matroska stores them. Marks the
+ * source files the output stores and returns how many it cannot store. */
+static unsigned plan_files(const Writer *writer, const AVFormatContext *input, uint8_t *keep, unsigned *kept) {
+    *kept = 0;
+    if (!writer->delivered || !writer->whole_sound || !sound_only(input))
+        return 0;
+    int stored = !strcmp(writer->output->oformat->name, "matroska");
+    unsigned dropped = 0;
+    for (unsigned i = 0; i < input->nb_streams; i++) {
+        if (!attached_file(input->streams[i]))
+            continue;
+        if (stored && keep)
+            keep[i] = 1;
+        *kept += stored;
+        dropped += !stored;
+    }
+    return dropped;
+}
+
 static int add_art(Writer *writer, const AVFormatContext *input) {
     AVFormatContext *output = writer->output;
     unsigned kept = 0;
@@ -795,6 +841,7 @@ static int add_art(Writer *writer, const AVFormatContext *input) {
     if (!writer->art)
         return fail(writer, "Cannot allocate cover art state");
     plan_art(writer, input, writer->art, &kept);
+    plan_files(writer, input, writer->art, &kept);
     int form = art_form(output->oformat);
     for (unsigned i = 0; i < input->nb_streams; i++) {
         if (!writer->art[i])
@@ -810,7 +857,12 @@ static int add_art(Writer *writer, const AVFormatContext *input) {
         codec->codec_tag = 0;
         destination->id = destination->index + 1;
         destination->time_base = (AVRational){1, 90000};
-        if (result >= 0 && form == ART_ATTACHMENT) {
+        if (result >= 0 && attached_file(source)) {
+            // The copied parameters hold the file itself. Matroska requires a name and a MIME type with it.
+            result = av_dict_set(&destination->metadata, "filename", "attachment", AV_DICT_DONT_OVERWRITE);
+            if (result >= 0)
+                result = av_dict_set(&destination->metadata, "mimetype", "application/octet-stream", AV_DICT_DONT_OVERWRITE);
+        } else if (result >= 0 && form == ART_ATTACHMENT) {
             // Matroska stores a picture as an attached file. Its readers find cover art by MIME type.
             const char *mime = picture_mime(source);
             const char *subtype = strchr(mime, '/');
@@ -877,6 +929,7 @@ typedef struct {
     size_t count;
     int unplaced;         /* A range could not be placed on the output timeline. */
     int64_t moved_start;  /* Milliseconds by which a MOV chapter track moves the first chapter back to zero. */
+    unsigned closed_gaps; /* Chapters that run on to the next one where the container stores no chapter end. */
 } Chapters;
 
 static void free_chapters(Chapters *chapters) {
@@ -891,7 +944,8 @@ enum { CHAPTERS_NONE, CHAPTERS_PLAIN, CHAPTERS_MOV };
 static int chapter_form(const AVOutputFormat *format) {
     if (!strcmp(format->name, "mov") || !strcmp(format->name, "mp4") || !strcmp(format->name, "ipod"))
         return CHAPTERS_MOV; // A text track that the movie's other tracks reference.
-    return is_matroska(format) || !strcmp(format->name, "mp3") ? CHAPTERS_PLAIN : CHAPTERS_NONE;
+    // The Ogg muxer lists chapters among an Opus stream's comments, and for no other codec.
+    return is_matroska(format) || av_match_name(format->name, "mp3,opus") ? CHAPTERS_PLAIN : CHAPTERS_NONE;
 }
 
 static MPCutTime mov_audio_lead(const MPCutSegment *segment);
@@ -931,6 +985,18 @@ static int plan_chapters(const Writer *writer, const MPCutSegment *segments, siz
         // A whole MP3 keeps its frames and its decoder delay, so its chapter times still describe it.
         if (whole && !strcmp(writer->output->oformat->name, "mp3"))
             shift = (MPCutTime){0, 1};
+        /* MP3 chapter times count from the first frame. A cropped MP3 starts with decoder history
+         * that its header hides, so its first audible sample comes that much later. */
+        MPCutTime lead = {0, 1};
+        if (!whole && count == 1 && writer->tracks == MPCUT_TRACKS_AUDIO && source_start.denominator &&
+            !strcmp(writer->output->oformat->name, "mp3") && !strcmp(input->iformat->name, "mp3")) {
+            for (unsigned i = 0; i < input->nb_streams && !lead.numerator; i++) {
+                int rate = input->streams[i]->codecpar->sample_rate;
+                if (selected_stream(writer, input->streams[i]) && rate > 0)
+                    lead = (MPCutTime){mpcut_mp3_crop_lead(time_round(source_start, (AVRational){1, rate}), rate), rate};
+            }
+            shift = time_add(shift, lead, 1);
+        }
         cursor = time_add(cursor, time_add(segment->end, segment->start, -1), 1);
         if (origin.denominator <= 0 || !source_start.denominator || !source_end.denominator ||
             !shift.denominator || !cursor.denominator) {
@@ -955,6 +1021,8 @@ static int plan_chapters(const Writer *writer, const MPCutSegment *segments, siz
                 if (!end.denominator)
                     end = time_compare(source_end, start) > 0 ? source_end : start;
             }
+            // The chapter that is playing where a cropped MP3 begins also covers its hidden history.
+            int covers_lead = lead.numerator && time_compare(start, source_start) <= 0;
             if (!whole) {
                 if (time_compare(start, source_start) < 0)
                     start = source_start;
@@ -963,7 +1031,7 @@ static int plan_chapters(const Writer *writer, const MPCutSegment *segments, siz
                 if (time_compare(end, start) <= 0)
                     continue;
             }
-            start = time_add(start, shift, 1);
+            start = covers_lead ? (MPCutTime){0, 1} : time_add(start, shift, 1);
             end = time_add(end, shift, 1);
             if (!start.denominator || !end.denominator) {
                 plan->unplaced = 1;
@@ -1019,9 +1087,12 @@ static int mov_chapter_times(const Chapter *chapter, int64_t previous_start, int
 static int store_chapters(Writer *writer, Chapters *plan, int movie_timescale, int apply, unsigned *unstored) {
     AVFormatContext *output = writer->output;
     int form = chapter_form(output->oformat);
-    int64_t previous = -1;
+    int64_t previous = -1, previous_end = -1;
+    // A MOV chapter sample lasts until the next one starts, and an Opus chapter comment states only a start.
+    int abutting = form == CHAPTERS_MOV || !strcmp(output->oformat->name, "opus");
     *unstored = 0;
     plan->moved_start = 0;
+    plan->closed_gaps = 0;
     for (size_t i = 0; i < plan->count; i++) {
         Chapter *planned = &plan->items[i];
         AVRational base = {1, 1000000000};
@@ -1039,6 +1110,11 @@ static int store_chapters(Writer *writer, Chapters *plan, int movie_timescale, i
         if (!usable) {
             (*unstored)++;
             continue;
+        }
+        if (abutting) {
+            if (previous_end >= 0 && time_round(planned->start, (AVRational){1, 1000}) > previous_end)
+                plan->closed_gaps++;
+            previous_end = time_round(planned->end, (AVRational){1, 1000});
         }
         previous = start;
         if (!apply)
@@ -2309,8 +2385,8 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
             size_t size = 0;
             uint8_t *side = av_packet_get_side_data(packet, AV_PKT_DATA_SKIP_SAMPLES, &size);
             unsigned discard = side && size >= 10 ? AV_RL32(side + 4) : 0;
-            // Demuxers distribute end padding over every affected frame. The MP3
-            // muxer records only the last packet's value in the 12-bit LAME tag.
+            // Demuxers distribute end padding over every affected frame. Its total goes
+            // into the 12-bit LAME tag when the file is finished (mp3_finish_header).
             if (writer->mp3_end_discard) {
                 const AVCodecParameters *codec = input->streams[input_index]->codecpar;
                 unsigned frame_samples = codec->sample_rate > 24000 ? 1152 : 576;
@@ -2321,7 +2397,7 @@ static int write_range(Writer *writer, AVFormatContext *input, const Range *rang
                 return fail(writer, "The MP3 header cannot preserve the trailing padding on track %u.", input_index);
             if (discard) {
                 writer->mp3_end_discard += discard;
-                AV_WL32(side + 4, writer->mp3_end_discard);
+                AV_WL32(side + 4, 0);
             }
         }
         const AVStream *input_track = input->streams[input_index];
@@ -2702,7 +2778,9 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             AVRational samples = {1, input->streams[video_index]->codecpar->sample_rate};
             result = mpcut_write_mp3_crop(input, video_index, writer.output,
                                           time_round(range.source_start, samples), time_round(range.source_end, samples),
-                                          segment->mp3_anchor, progress, context, error, error_capacity);
+                                          segment->mp3_anchor, progress, context,
+                                          &writer.mp3_skip, &writer.mp3_end_discard, error, error_capacity);
+            writer.mp3_header = MP3_HEADER_GAPLESS;
         } else {
             result = write_range(&writer, input, &range, time_seconds(total));
         }
@@ -2731,8 +2809,8 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             goto cleanup;
         }
     }
-    if (writer.mp3_header == MP3_HEADER_UNTAGGED) {
-        result = mp3_clear_lame_extension(&writer);
+    if (writer.mp3_header != MP3_HEADER_DEFAULT) {
+        result = mp3_finish_header(&writer);
         if (result) {
             goto cleanup;
         }
@@ -2792,18 +2870,26 @@ static void add_note(char *notes, size_t capacity, const char *format, ...) {
     va_end(args);
 }
 
-/* Pictures in a later source that the first source, whose art the copy keeps, does not also carry. */
-static unsigned unmatched_art(const AVFormatContext *first, const AVFormatContext *later) {
+/* The bytes of a cover picture, or of an attached file. */
+static const uint8_t *carried(const AVStream *stream, int files, int *size) {
+    if (!(files ? attached_file(stream) : attached_picture(stream)))
+        return NULL;
+    *size = files ? stream->codecpar->extradata_size : stream->attached_pic.size;
+    return files ? stream->codecpar->extradata : stream->attached_pic.data;
+}
+
+/* Pictures, or attached files, in a later source that the first source, whose own the copy keeps, does not also carry. */
+static unsigned unmatched(const AVFormatContext *first, const AVFormatContext *later, int files) {
     unsigned count = 0;
     for (unsigned i = 0; i < later->nb_streams; i++) {
-        const AVStream *stream = later->streams[i];
-        if (!attached_picture(stream))
+        int size = 0, kept_size = 0;
+        const uint8_t *data = carried(later->streams[i], files, &size);
+        if (!data)
             continue;
         int matched = 0;
         for (unsigned j = 0; j < first->nb_streams && !matched; j++) {
-            const AVPacket *kept = &first->streams[j]->attached_pic;
-            matched = attached_picture(first->streams[j]) && kept->size == stream->attached_pic.size &&
-                kept->size > 0 && !memcmp(kept->data, stream->attached_pic.data, (size_t)kept->size);
+            const uint8_t *kept = carried(first->streams[j], files, &kept_size);
+            matched = kept && kept_size == size && size > 0 && !memcmp(kept, data, (size_t)size);
         }
         count += !matched;
     }
@@ -2840,9 +2926,26 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
                 container[i] = (char)av_toupper(extension[1 + i]);
         }
 
-        unsigned kept = 0;
+        unsigned kept = 0, kept_files = 0;
         unsigned dropped = plan_art(&writer, input, NULL, &kept);
-        unsigned later = 0;
+        unsigned dropped_files = plan_files(&writer, input, NULL, &kept_files);
+        unsigned later = 0, later_files = 0;
+        if (!writer.whole_sound || !sound_only(input)) {
+            // One chosen audio track, or the picture or the sound of a movie, is copied on its own.
+            unsigned pictures = 0, files = 0;
+            for (unsigned i = 0; i < input->nb_streams; i++) {
+                pictures += attached_picture(input->streams[i]);
+                files += attached_file(input->streams[i]);
+            }
+            if (pictures) {
+                add_note(notes, capacity, "Cover art is copied only with all the audio tracks of a sound-only file. "
+                         "%u embedded picture%s not copied.", pictures, pictures == 1 ? " is" : "s are");
+            }
+            if (files) {
+                add_note(notes, capacity, "Attached files are copied only with all the audio tracks of a sound-only file. "
+                         "%u attached file%s not copied.", files, files == 1 ? " is" : "s are");
+            }
+        }
         if (writer.whole_sound && sound_only(input)) {
             for (size_t at = 1; at < count; at++) {
                 size_t source = 0;
@@ -2853,8 +2956,10 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
                 AVFormatContext *other = NULL;
                 if (avformat_open_input(&other, segments[at].path, NULL, NULL) < 0)
                     continue;
-                if (sound_only(other))
-                    later += unmatched_art(input, other);
+                if (sound_only(other)) {
+                    later += unmatched(input, other, 0);
+                    later_files += unmatched(input, other, 1);
+                }
                 avformat_close_input(&other);
             }
         }
@@ -2870,6 +2975,30 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
         if (kept && later) {
             add_note(notes, capacity, "Cover art comes from the first clip. %u different picture%s in later clips %s not copied.",
                      later, later == 1 ? "" : "s", later == 1 ? "is" : "are");
+        }
+        if (!kept_files)
+            dropped_files += later_files;
+        if (dropped_files) {
+            add_note(notes, capacity, "Attached files cannot be written to %s. %u attached file%s not copied.",
+                     container, dropped_files, dropped_files == 1 ? " is" : "s are");
+        } else if (later_files) {
+            add_note(notes, capacity, "Attached files come from the first clip. %u different file%s in later clips %s not copied.",
+                     later_files, later_files == 1 ? "" : "s", later_files == 1 ? "is" : "are");
+        }
+
+        // A join writes one timecode track, which counts on from the first range.
+        if (count > 1 && (tracks == MPCUT_TRACKS_ALL || writer.keep_timecode) &&
+            av_match_name(writer.output->oformat->name, "mov,mp4") && av_match_name("mov", input->iformat->name)) {
+            unsigned jumps = 0;
+            for (size_t at = 1; at < count; at++)
+                jumps += strcmp(segments[at].path, segments[at - 1].path) || time_compare(segments[at].start, segments[at - 1].end);
+            for (unsigned i = 0; jumps && i < input->nb_streams; i++) {
+                if (!timecode_track(input->streams[i]))
+                    continue;
+                add_note(notes, capacity, "The timecode track counts on from the first range. %u later range%s not keep %s source timecode.",
+                         jumps, jumps == 1 ? " does" : "s do", jumps == 1 ? "its" : "their");
+                break;
+            }
         }
 
         MPCutTime origin = segments[0].source_origin.denominator > 0 ? segments[0].source_origin : (MPCutTime){0, 1};
@@ -2889,6 +3018,10 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
             if (chapters.moved_start > 0) {
                 add_note(notes, capacity, "%s chapters begin with the file, so the first chapter starts at 0 instead of %"
                          PRId64 ".%03" PRId64 " s.", container, chapters.moved_start / 1000, chapters.moved_start % 1000);
+            }
+            if (chapters.closed_gaps) {
+                add_note(notes, capacity, "%s chapters follow one another without a gap, so %u chapter%s on to the start of the next.",
+                         container, chapters.closed_gaps, chapters.closed_gaps == 1 ? " runs" : "s run");
             }
         }
     }

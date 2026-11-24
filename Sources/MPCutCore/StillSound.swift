@@ -18,6 +18,8 @@ public struct StillSoundAction: Codable, Sendable {
     public var sampleRate: Int? = nil
     public var channelLayout: String? = nil
     public var bitDepth: Int? = nil
+    /// The rate of a converted AAC track, as it is encoded.
+    public var bitRate: Int? = nil
     public var treatment: String? = nil
     public let audio: ReencodeAudio
     public let originalStreams: [Int]
@@ -86,7 +88,8 @@ struct StillSoundPlanner {
     func resolve(_ project: CutProject, relativeTo location: URL?, timeline: StillTimelinePlan,
                  tracks: ExportTracks, audioStream: Int?, audioTrackOrdinal: Int? = nil, mode: ExportMode, audio: ReencodeAudio,
                  container: String, audioOutput: MulticamAudioOutput = .separateTracks,
-                 independentAudio: Bool = false, defaultSoundtrackPCM: Bool = false) throws -> StillSoundPlan {
+                 independentAudio: Bool = false, defaultSoundtrackPCM: Bool = false,
+                 defaultSoundtrackCodec: Bool = false) throws -> StillSoundPlan {
         let muxer = ExportRules.multicamMuxContainer(container)
         if tracks == .video || audio == .removeAudio {
             return StillSoundPlan(actions: [], treatments: [], container: muxer)
@@ -171,17 +174,26 @@ struct StillSoundPlanner {
                 copySpans = spans
             }
             func append(_ treatment: StillSoundPlan.Treatment, audio: ReencodeAudio, codec: String?,
-                        rate: Int?, layout: String?, bitDepth: Int? = nil, silence: [MulticamRange] = [], warnings: [String] = [],
+                        rate: Int?, layout: String?, bitDepth: Int? = nil, bitRate: Int? = nil,
+                        silence: [MulticamRange] = [], warnings: [String] = [],
                         description: String? = nil) {
                 treatments.append(treatment)
                 actions.append(StillSoundAction(ordinal: ordinal, laneID: lane.id, label: lane.label,
                                                 colorSlot: lane.colorSlot, sourceLaneIDs: lane.id.map { [$0] }, codec: codec,
-                                                sampleRate: rate, channelLayout: layout, bitDepth: bitDepth, treatment: description,
+                                                sampleRate: rate, channelLayout: layout, bitDepth: bitDepth, bitRate: bitRate,
+                                                treatment: description,
                                                 audio: audio, originalStreams: streams, sources: sources, warnings: soundtrackWarnings + warnings,
                                                 generatedSilence: silence))
             }
+            // The default codec of a soundtrack would only wrap the decoded sound of a lossy recording.
+            // Its packets are copied where the range and the container allow, and decoded as before where they do not.
+            let copiesLossySoundtrack = defaultSoundtrackCodec && !sources.isEmpty && ["mov", "mp4", "mkv", "m4a"].contains(muxer)
+                && spans.allSatisfy { span in
+                    guard let media = span.media, let stream = media.audio.first(where: { $0.stream.index == span.stream })?.stream else { return false }
+                    return Self.copiesByDefault(codec: stream.codec, format: media.format)
+                }
             var copyFailure: CutError?
-            if !explicitConversion || matchingLossless || (mode == .copy && !independentAudio)
+            if !explicitConversion || matchingLossless || copiesLossySoundtrack || (mode == .copy && !independentAudio)
                 || (!explicitLossless && !independentAudio && mode != .encode) {
                 do {
                     let copy = try resolveCopy(copySpans, duration: timeline.duration, container: muxer,
@@ -229,10 +241,10 @@ struct StillSoundPlanner {
                                                           candidates: candidates, ordinal: ordinal, lane: lane,
                                                           format: conversionFormat, preservePCM: independentAudio || hasSoundtrackSelection)
             configureMuxer(&sound, container: muxer)
-            let warnings = retained == nil ? (copyFailure.map { [$0.message] } ?? []) :
+            let copyNote = copiesLossySoundtrack ? "The soundtrack packets cannot be copied, so the recording is decoded. " : ""
+            let warnings = retained == nil ? (copyFailure.map { [copyNote + $0.message] } ?? []) :
                 ["Retained PCM samples are preserved. Uncovered intervals receive digital silence."]
-            let codec = sound.exactEncoding?.codec ?? sound.encoderArguments?.last ?? (sound.action == .aac ? "aac" :
-                sound.floatingPoint ? "pcm_f32le" : "pcm_s32le")
+            let codec = sound.writtenCodec
             let description: String?
             if sound.inputs.allSatisfy(\.silence) {
                 description = "generated digital silence"
@@ -242,12 +254,28 @@ struct StillSoundPlanner {
                 description = sound.exactEncoding.map { $0.warnings.isEmpty ? "losslessly encoded PCM samples" : "decoded source audio" }
             }
             append(.convert(sound), audio: sound.action, codec: codec, rate: sound.sampleRate, layout: sound.layout,
-                   bitDepth: sound.exactEncoding?.bitDepth, silence: conversionLane.filter { $0.media == nil }.map(\.output),
+                   bitDepth: sound.writtenBitDepth, bitRate: sound.writtenBitRate,
+                   silence: conversionLane.filter { $0.media == nil }.map(\.output),
                    warnings: warnings + sound.warnings, description: description)
         }
         let plan = StillSoundPlan(actions: actions, treatments: treatments, container: muxer)
         try plan.verifySources()
         return plan
+    }
+
+    /// The lossy soundtracks whose packets a still project copies without being asked, in place of decoding them
+    /// into its default lossless codec. These are the codecs and source formats whose copy into MOV, MP4 and
+    /// Matroska was measured to return the source packets. Any other lossy recording is decoded as before.
+    static func copiesByDefault(codec: String, format: String) -> Bool {
+        switch codec {
+        case "aac":
+            // An AAC track from Matroska has no edit list for its priming, and its copy into Matroska is refused late.
+            return format == "aac" || format.split(separator: ",").contains("mov")
+        case "ac3", "eac3":
+            return true
+        default:
+            return false
+        }
     }
 
     func write(_ plan: StillSoundPlan, in staging: URL,
@@ -333,6 +361,8 @@ struct StillSoundPlanner {
         switch container {
         case "m4a": sound.muxer = "ipod"
         case "wave": sound.muxer = "wav"
+        // The helper names the Matroska muxer, and has no format called "mka".
+        case "mka": sound.muxer = "matroska"
         default: break
         }
         sound.verifiesSampleRange = true
@@ -400,7 +430,8 @@ struct StillSoundPlanner {
                 var report = StillSoundAction(ordinal: 0, laneID: audioOutput.rawValue,
                                               label: channels == 1 ? "Mono downmix" : "Stereo downmix",
                                               sourceLaneIDs: laneIDs.compactMap { $0 }, codec: action == .aac ? "aac" : "pcm_f32le",
-                                              sampleRate: plan.sampleRate, channelLayout: plan.layout, audio: action,
+                                              sampleRate: plan.sampleRate, channelLayout: plan.layout,
+                                              bitDepth: plan.output.writtenBitDepth, bitRate: plan.output.writtenBitRate, audio: action,
                                               originalStreams: Set(sources.map(\.stream)).sorted(), sources: sources,
                                               warnings: plan.warnings, generatedSilence: commonSilence(spans))
                 report.treatment = "downmix"

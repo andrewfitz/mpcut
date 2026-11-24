@@ -838,10 +838,11 @@ final class EditorModelTests: XCTestCase {
         XCTAssertEqual(model.timelineClips.first?.sourceStart, 1)
         model.undo()
 
-        XCTAssertEqual(model.trim(id, edge: .end, sourceTime: 0.6, commit: false), 1)
-        XCTAssertEqual(model.trim(id, edge: .end, sourceTime: 0.6, commit: true), 1)
-        XCTAssertEqual(model.timelineClips.first?.sourceEnd, 1)
-        XCTAssertEqual(model.playhead, 0.96, accuracy: 1e-9)
+        // A copy of this reordered footage can end before pictures 13 and 17, inside the picture group. A start needs the keyframe.
+        XCTAssertEqual(model.trim(id, edge: .end, sourceTime: 0.6, commit: false), 0.52)
+        XCTAssertEqual(model.trim(id, edge: .end, sourceTime: 0.6, commit: true), 0.52)
+        XCTAssertEqual(model.timelineClips.first?.sourceEnd, 0.52)
+        XCTAssertEqual(model.playhead, 0.48, accuracy: 1e-9)
         model.undo()
 
         model.seek(0.6)

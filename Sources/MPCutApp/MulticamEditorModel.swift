@@ -2469,7 +2469,7 @@ final class MulticamEditorModel: ObservableObject {
                 if dryRun {
                     let encoder = JSONEncoder()
                     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-                    return (String(decoding: try encoder.encode(plan), as: UTF8.self), plan.audioDeliverySummary)
+                    return (String(decoding: try encoder.encode(plan), as: UTF8.self), plan.deliveryReview)
                 }
                 let result = saveResult ? try ExportResultFile(output: output, plan: plan,
                                                                cutMap: ExportCutMap(multicam: plan.mapping)) : nil

@@ -73,13 +73,16 @@ private struct IndexHeader: Codable {
         case sourceStartSafe = "source_start_safe"
     }
 
+    // Revision 10 lets reordered H.264 and HEVC with one picture duration end wherever
+    // the decode order is split by presentation time, not only before a keyframe. Every
+    // earlier H.264 or HEVC index is rebuilt, since it can hold the keyframe-only end points.
     // Revision 9 lets presentation-ordered H.264 and HEVC end at every picture, and
     // stops refusing to copy a MOV or MP4 movie because of its chapter track. Every
     // earlier index of H.264, HEVC or a MOV-family file is rebuilt, since it can hold
     // the old end points or that refusal. Revision 8 adds independent JPEG entry points
-    // and decoded packet counts for lossless audio. Other indexes from revisions 7 and 8
-    // remain usable.
-    private static let currentProbeRevision = 9
+    // and decoded packet counts for lossless audio. Other indexes from revisions 7, 8
+    // and 9 remain usable.
+    private static let currentProbeRevision = 10
     let probeRevision: Int
     let identity: SourceIdentity
     let sourceExtension: String
@@ -170,9 +173,9 @@ private struct IndexHeader: Codable {
     var isUsable: Bool {
         let descriptions = streams.map(\.value)
         let needsNewIndex = descriptions.contains { ["mjpeg", "alac", "flac"].contains($0.codec) }
-        let needsRevision9 = format.split(separator: ",").contains("mov")
-            || descriptions.contains { ["h264", "hevc"].contains($0.codec) }
-        guard probeRevision == Self.currentProbeRevision
+        let needsRevision10 = descriptions.contains { ["h264", "hevc"].contains($0.codec) }
+        let needsRevision9 = format.split(separator: ",").contains("mov") || needsRevision10
+        guard probeRevision == Self.currentProbeRevision || (probeRevision == 9 && !needsRevision10)
                 || (!needsRevision9 && (probeRevision == 8 || (probeRevision == 7 && !needsNewIndex))) else { return false }
         guard duration > .zero, descriptions.enumerated().allSatisfy({ $0.offset == $0.element.index }),
               audio.map(\.index) == descriptions.filter({ $0.kind == "audio" }).map(\.index),

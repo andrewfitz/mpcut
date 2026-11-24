@@ -9,9 +9,11 @@ struct FrameExportOptions {
     let source: Source
     let output: String
     let preset: JPEGPreset
+    let format: FrameImageFormat
 
     init(_ arguments: [String]) throws {
         var file: String?, output: String?, mode: String?, sample: JPEGSample?, preset: JPEGPreset?
+        var format: FrameImageFormat?
         var project: String?
         var clock: StillOptions.Clock?
         var times: [RationalTime] = []
@@ -55,6 +57,11 @@ struct FrameExportOptions {
             case "--preset":
                 guard let choice = JPEGPreset(rawValue: try value(flag)) else { throw invalid("Choose review or full.") }
                 preset = choice
+            case "--format":
+                guard let choice = FrameImageFormat(rawValue: try value(flag)) else {
+                    throw invalid("Choose jpeg, png or tiff. PNG and TIFF are lossless and keep the source's depth and color profile.")
+                }
+                format = choice
             case "--stream":
                 guard let choice = Int(try value(flag)), choice >= 0 else { throw invalid("Use a nonnegative audio stream index.") }
                 stream = choice
@@ -77,10 +84,11 @@ struct FrameExportOptions {
         }
         self.output = output
         self.preset = preset ?? .review
+        self.format = format ?? .jpeg
         if let project {
             guard !times.isEmpty, mode == nil, sample == nil, limit == nil,
                   stream == nil, threshold == nil, minimum == nil else {
-                throw invalid("Use --project with one or more --at times and optional --clock and --preset.")
+                throw invalid("Use --project with one or more --at times and optional --clock, --preset and --format.")
             }
             source = .project(project, times, clock: clock)
             return

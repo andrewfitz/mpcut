@@ -104,8 +104,9 @@ enum ParticipantRenderSound {
             spans, duration: timeline.duration, container: "mov", action: .pcm, allowsSilence: true,
             silenceFormat: .init(media: media, audio: index)) { error, _ in error }
         let action = StillSoundAction(ordinal: 0, laneID: MulticamPlan.programAudioLaneID, label: "Participant ISO",
-                                      codec: plan.floatingPoint ? "pcm_f32le" : "pcm_s32le",
-                                      sampleRate: plan.sampleRate, channelLayout: plan.layout, audio: .pcm,
+                                      codec: plan.writtenCodec,
+                                      sampleRate: plan.sampleRate, channelLayout: plan.layout,
+                                      bitDepth: plan.writtenBitDepth, audio: .pcm,
                                       originalStreams: [selection.stream], sources: spans.compactMap { span in
                                           guard span.media != nil else { return nil }
                                           return .init(file: file, stream: selection.stream, input: span.input, output: span.output)

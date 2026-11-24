@@ -351,6 +351,11 @@ struct Arguments {
             requestFile = options[index + 1]
             options.replaceSubrange(index...index + 1, with: ["--stdin"])
         }
+        // A participants command reads a JSON request alone. Say so, instead of calling --stdin an unknown option.
+        if CommandPath.participants[operation] != nil,
+           flags.contains("--stdin") && options != ["--stdin"] || flags.contains("--input") && options.count != 2 {
+            throw CLIError("invalid_arguments", "Put the other options inside the JSON request when supplying --stdin or --input FILE.")
+        }
         if json || requestFile != nil && operation.hasPrefix("export ") { options.insert("--json", at: 0) }
         let parsed = try parseCommand(operation, options: options, json: json || requestFile != nil)
         if !sidecar, case let .sidecar(settings) = parsed.command, settings.statusOnly {

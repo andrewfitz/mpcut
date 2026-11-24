@@ -43,7 +43,7 @@ final class StillImageTests: XCTestCase {
         XCTAssertEqual(try frame.sdrImage().colorSpace?.name, CGColorSpace.sRGB)
     }
 
-    func testISOGainMapLinearPatchesAndSDRShoulder() throws {
+    func testISOGainMapLinearPatchesAndSDRBase() throws {
         for suffix in ["jpeg", "heic"] {
             let url = fixture("gain-map.\(suffix)")
             let canvas = StillImageCanvas(width: 64, height: 64, transfer: "pq", primaries: "bt2020")
@@ -52,10 +52,23 @@ final class StillImageTests: XCTestCase {
             XCTAssertTrue(hdr.sourceInfo.auxiliaryImages.contains("iso_gain_map"))
             XCTAssertEqual(component(hdr, x: 16, y: 32), 0.510, accuracy: 0.004)
             XCTAssertEqual(component(hdr, x: 48, y: 32), 0.729, accuracy: 0.004)
-            let sdr = try StillImage.render(url, canvas: canvas, forceSDR: true)
-            XCTAssertEqual(component(sdr, x: 16, y: 32), 0.737, accuracy: 0.004)
-            XCTAssertEqual(component(sdr, x: 48, y: 32), 0.972, accuracy: 0.004)
+            // An SDR program shows the file's own SDR base: linear 0.5 and SDR white at full signal.
+            // The HDR rendition's shoulder would put the second patch at 0.972.
+            for sdr in [try StillImage.render(url, canvas: canvas, forceSDR: true),
+                        try StillImage.render(url, canvas: .init(width: 64, height: 64, transfer: "iec61966-2-1"))] {
+                XCTAssertEqual(sdr.sourceInfo.rendition, .gainMap)
+                XCTAssertEqual(component(sdr, x: 16, y: 32), 0.737, accuracy: 0.004)
+                XCTAssertEqual(component(sdr, x: 48, y: 32), 1, accuracy: 0.004)
+            }
         }
+    }
+
+    func testTaggedHDRStillKeepsItsShoulderOnAnSDRProgram() throws {
+        // PQ patches at linear 0.99 and 4.84 times SDR white have no SDR base to fall back on.
+        let sdr = try StillImage.render(fixture("hdr-pq.avif"), canvas: .init(width: 64, height: 64), forceSDR: true)
+        XCTAssertEqual(sdr.sourceInfo.rendition, .pq)
+        XCTAssertEqual(component(sdr, x: 16, y: 32), 0.878, accuracy: 0.01)
+        XCTAssertEqual(component(sdr, x: 48, y: 32), 0.976, accuracy: 0.01)
     }
 
     func testISOGainMapFallbackRecoversLinearPatches() throws {

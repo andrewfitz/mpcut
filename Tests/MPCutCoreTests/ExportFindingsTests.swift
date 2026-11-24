@@ -188,7 +188,8 @@ final class ExportFindingsTests: XCTestCase {
         XCTAssertEqual(state.factors.map(\.id), [.cutVideoEnd])
         XCTAssertEqual(state.factors.first?.segment, 2)
         let moved = try XCTUnwrap(evaluator.snapped(clips, media: indexed, to: .trueLossless))
-        XCTAssertEqual(moved.map { [$0.from, $0.to] }, [[.zero, t(7, 25)], [t(7, 25), t(1)]])
+        // 31/25 lies between the end points before pictures 30 and 34. The nearer one is not a keyframe.
+        XCTAssertEqual(moved.map { [$0.from, $0.to] }, [[.zero, t(7, 25)], [t(7, 25), t(6, 5)]])
         XCTAssertEqual(evaluator.evaluate(moved, media: indexed).tier, .trueLossless)
     }
 

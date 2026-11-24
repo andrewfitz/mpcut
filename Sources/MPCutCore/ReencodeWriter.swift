@@ -214,8 +214,10 @@ extension ReencodeEngine {
         try manifest.write(to: staging.appendingPathComponent("parts.ffconcat"), atomically: true, encoding: .utf8)
         let source = batches[0][0].media
         var args = ["-xerror", "-copyts", "-f", "concat", "-safe", "1", "-i", "parts.ffconcat"]
-        args += copiedAudio
-        args += ["-map_metadata", "-1", "-map_chapters", "-1", "-map", "0:v:0", "-c:v", "copy"]
+        var laterInputs = copiedAudio
+        let chapters = try chapterArguments(plan, in: staging, inputIndex: 1 + copiedAudio.count / 2, inputs: &laterInputs)
+        args += laterInputs
+        args += (chapters ?? ["-map_metadata", "-1", "-map_chapters", "-1"]) + ["-map", "0:v:0", "-c:v", "copy"]
         var stagedOrdinal = 0
         for (index, pair) in zip(plan.audioActions, plan.canvas?.audio ?? []).enumerated() {
             // Every part carries the canvas sound, whichever clips it holds.
@@ -331,8 +333,15 @@ extension ReencodeEngine {
             throw CutError(code: "write_failed", message: error.localizedDescription)
         }
         let container = intermediate ? "mov" : plan.edit.container
-        var args = ["-map_chapters", "-1", "-map_metadata", "-1",
-                 "-fps_mode", "passthrough", "-enc_time_base:v", "1:\(plan.timeScale)"]
+        // The published movie carries the chapters. They are one more input, after every input the filters number.
+        var chapters: [String]?
+        if !intermediate {
+            let index = decoders.count + extraInputs.count / 2
+            chapters = try chapterArguments(plan, in: staging, inputIndex: index, inputs: &extraInputs)
+        }
+        let unmapped = ["-map_chapters", "-1", "-map_metadata", "-1"]
+        var args = (chapters ?? unmapped)
+            + ["-fps_mode", "passthrough", "-enc_time_base:v", "1:\(plan.timeScale)"]
         let last = inputs[inputs.count - 1]
         let upper = last.media.frames.lowerBound { $0.time >= last.to }
         let lastFrame = last.media.frames[upper - 1].time
@@ -446,6 +455,7 @@ extension ReencodeEngine {
         } catch let error as CutError where error.code == "encode_failed" {
             // The second render uses the hardware decoder only. Its caller reports the first failure.
             if again { throw error }
+            if let damage = damagedSound(error, inputs: decoders) { throw damage }
             if let damage = try damagedPicture(error, inputs: decoders, plan: plan) {
                 throw DamagedPicture(error: damage, hardware: preferred != .compatible)
             }
@@ -459,9 +469,41 @@ extension ReencodeEngine {
             do {
                 try encode(.compatible)
             } catch let error as CutError where error.code == "encode_failed" {
-                throw try damagedPicture(error, inputs: decoders, plan: plan) ?? error
+                throw try damagedSound(error, inputs: decoders) ?? damagedPicture(error, inputs: decoders, plan: plan) ?? error
             }
         }
+    }
+
+    /// Adds the plan's chapters to a final mux as an input without streams, and returns the options that map them.
+    /// Nil when the plan has none, which leaves the helper's arguments as they are for a source without chapters.
+    private func chapterArguments(_ plan: ReencodePlan, in staging: URL, inputIndex: Int, inputs: inout [String]) throws -> [String]? {
+        guard !plan.chapters.isEmpty else { return nil }
+        do {
+            try ReencodeChapter.metadata(plan.chapters).write(to: staging.appendingPathComponent("chapters.ffmeta"),
+                                                              atomically: true, encoding: .utf8)
+        } catch {
+            throw CutError(code: "write_failed", message: error.localizedDescription)
+        }
+        inputs += ["-f", "ffmetadata", "-i", "chapters.ffmeta"]
+        // Disabling every metadata mapping at once would also drop the chapter titles.
+        return ["-map_chapters", "\(inputIndex)", "-map_metadata:g", "-1", "-map_metadata:s", "-1"]
+    }
+
+    /// Recognize a sound decoder that rejected a packet. The helper names the failing track as
+    /// "aist#<input>:<stream>". No picture is at fault, and decoding the picture another way cannot help.
+    private func damagedSound(_ error: CutError, inputs: [DecoderInput]) -> CutError? {
+        for line in error.message.lowercased().split(separator: "\n") where line.contains("invalid data found") {
+            guard line.contains("decoder") || line.contains("decoding error"), let mark = line.range(of: "aist#") else { continue }
+            let named = line[mark.upperBound...]
+            let input = Int(named.prefix(while: \.isNumber))
+            let track = Int(named.drop(while: \.isNumber).dropFirst().prefix(while: \.isNumber))
+            let name = input.flatMap { inputs.indices.contains($0) ? inputs[$0].file.lastPathComponent : nil } ?? "a source"
+            return CutError(code: "encode_failed",
+                            message: "The sound of \(name)\(track.map { " (audio track \($0))" } ?? "") is damaged and could not be decoded. "
+                                + "Re-encode decodes sound from before each selected range. Choose a range away from the damage, or remove the audio.",
+                            track: track)
+        }
+        return nil
     }
 
     /// Recognize a decoder that rejected one coded picture. The software HEVC decoder conceals

@@ -4037,9 +4037,9 @@ Returns `state`, `progress`, `input_revision` and published `outputs`. After can
 
 ### `export_editor_project_plan`
 
-Plan the open project export and report eligible ranges, review findings and the occurrence-level cut map when available.
+Plan the open project export and report eligible ranges, review findings and the occurrence-level cut map when available. An ordinary plan lists under warnings what the output does not keep: reductions made by an encode, and cover art, chapters or timecode that a copy leaves behind. A plain copy that keeps everything has no warnings field. A re-encode lists each audio track under audio_actions with its codec, bit_rate or bit_depth and reason. Multicam and still plans carry their warnings inside plan.
 
-Starts a live job. Poll `export_editor_job_status_read` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposed_ranges`, `alternatives` or `fallback`. An eligible plan or render can include `cut_map.occurrences[]` in playback order, with individual requested, resolved and output ranges and render segment references. Still plans report copied and encoded camera duration, generated still duration and sample count, placement ranges, effective output codec and sound actions. Confirm published paths in the job’s `outputs`.
+Starts a live job. Poll `export_editor_job_status_read` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposed_ranges`, `alternatives` or `fallback`. An eligible plan or render can include `cut_map.occurrences[]` in playback order, with individual requested, resolved and output ranges and render segment references. Still plans report copied and encoded camera duration, generated still duration and sample count, placement ranges, effective output codec and sound actions. Confirm published paths in the job’s `outputs`. `warnings` lists what a copy cannot carry in the chosen container and the notes of a re-encode, and is absent for a plain copy that keeps everything. A re-encode also reports `audio_actions` with each track’s codec, bit rate or bit depth, and reason.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -4062,9 +4062,9 @@ Starts a live job. Poll `export_editor_job_status_read` for its result. A succes
 
 ### `export_editor_project_render`
 
-Render the open project to the output path and report its occurrence-level cut map when available.
+Render the open project to the output path and report its occurrence-level cut map when available. The result reports warnings and audio_actions as export_editor_project_plan does.
 
-Starts a live job. Poll `export_editor_job_status_read` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposed_ranges`, `alternatives` or `fallback`. An eligible plan or render can include `cut_map.occurrences[]` in playback order, with individual requested, resolved and output ranges and render segment references. Still plans report copied and encoded camera duration, generated still duration and sample count, placement ranges, effective output codec and sound actions. Confirm published paths in the job’s `outputs`.
+Starts a live job. Poll `export_editor_job_status_read` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposed_ranges`, `alternatives` or `fallback`. An eligible plan or render can include `cut_map.occurrences[]` in playback order, with individual requested, resolved and output ranges and render segment references. Still plans report copied and encoded camera duration, generated still duration and sample count, placement ranges, effective output codec and sound actions. Confirm published paths in the job’s `outputs`. `warnings` lists what a copy cannot carry in the chosen container and the notes of a re-encode, and is absent for a plain copy that keeps everything. A re-encode also reports `audio_actions` with each track’s codec, bit rate or bit depth, and reason.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -4138,9 +4138,9 @@ Returns the default `coordinate_space` and current `ranges[]` with IDs, names wh
 
 ### `export_queue_plan`
 
-Plan exports of queued entries using their captured ranges.
+Plan exports of queued entries using their captured ranges. range_plans has one row for each ordinary sequence entry: destination, mode, tracks, container, duration, copied_video_duration and encoded_video_duration for picture, audio_actions for converted sound, a summary, and warnings for what the output does not keep, such as cover art, chapters or timecode that a copy leaves behind. Still and multicam entries report under still_plans and multicam_plans.
 
-Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` and published `outputs`. Poll `export_editor_job_status_read` with the same project. The terminal result reports planned `destinations` and still plans for applicable queue entries. Affected entries are skipped and their IDs appear in `skipped_needs_replan`.
+Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` and published `outputs`. Poll `export_editor_job_status_read` with the same project. The terminal result reports planned `destinations` and still plans for applicable queue entries. Affected entries are skipped and their IDs appear in `skipped_needs_replan`. `range_plans[]` gives each ordinary range’s destination, mode, container, copied and encoded video durations, audio actions and `warnings`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -4175,9 +4175,9 @@ Returns the default `coordinate_space` and current `ranges[]` with IDs, names wh
 
 ### `export_queue_render`
 
-Render the queued entries to the output directory.
+Render the queued entries to the output directory. The result reports range_plans as export_queue_plan does.
 
-Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` and published `outputs`. Poll `export_editor_job_status_read` with the same project. The terminal result reports planned `destinations` and still plans for applicable queue entries. Affected entries are skipped and their IDs appear in `skipped_needs_replan`.
+Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` and published `outputs`. Poll `export_editor_job_status_read` with the same project. The terminal result reports planned `destinations` and still plans for applicable queue entries. Affected entries are skipped and their IDs appear in `skipped_needs_replan`. `range_plans[]` gives each ordinary range’s destination, mode, container, copied and encoded video durations, audio actions and `warnings`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |

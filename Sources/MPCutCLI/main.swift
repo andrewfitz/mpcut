@@ -1910,17 +1910,20 @@ private func runMulticamExport(project loaded: LoadedProject<MulticamProject>? =
     }
 }
 
-private func finishResolveExport(_ output: URL, open: Bool, json: Bool, interruption: Interruption) throws {
+private func finishResolveExport(_ output: URL, open: Bool, json: Bool, interruption: Interruption,
+                                 warnings: [String] = []) throws {
     if open { try ResolveExport.openInResolve(output, cancelled: { !interruption.isActive }) }
     if json {
         struct Result: Encodable {
             let ok = true
             let output: String
             let opened: Bool
+            let warnings: [String]
         }
-        try writeJSON(Result(output: output.path, opened: open), checkCancellation: false)
+        try writeJSON(Result(output: output.path, opened: open, warnings: warnings), checkCancellation: false)
     } else {
         try interruption.beginResponse(checkCancellation: false)
+        for warning in warnings { errorOutput("mpcut: " + warning) }
         try writeOutput("Exported " + output.path)
     }
 }
@@ -2213,7 +2216,8 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
                 fileURL(file, label: "Input"), keyframes: true)
             guard media.hasVideo else { throw CutError(code: "no_video", message: "JPEG export requires a video stream.") }
             let result = try JPEGExport.write(media, to: output, selection: selection, sample: sample,
-                                              preset: options.preset, limit: limit, cancelled: { !interruption.isActive })
+                                              preset: options.preset, format: options.format,
+                                              limit: limit, cancelled: { !interruption.isActive })
             try writeJSON(result, pretty: !arguments.json, checkCancellation: false)
         case let .project(file, times, clock):
             let identity = isStandardInput(file) ? nil : (try? SourceIdentity(fileURL(file, label: "Project")))
@@ -2224,7 +2228,8 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
             try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
                 if case .multicam(let multicam) = loaded.project, clock == nil || clock == .group {
                     let result = try JPEGExport.writeMulticam(multicam, document: loaded.file, at: times, to: output,
-                                                              preset: options.preset, useSidecar: arguments.useSidecar,
+                                                              preset: options.preset, format: options.format,
+                                                              useSidecar: arguments.useSidecar,
                                                               documentIdentity: identity,
                                                               projectMedia: loaded.media,
                                                               cancelled: { !interruption.isActive })
@@ -2232,7 +2237,8 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
                 } else {
                     let result = try writeProgramFrames(loaded.project, media: loaded.media, projectPath: loaded.path,
                                                         location: loaded.location, at: times, clock: clock, to: output,
-                                                        preset: options.preset, documentIdentity: identity,
+                                                        preset: options.preset, format: options.format,
+                                                        documentIdentity: identity,
                                                         useSidecar: arguments.useSidecar, cancelled: { !interruption.isActive })
                     try writeJSON(result, pretty: !arguments.json, checkCancellation: false)
                 }
@@ -2263,11 +2269,11 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         let loaded = try loadDocument(path, interruption: interruption)
         let output = try fileURL(destination, label: "Output")
         try checkProjectOutput(output, media: loaded.media, location: loaded.location)
-        try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
+        let warnings = try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
             try ResolveExport.write(loaded.project, relativeTo: loaded.location, to: output,
                                     useSidecar: arguments.useSidecar, cancelled: { !interruption.isActive })
         }
-        try finishResolveExport(output, open: open, json: arguments.json, interruption: interruption)
+        try finishResolveExport(output, open: open, json: arguments.json, interruption: interruption, warnings: warnings)
     case let .inspectProject(path):
         let loaded = try loadDocument(path, interruption: interruption)
         if hasStillPlacements(loaded.project) || !loaded.project.stillAssets.isEmpty ||
@@ -2704,10 +2710,10 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
             }
         }
         if let resolveOpen {
-            try ResolveExport.write(clips, to: output, useSidecar: arguments.useSidecar,
-                                    cancelled: { !interruption.isActive })
+            let warnings = try ResolveExport.write(clips, to: output, useSidecar: arguments.useSidecar,
+                                                   cancelled: { !interruption.isActive })
             staging = nil  // The XML references these working copies for the lifetime of the timeline.
-            try finishResolveExport(output, open: resolveOpen, json: arguments.json, interruption: interruption)
+            try finishResolveExport(output, open: resolveOpen, json: arguments.json, interruption: interruption, warnings: warnings)
             return
         }
         var result: ExportResult

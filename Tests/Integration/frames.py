@@ -38,7 +38,7 @@ class Frames(unittest.TestCase):
         run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", ";".join(graphs) + ";[v]null[out0];[a]anull[out1]",
              "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-c:a", "pcm_s16le", cls.source])
 
-    def export(self, name, *flags, count, source=None):
+    def export(self, name, *flags, count, source=None, signature=b"\xff\xd8"):
         dest = self.root / name
         stdout = run([CLI, "review", "frames", "export", "--json", "--output", dest, *flags, source or self.source])
         report = json.loads(stdout)
@@ -48,7 +48,7 @@ class Frames(unittest.TestCase):
         self.assertEqual(len(report["frames"]), count, report)
         for frame in report["frames"]:
             file = dest / frame["file"]
-            self.assertEqual(file.read_bytes()[:2], b"\xff\xd8")
+            self.assertEqual(file.read_bytes()[:len(signature)], signature)
             dims = run(["ffprobe", "-loglevel", "error", "-show_entries", "stream=width,height",
                         "-of", "csv=p=0:s=x", file]).decode().strip()
             self.assertEqual(dims, f"{frame['width']}x{frame['height']}")
@@ -175,6 +175,31 @@ class Frames(unittest.TestCase):
             for hardware_channel, software_channel in zip(hardware_pixel, software_pixel, strict=True):
                 self.assertAlmostEqual(hardware_channel, software_channel, delta=4)
 
+    def test_untagged_matrix_follows_picture_size_on_both_decoders(self):
+        # 75% red and green, stored with the BT.709 matrix at 1280x720 and with BT.601 at 640x360,
+        # then stripped of every color tag. VideoToolbox tags untagged pictures larger than 704x576
+        # as BT.709 and smaller ones as BT.601, which is what the native preview shows. Read with
+        # the other matrix, the red patch moves by 16 to 42 levels and the green by 32.
+        for size, matrix in (("1280x720", "bt709"), ("640x360", "bt601")):
+            hardware = self.root / f"untagged-{matrix}.mp4"
+            software = self.root / f"untagged-{matrix}.mkv"
+            run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                 f"color=c=0xBF0000:s={size}:r=1:d=1[r];color=c=0x00BF00:s={size}:r=1:d=1[g];"
+                 f"[r][g]concat=n=2:v=1:a=0,format=gbrp,scale=out_color_matrix={matrix}:out_range=tv,format=yuv420p",
+                 "-c:v", "libx264", "-bsf:v",
+                 "h264_metadata=colour_primaries=2:transfer_characteristics=2:matrix_coefficients=2", hardware])
+            run(["ffmpeg", "-loglevel", "error", "-i", hardware, "-c:v", "ffv1", software])
+            for source in (hardware, software):
+                tags = run(["ffprobe", "-loglevel", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=color_space,color_primaries,color_transfer", "-of", "csv=p=0", source]).decode().strip()
+                self.assertEqual(tags, "unknown,unknown,unknown")
+                with self.subTest(size=size, decoder=source.suffix[1:]):
+                    dest, report = self.export(f"untagged-{matrix}-{source.suffix[1:]}", "--at", "0", "--at", "1",
+                                               "--preset", "full", count=2, source=source)
+                    for frame, expected in zip(report["frames"], ((191, 0, 0), (0, 191, 0)), strict=True):
+                        for channel, wanted in zip(rgb(dest / frame["file"]), expected, strict=True):
+                            self.assertAlmostEqual(channel, wanted, delta=6)
+
     def test_hlg_ramp_is_tone_mapped_and_sdr_ramp_is_not(self):
         # A neutral ramp from black to peak signal. Converted to sRGB without
         # tone mapping, the upper half of an HLG ramp is one flat white.
@@ -209,6 +234,131 @@ class Frames(unittest.TestCase):
         upper_middle, near_peak = ramp("sdr-ramp.mkv", 8, ("bt709", "bt709", "bt709"), ["-c:v", "ffv1"])
         self.assertAlmostEqual(upper_middle, 163, delta=6)
         self.assertAlmostEqual(near_peak, 233, delta=6)
+
+    def test_limited_range_levels_survive_every_software_conversion(self):
+        # Black, mid grey and white patches at limited-range codes 16, 126 and 235.
+        # The sRGB transfer tag keeps colour management from moving the mid level,
+        # so the expected picture values are exactly 0, 128 and 255. The scaled,
+        # odd-height, wide-sample and off-block-width conversions each lost two
+        # levels (white 253), and unscaled 8-bit gray kept 16 and 235.
+        cases = [("review", "yuv420p", "1280x720", "review"),
+                 ("off-block", "yuv420p", "648x360", "full"),
+                 ("off-block-422", "yuv422p", "648x360", "full"),
+                 ("odd-height", "yuv420p", "640x361", "full"),
+                 ("ten-bit", "yuv420p10le", "640x360", "full"),
+                 ("ten-bit-422", "yuv422p10le", "640x360", "full"),
+                 ("gray", "gray", "640x360", "full"),
+                 ("gray-review", "gray", "1280x720", "review"),
+                 ("block", "yuv420p", "640x360", "full")]
+        for name, fmt, size, preset in cases:
+            with self.subTest(case=name):
+                scale = 4 if "10" in fmt else 1
+                chroma = "" if fmt == "gray" else f":cb={128 * scale}:cr={128 * scale}"
+                source = self.root / f"levels-{name}.mkv"
+                run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                     f"nullsrc=s={size}:r=1:d=1,format={fmt},"
+                     f"geq=lum='{scale}*if(lt(X,W/3),16,if(lt(X,2*W/3),126,235))'{chroma},"
+                     "setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv",
+                     "-c:v", "ffv1", "-color_primaries", "bt709", "-color_trc", "iec61966-2-1",
+                     "-colorspace", "bt709", "-color_range", "tv", source])
+                dest, report = self.export(f"levels-{name}", "--at", "0", "--preset", preset, count=1, source=source)
+                image = dest / report["frames"][0]["file"]
+                for xfrac, expected in ((1 / 6, 0), (1 / 2, 128), (5 / 6, 255)):
+                    for channel in rgb(image, xfrac=xfrac):
+                        self.assertAlmostEqual(channel, expected, delta=1, msg=(name, xfrac))
+
+    def raw(self, path, pixel_format):
+        return run(["ffmpeg", "-loglevel", "error", "-i", path, "-frames:v", "1", "-pix_fmt", pixel_format,
+                    "-f", "rawvideo", "-"])
+
+    def image_facts(self, path):
+        pixel_format = run(["ffprobe", "-loglevel", "error", "-show_entries", "stream=pix_fmt",
+                            "-of", "csv=p=0", path]).decode().strip()
+        described = run(["sips", "-g", "profile", "-g", "hasAlpha", path]).decode()
+        facts = dict(line.strip().split(": ", 1) for line in described.splitlines()[1:])
+        return pixel_format, facts["profile"], facts["hasAlpha"]
+
+    def test_png_and_tiff_keep_rgb_samples_exactly(self):
+        # FFV1 holds these R'G'B' samples losslessly, so the exported file must return every one.
+        for depth, source_format, raw_format, stored in ((8, "gbrp", "rgb24", "rgb24"), (16, "gbrp16le", "rgb48le", "rgb48")):
+            source = self.root / f"rgb{depth}.mkv"
+            run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"testsrc2=s=326x182:r=5:d=1,format={source_format}",
+                 "-c:v", "ffv1", source])
+            expected = self.raw(source, raw_format)
+            for name, signature in (("png", b"\x89PNG\r\n\x1a\n"), ("tiff", b"")):
+                with self.subTest(depth=depth, format=name):
+                    dest, report = self.export(f"rgb{depth}-{name}", "--at", "0", "--preset", "full", "--format", name,
+                                               count=1, source=source, signature=signature)
+                    self.assertEqual(report["format"], name)
+                    frame = report["frames"][0]
+                    self.assertEqual(frame["file"], "frame-000001." + name)
+                    if name == "tiff":
+                        self.assertIn((dest / frame["file"]).read_bytes()[:4], (b"II*\x00", b"MM\x00*"))
+                    pixel_format, profile, alpha = self.image_facts(dest / frame["file"])
+                    self.assertTrue(pixel_format.startswith(stored), pixel_format)
+                    self.assertEqual((profile, alpha), ("sRGB IEC61966-2.1", "no"))
+                    self.assertEqual(self.raw(dest / frame["file"], raw_format), expected)
+        # JPEG stays the default and its manifest does not gain a key.
+        _, report = self.export("rgb-default", "--at", "0", count=1, source=source)
+        self.assertNotIn("format", report)
+        self.assertEqual(report["frames"][0]["file"], "frame-000001.jpg")
+        result = subprocess.run([CLI, "review", "frames", "export", "--json", "--format", "bmp", "--at", "0",
+                                 "--output", self.root / "rgb-bmp", source], capture_output=True, timeout=120)
+        self.assertEqual((result.returncode, json.loads(result.stdout)["error"]["code"]), (2, "invalid_arguments"))
+        self.assertFalse((self.root / "rgb-bmp").exists())
+
+    def test_png_keeps_depth_gamut_and_hdr_signal(self):
+        # Limited-range patches at 10-bit codes 64, 504 and 940: black, (126 - 16) / 219 and white.
+        def patches(name, primaries, transfer, matrix):
+            source = self.root / name
+            run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                 "nullsrc=s=640x360:r=1:d=1,format=yuv420p10le,"
+                 "geq=lum='4*if(lt(X,W/3),16,if(lt(X,2*W/3),126,235))':cb=512:cr=512,"
+                 f"setparams=color_primaries={primaries}:color_trc={transfer}:colorspace={matrix}:range=tv",
+                 "-c:v", "ffv1", "-color_primaries", primaries, "-color_trc", transfer, "-colorspace", matrix,
+                 "-color_range", "tv", source])
+            dest, report = self.export(name + "-png", "--at", "0", "--preset", "full", "--format", "png",
+                                       count=1, source=source, signature=b"\x89PNG")
+            image = dest / report["frames"][0]["file"]
+            pixel_format, profile, _ = self.image_facts(image)
+            self.assertEqual(pixel_format, "rgb48be")
+            samples = self.raw(image, "rgb48le")
+            row = 180 * 640 * 6
+            levels = [int.from_bytes(samples[row + x * 6:row + x * 6 + 2], "little") for x in (106, 320, 533)]
+            return profile, levels
+
+        expected = [0, round(110 / 219 * 65535), 65535]
+        for name, tags, profile in (
+                ("deep-709.mkv", ("bt709", "bt709", "bt709"), "HDTV"),
+                ("deep-p3.mkv", ("smpte432", "iec61966-2-1", "bt709"), "Display P3"),
+                # PQ and HLG keep their signal: no tone mapping moves the mid level.
+                ("deep-hlg.mkv", ("bt2020", "arib-std-b67", "bt2020nc"), "Rec. ITU-R BT.2100 HLG"),
+                ("deep-pq.mkv", ("bt2020", "smpte2084", "bt2020nc"), "Rec. ITU-R BT.2100 PQ")):
+            with self.subTest(source=name):
+                found, levels = patches(name, *tags)
+                self.assertEqual(found, profile)
+                for level, wanted in zip(levels, expected, strict=True):
+                    self.assertAlmostEqual(level, wanted, delta=16)
+
+    def test_png_keeps_full_range_deep_levels(self):
+        # A flat full-range picture at half scale and at peak. swscale delivers the code shifted up
+        # to 16 bits, which is exact only for a 16-bit source: 10-bit peak 1023 arrives as 65472.
+        for name, fmt, bits in (("gray16", "gray16le", 16), ("yuv444p10", "yuv444p10le", 10)):
+            peak = (1 << bits) - 1
+            for code in (1 << (bits - 1), peak):
+                with self.subTest(source=name, code=code):
+                    source = self.root / f"full-{name}-{code}.mkv"
+                    chroma = "" if fmt.startswith("gray") else f":cb={1 << (bits - 1)}:cr={1 << (bits - 1)}"
+                    run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                         f"nullsrc=s=320x180:r=1:d=1,format={fmt},geq=lum={code}{chroma},"
+                         "setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=pc",
+                         "-c:v", "ffv1", "-color_primaries", "bt709", "-color_trc", "iec61966-2-1",
+                         "-colorspace", "bt709", "-color_range", "pc", source])
+                    dest, report = self.export(f"full-{name}-{code}", "--at", "0", "--preset", "full", "--format", "png",
+                                               count=1, source=source, signature=b"\x89PNG")
+                    samples = self.raw(dest / report["frames"][0]["file"], "rgb48le")
+                    level = int.from_bytes(samples[(90 * 320 + 160) * 6:(90 * 320 + 160) * 6 + 2], "little")
+                    self.assertAlmostEqual(level, round(code / peak * 65535), delta=2)
 
     def test_anamorphic_bitstream_rotation_survives_first_seek(self):
         # The H.264 display orientation SEI occurs on the first decoded picture.

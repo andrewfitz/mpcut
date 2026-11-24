@@ -91,7 +91,7 @@ extension EditorModel {
                     guard case .still(let plan) = item.payload else { return nil }
                     return "\(item.output.lastPathComponent)\n\(plan.inspectorSummary)"
                 }
-                return .success(summaries.isEmpty ? nil : summaries.joined(separator: "\n\n"))
+                return .success(batch.review(interleaving: summaries))
             } catch let issue as CutError {
                 return .failure(issue)
             } catch {

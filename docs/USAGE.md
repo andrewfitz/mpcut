@@ -361,7 +361,7 @@ In the sequence and multicam editors, **Ignore sounds up to** sets the longest s
 
 In the pause controls, open **Take Candidates** to add a missed boundary at a sequence or assembly time, or remove a manual split. MPCut aligns the new boundary to the media. **Queue Takes** follows the revised candidates. To keep a specific duration of one detected pause, select it and enable **Set retained duration for this pause**. Enter the total seconds to retain across both sides. Boundary alignment can keep more silence, and protecting the pause keeps the whole interval. Multicam splits and retained durations follow their occurrence when it moves. Other structural assembly edits clear these adjustments. During the editor session, a duration override applies when the scan finds the same pause span in that occurrence. A split or merged detection uses global padding unless you set its own override.
 
-For a copy-only edit, choose **Snap To → Keyframes** before shortening and choose **Lossless Copy** at export. MPCut looks for usable boundaries inside each removable interval. Widely spaced keyframes can leave a longer pause, and a gap with no usable pair stays intact. Smart Trim can cut between keyframes on supported footage. The export sheet verifies the complete set of linked audio and video joins.
+For a copy-only edit, choose **Snap To → Keyframes** before shortening and choose **Lossless Copy** at export. MPCut looks for usable boundaries inside each removable interval. Kept footage has to resume on a keyframe, so widely spaced keyframes can leave a longer pause, and a gap with no usable pair stays intact. On H.264 and HEVC in MOV, MP4 and MKV the footage before a pause can usually end between keyframes. Smart Trim can cut between keyframes on supported footage. The export sheet verifies the complete set of linked audio and video joins.
 
 ## Export several ranges from the timeline
 
@@ -449,7 +449,7 @@ The prompt includes a frame count when the index confirms both positions, and gi
 
 Use the frame steppers, handles, or marks to choose your cut. If MPCut asks **Keep the cut here?**, review the [export quality options](#check-export-quality) before choosing the precise cut or a copy-safe boundary.
 
-With **Smart Trim**, MPCut copies the video it can and re-encodes frames near the cuts. If the last point it can copy is at 4:55 and you cut at 4:58, it may re-encode those final three seconds. If both cuts fall inside the same group of dependent frames, it may need to re-encode the whole selection.
+With **Smart Trim**, MPCut copies the video it can and re-encodes frames near the cuts. If the last point it can copy is at 4:55 and you cut at 4:58, it may re-encode those final three seconds. If both cuts fall inside the same group of dependent frames, it may need to re-encode the whole selection. H.264 and HEVC in MOV, MP4 and MKV can usually end a copied section inside a group of frames, so the end of a clip often needs no re-encoding. The start of a copied section still needs a keyframe.
 
 Only re-encoded frames can lose quality. MPCut uses the source bitrate near each cut as its target. A new keyframe takes extra space, so a very short edit can use more bytes per second than the source. Audio follows its own copy and trim rules. Your original files stay intact.
 

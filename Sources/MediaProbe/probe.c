@@ -645,7 +645,10 @@ typedef struct {
     unsigned char start, end;
 } CutPoint;
 
-static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska_avc_or_hevc)
+/* `picture_ends` marks every point where the decode order is also split by presentation
+ * time as an end, whether or not the next coded picture is a keyframe. It applies only
+ * to a stream whose pictures are all one duration apart. */
+static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska_avc_or_hevc, bool picture_ends)
 {
     MPProbePacket *packets = video->packets;
     CutPoint *cuts = av_calloc(video->count, sizeof(*cuts));
@@ -662,6 +665,10 @@ static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska
 
     // Retaining by presentation timestamps must reproduce the decode prefix
     // and suffix. Some closed GOPs display leading B pictures before the IDR.
+    // The pictures before such a point are a complete decode prefix: none of them
+    // was coded after, or predicted from, a picture at or past it. A reordered
+    // stream has one of these before each anchor picture that no earlier-presented
+    // picture follows in decode order, typically one per run of B pictures.
     int64_t prefix_max = INT64_MIN;
     for (size_t i = 0; i < video->count; i++) {
         CutPoint *cut = &cuts[i];
@@ -669,7 +676,8 @@ static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska
         if (prefix_max < cut->first_presentation) {
             cut->start = packet->start == 1 ||
                 (packet->start == 2 && cut->first_presentation == packet->pts);
-            cut->end = packet->end;
+            // 1 ends before a keyframe. 2 ends inside a picture group.
+            cut->end = packet->end ? 1 : picture_ends ? 2 : 0;
         }
         prefix_max = FFMAX(prefix_max, packet->pts);
         packet->start = packet->end = 0;
@@ -699,6 +707,14 @@ static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska
             packets[i].dts = (int64_t)dts;
         }
     }
+    // MOV times a track by decode intervals. When a picture is held longer than its
+    // neighbours, the decode clock of a prefix that stops inside its picture group can end
+    // before the presentation does, and a reader that measures the track by its samples
+    // shortens the last picture. Keyframe ends do not show this, so a stream with varying
+    // picture durations keeps those only.
+    bool steady = picture_ends && video->count > 1;
+    for (size_t i = 2; steady && i < video->count; i++)
+        steady = av_sat_sub64(packets[i].pts, packets[i - 1].pts) == av_sat_sub64(packets[1].pts, packets[0].pts);
     size_t frame = 0;
     for (size_t i = 0; i < video->count; i++) {
         const CutPoint *cut = &cuts[i];
@@ -708,7 +724,7 @@ static int reorder_video(MPProbeStream *video, bool *source_start, bool matroska
             frame++;
         if (frame < video->count && packets[frame].pts == cut->first_presentation) {
             packets[frame].start = cut->start;
-            packets[frame].end = cut->end;
+            packets[frame].end = cut->end == 1 || (cut->end == 2 && steady);
         }
     }
     av_free(cuts);
@@ -758,21 +774,24 @@ static int build_video_index(MPProbeResult *result, const AVStream *input_video)
     }
     bool source_start = packets[0].start != 0;
     enum AVCodecID codec = input_video->codecpar->codec_id;
+    // Every sample is one displayed progressive picture, so a decode prefix holds
+    // exactly the pictures it presents. A field-coded stream can split a frame
+    // across two samples. VP8, VP9 and AV1 packets can also carry pictures that
+    // are shown later.
+    bool picture_ends = (codec == AV_CODEC_ID_H264 || codec == AV_CODEC_ID_HEVC) &&
+        (av_match_name("mov", result->format) || av_match_name("matroska", result->format)) &&
+        input_video->codecpar->extradata_size > 0 && input_video->codecpar->extradata[0] == 1 &&
+        video->field_order == AV_FIELD_PROGRESSIVE && !video->complex_picture &&
+        !video->multilayer && !video->multiple_descriptions;
     if (!sorted) {
         bool matroska_avc_or_hevc = av_match_name("matroska", result->format) &&
                                     (codec == AV_CODEC_ID_H264 || codec == AV_CODEC_ID_HEVC);
-        int status = reorder_video(video, &source_start, matroska_avc_or_hevc);
+        int status = reorder_video(video, &source_start, matroska_avc_or_hevc, picture_ends);
         if (status < 0)
             return status;
-    } else if ((codec == AV_CODEC_ID_H264 || codec == AV_CODEC_ID_HEVC) &&
-               (av_match_name("mov", result->format) || av_match_name("matroska", result->format)) &&
-               input_video->codecpar->extradata_size > 0 && input_video->codecpar->extradata[0] == 1 &&
-               video->field_order == AV_FIELD_PROGRESSIVE && !video->complex_picture &&
-               !video->multilayer && !video->multiple_descriptions) {
-        // Every sample is one displayed progressive picture, decoded in presentation
-        // order from earlier samples only. The pictures before any picture decode
-        // without it. A field-coded stream can split a frame across two samples.
-        // VP8, VP9 and AV1 packets can also carry pictures that are shown later.
+    } else if (picture_ends) {
+        // In presentation order every picture decodes from earlier samples only.
+        // The pictures before any picture decode without it.
         for (size_t i = 0; i < video->count; i++)
             packets[i].end = 1;
     }

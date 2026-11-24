@@ -949,7 +949,7 @@ class StillTimelineAcceptance(unittest.TestCase):
         arguments = alternate["arguments"]
         planned = self.export(project, output, *arguments, "--dry-run")
         self.assert_report(planned, copied=4, generated=2)
-        from_document = self.export("-", output, *arguments, "--dry-run", stdin=project.read_text())
+        from_document = self.export("-", output, *arguments, "--dry-run", stdin=json.dumps(read_project(project)))
         from_request = self.cli("export", "project", "render", "--stdin", "--dry-run",
                                 stdin=json.dumps({"project_path": str(project), "output": str(output),
                                                   "mode": "smart", "tracks": "video"}))

@@ -353,6 +353,8 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         return false
     }
     private var review: ExportCutReview?
+    /// What the ready plan of `revision` leaves behind, read off the main thread with the plan.
+    private var copyOmissions: (revision: UUID, notes: [String])?
     private(set) var appliedReview: ExportCutReview?
     var selected: EditorExportPlan? {
         if case .ready(let plan) = availability { return plan }
@@ -860,7 +862,9 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         resolution = task
         Task { [weak self] in
             let result = await task.value
+            let omissions = await Task.detached(priority: .userInitiated) { result.availability.copyOmissions }.value
             guard let self, self.revision == id, !task.isCancelled else { return }
+            self.copyOmissions = (id, omissions)
             self.availability = result.availability
             self.failure = result.failure
             self.alternatives = result.offers
@@ -888,7 +892,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
             symbol = "checkmark.circle"
             description = "Export ready"
             statusIcon.contentTintColor = .secondaryLabelColor
-            summary.stringValue = plan.summary
+            summary.stringValue = plan.summary(noting: copyOmissions?.revision == revision ? copyOmissions?.notes ?? [] : [])
         case .unavailable(let message, _):
             symbol = "exclamationmark.triangle.fill"
             description = "Export unavailable"
