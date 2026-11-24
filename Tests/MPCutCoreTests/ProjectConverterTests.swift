@@ -3,6 +3,15 @@ import XCTest
 @testable import MPCutCore
 
 final class ProjectConverterTests: XCTestCase {
+    func testInterchangeRefusesFeedTreatmentEvenWhenOmissionsAreAllowed() throws {
+        var project = CutProject.sequence([.init(id: "clip", file: "call.mov", from: .zero, to: .init(numerator: 1))])
+        project.participants = .init(people: [.init(id: "guest", name: "Guest", treatment: .init(mode: .cover))])
+        XCTAssertThrowsError(try ProjectConverter.prepareForInterchange(project, for: "FCPXML", allowLoss: true)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "participant_render_unavailable")
+        }
+        XCTAssertNotNil(project.participants.transcriptExportWarning)
+    }
+
     func testTranscriptInterchangeReportsLossAndNativeCopyOwnsItsStore() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

@@ -1,6 +1,6 @@
 # Tiles: one picture pipeline and tile edits that follow the clip
 
-Plan written November 23, 2026. Nothing in this document is built. It is one plan for the desktop app, the CLI, MCP and the TileTrail detector: the same model, names and checks on every surface. It joins the interface redesign with the proposed update to MPCut and TileTrail that defines the `mpcut tiles` commands. It replaces the interface and storage decisions of the [video chat plan](VIDEO-CHAT-PLAN.md) that are listed under [What this overturns](#what-this-overturns-and-what-it-keeps) and keeps the rest. The [editing guide](PARTICIPANTS.md) describes how the feature works today.
+Written November 23, 2026, this plan records the starting state and the target design for the desktop app, CLI, MCP and TileTrail. Its descriptions of the earlier participant interface and command surface are historical. It replaces the interface and storage decisions listed in [What this overturns](#what-this-overturns-and-what-it-keeps). For current usage, see the [Tiles editing guide](PARTICIPANTS.md). The [stage 0 design record](FEEDS-STAGE-0.md) carries the format and delivery contract and links the fixture evidence.
 
 ## Requirements
 
@@ -14,6 +14,7 @@ These were decided during planning and are the acceptance criteria for every sta
 6. **One privacy rule.** Every output of the edit that can show a hidden feed applies the same check. Review views of the untreated source are the stated exception. See [Privacy](#privacy).
 7. **One contract on every surface.** Each operation exists in the app, the CLI and MCP with the same names, the same core call and the same checks. Stages 1 and 2 are led by the CLI and file tools. From stage 3 a stage ships the app, the CLI and the editor tools together. See [One contract](#one-contract-app-cli-and-mcp).
 8. **One command, and useful parts.** A user can point MPCut at a recording and export every source in one command. Scanning, inspecting a moment, correcting an assignment, rendering one ISO and verifying a delivery each work on their own.
+9. **Cutting between feeds needs no export.** Feeds are used as multicam angles straight from the recording. Rendering a movie per feed is a separate, optional delivery.
 
 ## What the feature is for
 
@@ -27,7 +28,7 @@ One recording contains several pictures: a call gallery, a switcher multiview, a
 | Reorder or remove tiles inside the original picture | Arranged layout on the clip | Nothing |
 | Side by side or grid | Layout on the clip | Two ordinary cameras need a multicam project; a sequence clip has one file |
 | Move the recording after another video | Ordinary clip editing | Nothing; tile edits travel with the clip |
-| Cut between people or cameras | Turn feeds into multicam angles, then the switch lane | Nothing |
+| Cut between people or cameras | Use Feeds as Multicam Angles, then the switch lane, with nothing rendered. Until that ships, the multicam project Export ISOs writes. | Nothing |
 | Cut by who is talking | The same, plus a transcript | A transcript voice attached to the feed |
 | Camera multiview, switcher grid, picture-in-picture | Find tiles automatically or as an even grid, then any route above | No people, microphones or voices |
 | Video call with separate microphones and transcript editing | Find tiles, attach microphone and voice, then transcript and switch lane | A multicam project, and linking by name where names agree |
@@ -49,7 +50,7 @@ One recording contains several pictures: a call gallery, a switcher multiview, a
 - **Layouts do not follow the footage.** In a sequence project a timed layout change is stored against output time, and the project's default layout applies to every clip. Reordering clips leaves the change behind, and a second video takes the first one's layout.
 - **Three unconnected identities.** A person's box, microphone and transcript voice are bound by hand in three menus. Transcript jobs keep their own record of call participants and their microphone tracks.
 - **A build without the analyzer offers little.** Boxes can be drawn by hand, but the panel leads with a disabled scan button and a sentence that names the analyzer library.
-- **Hiding someone rarely exports.** The privacy check passes only footage analysed frame by frame, and it tests the whole frame whichever tile the output shows. See [Privacy](#privacy).
+- **Hiding someone mostly blanks the picture.** The privacy check passes only footage analysed frame by frame, and it tests the whole frame whichever tile the output shows. The rest is blanked or stops the export. See [Privacy](#privacy).
 - **Exporting every source takes several hand-run steps.** A script scans, accepts the scan into a project it had to create, lists IDs, writes a render request as JSON and renders each angle in a separate full pass. The scan report the CLI can import is capped at 1 GiB.
 - **Detection breaks on a dense gallery.** The synthetic test behind the CLI proposal had 25 real tiles on screen and 40 distinct sources. Both tested sampling modes reported 64 boxes per sampled frame and 164 identities. This plan did not re-measure that result.
 
@@ -93,13 +94,13 @@ A layout and its contents are chosen in one action, such as **Solo: Host**, beca
 
 **Feed angle.** A multicam angle whose picture is a feed of another source. It is created by an explicit command and is the only thing level three adds.
 
-**One way to show one feed.** In a multicam project, a single feed is shown by switching to its feed angle. The layout lane there offers only layouts that combine or rearrange: Arranged, Side by side and Grid. Solo is a layout only in sequence projects, which have no switch lane. Converting a clip to multicam angles turns its Solo segments into switches.
+**Showing one feed.** Solo is a layout in both kinds of project. In a multicam project it shows one feed of whichever camera the switch lane has selected, which is what Take at Playhead does today. When feed angles arrive in stage 5, switching to a feed's angle replaces Solo there, and converting turns Solo segments into switches. Until then there is one way to show one feed: a Solo layout.
 
 ### The three levels
 
 1. **Edit in place.** The recording stays an ordinary clip. Hide, blur, swap or remove tiles inside its own picture.
 2. **Edit like any clip.** Trim it, split it or move it after another video. Layouts and treatments travel with it.
-3. **Turn feeds into multicam angles.** Choose **Use Feeds as Multicam Angles** on the clip. The switch lane, Take, the transcript reader and export then treat each feed as a camera. Edits made at levels one and two carry over.
+3. **Turn feeds into multicam angles.** Choose **Use Feeds as Multicam Angles** on the clip. Nothing is rendered. The switch lane, Take, the transcript reader and export then treat each feed as a camera, and edits made at levels one and two carry over. Export ISOs is the separate, optional route that renders one movie per feed and writes a multicam project of them, for handing files to someone else.
 
 ## Interface
 
@@ -217,8 +218,8 @@ This table covers the app's controls. The commands and tools that sit behind the
 | Roster and rename field | The feed list, renamed in place |
 | Previous and Next Appearance, Next Uncertain, Before, After and Next Reflow | Removed; the feed lane and Needs a Look replace them |
 | Bind Audio, Bind Transcript Speakers | Mic and Voice on the row; a single unambiguous name match is applied automatically and can be undone |
-| Draw Box, Redraw Box, New Box, Apply Bounds, Discard Box | On the picture |
-| Link Appearance, Split Here, Mark Presentation, Use This Appearance | The box popover |
+| Draw Box, Redraw Box, New Box, Apply Bounds, Discard Box | On the picture, from stage 6. Kept until then. |
+| Link Appearance, Split Here, Mark Presentation, Use This Appearance | The box popover, from stage 6. Kept until then. |
 | Typed From and To seconds, in three places | Marks, span edges and the extent choices |
 | Layout Change Markers rule builder | The list is available whenever a scan exists; the rules sit behind a filter |
 | Canvas width, height, frame rate | Export settings, as presets with a custom entry |
@@ -226,8 +227,8 @@ This table covers the app's controls. The commands and tools that sit behind the
 | Participant Masks, Unresolved Coverage | Hide on the feed row, and the export check |
 | Soundtrack | The project's audio controls, with a feed's microphone as a choice |
 | Save Composition, Check Export, Preview | Removed. Changes commit as they are made, the check runs on its own, and the monitor is the preview. |
-| Review Virtual Angles, Take at Playhead | Use Feeds as Multicam Angles, then the ordinary Take |
-| Suggest Dialogue Switches | Proposed cuts on the switch lane |
+| Review Virtual Angles, Take at Playhead | Kept, moved into the panel, until Use Feeds as Multicam Angles and the ordinary Take replace them in stage 5 |
+| Suggest Dialogue Switches | Proposed cuts on the switch lane for multicam projects from stage 2. The existing tool is kept until stage 5. |
 | Render Angle Media… | Export ISOs, with a plan to review, a manifest and a verify step |
 
 ## Engine
@@ -264,33 +265,55 @@ Hiding someone is the one place where a mistake exposes a person. This section r
 
 **What follows from that**
 
-- Hiding or blurring someone on a default scan covers or stops most of the output.
-- One hidden feed blocks every ISO, including movies of other people.
+- Hiding or blurring someone on a default scan blanks most of the output, or stops the export, depending on the stop-or-cover setting.
+- Every angle inherits every treatment, so one hidden feed blanks or stops the unchecked stretches of every other person's ISO as well.
 - A second, unscanned video in the same project is covered once anyone is hidden.
-- Skipping a hidden feed in an ISO export and returning success cannot be built until the gate is rescoped.
+- Checked footage with a treatment exports correctly today, and the tests check the covered pixels. That keeps working.
 
 **The rule this plan proposes**
 
-The first two points each let through something today's gate stops. Both were decided as written here, with the stricter alternative noted.
+Points 1, 2, 4 and 5 go beyond what is recorded under [Decided](#decided). They came from the second review and are listed under [Open decisions](#open-decisions) until confirmed. This rule has been rewritten after each review, so it is not trusted until it passes the private-delivery fixture.
 
-1. **Scope by recording.** The gate applies only to a recording that contains a treated feed. This is looser than today. A recording that was never scanned would pass, on the assumption that the hidden person is not in it. If they are, nothing covers them. The stricter choice is to require a scan of every recording in the project once anyone is hidden.
-2. **Scope by what the output shows.** An output of the whole picture needs every stretch of the hidden feed checked. An output of one crop, such as a Solo, a cell or an ISO, passes on a checked frame when neither the hidden feed's tile nor an unassigned tile overlaps the crop. On an inferred or unknown frame the positions are not known, so a crop is gated exactly like the whole picture. This is also looser than today: it trusts the checked boxes, where today any unassigned box anywhere in the frame stops the output.
+1. **Scope by recording.** The gate applies to every recording that could show a treated feed. That means a recording where any tile is or ever was linked to that feed, one with tiles waiting to be assigned, and one that was replaced on disk and not yet re-checked. Removing the last link does not switch the gate off. A recording that was never scanned passes, as decided, and the guarantee says so in plain words: hiding someone protects the recordings that were scanned, where that person was recognised as that feed. The same person detected as a separate feed in another recording is not hidden until the two are merged. The app lists any unscanned recordings whenever a feed is hidden.
+2. **Scope by what the output shows.** An output of the whole picture needs every stretch of the hidden feed checked. An output of one crop, such as a Solo, a cell or an ISO, passes on a checked frame when no unassigned tile overlaps the crop and any part of a treated feed's tile inside the crop has its treatment applied. On an inferred or unknown frame the positions are not known, so a crop is gated exactly like the whole picture.
 3. **Three states, not two.** Footage is checked, inferred or unknown. The words table keeps all three.
-4. **A way to clear inferred footage.** A frame-by-frame verification pass runs over that recording before export. A recorded confirmation by the editor for that feed is the explicit override. The pass is cheap: the scan work in progress reports about a minute for a frame-by-frame scan of a two-hour call in an optimized build, against a few seconds for the adaptive one. Two details are for stage 0. A recording accepted from one kind of scan asks for reconciliation when it is scanned again the other way, and the scan file records an adaptive scan as every-frame with mixed coverage, so the pass has to be told apart from the first scan.
-5. **Never silent.** A gated output either stops with the timestamp or covers the frame and reports it. The monitor shows the frames that will be covered.
-6. **Treatments before layout**, on the source picture, as today.
+4. **Checking has two parts.** A frame-by-frame pass over the recording removes the doubt that a stretch was skipped. It does not show that a box is linked to the right feed: a confident wrong link survives every frame. So the test is made frame by frame: a frame counts as checked when the pass observed it and it lies outside every open issue for that recording, such as a return, an unassigned tile or an ambiguous match under Needs a Look. The pass must keep the editor's reviewed links; today a rescan can discard them when tracks stop matching.
+5. **A confirmation is tied to what was reviewed.** The editor's override records the recording, the scan it was made against, the feed and the range. A later edit to that feed's tiles, a rescan or a replaced recording cancels it.
+6. **Never silent.** A gated output either stops with the timestamp or covers the frame and reports it.
+7. **Treatments before layout**, on the source picture, as today.
+
+The pass is cheap: the scan work in progress reports about a minute for a frame-by-frame scan of a two-hour call in an optimized build, against a few seconds for the adaptive one. Two details are for stage 0. A recording accepted from one kind of scan asks for reconciliation when it is scanned again the other way, and the scan file records an adaptive scan as every-frame with mixed coverage, so the pass has to be told apart from the first scan.
+
+**No path shows untreated pixels by accident**
+
+- **Output playback never falls back to the source.** If the pipeline cannot keep up, the monitor drops frames or shows the cover. It does not show the untreated recording under an Output label.
+- **Source review is asked for by name.** The Source view, the Check cards, `mpcut tiles preview` and a review frame of a single camera angle all show untreated pixels. Each is a separate, labelled request. The automation tool that returns a camera angle's frame today does so even when a composition is saved; it becomes a source review like the others.
+- **One decision for every export.** From the moment treatments are stored outside the composition, every export path asks one shared question: does this output render the treatment, or refuse? The test is "this project has a layout or a treatment", not "a composition is saved". Without that, an export that only checks for a saved composition would write the untreated picture.
+
+**Who gets an ISO is separate from how they look**
+
+A treatment says how a feed looks wherever it appears. Which feeds get their own ISO is chosen in the export, with `--all`, `--feed-id` or an exclusion. So one person can be left out of the ISOs and blurred in the full gallery in the same delivery.
+
+| Case | Result |
+| --- | --- |
+| A feed excluded from the export | No ISO, no ISO microphone, listed in the manifest as withheld |
+| A feed with cover or remove | `--all` skips it and lists it as withheld, and the run still succeeds. Naming it with `--feed-id` is refused, since a covered ISO is an empty movie. |
+| A feed with blur, selected for an ISO | Written blurred |
+| Another feed's ISO whose crop overlaps a treated feed's tile | The treatment is applied to those pixels |
+| The full gallery with one feed blurred | Exports where that feed is checked; stops or covers elsewhere |
 
 **Every output, not only the picture**
 
 | Output | Rule |
 | --- | --- |
-| Movie, frame, JPEG sequence, review frame, thumbnail written to disk | Gated as above |
+| Movie, frame, JPEG sequence, review frame | Gated as above |
+| Timeline thumbnails | Output thumbnails are kept apart from source thumbnails. A change to a treatment, a link, a box or a confirmation discards the output ones, in memory and on disk. |
 | Shared meeting mix | Still carries a hidden person's voice. The export warns and records it in the manifest, and offers to leave the mix out. |
 | ISO microphone of a withheld feed | Not written |
 | Manifest and filenames | A withheld feed is listed by ID, without its display name |
 | Delivered `multicam.cut` | Carries no name for a withheld feed |
 | Transcript and caption exports | A picture treatment does not remove words. The export warns. |
-| Check cards, the Source view and `mpcut tiles preview` | Review views of the untreated source. Labelled as such, not gated, and never written into a delivery folder. |
+| Source review views | Untreated by design. Labelled, asked for by name, and never written into a delivery folder. |
 
 A name drawn outside its tile is not covered. Accepted scans carry no label box today, so a treatment covers the tile and nothing beside it.
 
@@ -307,7 +330,8 @@ Every stored addition is designed once, in stage 0. Every participant type rejec
 | Pending scan | The Check step |
 | Treatments on the feed, outside any layout | Hide and blur without a composition. They are a field of the composition today. |
 | A screen share as a feed | The model. A screen share is a tile with no feed today, addressed by tile ID, and it cannot take a treatment. |
-| Layouts anchored to the clip | Requirement 3. In a sequence project, stored with a clip ID and a range in that clip's source time, as still replacements are. |
+| Layouts anchored to the clip | Requirement 3. In a sequence project, stored with a clip ID and a range in that clip's source time, as still replacements are. A split divides the layout between the two clips and a duplicate copies it, as the still edits already do. |
+| A reading of old timed shots | Old projects and old scripts. A timed shot on output time becomes a clip layout, and the old commands still see it as a timed shot. |
 | A stable key for a multicam occurrence override | Requirement 3. The override is keyed by position in the assembly today, so reordering leaves it behind. |
 | The arranged layout, and grids beyond four cells | Reorder and remove in place |
 | Feed angles | Multicam angles with nothing rendered |
@@ -329,7 +353,7 @@ Compatible has a boundary. The old commands keep working for everything they can
 
 Compatibility has a cost after the main format step. That step moves treatments out of the composition and replaces timed shots with clip layouts, so the stored shape no longer matches the old JSON. The old commands then work through a translation: a project that uses only what the old shape can express is read and written as the old JSON, and anything else is reported. That translation is extra code to build, test and keep.
 
-MCP follows the CLI. Each command has a file tool for media or a saved project and, from stage 3, an editor tool for the open project, including its unsaved revision. Their names come from the command, so `mpcut tiles link` is `tiles_file_link` and `tiles_editor_link`. An editor tool takes the project handle and revision and adds one undo step.
+MCP follows the CLI. Each command has a file tool for media or a saved project and, from stage 3, an editor tool for the open project, including its unsaved revision. Their names come from the command, so `mpcut tiles link` is `tiles_file_link` and `tiles_editor_link`. An editor tool that changes the project takes the project handle and revision and adds one undo step. One that only reads adds none. A job that finishes later, such as a scan, checks the revision again before it commits, so it cannot attach to a state the user has since undone.
 
 ### One-shot ISO export
 
@@ -355,7 +379,7 @@ mpcut tiles export-isos reviewed.cut --output ISOs
 - **Neither route needs** `jq`, a manually created project, a list of every ID or hand-authored render JSON.
 - **The two count hints are optional checks.** If MPCut sees 64 boxes where the operator gave a maximum of 25, it keeps the scan, reports the first affected timestamp and prints the command to inspect it. An expected total of 40 never causes the tracker to merge or discard detections to reach 40.
 - **Unattended runs finish when the checks pass.** When an issue needs a decision, the command saves a reviewable project and returns `needs_review` with timestamps. `--on-uncertain blank` is for jobs where the operator prefers blank intervals and a report. Running again after review picks up the corrections. The second run works from the saved review project, since a fresh scan of the recording would produce new IDs. Whether the same command on the recording finds that project by itself is settled in the contract below.
-- **A hidden feed** is never written unhidden. What the run does with one, and the status it returns, is an [open decision](#open-decisions).
+- **A hidden feed** is never written unhidden. `--all` skips a covered or removed feed and lists it as withheld. See the table under [Privacy](#privacy).
 - **Audio from a raw recording is the shared mix.** The command has no way to take separate microphone files or sync them. An ISO microphone comes from a reviewed multicam project that has it bound.
 - **In the app** the same operation is **Export ISOs**. A project saved by a `needs_review` run opens in the app like any project. Its issues are read with `mpcut tiles inspect --issues` at first and are listed under Needs a Look from stage 3.
 
@@ -365,7 +389,9 @@ mpcut tiles export-isos reviewed.cut --output ISOs
 - whether any movies are written before the status is returned;
 - where the review project is saved, and that the second run takes that project;
 - how `--on-uncertain blank` relates to today's stop-or-cover choice, which blanks the whole frame;
-- the JSON shape, the exit code, and how an MCP file job reports the status;
+- which issues have a timestamp and which are warnings about the whole recording, since 39 feeds found against 40 expected has no first bad moment;
+- the command that resolves or acknowledges each kind of issue;
+- the JSON shape, the exit code, and how an MCP file job reports the status, since the job runner reports every exit code other than 0 and 130 as failed today;
 - where the count hints are stored, so the app shows the same warning.
 
 ### Building blocks
@@ -413,17 +439,18 @@ The app plan needs these as well. They follow the same style and are also propos
 
 | Proposed command | Use | In the app | Today | Stage |
 | --- | --- | --- | --- | --- |
-| `mpcut tiles feeds merge`, `split` | Merge mistaken duplicates, or split a mistaken match | Check, and the return review | Whole-object `participants project apply` | 1 |
-| `mpcut tiles grid correct` | Correct the grid for an affected stretch so the boxes are right before identities are repaired | Check | None | 2 |
+| `mpcut tiles feeds merge`, `split` | Merge mistaken duplicates, or split a mistaken match. Each is one undoable change with a report of conflicts. A merged feed keeps the stricter treatment, a split never unhides a branch, and both cancel earlier confirmations. | Check, and the return review | Whole-object `participants project apply` | 1 |
+| `mpcut tiles grid correct` | Correct the grid for an affected stretch so the boxes are right before identities are repaired. Links, preferences and treatments already made on the old boxes are carried to the new ones where they correspond, and reported where they do not. | Check | None | 2 |
 | `mpcut tiles accept` | Take a scan into a project | Check, Use These Tiles | `participants project accept` | 1. The same operation, which from this stage also stores layout changes and the count hints |
 | `mpcut tiles reconcile` | Report what a replaced recording changes, and apply the reviewed result | Needs a Look | App only | 3 |
 | `mpcut tiles feeds confirm` | Record that one feed was reviewed | Needs a Look | App only | 3 |
 | `mpcut tiles layout set`, `list` | Set what the frame shows on a clip, with `--clip-id` and a source-time range | Monitor and layout lane | A render plan inside `participants project apply` | 3 |
 | Composed frame | See the result at a time | Monitor | Existing frame export and review frames, which refuse a saved composition today | 3 |
-| `mpcut tiles angles use` | Use feeds as multicam angles in the current project, with no rendering | Use Feeds as Multicam Angles | `participants angles list` and `angles take` | 6 |
-| `mpcut tiles switches propose` | Propose cuts from the transcript | Switch lane | App only | 6 |
+| `mpcut tiles angles use` | Use feeds as multicam angles in the current project, with no rendering | Use Feeds as Multicam Angles | `participants angles list` and `angles take` | 5 |
+| `mpcut tiles switches propose` | Propose cuts from the transcript. A proposal names the project revision it was made for and is accepted with the ordinary switch edit. | Switch lane | App only | 2, on rendered angles |
+| `mpcut tiles box add`, `box set`, `tile split`, `tile screen-share` | Draw a box, correct its bounds, split a tile at a time, or mark a tile as a screen share | Box popover | Whole-object `participants project apply`; the app's box controls | 6 |
 
-**Two ways to get angles.** `angles render` and `export-isos` write movies and a `multicam.cut` that any editor can open. `angles use` makes angles inside the current project from the feeds themselves, with nothing rendered, and needs the format change.
+**Two ways to get angles.** `angles render` and `export-isos` write movies and a `multicam.cut`, which is an MPCut project. Another editor takes the movies, or the project through MPCut's interchange export. `angles use` makes angles inside the current project from the feeds themselves, with nothing rendered, and needs the format change.
 
 ### Flag differences from the existing CLI
 
@@ -435,7 +462,8 @@ The proposal's syntax differed from the installed commands in the places below. 
 | Positional input, such as `meeting.mp4` or `meeting.scan` | `--file`, `--project`, `--analysis-file`; `export ranges separate SOURCE` already takes a positional | Keep the positional for `export-isos`, `inspect` and `preview`, and accept the flags too |
 | `--at TIME` | The naming convention asks a time to name its clock | Keep `--at` and define it as source time; write `source_time` in JSON |
 | `--feed ID` | `--source-id` | Use `--feed-id` and `--tile-id` |
-| `--gallery-grid 5x5` | `--feed-layout auto\|COLSxROWS` | Add `--gallery-grid` as the hint and keep `--feed-layout` for the fixed switcher grid |
+| `--gallery-grid 5x5` | `--feed-layout auto\|COLSxROWS`. Leaving it out means a meeting, `auto` means an automatic multiview, and a size means a fixed switcher grid. | Add `--gallery-grid` as a hint for a meeting, and leave `--feed-layout` as it is |
+| `tiles scan` returns a small result when saving to a file | `participants scan` prints the whole scan to standard output after writing the file | The small result is for `tiles scan` only; the old command keeps its output |
 | Positional input on `tiles` commands | The participant parser rejects any positional argument | The parser changes for the commands that take one |
 | Repeated `--feed ID` | A repeated option is an error | Allow `--feed-id` to repeat on the `tiles` commands |
 | A scan saved as `meeting.scan` | A saved scan must be a new `.json` file | Keep `.json` |
@@ -445,7 +473,7 @@ The proposal's syntax differed from the installed commands in the places below. 
 | `--size` with no frame rate | The canvas defaults to 1920 × 1080 at 30 | Add a frame-rate option and default it to the source rate |
 | `--at TIME` on a project | The still commands already pair `--at` with `--clock` | Accept `--clock source` for the same meaning |
 
-`--progress jsonl` is not a difference. It already exists on `participants scan` as `none|stderr|jsonl` and is used on every long job.
+`--progress jsonl` exists on `participants scan` as `none|stderr|jsonl`. Angle rendering does not accept it today, so it is added there.
 
 ### Export defaults and outputs
 
@@ -472,16 +500,16 @@ A bound ISO microphone can continue while its feed is offscreen. If only mixed a
 ### Long jobs
 
 - **Progress.** Show scan percentage, render percentage, completed angles out of the total, and an estimate of time remaining when one can be made. Use a terminal progress bar for people and `--progress jsonl` on stderr for agents. Standard output is reserved for the command result.
-- **Resume.** Checkpoint scans incrementally and reuse completed, verified movies. If a correction moves a tile from Alice to Bob, invalidate both affected movies and keep the other 38. Refuse to overwrite unrelated files.
-- **Resume needs a new delivery folder.** Angle rendering today refuses an existing folder, renders into a hidden staging folder that is deleted on any failure, and moves it into place at the end. Nothing survives an interrupted run. Stage 0 designs the folder: what a partial one contains, what the manifest records per movie (source identity, tile boxes, treatment, canvas and audio binding) to decide whether a movie is still valid, and how the must-be-new rule changes. A paused scan today resumes by replaying the decoded prefix to rebuild the tracker, so incremental checkpoints are also new.
-- **Scale.** Remove the one-shot workflow's dependency on importing a single scan JSON, which the CLI caps at 1 GiB today. The adaptive scan's output is reported to be about fifteen times smaller than a frame-by-frame one, which eases the cap and does not remove it. Share source decoding across crops so that exporting 40 synchronized movies reads the source in one pass.
+- **Resume.** Checkpoint scans incrementally and reuse completed, verified movies. If a correction moves a tile from Alice to Bob, invalidate every movie it affects and keep the rest. That is not always two: if Alice is hidden, a tile newly linked to her changes the mask in any other feed's movie whose crop includes it. Refuse to overwrite unrelated files.
+- **Resume needs a new delivery folder.** Angle rendering today refuses an existing folder, renders into a hidden staging folder that is deleted on any failure, and moves it into place at the end. Nothing survives an interrupted run. Stage 0 designs the folder: what a partial one contains, what the manifest records per movie to decide whether it is still valid (source identity, tile boxes, every treatment that falls inside its crop, the checked state, canvas, audio binding and preferences), that partial files stay hidden until the final manifest lists them, and how the must-be-new rule changes. A paused scan today resumes by replaying the decoded prefix to rebuild the tracker, so incremental checkpoints are also new.
+- **Scale.** Remove the one-shot workflow's dependency on importing a single scan JSON, which the CLI caps at 1 GiB today. The adaptive scan's output is reported to be about fifteen times smaller than a frame-by-frame one, which eases the cap and does not remove it. Share source decoding across crops so that exporting 40 synchronized movies reads the source in one pass. Forty encoders at once need bounded buffering and a check of free disk space first: at source size, a two-hour call is 80 hours of movie. A saved project is also capped at 64 MiB, so the review project for a long, dense call has to be shown to fit.
 - **Automation.** Provide versioned `--json` results, stable IDs, documented exit codes, and examples under each command's `--help`. Distinguish success, failure, interruption and `needs_review`. Include artifact paths, issue timestamps and the suggested next command. The CLI documents 0, 1, 2 and 130 today, so `needs_review` needs its own code.
 
 ### TileTrail and MPCut
 
 TileTrail owns rectangle detection, source-time tracking, layout interpretation and the evidence for possible matches. A generic `tiletrail scan` and `tiletrail inspect` use the same Rust analysis and scan format that MPCut consumes. A compatible standalone scan can be imported into MPCut without decoding and analyzing the recording again.
 
-Two things stand between that and today's code. TileTrail is a library with no decoder and no command-line program: the caller feeds it frames, and the video chat plan keeps decoding out of it. And MPCut does not import the detector's output directly. It wraps it with the recording's identity and checks that identity against the project's media, and adaptive sampling, pause and resume, and the cache all live on the MPCut side. A standalone `tiletrail scan` therefore needs a decoder of its own and an import step that stamps the recording's identity. It is a separate program beside the library, so the library itself still takes frames from its caller.
+Two things stand between that and today's code. TileTrail is a library with no decoder and no command-line program: the caller feeds it frames, and the video chat plan keeps decoding out of it. And MPCut does not import the detector's output directly. It wraps it with the recording's identity and checks that identity against the project's media, and adaptive sampling, pause and resume, and the cache all live on the MPCut side. A standalone `tiletrail scan` therefore needs a decoder of its own. Its output must record which file it came from, with the stream, time origin, display transform and sampling, so that MPCut can check that record against the recording. Stamping the identity at import would only show which file is present now, not which file produced the boxes. It is a separate program beside the library, so the library itself still takes frames from its caller.
 
 MPCut owns reviewed feed identities, corrections, mic and transcript bindings, treatments, preferred tiles, multicam choices and media delivery. Its app and CLI share those operations.
 
@@ -512,7 +540,7 @@ The [CLI and MCP parity review](CLI-MCP-PARITY-REVIEW.md) lists five gaps for th
 | The panel cannot be opened or inspected through MCP; the published schema leaves it out | The Tiles panel in the workspace tools | 3 |
 | Reconciliation is app only | `tiles reconcile` and `tiles feeds confirm` | 3 |
 | No composed review frame | Frame export and review frames go through the gated pipeline | 3 |
-| Dialogue proposals are app only | `tiles switches propose` | 6 |
+| Dialogue proposals are app only | `tiles switches propose` | 2 |
 
 ### Documents and tests
 
@@ -541,40 +569,46 @@ New commands reach [CLI.md](CLI.md), the CLI help, the MCP catalog, the generate
 
 ## Stages
 
+The [stage 0 design record](FEEDS-STAGE-0.md) specifies the command inventory, migration, privacy, review, delivery and acceptance criteria. It describes the target contract and records the legacy entry points separately.
+
 Each stage leaves the app usable. Each check in the last column can be run headless with what that stage ships. Requirements 3 and 6 are met from stage 3 and requirement 2 from stage 4. The limits before then are listed below the table.
 
-Four rules set the order:
+Five rules set the order:
 
 - The whole format is designed in stage 0, before any of it ships.
 - Hide and blur get their own commands only once treatments are stored outside the composition.
-- The sheet is removed in the same stage that ships the layout lane and the clip anchor, so there is never a stage with no way to edit a timed layout.
-- Feed angles ship only after the ordinary export can render them.
+- A control is removed only in the stage that ships its replacement.
+- Cutting between feeds with nothing rendered is the intended way and is required. It needs the format step and an export that can render it, so it follows stage 4. Rendered angles are an early stopgap, because they already exist as files.
+- Privacy is tested from the start, on one small fixture that every stage must keep passing.
 
 | Stage | App | CLI, MCP and TileTrail | Done when |
 | --- | --- | --- | --- |
-| 0. Measure and design | Accessibility identifiers, and the desktop test moved onto them. A throwaway monitor prototype: pixel buffer in, treatment and crop, pixel buffer out. | The format design with every stored addition. The privacy gate's new scope. The `needs_review` contract and the delivery-folder design. An inventory with one row per command. A committed detection test with 25 tiles and 40 sources, and a test at the detector's box limit. Thresholds for missed tiles, false tiles and swapped identities. | The prototype is timed at 1080p and 4K with blur on a dense gallery, and HDR is traced through it. Project size and undo cost are measured on a long, dense recording. Each design named here is written and reviewed. |
-| 1. ISO export on today's detector | Export ISOs, calling the same operation, with a plan to review and a verify step. | `tiles scan`, `inspect`, `preview`, `link`, `accept`, `feeds list`, `inspect`, `rename`, `mic`, `voice`, `prefer`, `merge` and `split`, `angles plan`, `render` and `verify`, and `export-isos`. File tools for each. Progress, the manifest, `needs_review` and the resumable delivery folder. | A small reviewed project and a raw recording that today's detector handles both export, and `angles verify` passes. A run interrupted after some movies resumes without re-rendering them. A second run on the saved review project keeps its feed IDs. |
-| 2. Detection | Both counts shown in the existing panel. | The gallery hint beside the fixed grid. Grid correction for a stretch. Evidence for returns in `inspect` and `preview`. `tiletrail scan` and `tiletrail inspect`, as a separate program with its own decoder. | On the committed test, the measured rates meet the stage 0 thresholds, and every unresolved move, departure or return is reported as an issue with its timestamp. |
-| 3. Format, gate and live layout | The main format step. Treatments move out of the composition. Changes commit as they are made. The monitor shows the output, with a Source and Output toggle. The clip badge, layout lane and feed lane. The sheet is removed. The panel becomes Find, Check and Fix with a recording picker, Needs a Look, grid correction and the return review. Hide and Blur on the tile. Marks replace typed seconds. Keyboard and menu equivalents for every drag. The words table. The even grid in a build without the analyzer. | The rescoped privacy gate. `feeds treatment`, `feeds confirm`, `tiles layout set` and `list` with their final arguments, and `tiles reconcile`. Frame export and review frames through the gated pipeline. Editor tools for every command shipped so far. | A layout set through an editor tool is in the next review frame with no save call. After a clip is moved behind another video, `inspect` shows the layout on the moved clip and none on the other. With one feed hidden, a checked frame of another feed's Solo exports, and a frame of the whole picture stops with a timestamp where the hidden one is unchecked. |
-| 4. One export path | Layout changes among the scene markers. | The ordinary export renders layouts and treatments, with the codec and still limits lifted. Selection and queued exports. `export-isos` and `angles render` read the source once for all movies. | A project with a layout exports through `export project render` in a codec other than H.264. A 40 feed export decodes the source once. |
-| 5. Editing on the picture | Swap and Remove on a tile. The box popover. Reframing by drag. | The same edits through `tiles link`, `tiles feeds prefer` and `tiles layout set` with the arranged layout. | A nine-tile gallery is reordered and one tile removed by commands alone, and a review frame shows the result. |
-| 6. Multicam angles | Use Feeds as Multicam Angles, with nothing rendered. Proposed cuts on the switch lane. One record per person shared with transcript tracks. Linking by name. | `tiles angles use`. `tiles switches propose`. | A call with ISO microphones is converted, cuts are proposed from its transcript and accepted, the switch coverage report is complete, and the project exports a movie. |
+| 0. Measure and design | Accessibility identifiers, and the desktop test moved onto them. A throwaway monitor prototype: pixel buffer in, treatment and crop, pixel buffer out. | The format design with every stored addition, including what a layout does on split, duplicate and trim, and how an old timed shot is read. The privacy gate's new scope. The `needs_review` contract and the delivery-folder design. An inventory with one row per command. Two committed fixtures: a detection test with 25 tiles and 40 sources, with a test at the detector's box limit, and a small private-delivery test with a hidden person in an inset, a second clip of the same recording, a replaced file, a shared mix and an interrupted export. Thresholds for missed tiles, false tiles and swapped identities. | The prototype is timed at 1080p and 4K with blur on a dense gallery, and HDR is traced through it. A two-hour, 40-feed review project is saved, reopened, edited and undone inside the project size limit. Each design named here is written and reviewed. |
+| 1. ISO export on today's detector | Export ISOs, calling the same operation, with a plan to review and a verify step. | `tiles scan`, `inspect`, `preview`, `link`, `accept`, `feeds list`, `inspect`, `rename`, `mic`, `voice`, `prefer`, `merge` and `split`, `angles plan`, `render` and `verify`, and `export-isos`. File tools for each. Progress, the manifest, `needs_review` and the resumable delivery folder. | A small reviewed project and a raw recording that today's detector handles both export, and `angles verify` passes. A run interrupted mid-movie resumes, and a correction made before resuming re-renders every movie it affects. A second run on the saved review project keeps its feed IDs. The private-delivery fixture behaves as today's gate does. Today's `participants` script still produces the same output. |
+| 2. Detection, and cuts from the transcript | Proposed cuts on the switch lane of any multicam project, including the one Export ISOs writes, with a step that links each transcript voice to an angle. Both counts shown in the existing panel. | The gallery hint beside the fixed grid. Grid correction for a stretch. Evidence for returns in `inspect` and `preview`. `tiles switches propose`, accepted with the ordinary switch edit. `tiletrail scan` and `tiletrail inspect` last, once the scan carries its own record of which file it came from. | On the committed test, the measured rates meet the stage 0 thresholds, and every unresolved move, departure or return is reported as an issue with its timestamp. On the project `export-isos` wrote, a transcript is made, its voices are linked to angles, cuts are proposed, accepted and undone, and the switch coverage report is complete. |
+| 3. Format, gate and live layout | The main format step. Treatments move out of the composition. Changes commit as they are made. The monitor shows the output, with a Source and Output toggle. The clip badge, layout lane and feed lane. The sheet's layout, mask, canvas and soundtrack controls are replaced. The panel becomes Find, Check and Fix with a recording picker, Needs a Look, grid correction and the return review. Hide and Blur on the tile. Marks replace typed seconds. Keyboard and menu equivalents for every drag. The words table. The even grid in a build without the analyzer. | The rescoped privacy gate, and the one shared export decision. `feeds treatment`, `feeds confirm`, `tiles layout set` and `list` with their final arguments, and `tiles reconcile`. Frame export and review frames through the gated pipeline. Editor tools for every command shipped so far. | A layout set through an editor tool is in the next review frame with no save call. After a clip is moved behind another video, `inspect` shows the layout on the moved clip and none on the other. A project with the Original layout and one blurred feed either renders the blur or refuses, through ordinary, stream-copy, selection, queued and frame export. The private-delivery fixture passes under the new gate. A project saved before the format step opens, and today's `participants` script gives the same rendered frames on it. |
+| 4. One export path | Layout changes among the scene markers. | The ordinary export renders layouts and treatments, with the codec and still limits lifted. Selection and queued exports. `export-isos` and `angles render` read the source once for all movies, with bounded memory, a disk-space estimate before starting, and a fallback to fewer movies at a time. | A project with a layout exports through `export project render` in a codec other than H.264. A 40-feed export decodes the source once, stays inside a stated memory limit, and resumes correctly after an interruption. |
+| 5. Feed angles with nothing rendered | Use Feeds as Multicam Angles. One record per person shared with transcript tracks. Linking by name. Take at Playhead and the old dialogue suggestions are retired. | `tiles angles use`. | A call is converted with nothing rendered and with no ISO export run, cut from its transcript, and the project exports a movie. |
+| 6. Editing on the picture | Swap and Remove on a tile. The box popover, replacing the old box controls. Reframing by drag. | `tiles box add`, `box set`, `tile split` and `tile screen-share`, with `tiles link`, `tiles feeds prefer` and `tiles layout set` with the arranged layout. | A nine-tile gallery is reordered and one tile removed by commands alone, including across a change of gallery size, and a review frame shows the result. |
 
-Stage 3 is the largest. Inside it the format and the gate land first, then the monitor and the lane, then the panel. Monitor playback through the pipeline ships in stage 3 if the stage 0 prototype is fast enough. If it is not, stage 3 shows the output when paused or scrubbing and the source while playing, with a visible badge, and a Metal version of the pipeline becomes the last part of stage 3.
+Stage 3 is the largest. Inside it the format and the gate land first, then the monitor and the lane, then the panel. Monitor playback through the pipeline ships in stage 3 if the stage 0 prototype is fast enough. If it is not, playback drops frames to keep up and a Metal version of the pipeline becomes the last part of stage 3. Playback never shows the untreated source under an Output label.
+
+Until stage 5, cutting between feeds goes through rendered angles or through Take at Playhead. After stages 1 and 2, rendered angles give a route from a call to a transcript-cut edit. The project `export-isos` writes carries the angles by feed name, the shared mix and any ISO microphones as audio lanes. It carries no transcript and no link from a transcript voice to an angle, so the transcript is made in that project, and stage 2 adds the link from each voice to an angle: by name when ISO microphones supply names, and by hand otherwise. Stage 5 removes the rendering step: feeds become angles straight from the recording, which is how the feature is meant to work. Export ISOs then remains as an optional delivery for files to hand to someone else.
 
 **Until the later stages land**
 
 - **Hide and blur before stage 3** work as they do today, through the sheet and the saved composition.
+- **Old controls stay until replaced.** The box controls stay until stage 6. Take at Playhead and the dialogue suggestions move into the panel in stage 3 and stay until stage 5. The composition they wrote timed shots into is gone by then, so from stage 3 they write Solo layouts on the layout lane.
 - **Stage 1 is led by the CLI.** Its app change is Export ISOs. Review is by command or in the existing panel. A project saved by a `needs_review` run opens like any project, and its issues are read with `mpcut tiles inspect --issues`.
-- **Refused exports.** Selection and queued range exports stay refused with a layout active until stage 4. From stage 3 the layout is visible on the monitor and Original removes it, so the refusal has a visible cause and a way out.
+- **Refused exports.** From stage 3, selection, queued and stream-copy exports are refused for a project with any layout or treatment until stage 4. The layout is visible on the monitor and Original removes it, so the refusal has a visible cause and a way out.
 - **ISO export speed.** Until stage 4, `export-isos` renders one full pass per movie, as angle rendering does today.
 - **Editor tools.** Stages 1 and 2 ship file tools only. Editor tools arrive in stage 3 with the rebuilt panel.
 - **Names.** The `mpcut tiles` commands are added beside `mpcut participants`, so no script breaks. The app's labels change in stage 3. From stage 3 the old commands work through a translation of the new stored shape.
-- **ISO export with someone hidden.** Until the gate is rescoped in stage 3, one hidden feed blocks every ISO from that project, as it blocks every angle today.
+- **ISO export with someone hidden.** Until the gate is rescoped in stage 3, today's gate applies: with one feed hidden, the unchecked stretches of every ISO are blanked or the export stops.
 
 ## Decided
 
-1. **The privacy gate.** It applies only to a recording that contains a hidden or blurred feed, so an unscanned recording passes. An output of one crop passes on a checked frame when the hidden feed is outside it. Unchecked footage is cleared by a frame-by-frame verification pass before export, with a recorded confirmation by the editor as the explicit override. See [Privacy](#privacy).
+1. **The privacy gate.** It applies only to a recording that contains a hidden or blurred feed, so an unscanned recording passes. An output of one crop passes on a checked frame when the hidden feed is outside it. Unchecked footage is cleared by a frame-by-frame verification pass before export, with a recorded confirmation by the editor as the explicit override. See [Privacy](#privacy), which also sets out amendments that are not yet confirmed.
 2. **A feed belongs to the project.** One person can appear in two recordings, and a treatment follows them into both. Counts are reported per recording, and commands take `--source-id` when a project has more than one scanned recording.
 3. **`tiletrail scan` is a separate program** beside the library, with its own decoder. MPCut stamps an imported scan with the recording's identity.
 4. **Command spellings follow the installed commands**, as the flag table under [One contract](#one-contract-app-cli-and-mcp) records.
@@ -583,13 +617,21 @@ Stage 3 is the largest. Inside it the format and the gate land first, then the m
 
 ## Open decisions
 
-1. **A hidden feed in an ISO export.** The recommendation is to skip it, list it in the manifest as withheld and return success, and to write a blurred feed blurred.
-2. **Scope of hide and blur.** This plan keeps today's rule: a treatment applies to the feed everywhere it appears. Whether it should also be limitable to one clip or a range is not decided.
-3. **How a feed angle is stored.** Per-source state in the multicam editor is keyed by source ID, and a multicam source requires a file today. The recommendation is a reference to the parent source. Stage 0 also has to say what an angle shows while its feed is offscreen, what the coverage report and audio follow do with it, and whether interchange to other editors renders it or refuses it.
-4. **Sequence projects and switching.** A sequence project gets layouts and treatments. Cutting between feeds is offered by converting the clip to multicam angles. Whether a sequence project should switch between feeds without that step is not decided, and neither is what conversion does with the other clips in the sequence.
-5. **What "reorder" means.** This plan reads it as swapping tiles inside the picture, which is the arranged layout.
-6. **The exit code for `needs_review`.** It needs a documented code of its own beside 0, 1, 2 and 130.
-7. **Where proposed cuts live in the CLI.** `tiles switches propose` produces switches, which belong to multicam. It may fit better beside `multicam switch coverage`.
+1. **Amendments to decided items, from the second review.** The Privacy section and the TileTrail section are written with these in. Each needs a yes or no.
+   - The gate stays on for a recording where a tile was ever linked to the hidden feed, where tiles are unassigned, or which was replaced on disk. This is stricter than decided.
+   - A crop that overlaps the hidden feed's tile passes when the treatment is applied to those pixels. This is looser than decided, which passed a crop only when the hidden feed was outside it.
+   - The frame-by-frame pass alone does not clear footage. Open issues for that recording keep their stretches unchecked. This is stricter than decided.
+   - An editor's confirmation is tied to the scan and range it was made against and is cancelled by later edits. This is stricter than decided.
+   - A standalone scan records which file it came from and MPCut checks it, in place of stamping the identity at import. This is stricter than decided.
+   - Converting an old composition includes its timed shots, not only its default layout.
+2. **Leaving someone out of the ISOs.** The table under [Privacy](#privacy) proposes that who gets an ISO is chosen in the export, separately from how a feed looks, and that a covered or removed feed cannot be selected. This replaces the earlier question of what `--all` does with a hidden feed, and it is a proposal until confirmed.
+3. **Scope of hide and blur.** This plan keeps today's rule: a treatment applies to the feed everywhere it appears, so hiding someone on one clip hides them on every clip of that recording. Whether it should also be limitable to one clip or a range is not decided.
+4. **What the arranged layout maps.** "Swap Alice and Bob" can mean exchange the two people, exchange two positions, or leave a position empty, and these differ once the gallery changes size or a person has two tiles. The recommendation is that it maps feeds to positions and lasts until the next layout change. Stage 0 has to define collisions and gaps.
+5. **How a feed angle is stored.** Per-source state in the multicam editor is keyed by source ID, and a multicam source requires a file today. The recommendation is a reference to the parent source. Stage 0 also has to say what an angle shows while its feed is offscreen, what the coverage report and audio follow do with it, and whether interchange to other editors renders it or refuses it.
+6. **Sequence projects and switching.** A sequence project gets layouts and treatments. Cutting between feeds is offered by converting the clip to multicam angles. Whether a sequence project should switch between feeds without that step is not decided, and neither is what conversion does with the other clips in the sequence.
+7. **How a layout is addressed in a multicam project.** A clip ID and a source range do not pick out one occurrence when the same stretch is used twice. The command needs the group clock and a stable occurrence ID there.
+8. **The exit code for `needs_review`.** It needs a documented code of its own beside 0, 1, 2 and 130.
+9. **Where proposed cuts live in the CLI.** `tiles switches propose` produces switches, which belong to multicam. It may fit better beside `multicam switch coverage`.
 
 ## Unknowns
 
@@ -631,5 +673,7 @@ This plan rests on reading the panel, the sheet, the monitor overlay, the render
 The scan timings, the size of adaptive output and the cache behaviour on a rescan were reported by the session implementing the adaptive scan, from its uncommitted work on two real calls of over two hours. They were not measured here. That session did not test whether automatic detection stops at the detector's box limit.
 
 An independent adversarial review then checked this plan against the source. Its main findings were re-checked here before the plan was changed: the privacy gate's two limits, random IDs on acceptance, the screen share having no feed, the all-or-nothing delivery folder, the participant parser's rules, the sequence limit on ISO microphones, and the detector's box limit and lack of a command-line program. The rest of its findings were accepted on its citations and not re-opened, including the count of places that branch on a saved composition and the detector's internals.
+
+A second adversarial review was run through Codex with the `gpt-6.2-astra` model, as a read-only stress test of eight scenarios. These of its findings were re-checked here: exports report as publishable under the cover setting, so a hidden feed blanks other ISOs and does not always block them; the 64 MiB limit applies when a project is loaded and saved; the old scan command prints the whole scan to standard output; `--feed-layout` defaults to a meeting; several export guards test only for a saved composition; the camera-angle review frame is returned even when a composition is saved; and the file-job runner reports every exit code other than 0 and 130 as failed. Its other findings were accepted on its citations.
 
 The CLI side of this plan is the "Proposed update to MPCut and TileTrail" supplied during planning. Its commands, defaults, outputs and job behaviour are carried over, and its syntax is marked as proposed. One name differs: the proposal says tile-unique where this plan says feed, so its `uniques` commands, `--tile-unique` flag and `tile_unique_id` field appear here as `feeds`, `--feed-id` and `feed_id`. Its flag spellings were also changed where the flag table says. Two of its statements about today were checked: the 1 GiB limit on an importable scan report is in the CLI source, and progress and resume already exist on `participants scan`. Its detection result was not re-measured. Its last heading mentions shipping in stages and lists none, so the stages here are this plan's.

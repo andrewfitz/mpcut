@@ -191,6 +191,16 @@ struct MediaRefreshEvidence: Codable, Sendable {
             let playable = streams.filter { $0.kind == "audio" || $0.kind == "video" }
             return !playable.isEmpty && playable.allSatisfy { $0.payload != nil && $0.timing != nil && $0.packetLayout != nil }
         }
+
+        /// The SHA-256 of this evidence as sorted JSON, in lowercase hex, when it is a complete
+        /// proof. Two recordings with equal evidence have equal digests.
+        var proofDigest: String? {
+            guard hasCompleteProof else { return nil }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .sortedKeys
+            guard let bytes = try? encoder.encode(self) else { return nil }
+            return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        }
     }
 
     var content: Content {

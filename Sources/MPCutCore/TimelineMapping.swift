@@ -122,8 +122,8 @@ extension CutProject {
             let items: [StillAssemblyItem] = multicam.assemblyItems ?? [.group(multicam.range)]
             for (index, item) in items.enumerated() {
                 switch item {
-                case .group(let range, let angle):
-                    try piece(index: index, input: range, duration: range.to.subtracting(range.from), angleOverride: angle)
+                case .group(let range, let angle, let id, _):
+                    try piece(index: index, id: id, input: range, duration: range.to.subtracting(range.from), angleOverride: angle)
                 case .still(let card): try still(index, card)
                 }
             }

@@ -296,7 +296,7 @@ extension TranscriptIndex {
                   attachment: groundwork.attachment, transcriptRevision: groundwork.transcriptRevision,
                   speakers: groundwork.speakers, authoredReview: review,
                   inputCoverageProvider: groundwork.inputCoverageProvider, usesMix: usesMix,
-                  staleLead: groundwork.staleLead)
+                  staleLead: groundwork.staleLead, multicamClockOffsets: projection.multicamMedia.mapValues(\.multicamClockOffset))
     }
 }
 

@@ -47,7 +47,7 @@ extension TranscriptIndex {
                                attachment: first.attachment, transcriptRevision: first.transcriptRevision,
                                speakers: first.speakers, authoredReview: first.authoredReview,
                                inputCoverageProvider: first.inputCoverageProvider, usesMix: first.usesMix,
-                               staleLead: shared.staleLead)
+                               staleLead: shared.staleLead, multicamClockOffsets: first.multicamClockOffsets)
     }
 
     /// An index that builds the clocks asked for now, and any other clock the first time

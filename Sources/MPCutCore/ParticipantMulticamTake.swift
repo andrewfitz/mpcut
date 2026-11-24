@@ -32,8 +32,11 @@ extension ParticipantMulticam {
             throw takeError("The playhead must be within the virtual angle’s source range.")
         }
         var plan = project.participants.render ?? .init(shots: [.init(layout: .original)], audio: .init(mode: .program))
+        let timing = try project.tileRenderPlan() ?? plan
+        let native = project.participants.tileOutput != nil || (project.participants.render == nil && project.requiresPictureProcessing)
         var end = min(occurrence.end, try time.adding(angle.range.to.subtracting(occurrence.sourceTime)))
-        for shot in plan.shots where shot.clock == .output && shot.occurrence == occurrence.index {
+        for shot in timing.shots where shot.clock == .output
+            && (shot.occurrence == occurrence.index || (native && shot.occurrence == nil && occurrence.clipID != nil)) {
             if let range = shot.range, time < range.from { end = min(end, range.from) }
         }
         guard time < end else { throw takeError("The take does not contain any output time.") }
@@ -60,13 +63,30 @@ extension ParticipantMulticam {
         shots.append(take)
         plan.shots = shots
         var updated = project
-        updated.participants.render = plan
+        if native {
+            let scope: TileLayoutScope
+            if let clipID = occurrence.clipID {
+                scope = .clip(clipID)
+            } else if case .multicam(let multicam) = project, let id = multicam.tileOccurrenceID(at: occurrence.index) {
+                scope = .occurrence(id)
+            } else {
+                throw takeError("The take does not refer to an available assembly occurrence.")
+            }
+            let range = try MulticamRange(from: occurrence.clockTime, to: occurrence.clockTime.adding(end.subtracting(time)))
+            updated = try project.settingTileLayout(scope: scope, range: range,
+                layout: .init(range: range, layout: take.layout, slots: take.slots))
+            if project.participants.render != nil {
+                updated.participants.render = plan
+            }
+        } else {
+            updated.participants.render = plan
+        }
         try updated.validate()
         return updated
     }
 
     private static func takeOccurrence(at time: RationalTime, in project: CutProject, sourceID: String, document: URL) throws
-        -> (index: Int, sourceTime: RationalTime, end: RationalTime) {
+        -> (index: Int, clipID: String?, clockTime: RationalTime, sourceTime: RationalTime, end: RationalTime) {
         switch project {
         case .multicam(let multicam):
             let intervals = try multicam.plan().intervals
@@ -79,15 +99,15 @@ extension ParticipantMulticam {
             let interval = intervals[index]
             let url = try CutProject.checkedMediaURL(source.file, relativeTo: document)
             let media = try CutEngine().inspectSummary(url)
-            let sourceTime = try interval.group.from.adding(time.subtracting(interval.output.from))
-                .subtracting(source.offset).subtracting(media.multicamSourceOffset)
+            let groupTime = try interval.group.from.adding(time.subtracting(interval.output.from))
+            let sourceTime = try groupTime.subtracting(source.offset).subtracting(media.multicamSourceOffset)
             var end = interval.output.to
             for next in intervals.dropFirst(index + 1) {
                 guard next.assemblyIndex == interval.assemblyIndex, next.pictureSourceID == sourceID,
                       next.output.from == end else { break }
                 end = next.output.to
             }
-            return (interval.assemblyIndex, sourceTime, end)
+            return (interval.assemblyIndex, nil, groupTime, sourceTime, end)
         case .sequence, .stillSequence:
             let spans = try project.resolveStillsUnchecked().spans
             let index = spans.lowerBound { $0.output.to > time }
@@ -97,7 +117,7 @@ extension ParticipantMulticam {
                 throw takeError("Park the playhead on the virtual angle’s recording.")
             }
             let sourceTime = try range.from.adding(time.subtracting(spans[index].output.from))
-            return (index, sourceTime, spans[index].output.to)
+            return (index, clip, sourceTime, sourceTime, spans[index].output.to)
         }
     }
 

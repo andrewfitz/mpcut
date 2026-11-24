@@ -11,10 +11,16 @@ extension MulticamEngine {
     /// `preferredContainer` is used when the program plans in it, otherwise the first listed container that plans.
     public func tier(_ project: MulticamProject, relativeTo location: URL? = nil, assembly: [MulticamRange]? = nil,
                      indexedSources: [String: MediaInfo] = [:], preferredContainer: String? = nil) -> TierState {
-        if project.participants.render != nil {
-            guard assembly == nil else { return .unavailable(ParticipantProjectExport.unsupported("A range export")) }
-            return ParticipantProjectExport.tier(.multicam(project), relativeTo: location,
-                                                 preferredContainer: preferredContainer, cancelled: cancelled)
+        if CutProject.multicam(project).requiresPictureProcessing {
+            do {
+                let snapshot = try assembly.map { try project.pictureExportSnapshot(ranges: $0) } ?? project
+                return ParticipantProjectExport.tier(.multicam(snapshot), relativeTo: location,
+                                                     preferredContainer: preferredContainer, cancelled: cancelled)
+            } catch let issue as CutError {
+                return .unavailable(issue)
+            } catch {
+                return .unavailable(CutError(code: "export_failed", message: error.localizedDescription))
+            }
         }
         var snapshot = project
         if let assembly { snapshot.assemblyItems = assembly.map { .group($0) } }

@@ -12,7 +12,7 @@ import unittest
 import xml.etree.ElementTree as ET
 
 from media_regression import ffmpeg, frames
-from saved_project import read_project, saved_file
+from saved_project import read_project
 
 
 class ProjectConversion(unittest.TestCase):
@@ -180,7 +180,7 @@ class ProjectConversion(unittest.TestCase):
         self.assertEqual(self.cli("project", "convert", self.project, "--to", "cut", "--output", output)["warnings"], [])
         saved = read_project(output)
         for actual, expected in zip(saved["clips"], self.document["clips"], strict=True):
-            self.assertEqual((child / saved_file(saved, actual.pop("file"))).resolve(), self.camera)
+            self.assertEqual((child / actual.pop("file")).resolve(), self.camera)
             self.assertEqual(actual, {k: v for k, v in expected.items() if k != "file"})
         before = output.read_bytes()
         self.assertFalse(self.cli("project", "convert", self.project, "--output", output, status=1)["ok"])

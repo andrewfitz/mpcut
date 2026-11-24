@@ -26,23 +26,27 @@ private func outputEnum<T: RawRepresentable>(_ args: [String: Any], _ key: Strin
 }
 
 private func exportOptions(_ args: [String: Any], container: String, source: ExportSourceKind,
-                           defaultMode: ExportMode, placements: ExportPlacementScope = .none) throws -> ExportSheetOptions {
+                           defaultMode: ExportMode, placements: ExportPlacementScope = .none,
+                           requiresPictureProcessing: Bool = false) throws -> ExportSheetOptions {
     guard !container.isEmpty, container.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) }) else {
         throw MCPCommandError("invalid_arguments", "Supply a container filename extension.")
     }
     var options = ExportSheetOptions()
     let tracks = try outputEnum(args, "tracks", source == .audio ? ExportTracks.audio : .all)
     let ordinaryMode: ExportMode = source != .audio && tracks == .all ? defaultMode : .copy
-    let mode = try outputEnum(args, "mode", ExportRules.defaultStillMode(tracks: tracks, placements: placements, otherwise: ordinaryMode))
+    let defaultSelectionMode: ExportMode = requiresPictureProcessing ? .encode
+        : ExportRules.defaultStillMode(tracks: tracks, placements: placements, otherwise: ordinaryMode)
+    let mode = try outputEnum(args, "mode", defaultSelectionMode)
     let cell = ExportRules.cell(source: source, tracks: tracks, mode: mode, placements: placements)
-    if let refusal = cell.refusal, refusal.code != "still_generation_required",
+    if !requiresPictureProcessing, let refusal = cell.refusal, refusal.code != "still_generation_required",
        !(source == .multicam && tracks == .audio && placements == .insertion && refusal.code == "still_requires_generation") {
         throw refusal
     }
     options.placements = placements
     options.requireCameraCopy = args["require_camera_copy"] as? Bool ?? false
-    options.tracks = cell.tracks
-    options.mode = cell.resolvedMode
+    options.requiresPictureProcessing = requiresPictureProcessing
+    options.tracks = requiresPictureProcessing ? tracks : cell.tracks
+    options.mode = requiresPictureProcessing ? mode : cell.resolvedMode
     options.codec = try outputEnum(args, "codec", .h264)
     options.audio = try outputEnum(args, "audio", .auto)
     guard source == .multicam || args["audio_output"] == nil else {
@@ -58,6 +62,7 @@ private func exportOptions(_ args: [String: Any], container: String, source: Exp
     if let ordinal = options.audioTrackOrdinal, options.tracks != .audio || ordinal < 0 {
         throw MCPCommandError("invalid_arguments", "Choose audio tracks before specifying a zero-based track ordinal.")
     }
+    if requiresPictureProcessing { return options }
     if placements != .none {
         guard args["codec"] == nil && args["quality"] == nil || options.tracks != .audio && options.mode != .copy else {
             throw MCPCommandError("invalid_arguments", "Choose Smart Trim or Re-encode with picture to specify video codec and quality.")
@@ -266,34 +271,59 @@ extension ProjectSessions {
     private func mcpRender(session: ProjectSession, output: URL, args: [String: Any], dryRun: Bool) throws -> MCPLiveOutputJobs.Work {
         let scope = args["scope"] as? String ?? "timeline"
         let project = session.isMulticam ? session.multicam.project.map(CutProject.multicam) : session.editor.stillProject
-        if let project, project.participants.render != nil {
+        if let project, project.requiresPictureProcessing {
             guard args["still_timing"] == nil, args["container"] == nil else {
                 throw MCPCommandError("invalid_arguments", "Still timing and container overrides apply to still project exports.")
+            }
+            let snapshot: CutProject
+            let range: MulticamRange?
+            if case .multicam(let value) = project {
+                if scope == "selection", let selection = session.multicam.assemblySelection {
+                    range = .init(from: selection.from, to: selection.to)
+                    snapshot = project
+                } else if scope == "selection" {
+                    let selected = session.multicam.selectedExportRanges
+                    guard !selected.isEmpty else {
+                        throw MCPCommandError("no_selection", "Select a timeline range first.")
+                    }
+                    snapshot = .multicam(try value.pictureExportSnapshot(ranges: selected))
+                    range = nil
+                } else {
+                    snapshot = scope == "group" ? .multicam(try value.pictureExportSnapshot(ranges: [value.range])) : project
+                    range = nil
+                }
+            } else {
+                guard scope != "group" else { throw MCPCommandError("invalid_target", "Group time requires a multicam project.") }
+                snapshot = project
+                range = scope == "selection" ? try session.editor.mcpPictureExportRange() : nil
             }
             let document = session.isMulticam ? session.multicam.projectURL : session.editor.projectURL
             let mode = try outputEnum(args, "mode", ExportMode.encode)
             let tracks = try outputEnum(args, "tracks", ExportTracks.all)
             let codec = try outputEnum(args, "codec", ReencodeCodec.h264)
-            let quality = try outputEnum(args, "quality", ReencodeQuality.balanced)
+            let quality = try outputEnum(args, "quality", ReencodeSettings(codec: codec).quality)
             let audio = try outputEnum(args, "audio", ReencodeAudio.auto)
             let audioOutput = try outputEnum(args, "audio_output", MulticamAudioOutput.separateTracks)
             let settings = ReencodeSettings(codec: codec, quality: quality, audio: audio)
             let requireCopy = args["require_camera_copy"] as? Bool ?? false
             let useReviewedCuts = args["use_reviewed_cuts"] as? Bool ?? false
-            let selectsAudio = args["audio_track"] != nil || args["audio_track_ordinal"] != nil
+            let audioTrackOrdinal = args["audio_track_ordinal"] as? Int
+            if let audioTrackOrdinal, audioTrackOrdinal < 0 {
+                throw MCPCommandError("invalid_arguments", "Choose a nonnegative audio track ordinal.")
+            }
+            let selectsAudio = args["audio_track"] != nil || (audioTrackOrdinal != nil && (tracks != .audio || session.isMulticam))
             return { progress in
                 let export: ParticipantProjectExport
                 do {
-                    guard scope == "timeline" else { throw ParticipantProjectExport.unsupported("A range export") }
-                    guard !requireCopy else {
+                    guard !requireCopy || tracks == .audio else {
                         throw CutError(code: "camera_copy_required", message: "The participant export would encode picture.")
                     }
                     guard !useReviewedCuts, !selectsAudio else {
                         throw ParticipantProjectExport.unsupported("Applying reviewed copy cuts or selecting a source audio track")
                     }
-                    export = try ParticipantProjectExport(project, relativeTo: document, output: output, mode: mode,
+                    export = try ParticipantProjectExport(snapshot, relativeTo: document, output: output, mode: mode,
                                                          tracks: tracks, settings: settings, audioOutput: audioOutput,
-                                                         cancelled: outputCancelled)
+                                                         range: range, audioTrackOrdinal: audioTrackOrdinal, cancelled: outputCancelled)
                 } catch let issue as CutError where dryRun {
                     return try Self.outputRefusal(issue)
                 }
@@ -623,7 +653,7 @@ extension ProjectSessions {
         String(decoding: value.utf8.prefix(32_768), as: UTF8.self)
     }
 
-    nonisolated private static func outputJSON(_ value: some Encodable) throws -> Any {
+    nonisolated static func outputJSON(_ value: some Encodable) throws -> Any {
         let data = try MCPSchemas.encodeResult(value)
         guard data.count < 1_500_000 else { return ["truncated": true, "encoded_bytes": data.count] }
         return try JSONSerialization.jsonObject(with: data)
@@ -692,7 +722,10 @@ extension ProjectSessions {
             if !skippedIDs.isEmpty { throw MCPCommandError(noReadyQueueEntries.code, noReadyQueueEntries.message) }
             throw MCPCommandError("empty_queue", "Queue at least one range first.")
         }
-        let hasVideo = ranges.contains { $0.stillProject != nil || $0.media.values.contains(where: \.hasVideo) }
+        let hasPictureProcessing = multi
+            ? groups.contains { CutProject.multicam($0.project).requiresPictureProcessing }
+            : ranges.contains { ($0.pictureProject ?? $0.stillProject)?.requiresPictureProcessing == true }
+        let hasVideo = hasPictureProcessing || ranges.contains { $0.stillProject != nil || $0.media.values.contains(where: \.hasVideo) }
         let source: ExportSourceKind = multi ? .multicam : (hasVideo ? .movie : .audio)
         var placements = ranges.map(\.placements).max(by: { $0.rawValue < $1.rawValue }) ?? .none
         for entry in groups {
@@ -707,7 +740,8 @@ extension ProjectSessions {
             if placements == .insertion { break }
         }
         var configured = try exportOptions(args, container: container, source: source,
-                                           defaultMode: preferences.defaultExportMode, placements: placements)
+                                           defaultMode: preferences.defaultExportMode, placements: placements,
+                                           requiresPictureProcessing: hasPictureProcessing)
         if args["still_timing"] != nil {
             guard placements != .none else {
                 throw MCPCommandError("invalid_arguments", "Still timing applies to queued ranges with generated picture.")
@@ -726,7 +760,8 @@ extension ProjectSessions {
         let audioAction: ReencodeAudio? = args["audio"] == nil ? nil : options.audio
         let mode = try (args["mode"] as? String).map { _ in try outputEnum(args, "mode", ExportMode.copy) }
         let sidecars = multi ? session.multicam.useAnalysisSidecars : session.editor.useAnalysisSidecars
-        let defaultOrdinaryMode: ExportMode = source != .audio && options.tracks == .all ? preferences.defaultExportMode : .copy
+        let defaultOrdinaryMode: ExportMode = hasPictureProcessing ? .encode
+            : (source != .audio && options.tracks == .all ? preferences.defaultExportMode : .copy)
         let hasStills = placements != .none
         guard !multi || options.audioTrackOrdinal == nil else { throw MCPCommandError("invalid_arguments", "Multicam uses routed program audio.") }
 
@@ -736,6 +771,7 @@ extension ProjectSessions {
             let write: (Int, @escaping @Sendable (Double) -> Void) throws -> Void
             var plans: [[String: Any]] = []
             var multicamPlans: [[String: Any]] = []
+            var picturePlans: [[String: Any]] = []
             do {
                 try options.organization.validateSubfolder(in: output, protectedMedia: protected)
                 if multi {
@@ -766,6 +802,10 @@ extension ProjectSessions {
                         guard case .still(let plan) = item.payload else { return nil }
                         return ["destination": item.output.path, "plan": try Self.outputJSON(plan.report)]
                     }
+                    picturePlans = try batch.items.compactMap { item in
+                        guard case .picture(let plan) = item.payload else { return nil }
+                        return ["destination": item.output.path, "plan": try Self.outputJSON(plan.report)]
+                    }
                     write = { index, update in
                         try batch.write(batch.items[index]) {
                             update($0)
@@ -773,7 +813,7 @@ extension ProjectSessions {
                         }
                     }
                 }
-            } catch let issue as CutError where dryRun && (hasStills || multi) {
+            } catch let issue as CutError where dryRun && (hasStills || multi || hasPictureProcessing) {
                 try Task.checkCancellation()
                 var result = try Self.outputRefusal(issue)
                 if !skippedIDs.isEmpty { result["skipped_needs_replan"] = skippedIDs }
@@ -797,14 +837,13 @@ extension ProjectSessions {
             if !rangePlans.isEmpty { result["range_plans"] = rangePlans }
             if !skippedIDs.isEmpty { result["skipped_needs_replan"] = skippedIDs }
             if !plans.isEmpty { result["still_plans"] = plans }
+            if !picturePlans.isEmpty { result["picture_plans"] = picturePlans }
             if !multicamPlans.isEmpty { result["multicam_plans"] = multicamPlans }
             return result
         }
     }
 
     private func mcpFrames(session: ProjectSession, output: URL, args: [String: Any]) throws -> MCPLiveOutputJobs.Work {
-        let project = session.isMulticam ? session.multicam.project.map(CutProject.multicam) : session.editor.stillProject
-        guard project?.participants.render == nil else { throw ParticipantProjectExport.unsupported("Project frame export") }
         let mode = args["selection"] as? String ?? "playhead"
         let times = try (args["times"] as? [String] ?? []).map { try RationalTime(parsing: $0) }
         guard (mode == "times") == !times.isEmpty, times.count <= 4096 else {

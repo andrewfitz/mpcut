@@ -60,7 +60,7 @@ public enum ParticipantDialogue {
                            message: "Choose angles from one recording, source-picture occurrences, and a positive minimum hold.")
         }
         let roster = Set(project.participants.people.map(\.id))
-        let masks = Set(project.participants.render?.redactions.filter { $0.treatment == .omit }.map(\.participantID) ?? [])
+        let masks = Set(project.participants.effectiveRedactions.filter { $0.treatment == .omit }.map(\.participantID))
         var choices: [ParticipantVirtualAngle] = []
         var ids = Set<String>()
         for angle in angles where angle.kind == .participant {

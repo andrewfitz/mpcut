@@ -25,7 +25,7 @@ extension MulticamEditorModel {
         let document = CutProject.multicam(project)
         let hasStills = ((try? document.exportPlacementScope()) ?? ExportPlacementScope.none) != .none
         // A source that cannot be read stops every mode. One that is still being indexed is not planned yet.
-        if !hasStills, let missing = project.sources.first(where: { indexed[$0.id] == nil }) {
+        if !hasStills, !document.requiresPictureProcessing, let missing = project.sources.first(where: { indexed[$0.id] == nil }) {
             tierIsCurrent = true
             if let issue = sourceIssues[missing.id] ?? sourceIndexIssues[missing.id] {
                 tierState = .unavailable(CutError(code: "missing_source", message: "\(missing.displayName) — \(issue)"))

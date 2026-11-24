@@ -248,15 +248,16 @@ public struct MulticamEngine: Sendable {
                  mode: ExportMode, tracks: ExportTracks, assembly: [MulticamRange]?,
                  settings: ReencodeSettings, media: inout [String: MediaInfo],
                  audioOutput: MulticamAudioOutput = .separateTracks, audioAction: ReencodeAudio? = nil) throws -> MulticamExportPlan {
-        if project.participants.render != nil {
-            guard assembly == nil else { throw ParticipantProjectExport.unsupported("A range export") }
-            let export = try ParticipantProjectExport(.multicam(project), relativeTo: location, output: output, mode: mode,
+        if CutProject.multicam(project).requiresPictureProcessing {
+            let snapshot = try assembly.map { try project.pictureExportSnapshot(ranges: $0) } ?? project
+            let export = try ParticipantProjectExport(.multicam(snapshot), relativeTo: location, output: output, mode: mode,
                                                       tracks: tracks, settings: settings, audioOutput: audioOutput,
                                                       audioAction: audioAction, plannedSubfolder: plannedSubfolder, cancelled: cancelled)
-            let mapping = try project.plan()
+            let mapping = try snapshot.plan()
             return MulticamExportPlan(mapping: mapping, picture: [], audioLanes: [], audioOutput: audioOutput,
                                       container: output.pathExtension.lowercased(), duration: export.report.duration,
-                                      mode: mode, tracks: tracks, warnings: [], encodedVideoDuration: export.report.duration,
+                                      mode: mode, tracks: tracks, warnings: [export.report.picturePrivacyNotice, export.report.audioPrivacyNotice].compactMap { $0 },
+                                      encodedVideoDuration: tracks == .audio ? .zero : export.report.duration,
                                       copiedVideoDuration: .zero, generatedPictureGaps: nil,
                                       pictureCopy: nil, pictureEncode: nil, sounds: [], recordingGapExport: nil,
                                       participantExport: export, participantRender: export.report)

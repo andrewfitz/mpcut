@@ -59,7 +59,7 @@ mpcut project convert Interview.cut --to fcp --output Interview.fcpxml
 
 | Extension | What opens it | Conversion requirements |
 | --- | --- | --- |
-| `.cut` | MPCut | A versioned JSON document containing an ordered sequence or multicam project, saved in a compact, compressed layout. MPCut also opens plain JSON written by hand. [Project format and schemas](docs/CUT-FORMAT.md). Media files are referenced by path. |
+| `.cut` | MPCut | A versioned JSON document containing an ordered sequence or multicam project. Saved files can store repeated values in a reference table. Media files are referenced by path. [Project format and schemas](docs/CUT-FORMAT.md) |
 | `.drp`, `.drt` | DaVinci Resolve | Resolve writes and reads its native project or timeline through its local scripting API. |
 | `.prproj` | Adobe Premiere Pro | Adobe Premiere Pro and the MPCut Premiere bridge handle the native project. [Install the panel](docs/PREMIERE.md#install-the-panel). |
 | `.fcpxml`, `.fcpxmld` | Final Cut Pro and compatible editors | MPCut reads and writes timeline interchange XML directly. |
@@ -145,9 +145,9 @@ open dist/MPCut.app
 
 Use `./scripts/build-app.sh /Applications` to install the source build there for the CLI examples above.
 
-To enable automatic feed detection, fixed multiview grids and meeting analysis, use the Apple Silicon macOS TileTrail **0.4.1** C ABI v1 build and set `MPCUT_TILETRAIL_PREFIX` to the extracted directory when running `swift build`, `swift build --build-tests`, or `scripts/build-app.sh`. Run the resulting macOS test host through Backstage as described in AGENTS.md. The directory contains `include/tiletrail.h`, `lib/libtiletrail.a`, and `LICENSE`. The app and CLI link the analyzer statically. The 0.1.0 library supports the meeting profile. Adaptive scans skip unchanged stretches only with a TileTrail build that supports coarse pushes; otherwise they analyze every frame. Standard builds run from a standalone MPCut checkout with analysis disabled. See the [feed and participant editing guide](docs/PARTICIPANTS.md).
+A standalone MPCut build can work with fixed grids and hand-drawn tiles. For automatic meeting and multiview detection, build TileTrail for Apple Silicon macOS and set `MPCUT_TILETRAIL_PREFIX` to the directory containing its matching `include/tiletrail.h` and `lib/libtiletrail.a` when running `swift build`, `swift build --build-tests`, or `scripts/build-app.sh`. Use a current build of TileTrail for gallery hints and incremental scan checkpoints. Adaptive scans skip unchanged stretches with a TileTrail build that supports coarse pushes. The app and CLI link the analyzer statically. Run the resulting macOS test host through Backstage as described in AGENTS.md. [Tiles editing guide](docs/PARTICIPANTS.md)
 
-For development, install Homebrew FFmpeg and pkg-config, then run `swift test`. The integration suites also use Python 3 and the FFmpeg CLI tools. [Test commands and qualification limits](AUDIT.md#reproduce-the-release-checks)
+For development, install Homebrew FFmpeg and pkg-config. Build the tests with `swift build --build-tests`, then launch their XCTest hosts on Backstage as described in AGENTS.md. The integration suites also use Python 3 and the FFmpeg CLI tools. [Test commands and qualification limits](AUDIT.md#reproduce-the-release-checks)
 
 To launch MPCut without sound, for example when an agent or test drives it, set `MPCUT_MUTED=1` in its environment. A muted MPCut plays no preview, scrub or reverse audio and none of its own alert sounds, while playback still advances as usual. The preview's saved volume and mute settings are unchanged. MPCutAppTests runs muted.
 

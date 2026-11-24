@@ -265,6 +265,66 @@ final class TimelineDisplayTests: XCTestCase {
     }
 
     @MainActor
+    func testGroupFilmstripUsesGroupPictureForOmittedAndRepeatedAssemblyFootage() async throws {
+        let movie = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
+                                                    subdirectory: "Fixtures"))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let model = MulticamEditorModel()
+        defer {
+            model.reset()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let document = directory.appendingPathComponent("group-filmstrip.cut")
+        let range = MulticamRange(from: .zero, to: .init(numerator: 2))
+        let excerpt = MulticamRange(from: .zero, to: .init(numerator: 1))
+        let half = RationalTime(numerator: 1, denominator: 2)
+        let later = RationalTime(numerator: 3, denominator: 2)
+        let feed = ParticipantPerson(id: "left", name: "Left")
+        let members = ParticipantProject(people: [feed], sources: [
+            .init(sourceID: "camera", appearances: [
+                .init(id: "tile", participantID: feed.id, range: range,
+                      bounds: .init(x: 0, y: 0, width: 0.4, height: 1))
+            ])
+        ])
+        let project = MulticamProject(
+            referenceAngle: "camera", range: range, angles: [.init(id: "camera", file: movie.path)],
+            audio: .none, switches: [.init(at: .zero, angle: "camera")],
+            assemblyItems: [
+                .group(excerpt, id: "solo", layouts: [.init(range: excerpt, layout: .solo, slots: [.init(id: feed.id)])]),
+                .group(excerpt, id: "original")
+            ],
+            participants: members, groupTileLayouts: [.init(range: range, layout: .original)]
+        )
+        try project.save(to: document)
+        model.openProject(document)
+        let deadline = ContinuousClock.now + .seconds(10)
+        while model.isBusy, .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(model.isBusy)
+        let size = CGSize(width: 160, height: 96)
+        let revision = try XCTUnwrap(model.timelineOutputRevision)
+        func pixels(_ image: CGImage?) throws -> Data {
+            let image = try XCTUnwrap(image)
+            return try XCTUnwrap(image.dataProvider?.data) as Data
+        }
+        let groupRepeated = try pixels(await model.outputThumbnail(group: half, recording: "camera", size: size, revision: revision))
+        let groupOmitted = try pixels(await model.outputThumbnail(group: later, recording: "camera", size: size, revision: revision))
+        let groupMonitor = try ParticipantOutputPicture(project: XCTUnwrap(model.stillPreviewProject),
+                                                       document: document, forceSDR: true)
+        XCTAssertEqual(groupRepeated, try pixels(groupMonitor.thumbnail(at: half, size: size)))
+        XCTAssertEqual(groupOmitted, try pixels(groupMonitor.thumbnail(at: later, size: size)))
+
+        model.setAssemblyPreview(true)
+        let assembly = try ParticipantOutputPicture(project: XCTUnwrap(model.stillPreviewProject),
+                                                   document: document, forceSDR: true)
+        XCTAssertNotEqual(groupRepeated, try pixels(assembly.thumbnail(at: half, size: size)))
+        XCTAssertEqual(groupRepeated, try pixels(assembly.thumbnail(at: later, size: size)))
+        let repeatedWhileInAssembly = try pixels(await model.outputThumbnail(group: half, recording: "camera",
+                                                                              size: size, revision: revision))
+        XCTAssertEqual(repeatedWhileInAssembly, groupRepeated)
+    }
+
+    @MainActor
     func testAssemblyRowsScrollBelowTheTimelineHeaderAndTransport() async throws {
         _ = NSApplication.shared
         let model = MulticamEditorModel()
@@ -1312,6 +1372,70 @@ final class TimelineDisplayTests: XCTestCase {
         XCTAssertEqual(requests.first?.0, 0)
         XCTAssertEqual(requests.first?.1.width, TimelineClip.largeTileWidth * window.backingScaleFactor)
 
+    }
+
+    @MainActor
+    func testOutputFilmstripDiscardsSourceAndPreviousEditPictures() async throws {
+        _ = NSApplication.shared
+        let clip = clip(size: CGSize(width: 60, height: 160))
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 225, height: 251))
+        surface.viewportWidth = surface.bounds.width
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        let context = try XCTUnwrap(CGContext(data: nil, width: 60, height: 160, bitsPerComponent: 8,
+                                              bytesPerRow: 240, space: CGColorSpaceCreateDeviceRGB(),
+                                              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        func picture(_ color: NSColor) throws -> CGImage {
+            context.setFillColor(color.cgColor)
+            context.fill(CGRect(origin: .zero, size: clip.displaySize))
+            return try XCTUnwrap(context.makeImage())
+        }
+        let source = try picture(.red)
+        let output = try picture(.blue)
+        var sourceRequests = 0
+        var outputTimes: [RationalTime] = []
+        var state = timeline([clip])
+        state.thumbnail = { _, _, _ in
+            sourceRequests += 1
+            return source
+        }
+        surface.timeline = state
+        let bitmap = try XCTUnwrap(surface.bitmapImageRepForCachingDisplay(in: surface.bounds))
+        func draw() { surface.cacheDisplay(in: surface.bounds, to: bitmap) }
+        func hasPicture(_ predicate: (NSColor) -> Bool) -> Bool {
+            let x = Int(CGFloat(bitmap.pixelsWide) * 0.25)
+            return (0..<bitmap.pixelsHigh).contains {
+                guard let color = bitmap.colorAt(x: x, y: $0)?.usingColorSpace(.deviceRGB) else { return false }
+                return predicate(color)
+            }
+        }
+        let isRed: (NSColor) -> Bool = { $0.redComponent - max($0.greenComponent, $0.blueComponent) > 0.35 }
+        let isBlue: (NSColor) -> Bool = { $0.blueComponent - max($0.greenComponent, $0.redComponent) > 0.65 }
+        draw()
+        for _ in 0..<100 where sourceRequests == 0 { try await Task.sleep(for: .milliseconds(10)) }
+        draw()
+        XCTAssertTrue(hasPicture(isRed))
+
+        let generation = UUID()
+        state.outputThumbnailRevision = .init(generation: generation, edit: 1, document: nil)
+        state.outputThumbnail = { time, _ in
+            outputTimes.append(time)
+            return output
+        }
+        surface.timeline = state
+        draw()
+        XCTAssertFalse(hasPicture(isRed))
+        for _ in 0..<100 where outputTimes.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+        draw()
+        XCTAssertTrue(hasPicture(isBlue))
+        XCTAssertTrue(outputTimes.allSatisfy { 0 < $0.seconds && $0.seconds < clip.duration })
+
+        state.outputThumbnailRevision = .init(generation: generation, edit: 2, document: nil)
+        state.outputThumbnail = { _, _ in nil }
+        surface.timeline = state
+        draw()
+        XCTAssertFalse(hasPicture(isBlue))
+        XCTAssertFalse(hasPicture(isRed))
     }
 
     @MainActor

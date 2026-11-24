@@ -564,10 +564,11 @@ private func errorOutput(_ message: String) {
 // An inherited stderr can share its blocking mode with the caller. Keep at most
 // one advisory write in flight so a stalled reader cannot hold up media work.
 private let progressWriteSlot = DispatchSemaphore(value: 1)
-func progressOutput(_ message: String) {
-    guard progressWriteSlot.wait(timeout: .now()) == .success else { return }
+func progressOutput(_ message: String, waitForDelivery: Bool = false) {
+    let deadline = DispatchTime.now() + .milliseconds(waitForDelivery ? 100 : 10)
+    guard progressWriteSlot.wait(timeout: waitForDelivery ? deadline : .now()) == .success else { return }
     let finished = DispatchSemaphore(value: 0)
-    DispatchQueue.global(qos: .utility).async {
+    DispatchQueue.global(qos: .userInitiated).async {
         defer {
             progressWriteSlot.signal()
             finished.signal()
@@ -583,8 +584,7 @@ func progressOutput(_ message: String) {
             }
         }
     }
-    // Give an available destination time to receive even the last progress event.
-    _ = finished.wait(timeout: .now() + .milliseconds(10))
+    _ = finished.wait(timeout: deadline)
 }
 
 private func jsonEncoder(pretty: Bool) -> JSONEncoder {
@@ -1140,7 +1140,7 @@ private struct SilenceExportSummary: Encodable {
 private func runSilence(_ options: SilenceOptions, arguments: Arguments, requestFile: String?, json: Bool, interruption: Interruption) async throws {
     if let project = options.project {
         let loaded = try loadDocument(project, interruption: interruption)
-        if loaded.project.participants.render != nil, options.output != nil {
+        if loaded.project.requiresPictureProcessing, options.output != nil {
             throw ParticipantProjectExport.unsupported("Pause removal export")
         }
         if case .multicam(let multicam) = loaded.project {
@@ -1471,7 +1471,7 @@ private struct MixedProjectInput {
                         guard case .multicam(let project) = media.project else {
                             throw CutError(code: "invalid_multicam_project", message: "Expected a multicam project")
                         }
-                        guard project.participants.render == nil else {
+                        guard !media.project.requiresPictureProcessing else {
                             throw ParticipantProjectExport.unsupported("An ordered join")
                         }
                         try checkProjectOutput(output, media: media, location: location)
@@ -1756,8 +1756,8 @@ private func runMulticamExport(project loaded: LoadedProject<MulticamProject>? =
         throw CLIError("invalid_arguments", "Set an external recorder in audio_sources and select it in the project audio policy.")
     }
     let mixed = try input.map { try MixedProjectInput($0, order: order, output: output, interruption: interruption) }
-    let includesParticipants = loaded?.project.participants.render != nil
-    if includesParticipants, options.requireCameraCopy == true {
+    let includesParticipants = loaded.map { CutProject.multicam($0.project).requiresPictureProcessing } ?? false
+    if includesParticipants, tracks != .audio, options.requireCameraCopy == true {
         throw CutError(code: "camera_copy_required", message: "The participant export would encode picture.")
     }
     let mode = options.mode ?? (includesParticipants ? .encode : ExportRules.defaultMode(for: .multicam, tracks: tracks))
@@ -1947,7 +1947,7 @@ private func rangeListDuration(_ media: MediaInfo, options: ExportOptions) throw
 private func renderLoadedProject(_ loaded: LoadedProject<CutProject>, output: URL, flags: ExportOptions, dryRun: Bool,
                                  arguments: Arguments, interruption: Interruption) async throws {
     let placements = try loaded.project.exportPlacementScope()
-    if loaded.project.participants.render == nil, placements != .none || loaded.project.stillFormat != nil {
+    if !loaded.project.requiresPictureProcessing, placements != .none || loaded.project.stillFormat != nil {
         try runStillExport(loaded, output: output, dryRun: dryRun, options: flags, json: arguments.json,
                            useSidecar: arguments.useSidecar, interruption: interruption)
         return
@@ -1963,13 +1963,14 @@ private func renderLoadedProject(_ loaded: LoadedProject<CutProject>, output: UR
         try runMulticamExport(project: document, output: output, options: options,
                               dryRun: dryRun, json: arguments.json, interruption: interruption)
     case .sequence, .stillSequence:
-        if loaded.project.participants.render != nil {
+        if loaded.project.requiresPictureProcessing {
             let mode = options.mode ?? .encode
             try validate(options, mode: mode)
-            if options.requireCameraCopy == true {
+            let tracks = options.tracks ?? .all
+            if tracks != .audio, options.requireCameraCopy == true {
                 throw CutError(code: "camera_copy_required", message: "The participant export would encode picture.")
             }
-            if options.audioStream != nil {
+            if tracks != .audio, options.audioStream != nil {
                 throw ParticipantProjectExport.unsupported("Selecting a source audio stream")
             }
             let settings = ReencodeSettings(codec: options.video ?? .h264, quality: options.quality,
@@ -1977,7 +1978,8 @@ private func renderLoadedProject(_ loaded: LoadedProject<CutProject>, output: UR
             let cancelled: @Sendable () -> Bool = { !interruption.isActive }
             let export = try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
                 let export = try ParticipantProjectExport(loaded.project, relativeTo: loaded.location, output: output, mode: mode,
-                                                          tracks: options.tracks ?? .all, settings: settings, cancelled: cancelled)
+                                                          tracks: tracks, settings: settings, audioStream: options.audioStream,
+                                                          cancelled: cancelled)
                 if !dryRun {
                     let progress = ExportProgress(interruption: interruption)
                     try export.write(to: output, cancelled: cancelled) { progress.report($0) }
@@ -1989,7 +1991,7 @@ private func renderLoadedProject(_ loaded: LoadedProject<CutProject>, output: UR
                     let ok = true
                     let output: String
                     let dryRun: Bool
-                    let mode = ExportMode.encode
+                    let mode: ExportMode
                     let tracks: ExportTracks
                     let container: String
                     let duration: RationalTime
@@ -1999,14 +2001,17 @@ private func renderLoadedProject(_ loaded: LoadedProject<CutProject>, output: UR
                     let participantRender: ParticipantRenderReport
                 }
                 let container = output.pathExtension.lowercased()
-                try writeJSON(Result(output: output.path, dryRun: dryRun, tracks: options.tracks ?? .all,
+                try writeJSON(Result(output: output.path, dryRun: dryRun, mode: mode, tracks: tracks,
                                      container: container, duration: export.report.duration,
-                                     encodedVideoDuration: export.report.duration,
+                                     encodedVideoDuration: tracks == .audio ? .zero : export.report.duration,
                                      tier: export.tier(container: container).summary(source: .movie),
                                      participantRender: export.report),
                               pretty: !arguments.json, checkCancellation: dryRun)
             } else {
                 try interruption.beginResponse(checkCancellation: false)
+                for warning in [export.report.picturePrivacyNotice, export.report.audioPrivacyNotice].compactMap({ $0 }) {
+                    errorOutput("mpcut: " + warning)
+                }
                 try writeOutput("Exported " + output.path)
             }
             return
@@ -2153,6 +2158,8 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         try writeJSON(result, pretty: !arguments.json, checkCancellation: false)
     case let .still(options):
         try runStill(options, json: arguments.json, interruption: interruption)
+    case let .tiles(options):
+        try options.run(json: arguments.json, useSidecar: arguments.useSidecar, interruption: interruption)
     case let .participants(options):
         try options.run(json: arguments.json, useSidecar: arguments.useSidecar, interruption: interruption)
     case let .transcript(options):
@@ -2222,11 +2229,8 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         case let .project(file, times, clock):
             let identity = isStandardInput(file) ? nil : (try? SourceIdentity(fileURL(file, label: "Project")))
             let loaded = try loadDocument(file, interruption: interruption)
-            guard loaded.project.participants.render == nil else {
-                throw ParticipantProjectExport.unsupported("Program frame export")
-            }
             try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
-                if case .multicam(let multicam) = loaded.project, clock == nil || clock == .group {
+                if !loaded.project.requiresPictureProcessing, case .multicam(let multicam) = loaded.project, clock == nil || clock == .group {
                     let result = try JPEGExport.writeMulticam(multicam, document: loaded.file, at: times, to: output,
                                                               preset: options.preset, format: options.format,
                                                               useSidecar: arguments.useSidecar,
@@ -2243,6 +2247,52 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
                     try writeJSON(result, pretty: !arguments.json, checkCancellation: false)
                 }
             }
+        }
+    case .printDocument(let source):
+        let saved = try isStandardInput(source) ? readStandardInput(interruption)
+            : Data(contentsOf: fileURL(source, label: "Project"))
+        let document = try CutProject.readableDocument(saved: saved)
+        try interruption.beginResponse(checkCancellation: false)
+        try writeOutput(document)
+    case let .mergeProject(base, ours, theirs):
+        let target = URL(fileURLWithPath: ours)
+        let sides = try ProjectMerge.sides(base: Data(contentsOf: URL(fileURLWithPath: base)),
+                                           ours: Data(contentsOf: target),
+                                           theirs: Data(contentsOf: URL(fileURLWithPath: theirs)))
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("mpcut-merge-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let files = [("ours", sides.ours), ("base", sides.base), ("theirs", sides.theirs)].map {
+            (scratch.appendingPathComponent($0.0), $0.1)
+        }
+        for (file, text) in files { try text.write(to: file) }
+        // Git's own line merge, on the edit alone.
+        let merge = Process()
+        merge.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        merge.arguments = ["git", "merge-file", "-p", "-L", "ours", "-L", "base", "-L", "theirs"] + files.map(\.0.path)
+        let output = Pipe()
+        merge.standardOutput = output
+        try merge.run()
+        let merged = output.fileHandleForReading.readDataToEndOfFile()
+        merge.waitUntilExit()
+        try interruption.beginResponse(checkCancellation: false)
+        switch merge.terminationStatus {
+        case 0:
+            let saved: Data
+            do {
+                saved = try ProjectMerge.saved(merged)
+            } catch {
+                // Git keeps what is in OURS, so both branches' lines must be there to put right.
+                try merged.write(to: target, options: .atomic)
+                let reason = (error as? CutError)?.message ?? error.localizedDescription
+                throw CLIError("merge_invalid", "The lines of \(ours) merged, but MPCut cannot open the result: \(reason) The merged text is in the file.")
+            }
+            try saved.write(to: target, options: .atomic)
+        case 1...127:
+            try merged.write(to: target, options: .atomic)
+            throw CLIError("merge_conflict", "Both branches changed the same lines of \(ours). Resolve the marked lines.")
+        default:
+            throw CLIError("merge_failed", "git merge-file could not merge \(ours).")
         }
     case let .convert(source, destination, allowLoss, flattenMulticam):
         func projectURL(_ path: String, label: String) throws -> URL {
@@ -2279,7 +2329,7 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         if hasStillPlacements(loaded.project) || !loaded.project.stillAssets.isEmpty ||
             loaded.project.programColorPolicy != nil || loaded.project.stillFormat != nil {
             var report = try StillInspection(loaded.project, location: loaded.location, input: loaded.path)
-            if loaded.project.participants.render != nil {
+            if loaded.project.requiresPictureProcessing {
                 let source: ExportSourceKind
                 if case .multicam = loaded.project { source = .multicam } else { source = .movie }
                 report.tier = AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
@@ -2325,7 +2375,7 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
                 let tier: TierSummary?
                 if let unavailable {
                     tier = TierState.unavailable(unavailable).summary(source: .movie)
-                } else if loaded.project.participants.render != nil {
+                } else if loaded.project.requiresPictureProcessing {
                     tier = ParticipantProjectExport.tier(loaded.project, relativeTo: loaded.location,
                                                          cancelled: { !interruption.isActive }).summary(source: .movie)
                 } else {
@@ -2455,7 +2505,7 @@ private func runCommand(_ arguments: Arguments, interruption: Interruption) asyn
         let output = try fileURL(path, label: "Output")
         try checkProjectOutput(output, media: loaded.media, location: loaded.location)
         if let spacing = flags.spaceClips {
-            guard loaded.project.participants.render == nil else { throw ParticipantProjectExport.unsupported("Clip spacing export") }
+            guard !loaded.project.requiresPictureProcessing else { throw ParticipantProjectExport.unsupported("Clip spacing export") }
             try checkSpacing(flags)
             let updated = try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
                 try spacedProject(loaded.project, using: spacing, relativeTo: loaded.location,

@@ -409,14 +409,11 @@ private func editMulticam(_ project: inout MulticamProject, action: String, edit
     if action == "switch_set" || action == "switch_remove" {
         let at = try edit.time("at")
         if action == "switch_set" {
-            try edit.check("action", "at", "angle_id")
+            try edit.check("action", "at", "angle_id", "project_revision")
             let angle = try edit.string("angle_id")
-            let index = project.switches.lowerBound { $0.at >= at }
-            if index < project.switches.count, project.switches[index].at == at {
-                project.switches[index].angle = angle
-            } else {
-                project.switches.insert(.init(at: at, angle: angle), at: index)
-            }
+            let revision = edit.values["project_revision"] == nil ? nil : try edit.string("project_revision")
+            try TileSwitches.verifyRevision(revision, in: project)
+            project = try project.settingSwitch(at: at, angle: angle)
         } else {
             try edit.check("action", "at")
             guard let index = project.switches.firstIndex(where: { $0.at == at }), index > 0 else {

@@ -205,6 +205,127 @@ final class TranscriptCodecTests: XCTestCase {
         XCTAssertEqual(labeled.words.map(\.text), ["First line.\nContinuation.", "Interruption."])
     }
 
+    func testSRTLongUtteranceWrapsAndSplitsAtTimedWords() throws {
+        let token = "café-12345"
+        let words = (0..<8).map { i in
+            TranscriptWord(id: "w\(i)", text: " " + token,
+                           start: .init(numerator: Int64(i), denominator: 4),
+                           end: .init(numerator: Int64(i + 1), denominator: 4),
+                           utteranceID: "u", speakerID: "s")
+        }
+        let document = TranscriptDocument(clock: .presentation, speakers: [.init(id: "s", name: "Ada")], words: words)
+        let index = try TranscriptIndex(document: document)
+        let cues = try TranscriptCodec.decode(TranscriptCodec.encodeCaptions([index], space: .source), format: .srt).words
+        XCTAssertEqual(cues.map(\.start), [.zero, .init(numerator: 6, denominator: 4)])
+        XCTAssertEqual(cues.map(\.end), [.init(numerator: 6, denominator: 4), .init(numerator: 2)])
+        let line = Array(repeating: token, count: 3).joined(separator: " ")
+        XCTAssertEqual(cues.map(\.text), [line + "\n" + line, token + " " + token])
+    }
+
+    func testSingleCaptionTrackShowsBothSpeakersOnlyDuringOverlap() throws {
+        let input = "1\n00:00:00,500 --> 00:00:04,000\n[A] Hello\n\n2\n00:00:02,000 --> 00:00:03,000\n[B] Hi\n"
+        let document = try TranscriptCodec.decode(Data(input.utf8), format: .srt)
+        let index = try TranscriptIndex(document: document)
+        let output = try TranscriptCodec.encodeCaptions([index], space: .source)
+        XCTAssertEqual(String(decoding: output, as: UTF8.self), """
+        1
+        00:00:00,500 --> 00:00:02,000
+        [A] Hello
+
+        2
+        00:00:02,000 --> 00:00:03,000
+        [A] Hello
+        [B] Hi
+
+        3
+        00:00:03,000 --> 00:00:04,000
+        [A] Hello
+
+
+        """)
+    }
+
+    func testSRTStartsANewCueAfterSixSecondsOfTimedSpeech() throws {
+        let words = (0..<7).map { i in
+            TranscriptWord(id: "w\(i)", text: " go", start: .init(numerator: Int64(i)),
+                           end: .init(numerator: Int64(i + 1)))
+        }
+        let document = TranscriptDocument(clock: .presentation, words: words)
+        let index = try TranscriptIndex(document: document)
+        let cues = try TranscriptCodec.decode(TranscriptCodec.encodeCaptions([index], space: .source), format: .srt).words
+        XCTAssertEqual(cues.map(\.text), ["go go go go go go", "go"])
+        XCTAssertEqual(cues.map(\.start), [.zero, .init(numerator: 6)])
+    }
+
+    func testSourceCaptionTimingIsRelativeToRecordingStart() throws {
+        let document = TranscriptDocument(clock: .presentation, tracks: [.init(id: "mic", name: "Mic")], words: [
+            .init(id: "w", text: "Hello", start: .init(numerator: 12), end: .init(numerator: 13))
+        ])
+        let attachment = TranscriptAttachment(id: "a", asset: .init(file: "t.json", sha256: String(repeating: "a", count: 64)),
+                                              bindings: [.init(trackID: "mic", file: "recording.mov", streamIndex: 1,
+                                                               sequenceClockOrigin: .init(numerator: 10))])
+        let index = try TranscriptIndex(document: document, attachment: attachment)
+        let output = try TranscriptCodec.encodeCaptions([index], space: .source)
+        let cue = try XCTUnwrap(TranscriptCodec.decode(output, format: .srt).words.first)
+        XCTAssertEqual(cue.start, .init(numerator: 2))
+        XCTAssertEqual(cue.end, .init(numerator: 3))
+        XCTAssertThrowsError(try TranscriptCodec.encodeCaptions([index], space: .source, filter: .init(trackID: "absent")))
+    }
+
+    func testSourceCaptionsRejectMixedRecordingsAndTimelineOnlyWords() throws {
+        let input = Data("1\n00:00:01,000 --> 00:00:02,000\nHello\n".utf8)
+        let document = try TranscriptCodec.decode(input, format: .srt)
+        let indexes = try ["left", "right"].map { name in
+            let attachment = TranscriptAttachment(id: name, asset: .init(file: "t.json", sha256: String(repeating: "a", count: 64)),
+                                                  bindings: [.init(trackID: "source", file: name + ".mov", streamIndex: 0)])
+            return try TranscriptIndex(document: document, attachment: attachment)
+        }
+        XCTAssertThrowsError(try TranscriptCodec.encodeCaptions(indexes, space: .source, filter: .init(trackID: "source")))
+        XCTAssertEqual(try TranscriptCodec.encodeCaptions(indexes, space: .source, filter: .init(file: "right.mov")),
+                       try TranscriptCodec.encodeCaptions([indexes[1]], space: .source))
+        var timeline = document
+        timeline.clock = .currentCut
+        let timelineIndex = try TranscriptIndex(document: timeline)
+        XCTAssertThrowsError(try TranscriptCodec.encodeCaptions([timelineIndex], space: .source))
+        XCTAssertFalse(try TranscriptCodec.encodeCaptions([timelineIndex], space: .currentCut).isEmpty)
+    }
+
+    func testCaptionWrapPreservesUnspacedGraphemes() throws {
+        let token = "界👩🏽‍💻"
+        let words = (0..<50).map { i in
+            TranscriptWord(id: String(i), text: token, start: .init(numerator: Int64(i), denominator: 20),
+                           end: .init(numerator: Int64(i + 1), denominator: 20))
+        }
+        let index = try TranscriptIndex(document: .init(clock: .presentation, words: words))
+        let data = try TranscriptCodec.encodeCaptions([index], space: .source)
+        let cues = try TranscriptCodec.decode(data, format: .srt).words
+        XCTAssertEqual(cues.count, 2)
+        XCTAssertEqual(cues.flatMap { $0.text.components(separatedBy: "\n") }.map(\.count), [42, 42, 16])
+        XCTAssertEqual(cues.map(\.text).joined().replacingOccurrences(of: "\n", with: ""), String(repeating: token, count: 50))
+    }
+
+    func testMulticamCaptionsMeasureFromRecordingStart() throws {
+        guard let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: FileManager.default.isExecutableFile)
+        else { throw XCTSkip("Needs ffmpeg for a movie with a leading empty edit.") }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mov")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let writer = Process()
+        writer.executableURL = URL(fileURLWithPath: ffmpeg)
+        writer.arguments = ["-v", "error", "-f", "lavfi", "-i", "sine=d=3", "-c:a", "pcm_s16le", "-output_ts_offset", "2", url.path]
+        try writer.run()
+        writer.waitUntilExit()
+        XCTAssertEqual(writer.terminationStatus, 0)
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(url)
+        XCTAssertEqual(media.multicamClockOffset, .init(numerator: 2))
+        let document = TranscriptDocument(clock: .presentation, tracks: [.init(id: "mic", name: "Mic", sourceID: "a")],
+                                          words: [.init(id: "w", text: "Hello", start: .init(numerator: 3), end: .init(numerator: 4))])
+        let index = try TranscriptIndex(document: document, multicamMedia: ["a": media], spaces: [.source])
+        let data = try TranscriptCodec.encodeCaptions([index], space: .source)
+        let cue = try XCTUnwrap(TranscriptCodec.decode(data, format: .srt).words.first)
+        XCTAssertEqual(cue.start, .init(numerator: 1))
+        XCTAssertEqual(cue.end, .init(numerator: 2))
+    }
+
     func testCurrentCutExportKeepsAdjacentRepeatedUtterancesDistinct() throws {
         let track = TranscriptTrack(id: "source", name: "Mic")
         let document = TranscriptDocument(clock: .presentation, tracks: [track], words: [

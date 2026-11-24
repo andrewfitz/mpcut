@@ -48,7 +48,7 @@ final class StillAuthoringTiming {
         case .multicam(let multicam):
             for (index, item) in (multicam.assemblyItems ?? [.group(multicam.range)]).enumerated() {
                 switch item {
-                case .group(let group, _): try append(length: group.to.subtracting(group.from), source: .group(multicam, group, occurrence: index))
+                case .group(let group, _, _, _): try append(length: group.to.subtracting(group.from), source: .group(multicam, group, occurrence: index))
                 case .still(let card): try append(length: card.duration, insert: card)
                 }
             }

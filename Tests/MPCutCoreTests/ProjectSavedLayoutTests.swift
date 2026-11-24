@@ -3,201 +3,190 @@ import XCTest
 @testable import MPCutCore
 
 final class ProjectSavedLayoutTests: XCTestCase {
-    private func compact(_ json: String) throws -> Data {
-        let object = try JSONSerialization.jsonObject(with: Data(json.utf8))
-        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
-    }
-
     private func object(_ data: Data) throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
-    private let interview = #"""
-    {"clips":[{"file":"Zoom/a long folder name/recording.mp4","from":"49681/5","id":"A","to":"282381/25"},
-              {"file":"Zoom/a long folder name/recording.mp4","from":"0","id":"B","original_file":"Zoom/a long folder name/first take.mp4","to":"3"}],
-     "format":"mpcut",
-     "history":{"undo":[{"action":"Trim Clip","clips":[{"file":"Zoom/a long folder name/recording.mp4","from":"0","id":"A","to":"282381/25"}],"origin":"user"}]},
-     "kind":"sequence","schema_version":4,
-     "transcripts":{"attachments":[{"asset":{"file":"eliz.cut.transcripts/00.json","sha256":"00"},
-       "bindings":[
-        {"audio_stream_index":0,"file":"Zoom/a long folder name/recording.mp4","offset":{"denominator":1,"numerator":0},"sequence_clock_origin":{"denominator":3000,"numerator":-1},"source_confirmed":true,"track_id":"t-1"},
-        {"audio_stream_index":0,"file":"Zoom/a long folder name/recording.mp4","offset":{"denominator":1,"numerator":0},"sequence_clock_origin":{"denominator":3000,"numerator":-1},"source_confirmed":true,"track_id":"t-2"},
-        {"audio_stream_index":1,"file":"Zoom/a long folder name/recording.mp4","offset":{"denominator":1,"numerator":0},"track_id":"t-3"},
-        {"audio_stream_index":0,"file":"Zoom/a long folder name/recording.mp4","offset":{"denominator":1,"numerator":0},"sequence_clock_origin":{"denominator":3000,"numerator":-1},"source_confirmed":true,"track_id":"t-4"}],
-       "id":"attachment","import_origin":{"denominator":2,"numerator":1}}],
-      "authoring":[{"anchors":[{"binding":{"audio_stream_index":0,"file":"Zoom/a long folder name/recording.mp4","offset":{"denominator":1,"numerator":0},"track_id":"t-1"},"range":{"from":"0","to":"1"}}]}],
-      "revision":2}}
-    """#
-
-    func testSavedLayoutSharesPathsAndBindingsAndExpandsToTheSameDocument() throws {
-        let original = try compact(interview)
-        let saved = try XCTUnwrap(ProjectSavedLayout.compacted(Data(interview.utf8)))
-        XCTAssertEqual(try ProjectSavedLayout.expanded(saved), original)
-        XCTAssertLessThan(saved.count * 4, original.count * 3)
-
-        let root = try object(saved)
-        XCTAssertEqual(root["schema_version"] as? Int, 5)
-        XCTAssertEqual(root["files"] as? [String], ["Zoom/a long folder name/recording.mp4",
-                                                    "Zoom/a long folder name/first take.mp4",
-                                                    "eliz.cut.transcripts/00.json"])
-        let clips = try XCTUnwrap(root["clips"] as? [[String: Any]])
-        XCTAssertEqual(clips.map { $0["file"] as? Int }, [0, 0])
-        XCTAssertEqual(clips[1]["original_file"] as? Int, 1)
-        let attachment = try XCTUnwrap(((root["transcripts"] as? [String: Any])?["attachments"] as? [[String: Any]])?.first)
-        XCTAssertEqual(attachment["import_origin"] as? String, "1/2")
-        let bindings = try XCTUnwrap(attachment["bindings"] as? [[String: Any]])
-        // Only neighbours join, so the order of the tracks survives.
-        XCTAssertEqual(bindings.count, 3)
-        XCTAssertEqual(bindings[0]["track_ids"] as? [String], ["t-1", "t-2"])
-        XCTAssertEqual(bindings[0]["offset"] as? String, "0")
-        XCTAssertEqual(bindings[0]["sequence_clock_origin"] as? String, "-1/3000")
-        XCTAssertEqual(bindings[1]["track_id"] as? String, "t-3")
-        XCTAssertEqual(bindings[2]["track_id"] as? String, "t-4")
-        XCTAssertFalse(String(decoding: saved, as: UTF8.self).contains("numerator"))
-    }
-
-    func testTextIsCarriedAsWritten() throws {
-        // Escapes, a fraction, an exponent and an integer past 64 bits must not be read and spelled again.
-        let project = #"{"clips":[{"file":"a\/bé \"x\".mov","id":"1","n":0.0058479533},{"file":"a\/bé \"x\".mov","id":"2","n":1e-7,"big":123456789012345678901234567890}],"schema_version":4}"#
-        let saved = try XCTUnwrap(ProjectSavedLayout.compacted(Data(project.utf8)))
-        XCTAssertEqual(try ProjectSavedLayout.expanded(saved), Data(project.utf8))
-        let pretty = project.replacingOccurrences(of: ",", with: " ,\n\t").replacingOccurrences(of: "{", with: "{ ")
-        XCTAssertEqual(ProjectSavedLayout.compacted(Data(pretty.utf8)), saved)
-    }
-
-    func testSnapshotExtensionFieldsSurviveCompactLayout() throws {
-        var root = try object(Data(interview.utf8))
-        let snapshot: NSDictionary = ["version": 1, "entries": [
-            ["path": "camera.mov", "future": ["file": 99, "bindings": [["track_ids": []]]]]
-        ]]
-        root["media_snapshot"] = snapshot
-        let original = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys, .withoutEscapingSlashes])
-        let compacted = try XCTUnwrap(ProjectSavedLayout.compacted(original))
-        XCTAssertEqual(try object(compacted)["media_snapshot"] as? NSDictionary, snapshot)
-        XCTAssertEqual(try ProjectSavedLayout.expanded(compacted), original)
-    }
-
-    func testDocumentThatCouldMisleadIsWrittenAsItIs() throws {
-        let kept = [
-            // Another version, or none.
-            #"{"clips":[{"file":"a.mov","id":"1"},{"file":"a.mov","id":"2"}],"schema_version":3}"#,
-            #"{"clips":[{"file":"a.mov","id":"1"},{"file":"a.mov","id":"2"}]}"#,
-            // Names and values the saved layout gives a meaning of its own.
-            #"{"clips":[{"file":"a.mov","id":"1"},{"file":"a.mov","id":"2"}],"files":[],"schema_version":4}"#,
-            #"{"clips":[{"file":"a long name.mov","id":"1"},{"file":"a long name.mov","id":"2"},{"file":0}],"schema_version":4}"#,
-            #"{"clips":[{"file":"a long name.mov"},{"file":"a long name.mov"}],"schema_version":4,"t":{"bindings":[{"offset":"1/2","track_id":"t"}]}}"#,
-            #"{"clips":[{"file":"a long name.mov"},{"file":"a long name.mov"}],"schema_version":4,"t":{"bindings":[{"track_ids":["a","b"]}]}}"#,
-            "[1]", "", "{"
-        ]
-        for (index, project) in kept.enumerated() {
-            XCTAssertNil(ProjectSavedLayout.compacted(Data(project.utf8)), "case \(index)")
-            XCTAssertNil(try ProjectSavedLayout.expanded(Data(project.utf8)), "case \(index)")
+    func testReadableDocumentIsTheSameTextHoweverTheProjectIsStored() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mpcut-readable-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let clips = (0..<3).map {
+            CutSequenceClip(id: "clip-\($0)", file: "media/a recording.mov", from: .zero, to: .init(numerator: Int64($0 + 1)))
         }
+        let url = directory.appendingPathComponent("Interview.cut")
+        try CutProject.sequence(clips).save(to: url, undo: [CutHistoryState(action: "Trim Clip", project: .sequence(clips))], redo: [])
+        let saved = try Data(contentsOf: url)
+
+        // The saved file, the plain document and the text itself all give one text, with
+        // nothing left as a reference.
+        let text = try CutProject.readableDocument(saved: saved)
+        XCTAssertEqual(try CutProject.readableDocument(saved: text), text)
+        let plain = try CutProject.documentJSON(saved: saved)
+        XCTAssertEqual(try CutProject.readableDocument(saved: plain), text)
+        let lines = String(decoding: text, as: UTF8.self).components(separatedBy: "\n")
+        XCTAssertEqual(lines.first, "{")
+        XCTAssertEqual(lines.suffix(2), ["}", ""])
+        XCTAssertTrue(lines.contains(#"      "id": "clip-1","#))
+        XCTAssertFalse(lines.contains { $0.contains("\"refs\"") || $0.contains("\"~") })
+        // Each clip names its file in full. The undo step repeats none of them.
+        XCTAssertEqual(lines.filter { $0.contains(#""file": "media/a recording.mov""#) }.count, 3)
+        let reordered = Data(#"{"schema_version":4,"kind":"sequence","format":"mpcut","clips":[{"to":"1","id":"clip-0","from":"0","file":"media/a recording.mov"}]}"#.utf8)
+        let ordered = Data(#"{"clips":[{"file":"media/a recording.mov","from":"0","id":"clip-0","to":"1"}],"format":"mpcut","kind":"sequence","schema_version":4}"#.utf8)
+        XCTAssertEqual(try CutProject.readableDocument(saved: reordered), try CutProject.readableDocument(saved: ordered))
+        // The text is a project.
+        try text.write(to: url)
+        XCTAssertEqual(try CutProject.load(from: url), .sequence(clips))
+        XCTAssertThrowsError(try CutProject.readableDocument(saved: Data("not a project".utf8)))
+        XCTAssertThrowsError(try CutProject.readableDocument(saved: Data("[1]".utf8)))
     }
 
-    func testRepeatedTextIsWrittenOnce() throws {
-        let digest = String(repeating: "0123456789abcdef", count: 4)
-        let angle = "0F8FAD5B-D9CB-469F-A165-70867728950E"
-        let project = #"""
-        {"angles":[{"file":"wide.mov","id":"\#(angle)"},{"file":"close.mov","id":"close"}],
-         "history":{"undo":[{"action":"Switch Angle","switches":[{"angle_id":"\#(angle)","group_time":"0"}]}]},
-         "note":"~/Movies is a folder","other":"~","schema_version":4,
-         "switches":[{"angle_id":"\#(angle)","group_time":"0"},{"angle_id":"close","group_time":"4"},{"angle_id":"\#(angle)","group_time":"9"}],
-         "transcripts":{"attachments":[{"asset":{"file":"Talk.cut.transcripts/\#(digest).json","sha256":"\#(digest)"},"bindings":[]}]}}
-        """#
-        let original = try compact(project)
-        let saved = try XCTUnwrap(ProjectSavedLayout.compacted(Data(project.utf8)))
-        XCTAssertEqual(try ProjectSavedLayout.expanded(saved), original)
+    func testKeysComeFromContentSoBranchesAgree() throws {
+        let recording = #""Interviews 2026/a long recording name.mov""#
+        let other = #""Interviews 2026/the second camera.mov""#
+        func project(_ clips: [(String, String)]) -> Data {
+            let rows = clips.map { #"{"file":\#($0.1),"from":"0","id":"\#($0.0)","to":"1"}"# }.joined(separator: ",")
+            return Data(#"{"clips":[\#(rows)],"format":"mpcut","kind":"sequence","schema_version":4}"#.utf8)
+        }
+        func saved(_ document: Data) throws -> [String: Any] {
+            let keyed = try XCTUnwrap(ProjectKeyedLayout.compacted(document))
+            XCTAssertEqual(try ProjectKeyedLayout.expanded(keyed), document)
+            return try object(keyed)
+        }
+        // Two branches that add clips in a different order, and one that adds another
+        // recording first, give each recording the same key.
+        let key = String(decoding: ProjectKeyedLayout.key(Array(recording.utf8)), as: UTF8.self)
+        XCTAssertEqual(key.count, 10)
+        let first = try saved(project([("a", recording), ("b", recording)]))
+        let second = try saved(project([("c", other), ("d", other), ("b", recording), ("a", recording)]))
+        XCTAssertEqual((first["refs"] as? [String: String])?[key], String(recording.dropFirst().dropLast()))
+        XCTAssertEqual((second["refs"] as? [String: String])?[key], String(recording.dropFirst().dropLast()))
+        XCTAssertEqual((second["clips"] as? [[String: Any]])?.map { $0["file"] as? String }.suffix(2), ["~" + key, "~" + key])
 
-        let text = String(decoding: saved, as: UTF8.self)
-        XCTAssertEqual(text.components(separatedBy: angle).count, 2)
-        let root = try object(saved)
-        XCTAssertEqual(root["strings"] as? [String], [angle])
-        XCTAssertEqual(root["files"] as? [String], ["wide.mov", "close.mov", "Talk.cut.transcripts/\(digest).json"])
-        XCTAssertEqual((root["angles"] as? [[String: Any]])?.map { $0["id"] as? String }, ["~0", "close"])
-        XCTAssertEqual((root["switches"] as? [[String: Any]])?.map { $0["angle_id"] as? String }, ["~0", "close", "~0"])
+        // Text used once, and text too short to gain, stays where it is. The table is there all the same.
+        let single = try saved(project([("a", recording), ("b", other)]))
+        // Its one entry is the fixed last one, which lets an entry be added without changing another line.
+        XCTAssertEqual(single["refs"] as? [String: String], ["~": ""])
+        XCTAssertEqual((single["clips"] as? [[String: Any]])?.first?["file"] as? String, String(recording.dropFirst().dropLast()))
+        let short = try saved(project([("a", #""a.mov""#), ("b", #""a.mov""#)]))
+        XCTAssertEqual(short["refs"] as? [String: String], ["~": ""])
         // Text that begins with the marker is kept apart from a reference.
-        XCTAssertEqual(root["note"] as? String, "~~/Movies is a folder")
-        XCTAssertEqual(root["other"] as? String, "~~")
-
-        // A snapshot added to the saved document is carried exactly, marker and all.
-        var appended = saved
-        appended.removeLast()
-        appended.append(contentsOf: Data(#","media_snapshot":{"entries":[{"file":"~/a.mov","id":"~7"}]}}"#.utf8))
-        let expanded = try XCTUnwrap(ProjectSavedLayout.expanded(appended))
-        XCTAssertTrue(String(decoding: expanded, as: UTF8.self).hasSuffix(#""media_snapshot":{"entries":[{"file":"~/a.mov","id":"~7"}]}}"#))
-
-        for damaged in [#"{"a":"~1","schema_version":5,"strings":["only one entry"]}"#,
-                        #"{"a":"~x","schema_version":5}"#, #"{"a":"~","schema_version":5}"#,
-                        #"{"a":"~0","schema_version":5,"strings":[7]}"#] {
-            XCTAssertThrowsError(try ProjectSavedLayout.expanded(Data(damaged.utf8)), damaged)
-        }
+        let home = try saved(project([("a", #""~/Movies/a.mov""#), ("b", #""~""#)]))
+        XCTAssertEqual((home["clips"] as? [[String: Any]])?.map { $0["file"] as? String }, ["~~/Movies/a.mov", "~~"])
     }
 
-    func testHistoryWritesWhatItsStepsRepeatOnce() throws {
-        // Each undo step keeps every span, and one span differs from step to step.
-        func spans(changed: Int) -> String {
-            (0..<60).map { index in
-                #"{"bounds":{"height":0.23391813,"width":0.2421875,"x":0.00390625,"y":0.0058479533},"id":"span-\#(index)","range":{"from":"\#(index)","to":"\#(index == changed ? 99 : index + 1)"},"role":"tile"}"#
-            }.joined(separator: ",")
+    func testHistoryWritesRepeatedValuesOnceUnderContentKeys() throws {
+        func clip(_ index: Int, to: Int) -> String {
+            #"{"file":"Interviews 2026/a long recording name.mov","from":"\#(index)","id":"clip-number-\#(index)","to":"\#(to)"}"#
         }
-        let steps = (0..<12).map { #"{"action":"Rename","participants":{"sources":[{"appearances":[\#(spans(changed: $0))]}]}}"# }
-        let project = #"{"clips":[{"file":"a.mov","id":"1"}],"history":{"undo":[\#(steps.joined(separator: ","))]},"participants":{"sources":[{"appearances":[\#(spans(changed: 0))]}]},"schema_version":4}"#
-        let saved = try XCTUnwrap(ProjectSavedLayout.compacted(Data(project.utf8)))
-        XCTAssertEqual(try ProjectSavedLayout.expanded(saved), Data(project.utf8))
-        XCTAssertLessThan(saved.count * 4, project.utf8.count)
-
-        let root = try object(saved)
-        XCTAssertNotNil(root["shared"] as? [Any])
-        // The document itself is left to read as it is; only history refers to the list.
-        let live = try XCTUnwrap(((root["participants"] as? [String: Any])?["sources"] as? [[String: Any]])?.first?["appearances"] as? [[String: Any]])
-        XCTAssertEqual(live.count, 60)
-        XCTAssertEqual(live[3]["id"] as? String, "span-3")
-
-        let damaged = [
-            // A position past the list, one that refers forward, and a list that is not one.
-            #"{"history":{"undo":[{"~":2}]},"schema_version":5,"shared":[{"a":1}]}"#,
-            #"{"history":{"undo":[{"~":0}]},"schema_version":5,"shared":[{"a":{"~":1}},{"b":1}]}"#,
-            #"{"history":{"undo":[{"~":0}]},"schema_version":5,"shared":{"a":1}}"#
-        ]
-        for text in damaged { XCTAssertThrowsError(try ProjectSavedLayout.expanded(Data(text.utf8)), text) }
-        // Each entry doubles the one before it. Expanding must stop long before memory does.
-        let doubling = (1..<40).map { #"[{"~":\#($0 - 1)},{"~":\#($0 - 1)}]"# }.joined(separator: ",")
-        let bomb = #"{"history":{"undo":[{"~":39}]},"schema_version":5,"shared":["0123456789abcdef",\#(doubling)]}"#
-        XCTAssertThrowsError(try ProjectSavedLayout.expanded(Data(bomb.utf8)))
-        // A marker outside history is an ordinary object.
-        XCTAssertEqual(try ProjectSavedLayout.expanded(Data(#"{"clips":[{"~":0}],"schema_version":5}"#.utf8)),
-                       Data(#"{"clips":[{"~":0}],"schema_version":4}"#.utf8))
+        let steps = (0..<10).map { step in
+            #"{"action":"Trim Clip","clips":[\#((0..<30).map { clip($0, to: $0 == step ? 99 : $0 + 1) }.joined(separator: ","))]}"#
+        }
+        let project = Data(#"{"clips":[\#((0..<30).map { clip($0, to: $0 + 1) }.joined(separator: ","))],"format":"mpcut","history":{"undo":[\#(steps.joined(separator: ","))]},"kind":"sequence","schema_version":4}"#.utf8)
+        let keyed = try XCTUnwrap(ProjectKeyedLayout.compacted(project))
+        XCTAssertEqual(try ProjectKeyedLayout.expanded(keyed), project)
+        XCTAssertLessThan(keyed.count * 2, project.count)
+        let root = try object(keyed)
+        // A clip an undo step keeps is a reference whose key is taken from the clip as the document holds it.
+        let key = String(decoding: ProjectKeyedLayout.key(Array(clip(5, to: 6).utf8)), as: UTF8.self)
+        let entry = try XCTUnwrap((root["refs"] as? [String: Any])?[key] as? [String: Any])
+        XCTAssertEqual(entry["id"] as? String, "clip-number-5")
+        let undo = try XCTUnwrap((root["history"] as? [String: Any])?["undo"] as? [[String: Any]])
+        let kept = try XCTUnwrap(undo.first?["clips"] as? [[String: Any]])
+        XCTAssertEqual(kept[5] as? [String: String], ["~": key])
+        // The timeline itself is left to read as it is.
+        XCTAssertEqual((root["clips"] as? [[String: Any]])?[5]["id"] as? String, "clip-number-5")
+        // Saved as text, an undo step takes one line, and so does a run of numbers anywhere else.
+        let text = String(decoding: try XCTUnwrap(ProjectSavedLayout.readable(keyed)), as: UTF8.self)
+        let stepLines = text.split(separator: "\n").filter { $0.contains(#""Trim Clip""#) }
+        XCTAssertEqual(stepLines.count, steps.count)
+        for (line, expectedStep) in zip(stepLines, undo) {
+            let row = line.last == "," ? line.dropLast() : line
+            XCTAssertEqual(try object(Data(row.utf8)) as NSDictionary, expectedStep as NSDictionary)
+        }
+        let runs = String(decoding: try XCTUnwrap(ProjectSavedLayout.readable(Data(#"{"a":[[0,1],[2,30]],"b":[]}"#.utf8))), as: UTF8.self)
+        XCTAssertEqual(runs, "{\n  \"a\": [\n    [0, 1],\n    [2, 30]\n  ],\n  \"b\": []\n}\n")
     }
 
-    func testDamagedSavedLayoutIsRefused() throws {
-        let damaged = [
-            #"{"clips":[{"file":1}],"files":["a.mov"],"schema_version":5}"#,
-            #"{"clips":[{"file":-1}],"files":["a.mov"],"schema_version":5}"#,
-            #"{"clips":[{"file":0.0}],"files":["a.mov"],"schema_version":5}"#,
-            #"{"clips":[{"file":0}],"schema_version":5}"#,
-            #"{"clips":[{"file":0}],"files":[1],"schema_version":5}"#,
-            #"{"files":["a.mov"],"schema_version":5,"t":{"bindings":[{"offset":"1/1","track_id":"t"}]}}"#,
-            #"{"files":["a.mov"],"schema_version":5,"t":{"bindings":[{"offset":"01","track_id":"t"}]}}"#,
-            #"{"files":["a.mov"],"schema_version":5,"t":{"bindings":[{"track_ids":[]}]}}"#,
-            #"{"files":["a.mov"],"schema_version":5,"t":{"bindings":[{"track_id":"a","track_ids":["b"]}]}}"#
-        ]
-        for (index, project) in damaged.enumerated() {
-            XCTAssertThrowsError(try ProjectSavedLayout.expanded(Data(project.utf8), code: "invalid_multicam_project"), "case \(index)") {
-                XCTAssertEqual(($0 as? CutError)?.code, "invalid_multicam_project")
+    func testRefsTableReadsWhatAMergeCanLeaveAndRefusesWhatItCannotResolve() throws {
+        func expanded(_ text: String) throws -> String {
+            guard let document = try ProjectKeyedLayout.expanded(Data(text.utf8)) else {
+                throw CutError(code: "no_table", message: "The text has no refs table.")
             }
+            return String(decoding: document, as: UTF8.self)
         }
-        XCTAssertEqual(try ProjectSavedLayout.expanded(Data(#"{"clips":[{"file":0}],"files":["a.mov"],"schema_version" : 5}"#.utf8)),
-                       Data(#"{"clips":[{"file":"a.mov"}],"schema_version":4}"#.utf8))
+        // An entry nothing refers to, and text written in full beside references, are both read.
+        XCTAssertEqual(try expanded(#"{"clips":[{"file":"~k1"},{"file":"b.mov"},{"file":"~~/c.mov"}],"refs":{"k1":"a.mov","unused":"z.mov"},"schema_version":4}"#),
+                       #"{"clips":[{"file":"a.mov"},{"file":"b.mov"},{"file":"~/c.mov"}],"schema_version":4}"#)
+        XCTAssertEqual(try expanded(#"{"history":{"undo":[{"~":"v2"},{"~":"v1"}]},"refs":{"p":"a.mov","v1":{"file":"~p"},"v2":[{"~":"v1"},{"~":"v1"}]},"schema_version":4}"#),
+                       #"{"history":{"undo":[[{"file":"a.mov"},{"file":"a.mov"}],{"file":"a.mov"}]},"schema_version":4}"#)
+        // A snapshot is carried exactly, marker and all.
+        XCTAssertEqual(try expanded(#"{"media_snapshot":{"entries":[{"file":"~/a.mov","id":"~7"}]},"refs":{},"schema_version":4}"#),
+                       #"{"media_snapshot":{"entries":[{"file":"~/a.mov","id":"~7"}]},"schema_version":4}"#)
+        // Text with no table is not this layout.
+        XCTAssertNil(try ProjectKeyedLayout.expanded(Data(#"{"clips":[{"file":"~k1"}],"schema_version":4}"#.utf8)))
+
+        // A reference whose entry a merge dropped names the entry, so it can be restored.
+        XCTAssertThrowsError(try expanded(#"{"clips":[{"file":"~gone"}],"refs":{},"schema_version":4}"#)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "invalid_cut_project")
+            XCTAssertTrue((($0 as? CutError)?.message ?? "").contains("‘gone’"), "\($0)")
+        }
+        let refused = [
+            #"{"clips":[{"file":"~v"}],"refs":{"v":{"a":1}},"schema_version":4}"#,
+            #"{"history":{"undo":[{"~":"p"}]},"refs":{"p":"a.mov"},"schema_version":4}"#,
+            #"{"history":{"undo":[{"~":7}]},"refs":{},"schema_version":4}"#,
+            #"{"history":{"undo":[{"~":"a"}]},"refs":{"a":[{"~":"b"}],"b":[{"~":"a"}]},"schema_version":4}"#,
+            #"{"clips":[],"refs":[],"schema_version":4}"#,
+            #"{"clips":[{"file":"~"}],"refs":{},"schema_version":4}"#
+        ]
+        for text in refused {
+            XCTAssertThrowsError(try expanded(text), text) { XCTAssertEqual(($0 as? CutError)?.code, "invalid_cut_project") }
+        }
+        // Each entry doubles the one before it. Expanding must stop long before memory does.
+        let doubling = (1..<40).map { #""e\#($0)":[{"~":"e\#($0 - 1)"},{"~":"e\#($0 - 1)"}]"# }.joined(separator: ",")
+        XCTAssertThrowsError(try expanded(#"{"history":{"undo":[{"~":"e39"}]},"refs":{"e0":["0123456789abcdef"],\#(doubling)},"schema_version":4}"#))
     }
 
-    func testProjectSavesInTheSharedLayoutAndLoadsBack() throws {
+    func testRefsBoundAliasDepthAndCachedExpandedDepth() throws {
+        func expand(_ json: String) throws -> Data? {
+            try ProjectKeyedLayout.expanded(Data(json.utf8))
+        }
+
+        // A chain of plain aliases takes stack space without increasing the expanded JSON depth.
+        let aliases = (1...600).map { #""e\#($0)":{"~":"e\#($0 - 1)"}"# }
+        let supported = aliases.prefix(511).joined(separator: ",")
+        XCTAssertEqual(try expand(#"{"value":{"~":"e511"},"refs":{"e0":[0],\#(supported)}}"#), Data(#"{"value":[0]}"#.utf8))
+        let excessive = aliases.joined(separator: ",")
+        XCTAssertThrowsError(try expand(#"{"value":{"~":"e600"},"refs":{"e0":[0],\#(excessive)}}"#)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "invalid_cut_project")
+        }
+
+        func nested(_ levels: Int, _ value: String) -> String {
+            String(repeating: "[", count: levels) + value + String(repeating: "]", count: levels)
+        }
+        // The first use is shallow enough to cache. A second use at greater depth is too deep.
+        let held = nested(70, "0")
+        let withinLimit = nested(50, #"{"~":"held"}"#)
+        XCTAssertEqual(try expand(#"{"first":{"~":"held"},"second":\#(withinLimit),"refs":{"held":\#(held)}}"#),
+                       Data(#"{"first":\#(held),"second":\#(nested(50, held))}"#.utf8))
+        let tooDeep = nested(70, #"{"~":"held"}"#)
+        XCTAssertThrowsError(try expand(#"{"first":{"~":"held"},"second":\#(tooDeep),"refs":{"held":\#(held)}}"#)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "invalid_cut_project")
+        }
+
+        // The number of values in an array does not count toward its depth.
+        let row = Array(repeating: "0", count: 10_000).joined(separator: ",")
+        XCTAssertEqual(try expand(#"{"value":{"~":"flat"},"refs":{"flat":[\#(row)]}}"#),
+                       Data(#"{"value":[\#(row)]}"#.utf8))
+    }
+
+    func testProjectSavesWithItsRefsTableAndLoadsBack() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("mpcut-layout-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
+        let path = "media/a recording with a long name.mov"
         func clip(_ index: Int, to: Int64 = 3) -> CutSequenceClip {
-            CutSequenceClip(id: "clip-\(index)", file: "media/a recording with a long name.mov", from: .zero,
-                            to: .init(numerator: to))
+            CutSequenceClip(id: "clip-\(index)", file: path, from: .zero, to: .init(numerator: to))
         }
         let before = (0..<40).map { clip($0) }
         let after = (0..<40).map { clip($0, to: $0 == 7 ? 2 : 3) }
@@ -205,41 +194,37 @@ final class ProjectSavedLayoutTests: XCTestCase {
         let undo = [CutHistoryState(action: "Trim Clip", project: .sequence(before))]
         try CutProject.sequence(after).save(to: url, undo: undo, redo: [])
 
-        // The file is the saved layout's text, compressed.
+        // The file is text with one field to a line. The path every clip names is written once,
+        // under a key taken from the path itself.
         let file = try Data(contentsOf: url)
-        XCTAssertEqual(file.first, 0)
-        let text = try XCTUnwrap(ProjectSavedBytes.unpacked(file, code: "invalid_cut_project"))
-        XCTAssertLessThan(file.count * 3, text.count)
-        let root = try object(text)
-        XCTAssertEqual(root["schema_version"] as? Int, 5)
-        XCTAssertEqual(root["files"] as? [String], ["media/a recording with a long name.mov"])
-        XCTAssertEqual(String(decoding: text, as: UTF8.self).components(separatedBy: "a recording with a long name").count, 2)
-        XCTAssertEqual(try object(ProjectFile.documentJSON(file))["schema_version"] as? Int, 4)
+        let text = String(decoding: file, as: UTF8.self)
+        XCTAssertTrue(text.hasPrefix("{\n  \"clips\": [\n    {\n      \"file\": \"~"), text)
+        XCTAssertTrue(text.hasSuffix("}\n"))
+        XCTAssertEqual(text.components(separatedBy: path).count, 2)
+        let key = String(decoding: ProjectKeyedLayout.key(Array("\"\(path)\"".utf8)), as: UTF8.self)
+        let root = try object(file)
+        XCTAssertEqual(root["schema_version"] as? Int, 4)
+        XCTAssertEqual((root["refs"] as? [String: Any])?[key] as? String, path)
+        XCTAssertEqual((root["clips"] as? [[String: Any]])?.first?["file"] as? String, "~" + key)
+        // The plain document is what the file stands for.
+        let plain = try ProjectFile.documentJSON(file)
+        XCTAssertNil(try object(plain)["refs"])
+        XCTAssertEqual((try object(plain)["clips"] as? [[String: Any]])?.first?["file"] as? String, path)
 
+        // Saving it again unchanged writes the same bytes, so version control sees no change.
         let loaded = try CutProject.loadDocument(from: url, limit: 5)
         XCTAssertEqual(loaded.project, .sequence(after))
         XCTAssertEqual(loaded.undo.map(\.project), [.sequence(before)])
         try loaded.project.save(to: url, undo: loaded.undo, redo: loaded.redo)
-        XCTAssertEqual(try CutProject.load(from: url), .sequence(after))
+        XCTAssertEqual(try Data(contentsOf: url), file)
 
-        // Every project is written the same way, whatever it has to share.
-        let single = directory.appendingPathComponent("Single.cut")
-        try CutProject.sequence([clip(0)]).save(to: single)
-        let saved = try XCTUnwrap(ProjectSavedBytes.unpacked(Data(contentsOf: single), code: "invalid_cut_project"))
-        XCTAssertEqual(try object(saved)["schema_version"] as? Int, 5)
-        XCTAssertEqual(try CutProject.load(from: single), .sequence([clip(0)]))
-
-        // A plain document written by an earlier build, or by hand, still opens.
-        let plain = directory.appendingPathComponent("Plain.cut")
-        try ProjectFile.documentJSON(Data(contentsOf: single)).write(to: plain)
-        XCTAssertEqual(try CutProject.load(from: plain), .sequence([clip(0)]))
-        // Damage to the compressed bytes is refused, not read as something else.
-        var damaged = file
-        damaged[8] ^= 0x01
-        for bytes in [damaged, file.prefix(file.count / 2), file.prefix(16)] {
-            XCTAssertThrowsError(try CutProject.decode(Data(bytes))) {
-                XCTAssertEqual(($0 as? CutError)?.code, "invalid_cut_project")
-            }
-        }
+        // The plain document opens, and its next save writes this text.
+        let earlier = directory.appendingPathComponent("Plain.cut")
+        try plain.write(to: earlier)
+        let reopened = try CutProject.loadDocument(from: earlier, limit: 5)
+        XCTAssertEqual(reopened.project, .sequence(after))
+        XCTAssertEqual(reopened.undo.map(\.project), [.sequence(before)])
+        try reopened.project.save(to: earlier, undo: reopened.undo, redo: reopened.redo)
+        XCTAssertEqual(try Data(contentsOf: earlier), file)
     }
 }

@@ -24,6 +24,10 @@ struct BulkQueueView: View {
         } else {
             value.mode = editor.defaultExportMode
         }
+        if editor.readyQueuedRanges.contains(where: { ($0.pictureProject ?? $0.stillProject)?.requiresPictureProcessing == true }) {
+            value.mode = .encode
+            value.encodeContainer = "mov"
+        }
         _options = State(initialValue: value)
     }
 
@@ -36,7 +40,10 @@ struct BulkQueueView: View {
     private var placements: ExportPlacementScope {
         editor.readyQueuedRanges.map(\.placements).max(by: { $0.rawValue < $1.rawValue }) ?? .none
     }
-    private var hasVideo: Bool { choices.hasVideo }
+    private var requiresPictureProcessing: Bool {
+        editor.readyQueuedRanges.contains { ($0.pictureProject ?? $0.stillProject)?.requiresPictureProcessing == true }
+    }
+    private var hasVideo: Bool { requiresPictureProcessing || choices.hasVideo }
     private var hasAudio: Bool { choices.hasAudio }
     private var tracks: ExportTracks { choices.tracks(options.tracks) }
     private var audioStreams: [StreamInfo] {
@@ -82,12 +89,16 @@ struct BulkQueueView: View {
         return hasSoundtrack && !listed.contains(.auto) ? [.auto] + listed : listed
     }
     private var audioConversions: [ReencodeAudio] {
-        hasSoundtrack ? ExportRules.stillSoundConversions : choices.conversions
+        hasSoundtrack || requiresPictureProcessing ? ExportRules.stillSoundConversions : choices.conversions
     }
     private var exportOptions: ExportSheetOptions {
         var result = options
         result.tracks = tracks
         result.placements = placements
+        if requiresPictureProcessing {
+            result.requiresPictureProcessing = true
+            result.mode = tracks == .audio ? result.audioMode : .encode
+        }
         return result
     }
 
@@ -126,6 +137,9 @@ struct BulkQueueView: View {
         options.tracks = selection
         options.copyContainer = ""
         options.audioTrackOrdinal = nil
+        if selection == .audio, requiresPictureProcessing {
+            options.convertAudio(to: .pcm, preferred: options.conversionContainer)
+        }
     }
 
     var body: some View {
@@ -174,9 +188,12 @@ struct BulkQueueView: View {
                         .help("Choose audio tracks")
                     }
                     // Exactly the modes the export rules write as themselves for this selection.
-                    let modes = choices.modes(tracks: tracks)
+                    let modes: [ExportMode] = requiresPictureProcessing && tracks != .audio ? [.encode] : choices.modes(tracks: tracks)
                     Picker("Mode", selection: Binding(get: { exportOptions.effectiveMode }, set: chooseMode)) {
-                        ForEach(modes, id: \.self) { Text(choices.title($0, tracks: tracks)) }
+                        ForEach(modes, id: \.self) {
+                            Text(requiresPictureProcessing ? ExportRules.displayName(mode: $0, soundOnly: tracks == .audio)
+                                 : choices.title($0, tracks: tracks))
+                        }
                     }
                     .disabled(modes.count < 2)
                     .help("Choose export mode")

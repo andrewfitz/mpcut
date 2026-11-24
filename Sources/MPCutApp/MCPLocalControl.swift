@@ -5,6 +5,7 @@ import MPCutCore
 
 extension ProjectSession {
     var mcpHandle: String {
+        if let handle = feedAngleProjectHandle { return handle }
         let generation = isMulticam ? multicam.mcpGeneration : editor.mcpGeneration
         return id.uuidString + "/" + mcpModeGeneration.uuidString + "/" + generation.uuidString
     }
@@ -382,7 +383,7 @@ final class MCPLocalControl {
             for tool in ["timeline_playhead_seek", "playback_transport_play", "playback_transport_pause", "timeline_item_split", "multicam_camera_take", "multicam_assembly_edit"] {
                 capability(tool, canEdit, "A loaded, idle multicam project is required.")
             }
-            capability("history_undo", canEdit && !model.undoStack.isEmpty, "No available undo step.")
+            capability("history_undo", canEdit && (!model.undoStack.isEmpty || session.canUndoFeedAngleConversion), "No available undo step.")
             capability("history_redo", canEdit && !model.redoStack.isEmpty, "No available redo step.")
             capability("multicam_sync_suggest", model.project != nil, "Open a multicam project to compare sources.", allowsSheet: true)
             let hasJoin = items.count > 1 || (model.project?.switches.count ?? 0) > 1
@@ -440,7 +441,7 @@ final class MCPLocalControl {
             capability("playback_transport_play", canNavigate && (!model.preview.hasBlockingIssue || model.preview.isPlaying), "Playback is unavailable.")
             capability("timeline_item_split", canEdit, "A loaded, idle timeline is required.")
             capability("history_undo", model.canUndo && !model.mcpHasActiveTrim, "No available undo step.")
-            capability("history_redo", model.canRedo && !model.mcpHasActiveTrim, "No available redo step.")
+            capability("history_redo", (model.canRedo || session.canRedoFeedAngleConversion) && !model.mcpHasActiveTrim, "No available redo step.")
             capability("timeline_editor_join_preview", canEdit && total > 1 && model.cutPreview == nil,
                        "A sequence with an existing join and an idle preview is required.")
             capability("source_selects_list", true, "", allowsSheet: true)

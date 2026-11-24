@@ -850,7 +850,7 @@
   },
   {
     "name": "review_editor_frames_export",
-    "description": "Export review JPEGs from the live editor. Still and playhead selections sample the program when still placements exist. Supply space to sample exact program times. With no space, times follow native source or multicam group and angle review.",
+    "description": "Export review JPEGs from the live editor. Programs with generated stills or tile edits use the rendered program for current-frame and program-time samples. Tile-edited multicam projects can sample switches on the group clock. Scene and non-silent source sampling require a project without tile processing.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -891,7 +891,7 @@
             "group",
             "assembly"
           ],
-          "description": "Select the program clock for still, playhead or explicit time samples. Omit for the native source and angle review modes."
+          "description": "Still and playhead samples use the active program clock. For explicit times, select the clock of the supplied timestamps. With tile edits, omitting space uses the active program clock. Switch sampling uses multicam group time."
         },
         "times": {
           "type": "array",

@@ -592,6 +592,19 @@ extension ReplaceEdit {
                 return nil
             }
             guard !lossKeepsOldPath.contains(clip.id) else { return clip }
+            if !clip.tileLayouts.isEmpty {
+                let originalDigest = sequence.participants.sources.first { $0.sourceID == clip.file }?.sourceContentSHA256
+                if originalDigest != nil && candidateDigest == nil {
+                    candidateDigest = try participantSourceDigest(candidate, identity: identity, cancelled: cancelled)
+                }
+                if originalDigest == nil || originalDigest != candidateDigest {
+                    clip.tileLayouts.removeAll()
+                    report.warnings.append("Tile layouts on clip ‘\(clip.id)’ are cleared for the replacement picture.")
+                } else {
+                    let previousFile = clip.file
+                    clip.mapTileCameraPaths { $0 == previousFile ? destination : $0 }
+                }
+            }
             clip.file = destination
             clip.from = range.from
             clip.to = range.to
@@ -657,7 +670,7 @@ extension ReplaceEdit {
         if replacedPicture || participantUse {
             let retainsOldPicture = !replacesAtSameLocation && revisedClips.contains { sameSource($0.file) }
             var paths = Set(sequence.participants.protectedMediaPaths.map { $0.1 }.filter(sameSource))
-            if replacedPicture, paths.isEmpty, sequence.participants.render?.redactions.isEmpty == false {
+            if replacedPicture, paths.isEmpty, sequence.participants.hasEffectiveTreatments {
                 paths.insert(source)
             }
             for id in paths.sorted() {
@@ -672,12 +685,19 @@ extension ReplaceEdit {
     private func replaceMulticam(_ value: MulticamProject) throws -> MulticamProject {
         guard let media else { return value }
         let indexed = try engine.multicamClock(media)
-        let targeted = Set(value.sources.filter { matches($0.file, useID: $0.id) }.map(\.id))
+        let targeted = Set(value.sources.filter { $0.feedAngle == nil && matches($0.file, useID: $0.id) }.map(\.id))
+        if let selectedID, let reference = value.angles.first(where: { $0.id == selectedID })?.feedAngle {
+            report.blockers.append("Replace the recording ‘\(reference.sourceID)’ that supplies this feed angle.")
+            return value
+        }
         let cameraIDs = Set(value.pictureSources.map(\.id))
+        let parentIDs = Dictionary(uniqueKeysWithValues: value.angles.compactMap { angle in
+            angle.feedAngle.map { (angle.id, $0.sourceID) }
+        })
         let initialPlan = try value.plan()
         var removed = Set<String>()
         var pictureCoverage: [String: MulticamRange] = [:]
-        let pictureSpansBySource = Dictionary(grouping: initialPlan.picture, by: \.source)
+        let pictureSpansBySource = Dictionary(grouping: initialPlan.picture) { parentIDs[$0.source] ?? $0.source }
         let audioSpansBySource = Dictionary(grouping: initialPlan.audioLanes.flatMap(\.spans), by: \.source)
         var result = value
 
@@ -709,6 +729,7 @@ extension ReplaceEdit {
                         return angle
                     }
                     trial.audioSources = value.audioSources.map { $0.id == copy.id ? copy : $0 }
+                    trial.syncFeedAngleRecordings()
                     let analysis = try MulticamSync.analyze(trial, relativeTo: projectURL, indexed: [copy.id: indexed],
                                                             sourceID: copy.id, waveform: sync == .waveform,
                                                             useSidecar: false, cancelled: cancelled)
@@ -769,6 +790,7 @@ extension ReplaceEdit {
         }
 
         result.angles = try value.angles.map { angle in
+            if angle.feedAngle != nil { return angle }
             let recordings = try angle.recordings.compactMap(reviseSource)
             if var primary = recordings.first, primary.id == angle.id {
                 primary.additionalRecordings = Array(recordings.dropFirst())
@@ -782,6 +804,14 @@ extension ReplaceEdit {
             logicalAngle.additionalRecordings = recordings
             return logicalAngle
         }
+        let remainingPictures = Set(result.pictureSources.filter { $0.feedAngle == nil }.map(\.id))
+        if let orphaned = result.angles.first(where: { angle in
+            angle.feedAngle.map { removed.contains($0.sourceID) || !remainingPictures.contains($0.sourceID) } ?? false
+        }) {
+            report.blockers.append("Removing the recording would leave feed angle ‘\(orphaned.name ?? orphaned.id)’ without its source.")
+            return value
+        }
+        result.syncFeedAngleRecordings()
         result.audioSources = try value.audioSources.compactMap(reviseSource)
         let items = value.assemblyItems ?? [.group(value.range)]
         let intervalsByIndex = Dictionary(grouping: initialPlan.intervals, by: \.assemblyIndex)
@@ -790,7 +820,7 @@ extension ReplaceEdit {
             var ranges: [MulticamRange] = []
             for interval in intervalsByIndex[index] ?? [] {
                 var kept = interval.group
-                if let id = interval.pictureSourceID, let coverage = pictureCoverage[id] {
+                if let id = interval.pictureSourceID, let coverage = pictureCoverage[parentIDs[id] ?? id] {
                     let from = max(coverage.from, kept.from)
                     let to = min(coverage.to, kept.to)
                     if from >= to {
@@ -808,7 +838,10 @@ extension ReplaceEdit {
                 }
             }
             if ranges == [group] { return [item] }
-            return ranges.map { .group($0, angle: item.angleOverride) }
+            if let only = ranges.first, ranges.count == 1 { return [item.trimmingGroup(to: only)] }
+            return ranges.enumerated().map { index, range in
+                item.groupPiece(range, from: range.from, to: range.to, keepingID: index == 0)
+            }
         }
         if items != conformedItems {
             if conformedItems.isEmpty {

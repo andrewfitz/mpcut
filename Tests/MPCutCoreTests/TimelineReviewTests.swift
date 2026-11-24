@@ -130,6 +130,44 @@ final class TimelineReviewTests: XCTestCase {
         XCTAssertEqual(mapping.pieces.first?.angleOverride, "b")
     }
 
+    func testComparisonReportsClipLayoutsAndIgnoresLayoutsOutsideTheTrim() throws {
+        let first = clip("first", "a.mov", 1, 4)
+        let second = clip("second", "a.mov", 0, 4)
+        var updated = first
+        updated.tileLayouts = [.init(range: range(0, 1), layout: .original)]
+        let before = CutProject.sequence([first, second])
+        XCTAssertTrue(try TimelineComparison.compare(from: before, to: .sequence([updated, second])).changes.isEmpty)
+        updated.tileLayouts.append(.init(range: range(2, 3), layout: .original))
+        let comparison = try TimelineComparison.compare(from: before, to: .sequence([updated, second]))
+        XCTAssertEqual(comparison.changes.map { $0.after?.id }, ["first"])
+        XCTAssertEqual(comparison.changes.map(\.fields), [["tile_layouts"]])
+    }
+
+    func testComparisonMatchesNamedRepeatedOccurrencesAndReportsOverlappingGroupLayouts() throws {
+        var project = MulticamProject(
+            referenceAngle: "camera", range: range(0, 8), angles: [.init(id: "camera", file: "camera.mov")],
+            audio: .none, switches: [.init(at: .zero, angle: "camera")],
+            assemblyItems: [.group(range(0, 2)), .group(range(3, 5), id: "first"), .group(range(3, 5), id: "second")]
+        )
+        let before = CutProject.multicam(project)
+        let layout = TileLayoutSpan(range: range(3, 4), layout: .original)
+        project.assemblyItems = [.group(range(0, 2), id: "new-id"),
+                                 .group(range(3, 5), id: "second", layouts: [layout]),
+                                 .group(range(3, 5), id: "first")]
+        project.groupTileLayouts = [layout]
+        let after = CutProject.multicam(project)
+        let comparison = try TimelineComparison.compare(from: before, to: after)
+        XCTAssertEqual(comparison.projectFields, ["group_tile_layouts"])
+        XCTAssertEqual(comparison.changes.map(\.kind), [.modified, .modified, .modified])
+        XCTAssertEqual(comparison.changes.map { $0.before?.index }, [0, 2, 1])
+        XCTAssertEqual(comparison.changes[0].fields, ["occurrence_id"])
+        XCTAssertTrue(comparison.changes[1].fields.contains("tile_layouts"))
+        XCTAssertFalse(comparison.changes[2].fields.contains("tile_layouts"))
+        XCTAssertEqual(comparison.changes.filter { $0.fields.contains("group_tile_layouts") }.map { $0.after?.id },
+                       ["second", "first"])
+        XCTAssertEqual(try after.mapTimelineRange(range(3, 4), clock: .group).pieces.map(\.id), ["second", "first"])
+    }
+
     private func clip(_ id: String, _ path: String, _ from: Int64, _ to: Int64) -> CutSequenceClip {
         CutSequenceClip(id: id, file: path, from: time(from), to: time(to))
     }

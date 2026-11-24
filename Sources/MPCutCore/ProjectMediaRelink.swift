@@ -676,9 +676,10 @@ private extension RelinkSpace {
             for index in participants.sources.indices {
                 let geometry = state.participants.sources[index]
                 let path = state.sequenceItems != nil ? geometry.sourceID : recordings[geometry.sourceID]
-                guard let change = path.flatMap({ byPath[$0] }),
-                      let identity = change.inspection.candidate.identity else { continue }
-                if change.inspection.verifiesGeometry(geometry, old: change.previous) {
+                guard let change = path.flatMap({ byPath[$0] }) else { continue }
+                participants.sources[index].confirmations = nil
+                if let identity = change.inspection.candidate.identity,
+                   change.inspection.verifiesGeometry(geometry, old: change.previous) {
                     participants.sources[index].sourceStamp = SceneSourceStamp(identity: identity)
                     participants.sources[index].sourceInode = identity.inode
                 } else {

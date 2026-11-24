@@ -41,6 +41,133 @@ final class ProjectMediaReplaceBindingsTests: XCTestCase {
         XCTAssertTrue(render.privacyIssues.contains { $0.sourceID == candidate.lastPathComponent })
     }
 
+    func testNativeLayoutsAndReviewAreScopedWhenReplacingOneUseOfARecording() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures/SmartTrim-GOP.mp4")
+        let old = folder.appendingPathComponent("original.mp4")
+        let candidate = folder.appendingPathComponent("replacement.mp4")
+        try FileManager.default.copyItem(at: fixture, to: old)
+        try FileManager.default.copyItem(at: fixture, to: candidate)
+        let range = MulticamRange(from: .zero, to: .init(numerator: 1))
+        let span = TileLayoutSpan(range: range, layout: .solo, slots: [.init(id: "guest")])
+        var project = CutProject.sequence(["replace", "keep"].map {
+            .init(id: $0, file: old.lastPathComponent, from: range.from, to: range.to, tileLayouts: [span])
+        })
+        project.participants = .init(people: [.init(id: "guest", name: "Guest", treatment: .init(mode: .blur))],
+            sources: [.init(sourceID: old.lastPathComponent, coverage: [.init(range: range, state: .verified)])])
+        try project.participants.confirmPrivacy(sourceID: old.lastPathComponent, participantID: "guest", range: range)
+        let preview = try ProjectMediaReplace.preview(project, relativeTo: folder.appendingPathComponent("edit.cut"),
+            source: old.path, candidate: candidate, options: .init(useID: "replace"))
+        let changed = try preview.applying(to: project)
+        XCTAssertEqual(changed.sequenceClips?.first { $0.id == "replace" }?.tileLayouts, [])
+        XCTAssertEqual(changed.sequenceClips?.first { $0.id == "keep" }?.tileLayouts, [span])
+        XCTAssertEqual(preview.report.affectedRedactionIDs, ["guest"])
+        XCTAssertNil(changed.participants.sources.first { $0.sourceID == candidate.lastPathComponent }?.confirmations)
+        XCTAssertEqual(changed.participants.sources.first { $0.sourceID == old.lastPathComponent }?.confirmations?.count, 1)
+    }
+
+    func testReplacingUnscannedRecordingDoesNotAddUnrelatedPrivacyScope() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures/SmartTrim-GOP.mp4")
+        let old = folder.appendingPathComponent("unrelated.mp4")
+        let candidate = folder.appendingPathComponent("new-unrelated.mp4")
+        try FileManager.default.copyItem(at: fixture, to: old)
+        try FileManager.default.copyItem(at: fixture, to: candidate)
+        let range = MulticamRange(from: .zero, to: .init(numerator: 1))
+        var project = CutProject.sequence([
+            .init(id: "protected", file: "gallery.mp4", from: range.from, to: range.to),
+            .init(id: "replace", file: old.lastPathComponent, from: range.from, to: range.to)
+        ])
+        project.participants = .init(people: [.init(id: "guest", name: "Guest", treatment: .init(mode: .blur))],
+            sources: [.init(sourceID: "gallery.mp4", appearances: [
+                .init(id: "tile", participantID: "guest", range: range, bounds: .init(x: 0, y: 0, width: 1, height: 1))
+            ])])
+        let preview = try ProjectMediaReplace.preview(project, relativeTo: folder.appendingPathComponent("edit.cut"),
+            source: old.path, candidate: candidate, options: .init(useID: "replace"))
+        let changed = try preview.applying(to: project)
+        XCTAssertEqual(changed.sequenceClips?.last?.file, candidate.lastPathComponent)
+        XCTAssertEqual(changed.participants, project.participants)
+        XCTAssertTrue(preview.report.affectedRedactionIDs.isEmpty)
+    }
+
+    func testByteIdenticalDestinationReviewKeepsOriginalPrivacyScope() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures/SmartTrim-GOP.mp4")
+        let old = folder.appendingPathComponent("original.mp4")
+        let candidate = folder.appendingPathComponent("copy.mp4")
+        try FileManager.default.copyItem(at: fixture, to: old)
+        try FileManager.default.copyItem(at: fixture, to: candidate)
+        let digest = try participantSourceDigest(old, identity: SourceIdentity(old))
+        let range = MulticamRange(from: .zero, to: .init(numerator: 1))
+        var project = CutProject.sequence([old, candidate].map { media in
+            .init(id: media.lastPathComponent, file: media.lastPathComponent, from: range.from, to: range.to)
+        })
+        let guest = ParticipantPerson(id: "guest", name: "Guest", treatment: .init(mode: .blur))
+        let other = ParticipantPerson(id: "other", name: "Other")
+        func accepted(_ media: URL, as person: ParticipantPerson) -> ParticipantSourceGeometry {
+            .init(sourceID: media.lastPathComponent, analysisIdentity: person.id, sourceContentSHA256: digest, appearances: [
+                .init(id: person.id, participantID: person.id, range: range, bounds: .init(x: 0, y: 0, width: 1, height: 1))
+            ], coverage: [.init(range: range, state: .verified)])
+        }
+        project.participants = .init(people: [guest, other], sources: [accepted(old, as: guest), accepted(candidate, as: other)])
+        let preview = try ProjectMediaReplace.preview(project, relativeTo: folder.appendingPathComponent("edit.cut"),
+                                                      source: old.path, candidate: candidate)
+        let changed = try preview.applying(to: project)
+        let destination = try XCTUnwrap(changed.participants.sources.first)
+        XCTAssertEqual(changed.participants.sources.count, 1)
+        XCTAssertEqual(destination.appearances.first?.participantID, other.id)
+        XCTAssertEqual(destination.unresolvedParticipantIDs, [guest.id])
+        XCTAssertTrue(destination.historicalParticipantIDs?.contains(guest.id) == true)
+        XCTAssertEqual(preview.report.affectedRedactionIDs, [guest.id])
+
+        // An older review may have no digest at all. It cannot invalidate the
+        // independently verified assignments on the existing destination clip.
+        project.participants.sources[0].sourceContentSHA256 = nil
+        let olderReview = try ProjectMediaReplace.preview(project, relativeTo: folder.appendingPathComponent("edit.cut"),
+                                                          source: old.path, candidate: candidate)
+        let retained = try XCTUnwrap(olderReview.applying(to: project).participants.sources.first)
+        XCTAssertEqual(retained.appearances, project.participants.sources[1].appearances)
+        XCTAssertEqual(retained.coverage, project.participants.sources[1].coverage)
+        XCTAssertEqual(retained.unresolvedParticipantIDs, [guest.id])
+        XCTAssertFalse(olderReview.report.removedAppearanceIDs.contains(other.id))
+    }
+
+    func testReplacementConformsAnOccurrenceUsingTheFeedAnglesPhysicalRecording() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures/SmartTrim-GOP.mp4")
+        let old = folder.appendingPathComponent("gallery.mp4")
+        let candidate = folder.appendingPathComponent("new-gallery.mp4")
+        try FileManager.default.copyItem(at: fixture, to: old)
+        try FileManager.default.copyItem(at: fixture, to: candidate)
+        let range = MulticamRange(from: .zero, to: .init(numerator: 1))
+        let offset = RationalTime(numerator: 1, denominator: 2)
+        let layout = TileLayoutSpan(range: range, layout: .original)
+        let source = MulticamSource(id: "gallery", file: old.lastPathComponent)
+        let feed = MulticamSource(id: "angle", file: source.file, feedAngle: .init(sourceID: source.id, feedID: "guest"))
+        let project = CutProject.multicam(.init(referenceAngle: source.id, range: range, angles: [source, feed], audio: .none,
+            switches: [.init(at: .zero, angle: feed.id)], assemblyItems: [.group(range, id: "occurrence", layouts: [layout])],
+            participants: .init(people: [.init(id: "guest", name: "Guest")])))
+        let preview = try ProjectMediaReplace.preview(project, relativeTo: folder.appendingPathComponent("edit.cut"),
+            source: old.path, candidate: candidate, options: .init(useID: source.id, replacementOffset: offset))
+        guard case .multicam(let changed) = try preview.applying(to: project) else { return XCTFail("Expected multicam.") }
+        XCTAssertEqual(changed.angles.map(\.offset), [offset, offset])
+        XCTAssertEqual(changed.assemblyItems?.first?.group, .init(from: offset, to: range.to))
+        XCTAssertEqual(changed.assemblyItems?.first?.occurrenceID, "occurrence")
+        XCTAssertEqual(changed.assemblyItems?.first?.tileLayouts, [layout])
+    }
+
     func testSavedReplaceHistoryPreservesLaterChangesToOtherBindingsInSameAttachment() throws {
         let digest = String(repeating: "0", count: 64)
         let asset = TranscriptAsset(file: "edit.transcripts/\(digest).json", sha256: digest, unavailable: .missing)

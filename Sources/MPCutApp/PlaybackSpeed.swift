@@ -26,7 +26,9 @@ final class PreviewDisplayTicker {
 
     @MainActor
     init(screen: NSScreen?, tick: @escaping @MainActor () -> Void) {
-        if let screen = screen ?? NSScreen.main {
+        // Playback without a video surface (for example, the waveform viewer)
+        // has no display refresh to wait for.
+        if let screen {
             let link = screen.displayLink(target: Target(tick), selector: #selector(Target.refresh(_:)))
             let maximum = Float(max(1, screen.maximumFramesPerSecond))
             link.preferredFrameRateRange = CAFrameRateRange(minimum: min(60, maximum), maximum: maximum, preferred: maximum)

@@ -80,7 +80,7 @@ final class JPEGExportOptions: NSObject, ObservableObject, NSOpenSavePanelDelega
     }
 
     func panel(source: URL, directory: URL? = nil, hasAudio: Bool, hasPictureAtPlayhead: Bool = true, multicam: Bool = false,
-               hasAnalysisSource: Bool = true, hasProgramStill: Bool = false) -> NSSavePanel {
+               hasAnalysisSource: Bool = true, hasProgramStill: Bool = false, programOnly: Bool = false) -> NSSavePanel {
         if !hasPictureAtPlayhead { mode = .scenes }
         programPicture = hasProgramStill
         let panel = NSSavePanel()
@@ -93,7 +93,8 @@ final class JPEGExportOptions: NSObject, ObservableObject, NSOpenSavePanelDelega
         panel.delegate = self
         let accessory = NSHostingView(rootView: JPEGExportAccessory(source: source, hasAudio: hasAudio,
                                                                     hasPictureAtPlayhead: hasPictureAtPlayhead, multicam: multicam,
-                                                                    hasAnalysisSource: hasAnalysisSource, hasProgramStill: hasProgramStill, options: self))
+                                                                    hasAnalysisSource: hasAnalysisSource, hasProgramStill: hasProgramStill,
+                                                                    programOnly: programOnly, options: self))
         accessory.frame.size = accessory.fittingSize
         panel.accessoryView = accessory
         return panel
@@ -123,15 +124,17 @@ private struct JPEGExportAccessory: View {
     let multicam: Bool
     let hasAnalysisSource: Bool
     let hasProgramStill: Bool
+    let programOnly: Bool
     @ObservedObject var options: JPEGExportOptions
 
     var body: some View {
         Form {
-            LabeledContent(hasProgramStill ? "Program image" : multicam ? "On-air camera" : "Source") {
+            LabeledContent(hasProgramStill || programOnly ? "Program" : multicam ? "On-air camera" : "Source") {
                 Text(source.lastPathComponent).lineLimit(1).truncationMode(.middle).help(source.path)
             }
             Picker("Frames", selection: $options.mode) {
-                Text(multicam && !hasProgramStill ? "Compare all camera angles" : "Current picture at playhead").tag(JPEGExportMode.playhead)
+                Text(multicam && !hasProgramStill && !programOnly ? "Compare all camera angles"
+                     : programOnly ? "Program picture" : "Current picture at playhead").tag(JPEGExportMode.playhead)
                     .disabled(!hasPictureAtPlayhead)
                 Text("Each scene in the source file").tag(JPEGExportMode.scenes)
                     .disabled(!hasAnalysisSource)

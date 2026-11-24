@@ -8,10 +8,11 @@ extension ProjectSession {
     }
 
     func retainedTimeline(at index: Int) -> CutProject? {
-        isMulticam ? multicam.retainedTimeline(at: index) : editor.retainedTimeline(at: index)
+        conversionHistoryTimeline(at: index)
     }
 
     private var timelineHistoryToken: String {
+        if hasFeedAngleConversionHistory { return conversionHistoryToken }
         if isMulticam { return multicam.historyToken }
         return editor.historyToken
     }

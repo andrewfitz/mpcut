@@ -66,6 +66,9 @@ func (p *savedTranscriptPath) expand(t *testing.T, files []string) {
 func readTranscriptProject(t *testing.T, path string) transcriptProjectSnapshot {
 	t.Helper()
 	data, err := os.ReadFile(path)
+	if err == nil {
+		data, err = plainProject(data)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,6 +362,9 @@ func checkTranscriptQueueParity(t *testing.T, ctx context.Context, contents, saf
 	checkExcerpt := func(path string) {
 		t.Helper()
 		body, err := os.ReadFile(path)
+		if err == nil {
+			body, err = plainProject(body)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -415,6 +421,9 @@ func checkTranscriptQueueParity(t *testing.T, ctx context.Context, contents, saf
 	// Change both original projects after queuing. The subsequent output must still
 	// switch from wide to close halfway through the saved excerpt.
 	originalCLI, err := os.ReadFile(pathCLI)
+	if err == nil {
+		originalCLI, err = plainProject(originalCLI)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

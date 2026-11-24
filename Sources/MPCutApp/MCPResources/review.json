@@ -1,7 +1,7 @@
 [
   {
     "name": "review_editor_frame_read",
-    "description": "Return one JPEG image content block from the open project's current playhead, or specify an exact sequence, group or assembly time. For multicam, angle optionally selects a specific camera. Reads the current in-memory edit. Preserves playback, selection, history and disk contents. The longest image edge is at most 640 pixels. Metadata identifies the source frame or still placement, asset and program presentation time.",
+    "description": "Return one JPEG from the current in-memory program at the playhead or at an exact sequence, group or assembly time. Output applies tile layouts and feed treatments. Choose Source to inspect an untreated recording. An explicit angle_id also selects Source when view is omitted. The longest image edge is at most 640 pixels.",
     "annotations": {
       "readOnlyHint": true,
       "openWorldHint": false
@@ -29,9 +29,18 @@
             "assembly"
           ]
         },
+        "view": {
+          "type": "string",
+          "enum": [
+            "output",
+            "source"
+          ],
+          "description": "Output shows the rendered program. Source shows the untreated recording for correction and review."
+        },
         "angle_id": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "description": "A multicam camera ID for Source review. Omit to use the camera selected at that time."
         }
       },
       "required": [
@@ -39,6 +48,21 @@
       ],
       "additionalProperties": false,
       "allOf": [
+        {
+          "if": {
+            "required": [
+              "angle_id",
+              "view"
+            ]
+          },
+          "then": {
+            "properties": {
+              "view": {
+                "const": "source"
+              }
+            }
+          }
+        },
         {
           "if": {
             "required": [

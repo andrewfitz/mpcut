@@ -8,8 +8,8 @@ extension MulticamEditorModel {
 
     func chooseStillFrame() {
         guard canExportStillFrame, let window, let project else { return }
-        if project.participants.render != nil {
-            fail(ParticipantProjectExport.unsupported("Project frame export").message)
+        if CutProject.multicam(project).requiresPictureProcessing {
+            chooseOutputFrame(project, window: window, directory: false)
             return
         }
         let generation = mcpGeneration
@@ -67,8 +67,8 @@ extension MulticamEditorModel {
 
     func chooseJPEGExport() {
         guard !isBusy, let window, let project else { return }
-        if project.participants.render != nil {
-            fail(ParticipantProjectExport.unsupported("Project frame export").message)
+        if CutProject.multicam(project).requiresPictureProcessing {
+            chooseOutputFrame(project, window: window, directory: true)
             return
         }
         let generation = mcpGeneration
@@ -171,6 +171,54 @@ extension MulticamEditorModel {
             } catch { self.notice = Notice(title: "Export JPEG Frames", message: error.localizedDescription) }
         }
     }
+
+    private func chooseOutputFrame(_ project: MulticamProject, window: NSWindow, directory: Bool) {
+        let generation = mcpGeneration, revision = mcpRevision, document = projectURL
+        preview.pause()
+        do {
+            let snapshot = assemblyPreview ? project : try project.pictureExportSnapshot(ranges: [project.range])
+            let time = assemblyPreview ? preview.currentTime() : try currentGroupTime().subtracting(project.range.from)
+            let source = document ?? URL(fileURLWithPath: "Output")
+            let stillOptions = StillFrameSaveOptions()
+            let jpegOptions = JPEGExportOptions(preset: preferences.jpegPreset)
+            let panel = directory
+                ? jpegOptions.panel(source: source, directory: document?.deletingLastPathComponent(),
+                                    hasAudio: false, multicam: true, hasAnalysisSource: false, programOnly: true)
+                : stillOptions.panel(source: source, directory: document?.deletingLastPathComponent())
+            ProjectPanels.present(panel, in: window) { [weak self] accepted in
+                guard let self, accepted, let output = panel.url, self.mcpGeneration == generation,
+                      self.mcpRevision == revision else { return }
+                do {
+                    try self.validateHistoryDestination(output, includesContents: directory)
+                    let replacing = directory ? nil : stillOptions.confirmedDestination(at: output)
+                    let preset = directory ? jpegOptions.preset : .full
+                    let outputProject: MulticamProject
+                    let times: [RationalTime]
+                    if directory && jpegOptions.allSwitches {
+                        outputProject = try project.pictureExportSnapshot(ranges: [project.range])
+                        times = try project.switches.map { try $0.at.subtracting(project.range.from) }
+                    } else {
+                        outputProject = snapshot
+                        times = [time]
+                    }
+                    self.run(directory ? "Exporting JPEG frames…" : "Exporting current frame…", exporting: true) {
+                        token, _ -> [ParticipantPrivacyIssue] in
+                        let renderer = try ProjectOutputJPEG(.multicam(outputProject), document: document, cancelled: { token.isCancelled })
+                        if directory {
+                            return try renderer.writeDirectory(at: times, to: output, preset: preset)
+                        }
+                        return try renderer.writeStill(at: time, to: output, replacing: replacing, preset: preset).privacyIssues
+                    } onSuccess: { issues in
+                        let summary = issues.first.map { " Privacy coverage applied starting at \($0.output.from)." } ?? ""
+                        self.status = directory
+                            ? "Exported \(times.count) JPEG frames to \(output.lastPathComponent)." + summary
+                            : "Exported \(output.lastPathComponent)." + summary
+                    }
+                } catch { self.fail(error.localizedDescription) }
+            }
+        } catch { fail(error.localizedDescription) }
+    }
+
 }
 
 struct MulticamStillPosition: Equatable, Sendable {

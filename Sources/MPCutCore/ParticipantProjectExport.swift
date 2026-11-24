@@ -1,49 +1,99 @@
 import Foundation
 
-/// The ordinary export settings that can deliver a saved participant composition.
+/// An ordinary export that renders the project’s layouts and feed treatments.
 package struct ParticipantProjectExport: Sendable {
     package let report: ParticipantRenderReport
     let project: CutProject
     let document: URL
+    let settings: ReencodeSettings
+    let range: MulticamRange?
+    let audioOutput: MulticamAudioOutput
+    private let soundOnly: StillExportPlan?
 
     package static var requiresEncoding: CutError {
         CutError(code: "participant_render_requires_encoding",
-                 message: "The saved participant composition requires Re-encode.")
+                 message: "Tile layouts and feed treatments require Re-encode.")
     }
 
     package static func unsupported(_ operation: String) -> CutError {
         CutError(code: "participant_render_unavailable",
-                 message: "\(operation) cannot apply the saved participant composition. Export the current assembly with Re-encode.")
+                 message: "\(operation) cannot render tile layouts and feed treatments. Use a Re-encode export.")
     }
 
     package init(_ project: CutProject, relativeTo document: URL? = nil, output: URL,
                  mode: ExportMode, tracks: ExportTracks = .all, settings: ReencodeSettings = .init(),
                  audioOutput: MulticamAudioOutput = .separateTracks, audioAction: ReencodeAudio? = nil,
-                 plannedSubfolder: URL? = nil, cancelled: (@Sendable () -> Bool)? = nil) throws {
-        guard mode == .encode else { throw Self.requiresEncoding }
-        guard tracks != .audio, settings.codec == .h264, settings.quality == .balanced,
-              audioOutput == .separateTracks,
-              [.auto, .pcm, .removeAudio].contains(audioAction ?? settings.audio) else {
-            throw CutError(code: "participant_render_settings",
-                           message: "Participant export uses balanced H.264 and the saved participant audio selection. Choose automatic audio, PCM, or remove audio.")
+                 plannedSubfolder: URL? = nil, range: MulticamRange? = nil, audioStream: Int? = nil,
+                 audioTrackOrdinal: Int? = nil, cancelled: (@Sendable () -> Bool)? = nil) throws {
+        let nativeAudio = tracks == .audio && project.participants.render == nil
+        if !nativeAudio {
+            guard mode == .encode else { throw Self.requiresEncoding }
+            guard tracks != .audio else {
+                throw CutError(code: "participant_render_settings", message: "Choose a movie export to render the saved participant composition.")
+            }
         }
-        guard project.stillFormat == nil else {
-            throw CutError(code: "participant_render_settings",
-                           message: "The saved participant canvas and a custom still output format cannot be used together.")
-        }
+        let action = tracks == .video ? .removeAudio : audioAction ?? settings.audio
+        let settings = ReencodeSettings(codec: settings.codec, quality: settings.quality, audio: action)
         let cutter = CutEngine(cancelled: cancelled)
         try cutter.checkCancellation()
         try cutter.checkDestination(output, plannedSubfolder: plannedSubfolder)
-        var project = project
-        if tracks == .video || (audioAction ?? settings.audio) == .removeAudio {
-            var participants = project.participants
-            participants.render?.audio = .init()
-            project.participants = participants
-        }
         self.project = project
+        self.settings = settings
+        self.range = range
+        self.audioOutput = audioOutput
         self.document = document ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
             .appendingPathComponent("timeline.cut")
-        report = try ParticipantRenderer(cancelled: cancelled).report(project, document: self.document, output: output)
+        if nativeAudio {
+            if case .multicam = project, audioStream != nil || audioTrackOrdinal != nil {
+                throw CutError(code: "invalid_arguments", message: "Choose project microphones in the audio policy.")
+            }
+            try project.validateDestination(output, relativeTo: self.document)
+            let original = try project.resolveStills()
+            if let range, range.from < .zero || range.to > original.duration || range.from >= range.to {
+                throw CutError(code: "invalid_range", message: "Choose a nonempty selection inside the program.")
+            }
+            let timeline = try range.map { try original.participantScoped(to: $0) } ?? original
+            let container = output.pathExtension.lowercased()
+            guard ExportRules.stillContainers(mode: mode, tracks: .audio, codec: settings.codec, audio: action).contains(container) else {
+                throw CutError(code: "unsupported_container", message: "Choose an audio container supported by the selected codec.")
+            }
+            let policy = project.projectOutputSettings
+            let soundAction: ReencodeAudio
+            if action == .auto, mode == .copy {
+                soundAction = .copyOriginal
+            } else if action == .auto, ![.aac, .pcm].contains(where: { ExportRules.allows(stillAudio: $0, in: container) }),
+                      let lossless = ExportRules.defaultStillLosslessAudio(codec: settings.codec, container: container) {
+                soundAction = lossless
+            } else {
+                soundAction = action
+            }
+            let scoped = try project.participantSound(in: range)
+            let sound = try ParticipantRenderSound.resolve(
+                scoped, document: self.document, timeline: timeline, audio: policy.audio, cancelled: cancelled,
+                action: soundAction, container: container, audioOutput: audioOutput,
+                tracks: .audio, mode: mode, audioStream: audioStream, audioTrackOrdinal: audioTrackOrdinal
+            )
+            try sound.verifySources()
+            let warning = Self.sharedAudioNotice(project, audio: policy.audio, actions: sound.actions)
+            report = .init(canvas: policy.canvas, duration: timeline.duration, frameCount: 0, audio: policy.audio,
+                           audioActions: sound.actions, privacyIssues: [], publishable: true, staleSourceIDs: [],
+                           output: nil, audioPrivacyNotice: warning)
+            let exportReport = try StillExportReport(
+                mode: mode, tracks: .audio, container: container, duration: timeline.duration,
+                copiedCameraDuration: .zero, encodedCameraDuration: .zero, generatedStillDuration: .zero,
+                copiedVideoDuration: .zero, encodedVideoDuration: .zero, picture: [], pictureTiming: .cadence,
+                videoCodec: nil, generatedVideoSampleCount: 0, writtenPictureDuration: nil,
+                cutMap: ExportCutMap(stills: scoped, relativeTo: self.document), placements: [],
+                audioOutput: audioOutput, soundActions: sound.actions, colorPolicy: nil,
+                warnings: sound.actions.flatMap(\.warnings) + [warning].compactMap { $0 }
+            )
+            soundOnly = .init(report: exportReport, pictures: [], sound: sound, identities: [:], settings: settings, hdrMetadata: nil)
+            return
+        }
+        soundOnly = nil
+        report = try ParticipantRenderer(cancelled: cancelled, legacyWholeFramePrivacy: false, allowsOriginal: true).report(
+            project, document: self.document, output: output, settings: settings, range: range, audioOutput: audioOutput
+        )
         if !report.publishable {
             let detail = report.privacyIssues.first.map {
                 "Review source ‘\($0.sourceID)’ from \($0.source.from) to \($0.source.to) "
@@ -55,23 +105,49 @@ package struct ParticipantProjectExport: Sendable {
     }
 
     package func tier(container: String) -> TierState {
-        .known(tier: .reencode, factors: [TierFactor(Self.requiresEncoding, forces: .reencode)],
-               container: container, warnings: [])
+        if let soundOnly {
+            let copied = soundOnly.report.soundActions.allSatisfy { $0.audio == .copyOriginal }
+            return .known(tier: copied ? .trueLossless : .reencode, factors: [], container: container,
+                          warnings: soundOnly.report.warnings)
+        }
+        return .known(tier: .reencode, factors: [TierFactor(Self.requiresEncoding, forces: .reencode)],
+                      container: container, warnings: [report.picturePrivacyNotice, report.audioPrivacyNotice].compactMap { $0 })
     }
 
     package func write(to output: URL, cancelled: (@Sendable () -> Bool)? = nil,
                        progress: ((Double) -> Bool)? = nil) throws {
-        _ = try ParticipantRenderer(cancelled: cancelled).render(project, document: document, to: output, progress: progress)
+        if let soundOnly {
+            try StillExportPlanner(cancelled: cancelled).write(soundOnly, to: output, progress: progress)
+            return
+        }
+        _ = try ParticipantRenderer(cancelled: cancelled, legacyWholeFramePrivacy: false, allowsOriginal: true).render(
+            project, document: document, to: output, settings: settings, range: range, audioOutput: audioOutput, progress: progress
+        )
+    }
+
+    static func sharedAudioNotice(_ project: CutProject, audio: ParticipantRenderAudio,
+                                  actions: [StillSoundAction]) -> String? {
+        guard project.participants.hasEffectiveTreatments, audio.mode != .iso, !actions.isEmpty else { return nil }
+        return "Shared audio can still contain speech from treated feeds."
     }
 
     package static func tier(_ project: CutProject, relativeTo document: URL? = nil,
                              preferredContainer: String? = nil, cancelled: (@Sendable () -> Bool)? = nil) -> TierState {
-        let container = preferredContainer == "mp4" && project.participants.render?.audio.mode == .silence ? "mp4" : "mov"
-        let output = FileManager.default.temporaryDirectory
-            .appendingPathComponent(".mpcut-tier-\(UUID().uuidString)").appendingPathExtension(container)
+        let defaultCodec = project.stillFormat?.codec ?? .h264
+        func checked(_ codec: ReencodeCodec) throws -> TierState {
+            let supported = ExportRules.multicamReencodeContainers(codec)
+            let preference = preferredContainer ?? project.stillFormat?.container
+            let container = preference.flatMap { supported.contains($0) ? $0 : nil } ?? "mov"
+            let output = FileManager.default.temporaryDirectory
+                .appendingPathComponent(".mpcut-tier-\(UUID().uuidString)").appendingPathExtension(container)
+            return try Self(project, relativeTo: document, output: output, mode: .encode,
+                            settings: .init(codec: codec), cancelled: cancelled).tier(container: container)
+        }
         do {
-            return try Self(project, relativeTo: document, output: output, mode: .encode, cancelled: cancelled)
-                .tier(container: container)
+            do { return try checked(defaultCodec) }
+            catch let issue as CutError where issue.code == "unsupported_format" && defaultCodec == .h264 {
+                return try checked(.hevc)
+            }
         } catch let issue as CutError {
             return issue.code == "cancelled" ? .checking : .unavailable(issue)
         } catch {

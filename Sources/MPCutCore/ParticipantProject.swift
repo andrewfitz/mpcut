@@ -42,6 +42,11 @@ public struct ParticipantAppearance: Codable, Hashable, Sendable, Identifiable {
     public var role: Role
     public var state: State
     public var slotID: String?
+    // Keep the detector box when its bounds are corrected. A later scan can
+    // then identify this tile using picture evidence without losing the edit.
+    var detectedBounds: ParticipantBounds?
+    var reviewedIdentity: Bool?
+    var reviewedPresentation: Bool?
 
     public init(id: String, participantID: String? = nil, range: MulticamRange, bounds: ParticipantBounds,
                 labelBounds: ParticipantBounds? = nil, role: Role? = nil, state: State? = nil, slotID: String? = nil) {
@@ -60,6 +65,9 @@ public struct ParticipantAppearance: Codable, Hashable, Sendable, Identifiable {
         case participantID = "participant_id"
         case labelBounds = "label_bounds"
         case slotID = "slot_id"
+        case detectedBounds = "detected_bounds"
+        case reviewedIdentity = "reviewed_identity"
+        case reviewedPresentation = "reviewed_presentation"
     }
 
     public init(from decoder: Decoder) throws {
@@ -73,6 +81,9 @@ public struct ParticipantAppearance: Codable, Hashable, Sendable, Identifiable {
                   role: try values.decodeIfPresent(Role.self, forKey: .role),
                   state: try values.decodeIfPresent(State.self, forKey: .state),
                   slotID: try values.decodeIfPresent(String.self, forKey: .slotID))
+        detectedBounds = try values.decodeIfPresent(ParticipantBounds.self, forKey: .detectedBounds)
+        reviewedIdentity = try values.decodeIfPresent(Bool.self, forKey: .reviewedIdentity)
+        reviewedPresentation = try values.decodeIfPresent(Bool.self, forKey: .reviewedPresentation)
     }
 }
 
@@ -99,19 +110,56 @@ public struct ParticipantCoverage: Codable, Equatable, Sendable {
 
 public struct ParticipantSourceGeometry: Codable, Equatable, Sendable {
     public var sourceID: String
-    public var analysisIdentity: String?
-    public var sourceStamp: SceneSourceStamp?
-    public var sourceInode: UInt64?
-    public var sourceContentSHA256: String?
-    public var feedLayout: ParticipantFeedLayout?
-    public var appearances: [ParticipantAppearance]
-    public var coverage: [ParticipantCoverage]
-    public internal(set) var unresolvedParticipantIDs: [String]
+    public var analysisIdentity: String? {
+        didSet { if oldValue != analysisIdentity { confirmations = nil } }
+    }
+    public var sourceStamp: SceneSourceStamp? {
+        didSet { if oldValue != sourceStamp { confirmations = nil } }
+    }
+    public var sourceInode: UInt64? {
+        didSet { if oldValue != sourceInode { confirmations = nil } }
+    }
+    public var sourceContentSHA256: String? {
+        didSet { if oldValue != sourceContentSHA256 { confirmations = nil } }
+    }
+    public var feedLayout: ParticipantFeedLayout? {
+        didSet { if oldValue != feedLayout { confirmations = nil } }
+    }
+    public var countHints: TilesCountHints?
+    var layoutCapacityRanges: [MulticamRange]?
+    private var savedScanEvents: [ParticipantTileScanEvent]?
+    public internal(set) var scanEvents: [ParticipantTileScanEvent] {
+        get { savedScanEvents ?? [] }
+        set {
+            if newValue != scanEvents { confirmations = nil }
+            savedScanEvents = newValue.isEmpty ? nil : newValue
+        }
+    }
+    public var layoutChangeTimes: [RationalTime] {
+        Set(scanEvents.filter(\.changesLayout).map(\.time)).sorted()
+    }
+    public var appearances: [ParticipantAppearance] {
+        didSet {
+            guard oldValue != appearances else { return }
+            confirmations = nil
+            recordPrivacyHistory(previousAppearances: oldValue)
+        }
+    }
+    public var coverage: [ParticipantCoverage] {
+        didSet { if oldValue != coverage { confirmations = nil } }
+    }
+    public package(set) var historicalParticipantIDs: [String]?
+    public package(set) var confirmations: [ParticipantPrivacyConfirmation]?
+    public internal(set) var unresolvedParticipantIDs: [String] {
+        didSet { if oldValue != unresolvedParticipantIDs { confirmations = nil } }
+    }
 
     public init(sourceID: String, analysisIdentity: String? = nil, sourceStamp: SceneSourceStamp? = nil,
                 sourceInode: UInt64? = nil, sourceContentSHA256: String? = nil, feedLayout: ParticipantFeedLayout? = nil,
                 appearances: [ParticipantAppearance] = [],
-                coverage: [ParticipantCoverage] = [], unresolvedParticipantIDs: [String] = []) {
+                coverage: [ParticipantCoverage] = [], unresolvedParticipantIDs: [String] = [],
+                historicalParticipantIDs: [String]? = nil, confirmations: [ParticipantPrivacyConfirmation]? = nil,
+                scanEvents: [ParticipantTileScanEvent] = [], countHints: TilesCountHints? = nil) {
         self.sourceID = sourceID
         self.analysisIdentity = analysisIdentity
         self.sourceStamp = sourceStamp
@@ -121,6 +169,10 @@ public struct ParticipantSourceGeometry: Codable, Equatable, Sendable {
         self.appearances = appearances
         self.coverage = coverage
         self.unresolvedParticipantIDs = unresolvedParticipantIDs
+        self.historicalParticipantIDs = historicalParticipantIDs
+        self.confirmations = confirmations
+        self.countHints = countHints
+        self.savedScanEvents = scanEvents.isEmpty ? nil : scanEvents
     }
 
     package init(sourceID: String, media: MediaInfo, appearances: [ParticipantAppearance] = []) {
@@ -135,8 +187,13 @@ public struct ParticipantSourceGeometry: Codable, Equatable, Sendable {
         case sourceInode = "source_inode"
         case sourceContentSHA256 = "source_content_sha256"
         case feedLayout = "feed_layout"
+        case savedScanEvents = "scan_events"
+        case countHints = "count_hints"
+        case layoutCapacityRanges = "layout_capacity_ranges"
         case appearances, coverage
         case unresolvedParticipantIDs = "unresolved_participant_ids"
+        case historicalParticipantIDs = "historical_participant_ids"
+        case confirmations = "privacy_confirmations"
     }
 
     public init(from decoder: Decoder) throws {
@@ -150,7 +207,12 @@ public struct ParticipantSourceGeometry: Codable, Equatable, Sendable {
                   feedLayout: try values.decodeIfPresent(ParticipantFeedLayout.self, forKey: .feedLayout),
                   appearances: try values.decodeIfPresent([ParticipantAppearance].self, forKey: .appearances) ?? [],
                   coverage: try values.decodeIfPresent([ParticipantCoverage].self, forKey: .coverage) ?? [],
-                  unresolvedParticipantIDs: try values.decodeIfPresent([String].self, forKey: .unresolvedParticipantIDs) ?? [])
+                  unresolvedParticipantIDs: try values.decodeIfPresent([String].self, forKey: .unresolvedParticipantIDs) ?? [],
+                  historicalParticipantIDs: try values.decodeIfPresent([String].self, forKey: .historicalParticipantIDs),
+                  confirmations: try values.decodeIfPresent([ParticipantPrivacyConfirmation].self, forKey: .confirmations),
+                  scanEvents: try values.decodeIfPresent([ParticipantTileScanEvent].self, forKey: .savedScanEvents) ?? [],
+                  countHints: try values.decodeIfPresent(TilesCountHints.self, forKey: .countHints))
+        layoutCapacityRanges = try values.decodeIfPresent([MulticamRange].self, forKey: .layoutCapacityRanges)
     }
 }
 
@@ -206,22 +268,31 @@ public struct ParticipantPerson: Codable, Equatable, Sendable, Identifiable {
     public var name: String
     public var audio: ParticipantAudioBinding?
     public var speakers: [ParticipantSpeakerBinding]
+    public var treatment: ParticipantFeedTreatment?
+    var legacyPresentation: LegacyPresentationOrigin? = nil
 
-    public init(id: String, name: String, audio: ParticipantAudioBinding? = nil, speakers: [ParticipantSpeakerBinding] = []) {
+    public init(id: String, name: String, audio: ParticipantAudioBinding? = nil, speakers: [ParticipantSpeakerBinding] = [],
+                treatment: ParticipantFeedTreatment? = nil) {
         self.id = id
         self.name = name
         self.audio = audio
         self.speakers = speakers
+        self.treatment = treatment
     }
 
-    private enum CodingKeys: String, CodingKey { case id, name, audio, speakers }
+    private enum CodingKeys: String, CodingKey {
+        case id, name, audio, speakers, treatment
+        case legacyPresentation = "legacy_presentation"
+    }
 
     public init(from decoder: Decoder) throws {
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_participant_project")
         let values = try decoder.container(keyedBy: CodingKeys.self)
         self.init(id: try values.decode(String.self, forKey: .id), name: try values.decode(String.self, forKey: .name),
                   audio: try values.decodeIfPresent(ParticipantAudioBinding.self, forKey: .audio),
-                  speakers: try values.decodeIfPresent([ParticipantSpeakerBinding].self, forKey: .speakers) ?? [])
+                  speakers: try values.decodeIfPresent([ParticipantSpeakerBinding].self, forKey: .speakers) ?? [],
+                  treatment: try values.decodeIfPresent(ParticipantFeedTreatment.self, forKey: .treatment))
+        legacyPresentation = try values.decodeIfPresent(LegacyPresentationOrigin.self, forKey: .legacyPresentation)
     }
 }
 
@@ -261,21 +332,25 @@ public struct ParticipantProject: Codable, Equatable, Sendable {
     public var sources: [ParticipantSourceGeometry]
     public var appearanceOverrides: [ParticipantAppearanceOverride]
     public var render: ParticipantRenderPlan?
+    public var tileOutput: TileOutputSettings?
 
     public init(people: [ParticipantPerson] = [], sources: [ParticipantSourceGeometry] = [],
-                appearanceOverrides: [ParticipantAppearanceOverride] = [], render: ParticipantRenderPlan? = nil) {
+                appearanceOverrides: [ParticipantAppearanceOverride] = [], render: ParticipantRenderPlan? = nil,
+                tileOutput: TileOutputSettings? = nil) {
         self.people = people
         self.sources = sources
         self.appearanceOverrides = appearanceOverrides
         self.render = render
+        self.tileOutput = tileOutput
     }
 
     private enum CodingKeys: String, CodingKey {
         case people, sources, render
+        case tileOutput = "tile_output"
         case appearanceOverrides = "appearance_overrides"
     }
 
-    public var isEmpty: Bool { people.isEmpty && sources.isEmpty && appearanceOverrides.isEmpty && render == nil }
+    public var isEmpty: Bool { people.isEmpty && sources.isEmpty && appearanceOverrides.isEmpty && render == nil && tileOutput == nil }
 
     public func appearances(sourceID: String, at time: RationalTime) -> [ParticipantAppearance] {
         sources.first { $0.sourceID == sourceID }?.appearances.filter { $0.range.contains(time) } ?? []
@@ -321,7 +396,8 @@ public struct ParticipantProject: Codable, Equatable, Sendable {
         self.init(people: try values.decodeIfPresent([ParticipantPerson].self, forKey: .people) ?? [],
                   sources: try values.decodeIfPresent([ParticipantSourceGeometry].self, forKey: .sources) ?? [],
                   appearanceOverrides: try values.decodeIfPresent([ParticipantAppearanceOverride].self, forKey: .appearanceOverrides) ?? [],
-                  render: try values.decodeIfPresent(ParticipantRenderPlan.self, forKey: .render))
+                  render: try values.decodeIfPresent(ParticipantRenderPlan.self, forKey: .render),
+                  tileOutput: try values.decodeIfPresent(TileOutputSettings.self, forKey: .tileOutput))
     }
 }
 

@@ -27,6 +27,7 @@ public enum ParticipantSampling: String, Codable, Sendable {
 public enum ParticipantFeedLayout: Equatable, Codable, Sendable {
     case meeting
     case automatic
+    case gallery(columns: UInt32, rows: UInt32)
     case fixed(columns: UInt32, rows: UInt32)
 
     public init?(feedLayout: String) {
@@ -42,9 +43,24 @@ public enum ParticipantFeedLayout: Equatable, Codable, Sendable {
         guard isValid else { return nil }
     }
 
+    public init?(galleryGrid: String) {
+        guard case .fixed(let columns, let rows) = Self(feedLayout: galleryGrid) else { return nil }
+        self = .gallery(columns: columns, rows: rows)
+    }
+
     public var isValid: Bool {
-        guard case .fixed(let columns, let rows) = self else { return true }
-        return columns > 0 && rows > 0 && UInt64(columns) * UInt64(rows) <= 64
+        switch self {
+        case .meeting, .automatic: true
+        case .fixed(let columns, let rows), .gallery(let columns, let rows):
+            columns > 0 && rows > 0 && UInt64(columns) * UInt64(rows) <= 64
+        }
+    }
+
+    public var isMeeting: Bool {
+        switch self {
+        case .meeting, .gallery: true
+        case .automatic, .fixed: false
+        }
     }
 
     public init(from decoder: Decoder) throws {
@@ -52,6 +68,8 @@ public enum ParticipantFeedLayout: Equatable, Codable, Sendable {
         let value = try container.decode(String.self)
         if value == "meeting" {
             self = .meeting
+        } else if value.hasPrefix("gallery:"), let layout = Self(galleryGrid: String(value.dropFirst(8))) {
+            self = layout
         } else if let layout = Self(feedLayout: value) {
             self = layout
         } else {
@@ -68,6 +86,7 @@ public enum ParticipantFeedLayout: Equatable, Codable, Sendable {
         switch self {
         case .meeting: try container.encode("meeting")
         case .automatic: try container.encode("auto")
+        case .gallery(let columns, let rows): try container.encode("gallery:\(columns)x\(rows)")
         case .fixed(let columns, let rows): try container.encode("\(columns)x\(rows)")
         }
     }
@@ -79,6 +98,10 @@ public struct ParticipantScanOptions: Sendable {
     public let includeScenes: Bool
     public let useSidecar: Bool
     public let feedLayout: ParticipantFeedLayout
+
+    /// Private journal for incremental tile-only scans. An interruption can
+    /// resume using the same directory and source settings.
+    public var checkpointDirectory: URL? = nil
 
     public init(backend: ParticipantBackendMode = .automatic, sampling: ParticipantSampling = .adaptive,
                 includeScenes: Bool = false, useSidecar: Bool = true, feedLayout: ParticipantFeedLayout = .meeting) {
@@ -149,7 +172,8 @@ public struct ParticipantDisplayTransform: Codable, Equatable, Sendable {
 public struct ParticipantScanSource: Codable, Sendable {
     public let file: String
     public let stamp: SceneSourceStamp
-    public let inode: UInt64?
+    public internal(set) var inode: UInt64?
+    public internal(set) var producer: String? = nil
     public internal(set) var contentSHA256: String? = nil
     public let stream: Int
     public let origin: RationalTime
@@ -164,7 +188,7 @@ public struct ParticipantScanSource: Codable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case file, stamp, inode, stream, origin, duration, transform
+        case file, stamp, inode, stream, origin, duration, transform, producer
         case contentSHA256 = "content_sha256"
         case timeBase = "time_base"
     }
@@ -182,11 +206,13 @@ public struct ParticipantScanResult: Codable, Sendable {
     public let analysis: ParticipantTrackingResult?
     public let sceneReport: SceneReport?
     public let analysisIdentity: String
+    public package(set) var countHints: TilesCountHints? = nil
 
     enum CodingKeys: String, CodingKey {
         case state, source, configuration, analysis
         case sceneReport = "scene_report"
         case analysisIdentity = "analysis_identity"
+        case countHints = "count_hints"
     }
 }
 
@@ -215,8 +241,13 @@ extension ParticipantScanResult {
     /// Foundation tree to one batch of detector rows. The ordinary encoder
     /// supplies the envelope, keys, number formatting and escaping.
     package func writeJSON(pretty: Bool, write: (Data) throws -> Void) throws {
+        try writeJSON(pretty: pretty, escapeSlashes: false, write: write)
+    }
+
+    func writeJSON(pretty: Bool, escapeSlashes: Bool, write: (Data) throws -> Void) throws {
         let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.outputFormatting = [.sortedKeys]
+        if !escapeSlashes { encoder.outputFormatting.insert(.withoutEscapingSlashes) }
         if pretty { encoder.outputFormatting.insert(.prettyPrinted) }
         let batchSize = 32
         guard let a = analysis, [a.appearances.count, a.coverage.count, a.diagnostics.count, a.events.count,
@@ -229,7 +260,7 @@ extension ParticipantScanResult {
             sampling: a.sampling, observations: [], tracks: [], appearances: [], events: [],
             coverage: [], diagnostics: [], resumeAt: a.resumeAt)
         let envelope = try encoder.encode(ParticipantScanResult(state: state, source: source, configuration: configuration,
-            analysis: empty, sceneReport: sceneReport, analysisIdentity: analysisIdentity))
+            analysis: empty, sceneReport: sceneReport, analysisIdentity: analysisIdentity, countHints: countHints))
         var position = envelope.startIndex
 
         func rows<T: Encodable>(_ key: ParticipantTrackingResult.CodingKeys, _ values: [T]) throws {
@@ -284,10 +315,51 @@ public struct ParticipantObservation: Codable, Equatable, Sendable {
     public let display: ParticipantDisplayTransform
     public let confidence: Double
     public let regions: [ParticipantRegion]
+    public internal(set) var layoutCapacityExceeded: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case display, confidence, regions
         case time = "timestamp"
+        case layoutCapacityExceeded = "layout_capacity_exceeded"
+    }
+}
+
+extension ParticipantObservation {
+    /// The other identities a reviewer should weigh for this region. A feed
+    /// that is plainly shown in another tile of the same role at this moment
+    /// cannot be this tile's feed, so it is left out. Plainly means certain
+    /// and with no rival of its own, so two tiles that each name the other's
+    /// feed both stay in question. A stage and a thumbnail can show the same
+    /// feed, so tiles of another role still count.
+    func competingMatches(for region: ParticipantRegion) -> [ParticipantIdentityMatch] {
+        region.possibleMatches.filter { match in
+            match.participantID != region.participantID && !regions.contains { other in
+                other.appearanceID != region.appearanceID && other.role == region.role
+                    && !other.identityUncertain && other.participantID == match.participantID
+                    && !other.possibleMatches.contains { $0.participantID != other.participantID }
+            }
+        }
+    }
+
+    /// This region's identity needs review: TileTrail marked it uncertain or
+    /// listed a competing feed that could still be this tile's.
+    func needsIdentityReview(_ region: ParticipantRegion) -> Bool {
+        region.identityUncertain || !competingMatches(for: region).isEmpty
+    }
+}
+
+extension ParticipantTrackingResult {
+    var layoutCapacityRanges: [MulticamRange] {
+        var ranges: [MulticamRange] = []
+        for index in observations.indices where observations[index].layoutCapacityExceeded == true {
+            let start = observations[index].time
+            let next = index + 1
+            let stop = next < observations.count ? observations[next].time : end
+            guard start < stop else { continue }
+            if ranges.last?.to == start { ranges[ranges.count - 1].to = stop }
+            else { ranges.append(.init(from: start, to: stop)) }
+        }
+        return ranges
     }
 }
 
@@ -453,12 +525,17 @@ public struct ParticipantSourceTime: Codable, Equatable, Sendable {
     }
 
     public init(from decoder: Decoder) throws {
-        if let origin = decoder.userInfo[participantOriginKey] as? RationalTime {
+        let origin = decoder.userInfo[participantOriginKey] as? RationalTime
+        let hasSourceTicks = origin == nil ? try decoder.container(keyedBy: RawTimestamp.CodingKeys.self).contains(.pts) : false
+        if origin != nil || hasSourceTicks {
+            // Standalone reports use the same tick shape as the C ABI, with
+            // their timestamps already relative to the recording origin.
             let timestamp = try RawTimestamp(from: decoder)
             guard timestamp.timeBase.numerator > 0 else {
                 throw CutError(code: "participant_result_invalid", message: "TileTrail returned an invalid time base.")
             }
-            wrappedValue = try RationalTime(numerator: timestamp.pts).multiplied(by: timestamp.timeBase).subtracting(origin)
+            wrappedValue = try RationalTime(numerator: timestamp.pts).multiplied(by: timestamp.timeBase)
+                .subtracting(origin ?? .zero)
         } else {
             wrappedValue = try RationalTime(from: decoder)
         }
@@ -507,5 +584,28 @@ public struct ParticipantOptionalSourceTime: Codable, Sendable {
             var value = encoder.singleValueContainer()
             try value.encodeNil()
         }
+    }
+}
+
+extension ParticipantScanSource {
+    init(file: String, media: MediaInfo, video: StreamInfo) throws {
+        guard video.rotation.isMultiple(of: 90), video.rotationOnly || !video.hasDisplayMatrix else {
+            throw CutError(code: "unsupported_display_transform",
+                           message: "Participant analysis requires a quarter-turn display transform.")
+        }
+        let turns = ((-video.rotation % 360) + 360) % 360
+        let rotation: ParticipantDisplayTransform.Rotation
+        switch turns {
+        case 90: rotation = .r90
+        case 180: rotation = .r180
+        case 270: rotation = .r270
+        default: rotation = .r0
+        }
+        let transform = ParticipantDisplayTransform(rotation: rotation,
+            pixelAspectNum: UInt32(exactly: video.sampleAspectRatio.numerator).flatMap { $0 > 0 ? $0 : nil } ?? 1,
+            pixelAspectDen: UInt32(exactly: video.sampleAspectRatio.denominator) ?? 1)
+        self.init(file: file, stamp: SceneSourceStamp(media: media), inode: media.identity.inode,
+                  stream: video.index, origin: media.origin, timeBase: video.timeBase, duration: media.duration,
+                  transform: transform)
     }
 }

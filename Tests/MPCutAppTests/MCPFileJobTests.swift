@@ -320,6 +320,55 @@ final class MCPFileJobTests: XCTestCase {
         ])
     }
 
+    func testTilesFileAndEditorContracts() throws {
+        let schemas = try MCPSchemas.loaded.get()
+        let request = try MCPFileRequest(tool: "tiles_file_export_isos", fields: [
+            "operation_id": UUID().uuidString, "working_directory": "/tmp",
+            "project_path": "/tmp/reviewed.cut", "output": "/tmp/ISOs", "feed_id": ["alice", "bob"]
+        ])
+        XCTAssertEqual(request.arguments, ["tiles", "export-isos", "--stdin", "--json"])
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.input)) as? [String: Any])
+        XCTAssertEqual(body["feed_id"] as? [String], ["alice", "bob"])
+        XCTAssertEqual(body["progress"] as? String, "jsonl")
+        XCTAssertNil(body["operation_id"])
+        XCTAssertNil(body["working_directory"])
+
+        let tool = "tiles_editor_feeds_rename"
+        var edit: [String: Any] = ["project_handle": "project", "feed_id": "alice", "name": "Alice"]
+        XCTAssertThrowsError(try schemas.validate(tool: tool, arguments: edit))
+        edit["expected_revision"] = 7
+        XCTAssertNoThrow(try schemas.validate(tool: tool, arguments: edit))
+        XCTAssertFalse(MCPFileRequest.isFileTool(tool))
+    }
+
+    @MainActor
+    func testTilesReviewIsTerminalAndHasAReadableResult() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let mock = folder.appendingPathComponent("review-cli")
+        try """
+        #!/bin/sh
+        echo '{"event":"progress","fraction":0.50}' >&2
+        echo '{"status":"needs_review","review_project_path":"/tmp/review.cut","issues":[{"source_time":{"numerator":3,"timescale":2}}]}'
+        exit 3
+        """.write(to: mock, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: mock.path)
+        let jobs = MCPFileJobs(executable: mock)
+        defer { jobs.disable() }
+        let id = UUID()
+        _ = try jobs.start(tool: "tiles_file_export_isos", arguments: [
+            "operation_id": id.uuidString, "file": "/tmp/recording.mov", "output": "/tmp/ISOs"
+        ])
+        let status = try await wait(jobs, id: id)
+        XCTAssertEqual(status["state"] as? String, "needs_review")
+        XCTAssertEqual(status["exit_code"] as? Int, 3)
+        XCTAssertEqual(status["progress_percent"] as? Int, 50)
+        let result = try XCTUnwrap(status["result"] as? [String: Any])
+        XCTAssertEqual(result["review_project_path"] as? String, "/tmp/review.cut")
+        XCTAssertEqual(try jobs.read(id: id, offset: 0, limit: nil)["done"] as? Bool, true)
+    }
+
     @MainActor
     func testFileJobReplayResultAndCleanup() async throws {
         let cli = productsDirectory.appendingPathComponent("mpcut")
@@ -620,7 +669,7 @@ final class MCPFileJobTests: XCTestCase {
         let deadline = ContinuousClock.now + .seconds(15)
         while ContinuousClock.now < deadline {
             let status = try jobs.status(id: id)
-            if let state = status["state"] as? String, ["succeeded", "failed", "cancelled"].contains(state) { return status }
+            if let state = status["state"] as? String, ["succeeded", "failed", "cancelled", "needs_review"].contains(state) { return status }
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTFail("Timed out waiting for CLI job")

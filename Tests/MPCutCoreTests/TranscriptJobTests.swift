@@ -4,6 +4,27 @@ import XCTest
 @testable import MPCutCore
 
 final class TranscriptJobTests: XCTestCase {
+    func testFeedAnglesSharePhysicalTranscriptTracksAndMicrophoneNames() throws {
+        try inTemporaryFolder { folder in
+            let media = folder.appendingPathComponent("recording.wav")
+            try wave(click: 20_000).write(to: media)
+            let feed = ParticipantPerson(id: "alice", name: "Alice")
+            let group = MulticamProject(referenceAngle: "gallery", range: .init(from: .zero, to: .init(numerator: 4)),
+                angles: [
+                    .init(id: "gallery", file: media.path, audioStream: 0),
+                    .init(id: "virtual", file: media.path, name: feed.name, feedAngle: .init(sourceID: "gallery", feedID: feed.id))
+                ], audioSources: [.init(id: "mic", file: media.path, name: "alice", audioStream: 0)],
+                audio: .follow, switches: [.init(at: .zero, angle: "gallery")], participants: .init(people: [feed]))
+            let tracks = try XCTUnwrap(TranscriptJobPlan.inventory(project: .multicam(group)).first).tracks
+            XCTAssertEqual(Set(tracks.map(\.sourceID)), ["gallery", "mic"])
+            let mic = try XCTUnwrap(tracks.first { $0.sourceID == "mic" })
+            XCTAssertEqual(mic.name, feed.name)
+            XCTAssertEqual(mic.speaker, feed.name)
+            XCTAssertEqual(mic.role, TranscriptRole.isolatedMic.rawValue)
+            XCTAssertEqual(mic.binding?.sourceID, "mic")
+        }
+    }
+
     func testZoomSuggestionRequiresCoverageAndUsesTheSelectedSegmentsClock() throws {
         let mix = URL(fileURLWithPath: "/private/tmp/video2067067067.mp4")
         let first = "/private/tmp/Audio Record/audioAlice11067067067.m4a"

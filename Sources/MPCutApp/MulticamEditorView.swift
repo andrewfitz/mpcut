@@ -74,6 +74,7 @@ struct MulticamEditorView: View {
                     Button("Save Project", systemImage: "square.and.arrow.down") { _ = model.saveProject() }
                         .labelStyle(.iconOnly)
                         .help("Save multicam project (⌘S)")
+                        .accessibilityIdentifier("multicam.project.save")
                         .disabled(model.isBusy)
                     Button(presentation.inspectorVisible ? "Hide Inspector" : "Show Inspector", systemImage: "sidebar.trailing") {
                         presentation.inspectorVisible.toggle()
@@ -165,7 +166,7 @@ struct MulticamEditorView: View {
             viewer: MulticamProgramViewer(preview: model.preview)
                 .overlay {
                     let editing = presentation.inspectorVisible && presentation.inspector == .participants
-                    if let transcriptSession, editing || !project.participants.isEmpty {
+                    if let transcriptSession, editing || !project.participants.isEmpty || CutProject.multicam(project).requiresPictureProcessing {
                         ParticipantMonitorOverlay(session: transcriptSession, interactive: editing)
                     }
                 }
@@ -194,12 +195,14 @@ struct MulticamEditorView: View {
                 case .assembly: "Inspect assembly ranges"
                 case .export: "Configure multicam export"
                 case .transcript: "Read and edit the transcript"
-                case .participants: "Review camera feeds and meeting participants"
+                case .participants: "Find and edit tiles in recordings"
                 }
                 Text(inspector.label).help(toolTip).tag(inspector)
+                    .accessibilityIdentifier("multicam.inspector.\(inspector.rawValue)")
             }
         }
         .labelsHidden()
+        .accessibilityIdentifier("multicam.inspector")
     }
 
     private func inspectorPanel(_ project: MulticamProject) -> some View {
@@ -234,7 +237,13 @@ struct MulticamEditorView: View {
                         case .switches: switchInspector(project)
                         case .sources: sourceInspector(project)
                         case .assembly: assemblyInspector(project)
-                        case .export: MulticamExportControls(model: model, project: project)
+                        case .export:
+                            MulticamExportControls(model: model, project: project)
+                            if let transcriptSession {
+                                Button("Export Settings…", action: transcriptSession.presentOutputSettings)
+                                    .disabled(model.isBusy)
+                                    .accessibilityIdentifier("project.output.open")
+                            }
                         case .transcript, .participants: EmptyView()
                         }
                     }
@@ -452,7 +461,7 @@ struct MulticamEditorView: View {
                             .fixedSize()
                         }
                     }
-                    if index != nil {
+                    if index != nil, source.feedAngle == nil {
                         Button("Add Recording…") { model.chooseAdditionalRecording(for: source.id) }
                     }
                     if let coverage = source.coverage {
@@ -461,7 +470,9 @@ struct MulticamEditorView: View {
                     Text(source.id == project.referenceAngle ? "Reference camera · \(source.file)" : source.file)
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                         .help(source.file)
-                    if isBoundReplacement {
+                    if source.feedAngle != nil {
+                        Text("Shares timing with the source recording").font(.caption).foregroundStyle(.secondary)
+                    } else if isBoundReplacement {
                         Text("Synced replacement").font(.caption).foregroundStyle(.secondary)
                     } else {
                         MulticamTimeField(label: "Offset", value: source.offset) { text in
@@ -469,7 +480,7 @@ struct MulticamEditorView: View {
                         }
                     }
                     HStack {
-                        if !isBoundReplacement {
+                        if !isBoundReplacement, source.feedAngle == nil {
                             ControlGroup {
                                 Button("−1 \(isCamera ? "frame" : "sample")") { model.byHand { model.moveOffset(source.id, by: -1) } }
                                     .help("Shift earlier one \(isCamera ? "frame" : "sample")")
@@ -495,7 +506,7 @@ struct MulticamEditorView: View {
                     if let message = mediaIssues[source.id] ?? model.sourceIssues[source.id] ?? model.sourceIndexIssues[source.id] {
                         IssueLabel(message)
                     }
-                    if isCamera {
+                    if isCamera, source.feedAngle == nil {
                         MulticamSourceTrackPicker(stream: Binding(get: { source.audioStream }, set: { stream in
                             model.byHand { model.updateSource(source.id) { $0.audioStream = stream } }
                         }), media: model.media[source.id])
@@ -519,7 +530,7 @@ struct MulticamEditorView: View {
 
     private func directAudioSources(_ project: MulticamProject) -> [MulticamSource] {
         let boundSources = Set(project.audioReplacements.map(\.replacement.source))
-        return project.sources.filter { !boundSources.contains($0.id) }
+        return project.sources.filter { $0.feedAngle == nil && !boundSources.contains($0.id) }
     }
 
     private func assemblyInspector(_ project: MulticamProject) -> some View {
@@ -923,6 +934,11 @@ private struct MulticamTimelineHost: View {
     let inspectingAssembly: Bool
     let showSwitchInspector: () -> Void
 
+    @State private var proposedSwitches: [TileSwitchProposal] = []
+    @State private var proposalIndexes: [TranscriptIndex] = []
+    @State private var proposalRefresh: Task<Void, Never>?
+    @State private var acceptedRefreshProject: MulticamProject?
+
     var body: some View {
         var timeline = MulticamTimeline(project: project, media: model.media, playhead: .zero,
                          clock: MulticamTimelineClock(preview: preview, groupTime: model.groupTime(at:)),
@@ -948,17 +964,84 @@ private struct MulticamTimelineHost: View {
                          assembly: model.assemblyPreview || inspectingAssembly
                             ? MulticamAssemblyTimeline(model: model, preview: preview, paddingSpans: model.paddingSpans(assembly: true)) : nil)
         timeline.sourceMediaStatus = { model.mediaStatus(for: model.projectMediaURL($0.file)) }
+        if let revision = model.timelineOutputRevision {
+            timeline.outputThumbnailRevision = revision
+            timeline.outputThumbnail = { time, recording, size in
+                await model.outputThumbnail(group: time, recording: recording, size: size, revision: revision)
+            }
+        }
         timeline.onProjectMedia = { action, source in
             model.presentProjectMedia(action, path: model.projectMediaURL(source.file).path, useID: source.id)
         }
         if !model.isBusy { timeline.onPreviewSwitch = { _ = model.previewMulticamSwitch(at: $0) } }
+        timeline.tileContent = .group(TileTimelineContent.layoutDisplayProject(project),
+                                      media: model.media, intervals: model.analysis.groupIntervals)
+        if !model.isBusy {
+            timeline.onResizeTileSpan = model.resizeTimelineTile
+            if model.markIn != nil && model.markOut != nil {
+                timeline.onClearTileLayouts = model.clearMarkedGroupTileLayout
+            }
+        }
+        timeline.proposedSwitches = proposedSwitches
+        timeline.onPreviewProposal = { proposal in
+            model.preview.pause()
+            model.seekGroup(proposal.at)
+        }
+        if !model.isBusy {
+            timeline.onAcceptProposal = accept
+        }
+        timeline.onDiscardProposal = { proposal in proposedSwitches.removeAll { $0.id == proposal.id } }
+        timeline.switchReview = TileSwitchLaneReview(model: model, proposals: $proposedSwitches, proposalIndexes: $proposalIndexes)
         timeline.groupPadding = model.paddingSpans(assembly: false)
         if model.rangeTool && !model.isBusy { timeline.selectRange = model.selectGroupRange }
-        return timeline
+        return timeline.onChange(of: project) { _, new in
+            if new != acceptedRefreshProject {
+                proposalRefresh?.cancel()
+                proposedSwitches = []
+            }
+        }
+            .onChange(of: model.transcriptMediaRevision) { _, _ in
+                proposalRefresh?.cancel()
+                proposedSwitches = []
+            }
+            .onDisappear { proposalRefresh?.cancel() }
+    }
+
+    private func accept(_ proposal: TileSwitchProposal) {
+        let remaining = Set(proposedSwitches.lazy.filter { $0.id != proposal.id }.map(\.id))
+        let accepted = model.byHand {
+            model.edit("Take Camera") { project in
+                project = try TileSwitches.accepting(proposal, in: project)
+            }
+        }
+        guard accepted, let updated = model.project else { return }
+        acceptedRefreshProject = updated
+        proposedSwitches = []
+        model.selectMarker(proposal.at)
+        guard !remaining.isEmpty else { return }
+        let indexes = proposalIndexes
+        let revision = model.mcpRevision
+        let generation = model.mcpGeneration
+        let mediaRevision = model.transcriptMediaRevision
+        let document = model.projectURL ?? model.draft.url ?? LiveProjectMediaArchive.untitledURL
+        let useSidecar = model.useAnalysisSidecars
+        let sidecarWork = model.sidecarWork
+        proposalRefresh?.cancel()
+        proposalRefresh = Task {
+            let work = sidecarWork.detached(priority: .userInitiated) {
+                try TileSwitches.propose(in: updated, document: document, indexes: indexes,
+                                         useSidecar: useSidecar, cancelled: { Task.isCancelled })
+            }
+            let refreshed = try? await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
+            guard !Task.isCancelled, model.mcpRevision == revision, model.mcpGeneration == generation,
+                  model.transcriptMediaRevision == mediaRevision, proposedSwitches.isEmpty else { return }
+            proposedSwitches = refreshed?.filter { remaining.contains($0.id) } ?? []
+        }
     }
 }
 
 struct MulticamTransport: View {
+    @Environment(\.transcriptSession) private var transcriptSession
     @ObservedObject var model: MulticamEditorModel
     @ObservedObject var preview: MulticamPreview
     let project: MulticamProject
@@ -988,7 +1071,13 @@ struct MulticamTransport: View {
             split: .init(title: "Split Assembly Item at Playhead", enabled: model.canCutOccurrence,
                          perform: model.splitOccurrence),
             delete: .init(title: model.deleteTitle, enabled: model.canDeleteSelection, perform: model.deleteSelection),
-            undo: .init(title: model.undoTitle, enabled: !model.isBusy && !model.undoStack.isEmpty, perform: model.undo),
+            undo: .init(title: transcriptSession?.canUndoFeedAngleConversion == true
+                        ? "Undo " + (transcriptSession?.feedAngleConversionAction ?? "") : model.undoTitle,
+                        enabled: !model.isBusy && (!model.undoStack.isEmpty || transcriptSession?.canUndoFeedAngleConversion == true),
+                        perform: {
+                            if transcriptSession?.canUndoFeedAngleConversion == true { transcriptSession?.undoFeedAngleConversion() }
+                            else { model.undo() }
+                        }),
             redo: .init(title: model.redoTitle, enabled: !model.isBusy && !model.redoStack.isEmpty, perform: model.redo),
             rangeTools: .init(active: $model.rangeTool, canAct: model.canActOnRange,
                               canSplit: model.canSplitSelectedRange, canDelete: model.canDeleteSelectedRange,
@@ -1292,7 +1381,7 @@ private struct MulticamExportControls: View {
     }
 
     private static func placementScope(_ document: CutProject?) -> ExportPlacementScope {
-        guard let document, document.participants.render == nil else { return .none }
+        guard let document, !document.requiresPictureProcessing else { return .none }
         let authored = (try? document.exportPlacementScope()) ?? .none
         guard authored == .none, case .multicam(let project) = document, project.angles.contains(where: { $0.coverage != nil }),
               (try? project.plan().recordingGaps.isEmpty) == false else { return authored }
@@ -1309,7 +1398,7 @@ private struct MulticamExportControls: View {
         var initial = MulticamExportChoices(entry: .multicamSheet, preferred: preferred)
         let selection = model.exportProgram == .selection ? model.selectedExportRanges : nil
         let document = model.stillExportDocument(wholeGroup: model.exportProgram == .group, selection: selection)
-        initial.participantAudio = project.participants.render?.audio.mode
+        initial.usePictureProject(.multicam(project))
         initial.placements = Self.placementScope(document)
         if initial.participantAudio != nil { initial.settle() }
         if initial.placements != .none {
@@ -1344,10 +1433,10 @@ private struct MulticamExportControls: View {
         InspectorRow("Tracks") {
             Picker("Tracks", selection: $choices.tracks) {
                 let silent = project.audio == .none && project.switches.allSatisfy { $0.audio == nil }
-                ForEach(choices.participantAudio == nil ? ExportTracks.allCases : [.all, .video], id: \.self) {
+                ForEach(choices.trackChoices, id: \.self) {
                     Text(choices.participantAudio == nil
                          ? MulticamExportChoices.title(of: $0, silentProject: silent, placements: choices.placements)
-                         : ($0 == .all ? "Saved composition" : "Picture only")).tag($0)
+                         : ($0 == .all ? "Program tracks" : ExportRules.displayName(tracks: $0))).tag($0)
                 }
             }
             .help("Choose output tracks")
@@ -1375,7 +1464,7 @@ private struct MulticamExportControls: View {
                 Toggle("One frame per still", isOn: $choices.heldStills)
             }
         }
-        if choices.participantAudio == nil && effectiveMode == .encode && tracks != .audio {
+        if effectiveMode == .encode && tracks != .audio {
             InspectorRow("Video") {
                 Picker("Video", selection: $choices.codec) {
                     ForEach(ReencodeCodec.allCases.filter { $0 != .jpeg }, id: \.self) { Text($0.displayName).tag($0) }
@@ -1389,7 +1478,7 @@ private struct MulticamExportControls: View {
                 .help("Set video quality")
             }
         }
-        if choices.participantAudio == nil && tracks != .video { audioDelivery }
+        if tracks == .audio || choices.participantAudio == nil && tracks == .all { audioDelivery }
         let sourceIssue = model.exportSourceIssue(tracks: tracks, wholeGroup: wholeGroup, mode: effectiveMode,
                                                   settings: choices.settings, selection: selectionRanges,
                                                   audioAction: choices.requestedAudioAction)
@@ -1418,11 +1507,8 @@ private struct MulticamExportControls: View {
             pendingBoundary = nil
         }
         .onChange(of: project) { _, project in
-            choices.participantAudio = project.participants.render?.audio.mode
-            if choices.participantAudio != nil {
-                if choices.tracks == .audio { choices.tracks = .all }
-                choices.audioOutput = .separateTracks
-            }
+            choices.usePictureProject(.multicam(project))
+            choices.settle()
             model.stillExportBoundaryChoices = []
             pendingBoundary = nil
         }

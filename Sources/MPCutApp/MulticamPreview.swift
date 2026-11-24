@@ -485,6 +485,8 @@ final class MulticamPreview: ObservableObject {
     private var ticker: PreviewDisplayTicker?
     private var frame: PreviewFrame?
     private let surfaces = NSHashTable<PreviewSurface>.weakObjects()
+    private let participantPreview = ParticipantPreview()
+    var participantPreviewCells: AnyPublisher<ParticipantPreviewCells?, Never> { participantPreview.cells.eraseToAnyPublisher() }
     private var desiredPicture: MulticamPicturePosition?
     private var decodingPicture: MulticamPicturePosition?
     private var failedPicture: MulticamPicturePosition?
@@ -558,6 +560,7 @@ final class MulticamPreview: ObservableObject {
     func reset() {
         pause()
         plan = nil
+        participantPreview.configure(project: nil, document: nil)
         programStills = nil
         programTransfer = nil
         stillPreview.cancel()
@@ -578,6 +581,7 @@ final class MulticamPreview: ObservableObject {
     }
 
     func invalidateMedia(_ urls: Set<URL>) {
+        participantPreview.invalidateMedia()
         pause()
         stopProgramStill()
         _ = pictureDecoder.requests.invalidate()
@@ -590,6 +594,10 @@ final class MulticamPreview: ObservableObject {
 
     func configure(plan: MulticamPlan, media: [String: MediaInfo], project: CutProject? = nil,
                    document: URL? = nil, audioIsResolved: Bool = false) {
+        if participantPreview.configure(project: project, document: document) {
+            stillPreview.cancel()
+            clearPicture()
+        }
         let reference = plan.picture.lazy.compactMap { media[$0.source] }.first { $0.hasVideo }
             ?? media.sorted { $0.key < $1.key }.lazy.map(\.value).first { $0.hasVideo }
         programStills = ProgramPreviewStills(project: project, reference: reference, document: document)
@@ -803,8 +811,9 @@ final class MulticamPreview: ObservableObject {
         surface.otherMonitorStatus = { [weak self] in
             self?.surfaces.allObjects.first(where: \.isVideoMonitor)?.presentationDescription
         }
-        if let frame { surface.display(frame) }
-        else if let pictureIssue { surface.unavailable(pictureIssue) }
+        if let frame {
+            participantPreview.attach(surface, frame: frame)
+        } else if let pictureIssue { surface.unavailable(pictureIssue) }
     }
 
     fileprivate func detach(_ surface: PreviewSurface) {
@@ -830,7 +839,9 @@ final class MulticamPreview: ObservableObject {
                 switch result {
                 case .success(let frame):
                     self.frame = frame
-                    self.surfaces.allObjects.forEach { $0.display(frame) }
+                    self.participantPreview.display(frame, at: self.time,
+                                                sourceID: nil, sourceTime: nil, programStill: true,
+                                                on: self.surfaces.allObjects) { [weak self] in self?.surfaces.allObjects ?? [] }
                     self.setPictureIssue(nil)
                 case .failure(let error):
                     self.clearPicture()
@@ -904,6 +915,8 @@ final class MulticamPreview: ObservableObject {
             let tagged = taggedPicture(frame, at: target)
             if frame.programTransfer != tagged.programTransfer || frame.cameraTransfer != tagged.cameraTransfer {
                 show(tagged, at: target)
+            } else if participantPreview.enabled {
+                displayParticipantPicture(frame, position: target)
             }
             return
         }
@@ -922,12 +935,35 @@ final class MulticamPreview: ObservableObject {
     private func show(_ decoded: PreviewFrame, at position: MulticamPicturePosition) {
         let frame = taggedPicture(decoded, at: position)
         self.frame = frame
-        surfaces.allObjects.forEach { $0.display(frame) }
+        displayParticipantPicture(frame, position: position)
         picture = position
         setPictureIssue(nil)
     }
 
+    func setParticipantSource(_ source: Bool) {
+        guard participantPreview.source != source else { return }
+        participantPreview.source = source
+        guard let frame else { return }
+        if !source, participantPreview.enabled {
+            for surface in surfaces.allObjects where !surface.isVideoMonitor { surface.clear() }
+        }
+        if showingProgramStill {
+            participantPreview.display(frame, at: time, sourceID: nil, sourceTime: nil, programStill: true,
+                                       on: surfaces.allObjects) { [weak self] in self?.surfaces.allObjects ?? [] }
+        } else if let picture {
+            displayParticipantPicture(frame, position: picture)
+        }
+    }
+
+    private func displayParticipantPicture(_ frame: PreviewFrame, position: MulticamPicturePosition) {
+        participantPreview.display(frame, at: isAuditioning ? nil : time, sourceID: position.source,
+                                   sourceTime: position.provisional ? nil : position.frameTime, on: surfaces.allObjects) { [weak self] in
+            self?.surfaces.allObjects ?? []
+        }
+    }
+
     private func clearPicture() {
+        participantPreview.clear()
         if frame != nil { surfaces.allObjects.forEach { $0.clear() } }
         frame = nil
         if picture != nil { picture = nil }

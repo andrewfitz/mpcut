@@ -3,6 +3,88 @@ import XCTest
 @testable import MPCutApp
 
 final class CutSequenceDocumentTests: XCTestCase {
+    func testHDRFallbackKeepsVideoOnlySelectionAndItsRange() throws {
+        let movie = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
+        let end = RationalTime(numerator: 1)
+        let project = CutProject.stillSequence(.init(
+            items: [.source(.init(id: "gallery", file: movie.path, from: .zero, to: end))],
+            programColorPolicy: StillTimelineFormat.Color.pq.policy,
+            participants: .init(tileOutput: .init(canvas: .init(width: 320, height: 180)))))
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mov")
+        let range = MulticamRange(from: .zero, to: .init(numerator: 1, denominator: 2))
+        let plan = try EditorModel.planParticipantExport(project, document: nil, output: output, tracks: .video,
+                                                         range: range, cancelled: { false })
+        XCTAssertEqual(plan.settings.codec, .hevc)
+        XCTAssertEqual(plan.settings.audio, .removeAudio)
+        XCTAssertTrue(plan.report.audioActions.isEmpty)
+        XCTAssertEqual(plan.report.duration, range.to)
+    }
+
+    @MainActor
+    func testTileLayoutsSurviveDesktopSplitReorderAndSavedHistory() async throws {
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov", subdirectory: "Fixtures"))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let original = directory.appendingPathComponent("Original.cut")
+        let revised = directory.appendingPathComponent("Revised.cut")
+        func time(_ frame: Int64) -> RationalTime { .init(numerator: frame * 1001, denominator: 30_000) }
+        let layout = TileLayoutSpan(range: .init(from: .zero, to: time(8)), layout: .solo,
+                                    slots: [.init(target: .camera, id: source.path)])
+        let clips = [
+            CutSequenceClip(id: "gallery", file: source.path, from: time(1), to: time(7), tileLayouts: [layout]),
+            CutSequenceClip(id: "plain", file: source.path, from: time(7), to: time(9))
+        ]
+        try CutProject.sequence(clips).mapMediaPaths { CutProject.relativeMediaPath($0, to: original) }.save(to: original)
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        preferences.warnBeforeLoweringExportTier = false
+        preferences.historyLimit = 10
+        let editor = EditorModel(preferences: preferences)
+        defer { editor.endSession() }
+        try editor.openProject(clips, at: original)
+        try await waitForImport(editor)
+        XCTAssertEqual(editor.sequenceClips.map(\.tileLayouts), [[layout], []])
+
+        editor.snapTarget = .off
+        editor.seek(time(3).seconds)
+        editor.split()
+        try await waitForImport(editor)
+        XCTAssertEqual(editor.sequenceClips.count, 3)
+        guard editor.sequenceClips.count == 3 else { return }
+        let left = try XCTUnwrap(editor.sequenceClips.first)
+        let right = editor.sequenceClips[1]
+        XCTAssertEqual(left.tileLayouts.map(\.range), [.init(from: .zero, to: left.to)])
+        XCTAssertEqual(right.tileLayouts.map(\.range), [.init(from: left.to, to: time(8))])
+
+        editor.select(editor.timelineClips[1].id)
+        editor.moveSelectedClip(by: 1)
+        try await waitForImport(editor)
+        XCTAssertEqual(editor.sequenceClips.map(\.id), [left.id, "plain", right.id])
+        try editor.writeProject(to: revised)
+        let disk = try CutProject.loadDocument(from: revised, limit: 10)
+        for state in [disk.project] + disk.undo.map(\.project) {
+            for clip in state.sequenceClips ?? [] {
+                for slot in clip.tileLayouts.flatMap(\.slots) {
+                    XCTAssertEqual(slot.id, clip.file)
+                    XCTAssertFalse(slot.id.hasPrefix("/"))
+                }
+            }
+        }
+
+        let reopened = EditorModel(preferences: preferences)
+        defer { reopened.endSession() }
+        try reopened.openProject(editor.sequenceClips, at: revised)
+        try await waitForImport(reopened)
+        XCTAssertEqual(reopened.sequenceClips, editor.sequenceClips)
+        reopened.undo()
+        try await waitForImport(reopened)
+        XCTAssertEqual(reopened.sequenceClips.map(\.id), [left.id, right.id, "plain"])
+        reopened.undo()
+        try await waitForImport(reopened)
+        XCTAssertEqual(reopened.sequenceClips.map(\.tileLayouts), [[layout], []])
+    }
+
     @MainActor
     func testInPlaceSaveRejectsChangesOnlyInStillRedoAndAllowsSaveAs() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

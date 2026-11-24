@@ -371,7 +371,7 @@ final class TranscriptBoundaryResolver {
         if case .multicam(let multicam) = project {
             return MulticamEngine().tier(multicam, relativeTo: projectURL, indexedSources: multicamMedia).summary(source: .multicam)
         }
-        if project.participants.render != nil {
+        if project.requiresPictureProcessing {
             return ParticipantProjectExport.tier(project, relativeTo: projectURL).summary(source: .movie)
         }
         if !project.stillInserts.isEmpty || !project.stillReplacements.isEmpty {

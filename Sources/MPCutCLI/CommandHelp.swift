@@ -39,7 +39,7 @@ struct CommandHelp: Encodable {
 
     static let conventions = [
         "Use mpcut help COMMAND --json to retrieve one command. mpcut COMMAND --help prints its text reference. mpcut help manual prints the complete guide. mpcut --version --json identifies the installed build.",
-        "With --stdin, send one UTF-8 JSON object and close stdin. With --json, read one JSON object from stdout and drain stderr separately for progress and diagnostics. Exit 0 means success, 1 an operation failure, 2 a CLI/request error, and 130 cancellation. On failure read error.code and error.message, plus error.segment, error.boundary, error.track or error.nearest when present. A batch that fails during writing can also report completed outputs and failed_range.",
+        "With --stdin, send one UTF-8 JSON object and close stdin. With --json, read one JSON object from stdout and drain stderr separately for progress and diagnostics. Exit 0 means success, 1 an operation failure, 2 a CLI/request error, 3 a Tiles ISO delivery awaiting review, and 130 cancellation. On failure read error.code and error.message, plus error.segment, error.boundary, error.track or error.nearest when present. A batch that fails during writing can also report completed outputs and failed_range.",
         "Use local paths. Relative input and output paths resolve from the process working directory, including paths inside stdin JSON. Quote spaces in a shell. Pass separate argv entries from code. Use ./ for a filename beginning with a dash. A parent output directory must already exist. Media exports require a new filename.",
         "Times are relative to each source or to the group clock for project clips. Ranges include from and exclude to. Command-line times accept decimal seconds, MM:SS, HH:MM:SS and fractions such as 1001/30000. In edit JSON use strings or exact objects such as {\"numerator\":1001,\"denominator\":30000}. Keep the rational times from inspection through export.",
         "Stream indices are absolute, zero-based media.streams[].index values. Order entries, scene numbers, failed_range and error.segment are one-based. error.segment is the clip's number in the request's clips array, whatever the playback order. For a saved multicam project it is the number of the assembly range, and a project without an assembly has the single range 1. --stream chooses the audio to analyze. --tracks audio --audio-stream INDEX chooses the audio to write.",
@@ -81,6 +81,12 @@ struct CommandHelp: Encodable {
         .init(name: "--version", purpose: "Identify the installed CLI.",
               usage: ["mpcut --version [--json]"], instructions: [],
               result: "Plain output is the version string. JSON has a version field.", examples: ["mpcut --version --json"]),
+        .init(name: "tiles", purpose: "Find tiles, review feeds, edit layouts and deliver synchronized ISOs.",
+              usage: ([TilesCLI.Operation.exportISOs] + TilesCLI.Operation.allCases.filter { $0 != .exportISOs }).map { "mpcut tiles \($0.rawValue) \($0.helpUsage) [--json]" },
+              instructions: ["Inspect, preview and recording edits use source time. Multicam group and occurrence layouts use group time. A project with multiple scanned recordings requires --source-id. Project edits require --out-project or --in-place.",
+                             "Preview writes untreated source pixels with tile annotations. Add --progress stderr or jsonl to report progress on standard error."],
+              result: "Read the command's JSON result for source, tile and feed information or the generated artifacts. ISO export returns exit code 3 when review is required.",
+              examples: TilesCLI.Operation.allCases.map { "mpcut tiles \($0.rawValue) \($0.helpExample) --json" }),
         .init(name: "participants", purpose: "Scan gallery recordings, edit participant tracks and render participant shots.",
               usage: ["mpcut participants scan --file MEDIA [--backend auto|cpu-only|gpu-required] [--sampling adaptive|every-frame|sparse] [--feed-layout auto|COLSxROWS] [--include-scenes] [--no-sidecar] [--output SCAN.json [--summary]] [--resume-file SCAN.json] [--progress none|stderr|jsonl] [--json]",
                       "mpcut participants markers build --analysis-file SCAN.json [--json]",
@@ -136,7 +142,7 @@ struct CommandHelp: Encodable {
                       "mpcut transcript edit plan --project FILE --action ACTION --first-word-id ID [--last-word-id ID] [--space SPACE] [--first-occurrence-id ID] [--last-occurrence-id ID] [--output FILE] [--json]",
                       "mpcut transcript edit apply --project FILE --plan-file FILE (--out-project FILE | --in-place) [--json]",
                       "mpcut transcript excerpt queue --project FILE --name TEXT --first-word-id ID [--last-word-id ID] [--out-project FILE] [--json]",
-                      "mpcut transcript export --project FILE [--attachment-id ID] [--space SPACE] [--format json|text|srt|vtt] [--output FILE] [--json]",
+                      "mpcut transcript export --project FILE [--attachment-id ID] [--space SPACE] [--captions] [--format json|text|srt|vtt] [--output FILE] [--json]",
                       "mpcut transcript words correct --input REQUEST.json [--json]"],
               instructions: [
                   "Run tracks to inventory the source streams. transcript job prepare writes staged 16 kHz audio and manifest paths, then returns. Use transcript job run with its job ID or launch the reported Transcriberrr command separately, then import the result or import by job ID. Use MPCUT_TRANSCRIBERRR_HELPER to identify a local executable and an explicit Transcriberrr download option when a model needs installation.",
@@ -154,7 +160,7 @@ struct CommandHelp: Encodable {
                          "mpcut transcript edit plan --project interview.cut --action delete --first-word-id word-0 --output review.json --json",
                          "mpcut transcript edit apply --project interview.cut --plan-file review.json --out-project reviewed.cut --json",
                          "mpcut transcript words correct --input correction.json --json",
-                         "mpcut transcript export --project interview.cut --space current_cut --output captions.srt"]),
+                         "mpcut transcript export --project interview.cut --captions --space current_cut --output captions.srt"]),
         .init(name: "project authoring", purpose: "Create or edit a saved timeline in a new .cut file.",
               usage: ["mpcut project create (--input REQUEST.json | --stdin) [--json]", "mpcut project edit (--input REQUEST.json | --stdin) [--json]"],
               instructions: ["Supply out_project and an ordered operations array. Create takes kind sequence or multicam. Edit takes project_path. For sequence use append, trim, split, move or remove with clip id. Save named source intervals with source_select_save and remove them with source_select_remove. Apply an ordered ranges array with source_ranges_apply. Use equal sequence from and to times to insert, or choose a nonempty interval to replace. Multicam uses assembly indices and also accepts switch_set, switch_remove, angle_set, angle_clear and add_recording. add_recording takes angle_id, path and group_start. See docs/HEADLESS.md for the request fields."],
@@ -229,6 +235,18 @@ struct CommandHelp: Encodable {
               examples: ["mpcut project convert interview.cut --to resolve --output interview.drp",
                          "mpcut project convert interview.fcpxml --output imported.cut --json",
                          "mpcut project convert cutaway.cut --to premiere --output cutaway.prproj"]),
+        .init(name: "project document print", purpose: "Print expanded project JSON as readable text.",
+              usage: ["mpcut project document print FILE", "mpcut project document print -"],
+              instructions: ["Expands the saved reference table. Use the result for schema validation. Pass - to read standard input."],
+              result: "The expanded project document on standard output.",
+              examples: ["mpcut project document print interview.cut", "mpcut project document print - < interview.cut"]),
+        .init(name: "project merge", purpose: "Merge two branches of a project file for Git.",
+              usage: ["mpcut project merge BASE OURS THEIRS"],
+              instructions: ["Merges the edits of OURS and THEIRS, which both started from BASE, and replaces OURS with the result. Clips and other edit fields are merged line by line. Recordings in the media snapshot are merged by path. Undo history is left out, since steps from two branches cannot be combined.",
+                             "Register it once in a clone with git config merge.mpcut.driver \"mpcut project merge %O %A %B\" and add the line *.cut merge=mpcut to .gitattributes. Git then runs it for every project it merges.",
+                             "When both branches changed the same lines, OURS is left as plain project JSON with Git conflict markers around them and the command exits with status 1. Resolve the marked lines and the file opens. Status 1 also reports a merge MPCut cannot open, such as one with the same clip ID twice. OURS then holds the merged text to correct."],
+              result: "OURS holds the merged project. Exit status 1 reports conflicting edits.",
+              examples: ["mpcut project merge base.cut interview.cut theirs.cut"]),
         .init(name: "resolve", purpose: "Export a saved project as an editable DaVinci Resolve timeline.",
               usage: ["mpcut project resolve export (--project PROJECT --output FILE.fcpxml | --clips LIST --output FILE.fcpxml | --input REQUEST.json | --stdin) [--json]",
                       "mpcut project resolve import (--project PROJECT --output FILE.fcpxml | --clips LIST --output FILE.fcpxml | --input REQUEST.json | --stdin) [--json]"],
@@ -323,8 +341,8 @@ struct CommandHelp: Encodable {
                       "mpcut review frames export [--json] --output NEW_DIRECTORY [--select scenes|non-silent] [--sample first|midpoint] [--limit N] [--preset review|full] [--format jpeg|png|tiff] [--stream INDEX] [--threshold-db DB] [--min-pause-seconds SEC] [--] FILE",
                       "mpcut review frames export [--json] --project PROJECT [--clock sequence|assembly|group] --at TIME [--at TIME ...] --output NEW_DIRECTORY [--preset review|full] [--format jpeg|png|tiff]"],
               instructions: ["Default is a review JPEG at each scene midpoint. Review fits the long edge within 640 pixels at quality 0.62. Full uses display resolution at quality 0.95. --limit is positive and spreads images across the ranges. Supply one --at per explicit source time, without --select, --sample or --limit. Audio options apply only to non-silent ranges. Their defaults match silence detection. Both the JPEGs and manifest.json go into a new directory.",
-                             "With a multicam --project, the default group clock returns a row for every angle, including coverage gaps. Choose --clock assembly to review the edited program including still placements. A sequence project uses the sequence clock and returns one program frame per requested time."],
-              result: "The stdout manifest matches manifest.json. frames[].file names a JPEG inside output_directory. Actual picture time and PTS appear in frame_time and frame_pts. Single-source rows give clip_from and clip_to as frame-aligned export bounds, with range_number, scene_number and view_label where applicable. On the group clock, project rows give group_time, angle_id, source_time and availability in request order, then project angle order. Available rows give group_coverage, the half-open interval where that picture is visible on the group clock. See angles[] for the source path, offset, original timestamp origin, time base and source errors. Program rows identify each selected still or source occurrence.",
+                             "For a multicam project with tile processing, the default is the assembly clock. Both assembly and group clocks sample one rendered program frame per time. Other multicam projects default to the group clock, which returns a row for every angle, including coverage gaps. Use --clock assembly for the edited program and still placements. A sequence project uses the sequence clock."],
+              result: "The stdout manifest matches manifest.json. frames[].file names a JPEG inside output_directory. Actual picture time and source PTS appear in frame_time and frame_pts where available. Single-source rows give clip_from and clip_to as frame-aligned export bounds, with range_number, scene_number and view_label where applicable. Angle-comparison rows give group_time, angle_id, source_time and availability in request order, then project angle order. Available rows give group_coverage, the half-open interval where that picture is visible on the group clock. See angles[] for the source path, offset, original timestamp origin, time base and source errors. Rendered Tiles rows report frame_time on the selected program clock and any applied privacy_issues.",
               examples: ["mpcut review frames export --json --select scenes --limit 12 --output overview interview.mov",
                          "mpcut review frames export --json --preset full --at 3/2 --output detail interview.mov",
                          "mpcut review frames export --json --project interview.cut --at 3/2 --at 3 --output angle-review",
@@ -382,14 +400,14 @@ struct CommandHelp: Encodable {
     ]
 
     static let commands: [CommandHelp] = {
-        var topics = families.filter { ["help", "--version", "multicam", "participants"].contains($0.name) }
+        var topics = families.filter { ["help", "--version", "multicam", "participants", "tiles"].contains($0.name) }
         for path in CommandPath.paths.sorted() {
             let prefix = "mpcut " + path
             guard let family = families.first(where: {
                 $0.name != "multicam" && $0.usage.contains { $0 == prefix || $0.hasPrefix(prefix + " ") }
             }) else { preconditionFailure("Missing command reference for " + path) }
             var usage = family.usage.filter { $0 == prefix || $0.hasPrefix(prefix + " ") }
-            if CommandPath.transcript[path] != nil || CommandPath.participants[path] != nil {
+            if CommandPath.transcript[path] != nil || CommandPath.participants[path] != nil || CommandPath.tiles[path] != nil {
                 let requestUsage = prefix + " (--stdin | --input REQUEST.json) [--json]"
                 if !usage.contains(requestUsage) { usage.append(requestUsage) }
             }
@@ -404,8 +422,13 @@ struct CommandHelp: Encodable {
             default:
                 template = family.stdinExample
             }
+            var instructions = family.instructions
+            if path == "tiles accept" {
+                instructions.append("Supply a scan, revised count hints, or --clear-count-hints. A hint edit without a scan preserves the accepted tiles and feed IDs.")
+                examples.append("mpcut tiles accept --project reviewed.cut --clear-count-hints --in-place")
+            }
             topics.append(.init(name: path, purpose: purposes[path] ?? family.purpose, usage: usage,
-                                instructions: family.instructions, result: family.result,
+                                instructions: instructions, result: family.result,
                                 examples: examples, stdinExample: template))
         }
         return topics
@@ -493,7 +516,7 @@ struct CommandHelp: Encodable {
             let invocation: String
             switch command.name {
             case "version": invocation = "--version"
-            case "multicam", "participants": invocation = "help " + command.name
+            case "multicam", "participants", "tiles": invocation = "help " + command.name
             default: invocation = command.name
             }
             return "  \(invocation)  —  \(command.purpose)"

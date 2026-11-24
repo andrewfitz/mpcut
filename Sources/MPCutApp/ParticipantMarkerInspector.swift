@@ -58,56 +58,62 @@ struct ParticipantMarkerInspector: View {
     }
 
     var body: some View {
-        DisclosureGroup("Layout Change Markers") {
-            Picker("Count", selection: $unit) {
-                Text("Participants").tag(ParticipantMarkerRule.Unit.participants)
-                Text("Comparable Slots").tag(ParticipantMarkerRule.Unit.slots)
-            }
-            Picker("Threshold", selection: $threshold) {
-                Text("Any").tag(Threshold.any)
-                Text("At least").tag(Threshold.atLeast)
-                Text("All").tag(Threshold.all)
-            }
-            if threshold == .atLeast { Stepper("Minimum \(minimum)", value: $minimum, in: 1...64) }
-            Stepper("Settling \(settlingWindow) ms", value: $settlingWindow, in: 0...2000, step: 25)
-            Menu("Event Types") {
-                ForEach(ParticipantChangeEvent.Kind.allCases, id: \.self) { kind in
-                    Toggle(kind.rawValue.replacingOccurrences(of: "_", with: " ").capitalized,
-                           isOn: membership(kind, in: $kinds))
+        DisclosureGroup {
+            VStack(alignment: .leading) {
+                Picker("Count", selection: $unit) {
+                    Text("Feeds").tag(ParticipantMarkerRule.Unit.participants)
+                    Text("Tile Positions").tag(ParticipantMarkerRule.Unit.slots)
                 }
-            }
-            Picker("Roster", selection: $scopeToRoster) {
-                Text("Everyone").tag(false)
-                Text("Selected Participants").tag(true)
-            }
-            if scopeToRoster {
-                Menu("Detected Participants (\(roster.count) selected)") {
-                    ForEach(trackIDs, id: \.self) { id in
-                        Toggle("Detected Participant \(id)", isOn: membership(id, in: $roster))
+                Picker("Threshold", selection: $threshold) {
+                    Text("Any").tag(Threshold.any)
+                    Text("At least").tag(Threshold.atLeast)
+                    Text("All").tag(Threshold.all)
+                }
+                if threshold == .atLeast { Stepper("Minimum \(minimum)", value: $minimum, in: 1...64) }
+                Stepper("Settling \(settlingWindow) ms", value: $settlingWindow, in: 0...2000, step: 25)
+                Menu("Event Types") {
+                    ForEach(ParticipantChangeEvent.Kind.allCases, id: \.self) { kind in
+                        Toggle(kind.rawValue.replacingOccurrences(of: "_", with: " ").capitalized,
+                               isOn: membership(kind, in: $kinds))
                     }
                 }
-                .disabled(trackIDs.isEmpty)
-                if roster.isEmpty {
-                    Text("Select detected participants to include in this rule.")
-                        .font(.caption).foregroundStyle(.secondary)
+                Picker("Feeds", selection: $scopeToRoster) {
+                    Text("Everyone").tag(false)
+                    Text("Selected Feeds").tag(true)
+                }
+                if scopeToRoster {
+                    Menu("Detected Feeds (\(roster.count) selected)") {
+                        ForEach(trackIDs, id: \.self) { id in
+                            Toggle("Detected Feed \(id)", isOn: membership(id, in: $roster))
+                        }
+                    }
+                    .disabled(trackIDs.isEmpty)
+                    if roster.isEmpty {
+                        Text("Select detected feeds to include in this rule.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Button("Review Marker Candidates") {
+                    clearResults()
+                    request = Query(rule: rule)
+                }
+                .disabled(busy || kinds.isEmpty || (scopeToRoster && roster.isEmpty)
+                          || (request?.rule == rule && markers == nil && failure == nil))
+                .accessibilityIdentifier("participant.markers.review")
+                if request?.rule == rule {
+                    if let markers {
+                        candidates(markers)
+                    } else if let failure {
+                        Text(failure).font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        ProgressView("Finding marker candidates…")
+                            .controlSize(.small)
+                    }
                 }
             }
-            Button("Review Marker Candidates") {
-                clearResults()
-                request = Query(rule: rule)
-            }
-            .disabled(busy || kinds.isEmpty || (scopeToRoster && roster.isEmpty)
-                      || (request?.rule == rule && markers == nil && failure == nil))
-            if request?.rule == rule {
-                if let markers {
-                    candidates(markers)
-                } else if let failure {
-                    Text(failure).font(.caption).foregroundStyle(.secondary)
-                } else {
-                    ProgressView("Finding marker candidates…")
-                        .controlSize(.small)
-                }
-            }
+            .accessibilityElement(children: .contain)
+        } label: {
+            Text("Layout Change Filters").accessibilityIdentifier("participant.markers")
         }
         .onChange(of: rule) { _, _ in
             request = nil
@@ -173,6 +179,7 @@ struct ParticipantMarkerInspector: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityAddTraits(selected ? .isSelected : [])
+                .accessibilityIdentifier("participant.markers.candidate.\(marker.time.description)")
                 .disabled(busy)
             }
         }

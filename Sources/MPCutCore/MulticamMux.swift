@@ -81,6 +81,10 @@ struct MulticamMux {
         }
         try verifySources()
         try runner.checkCancellation()
+        try Self.publishMovie(partial, to: destination)
+    }
+
+    static func publishMovie(_ partial: URL, to destination: URL) throws {
         // The movie is staged private. Publish it with the permissions of any other export.
         guard chmod(partial.path, try publicationPermissions(0o666)) == 0 else {
             throw CutError(code: "write_failed", message: String(cString: strerror(errno)))

@@ -78,10 +78,12 @@ func previewTime(_ time: RationalTime) -> CMTime {
 struct SequenceSourcePicture: Equatable {
     let url: URL
     let time: RationalTime
+    let identity: SourceIdentity?
 
-    init?(url: URL?, pts: CMTime) {
+    init?(url: URL?, pts: CMTime, identity: SourceIdentity?) {
         guard let url, pts.isNumeric, pts.timescale > 0 else { return nil }
         self.url = url
+        self.identity = identity
         time = RationalTime(numerator: pts.value, denominator: Int64(pts.timescale))
     }
 }
@@ -94,6 +96,8 @@ struct PreviewFrame: @unchecked Sendable {
     var sourceRendition: String? = nil
     var cameraTransfer: String? = nil
     var sourcePicture: SequenceSourcePicture? = nil
+    var timelinePictureTime: RationalTime? = nil
+    var privacyCoverNote: String? = nil
 
     func tagged(transfer: String?, cameraTransfer: String? = nil) -> Self {
         var result = self
@@ -109,6 +113,7 @@ struct PreviewFrame: @unchecked Sendable {
 
 final class HardwareFrames: @unchecked Sendable {
     private let asset: AVURLAsset
+    private let sourceIdentity: SourceIdentity?
     private let track: AVAssetTrack
     private let origin: CMTime
     private let transform: CGAffineTransform
@@ -126,6 +131,7 @@ final class HardwareFrames: @unchecked Sendable {
     private var decodeError: OSStatus = noErr
 
     init(url: URL) throws {
+        sourceIdentity = try? SourceIdentity(url)
         asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         let video = asset.tracks(withMediaType: .video)
         guard video.count == 1, let track = video.first else {
@@ -219,7 +225,7 @@ final class HardwareFrames: @unchecked Sendable {
                     // Keep later pictures that arrive first in decode order.
                     if time >= decoder.requestedPicture {
                         decoder.frames.append(PreviewFrame(buffer: pixelBuffer, time: time, transform: decoder.transform,
-                            sourcePicture: .init(url: decoder.asset.url, pts: time - decoder.origin)))
+                            sourcePicture: .init(url: decoder.asset.url, pts: time - decoder.origin, identity: decoder.sourceIdentity)))
                     }
                 }
             },
@@ -649,6 +655,9 @@ final class SequencePreview: ObservableObject {
             if sourcePicture.value != frame?.sourcePicture { sourcePicture.send(frame?.sourcePicture) }
         }
     }
+    private let participantPreview = ParticipantPreview()
+    var participantPreviewCells: AnyPublisher<ParticipantPreviewCells?, Never> { participantPreview.cells.eraseToAnyPublisher() }
+    private var participantOutputTime: RationalTime?
     private var programStills: ProgramPreviewStills?
     private var programTransfer: String?
     private let stillPreview = ProgramStillPreview()
@@ -692,6 +701,7 @@ final class SequencePreview: ObservableObject {
     }
 
     func invalidateMedia(alsoFilmstrip: Bool) {
+        participantPreview.invalidateMedia()
         _ = requests.next()
         requests.releaseDecoder()
         rendering = false
@@ -702,7 +712,11 @@ final class SequencePreview: ObservableObject {
     }
 
     func update(_ sourceRanges: [PreviewRange], at time: Double, project: CutProject? = nil, reference: MediaInfo? = nil,
-                soundtrack: PreviewRange? = nil) {
+                soundtrack: PreviewRange? = nil, document: URL? = nil) {
+        if participantPreview.configure(project: project, document: document) {
+            stillPreview.cancel()
+            clearPicture()
+        }
         let programStills = ProgramPreviewStills(project: project, reference: reference)
         var ranges = sourceRanges
         var indices = Array(sourceRanges.indices)
@@ -954,7 +968,8 @@ final class SequencePreview: ObservableObject {
             self.canPlayWithoutPicture = false
             let tagged = frame.tagged(transfer: self.auditionPosition == nil ? self.programTransfer : nil)
             self.frame = tagged
-            self.surfaces.allObjects.forEach { $0.display(tagged) }
+            let clock = self.auditionPosition == nil ? (tagged.timelinePictureTime ?? timelineRationalTime(self.time)) : nil
+            self.displayParticipantPicture(tagged, at: clock)
         }, onTime: { [weak self] position in
             guard let self, self.sequenceGeneration == generation else { return }
             let time = min(max(0, position), self.duration)
@@ -1088,7 +1103,7 @@ final class SequencePreview: ObservableObject {
                     fallback.audition(url: range.url, at: sourceFrame, before: range.end, transfer: range.programTransfer)
                 } else {
                     render(url: range.url, time: sourceFrame, before: range.end,
-                           transfer: programTransfer ?? range.programTransfer, cameraTransfer: range.programTransfer ?? "unknown")
+                           transfer: programTransfer ?? range.programTransfer, cameraTransfer: range.programTransfer ?? "unknown", outputTime: target)
                 }
             }
         }
@@ -1280,7 +1295,9 @@ final class SequencePreview: ObservableObject {
             case .success(let frame):
                 self.programPictureIssue = nil
                 self.frame = frame
-                self.surfaces.allObjects.forEach { $0.display(frame) }
+                self.participantPreview.display(frame, at: timelineRationalTime(self.time),
+                                                sourceID: nil, sourceTime: nil, programStill: true,
+                                                on: self.surfaces.allObjects) { [weak self] in self?.surfaces.allObjects ?? [] }
             case .failure(let error):
                 self.clearPicture()
                 self.programPictureIssue = error.localizedDescription
@@ -1315,7 +1332,7 @@ final class SequencePreview: ObservableObject {
         let sourceTime = time == duration ? range.end
             : min(range.end, range.start + (time - offsets[index]))
         render(url: range.url, time: sourceTime, before: range.end, scrubbing: immediate,
-               transfer: programTransfer ?? range.programTransfer, cameraTransfer: range.programTransfer ?? "unknown")
+               transfer: programTransfer ?? range.programTransfer, cameraTransfer: range.programTransfer ?? "unknown", outputTime: time)
     }
 
     private func cancelPictureRequest() {
@@ -1336,11 +1353,12 @@ final class SequencePreview: ObservableObject {
     }
 
     private func render(url: URL, time: Double, before end: Double? = nil, scrubbing: Bool = true,
-                        transfer: String? = nil, cameraTransfer: String? = nil) {
+                        transfer: String? = nil, cameraTransfer: String? = nil, outputTime: Double? = nil) {
         let serial = requests.next()
         rendering = true
         let requests = requests
         let independentPicture = programStills != nil
+        let programTime = outputTime.flatMap(timelineRationalTime)
         requests.pictureWork.submit(on: requests.queue) { [weak self] in
             guard requests.current(serial) else { return }
             let result = Result {
@@ -1359,7 +1377,9 @@ final class SequencePreview: ObservableObject {
                         || self.frame?.cameraTransfer != frame.cameraTransfer {
                         self.displayedURL = url
                         self.frame = frame
-                        self.surfaces.allObjects.forEach { $0.display(frame) }
+                        self.displayParticipantPicture(frame, at: programTime)
+                    } else if self.participantPreview.enabled && self.participantOutputTime != programTime {
+                        self.displayParticipantPicture(frame, at: programTime)
                     }
                 case .success(nil):
                     self.reportPictureFailure("The source produced no picture at this position.", independent: independentPicture)
@@ -1421,11 +1441,37 @@ final class SequencePreview: ObservableObject {
         surface.otherMonitorStatus = { [weak self] in
             self?.surfaces.allObjects.first(where: \.isVideoMonitor)?.presentationDescription
         }
-        if let frame { surface.display(frame) }
-        else if let programPictureIssue { surface.unavailable(programPictureIssue) }
+        if let frame {
+            participantPreview.attach(surface, frame: frame)
+        } else if let programPictureIssue { surface.unavailable(programPictureIssue) }
+    }
+
+    func setParticipantSource(_ source: Bool) {
+        guard participantPreview.source != source else { return }
+        participantPreview.source = source
+        guard let frame else { return }
+        if !source, participantPreview.enabled {
+            for surface in surfaces.allObjects where !surface.isVideoMonitor { surface.clear() }
+        }
+        if showingProgramStill && auditionPosition == nil {
+            participantPreview.display(frame, at: timelineRationalTime(time), sourceID: nil, sourceTime: nil,
+                                       programStill: true, on: surfaces.allObjects) { [weak self] in self?.surfaces.allObjects ?? [] }
+        } else {
+            displayParticipantPicture(frame, at: participantOutputTime)
+        }
+    }
+
+    private func displayParticipantPicture(_ frame: PreviewFrame, at time: RationalTime?) {
+        participantOutputTime = time
+        participantPreview.display(frame, at: time, sourceID: frame.sourcePicture?.url.path,
+                                   sourceTime: frame.sourcePicture?.time, on: surfaces.allObjects) { [weak self] in
+            self?.surfaces.allObjects ?? []
+        }
     }
 
     private func clearPicture() {
+        participantPreview.clear()
+        participantOutputTime = nil
         displayedURL = nil
         frame = nil
         surfaces.allObjects.forEach { $0.clear() }

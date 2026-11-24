@@ -17,13 +17,28 @@ final class ProjectSession: ObservableObject {
     let transcriptPaneMemory = TranscriptPaneMemory()
     private var participantGeometryRevision: ParticipantSpeakerIndexKey?
     private var participantGeometryIndexes: [String: ParticipantMonitorGeometry] = [:]
+    private var participantFeedIDsBySource: [String: Set<String>] = [:]
+    private var participantLinkedFeedIDs: Set<String> = []
+
+    private func refreshParticipantInspection() {
+        let revision = ParticipantSpeakerIndexKey(session: self)
+        guard revision != participantGeometryRevision else { return }
+        participantGeometryIndexes.removeAll()
+        participantFeedIDsBySource = Dictionary(uniqueKeysWithValues: participantProject.sources.map { source in
+            (source.sourceID, Set(source.appearances.compactMap(\.participantID)).union(source.unresolvedParticipantIDs))
+        })
+        participantLinkedFeedIDs = participantFeedIDsBySource.values.reduce(into: []) { $0.formUnion($1) }
+        participantGeometryRevision = revision
+    }
+
+    func participantFeedIDs(sourceID: String? = nil) -> Set<String> {
+        refreshParticipantInspection()
+        if let sourceID { return participantFeedIDsBySource[sourceID] ?? [] }
+        return participantLinkedFeedIDs
+    }
 
     func participantGeometry(for sourceID: String) -> ParticipantMonitorGeometry? {
-        let revision = ParticipantSpeakerIndexKey(session: self)
-        if revision != participantGeometryRevision {
-            participantGeometryIndexes.removeAll()
-            participantGeometryRevision = revision
-        }
+        refreshParticipantInspection()
         if let index = participantGeometryIndexes[sourceID] { return index }
         guard let source = participantProject.sources.first(where: { $0.sourceID == sourceID }) else { return nil }
         let index = ParticipantMonitorGeometry(source)
@@ -32,13 +47,246 @@ final class ProjectSession: ObservableObject {
     }
 
     lazy var transcript = LiveTranscriptController(session: self)
+    private var feedAngleConversion: (sequence: DocumentState, action: String, origin: HistoryOrigin, handle: String,
+                                      editorGeneration: UUID, multicamGeneration: UUID)?
+    var feedAngleProjectHandle: String? {
+        guard let conversion = feedAngleConversion,
+              conversion.editorGeneration == editor.mcpGeneration,
+              conversion.multicamGeneration == multicam.mcpGeneration else { return nil }
+        return conversion.handle
+    }
+    var canUndoFeedAngleConversion: Bool {
+        isMulticam && feedAngleHistoryAction != nil && !multicam.isBusy && multicam.notice == nil &&
+            !editor.isBusy && multicam.historyCursor == 0
+    }
+    var canRedoFeedAngleConversion: Bool {
+        !isMulticam && feedAngleHistoryAction != nil && !editor.isBusy && editor.alert == nil &&
+            !editor.mcpHasActiveTrim && feedAngleSequenceBoundary == editor.historyCursor
+    }
+    var feedAngleSequenceBoundary: Int? {
+        guard let conversion = feedAngleConversion,
+              case .sequence(_, let project, let entries, let cursor) = conversion.sequence,
+              editor.historyCursor <= cursor, editor.historyEntryIDs == entries else { return nil }
+        if editor.historyCursor == cursor {
+            var current = editor.transcriptProject
+            current.transcripts.revision = project.transcripts.revision
+            if current != project { return nil }
+        }
+        return cursor
+    }
+    private var feedAngleUndoArchive: [CutHistoryState] {
+        guard isMulticam, feedAngleHistoryAction != nil,
+              let conversion = feedAngleConversion,
+              case .sequence(_, let project, _, _) = conversion.sequence else { return [] }
+        let steps = max(0, editor.mcpHistoryLimit - multicam.projectHistory.count)
+        return Array((editor.nativeConversionUndoArchive + [.init(action: conversion.action, origin: conversion.origin,
+                                                                  project: project)]).suffix(steps))
+    }
+    private var feedAngleRedoArchive: [CutHistoryState] {
+        guard !isMulticam, feedAngleHistoryAction != nil, feedAngleSequenceBoundary != nil,
+              let conversion = feedAngleConversion, let project = multicam.project else { return [] }
+        let steps = max(0, editor.mcpHistoryLimit - editor.projectHistory.count)
+        return Array((multicam.nativeConversionRedoArchive + [.init(action: conversion.action, origin: conversion.origin,
+                                                                       project: .multicam(project))]).suffix(steps))
+    }
+    var feedAngleConversionAction: String? { feedAngleConversion?.action }
+    private var feedAngleHistoryAction: ProjectHistoryAction? {
+        guard editor.mcpHistoryLimit > 0, let conversion = feedAngleConversion, feedAngleProjectHandle != nil else { return nil }
+        return .init(name: conversion.action, origin: conversion.origin)
+    }
+
+    var hasFeedAngleConversionHistory: Bool {
+        feedAngleHistoryAction != nil && (isMulticam || feedAngleSequenceBoundary != nil)
+    }
+
+    var conversionHistoryCursor: Int {
+        if isMulticam {
+            return multicam.historyCursor + (feedAngleHistoryAction == nil ? 0 : editor.historyCursor + 1)
+        }
+        return editor.historyCursor
+    }
+
+    var conversionHistoryActions: [ProjectHistoryAction] {
+        guard hasFeedAngleConversionHistory, let action = feedAngleHistoryAction else {
+            return isMulticam ? multicam.projectHistory : editor.projectHistory
+        }
+        return Array(editor.projectHistory.prefix(feedAngleSequenceBoundary ?? editor.historyCursor)) + [action] + multicam.projectHistory
+    }
+
+    var conversionHistoryToken: String {
+        "\(isMulticam ? multicam.historyToken : editor.historyToken)/\(mcpRevision)/\(conversionHistoryActions.count)"
+    }
+
+    func conversionHistoryTimeline(at index: Int) -> CutProject? {
+        if isMulticam {
+            guard feedAngleHistoryAction != nil else { return multicam.retainedTimeline(at: index) }
+            if index > editor.historyCursor { return multicam.retainedTimeline(at: index - editor.historyCursor - 1) }
+            return editor.retainedTimeline(at: index)
+        }
+        if let boundary = feedAngleSequenceBoundary, index > boundary {
+            return multicam.retainedTimeline(at: index - boundary - 1)
+        }
+        return editor.retainedTimeline(at: index)
+    }
+
+    func restoreConversionHistory(_ index: Int) {
+        let boundary = feedAngleSequenceBoundary ?? editor.historyCursor
+        if isMulticam {
+            guard feedAngleHistoryAction != nil else { multicam.moveToHistoryState(index); return }
+            if index > boundary {
+                multicam.moveToHistoryState(index - boundary - 1)
+            } else {
+                multicam.moveToHistoryState(0)
+                guard canUndoFeedAngleConversion else { return }
+                undoFeedAngleConversion()
+                if index < boundary { editor.moveToHistoryState(index) }
+            }
+        } else if index > boundary, hasFeedAngleConversionHistory {
+            editor.moveToHistoryState(boundary, beforeRestore: nil) { result in
+                guard case .success = result else {
+                    if case .failure(let error) = result {
+                        self.editor.alert = EditorNotice(title: "Couldn’t Restore History State", message: error.localizedDescription)
+                    }
+                    return
+                }
+                self.redoFeedAngleConversion()
+                if self.isMulticam { self.multicam.moveToHistoryState(index - boundary - 1) }
+            }
+        } else {
+            editor.moveToHistoryState(index)
+        }
+    }
+    @Published private(set) var isConvertingFeedAngles = false
+    private var feedAngleConversionWork: Task<MulticamProject, Error>?
+
+    func useFeedsAsMulticamAngles(sourceID: String, feedIDs: [String] = []) {
+        guard !isConvertingFeedAngles else { return }
+        let project = transcript.project
+        let document = isMulticam ? multicam.projectURL ?? multicam.draft.url : editor.projectURL ?? editor.draft.url
+        let context = document ?? LiveProjectMediaArchive.untitledURL
+        let revision = mcpRevision
+        let handle = mcpHandle
+        isConvertingFeedAngles = true
+        let work = sidecarWork.detached(priority: .userInitiated) {
+            try TileFeedAngles.usingFeeds(in: project, document: context, sourceID: sourceID, feedIDs: feedIDs,
+                                          cancelled: { Task.isCancelled })
+        }
+        feedAngleConversionWork = work
+        Task { [weak self] in
+            guard let self else { work.cancel(); return }
+            defer {
+                self.feedAngleConversionWork = nil
+                self.isConvertingFeedAngles = false
+            }
+            do {
+                let converted = try await work.value
+                guard self.mcpHandle == handle else { return }
+                try self.commitFeedAngles(converted, action: "Use Feeds as Multicam Angles", expectedRevision: revision)
+            } catch is CancellationError {
+            } catch {
+                guard self.mcpHandle == handle else { return }
+                if self.isMulticam { self.multicam.fail(error.localizedDescription) }
+                else { self.editor.alert = EditorNotice(title: "Use Feeds as Multicam Angles", message: error.localizedDescription) }
+            }
+        }
+    }
+
+    func commitFeedAngles(_ project: MulticamProject, action: String, expectedRevision: Int) throws {
+        guard mcpRevision == expectedRevision else {
+            throw MCPCommandError("stale_revision", "Current revision is \(mcpRevision). Read the project state again.")
+        }
+        if isMulticam {
+            guard multicam.edit(action, { $0 = project }) else {
+                throw MCPCommandError("editor_busy", "The multicam timeline is unavailable for editing.")
+            }
+            return
+        }
+        guard !editor.isBusy, !editor.mcpHasActiveTrim, editor.alert == nil,
+              let archive = editor.projectMediaArchive else {
+            throw MCPCommandError("editor_busy", "The sequence is unavailable for editing.")
+        }
+        let outputTime = editor.playhead
+        let handle = mcpHandle
+        editor.preview.pause()
+        try multicam.installFeedAngleConversion(project, from: editor, archive: archive, action: action)
+        editor.discardRedoBeforeFeedAngleConversion()
+        feedAngleConversion = (documentState, action, HistoryOrigin.current, handle, editor.mcpGeneration, multicam.mcpGeneration)
+        isMulticam = true
+        multicam.saveFeedAngleDraft()
+        multicam.seekAssemblyTimeline(outputTime, scrubbing: false)
+    }
+
+    func loadFeedAngleHistory(_ states: [CutHistoryState], at url: URL, archiveMedia: CutProjectMedia) {
+        guard let boundary = states.last else { return }
+        let isCurrentMulticam = isMulticam
+        let handle = mcpHandle
+        let didLoad: ([CutHistoryState]) -> Void = { [weak self] _ in
+            guard let self, self.isMulticam == isCurrentMulticam, self.mcpHandle == handle else { return }
+            if isCurrentMulticam { self.editor.invalidateFeedAngleDiskRevision() }
+            else { self.multicam.invalidateFeedAngleDiskRevision() }
+            let sequenceCursor = isCurrentMulticam ? self.editor.historyCursor : self.editor.projectHistory.count
+            guard let sequenceProject = self.editor.retainedTimeline(at: sequenceCursor) else { return }
+            let sequence = DocumentState.sequence(self.editor.projectURL ?? self.editor.draft.url,
+                                                   sequenceProject, self.editor.historyEntryIDs, sequenceCursor)
+            self.feedAngleConversion = (sequence, boundary.action, boundary.origin, handle,
+                                        self.editor.mcpGeneration, self.multicam.mcpGeneration)
+            if isCurrentMulticam { self.multicam.didOpenFeedAngleHistory() }
+            else { self.editor.didOpenFeedAngleHistory() }
+            self.objectWillChange.send()
+            self.editor.objectWillChange.send()
+            self.multicam.objectWillChange.send()
+        }
+        let history = Array(states.dropLast())
+        if isCurrentMulticam, let clips = boundary.project.sequenceClips {
+            do {
+                try editor.openProject(clips, at: url, history: (history, []), archiveMedia: archiveMedia,
+                                       stillProject: boundary.project, openingConversionHistory: true, onConversionHistory: didLoad)
+            } catch { multicam.fail(error.localizedDescription) }
+        } else if !isCurrentMulticam, case .multicam(let project) = boundary.project {
+            multicam.openProject(url, document: project, history: ([], history), archiveMedia: archiveMedia,
+                                 openingConversionHistory: true, onConversionHistory: didLoad)
+        }
+    }
+
+    func undoFeedAngleConversion() {
+        guard canUndoFeedAngleConversion else { return }
+        let assets = currentFeedAngleTranscriptAssets()
+        multicam.preview.pause()
+        multicam.draft.move(to: editor.draft)
+        isMulticam = false
+        editor.restoreAfterFeedAngleConversion(url: multicam.projectURL, diskRevision: multicam.feedAngleDiskRevision,
+                                               revision: multicam.mcpRevision, assets: assets)
+        feedAngleConversion?.sequence = documentState
+    }
+
+    func redoFeedAngleConversion() {
+        guard canRedoFeedAngleConversion else { return }
+        let assets = currentFeedAngleTranscriptAssets()
+        editor.preview.pause()
+        editor.draft.move(to: multicam.draft)
+        isMulticam = true
+        multicam.restoreFeedAngleConversion(url: editor.projectURL, diskRevision: editor.feedAngleDiskRevision,
+                                            revision: editor.mcpRevision, assets: assets)
+    }
+
+    private func currentFeedAngleTranscriptAssets() -> [String: TranscriptAsset] {
+        Dictionary(transcript.project.transcripts.attachments.map { ($0.asset.sha256, $0.asset) },
+                   uniquingKeysWith: { first, _ in first })
+    }
     var mcpMediaPreview: MCPProjectMediaPreview?
     private(set) var mcpModeGeneration = UUID()
     @Published var isMulticam = false {
-        didSet { if oldValue != isMulticam { mcpModeGeneration = UUID() } }
+        didSet {
+            guard oldValue != isMulticam else { return }
+            mcpModeGeneration = UUID()
+            presentation.participantMonitorSource = false
+        }
     }
     @Published var isHistoryPresented = false
     @Published var isTimelineMapPresented = false
+    @Published var isOutputSettingsPresented = false
+    @Published var isISOVerificationPresented = false
+    var afterOutputSettingsDismiss: (() -> Void)?
     weak var window: NSWindow? {
         didSet { applyCloseState() }
     }
@@ -58,6 +306,20 @@ final class ProjectSession: ObservableObject {
         self.id = id
         editor = EditorModel(preferences: preferences)
         multicam = MulticamEditorModel(preferences: preferences)
+        editor.conversionRedoArchive = { [weak self] in self?.feedAngleRedoArchive ?? [] }
+        multicam.conversionUndoArchive = { [weak self] in self?.feedAngleUndoArchive ?? [] }
+        presentation.participantMonitorSourceChanged = { [weak self] source in
+            self?.editor.preview.setParticipantSource(source)
+            self?.multicam.preview.setParticipantSource(source)
+        }
+        editor.participantSourceReset = { [weak self] in
+            guard let self, !self.isMulticam else { return }
+            self.presentation.participantMonitorSource = false
+        }
+        multicam.participantSourceReset = { [weak self] in
+            guard let self, self.isMulticam else { return }
+            self.presentation.participantMonitorSource = false
+        }
         Publishers.CombineLatest4($isMulticam, multicam.$isBusy, editor.$isExporting, editor.$isSavingSidecars)
             .map { isMulticam, busy, exporting, saving in isMulticam ? busy : exporting || saving }
             .removeDuplicates()
@@ -85,7 +347,8 @@ final class ProjectSession: ObservableObject {
     var isExporting: Bool { editor.isExporting || multicam.isExporting }
 
     var hasLifecycleModal: Bool {
-        window?.attachedSheet != nil || isHistoryPresented || isTimelineMapPresented || (isMulticam
+        window?.attachedSheet != nil || isHistoryPresented || isTimelineMapPresented || isOutputSettingsPresented
+            || isISOVerificationPresented || (isMulticam
             ? !multicam.setup.isEmpty || multicam.isBulkQueuePresented || multicam.isReplacementAudioPresented || multicam.report != nil
             : editor.isBulkQueuePresented || editor.cutPreview != nil)
     }
@@ -179,6 +442,7 @@ final class ProjectSession: ObservableObject {
     }
 
     func end() {
+        feedAngleConversionWork?.cancel()
         transcript.prepareForWindowEnd()
         windowDelegate?.detach()
         windowDelegate = nil
@@ -666,8 +930,10 @@ final class ProjectSessions: ObservableObject {
         func project(matching matches: (URL) -> Bool) -> ProjectSession? {
             sessions.values.first { session in
                 guard session !== excluded else { return false }
-                let urls = [session.multicam.openingProjectURL, session.multicam.projectURL, session.multicam.draft.url,
-                            session.editor.openingProjectURL, session.editor.projectURL, session.editor.draft.url]
+                let multicam = [session.multicam.openingProjectURL, session.multicam.projectURL, session.multicam.draft.url]
+                let sequence = [session.editor.openingProjectURL, session.editor.projectURL, session.editor.draft.url]
+                let urls = session.feedAngleProjectHandle == nil ? multicam + sequence
+                    : (session.isMulticam ? multicam : sequence)
                 return urls.compactMap { $0 }.contains(where: matches)
             }
         }
@@ -722,11 +988,15 @@ final class ProjectSessions: ObservableObject {
             throw CutError(code: "app_starting", message: "The application is still preparing its project windows.")
         }
         let history = (document.undo, document.redo)
+        let onConversionHistory: ([CutHistoryState]) -> Void = { [weak target] states in
+            target?.loadFeedAngleHistory(states, at: url, archiveMedia: document.media)
+        }
         switch document.project {
         case .sequence(let clips):
             target.isMulticam = false
             try target.editor.openProject(clips, at: url, history: history, reservation: reservation,
-                                          archiveMedia: document.media, allowCommit: commitCheck?(target))
+                                          archiveMedia: document.media, allowCommit: commitCheck?(target),
+                                          onConversionHistory: onConversionHistory)
             target.window?.makeKeyAndOrderFront(nil)
         case .stillSequence(let sequence):
             target.isMulticam = false
@@ -736,12 +1006,13 @@ final class ProjectSessions: ObservableObject {
             }
             try target.editor.openProject(clips, at: url, history: history, reservation: reservation,
                                           archiveMedia: document.media, allowCommit: commitCheck?(target),
-                                          stillProject: document.project)
+                                          stillProject: document.project, onConversionHistory: onConversionHistory)
             target.window?.makeKeyAndOrderFront(nil)
         case .multicam(let project):
             target.isMulticam = true
             target.multicam.openProject(url, document: project, history: history, reservation: reservation,
-                                        archiveMedia: document.media, allowCommit: commitCheck?(target))
+                                        archiveMedia: document.media, allowCommit: commitCheck?(target),
+                                        onConversionHistory: onConversionHistory)
         }
         return (target, false)
     }
@@ -806,20 +1077,24 @@ private struct ProjectWorkspace: View {
             session.presentation.showSettings = { [openSettings] in openSettings() }
         }
         .sheet(isPresented: $session.isHistoryPresented) {
-            if session.isMulticam {
-                ProjectHistoryView(actions: multicam.projectHistory, cursor: multicam.historyCursor,
-                                   disabled: multicam.isBusy, timeline: session.retainedTimeline,
-                                   restore: multicam.moveToHistoryState)
-            } else {
-                ProjectHistoryView(actions: editor.projectHistory, cursor: editor.historyCursor,
-                                   disabled: editor.isBusy, timeline: session.retainedTimeline,
-                                   restore: editor.moveToHistoryState)
-            }
+            ProjectHistoryView(actions: session.conversionHistoryActions, cursor: session.conversionHistoryCursor,
+                               disabled: session.isMulticam ? multicam.isBusy : editor.isBusy,
+                               timeline: session.conversionHistoryTimeline, restore: session.restoreConversionHistory)
         }
         .sheet(isPresented: $session.isTimelineMapPresented) {
             if let timeline = session.currentTimeline {
                 TimelineRangeMapView(timeline: timeline)
             }
+        }
+        .sheet(isPresented: $session.isOutputSettingsPresented, onDismiss: {
+            let action = session.afterOutputSettingsDismiss
+            session.afterOutputSettingsDismiss = nil
+            action?()
+        }) {
+            ProjectOutputSettingsView(session: session)
+        }
+        .sheet(isPresented: $session.isISOVerificationPresented) {
+            TilesISOExportSheet(session: session)
         }
         .background(ProjectWindowBinding(session: session, sessions: sessions, openWindow: openWindow,
                                          documentURL: session.isMulticam ? multicam.projectURL : editor.projectURL,

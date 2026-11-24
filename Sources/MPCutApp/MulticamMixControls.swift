@@ -79,7 +79,7 @@ struct MulticamMixControls: View {
             return .init(target: .camera(angle.id), label: angle.displayName,
                          detail: "\(angle.displayName) · Camera track · \(layouts)")
         }
-        let recordings = project.sources.filter { !boundSources.contains($0.id) }.flatMap { source in
+        let recordings = project.sources.filter { $0.feedAngle == nil && !boundSources.contains($0.id) }.flatMap { source in
             (model.media[source.id]?.audio ?? []).map { track in
                 MixTrackChoice(target: .recording(.init(source: source.id, stream: track.stream.index)),
                                label: "\(source.displayName) · Stream \(track.stream.index)",

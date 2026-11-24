@@ -177,6 +177,41 @@ func TestSDKHostStdio(t *testing.T) {
 	}
 }
 
+func TestTilesSchemaPinsEditorMutationsAndSelectsOneFileInput(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	session := connectSDKHost(t, ctx, socketPath(t), "2026-07-28")
+	defer session.Close()
+
+	call := func(name string, arguments map[string]any, valid bool) {
+		t.Helper()
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: arguments})
+		if err != nil || !result.IsError || len(result.Content) != 1 {
+			t.Fatalf("expected a validation or bridge error: %+v (%v)", result, err)
+		}
+		content, ok := result.Content[0].(*mcp.TextContent)
+		if !ok {
+			t.Fatalf("expected a text error, got %T", result.Content[0])
+		}
+		if valid && !strings.Contains(content.Text, `"code":"app_unavailable"`) {
+			t.Fatalf("valid %s did not reach the bridge: %s", name, content.Text)
+		}
+		if !valid && !strings.HasPrefix(content.Text, `validating "arguments":`) {
+			t.Fatalf("invalid %s passed validation: %s", name, content.Text)
+		}
+	}
+
+	edit := map[string]any{"project_handle": "timeline", "feed_id": "alice", "name": "Alice"}
+	call("tiles_editor_feeds_rename", edit, false)
+	edit["expected_revision"] = 7
+	call("tiles_editor_feeds_rename", edit, true)
+
+	inspect := map[string]any{"operation_id": "25ff1106-d43f-4b88-8a38-2854769ad82d", "project_path": "/tmp/meeting.cut"}
+	call("tiles_file_inspect", inspect, true)
+	inspect["analysis_file"] = "/tmp/meeting.json"
+	call("tiles_file_inspect", inspect, false)
+}
+
 func TestStillSchemaRejectsMixedPlacementFields(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()

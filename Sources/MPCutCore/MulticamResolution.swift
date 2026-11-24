@@ -48,7 +48,7 @@ extension MulticamEngine {
                             mode: ExportMode, tracks: ExportTracks = .all, assembly: [MulticamRange]? = nil,
                             settings: ReencodeSettings = .init(), indexedSources: [String: MediaInfo] = [:],
                             audioOutput: MulticamAudioOutput = .separateTracks, audioAction: ReencodeAudio? = nil) -> MulticamResolution {
-        if project.participants.render != nil {
+        if CutProject.multicam(project).requiresPictureProcessing {
             do {
                 let plan = try resolve(project, relativeTo: location, output: output, mode: mode, tracks: tracks,
                                        assembly: assembly, settings: settings, indexedSources: indexedSources,

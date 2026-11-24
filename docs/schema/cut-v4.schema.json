@@ -2454,43 +2454,8 @@
         "still_sha256": {
           "$ref": "#/$defs/transcriptDigest"
         },
-        "evidence": {
-          "type": "object",
-          "properties": {
-            "format": {
-              "type": "string"
-            },
-            "origin": {
-              "$ref": "#/$defs/transcriptTime"
-            },
-            "duration": {
-              "$ref": "#/$defs/transcriptTime"
-            },
-            "video_index": {
-              "type": "integer"
-            },
-            "index_issues": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "streams": {
-              "type": "array",
-              "items": {
-                "type": "object"
-              }
-            }
-          },
-          "required": [
-            "format",
-            "origin",
-            "duration",
-            "video_index",
-            "index_issues",
-            "streams"
-          ],
-          "additionalProperties": false
+        "evidence_sha256": {
+          "$ref": "#/$defs/transcriptDigest"
         },
         "previous_path": {
           "$ref": "#/$defs/file"

@@ -91,7 +91,8 @@ def verify_bitstream_rotation_refuses_scanned_geometry(harness):
     harness.assertEqual(report["error"]["code"], "participant_display_transform_changed")
     report = harness.cli("participants", "scan", "--file", str(source), "--backend", "cpu-only",
                          "--sampling", "sparse", ok=False)
-    harness.assertEqual(report["error"]["code"], "unsupported_display_transform")
+    # The detector library is optional. The output-side mismatch check above runs in either build.
+    harness.assertIn(report["error"]["code"], ("unsupported_display_transform", "participant_analysis_unavailable"))
 
     geometry.pop("analysis_identity")
     for appearance in geometry["appearances"]:
@@ -103,6 +104,72 @@ def verify_bitstream_rotation_refuses_scanned_geometry(harness):
     frame = harness.decode(output, size=(180, 320))[0]
     harness.assert_color(frame, 180, 45, 85, fixture.COVER, "rotated guest with manual bounds")
     harness.assert_color(frame, 180, 90, 235, fixture.HOST, "rotated host with manual bounds")
+
+
+def verify_native_treatment_and_confirmation(harness):
+    geometry = fixture.geometry()
+    geometry["coverage"] = [{"range": fixture.interval(0, 5), "state": "inferred"}]
+    project = harness.approved(harness.base("native-base"), "native-private", edited_geometry=geometry)
+    treatment = ("tiles", "feeds", "treatment", "--source-id", "gallery",
+                 "--feed-id", "guest", "--treatment", "cover", "--color", "#ff00ff", "--in-place")
+    harness.cli(*treatment, "--project", str(project))
+    harness.assertIsNone(read_project(project)["participants"].get("render"))
+    movie = harness.folder / "native-program.mov"
+    render = ("export", "project", "render", "--output", str(movie))
+
+    refusal = harness.cli(*render, "--project", str(project), "--mode", "copy", ok=False)
+    harness.assertEqual(refusal["error"]["code"], "participant_render_requires_encoding")
+    refusal = harness.cli(*render, "--project", str(project), "--dry-run", ok=False)
+    harness.assertEqual(refusal["error"]["code"], "unresolved_participant_privacy")
+    harness.assertFalse(movie.exists())
+
+    def review(label, time, *, expect_open=False):
+        directory = harness.folder / label
+        args = ("review", "frames", "export", "--project", str(project), "--clock", "assembly",
+                "--at", str(time), "--preset", "full", "--output", str(directory))
+        result = harness.cli(*args, ok=expect_open)
+        if expect_open:
+            frame, = result["frames"]
+            image = ffmpeg("-i", directory / frame["file"], "-pix_fmt", "rgb24", "-f", "rawvideo", "-")
+            width, height = frame["width"], frame["height"]
+            harness.assert_color(image, width, width * 3 // 4, height // 2, (255, 0, 255), "reviewed guest cover")
+        else:
+            harness.assertEqual(result["error"]["code"], "unresolved_participant_privacy")
+            harness.assertFalse(directory.exists())
+
+    review("before-confirmation", 0)
+    confirm = ("tiles", "feeds", "confirm", "--source-id", "gallery",
+               "--feed-id", "guest", "--in-place")
+    harness.cli(*confirm, "--project", str(project), "--from", "0", "--to", "1")
+    review("within-confirmation", 0, expect_open=True)
+    review("outside-confirmation", 2)
+
+    guest = next(a for a in geometry["appearances"] if a["participant_id"] == "guest" and fixture.rational(a["range"]["from"]) == 0)
+    bounds = guest["bounds"]
+    corrected = ",".join(str(bounds[key] if key != "width" else bounds[key] - 0.01)
+                         for key in ("x", "y", "width", "height"))
+    harness.cli("tiles", "box", "set", "--project", str(project), "--source-id", "gallery",
+                "--tile-id", guest["id"], "--from", "0", "--to", "1", "--bounds", corrected, "--in-place")
+    review("after-box-edit", 0)
+    harness.cli(*confirm, "--project", str(project))
+    review("after-reconfirmation", 0, expect_open=True)
+    review("inferred-absence", 3)
+    refusal = harness.cli(*render, "--project", str(project), ok=False)
+    harness.assertEqual(refusal["error"]["code"], "unresolved_participant_privacy")
+    harness.assertFalse(movie.exists())
+
+    # The source fixture has two verified offscreen intervals for the guest.
+    coverage = [(0, 3, "inferred"), (3, Fraction(27, 8), "verified"),
+                (Fraction(27, 8), Fraction(7, 2), "inferred"),
+                (Fraction(7, 2), Fraction(15, 4), "verified"), (Fraction(15, 4), 5, "inferred")]
+    geometry["coverage"] = [{"range": fixture.interval(start, end), "state": state}
+                            for start, end, state in coverage]
+    verified = harness.approved(harness.base("verified-absence-base"), "verified-absence", edited_geometry=geometry)
+    harness.cli(*treatment, "--project", str(verified))
+    harness.cli(*confirm, "--project", str(verified))
+    report = harness.cli(*render, "--project", str(verified))
+    harness.assertTrue(report["participant_render"]["publishable"])
+    harness.assertTrue(movie.exists())
 
 
 def main():
@@ -164,6 +231,26 @@ def main():
         harness.assertTrue(report["publishable"])
         harness.assertEqual(report["privacy_issues"], [])
 
+        # Clearing a native screen-share assignment makes its pixels unreviewed again.
+        native = harness.folder / "native-share.cut"
+        harness.cli("tiles", "tile", "screen-share", str(approved), "--tile-id", second["id"], "--out-project", str(native))
+        harness.cli("tiles", "feeds", "treatment", str(native), "--feed-id", "guest", "--treatment", "cover", "--in-place")
+        harness.cli("tiles", "link", str(native), "--tile-id", second["id"], "--clear", "--in-place")
+        at = second["range"]["from"]
+        review = harness.cli("tiles", "inspect", str(native), "--at", at)
+        harness.assertTrue(any(issue["kind"] == "unassigned_tile" and issue["tile_id"] == second["id"]
+                               for issue in review["issues"]))
+        frames_dir = harness.folder / "unassigned-share-frames"
+        frame = harness.cli("review", "frames", "export", "--project", str(native), "--clock", "assembly",
+                            "--at", at, "--output", str(frames_dir), ok=False)
+        harness.assertEqual(frame["error"]["code"], "unresolved_participant_privacy")
+        harness.assertFalse(list(frames_dir.glob("*.jpg")))
+        iso = harness.cli("tiles", "angles", "plan", str(native), "--all", "--no-meeting-mix")
+        harness.assertTrue(iso["requires_review"])
+        harness.assertTrue(any(issue["code"] == "unassigned_tiles" for issue in iso["issues"]))
+        old = harness.cli("participants", "render", "plan", request={"project_path": str(native), "plan": render}, ok=False)
+        harness.assertEqual(old["error"]["code"], "unsupported_legacy_participant_edit")
+
         second["role"], second["state"] = "thumbnail", "video"
         geometry["appearances"] = [a for a in geometry["appearances"] if a["id"] != "guest-stage-16"]
         uncertain = harness.approved(base, "uncertain", edited_geometry=geometry)
@@ -175,6 +262,7 @@ def main():
         harness.assert_color(frame, 320, 240, 45, fixture.GAP, "held unresolved guest seat")
         verify_rotated_vfr(harness)
         verify_bitstream_rotation_refuses_scanned_geometry(harness)
+        verify_native_treatment_and_confirmation(harness)
     finally:
         harness.doClassCleanups()
 

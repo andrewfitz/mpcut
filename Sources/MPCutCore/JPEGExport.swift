@@ -192,7 +192,7 @@ public enum JPEGExport {
         }
     }
 
-    package static func publishStillJPEG(_ jpeg: Data, source: URL, sourceIdentity: SourceIdentity,
+    package static func publishStillJPEG(_ jpeg: Data, source: URL?, sourceIdentity: SourceIdentity?,
                                          to output: URL, replacing confirmed: SourceIdentity?,
                                          cancelled: @escaping @Sendable () -> Bool,
                                          validate: () throws -> Void) throws {
@@ -218,9 +218,9 @@ public enum JPEGExport {
         }
     }
 
-    package static func validateStillDestination(_ output: URL, source: URL, sourceIdentity: SourceIdentity,
+    package static func validateStillDestination(_ output: URL, source: URL?, sourceIdentity: SourceIdentity?,
                                                  replacing confirmed: SourceIdentity?) throws {
-        guard output.isFileURL, output.resolvingSymlinksInPath() != source.resolvingSymlinksInPath() else {
+        guard output.isFileURL, output.resolvingSymlinksInPath() != source?.resolvingSymlinksInPath() else {
             throw CutError(code: "invalid_output", message: "Choose a separate JPEG file.")
         }
         var info = stat()
@@ -311,7 +311,7 @@ public enum JPEGExport {
                                       cancelled: @escaping @Sendable () -> Bool) throws -> MulticamJPEGManifest {
         let control = JPEGControl(cancelled)
         try control.check()
-        guard project.participants.render == nil else {
+        guard !CutProject.multicam(project).requiresPictureProcessing else {
             throw ParticipantProjectExport.unsupported("Program frame export")
         }
         guard !times.isEmpty else { throw CutError(code: "invalid_range", message: "Supply at least one group time.") }
@@ -746,7 +746,7 @@ final class JPEGRenderer {
 
     var displayTransform: CGAffineTransform { mp_jpeg_transform(reader) }
 
-    func picture(at pts: Int64, seekDTS: Int64, preset: JPEGPreset) throws -> CIImage {
+    func picture(at pts: Int64, seekDTS: Int64, preset: JPEGPreset, toneMapHDR: Bool = true) throws -> CIImage {
         var buffer: CVPixelBuffer?
         var error = [CChar](repeating: 0, count: 256)
         guard mp_jpeg_frame(reader, pts, seekDTS, preset == .review ? 640 : 0, &buffer, &error, error.count) >= 0,
@@ -760,7 +760,7 @@ final class JPEGRenderer {
         let transfer = CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil) as? String
         let isHDR = transfer == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String) ||
             transfer == (kCVImageBufferTransferFunction_ITU_R_2100_HLG as String)
-        var image = isHDR ? CIImage(cvPixelBuffer: buffer, options: [.toneMapHDRtoSDR: true]) : CIImage(cvPixelBuffer: buffer)
+        var image = isHDR && toneMapHDR ? CIImage(cvPixelBuffer: buffer, options: [.toneMapHDRtoSDR: true]) : CIImage(cvPixelBuffer: buffer)
         let display = mp_jpeg_display_size(reader)
         let natural = CGAffineTransform(scaleX: display.width / image.extent.width,
                                        y: display.height / image.extent.height)

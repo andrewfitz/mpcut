@@ -36,7 +36,7 @@ struct TranscriptCLI {
             case .read: return display.union(page).union(["occurrence_id"])
             case .search: return display.union(page).union(["query"])
             case .locate: return display.union(page).union(["word_id", "occurrence_id"])
-            case .export: return display.union(["format", "output"])
+            case .export: return display.union(["format", "output", "captions"])
             case .compare: return display.union(page).union(["query", "context_words"])
             case .alignScript: return display.union(page).union(["script", "script_file"])
             case .suggest: return display.union(page).union(["filler_terms"])
@@ -57,7 +57,7 @@ struct TranscriptCLI {
     let operation: Operation
     private let requestSource: String?
     private let commandRequest: [String: Any]
-    private static let boolFields: Set<String> = ["in_place", "include_inferred", "diarization", "download"]
+    private static let boolFields: Set<String> = ["in_place", "include_inferred", "diarization", "download", "captions"]
     private static let intFields: Set<String> = ["expected_speakers", "audio_stream_index", "channel", "assembly_index",
                                                   "offset", "limit", "context_words", "start_frame_nudge", "end_frame_nudge"]
     private static let arrayFields: Set<String> = ["selected_tracks", "filler_terms"]
@@ -258,6 +258,24 @@ private struct TranscriptCLIPage<Item: Encodable>: Encodable {
     }
 }
 
+func loadTileSwitchTranscripts(document: URL, attachmentID: String?, useSidecar: Bool, interruption: Interruption) throws
+    -> (MulticamProject, [TranscriptIndex]) {
+    let loaded = try TranscriptCLIProject(url: document)
+    guard case .multicam(let project) = loaded.project else {
+        throw CLIError("invalid_arguments", "Choose a multicam project for transcript switch proposals.")
+    }
+    let attachments = project.transcripts.attachments.filter { attachmentID == nil || $0.id == attachmentID }
+    guard !attachments.isEmpty else {
+        throw CLIError("transcript_attachment_missing", "No matching transcript attachment.")
+    }
+    let media = try loaded.indexMedia(forSpace: .group, useSidecar: useSidecar, interruption: interruption)
+    let indexes = try attachments.map { attachment in
+        try interruption.check()
+        return try loaded.index(document: loaded.document(attachment), attachment: attachment, media: media, spaces: [.source, .group])
+    }
+    return (project, indexes)
+}
+
 private struct TranscriptCLIProject {
     let url: URL
     let project: CutProject
@@ -360,8 +378,8 @@ private struct TranscriptCLIProject {
     }
 
     func indexMedia(forSpace space: TranscriptSpace, sequenceCoveragePaths: Set<String> = [],
-                    interruption: Interruption) throws -> IndexMedia {
-        let engine = CutEngine(cancelled: { !interruption.isActive })
+                    useSidecar: Bool = true, interruption: Interruption) throws -> IndexMedia {
+        let engine = CutEngine(cancelled: { !interruption.isActive }, useSidecar: useSidecar)
         var resolved = IndexMedia()
         try AnalysisSidecar.$excludedSources.withValue(
             AnalysisSidecar.excludedSources.union(media.sidecarExclusions(relativeTo: url))
@@ -963,12 +981,17 @@ extension TranscriptCLI {
         let space = try request.space(default: .currentCut)
         let filter = try request.filter()
         // Source and Group reads both report input coverage, which needs each bound recording's bounds.
-        let sourceCoveragePaths: Set<String> = operation == .read && space != .currentCut ? Set(attachments.flatMap { attachment in
-            attachment.bindings.filter { filter.trackID == nil || filter.trackID == $0.trackID }.compactMap(\.file)
+        let captions = operation == .export ? try request.optional("captions", Bool.self) ?? false : false
+        let sourceCoveragePaths: Set<String> = space != .currentCut ? Set(attachments.flatMap { attachment in
+            attachment.bindings.filter {
+                (operation == .read || (captions && space == .source && $0.sequenceClockOrigin == nil))
+                    && (filter.trackID == nil || filter.trackID == $0.trackID)
+                    && (filter.file == nil || filter.file == $0.file)
+            }.compactMap(\.file)
         }) : []
         let media = try loaded.indexMedia(forSpace: space, sequenceCoveragePaths: sourceCoveragePaths,
                                           interruption: interruption)
-        var spaces: Set<TranscriptSpace> = [.read, .search, .locate].contains(operation) ? [space] : Set(TranscriptSpace.allCases)
+        var spaces: Set<TranscriptSpace> = [.read, .search, .locate, .export].contains(operation) ? [space] : Set(TranscriptSpace.allCases)
         if operation == .read, case let .multicam(multicam) = loaded.project, !multicam.mixLanes.isEmpty {
             spaces.insert(.source)
         }
@@ -976,11 +999,16 @@ extension TranscriptCLI {
             try interruption.check()
             return try loaded.index(document: loaded.document(attachment), attachment: attachment, media: media, spaces: spaces)
         }
-        let index = TranscriptProjectIndex(indexes: indexes, space: space)
         if let expected = try request.optional("expected_attachment_results", [String: String].self),
-           expected != index.attachmentResults {
+           expected != Dictionary(attachments.map { ($0.id, $0.resultID) }, uniquingKeysWith: { first, _ in first }) {
             throw CutError(code: "stale_transcript_result", message: "The attachment results changed after the previous read.")
         }
+        if operation == .export {
+            try export(request, project: loaded, indexes: indexes, space: space, filter: filter,
+                       captions: captions, json: json, interruption: interruption)
+            return
+        }
+        let index = TranscriptProjectIndex(indexes: indexes, space: space)
         let page = try request.page()
         let occurrenceID = try request.optional("occurrence_id", String.self)
         switch operation {
@@ -1623,6 +1651,38 @@ private struct TranscriptImportReport: Encodable {
 }
 
 private extension TranscriptCLI {
+    func export(_ request: TranscriptCLIRequest, project: TranscriptCLIProject, indexes: [TranscriptIndex],
+                space: TranscriptSpace, filter: TranscriptFilter, captions: Bool, json: Bool, interruption: Interruption) throws {
+        let output = try request.url("output")
+        let format = try request.format(path: output?.path, default: captions ? .srt : (json ? .json : .text))
+        guard !captions || format == .srt else { throw CLIError("invalid_arguments", "--captions requires SRT output.") }
+        let bytes: Data
+        let wordCount: Int
+        if captions {
+            (bytes, wordCount) = try TranscriptCodec.captionExport(indexes, space: space, filter: filter)
+        } else {
+            bytes = try TranscriptCodec.encode(indexes, space: space, format: format, filter: filter)
+            wordCount = output == nil ? 0 : indexes.reduce(0) { $0 + $1.read(space: space, filter: filter, limit: 1).total }
+        }
+        if let output {
+            try project.media.validateDestination(output, relativeTo: project.url)
+            guard project.media.diskRevision?.matchesDestination(output) != true else {
+                throw CLIError("invalid_arguments", "Choose a separate transcript output file.")
+            }
+            try publish(bytes, to: output, interruption: interruption)
+            let warnings = project.project.participants.transcriptExportWarning.map { [$0] }
+            try writeJSON(TranscriptExportReceipt(output: output.path, space: space, format: format, words: wordCount,
+                                                  warnings: warnings),
+                          pretty: !json, checkCancellation: false)
+        } else {
+            try interruption.beginResponse()
+            if let warning = project.project.participants.transcriptExportWarning {
+                FileHandle.standardError.write(Data((warning + "\n").utf8))
+            }
+            try writeOutput(bytes + (bytes.last == 10 ? Data() : Data([10])))
+        }
+    }
+
     func runEditorial(_ request: TranscriptCLIRequest, project: TranscriptCLIProject,
                       indexes: [TranscriptIndex], words: [TranscriptOccurrence], space: TranscriptSpace, filter: TranscriptFilter,
                       page: (offset: Int, limit: Int), json: Bool, interruption: Interruption) throws {
@@ -1655,22 +1715,6 @@ private extension TranscriptCLI {
             let fillers = try request.optional("filler_terms", [String].self) ?? []
             let suggestions = TranscriptEditorial.suggest(words: words, fillerTerms: fillers)
             try writeJSON(TranscriptCLIPage(suggestions, page: page), pretty: !json)
-        case .export:
-            let output = try request.url("output")
-            let format = try request.format(path: output?.path, default: json ? .json : .text)
-            let bytes = try TranscriptCodec.encode(indexes, space: space, format: format, filter: filter)
-            if let output {
-                try project.media.validateDestination(output, relativeTo: project.url)
-                guard project.media.diskRevision?.matchesDestination(output) != true else {
-                    throw CLIError("invalid_arguments", "Choose a separate transcript output file.")
-                }
-                try publish(bytes, to: output, interruption: interruption)
-                try writeJSON(TranscriptExportReceipt(output: output.path, space: space, format: format, words: words.count),
-                              pretty: !json, checkCancellation: false)
-            } else {
-                try interruption.beginResponse()
-                try writeOutput(bytes + (bytes.last == 10 ? Data() : Data([10])))
-            }
         default: preconditionFailure()
         }
     }
@@ -1684,6 +1728,7 @@ private struct TranscriptExportReceipt: Encodable {
     let space: TranscriptSpace
     let format: TranscriptFormat
     let words: Int
+    let warnings: [String]?
 }
 
 private struct TranscriptCLIRead: Encodable {

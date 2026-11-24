@@ -59,6 +59,18 @@ Nearest media-frame timing can move a boundary by up to half a frame. When a del
 
 Choose **Export Transcript…** in the attachment’s options to write native JSON, readable text, SubRip, or WebVTT. Choose **Current Cut** for captions timed to the edited output and **Source** for the recording’s own timing. Transcript export creates a separate text or data file. Use media export to render an excerpt or movie.
 
+## Export captions for a video editor
+
+In **Transcript Options → Export Captions…**, choose **Current Cut** to write an SRT for the selected attachment in edited playback order. Align the SRT with the start of the exported movie, including any silence before the first caption. For an original recording, choose **Source** and select the matching recording track. From the CLI, use `--captions` for single-track SRT output and `--track-id` to select a recording (see the export example below). If multiple attachments use the same track ID, add `--attachment-id` or `--file` to select one recording. Timeline-only dialogue requires a timeline clock.
+
+For word-timed speech, MPCut breaks long utterances at word timestamps, targeting two lines of 42 characters and up to six seconds per cue. Imported subtitle dialogue keeps its original timing and line breaks. **Export Captions…** combines simultaneous speakers into one cue for the time they overlap. Speaker labels are visible caption text. Review overlapping speakers and choose the font, size, and position in the destination editor before burning captions into the picture.
+
+| Editor | Load the SRT | Burn captions into the movie |
+| --- | --- | --- |
+| DaVinci Resolve | Import the SRT into the Media Pool and place it on a subtitle track. To use a source-timed SRT as a clip transcript, right-click the matching clip and choose **Audio Transcription → Import from Subtitles** (under **AI Tools** in Resolve 21). | On the Deliver page, enable **Export Subtitle** and choose **Burn into video**. [Resolve editor guide](https://documents.blackmagicdesign.com/UserManuals/DaVinci-Resolve-18-Editors-Guide.pdf) · [Resolve transcription guide](https://documents.blackmagicdesign.com/SupportNotes/DaVinci_Resolve_21_New_Features_Guide.pdf) |
+| Final Cut Pro | Choose **File → Import → Closed Captions** and select the SRT. Choose **Relative to Timeline** for a Current Cut export. | In the share destination’s **Roles** settings, select the captions to burn in. [Apple caption guide](https://support.apple.com/guide/final-cut-pro/ver4185ef95a/mac) · [Apple export guide](https://support.apple.com/guide/final-cut-pro/ver245c7581b/mac) |
+| Premiere Pro | Import the SRT into the Project panel and drag it to the sequence start. Edit the resulting track in **Text → Captions**. | In **Export → Captions**, choose **Burn Captions Into Video**. [Adobe import guide](https://helpx.adobe.com/ie/premiere/desktop/add-text-images/insert-captions/import-caption-file-from-third-party-service.html) · [Adobe export guide](https://helpx.adobe.com/premiere/desktop/render-and-export/export-files/export-caption-tracks.html) |
+
 ## Use the command line
 
 Run `mpcut help transcript words search --json` for the request fields. Each action accepts flags, or one snake_case JSON object with fields such as `project_path` and `audio_stream_index` via `--input REQUEST.json` or `--stdin`. Add `--json` for structured output. With flag input, `--transcript -` reads the transcript itself from stdin.
@@ -73,7 +85,7 @@ mpcut transcript attachment import --file Interview.wav --audio-stream-index 0 -
     --out-project Interview-text.cut --json
 mpcut transcript words search --project Interview-text.cut --space current_cut \
     --query "expected benefit" --limit 5 --json
-mpcut transcript export --project Interview-text.cut --space current_cut --output Interview.srt
+mpcut transcript export --project Interview-text.cut --captions --space current_cut --output Interview.srt
 ```
 
 For an existing project, use `--project FILE.cut` on import and supply `--out-project FILE.cut` or `--in-place`. Inspect a raw transcript with `transcript attachment inspect --transcript FILE` or existing attachments with `transcript attachment inspect --project FILE.cut`. Add `--track-id ID` to page through the activity frames of a track in a transcript that still carries them. Use `transcript attachment bind` to update association or origin and `transcript attachment detach` to remove an attachment. To normalize a bare import to JSON, use `transcript attachment import --file MEDIA --transcript FILE --output FILE.json`.

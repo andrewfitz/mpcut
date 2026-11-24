@@ -290,7 +290,11 @@ final class PreviewSurface: NSView {
             status = forceSDR ? "SDR" : "Unknown"
             reason = forceSDR ? "Force SDR Preview treats the untagged picture as SDR." : "The picture has no transfer signaling."
         }
-        setStatus(status, frame: frame, reason: reason)
+        if let cover = frame.privacyCoverNote {
+            setStatus("Covered", frame: frame, reason: cover)
+        } else {
+            setStatus(status, frame: frame, reason: reason)
+        }
     }
 
     private func requestExtendedRange(_ enabled: Bool) {
@@ -309,7 +313,7 @@ final class PreviewSurface: NSView {
                        "program \(transfer?.program ?? "unresolved")", display].joined(separator: ", ")
         let description = "\(status). \(details). \(reason ?? "")"
         if badge.stringValue != status { badge.stringValue = status }
-        let error = status == "Unavailable" ? reason ?? "" : ""
+        let error = status == "Unavailable" || status == "Covered" ? reason ?? "" : ""
         if failure.stringValue != error { failure.stringValue = error }
         failure.isHidden = cleanFeed || error.isEmpty
         if badge.toolTip != description {

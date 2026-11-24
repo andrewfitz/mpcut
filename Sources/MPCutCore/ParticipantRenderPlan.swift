@@ -27,19 +27,19 @@ public struct ParticipantCanvas: Codable, Equatable, Sendable {
     }
 }
 
-public enum ParticipantShotLayout: String, Codable, Sendable {
-    case solo, pair, grid, flow, original
+public enum ParticipantShotLayout: String, Codable, Hashable, Sendable {
+    case solo, pair, grid, flow, original, arranged
 }
 
-public enum ParticipantSlotTarget: String, Codable, Sendable {
-    case participant, camera, presentation
+public enum ParticipantSlotTarget: String, Codable, Hashable, Sendable {
+    case participant, camera, presentation, empty
 }
 
-public enum ParticipantSlotFraming: String, Codable, Sendable {
+public enum ParticipantSlotFraming: String, Codable, Hashable, Sendable {
     case fit, fill
 }
 
-public struct ParticipantSlot: Codable, Equatable, Sendable {
+public struct ParticipantSlot: Codable, Hashable, Sendable {
     public var target: ParticipantSlotTarget
     /// Participant ID, logical camera angle ID, or presentation appearance ID.
     public var id: String
@@ -48,9 +48,11 @@ public struct ParticipantSlot: Codable, Equatable, Sendable {
     public var anchorY: Double
     public var background: UInt32?
     public var includeCameraOff: Bool
+    public var destinationTileID: String?
 
     private enum CodingKeys: String, CodingKey {
         case target, id, framing, background
+        case destinationTileID = "destination_tile_id"
         case anchorX = "anchor_x", anchorY = "anchor_y", includeCameraOff = "include_camera_off"
     }
 
@@ -63,11 +65,13 @@ public struct ParticipantSlot: Codable, Equatable, Sendable {
                   anchorX: try values.decodeIfPresent(Double.self, forKey: .anchorX) ?? 0.5,
                   anchorY: try values.decodeIfPresent(Double.self, forKey: .anchorY) ?? 0.5,
                   background: try values.decodeIfPresent(UInt32.self, forKey: .background),
-                  includeCameraOff: try values.decodeIfPresent(Bool.self, forKey: .includeCameraOff) ?? true)
+                  includeCameraOff: try values.decodeIfPresent(Bool.self, forKey: .includeCameraOff) ?? true,
+                  destinationTileID: try values.decodeIfPresent(String.self, forKey: .destinationTileID))
     }
 
     public init(target: ParticipantSlotTarget = .participant, id: String, framing: ParticipantSlotFraming = .fit,
-                anchorX: Double = 0.5, anchorY: Double = 0.5, background: UInt32? = nil, includeCameraOff: Bool = true) {
+                anchorX: Double = 0.5, anchorY: Double = 0.5, background: UInt32? = nil, includeCameraOff: Bool = true,
+                destinationTileID: String? = nil) {
         self.target = target
         self.id = id
         self.framing = framing
@@ -75,6 +79,7 @@ public struct ParticipantSlot: Codable, Equatable, Sendable {
         self.anchorY = anchorY
         self.background = background
         self.includeCameraOff = includeCameraOff
+        self.destinationTileID = destinationTileID
     }
 }
 
@@ -199,7 +204,7 @@ public struct ParticipantRenderPlan: Codable, Equatable, Sendable {
         self.unresolvedPrivacy = unresolvedPrivacy
     }
 
-    public func validate() throws {
+    public func validate(allowNativeLayouts: Bool = false) throws {
         guard (2...8192).contains(canvas.width), (2...8192).contains(canvas.height),
               canvas.width.isMultiple(of: 2), canvas.height.isMultiple(of: 2),
               canvas.frameRate > .zero, canvas.frameRate.seconds <= 120,
@@ -212,9 +217,11 @@ public struct ParticipantRenderPlan: Codable, Equatable, Sendable {
             case .original: capacity = 0
             case .solo: capacity = 1
             case .pair: capacity = 2
-            case .grid, .flow: capacity = 4
+            case .flow: capacity = 4
+            case .grid: capacity = allowNativeLayouts ? 64 : 4
+            case .arranged: capacity = allowNativeLayouts ? Int.max : 0
             }
-            guard shot.slots.count <= capacity, (capacity == 0 || !shot.slots.isEmpty),
+            guard (allowNativeLayouts || shot.layout != .arranged), shot.slots.count <= capacity, (capacity == 0 || !shot.slots.isEmpty),
                   !shot.compact || shot.layout == .flow else { throw invalid("The shot layout does not accommodate those slots.") }
             if let range = shot.range {
                 guard range.from < range.to, shot.clock != .output || range.from >= .zero,
@@ -223,6 +230,13 @@ public struct ParticipantRenderPlan: Codable, Equatable, Sendable {
                 }
             } else if shot.occurrence != nil {
                 throw invalid("Choose a time range for the assembly occurrence override.")
+            }
+            let destinations = shot.slots.compactMap(\.arrangedDestination)
+            guard shot.layout == .arranged
+                ? destinations.count == shot.slots.count && destinations.allSatisfy(validStillID)
+                    && Set(destinations).count == destinations.count
+                : destinations.isEmpty && !shot.slots.contains(where: { $0.target == .empty }) else {
+                throw invalid("Arranged slots require distinct destination tiles.")
             }
             for slot in shot.slots {
                 guard !slot.id.isEmpty, (0...1).contains(slot.anchorX), (0...1).contains(slot.anchorY),
@@ -244,7 +258,7 @@ public struct ParticipantRenderPlan: Codable, Equatable, Sendable {
         case .iso, .follow: guard audio.ids.count == 1 else { throw invalid("This audio policy requires a single ID.") }
         case .lanes: guard !audio.ids.isEmpty else { throw invalid("Select at least one audio lane.") }
         }
-        if shots.contains(where: { $0.layout == .original }), redactions.contains(where: { $0.treatment == .omit }) {
+        if !allowNativeLayouts, shots.contains(where: { $0.layout == .original }), redactions.contains(where: { $0.treatment == .omit }) {
             throw invalid("Choose blur or opaque cover when retaining the original layout.")
         }
     }
@@ -289,5 +303,11 @@ extension Array where Element == ParticipantTimedShot {
         let first = lowerBound { $0.range.to > range.from }
         let end = lowerBound { $0.range.from >= range.to }
         return self[first..<end]
+    }
+}
+
+extension ParticipantSlot {
+    package var arrangedDestination: String? {
+        destinationTileID ?? (target == .empty ? id : nil)
     }
 }

@@ -18,6 +18,7 @@ enum CommandPath {
         "participants render export": .render, "participants angles list": .angles,
         "participants angles take": .takeAngle, "participants angles plan": .planAngles, "participants angles render": .renderAngles
     ]
+    static let tiles = Dictionary(uniqueKeysWithValues: TilesCLI.Operation.allCases.map { ("tiles " + $0.rawValue, $0) })
     static let stills: [String: StillOptions.Operation] = [
         "timeline gap insert": .add, "still picture replace": .add, "still placement insert": .add,
         "still placement list": .list, "still placement update": .update, "still placement remove": .remove,
@@ -26,13 +27,13 @@ enum CommandPath {
         "still soundtrack detach": .detachSoundtrack
     ]
     static let paths = Set([
-        "project create", "project edit", "multicam switch coverage", "project convert", "project resolve import", "project resolve export", "analysis sidecar inspect",
+        "project create", "project edit", "multicam switch coverage", "project convert", "project document print", "project merge", "project resolve import", "project resolve export", "analysis sidecar inspect",
         "analysis sidecar build", "still project create", "silence shorten", "silence scan", "silence plan", "silence export",
         "scenes scan", "scenes export", "project media refresh", "project media list", "project media relink", "project media locate", "project media replace",
         "multicam sync suggest", "waveform envelope read", "review frames export",
         "timeline range map", "history compare", "media inspect", "project inspect", "export ranges separate", "export project render",
         "export clips join", "export soundtrack replace", "export ranges join"
-    ]).union(transcript.keys).union(stills.keys).union(participants.keys)
+    ]).union(transcript.keys).union(stills.keys).union(participants.keys).union(tiles.keys)
 
     static func match(_ tokens: [String]) -> String? {
         for count in [3, 2] where tokens.count >= count {

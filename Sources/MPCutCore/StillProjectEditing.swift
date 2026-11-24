@@ -294,8 +294,8 @@ extension CutProject {
                     guard let range = item.group else { throw insertConflict(item.still!.id) }
                     let split = try range.from.adding(position.subtracting(start))
                     items.replaceSubrange(index...index, with: [
-                        .group(.init(from: range.from, to: split), angle: item.angleOverride), .still(insert),
-                        .group(.init(from: split, to: range.to), angle: item.angleOverride)
+                        item.groupPiece(.init(from: range.from, to: split), to: split), .still(insert),
+                        item.groupPiece(.init(from: split, to: range.to), from: split, keepingID: false)
                     ])
                     project.assemblyItems = items
                     return
@@ -357,6 +357,10 @@ extension CutProject {
                     if span.from != original.from { clip.id = ProjectIdentifier.make() }
                     clip.from = span.from
                     clip.to = span.to
+                    clip.tileLayouts = original.tileLayouts.compactMap {
+                        $0.limited(from: span.from == original.from ? nil : span.from,
+                                   to: span.to == original.to ? nil : span.to)
+                    }
                     return clip
                 }
                 // Split replacement coverage at the same boundaries as normal clip
@@ -424,9 +428,11 @@ private extension StillSequenceProject {
         }
         var left = original
         left.to = time
+        left.tileLayouts = original.tileLayouts.compactMap { $0.limited(from: nil, to: time) }
         var right = original
         right.id = rightID
         right.from = time
+        right.tileLayouts = original.tileLayouts.compactMap { $0.limited(from: time, to: nil) }
         items.replaceSubrange(index...index, with: [.source(left), .source(right)])
         for placement in stillReplacements.indices {
             guard case .sequence(let fragments) = stillReplacements[placement].coverage else { continue }
@@ -459,7 +465,7 @@ private extension StillSequenceItem {
 private extension StillAssemblyItem {
     func duration() throws -> RationalTime {
         switch self {
-        case .group(let range, _): try range.to.subtracting(range.from)
+        case .group(let range, _, _, _): try range.to.subtracting(range.from)
         case .still(let insert): insert.duration
         }
     }

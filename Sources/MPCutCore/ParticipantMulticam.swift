@@ -157,7 +157,7 @@ public enum ParticipantMulticam {
         let (source, gallery, identity) = try excerpt(project, document: document, sourceID: first.sourceID,
                                                       range: first.range, cancelled: cancelled)
         let isoSnapshots = audio.includeISOs ? snapshots(in: source, document: document) : [:]
-        let renderer = ParticipantRenderer(cancelled: cancelled)
+        let renderer = ParticipantRenderer(cancelled: cancelled, legacyWholeFramePrivacy: true)
         let reports: [ParticipantMulticamReport.Angle] = try angles.map { angle in
             let sound = iso(for: angle, in: source, routing: audio)
             let plan = try anglePlan(angle, participants: project.participants, canvas: canvas, audio: sound)
@@ -190,7 +190,7 @@ public enum ParticipantMulticam {
             throw CutError(code: "invalid_output", message: "Choose a new folder in an existing output directory.")
         }
         let engine = CutEngine(cancelled: cancelled, useSidecar: false)
-        let renderer = ParticipantRenderer(cancelled: cancelled)
+        let renderer = ParticipantRenderer(cancelled: cancelled, legacyWholeFramePrivacy: true)
         try engine.checkCancellation()
         let (source, gallery, identity) = try excerpt(project, document: document, sourceID: first.sourceID,
                                                       range: first.range, cancelled: cancelled)
@@ -272,7 +272,7 @@ public enum ParticipantMulticam {
         return result
     }
 
-    private static func iso(for angle: ParticipantVirtualAngle, in project: CutProject,
+    static func iso(for angle: ParticipantVirtualAngle, in project: CutProject,
                             routing: ParticipantMulticamAudioRouting) -> ParticipantRenderAudio {
         let id = angle.targetID ?? angle.id
         guard routing.includeISOs, angle.kind == .participant, project.participants.audioBinding(for: id) != nil else {
@@ -290,7 +290,7 @@ public enum ParticipantMulticam {
         return first
     }
 
-    private static func snapshots(in project: CutProject, document: URL) -> [URL: SourceIdentity] {
+    static func snapshots(in project: CutProject, document: URL) -> [URL: SourceIdentity] {
         // An ISO can use a recording, a lane or a lane's replacement.
         var snapshots: [URL: SourceIdentity] = [:]
         for (_, path) in project.mediaPaths {
@@ -302,11 +302,11 @@ public enum ParticipantMulticam {
         return snapshots
     }
 
-    private static func usedSoundFiles(_ report: ParticipantRenderReport) -> [URL] {
+    static func usedSoundFiles(_ report: ParticipantRenderReport) -> [URL] {
         report.audioActions.flatMap { $0.sources.map { $0.file.standardizedFileURL } }
     }
 
-    private static func verifyISOs(_ files: Set<URL>, against snapshots: [URL: SourceIdentity]) throws {
+    static func verifyISOs(_ files: Set<URL>, against snapshots: [URL: SourceIdentity]) throws {
         for file in files {
             guard let identity = snapshots[file], identity.isCurrentSnapshot(at: file) else {
                 throw CutError(code: "source_changed", message: "The ISO source changed while preparing the angle group: \(file.path)")
@@ -314,7 +314,7 @@ public enum ParticipantMulticam {
         }
     }
 
-    private static func excerpt(_ project: CutProject, document: URL, sourceID: String, range: MulticamRange,
+    static func excerpt(_ project: CutProject, document: URL, sourceID: String, range: MulticamRange,
                                 cancelled: (@Sendable () -> Bool)? = nil) throws
         -> (project: CutProject, file: URL, identity: SourceIdentity) {
         try project.validate()
@@ -349,7 +349,8 @@ public enum ParticipantMulticam {
             guard media.hasVideo, range.to <= media.duration else {
                 throw invalid("The virtual angle's range is outside the recording's picture.")
             }
-            selected = .sequence([.init(id: "gallery-excerpt", file: sourceID, from: range.from, to: range.to)])
+            let clip = CutSequenceClip(id: "gallery-excerpt", file: sourceID, from: range.from, to: range.to)
+            selected = .stillSequence(.init(items: [.source(clip)], programColorPolicy: project.programColorPolicy))
         }
         var participants = project.participants
         participants.render = nil
@@ -358,7 +359,7 @@ public enum ParticipantMulticam {
         return (selected, gallery, media.identity)
     }
 
-    private static func meetingMix(in source: CutProject, galleryID: String, document: URL,
+    static func meetingMix(in source: CutProject, galleryID: String, document: URL,
                                    timeline: StillTimelinePlan, binding: ParticipantAudioBinding?,
                                    cancelled: (@Sendable () -> Bool)?) throws -> StillSoundPlan {
         var soundtrack = source

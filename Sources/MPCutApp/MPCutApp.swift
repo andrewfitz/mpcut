@@ -73,8 +73,14 @@ private struct ProjectCommands: Commands {
             }
             if let session {
                 ExportCommands(editor: session.editor, multicam: session.multicam, isMulticam: isMulticam,
-                               isConverting: sessions.isConvertingProject, export: { sessions.chooseExternalExport($0, in: session) })
+                               isConverting: sessions.isConvertingProject, export: { sessions.chooseExternalExport($0, in: session) },
+                               showOutputSettings: { session.presentOutputSettings() })
             }
+            Button("Verify ISO Delivery…") {
+                guard let session, !session.hasLifecycleModal else { return }
+                session.isISOVerificationPresented = true
+            }
+            .disabled(session == nil)
         }
         CommandGroup(replacing: .undoRedo) {
             if let session {
@@ -229,6 +235,7 @@ private struct ExportCommands: View {
 
     let isConverting: Bool
     let export: (ExternalProjectFormat) -> Void
+    let showOutputSettings: () -> Void
 
     var body: some View {
         Menu("Export Project") {
@@ -251,6 +258,9 @@ private struct ExportCommands: View {
         .keyboardShortcut("e", modifiers: [.command, .option])
         .disabled(isMulticam ? !multicam.canActOnRange : !editor.canActOnRange)
         .help("Export selected range")
+        Button("Export Settings…", action: showOutputSettings)
+            .disabled(isMulticam ? multicam.project == nil || multicam.isBusy : !editor.canEdit || editor.isAudioOnly)
+            .help("Set the output canvas and soundtrack")
         if isMulticam {
             Button("Export Multicam…", action: multicam.chooseProgramExport)
                 .keyboardShortcut("e")

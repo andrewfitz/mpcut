@@ -73,6 +73,26 @@ final class MulticamQueueAndAudioTests: XCTestCase {
     }
 
     @MainActor
+    func testPauseTakeKeepsSingleAssemblyOccurrenceWithOriginalLayout() throws {
+        let camera = try fixture("ProRes-2997", extension: "mov")
+        let info = try CutEngine(useSidecar: false).inspectMulticamSource(camera)
+        let model = MulticamEditorModel()
+        defer { model.reset() }
+        model.confirmSetup(drafts: [.init(source: .init(id: "wide", file: camera.path), media: info)],
+                           opening: "wide", audio: .none)
+        let group = MulticamRange(from: info.frames[1].time, to: info.frames[6].time)
+        let original = TileLayoutSpan(range: group, layout: .original)
+        XCTAssertTrue(model.edit { $0.assemblyItems = [.group(group, id: "original", layouts: [original])] })
+        let expectedDuration = try group.to.subtracting(group.from)
+        XCTAssertTrue(model.enqueuePauseTakes([.init(from: .zero, to: expectedDuration)]))
+        let queued = try XCTUnwrap(model.queuedRanges.first)
+        let item = try XCTUnwrap(queued.snapshot.assemblyItems?.first)
+        XCTAssertTrue(queued.usesAssembly)
+        XCTAssertEqual(item.occurrenceID, "original")
+        XCTAssertEqual(item.tileLayouts, [original])
+    }
+
+    @MainActor
     func testRangeQueuedDuringIndexingKeepsItsRecordingIdentity() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)

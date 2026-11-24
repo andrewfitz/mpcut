@@ -35,7 +35,7 @@ extension MulticamEditorModel {
         let index = suggestion.edge.range - 1
         guard let range = assemblyRange(at: index), let moved = suggestion.moving(range, to: time) else { return false }
         var items = assemblyItems
-        items[index] = .group(moved, angle: items[index].angleOverride)
+        items[index] = items[index].trimmingGroup(to: moved)
         preview.pause()
         guard edit("Move Range Edge", { $0.assemblyItems = items }) else { return false }
         edgeSuggestion = nil

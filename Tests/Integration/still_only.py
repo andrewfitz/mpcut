@@ -13,7 +13,7 @@ import wave
 from xml.etree import ElementTree
 
 from media_regression import ffmpeg, probe, run, sample_hashes
-from saved_project import read_project, saved_file, saved_text
+from saved_project import read_project
 
 CLI = None
 
@@ -92,21 +92,16 @@ class StillOnlyTests(unittest.TestCase):
             sibling = root / "Sibling.cut"
             run([CLI, "project", "convert", xml, "--output", sibling])
             sibling_project = read_project(sibling)
-            self.assertEqual(saved_file(sibling_project, sibling_project["still_assets"][0]["file"]), image.name)
+            self.assertEqual(sibling_project["still_assets"][0]["file"], image.name)
             nested = root / "nested"
             nested.mkdir()
             restored = nested / "Restored.cut"
             run([CLI, "project", "convert", xml, "--output", restored])
             original = read_project(cut)
             result = read_project(restored)
-            for project in (original, result):
-                for clip in project["clips"]:
-                    still = clip["still"]
-                    for key in ("id", "asset_id"):
-                        still[key] = saved_text(project, still[key])
             self.assertEqual(result["clips"], original["clips"])
             self.assertEqual(result["still_format"], original["still_format"])
-            self.assertEqual(saved_file(result, result["still_assets"][0]["file"]), "../Card #1.png")
+            self.assertEqual(result["still_assets"][0]["file"], "../Card #1.png")
 
     def test_interchange_refuses_a_timeline_with_no_retained_material(self):
         with tempfile.TemporaryDirectory(prefix="mpcut-still-conversion-") as directory:
@@ -211,7 +206,7 @@ class StillOnlyTests(unittest.TestCase):
                     project = read_project(cut)
                     self.assertIn(project["schema_version"], (4, 5))
                     self.assertEqual(project["clips"][0]["kind"], "still")
-                    self.assertEqual(saved_file(project, project["still_assets"][0]["file"]), image.name)
+                    self.assertEqual(project["still_assets"][0]["file"], image.name)
                     self.assertEqual(project["program_color_policy"]["transfer"], transfer)
                     run([
                         CLI, "still", "placement", "insert", "--project", cut, "--image", last_image, "--clock", "sequence", "--at", "1001/6000", "--duration", "1001/30000", "--in-place", "--json",

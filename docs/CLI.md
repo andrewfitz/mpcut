@@ -214,7 +214,7 @@ mpcut waveform envelope read --stream 1 --from 2 --to 2.1 --columns 1024 --json 
 
 `review frames export` writes JPEGs and `manifest.json` to a new directory. File review defaults to scene midpoints. Use `--select non-silent` for audio-driven ranges, with optional stream and detector settings. Explicit times supplied through repeated `--at` or an `--at-file` list go directly to those pictures. The review preset limits the long edge to 640 pixels. Full uses display resolution. Add `--format png` or `--format tiff` for lossless frames in place of the default JPEGs. Both keep the decoded R′G′B′ values, with 16 bits per channel when the source has more than 8, and embed the profile that describes them: sRGB, Rec. 709, Display P3, or BT.2100 PQ or HLG. A PQ or HLG source is written as its HDR signal. The JPEG holds the tone-mapped SDR rendition in sRGB. Still placements and generated gaps on a program clock are written as 16-bit sRGB. The manifest reports `format` for PNG and TIFF.
 
-Frame manifests use `schema_version` 2. Read `frame_time`, `frame_pts` (when available), and `file` for each source frame. For single-source footage, `clip_from` and `clip_to` give frame-aligned export bounds. A multicam project defaults to the group clock, which returns a row per angle, including gaps. Use the assembly clock to review the edited program, including visible stills. Recording gaps in the selected angle export black frames marked `generated_gap`. For a sequence project, use the sequence clock.
+Frame manifests use `schema_version` 2. Read `frame_time`, `frame_pts` when available, and `file` for each source frame. For single-source footage, `clip_from` and `clip_to` give frame-aligned export bounds. Multicam projects with tile processing default to the assembly clock. With either assembly or group time, they return one rendered program frame per request and `frame_time` on that clock. Other multicam projects default to the group clock and return a row per angle, including gaps. Use the assembly clock to review the edited program, including visible stills. Recording gaps in the selected angle export black frames marked `generated_gap`. For a sequence project, use the sequence clock.
 
 `waveform envelope read` reads signed minimum and maximum sample amplitudes per bin from one audio stream. It defaults to the entire source, the first audio stream and 1,024 columns. Set `--columns` from 1 through 65,536.
 
@@ -276,7 +276,63 @@ When a multicam boundary fails, read `error.multicam` and `error.nearest`. If `m
 
 ## Edit camera feeds and recorded calls
 
-Participant commands require a TileTrail-enabled build. `mpcut help participants --json` lists the request fields.
+Use `mpcut tiles` to scan a recording, correct the assignments, or deliver synchronized movies. Automatic scanning requires a TileTrail-enabled build. Inspection and delivery can start from accepted tiles in a saved project.
+
+```sh
+mpcut tiles scan gallery.mov --output gallery-scan.json --progress stderr --json
+mpcut tiles inspect gallery-scan.json --issues --json
+mpcut tiles preview gallery-scan.json --at 00:00:12 --output gallery.png
+mpcut tiles accept --project interview.cut --source-id gallery --scan gallery-scan.json --out-project reviewed.cut
+mpcut tiles accept --project reviewed.cut --clear-count-hints --in-place
+mpcut tiles feeds list reviewed.cut --json
+```
+
+The scan summary's `issues` lists count mismatches. Its `review_issue_count` gives the number of entries in `tiles inspect SCAN.json --issues`, including uncertain matches, coverage gaps and layout changes. The receipt from `tiles accept` gives the corresponding count for the edited recording in the project.
+
+Feed decisions about one tile share a `group_id` and report their `group_count`, in `tiles inspect --issues` and in the issues of `tiles export-isos`. An issue's `feed_id` is the scan's own feed for the tile, and `candidate_feed_ids` lists the earlier feeds it may be. To keep the tile on its own feed, run one `tiles link --tile-id ID --feed-id OWN` with no `--from` or `--to`. If it is the same person as an earlier feed, first fold the own feed into it with `tiles feeds merge --feed-id OWN --into-feed-id EARLIER`, then link the whole tile to `EARLIER`. Either settles the whole group. Each issue keeps its own range, so `--on-uncertain blank` still covers only the flagged frames.
+
+`--at`, and the bounds of a tile correction, refer to the recording's source clock. Use `--source-id ID` when a project contains several tile recordings. Edits to a saved project require `--out-project FILE` or `--in-place`.
+
+When the linked TileTrail supports incremental checkpoints, a tile-only scan with `--output` can resume from its most recent committed checkpoint. Rerun with the same input, options and output path. An interrupted scan keeps its checkpoint next to the requested output. A scan that finds incomplete coverage saves its report, including the affected intervals. Legacy resume files and scans that include scenes use decoded replay to reconstruct the tracker.
+
+To deliver every eligible feed from a source, use the one-shot command. To deliver a subset, make a plan with a `--feed-id` for each selected feed, then render that plan.
+
+```sh
+mpcut tiles export-isos gallery.mov --output Gallery-ISOs --progress jsonl --json
+mpcut tiles angles plan --project reviewed.cut --feed-id HOST_ID --output host-plan.json
+mpcut tiles angles render --plan host-plan.json --output Host-ISO
+mpcut tiles angles verify Host-ISO --json
+```
+
+Each ISO preserves time while its feed is offscreen. A raw recording can supply a common mix. A separate microphone requires a binding in the reviewed project. A transcript speaker binding cannot supply isolated audio.
+
+If preflight needs a decision, the job exits 3 and returns `status: "needs_review"` alongside `review_project_path`, `issues`, and `suggested_next_command`. For raw input the review project is created beside the destination in a private folder. Open or inspect that project and resolve its issues. To revise a count expectation, run `tiles accept` with `--expected-feeds` or `--max-visible-tiles`. Use `--clear-count-hints` to remove both expectations. Both edits preserve the accepted tiles and feed IDs without rescanning. Then pass the project to `export-isos` with the same destination. Use `--resume` to reuse the matching finished files from an interrupted delivery. Use `--on-uncertain blank` to cover eligible uncertain intervals and `--no-meeting-mix` to omit the shared mix. `angles verify` checks the delivery against its manifest.
+
+A full `tiles inspect` report on a project includes `layouts` in timeline order. Each sequence clip has a row, including clips with an empty layout list. Multicam reports include the group and each assembly occurrence. Use `--at` or a source-time range to see the scopes and layouts applicable to the selected recording at those times.
+
+To draw tiles by hand, start with `mpcut tiles feeds add edit.cut --name Guest --in-place --json`. Use the returned `feed_id` with `tiles box add --feed-id` for a new box or `tiles link --feed-id` for an existing box. A feed belongs to the project and appears in a recording's feed list once a tile there is assigned to it.
+
+Use `tiles layout list` to find a clip or multicam occurrence. For a sequence, address a layout with `--clip-id` in source time. For multicam, use `--group` or `--occurrence-id` in group time. A feed's treatment applies wherever that feed appears, including outside the selected layout range.
+
+Arranged layouts map feeds to tile positions. A range that crosses gallery changes is split into layout spans at each change. Every destination must resolve to a unique tile throughout the requested range. If a smaller gallery loses a position, the command returns `unmappable_tile_layout` with the destination, recording and source time and leaves the project unchanged. Set separate ranges with destinations visible in each gallery.
+
+```sh
+mpcut tiles layout list reviewed.cut --json
+mpcut tiles layout set reviewed.cut --clip-id CLIP_ID --layout solo --feed-id HOST_ID --in-place
+mpcut tiles feeds treatment reviewed.cut --feed-id GUEST_ID --treatment blur --in-place
+mpcut tiles angles use reviewed.cut --all --out-project angles.cut
+mpcut tiles switches propose angles.cut --attachment-id TRANSCRIPT_ID --voice-angle SPEAKER_ID=ANGLE_ID --json
+```
+
+`angles use` creates angles that reference the original recording. A single recording can retain multiple audio tracks. When multiple recordings contribute sound, sequence conversion supports one selected track per recording. A sequence with multiple audio tracks continuing across recordings needs to keep its existing timeline to preserve track continuity.
+
+`switches propose` reports proposed cuts. Apply the chosen cuts as ordinary multicam switches.
+
+### Existing participant commands
+
+The `mpcut participants` entry points continue to accept their existing requests. `mpcut help participants --json` lists their request fields.
+
+For projects that fit the legacy format, `participants project inspect` returns the familiar roster, source geometry and timed shots, and `participants project apply` accepts that JSON. Projects with clip layouts that cannot be translated to timed shots, arranged layouts, grids of more than four cells, screen-share feeds or live feed angles return `unsupported_legacy_participant_edit` and leave the project file untouched.
 
 ```sh
 mpcut participants scan --file gallery.mov --output gallery-scan.json --progress stderr --json
@@ -343,6 +399,10 @@ mpcut project convert interview.cut --to resolve --output interview.drp --json
 mpcut project resolve export --project interview.cut --output interview.fcpxml --json
 ```
 
+`mpcut project merge BASE OURS THEIRS` merges two branches of a project for Git and replaces OURS with the result. It merges the edit line by line and the media snapshot by recording, and leaves undo history out. Register it with `git config merge.mpcut.driver "mpcut project merge %O %A %B"` and the `.gitattributes` line `*.cut merge=mpcut`. Exit status 1 means both branches changed the same lines, and OURS then holds plain project JSON with conflict markers, or that the merged project cannot be opened, and OURS then holds the merged text. See [version control](CUT-FORMAT.md#version-control).
+
+`mpcut project document print interview.cut` expands the saved references to produce readable JSON, with one field of the edit to a line. Use that output for schema validation. It reads hand-written projects, and standard input when given `-`. [Project format and schema validation](CUT-FORMAT.md)
+
 `project convert` works with MPCut `.cut`, Resolve `.drp` and `.drt`, Premiere `.prproj`, and Final Cut Pro `.fcpbundle`, `.fcpxml` and `.fcpxmld`. The input and output extensions select adapters. `--to cut|resolve|premiere|fcp` checks the chosen destination format. Native operations can require the editing app. Use `--allow-loss` to accept reported approximations. For a Premiere delivery, `--allow-loss --flatten-multicam` keeps selected picture and sound while discarding alternate angles.
 
 `project resolve export` writes an editable FCPXML timeline. Use `project resolve import` to write it and import it into the active Resolve project. For an ordinary file edit, use `--clips LIST --output FILE.fcpxml` or an edit request through `--stdin` or `--input`. Keep source media and generated `Audio` or `Sources` folders available. Render projects with still edits to media when you need the generated pictures preserved. [Resolve handoff](../README.md#export-a-project-to-davinci-resolve) · [Premiere interchange](PREMIERE.md)
@@ -368,7 +428,7 @@ A clip’s `--ranges` file can contain CSV or JSON. Its times are relative to th
 - Paths in flags and request files resolve relative to the working directory. Paths stored in a named `.cut` resolve from the project directory. Commands that accept `--project -` resolve paths in that streamed project from the working directory. Quote shell paths with spaces and use `./` for a filename starting with a dash. Use fresh output paths with existing parent directories.
 - Ranges include their start and exclude their end. CLI times accept seconds, `MM:SS`, `HH:MM:SS`, and fractions such as `1001/30000`. Preserve exact times in edit JSON as strings or objects such as `{"numerator":1001,"denominator":30000}`.
 - With `--stdin`, send one UTF-8 JSON object and close stdin. `export clips join` and `export ranges separate` require `--json` with `--stdin`. Use `--input FILE.json` as the file equivalent for those commands and for `resolve`, `silence`, `scenes`, and transcript operations. `scenes` and `silence` can replay the reports they produce. With `--json`, consume one response object on stdout and drain stderr separately for progress and diagnostics.
-- Exit status `0` means success, `1` operation failure, `2` invalid CLI arguments or request, and `130` cancellation. Inspect `error.code`, `error.message`, `error.nearest` and `error.alternatives` when present. `error.segment` identifies the one-based input clip or saved multicam assembly range. `failed_range` identifies a one-based batch range.
+- Exit status `0` means success, `1` operation failure, `2` invalid CLI arguments or request, `3` an ISO delivery that needs review, and `130` cancellation. Inspect `error.code`, `error.message`, `error.nearest` and `error.alternatives` when present. `error.segment` identifies the one-based input clip or saved multicam assembly range. `failed_range` identifies a one-based batch range.
 - For `unsafe_boundary`, use the reported boundary or preflight an allowed mode or snap change. For `unsupported_container`, choose a compatible extension for the selected tracks. For `output_exists`, choose a fresh destination. For `source_changed`, rescan before replaying a report.
 
 An edit request takes `output` and either a top-level `project_path` or a nonempty array of clips. An optional top-level `file` supplies the default source for file clips. A batch request takes `file`, `output_directory`, and `ranges`.

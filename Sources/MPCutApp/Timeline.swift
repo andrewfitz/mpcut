@@ -168,6 +168,20 @@ struct SequenceTimeline: View {
     var sceneOverlaysByClip: [UUID: TimelineSceneOverlay] = [:]
     var viewNamesBySource: [UUID: [Int: String]] = [:]
     var sceneRevision = 0
+    var tileContent: [UUID: TileTimelineContent] = [:]
+    var onResizeTileSpan: ((TileTimelineContent.FeedSpan, TimelineEdge, Double) -> Void)?
+    var onClearTileLayouts: (() -> Void)?
+    var showTileFeeds: Binding<Bool> = .constant(false)
+    fileprivate var tileFeedRows: [TileTimelineContent.Feed] {
+        guard showTileFeeds.wrappedValue else { return [] }
+        return TileTimelineContent.feedRows(in: tileContent)
+    }
+    fileprivate var hasTileLayouts: Bool { tileContent.values.contains(where: \.hasLayouts) }
+    fileprivate var hasTileOverrides: Bool { tileContent.values.contains { !$0.overrides.isEmpty } }
+    var tileLaneHeight: CGFloat {
+        (hasTileLayouts ? 22 : 0) + (hasTileOverrides ? 22 : 0) + CGFloat(tileFeedRows.count) * 14
+    }
+    var hasTileFeeds: Bool { tileContent.values.contains { !$0.feeds.isEmpty } }
     var audioOnly = false
     var showsWaveform = false
     var soundtrack: TimelineSoundtrack?
@@ -219,6 +233,8 @@ struct SequenceTimeline: View {
     var onCancelTrim: () -> Void = {}
     var validateHandle: TimelineHandleValidation? = nil
     var thumbnail: ((UUID, Double, CGSize) async -> CGImage?)? = nil
+    var outputThumbnailRevision: TimelineOutputRevision?
+    var outputThumbnail: ((RationalTime, CGSize) async -> CGImage?)?
 
     var audioTrackLabels: ((UUID) -> [String])?
     var onMonitorAudio: ((Int, UUID) -> Void)?
@@ -240,7 +256,7 @@ struct SequenceTimeline: View {
             TimelineScrollSurface(timeline: self, zoom: pow(2, zoom.wrappedValue),
                                   hidesCutSections: hidesCutSections,
                                   revealTime: revealTime, revealRequest: revealRequest)
-                .frame(height: (showsControls ? 87 : 65) + thumbnailHeight + waveformHeight + sourceRulerHeight + assemblyAssetHeight)
+                .frame(height: (showsControls ? 87 : 65) + thumbnailHeight + waveformHeight + sourceRulerHeight + assemblyAssetHeight + tileLaneHeight)
         }
     }
 
@@ -261,6 +277,12 @@ struct SequenceTimeline: View {
             PaneIconButton(title: hidesCutSections ? "Show cut sections" : "Hide cut sections",
                            symbol: hidesCutSections ? "eye.slash" : "eye", active: hidesCutSections) {
                 hidesCutSections.toggle()
+            }
+            if hasTileFeeds {
+                Toggle("Feeds", isOn: showTileFeeds)
+                    .toggleStyle(.button)
+                    .help("Show feed visibility on the timeline")
+                    .accessibilityIdentifier("timeline.tile-feeds")
             }
             TimelineViewControls(zoom: zoom, largeThumbnails: largeThumbnails, audioOnly: audioOnly)
                 .layoutPriority(1)
@@ -577,9 +599,11 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         let size: CGSize
         var openingClock: OpeningClock? = nil
         var mediaRevision = 0
+        var outputTime: RationalTime?
 
         static func == (lhs: Self, rhs: Self) -> Bool {
-            lhs.source == rhs.source && lhs.sourceTime == rhs.sourceTime && lhs.size == rhs.size && lhs.openingClock == rhs.openingClock && lhs.mediaRevision == rhs.mediaRevision
+            lhs.source == rhs.source && lhs.sourceTime == rhs.sourceTime && lhs.size == rhs.size
+                && lhs.openingClock == rhs.openingClock && lhs.mediaRevision == rhs.mediaRevision && lhs.outputTime == rhs.outputTime
         }
 
         func hash(into hasher: inout Hasher) {
@@ -589,6 +613,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             hasher.combine(size.height)
             hasher.combine(openingClock)
             hasher.combine(mediaRevision)
+            hasher.combine(outputTime)
         }
     }
 
@@ -609,6 +634,17 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     var timeline: SequenceTimeline? {
         didSet {
             let previousDuration = sequenceDuration
+            if oldValue?.outputThumbnailRevision != timeline?.outputThumbnailRevision {
+                thumbnailTask?.cancel()
+                thumbnailRequests = []
+                visibleThumbnailTiles.removeAll()
+                filmstripTilesByPosition.removeAll()
+                thumbnails.removeAll(keepingCapacity: true)
+                thumbnailOrder.removeAll(keepingCapacity: true)
+                unavailableThumbnails.removeAll(keepingCapacity: true)
+                filmstripViewport = nil
+                needsDisplay = true
+            }
             // Editor snapshots retain this native array across playhead updates.
             // A new edit supplies new storage with the current source geometry.
             let sharedClips = oldValue?.clips.withUnsafeBufferPointer { previous in
@@ -653,12 +689,18 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             let laneHeightChanged = oldValue?.thumbnailHeight != timeline?.thumbnailHeight ||
                 oldValue?.waveformHeight != timeline?.waveformHeight || oldValue?.showsSourceRuler != timeline?.showsSourceRuler
             if laneHeightChanged { window?.invalidateCursorRects(for: self) }
-            if laneHeightChanged || oldValue?.markIn != timeline?.markIn || oldValue?.markOut != timeline?.markOut {
+            let tileLanesChanged = oldValue?.tileContent != timeline?.tileContent
+                || oldValue?.tileFeedRows.map(\.id) != timeline?.tileFeedRows.map(\.id)
+            if tileLanesChanged {
+                tileDrag = nil
+                window?.invalidateCursorRects(for: self)
+            }
+            if laneHeightChanged || tileLanesChanged || oldValue?.markIn != timeline?.markIn || oldValue?.markOut != timeline?.markOut {
                 updateTimelineOverlay()
             }
             if !sharedClips || oldValue?.sceneRevision != timeline?.sceneRevision ||
                 oldValue?.showsWaveform != timeline?.showsWaveform || oldValue?.selection != timeline?.selection ||
-                laneHeightChanged || paddingChanged || oldValue?.assemblyAssets != timeline?.assemblyAssets
+                laneHeightChanged || tileLanesChanged || paddingChanged || oldValue?.assemblyAssets != timeline?.assemblyAssets
                 || oldValue?.soundtrack != timeline?.soundtrack
                 || (oldValue?.thumbnail == nil) != (timeline?.thumbnail == nil) {
                 needsDisplay = true
@@ -744,6 +786,9 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     private var waveformHeight: CGFloat { timeline?.waveformHeight ?? 0 }
     private var waveformTop: CGFloat { laneTop + 21 + thumbnailHeight }
     private var sourceRulerTop: CGFloat { waveformTop + waveformHeight }
+    private var tileLaneTop: CGFloat { laneTop + laneHeight + 4 }
+    private var tileLaneBottom: CGFloat { tileLaneTop + (timeline?.tileLaneHeight ?? 0) }
+    private var tileDrag: (span: TileTimelineContent.FeedSpan, edge: TimelineEdge, initialX: CGFloat, x: CGFloat)?
     private var laneHeight: CGFloat { thumbnailHeight + 29 + waveformHeight + (timeline?.sourceRulerHeight ?? 0) }
     private var thumbnailWidth: CGFloat {
         timeline?.largeThumbnails.wrappedValue == true ? TimelineClip.largeTileWidth : TimelineClip.tileWidth
@@ -751,7 +796,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
 
     fileprivate var playheadRect: NSRect? {
         guard let timeline, !positions.isEmpty, trimPosition == nil else { return nil }
-        return NSRect(x: x(at: timeline.playhead) - 10, y: 16, width: 20, height: laneTop + laneHeight - 10)
+        return NSRect(x: x(at: timeline.playhead) - 10, y: 16, width: 20, height: tileLaneBottom - 14)
     }
 
     override var isFlipped: Bool { true }
@@ -855,8 +900,9 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             } else {
                 element.setAccessibilityLabel(position.clip.stripLabel)
             }
+            let tileBadge = timeline?.tileContent[id].map { $0.edited || $0.hasLayouts } == true ? ", Tile edits" : ""
             element.setAccessibilityValue(
-                "\(timelineTime(position.sequenceStart, milliseconds: true))–\(timelineTime(position.sequenceEnd, milliseconds: true))"
+                "\(timelineTime(position.sequenceStart, milliseconds: true))–\(timelineTime(position.sequenceEnd, milliseconds: true))\(tileBadge)"
             )
             let hasSourceTime = timeline?.showsSourceRuler == true && !position.clip.isStill && !position.clip.isGap
             let mediaHelp = [position.clip.mediaIssue, position.clip.mediaURL?.path].compactMap { $0 }.joined(separator: "\n")
@@ -897,7 +943,78 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             element.setAccessibilityCustomActions(timeline?.allowsClipEdits == true && !position.clip.isGap ? actions : [])
             return element
         }
-        return [accessibleRuler] + children.map { $0 as NSAccessibilityElement }
+        return [accessibleRuler] + children.map { $0 as NSAccessibilityElement } + accessibleTileLanes()
+    }
+
+    private func accessibleTileLanes() -> [NSAccessibilityElement] {
+        guard let timeline, !timeline.tileContent.isEmpty else { return [] }
+        let visible = visibleRect
+        let first = firstClipIndex { stripX(at: $0.stripEnd) > visible.minX }
+        var elements: [NSAccessibilityElement] = []
+
+        func add(_ title: String, range: MulticamRange, top: CGFloat, height: CGFloat,
+                 position: PositionedClip, span: TileTimelineContent.FeedSpan? = nil) {
+            let lower = max(range.from.seconds, position.sourceStart)
+            let upper = min(range.to.seconds, position.sourceEnd)
+            guard lower < upper else { return }
+            let left = stripX(at: position.sourceOrigin + lower)
+            let right = stripX(at: position.sourceOrigin + upper)
+            let bounds = NSRect(x: left, y: top, width: right - left, height: height).intersection(visible)
+            guard !bounds.isEmpty else { return }
+            let element = NSAccessibilityElement()
+            element.setAccessibilityElement(true)
+            element.setAccessibilityRole(.staticText)
+            element.setAccessibilityLabel(title)
+            element.setAccessibilityValue("\(timelineTime(position.sequenceStart + lower - position.sourceStart))–\(timelineTime(position.sequenceStart + upper - position.sourceStart))")
+            element.setAccessibilityParent(self)
+            element.setAccessibilityFrameInParentSpace(accessibilityParentRect(bounds))
+            if let span, isEditingEnabled, timeline.onResizeTileSpan != nil {
+                let target = position.sourceStart + timeline.playhead - position.sequenceStart
+                var actions: [NSAccessibilityCustomAction] = []
+                if span.hasStart, target >= position.sourceStart && target < upper {
+                    actions.append(NSAccessibilityCustomAction(name: "Move Feed Start to Playhead") { [weak self] in
+                        self?.timeline?.onResizeTileSpan?(span, .start, target)
+                        return self != nil
+                    })
+                }
+                if span.hasEnd, target > lower && target <= position.sourceEnd {
+                    actions.append(NSAccessibilityCustomAction(name: "Move Feed End to Playhead") { [weak self] in
+                        self?.timeline?.onResizeTileSpan?(span, .end, target)
+                        return self != nil
+                    })
+                }
+                element.setAccessibilityCustomActions(actions)
+            }
+            elements.append(element)
+        }
+
+        for index in first..<positions.count {
+            let position = position(at: index)
+            if stripX(at: position.keptStart) >= visible.maxX { break }
+            guard let content = timeline.tileContent[position.clip.id] else { continue }
+            var y = tileLaneTop
+            if timeline.hasTileLayouts {
+                for layout in content.layouts {
+                    add("\(content.layoutName(layout)) layout", range: layout.range,
+                        top: y, height: 22, position: position)
+                }
+                y += 22
+            }
+            if timeline.hasTileOverrides {
+                for layout in content.overrides {
+                    add("\(content.layoutName(layout)) occurrence override", range: layout.range,
+                        top: y, height: 22, position: position)
+                }
+                y += 22
+            }
+            for row in timeline.tileFeedRows {
+                for span in content.feeds.first(where: { $0.id == row.id })?.spans ?? [] {
+                    add("\(row.name) feed", range: span.range, top: y, height: 14, position: position, span: span)
+                }
+                y += 14
+            }
+        }
+        return elements
     }
 
     /// NSAccessibilityElement reads parent-space frames as unflipped view coordinates.
@@ -916,6 +1033,10 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             let index = firstClipIndex { stripX(at: $0.stripEnd) > local.x }
             if positions.indices.contains(index), clipRect(position(at: index)).contains(local) {
                 return children?[index + 1]
+            }
+            if local.y >= tileLaneTop,
+               let hit = accessibleTileLanes().first(where: { $0.accessibilityFrame().contains(point) }) {
+                return hit
             }
             return super.accessibilityHitTest(point)
         }
@@ -1083,7 +1204,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
 
         fill(dirtyRect, NSColor.controlBackgroundColor)
         if !timeline.assemblyAssets.isEmpty {
-            let top = laneTop + laneHeight + 5
+            let top = tileLaneBottom + 1
             fill(NSRect(x: 0, y: top, width: bounds.width, height: 1), .separatorColor)
             for asset in timeline.assemblyAssets {
                 let left = x(at: asset.interval.from.seconds)
@@ -1106,6 +1227,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
              NSColor.labelColor.withAlphaComponent(0.055))
         fill(NSRect(x: 0, y: laneTop - 3, width: bounds.width, height: 1), .separatorColor)
 
+        drawTileLaneBackground(dirtyRect)
         let waveformOnly = waveformHeight > 0 && dirtyRect.minY >= waveformTop && dirtyRect.maxY <= waveformTop + waveformHeight
         if !waveformOnly { updateVisibleFilmstrip(visibleRect) }
         var visibleWaveforms = Set<WaveformSurface>()
@@ -1133,6 +1255,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
                 if position.clip.isGap { continue }
                 drawClip(position, index: index, selected: position.clip.id == timeline.selection,
                          visible: visible, dirty: dirtyRect, waveformOnly: waveformOnly)
+                drawTileLanes(for: position, visible: visible, dirty: dirtyRect)
             }
             if let soundtrack = timeline.soundtrack {
                 let left = x(at: soundtrack.output.from.seconds)
@@ -1146,16 +1269,183 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
                 }
             }
 
+            if let tileDrag {
+                fill(NSRect(x: tileDrag.x, y: tileLaneTop, width: 1, height: tileLaneBottom - tileLaneTop), .controlAccentColor)
+            }
             if let trimPosition, let trimClipIndex {
                 let position = position(at: trimClipIndex)
                 let edge = trimPosition.edge == .start ? position.keptStart : position.keptEnd
-                drawTimelinePlayhead(x: stripX(at: edge), top: 16, bottom: laneTop + laneHeight + 6, color: .controlAccentColor)
+                drawTimelinePlayhead(x: stripX(at: edge), top: 16, bottom: tileLaneBottom + 2, color: .controlAccentColor)
                 drawTrimTime(trimPosition.time, edgeX: stripX(at: edge))
             } else if !(enclosingScrollView is TimelineScrollView) {
-                drawTimelinePlayhead(x: x(at: timeline.playhead), top: 16, bottom: laneTop + laneHeight + 6, color: .systemRed)
+                drawTimelinePlayhead(x: x(at: timeline.playhead), top: 16, bottom: tileLaneBottom + 2, color: .systemRed)
             }
         }
     }
+
+    private func tileLaneTitle(top: CGFloat, height: CGFloat, dirty: NSRect) {
+        let area = NSRect(x: visibleRect.minX, y: top, width: visibleRect.width, height: height)
+        guard area.intersects(dirty) else { return }
+        fill(area, NSColor.labelColor.withAlphaComponent(0.055))
+        fill(NSRect(x: area.minX, y: top, width: area.width, height: 1), .separatorColor)
+    }
+
+    private func drawTileLaneBackground(_ dirty: NSRect) {
+        guard let timeline else { return }
+        var y = tileLaneTop
+        if timeline.hasTileLayouts {
+            tileLaneTitle(top: y, height: 22, dirty: dirty)
+            y += 22
+        }
+        if timeline.hasTileOverrides {
+            tileLaneTitle(top: y, height: 22, dirty: dirty)
+            y += 22
+        }
+        for _ in timeline.tileFeedRows {
+            tileLaneTitle(top: y, height: 14, dirty: dirty)
+            y += 14
+        }
+    }
+
+    private func drawTileLanes(for position: PositionedClip, visible: NSRect, dirty: NSRect) {
+        guard let timeline, let content = timeline.tileContent[position.clip.id] else { return }
+        let origin = position.sourceOrigin
+        let left = max(position.sourceStart, stripTime(at: visible.minX) - origin)
+        let right = min(position.sourceEnd, stripTime(at: visible.maxX) - origin)
+        guard right > left else { return }
+        var y = tileLaneTop
+
+        func layouts(_ spans: [TileLayoutSpan], color: NSColor, heading: String) {
+            let row = NSRect(x: visible.minX, y: y, width: visible.width, height: 22)
+            guard row.intersects(dirty) else { return }
+            let first = spans.lowerBound { $0.range.to.seconds > left }
+            for span in spans[first...] {
+                guard span.range.from.seconds < right else { break }
+                let x = stripX(at: origin + max(left, span.range.from.seconds))
+                let end = stripX(at: origin + min(right, span.range.to.seconds))
+                let box = NSRect(x: x, y: y + 2, width: max(1, end - x - 1), height: 18)
+                fill(box, color.withAlphaComponent(0.28))
+                NSGraphicsContext.saveGraphicsState()
+                NSBezierPath(rect: box).addClip()
+                label(heading + content.layoutName(span), at: NSPoint(x: x + 4, y: y + 4),
+                      font: .systemFont(ofSize: 10, weight: .medium), color: .labelColor)
+                NSGraphicsContext.restoreGraphicsState()
+            }
+        }
+        if timeline.hasTileLayouts {
+            layouts(content.layouts, color: .systemPurple, heading: timeline.hasTileOverrides ? "Group · " : "")
+            y += 22
+        }
+        if timeline.hasTileOverrides {
+            layouts(content.overrides, color: .systemIndigo, heading: "Occurrence · ")
+            y += 22
+        }
+        for row in timeline.tileFeedRows {
+            let top = y
+            y += 14
+            guard NSRect(x: visible.minX, y: top, width: visible.width, height: 14).intersects(dirty),
+                  let feed = content.feeds.first(where: { $0.id == row.id }) else { continue }
+            for span in feed.spans where span.range.from.seconds < right && span.range.to.seconds > left {
+                let x = stripX(at: origin + max(left, span.range.from.seconds))
+                let end = stripX(at: origin + min(right, span.range.to.seconds))
+                let rect = NSRect(x: x, y: top + 2, width: end - x, height: 10)
+                fill(rect, NSColor.systemTeal.withAlphaComponent(0.30))
+                NSGraphicsContext.saveGraphicsState()
+                NSBezierPath(rect: rect).addClip()
+                let hatch = NSBezierPath()
+                for tick in stride(from: x - 10, to: end, by: 5) {
+                    hatch.move(to: .init(x: tick, y: rect.maxY))
+                    hatch.line(to: .init(x: tick + 10, y: rect.minY))
+                }
+                NSColor.systemTeal.withAlphaComponent(0.60).setStroke()
+                hatch.stroke()
+                for coverage in span.coverage where coverage.range.from.seconds < right && coverage.range.to.seconds > left {
+                    let x = stripX(at: origin + max(left, coverage.range.from.seconds))
+                    let end = stripX(at: origin + min(right, coverage.range.to.seconds))
+                    fill(NSRect(x: x, y: top + 2, width: end - x, height: 10), .systemTeal)
+                }
+                label(feed.name, at: NSPoint(x: x + 4, y: top + 1),
+                      font: .systemFont(ofSize: 9, weight: .medium), color: .labelColor)
+                NSGraphicsContext.restoreGraphicsState()
+            }
+        }
+        let first = content.ticks.lowerBound { $0.seconds >= left }
+        for tick in content.ticks[first...] {
+            guard tick.seconds < right else { break }
+            let x = stripX(at: origin + tick.seconds)
+            fill(NSRect(x: x, y: laneTop + laneHeight - 7, width: 1, height: max(7, y - laneTop - laneHeight + 6)),
+                 .systemPurple)
+        }
+    }
+
+    private func tileSpan(at point: NSPoint, nearEdge: Bool = false)
+        -> (span: TileTimelineContent.FeedSpan, edge: TimelineEdge, origin: Double, position: PositionedClip)? {
+        guard let timeline, timeline.onResizeTileSpan != nil else { return nil }
+        let feedsTop = tileLaneTop + (timeline.hasTileLayouts ? 22 : 0) + (timeline.hasTileOverrides ? 22 : 0)
+        guard point.y >= feedsTop, point.y < tileLaneBottom else { return nil }
+        let row = Int((point.y - feedsTop) / 14)
+        let feedID = timeline.tileFeedRows[row].id
+        let first = firstClipIndex { stripX(at: $0.stripEnd) >= point.x - 4 }
+        for index in first..<positions.count {
+            let position = position(at: index)
+            guard stripX(at: position.keptStart) <= point.x + 4 else { break }
+            guard let feed = timeline.tileContent[position.clip.id]?.feeds.first(where: { $0.id == feedID }) else { continue }
+            let origin = position.sourceOrigin
+            for span in feed.spans {
+                let from = stripX(at: origin + span.range.from.seconds)
+                let to = stripX(at: origin + span.range.to.seconds)
+                if span.hasStart, abs(point.x - from) <= 4 {
+                    return (span, .start, origin, position)
+                }
+                if span.hasEnd, abs(point.x - to) <= 4 {
+                    return (span, .end, origin, position)
+                }
+                if !nearEdge, from <= point.x, point.x <= to {
+                    return (span, .start, origin, position)
+                }
+            }
+        }
+        return nil
+    }
+
+    private func tileGrip(at point: NSPoint) -> (span: TileTimelineContent.FeedSpan, edge: TimelineEdge, origin: Double)? {
+        guard let hit = tileSpan(at: point, nearEdge: true),
+              abs(stripX(at: hit.origin + (hit.edge == .start ? hit.span.range.from.seconds : hit.span.range.to.seconds)) - point.x) <= 4 else { return nil }
+        return (hit.span, hit.edge, hit.origin)
+    }
+
+    private func tileLaneMenu(at point: NSPoint) -> NSMenu? {
+        guard isEditingEnabled, let timeline else { return nil }
+        let menu = NSMenu()
+        if let hit = tileSpan(at: point) {
+            let target = hit.position.sourceStart + timeline.playhead - hit.position.sequenceStart
+            if hit.span.hasStart, target >= hit.position.sourceStart, target < hit.span.range.to.seconds {
+                addTileSpanMenuItem(menu, title: "Move Feed Start to Playhead", span: hit.span, edge: .start, target: target)
+            }
+            if hit.span.hasEnd, target > hit.span.range.from.seconds, target <= hit.position.sourceEnd {
+                addTileSpanMenuItem(menu, title: "Move Feed End to Playhead", span: hit.span, edge: .end, target: target)
+            }
+        } else if timeline.hasTileLayouts, (tileLaneTop..<(tileLaneTop + (timeline.hasTileOverrides ? 44 : 22))).contains(point.y),
+                  timeline.onClearTileLayouts != nil {
+            let item = menu.addItem(withTitle: "Clear Layout in Marks", action: #selector(clearTileLayouts), keyEquivalent: "")
+            item.target = self
+        }
+        return menu.items.isEmpty ? nil : menu
+    }
+
+    private func addTileSpanMenuItem(_ menu: NSMenu, title: String, span: TileTimelineContent.FeedSpan,
+                                     edge: TimelineEdge, target: Double) {
+        let item = menu.addItem(withTitle: title, action: #selector(moveTileSpan(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = (span, edge, target)
+    }
+
+    @objc private func moveTileSpan(_ sender: NSMenuItem) {
+        guard let (span, edge, target) = sender.representedObject as? (TileTimelineContent.FeedSpan, TimelineEdge, Double) else { return }
+        timeline?.onResizeTileSpan?(span, edge, target)
+    }
+
+    @objc private func clearTileLayouts() { timeline?.onClearTileLayouts?() }
 
     private func drawDragMarkers() {
         if let csvTarget, positions.indices.contains(csvTarget) {
@@ -1346,6 +1636,16 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             textRect.origin.x += 15
             textRect.size.width -= 15
         }
+        if let content = timeline?.tileContent[position.clip.id], (content.edited || content.hasLayouts),
+           textRect.width >= 48 {
+            let badgeWidth: CGFloat = 29
+            let badge = NSRect(x: textRect.maxX - badgeWidth, y: nameRect.minY - 1, width: badgeWidth, height: 15)
+            NSColor.systemPurple.withAlphaComponent(0.28).setFill()
+            NSBezierPath(roundedRect: badge, xRadius: 4, yRadius: 4).fill()
+            label("Tiles", at: NSPoint(x: badge.minX + 4, y: badge.minY + 1),
+                  font: .systemFont(ofSize: 10, weight: .semibold), color: .labelColor)
+            textRect.size.width -= badgeWidth + 3
+        }
         (position.clip.stripLabel as NSString).draw(in: textRect, withAttributes: [
             .font: NSFont.systemFont(ofSize: 11, weight: selected ? .semibold : .medium),
             .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph,
@@ -1470,7 +1770,8 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         let viewport = FilmstripViewport(visible: visible.minX..<visible.maxX, scale: scale,
                                          tileSize: CGSize(width: thumbnailWidth, height: thumbnailHeight),
                                          backingScale: window?.backingScaleFactor ?? 2,
-                                         enabled: timeline?.thumbnail != nil)
+                                         enabled: timeline?.outputThumbnailRevision == nil
+                                            ? timeline?.thumbnail != nil : timeline?.outputThumbnail != nil)
         guard filmstripViewport != viewport else { return }
         filmstripViewport = viewport
         visibleThumbnailTiles.removeAll(keepingCapacity: true)
@@ -1505,6 +1806,25 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
 
         let size = CGSize(width: viewport.tileSize.width * viewport.backingScale,
                           height: viewport.tileSize.height * viewport.backingScale)
+        if timeline?.outputThumbnailRevision != nil {
+            let clip = position.clip
+            let keptLeft = rect.minX + (clip.sourceStart - position.displayFrom) * viewport.scale
+            let keptRight = rect.minX + (clip.sourceEnd - position.displayFrom) * viewport.scale
+            return tiles.compactMap { tile in
+                let range = layout.tileRange(tile, origin: rect.minX, displayScale: viewport.backingScale)
+                let left = max(keptLeft, range.lowerBound)
+                let right = min(keptRight, range.upperBound)
+                guard left < right else { return nil }
+                let delta = Double((left + (right - left) / 2 - keptLeft) / viewport.scale)
+                guard let time = timelineRationalTime((clip.sequenceRange?.lowerBound ?? position.sequenceStart) + delta) else { return nil }
+                let key = ThumbnailKey(source: clip.sourceID, sourceTime: 0, size: size,
+                                       mediaRevision: clip.mediaRevision, outputTime: time)
+                let tileRect = NSRect(x: left, y: rect.minY, width: right - left, height: rect.height)
+                keys.append(key)
+                visibleThumbnailTiles[key, default: []].append(tileRect)
+                return VisibleFilmstripTile(rect: tileRect, key: key, fallbacks: [])
+            }
+        }
         let groups = min(tiles.count, TimelineFilmstrip.openingFrameLimit)
         let middle = groups / 2
         let last = groups - 1
@@ -1569,7 +1889,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
             guard tile.rect.minX < dirty.maxX else { break }
             guard needsToDraw(tile.rect) else { continue }
             guard let image = thumbnails[tile.key] ?? tile.fallbacks.lazy.compactMap({ self.thumbnails[$0] }).first else { continue }
-            let aspectSize = displaySize.width > 0 && displaySize.height > 0 ? displaySize : image.size
+            let aspectSize = tile.key.outputTime == nil && displaySize.width > 0 && displaySize.height > 0 ? displaySize : image.size
             let scale = max(tile.rect.width / aspectSize.width, tile.rect.height / aspectSize.height)
             let width = aspectSize.width * scale
             let height = aspectSize.height * scale
@@ -1587,13 +1907,20 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         if let activeThumbnail, visibleThumbnailTiles[activeThumbnail] == nil {
             thumbnailTask?.cancel()
         }
-        guard thumbnailTask == nil, !thumbnailRequests.isEmpty, let callback = timeline?.thumbnail else { return }
+        guard thumbnailTask == nil, !thumbnailRequests.isEmpty else { return }
+        let callback = timeline?.thumbnail
+        let output = timeline?.outputThumbnail
         thumbnailTask = Task { [weak self] in
             while !Task.isCancelled, let self, let key = self.thumbnailRequests.first {
                 self.thumbnailRequests.removeFirst()
                 if self.thumbnails[key] != nil || self.unavailableThumbnails.contains(key) { continue }
                 self.activeThumbnail = key
-                let image = await callback(key.source, key.sourceTime, key.size)
+                let image: CGImage?
+                if let time = key.outputTime {
+                    image = await output?(time, key.size)
+                } else {
+                    image = await callback?(key.source, key.sourceTime, key.size)
+                }
                 guard !Task.isCancelled else { break }
                 if let image {
                     if self.thumbnails.count >= max(256, self.visibleThumbnailTiles.count),
@@ -1684,7 +2011,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     private func drawMark(_ time: Double, isIn: Bool, otherMark: Double?) {
         // Put the bracket on its own side of the playhead so it is visible immediately.
         let edge = x(at: time, preceding: otherMark.map { time > $0 } ?? !isIn)
-        for rect in timelineMarkRects(at: edge, isIn: isIn, bottom: laneTop + laneHeight + 2) {
+        for rect in timelineMarkRects(at: edge, isIn: isIn, bottom: tileLaneBottom - 2) {
             fill(rect, .controlAccentColor)
         }
     }
@@ -1737,6 +2064,7 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
+        if let menu = tileLaneMenu(at: point) { return menu }
         guard isEditingEnabled, let timeline, timeline.allowsClipEdits,
               let index = clipIndex(at: point) else { return super.menu(for: event) }
         let clip = position(at: index)
@@ -1842,6 +2170,10 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
         if interaction != nil || isExternalDrag { clearInteraction() }
         window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
+        if timeline.onRangeSelect == nil, let grip = tileGrip(at: point) {
+            tileDrag = (grip.span, grip.edge, point.x, point.x)
+            return
+        }
         switch pointerTarget(at: point, in: timeline) {
         case .range:
             interaction = .range(anchor: rangeTime(at: point.x), downX: point.x)
@@ -1888,6 +2220,11 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if tileDrag != nil {
+            tileDrag?.x = convert(event.locationInWindow, from: nil).x
+            needsDisplay = true
+            return
+        }
         guard isEditingEnabled, let interaction else { return }
         if case let .clip(id, down) = interaction {
             let point = event.locationInWindow
@@ -1949,6 +2286,15 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let drag = tileDrag {
+            tileDrag = nil
+            needsDisplay = true
+            let x = convert(event.locationInWindow, from: nil).x
+            guard isEditingEnabled, abs(x - drag.initialX) >= 2 else { return }
+            let start = drag.edge == .start ? drag.span.range.from.seconds : drag.span.range.to.seconds
+            timeline?.onResizeTileSpan?(drag.span, drag.edge, start + (x - drag.initialX) / scale)
+            return
+        }
         guard let timeline, let interaction else { return }
         let point = convert(event.locationInWindow, from: nil)
         if isEditingEnabled, dragLocation != nil {
@@ -1995,12 +2341,17 @@ final class TimelineSurface: NSView, NSViewToolTipOwner {
     }
 
     override func cancelOperation(_ sender: Any?) {
+        if tileDrag != nil {
+            tileDrag = nil
+            needsDisplay = true
+            return
+        }
         if case .trim = interaction { timeline?.onCancelTrim() }
         if interaction != nil { clearInteraction() } else { super.cancelOperation(sender) }
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.keyCode == 53, interaction != nil, window?.firstResponder === self {
+        if event.keyCode == 53, interaction != nil || tileDrag != nil, window?.firstResponder === self {
             cancelOperation(self)
             return true
         }

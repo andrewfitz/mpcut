@@ -2,12 +2,22 @@ import Foundation
 
 enum ParticipantRenderSound {
     static func resolve(_ project: CutProject, document: URL, timeline: StillTimelinePlan,
-                        audio: ParticipantRenderAudio, cancelled: (@Sendable () -> Bool)?) throws -> StillSoundPlan {
-        if audio.mode == .silence {
-            return .init(actions: [], treatments: [], container: "mov")
+                        audio: ParticipantRenderAudio, cancelled: (@Sendable () -> Bool)?,
+                        action: ReencodeAudio = .pcm, container: String = "mov",
+                        audioOutput: MulticamAudioOutput? = nil, tracks: ExportTracks = .all,
+                        mode: ExportMode = .encode, audioStream: Int? = nil, audioTrackOrdinal: Int? = nil) throws -> StillSoundPlan {
+        let container = ExportRules.multicamMuxContainer(container)
+        if audio.mode == .silence || action == .removeAudio {
+            guard tracks != .audio else {
+                throw CutError(code: "no_audio", message: "The project soundtrack is set to silence.")
+            }
+            return .init(actions: [], treatments: [], container: container)
         }
         try project.validate()
         let planner = StillSoundPlanner(cancelled: cancelled)
+        if (audioStream != nil || audioTrackOrdinal != nil), audio.mode != .program {
+            throw missing("Choose Program Audio before selecting a source stream.")
+        }
         let binding: ParticipantAudioBinding?
         if audio.mode == .iso {
             guard let id = audio.ids.first, let selected = project.participants.audioBinding(for: id) else {
@@ -34,23 +44,28 @@ enum ParticipantRenderSound {
                 multicam.audio = .follow
                 multicam.switches = [.init(at: .zero, angle: angle)]
             }
-            let output: MulticamAudioOutput = audio.mode == .program && multicam.audio == .mix
-                ? .downmixStereo : .separateTracks
+            let output: MulticamAudioOutput = audioOutput ?? (audio.mode == .program && multicam.audio == .mix
+                ? .downmixStereo : .separateTracks)
             return try planner.resolve(.multicam(multicam), relativeTo: document, timeline: timeline,
-                                       tracks: .all, audioStream: nil, mode: .encode, audio: .pcm,
-                                       container: "mov", audioOutput: output)
+                                       tracks: tracks, audioStream: nil, mode: mode, audio: action,
+                                       container: container, audioOutput: output)
         case .sequence, .stillSequence:
             switch audio.mode {
             case .program:
                 return try planner.resolve(project, relativeTo: document, timeline: timeline,
-                                           tracks: .all, audioStream: nil, mode: .encode, audio: .pcm,
-                                           container: "mov", audioOutput: .downmixStereo)
+                                           tracks: tracks, audioStream: audioStream, audioTrackOrdinal: audioTrackOrdinal,
+                                           mode: mode, audio: action, container: container,
+                                           audioOutput: audioOutput ?? .downmixStereo)
             case .iso:
                 guard let selection = binding?.selection else {
                     throw missing("A sequence ISO needs a source and stream binding.")
                 }
+                guard mode != .copy else {
+                    throw CutError(code: "unsupported_audio", message: "Choose Convert Audio to deliver an isolated sequence microphone.")
+                }
                 return try resolveSequenceISO(project, document: document, timeline: timeline,
-                                              selection: selection, cancelled: cancelled)
+                                              selection: selection, cancelled: cancelled, action: action,
+                                              container: container)
             case .lanes, .follow:
                 throw missing("Lane and camera audio routing require a multicam project.")
             case .silence:
@@ -61,7 +76,14 @@ enum ParticipantRenderSound {
 
     private static func resolveSequenceISO(_ project: CutProject, document: URL, timeline: StillTimelinePlan,
                                            selection: MulticamAudioSelection,
-                                           cancelled: (@Sendable () -> Bool)?) throws -> StillSoundPlan {
+                                           cancelled: (@Sendable () -> Bool)?, action: ReencodeAudio, container: String) throws -> StillSoundPlan {
+        let action = action == .auto ? (ExportRules.allows(stillAudio: .pcm, in: container) ? .pcm : .aac) : action
+        guard action == .pcm || action == .aac else {
+            throw missing("A sequence ISO needs PCM or AAC sound.")
+        }
+        guard ExportRules.allows(stillAudio: action, in: container) else {
+            throw CutError(code: "unsupported_audio", message: "Choose a container supported by the selected audio codec.")
+        }
         let clips = Dictionary(uniqueKeysWithValues: (project.sequenceClips ?? []).map { ($0.id, $0) })
         let file = try CutProject.checkedMediaURL(selection.source, relativeTo: document)
         let media = try CutEngine(cancelled: cancelled).inspect(file)
@@ -101,17 +123,17 @@ enum ParticipantRenderSound {
             appendSilence(from: output.to, to: span.output.to)
         }
         let plan = try MulticamEngine(cancelled: cancelled).resolveConvertedSound(
-            spans, duration: timeline.duration, container: "mov", action: .pcm, allowsSilence: true,
+            spans, duration: timeline.duration, container: container, action: action, allowsSilence: true,
             silenceFormat: .init(media: media, audio: index)) { error, _ in error }
-        let action = StillSoundAction(ordinal: 0, laneID: MulticamPlan.programAudioLaneID, label: "Participant ISO",
+        let soundAction = StillSoundAction(ordinal: 0, laneID: MulticamPlan.programAudioLaneID, label: "Participant ISO",
                                       codec: plan.writtenCodec,
                                       sampleRate: plan.sampleRate, channelLayout: plan.layout,
-                                      bitDepth: plan.writtenBitDepth, audio: .pcm,
+                                      bitDepth: plan.writtenBitDepth, audio: plan.action,
                                       originalStreams: [selection.stream], sources: spans.compactMap { span in
                                           guard span.media != nil else { return nil }
                                           return .init(file: file, stream: selection.stream, input: span.input, output: span.output)
                                       }, warnings: plan.warnings, generatedSilence: spans.filter { $0.media == nil }.map(\.output))
-        return .init(actions: [action], treatments: [.convert(plan)], container: "mov")
+        return .init(actions: [soundAction], treatments: [.convert(plan)], container: container)
     }
 
     static func apply(_ binding: ParticipantAudioBinding, to project: inout MulticamProject) throws {

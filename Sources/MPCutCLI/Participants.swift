@@ -69,7 +69,10 @@ struct ParticipantCLI {
     }
 
     func run(json: Bool, useSidecar: Bool, interruption: Interruption) throws {
-        let request = try read(interruption)
+        try run(request: read(interruption), json: json, useSidecar: useSidecar, interruption: interruption)
+    }
+
+    func run(request: ParticipantRequest, json: Bool, useSidecar: Bool, interruption: Interruption, tiles: Bool = false) throws {
         let cancelled: @Sendable () -> Bool = { !interruption.isActive }
         if operation == .scan {
             let resume = try request.value("resume_file", as: String.self)
@@ -91,7 +94,12 @@ struct ParticipantCLI {
             default: throw CLIError("invalid_arguments", "Choose sampling adaptive, every-frame or sparse.")
             }
             let feedLayout: ParticipantFeedLayout
-            if let value = try request.value("feed_layout", as: String.self) {
+            if tiles, let grid = try request.value("gallery_grid", as: String.self) {
+                guard request.fields["feed_layout"] == nil, let layout = ParticipantFeedLayout(galleryGrid: grid) else {
+                    throw CLIError("invalid_arguments", "Choose --gallery-grid COLSxROWS with one to 64 tiles, or --feed-layout.")
+                }
+                feedLayout = layout
+            } else if let value = try request.value("feed_layout", as: String.self) {
                 guard let layout = ParticipantFeedLayout(feedLayout: value) else {
                     throw CLIError("invalid_arguments", "Choose feed layout auto or COLSxROWS with one to 64 feeds.")
                 }
@@ -116,12 +124,16 @@ struct ParticipantCLI {
             guard !summary || destination != nil else {
                 throw CLIError("invalid_arguments", "Supply --output to save the scan that --summary describes.")
             }
+            let hints = tiles ? try request.tileCountHints()?.overriding(resume?.countHints) ?? resume?.countHints : nil
             let progress = try request.progress()
-            let options = try ParticipantScanOptions(
+            var options = try ParticipantScanOptions(
                 backend: backend, sampling: sampling,
                 includeScenes: request.value("include_scenes", as: Bool.self) ?? resume?.configuration.includeScenes ?? false,
                 useSidecar: useSidecar && !(request.value("no_sidecar", as: Bool.self) ?? false), feedLayout: feedLayout)
-            let result: ParticipantScanResult
+            if tiles, let destination {
+                options.checkpointDirectory = destination.appendingPathExtension("checkpoints")
+            }
+            var result: ParticipantScanResult
             var last: ParticipantScanProgress?
             do {
                 if progress == .none {
@@ -131,29 +143,79 @@ struct ParticipantCLI {
                         last = update
                         switch update.phase {
                         case .preparing, .checkingCache, .scanning, .finalizing:
-                            emitScanProgress(progress, phase: update.phase.rawValue, percent: update.percent, time: update.time)
+                            emitScanProgress(progress, phase: update.phase.rawValue, percent: update.percent, time: update.time,
+                                             waitForDelivery: update.phase == .preparing)
                         case .completed, .upToDate, .paused, .incomplete, .failed:
                             break
                         }
                     }
                 }
+                if tiles { result.countHints = hints }
                 if let last {
                     // A completed scan or paused checkpoint still needs to be delivered.
-                    emitScanProgress(progress, phase: "writing_result", percent: min(99, last.percent), time: last.time)
+                    emitScanProgress(progress, phase: "writing_result", percent: min(99, last.percent), time: last.time,
+                                     waitForDelivery: true)
                 }
-                try outputScan(result, to: destination, pretty: destination == nil && !json, summary: summary,
-                               summaryPretty: !json, interruption: interruption)
+                if tiles, let destination {
+                    let journal = options.checkpointDirectory?.appendingPathComponent("manifest.json")
+                    let hasJournal = journal.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+                    let saveReport = result.state != .paused || !hasJournal
+                    if saveReport {
+                        try outputScan(result, to: destination, pretty: false, summary: false, summaryPretty: !json,
+                                       interruption: interruption, writeResponse: false)
+                    }
+                    if saveReport, let directory = options.checkpointDirectory {
+                        ParticipantAnalysis.discardCheckpoint(for: result, directory: directory)
+                    }
+                    let review = TilesReview(scan: result, countHints: hints)
+                    let report = review.report(issuesOnly: true)
+                    struct TilesScanSummary: Encodable {
+                        struct Counts: Encodable {
+                            let feedCount, maxVisibleTiles, observations: Int
+                            enum CodingKeys: String, CodingKey {
+                                case observations, feedCount = "feed_count", maxVisibleTiles = "max_visible_tiles"
+                            }
+                        }
+                        let schemaVersion = 1
+                        let state: ParticipantScanResult.State
+                        let output: String?
+                        let checkpointDirectory: String?
+                        let source: ParticipantScanSource
+                        let counts: Counts
+                        let coverage: [ParticipantCoverage]
+                        let issues: [TilesIssue]
+                        let reviewIssueCount: Int
+                        enum CodingKeys: String, CodingKey {
+                            case schemaVersion = "schema_version", checkpointDirectory = "checkpoint_directory"
+                            case state, output, source, counts, coverage, issues
+                            case reviewIssueCount = "review_issue_count"
+                        }
+                    }
+                    try writeJSON(TilesScanSummary(state: result.state, output: saveReport ? destination.path : nil,
+                                                   checkpointDirectory: saveReport ? nil : options.checkpointDirectory?.path,
+                                                   source: result.source,
+                                                   counts: .init(feedCount: report.counts.feedCount, maxVisibleTiles: report.counts.maxVisibleTiles,
+                                                                 observations: result.analysis?.observations.count ?? 0),
+                                                   coverage: report.coverage, issues: report.issues.filter { $0.kind == .countMismatch },
+                                                   reviewIssueCount: report.issues.count),
+                                  pretty: !json, checkCancellation: false)
+                } else {
+                    try outputScan(result, to: destination, pretty: destination == nil && !json, summary: summary,
+                                   summaryPretty: !json, interruption: interruption)
+                }
             } catch {
                 if let last {
                     let wasCancelled = error is CancellationError || (error as? CLIError)?.code == "cancelled"
                         || (error as? CutError)?.code == "cancelled"
                     let phase = wasCancelled ? "paused" : "failed"
-                    emitScanProgress(progress, phase: phase, percent: min(99, last.percent), time: last.time)
+                    emitScanProgress(progress, phase: phase, percent: min(99, last.percent), time: last.time,
+                                     waitForDelivery: true)
                 }
                 throw error
             }
             if let last {
-                emitScanProgress(progress, phase: last.phase.rawValue, percent: last.percent, time: last.time)
+                emitScanProgress(progress, phase: last.phase.rawValue, percent: last.percent, time: last.time,
+                                 waitForDelivery: true)
             }
             if result.state == .paused { exit(130) }
             if result.state == .incomplete { exit(1) }
@@ -178,11 +240,12 @@ struct ParticipantCLI {
                             interruption: Interruption, cancelled: @escaping @Sendable () -> Bool) throws {
         let loaded = try CutProject.loadEditorDocument(from: document, limit: CutProject.maximumHistorySteps)
         let project = loaded.project
+        let legacy = try project.legacyParticipantView(forRendering: [.plan, .render, .planAngles, .renderAngles].contains(operation))
         switch operation {
         case .scan, .markers:
             return
         case .inspect:
-            try writeJSON(project.participants, pretty: !json)
+            try writeJSON(legacy.participants.legacyParticipantJSON, pretty: !json)
         case .apply, .accept, .takeAngle:
             let inPlace = try request.value("in_place", as: Bool.self) ?? false
             let outProject = try request.value("out_project", as: String.self)
@@ -194,7 +257,7 @@ struct ParticipantCLI {
                 throw CLIError("invalid_arguments", "Choose a .cut destination.")
             }
             try loaded.media.validateDestination(destination, relativeTo: document)
-            var updated = project
+            var updated = legacy
             if operation == .apply {
                 let edits: ParticipantProject
                 if request.fields["participants_file"] != nil {
@@ -206,16 +269,20 @@ struct ParticipantCLI {
                 } else {
                     edits = try request.required("participants", as: ParticipantProject.self)
                 }
+                try edits.validateLegacyParticipantEdits()
                 try updated.applyParticipantEdits(edits, relativeTo: document)
+                updated.participants = updated.participants.preservingTileReview(from: legacy.participants)
             } else if operation == .accept {
                 let sourceID = try request.required("source_id", as: String.self)
                 let scan = try request.analysis(cancelled: cancelled)
-                try updated.acceptParticipantAnalysis(scan, sourceID: sourceID, relativeTo: document)
+                try updated.acceptParticipantAnalysis(scan, sourceID: sourceID, relativeTo: document,
+                                                      promoteScreenShares: false, cancelled: cancelled)
             } else {
                 let angle = try request.required("angle", as: ParticipantVirtualAngle.self)
                 let time = try RationalTime(parsing: request.required("output_time", as: String.self))
-                updated = try ParticipantMulticam.taking(angle, at: time, in: project, document: document)
+                updated = try ParticipantMulticam.taking(angle, at: time, in: legacy, document: document)
             }
+            updated = try project.applyingLegacyParticipantView(updated, previous: legacy)
             let action = operation == .takeAngle ? "Take Participant Angle" : "Edit Participants"
             try updated.validate()
             if inPlace, project != updated {
@@ -232,17 +299,17 @@ struct ParticipantCLI {
                           pretty: !json, checkCancellation: false)
         case .plan, .render:
             let plan = try request.value("plan", as: ParticipantRenderPlan.self)
-            let renderer = ParticipantRenderer(cancelled: cancelled)
+            let renderer = ParticipantRenderer(cancelled: cancelled, legacyWholeFramePrivacy: true)
             if operation == .plan {
                 let output = try request.value("output", as: String.self).map { try fileURL($0, label: "Output") }
                 if let output { try loaded.media.validateDestination(output, relativeTo: document) }
-                try writeJSON(renderer.report(project, document: document, plan: plan, output: output), pretty: !json)
+                try writeJSON(renderer.report(legacy, document: document, plan: plan, output: output), pretty: !json)
             } else {
                 let progress = try request.progress()
                 let output = try request.url("output")
                 try loaded.media.validateDestination(output, relativeTo: document)
                 var lastUpdate = -Double.infinity
-                let report = try renderer.render(project, document: document, plan: plan, to: output) { fraction in
+                let report = try renderer.render(legacy, document: document, plan: plan, to: output) { fraction in
                     let now = ProcessInfo.processInfo.systemUptime
                     if fraction == 1 || now - lastUpdate >= 0.2 {
                         lastUpdate = now
@@ -254,7 +321,7 @@ struct ParticipantCLI {
             }
         case .angles, .planAngles, .renderAngles:
             let angles = try ParticipantMulticam.virtualAngles(
-                project, sourceID: request.required("source_id", as: String.self),
+                legacy, sourceID: request.required("source_id", as: String.self),
                 participantIDs: request.value("participant_ids", as: [String].self) ?? [],
                 range: request.required("range", as: MulticamRange.self),
                 includeOriginal: request.value("include_original", as: Bool.self) ?? false,
@@ -267,13 +334,13 @@ struct ParticipantCLI {
             let canvas = try request.required("canvas", as: ParticipantCanvas.self)
             let audio = try request.value("audio", as: ParticipantMulticamAudioRouting.self) ?? .init()
             if operation == .planAngles {
-                let report = try ParticipantMulticam.report(angles, project: project, document: document,
+                let report = try ParticipantMulticam.report(angles, project: legacy, document: document,
                                                           canvas: canvas, audio: audio, cancelled: cancelled)
                 try writeJSON(report, pretty: !json)
             } else {
                 let directory = try request.url("output_directory", directory: true)
                 try loaded.media.validateDestination(directory, relativeTo: document, includesContents: true)
-                let delivered = try ParticipantMulticam.materialize(angles, project: project, document: document,
+                let delivered = try ParticipantMulticam.materialize(angles, project: legacy, document: document,
                     canvas: canvas, audio: audio, to: directory, cancelled: cancelled)
                 struct Result: Encodable {
                     let projectPath: String
@@ -309,7 +376,7 @@ struct ParticipantCLI {
     }
 
     private func outputScan(_ result: ParticipantScanResult, to destination: URL?, pretty: Bool,
-                            summary: Bool, summaryPretty: Bool, interruption: Interruption) throws {
+                            summary: Bool, summaryPretty: Bool, interruption: Interruption, writeResponse: Bool = true) throws {
         let directory = destination?.deletingLastPathComponent() ?? FileManager.default.temporaryDirectory
         let staging = directory.appendingPathComponent(".mpcut-participants-\(UUID().uuidString)")
         let fd = open(staging.path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, destination == nil ? 0o600 : 0o666)
@@ -339,6 +406,7 @@ struct ParticipantCLI {
             if code == EEXIST { throw CutError(code: "output_exists", message: "Choose a new analysis destination.") }
             if code != 0 { throw CutError(code: "participant_analysis_write_failed", message: String(cString: strerror(code))) }
         }
+        guard writeResponse else { return }
         if summary, let destination {
             let analysis = result.analysis
             try writeJSON(ScanSummary(
@@ -372,7 +440,7 @@ struct ParticipantCLI {
     }
 }
 
-private struct ParticipantRequest {
+struct ParticipantRequest {
     let fields: [String: Any]
 
     func value<T: Decodable>(_ key: String, as type: T.Type) throws -> T? {
@@ -424,17 +492,19 @@ private struct ParticipantRequest {
     }
 }
 
-private func emitScanProgress(_ output: MediaProgressOutput, phase: String, percent: Int, time: RationalTime) {
-    emitProgress(output, time: time, fraction: Double(percent) / 100, phase: phase, percent: percent)
+private func emitScanProgress(_ output: MediaProgressOutput, phase: String, percent: Int, time: RationalTime,
+                              waitForDelivery: Bool) {
+    emitProgress(output, time: time, fraction: Double(percent) / 100, phase: phase, percent: percent,
+                 waitForDelivery: waitForDelivery)
 }
 
 private func emitProgress(_ output: MediaProgressOutput, time: RationalTime? = nil, fraction: Double? = nil,
-                          phase: String? = nil, percent: Int? = nil) {
+                          phase: String? = nil, percent: Int? = nil, waitForDelivery: Bool = false) {
     switch output {
     case .none: break
     case .stderr:
         if let phase, let percent {
-            progressOutput("\(phase) \(percent)%")
+            progressOutput("\(phase) \(percent)%", waitForDelivery: waitForDelivery)
             return
         }
         if let time { progressOutput(String(format: "%.2f s media scanned", time.seconds)) }
@@ -448,7 +518,7 @@ private func emitProgress(_ output: MediaProgressOutput, time: RationalTime? = n
             let fraction: Double?
         }
         if let data = try? JSONEncoder().encode(Event(phase: phase, percent: percent, time: time, fraction: fraction)) {
-            progressOutput(String(decoding: data, as: UTF8.self))
+            progressOutput(String(decoding: data, as: UTF8.self), waitForDelivery: waitForDelivery)
         }
     }
 }

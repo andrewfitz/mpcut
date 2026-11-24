@@ -265,6 +265,7 @@ enum CLICommand {
     case still(StillOptions)
     case transcript(TranscriptCLI)
     case participants(ParticipantCLI)
+    case tiles(TilesCLI)
     case stillCreate(StillCreateOptions)
     case silence(SilenceOptions)
     case scenes(SceneScanOptions)
@@ -273,6 +274,8 @@ enum CLICommand {
     case projectMedia(ProjectMediaOptions)
     case inspect(file: String, keyframes: Bool, allFrames: Bool, audioPackets: Bool, packetStream: Int?, from: RationalTime?, to: RationalTime?, tracks: ExportTracks, audioStream: Int?)
     case convert(input: String, output: String, allowLoss: Bool, flattenMulticam: Bool)
+    case printDocument(String)
+    case mergeProject(base: String, ours: String, theirs: String)
     case resolve(project: String, output: String, open: Bool)
     case inspectProject(String)
     case multicamSync(MulticamSyncOptions)
@@ -341,7 +344,7 @@ struct Arguments {
         var options = Array(words.dropFirst(operation.split(separator: " ").count))
         let flags = options.prefix { $0 != "--" }
         var requestFile: String?
-        if !operation.hasPrefix("transcript "), CommandPath.participants[operation] == nil, let index = flags.firstIndex(of: "--input") {
+        if !operation.hasPrefix("transcript "), CommandPath.participants[operation] == nil, CommandPath.tiles[operation] == nil, let index = flags.firstIndex(of: "--input") {
             guard index + 1 < flags.endIndex, !options[index + 1].hasPrefix("--"),
                   flags.filter({ $0 == "--input" }).count == 1, !flags.contains("--stdin"),
                   ["project create", "project edit", "multicam switch coverage", "export clips join", "export project render", "export soundtrack replace", "export ranges separate",
@@ -351,8 +354,8 @@ struct Arguments {
             requestFile = options[index + 1]
             options.replaceSubrange(index...index + 1, with: ["--stdin"])
         }
-        // A participants command reads a JSON request alone. Say so, instead of calling --stdin an unknown option.
-        if CommandPath.participants[operation] != nil,
+        // A participants or Tiles command reads a JSON request alone. Say so, instead of calling --stdin an unknown option.
+        if CommandPath.participants[operation] != nil || CommandPath.tiles[operation] != nil,
            flags.contains("--stdin") && options != ["--stdin"] || flags.contains("--input") && options.count != 2 {
             throw CLIError("invalid_arguments", "Put the other options inside the JSON request when supplying --stdin or --input FILE.")
         }
@@ -368,6 +371,9 @@ struct Arguments {
     private static func parseCommand(_ path: String, options: [String], json: Bool) throws -> Arguments {
         if path.hasPrefix("project media "), let operation = ProjectMediaOptions.Operation(rawValue: String(path.dropFirst("project media ".count))) {
             return Arguments(command: .projectMedia(try ProjectMediaOptions(operation, arguments: options)), json: json)
+        }
+        if let operation = CommandPath.tiles[path] {
+            return Arguments(command: .tiles(try TilesCLI(operation: operation, arguments: options)), json: json)
         }
         if let operation = CommandPath.participants[path] {
             return Arguments(command: .participants(try ParticipantCLI(operation: operation, arguments: options)), json: json)
@@ -393,6 +399,16 @@ struct Arguments {
             return Arguments(command: .authorProject(creating: path == "project create"), json: json)
         case "project convert":
             return Arguments(command: try convert(options), json: json)
+        case "project document print":
+            guard options.count == 1, !json else {
+                throw CLIError("invalid_arguments", "Use project document print FILE, or - to read the project from standard input.")
+            }
+            return Arguments(command: .printDocument(options[0]), json: false)
+        case "project merge":
+            guard options.count == 3, !json, !options.contains(where: { $0.hasPrefix("--") }) else {
+                throw CLIError("invalid_arguments", "Use project merge BASE OURS THEIRS. The merged project replaces OURS.")
+            }
+            return Arguments(command: .mergeProject(base: options[0], ours: options[1], theirs: options[2]), json: false)
         case "project resolve export", "project resolve import":
             let importing = path == "project resolve import"
             if options.contains("--clips") {

@@ -372,7 +372,9 @@ struct EditorTransportBar<Player: EditorPlayback, Accessory: View>: View {
     private var history: some View {
         HStack(spacing: 4) {
             editTool(undo, icon: "arrow.uturn.backward", shortcut: "⌘Z")
+                .accessibilityIdentifier("editor.history.undo")
             editTool(redo, icon: "arrow.uturn.forward", shortcut: "⇧⌘Z")
+                .accessibilityIdentifier("editor.history.redo")
         }
     }
 

@@ -293,11 +293,11 @@ class MulticamCLITests(unittest.TestCase):
         sources = Path(__file__).resolve().parents[2] / "Sources/MPCutCLI"
         parsed = set()
         for file in sources.glob("*.swift"):
-            if file.name not in {"CommandHelp.swift", "Transcript.swift", "Participants.swift"}:
+            if file.name not in {"CommandHelp.swift", "Transcript.swift", "Participants.swift"} and not file.name.startswith("Tiles"):
                 parsed.update(re.findall(r'"(--[a-z][a-z-]*)"', file.read_text()))
-        # The transcript and participants commands map flags to request fields by name instead of listing them
-        # as literals. transcript_cli.py and the participant suites cover their flags.
-        mapped = ("transcript", "participants")
+        # The transcript, participants and tiles commands map flags to request fields by name instead of listing
+        # them as literals. transcript_cli.py, the participant suites and the tiles suites cover their flags.
+        mapped = ("transcript", "participants", "tiles")
         listed = dict(overview,
                       usage=[line for line in overview["usage"].splitlines()
                              if not any(f"mpcut {family} " in line for family in mapped)],

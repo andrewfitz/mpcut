@@ -1,0 +1,1316 @@
+[
+  {
+    "name": "tiles_file_scan",
+    "description": "Scan a recording for visible tiles, distinct feeds and layout changes.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "file": {"type": "string", "pattern": "^/", "description": "The input recording."},
+        "output": {"type": "string", "pattern": "^/", "description": "The output scan JSON. With this option the job returns a small scan summary."},
+        "backend": {"type": "string", "enum": ["auto", "cpu-only", "gpu-required"], "description": "Detector backend."},
+        "sampling": {"type": "string", "enum": ["adaptive", "every-frame", "sparse"], "description": "Frame sampling mode."},
+        "feed_layout": {"type": "string", "minLength": 1, "description": "Detector layout hint such as auto or 2x2."},
+        "gallery_grid": {"type": "string", "minLength": 1, "description": "Expected gallery grid as COLSxROWS."},
+        "expected_feeds": {"type": "integer", "minimum": 1, "description": "The expected number of unique feeds. A mismatch requires review."},
+        "max_visible_tiles": {"type": "integer", "minimum": 1, "description": "The expected maximum visible tiles in one frame. A mismatch requires review."},
+        "include_scenes": {"type": "boolean", "description": "Include scene analysis in the scan."},
+        "no_sidecar": {"type": "boolean", "description": "Skip reading or writing the recording analysis cache."},
+        "resume_file": {"type": "string", "pattern": "^/", "description": "A partial scan to resume."}
+      },
+      "required": ["operation_id", "file"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_editor_scan",
+    "description": "Scan a recording for visible tiles, distinct feeds and layout changes.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "output": {"type": "string", "pattern": "^/", "description": "The destination for the command’s output."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "backend": {"type": "string", "enum": ["auto", "cpu-only", "gpu-required"], "description": "Detector backend."},
+        "sampling": {"type": "string", "enum": ["adaptive", "every-frame", "sparse"], "description": "Frame sampling mode."},
+        "feed_layout": {"type": "string", "minLength": 1, "description": "Detector layout hint such as auto or 2x2."},
+        "gallery_grid": {"type": "string", "minLength": 1, "description": "Expected gallery grid as COLSxROWS."},
+        "expected_feeds": {"type": "integer", "minimum": 1, "description": "The expected number of unique feeds. A mismatch requires review."},
+        "max_visible_tiles": {"type": "integer", "minimum": 1, "description": "The expected maximum visible tiles in one frame. A mismatch requires review."},
+        "include_scenes": {"type": "boolean", "description": "Include scene analysis in the scan."},
+        "no_sidecar": {"type": "boolean", "description": "Skip reading or writing the recording analysis cache."},
+        "resume_file": {"type": "string", "pattern": "^/", "description": "A partial scan to resume."},
+        "resume": {"type": "boolean", "description": "Resume this recording’s pending scan, or the checkpoint beside the supplied output path."},
+        "accept": {"type": "boolean", "description": "Accept the completed scan as one project edit."}
+      },
+      "required": ["project_handle"],
+      "additionalProperties": false,
+      "allOf": [{"if": {"required": ["accept"], "properties": {"accept": {"const": true}}}, "then": {"required": ["expected_revision"]}}]
+    }
+  },
+  {
+    "name": "tiles_file_inspect",
+    "description": "Inspect visible tiles, source-clock ranges, layout changes and review issues.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "issues": {"type": "boolean", "description": "Return review issues and timestamps."},
+        "at": {"type": "string", "minLength": 1, "description": "Source-clock timestamp."},
+        "layout_changes": {"type": "boolean", "description": "Return detected layout changes."},
+        "rule": {"type": "object", "description": "Optional ParticipantMarkerRule for the layout-change query."},
+        "clock": {"type": "string", "enum": ["source"], "description": "Time coordinate for a Tiles query."}
+      },
+      "required": ["operation_id"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["project_path"]}, {"required": ["analysis_file"]}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_inspect",
+    "description": "Inspect visible tiles, source-clock ranges, layout changes and review issues.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "issues": {"type": "boolean", "description": "Return review issues and timestamps."},
+        "at": {"type": "string", "minLength": 1, "description": "Source-clock timestamp."},
+        "layout_changes": {"type": "boolean", "description": "Return detected layout changes."},
+        "rule": {"type": "object", "description": "Optional ParticipantMarkerRule for the layout-change query."},
+        "clock": {"type": "string", "enum": ["source"], "description": "Time coordinate for a Tiles query."}
+      },
+      "required": ["project_handle"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_preview",
+    "description": "Write an annotated source frame for a timestamp or issue. This source review can show untreated pixels.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "at": {"type": "string", "minLength": 1, "description": "Source-clock timestamp."},
+        "clock": {"type": "string", "enum": ["source"], "description": "Time coordinate for a Tiles query."},
+        "issue_id": {"type": "string", "minLength": 1, "description": "Review issue ID from Tiles inspect."},
+        "output": {"type": "string", "pattern": "^/", "description": "The destination for the command’s output."}
+      },
+      "required": ["operation_id", "output"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["project_path"]}, {"required": ["analysis_file"]}]}, {"oneOf": [{"required": ["at"]}, {"required": ["issue_id"]}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_preview",
+    "description": "Write an annotated source frame for a timestamp or issue. This source review can show untreated pixels.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "at": {"type": "string", "minLength": 1, "description": "Source-clock timestamp."},
+        "clock": {"type": "string", "enum": ["source"], "description": "Time coordinate for a Tiles query."},
+        "issue_id": {"type": "string", "minLength": 1, "description": "Review issue ID from Tiles inspect."},
+        "output": {"type": "string", "pattern": "^/", "description": "The destination for the command’s output."}
+      },
+      "required": ["project_handle", "output"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["at"]}, {"required": ["issue_id"]}]}]
+    }
+  },
+  {
+    "name": "tiles_file_accept",
+    "description": "Accept a saved scan or revise the saved count hints for a recording.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "expected_feeds": {"type": "integer", "minimum": 1, "description": "The expected number of unique feeds. A mismatch requires review."},
+        "max_visible_tiles": {"type": "integer", "minimum": 1, "description": "The expected maximum visible tiles in one frame. A mismatch requires review."},
+        "clear_count_hints": {"type": "boolean", "const": true, "description": "Clear both count hints without changing the accepted tiles or feed IDs."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."}
+      },
+      "required": ["operation_id", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}, {"not": {"allOf": [{"not": {"required": ["analysis_file"]}}, {"not": {"required": ["expected_feeds"]}}, {"not": {"required": ["max_visible_tiles"]}}, {"not": {"required": ["clear_count_hints"]}}]}}, {"not": {"required": ["clear_count_hints", "expected_feeds"]}}, {"not": {"required": ["clear_count_hints", "max_visible_tiles"]}}]
+    }
+  },
+  {
+    "name": "tiles_editor_accept",
+    "description": "Accept a saved scan or revise the saved count hints for a recording.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "expected_feeds": {"type": "integer", "minimum": 1, "description": "The expected number of unique feeds. A mismatch requires review."},
+        "max_visible_tiles": {"type": "integer", "minimum": 1, "description": "The expected maximum visible tiles in one frame. A mismatch requires review."},
+        "clear_count_hints": {"type": "boolean", "const": true, "description": "Clear both count hints without changing the accepted tiles or feed IDs."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."}
+      },
+      "required": ["project_handle", "expected_revision"],
+      "additionalProperties": false,
+      "allOf": [{"not": {"allOf": [{"not": {"required": ["analysis_file"]}}, {"not": {"required": ["expected_feeds"]}}, {"not": {"required": ["max_visible_tiles"]}}, {"not": {"required": ["clear_count_hints"]}}]}}, {"not": {"required": ["clear_count_hints", "expected_feeds"]}}, {"not": {"required": ["clear_count_hints", "max_visible_tiles"]}}]
+    }
+  },
+  {
+    "name": "tiles_file_link",
+    "description": "Assign a tile to a feed over a source-clock range.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "clear": {"type": "boolean", "description": "Clear the selected assignment."}
+      },
+      "required": ["operation_id", "tile_id", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_link",
+    "description": "Assign a tile to a feed over a source-clock range.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "clear": {"type": "boolean", "description": "Clear the selected assignment."}
+      },
+      "required": ["project_handle", "tile_id", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_feeds_list",
+    "description": "List distinct feeds in the selected recording.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."}
+      },
+      "required": ["operation_id"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["project_path"]}, {"required": ["analysis_file"]}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_feeds_list",
+    "description": "List distinct feeds in the selected recording.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."}
+      },
+      "required": ["project_handle"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_feeds_inspect",
+    "description": "Inspect one feed’s tiles, gaps, microphone and voice bindings.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}
+      },
+      "required": ["operation_id", "feed_id"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["project_path"]}, {"required": ["analysis_file"]}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_feeds_inspect",
+    "description": "Inspect one feed’s tiles, gaps, microphone and voice bindings.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}
+      },
+      "required": ["project_handle", "feed_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_feeds_add",
+    "description": "Add a project feed and return its feed_id for assigning tiles. The name defaults to Feed N.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "name": {"type": "string", "minLength": 1, "description": "The display name for the feed."}
+      },
+      "required": ["operation_id", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_feeds_add",
+    "description": "Add a project feed and return its feed_id for assigning tiles. The name defaults to Feed N.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "name": {"type": "string", "minLength": 1, "description": "The display name for the feed."}
+      },
+      "required": ["project_handle", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_feeds_rename",
+    "description": "Set the feed display name.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "name": {"type": "string", "minLength": 1, "description": "The display name for the feed."}
+      },
+      "required": ["operation_id", "feed_id", "name", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_feeds_rename",
+    "description": "Set the feed display name.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "name": {"type": "string", "minLength": 1, "description": "The display name for the feed."}
+      },
+      "required": ["project_handle", "feed_id", "name", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_feeds_mic",
+    "description": "Assign or clear an isolated microphone for the feed.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "mic_id": {"type": "string", "minLength": 1, "description": "The microphone lane or source ID."},
+        "audio_stream_index": {"type": "integer", "minimum": 0, "description": "Zero-based absolute audio stream index."},
+        "clear": {"type": "boolean", "description": "Clear the selected assignment."},
+        "binding": {"type": "object", "description": "A ParticipantAudioBinding with a lane_id or stream selection."}
+      },
+      "required": ["operation_id", "feed_id", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_feeds_mic",
+    "description": "Assign or clear an isolated microphone for the feed.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "mic_id": {"type": "string", "minLength": 1, "description": "The microphone lane or source ID."},
+        "audio_stream_index": {"type": "integer", "minimum": 0, "description": "Zero-based absolute audio stream index."},
+        "clear": {"type": "boolean", "description": "Clear the selected assignment."},
+        "binding": {"type": "object", "description": "A ParticipantAudioBinding with a lane_id or stream selection."}
+      },
+      "required": ["project_handle", "feed_id", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_feeds_voice",
+    "description": "Assign or clear a transcript voice for the feed.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "attachment_id": {"type": "string", "minLength": 1, "description": "The transcript attachment ID."},
+        "track_id": {"type": "string", "minLength": 1, "description": "The transcript track ID."},
+        "speaker_id": {"type": "string", "minLength": 1, "description": "The transcript voice ID."},
+        "clear": {"type": "boolean", "description": "Clear the selected assignment."}
+      },
+      "required": ["operation_id", "feed_id", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_feeds_voice",
+    "description": "Assign or clear a transcript voice for the feed.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "attachment_id": {"type": "string", "minLength": 1, "description": "The transcript attachment ID."},
+        "track_id": {"type": "string", "minLength": 1, "description": "The transcript track ID."},
+        "speaker_id": {"type": "string", "minLength": 1, "description": "The transcript voice ID."},
+        "clear": {"type": "boolean", "description": "Clear the selected assignment."}
+      },
+      "required": ["project_handle", "feed_id", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_feeds_prefer",
+    "description": "Choose the feed tile used when multiple tiles show it.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "clear": {"type": "boolean", "description": "Clear the selected assignment."}
+      },
+      "required": ["operation_id", "feed_id", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_feeds_prefer",
+    "description": "Choose the feed tile used when multiple tiles show it.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "clear": {"type": "boolean", "description": "Clear the selected assignment."}
+      },
+      "required": ["project_handle", "feed_id", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_feeds_merge",
+    "description": "Merge a duplicate feed into another feed.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "into_feed_id": {"type": "string", "minLength": 1, "description": "The feed that survives the merge."}
+      },
+      "required": ["operation_id", "feed_id", "into_feed_id", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_feeds_merge",
+    "description": "Merge a duplicate feed into another feed.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "into_feed_id": {"type": "string", "minLength": 1, "description": "The feed that survives the merge."}
+      },
+      "required": ["project_handle", "feed_id", "into_feed_id", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_feeds_split",
+    "description": "Split a tile and optional interval into a separate feed.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "name": {"type": "string", "minLength": 1, "description": "The display name for the feed."},
+        "new_feed_id": {"type": "string", "minLength": 1, "description": "Stable ID for the new feed."}
+      },
+      "required": ["operation_id", "feed_id", "tile_id", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_feeds_split",
+    "description": "Split a tile and optional interval into a separate feed.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "name": {"type": "string", "minLength": 1, "description": "The display name for the feed."},
+        "new_feed_id": {"type": "string", "minLength": 1, "description": "Stable ID for the new feed."}
+      },
+      "required": ["project_handle", "feed_id", "tile_id", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_feeds_treatment",
+    "description": "Change the treatment for the feed’s visible appearances.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "treatment": {"type": "string", "enum": ["none", "blur", "cover", "remove"], "description": "Treatment applied to the feed’s visible appearances."},
+        "color": {"type": "string", "minLength": 1, "description": "RGB color in hexadecimal."}
+      },
+      "required": ["operation_id", "feed_id", "treatment", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_feeds_treatment",
+    "description": "Change the treatment for the feed’s visible appearances.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "treatment": {"type": "string", "enum": ["none", "blur", "cover", "remove"], "description": "Treatment applied to the feed’s visible appearances."},
+        "color": {"type": "string", "minLength": 1, "description": "RGB color in hexadecimal."}
+      },
+      "required": ["project_handle", "feed_id", "treatment", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_feeds_confirm",
+    "description": "Confirm reviewed coverage for a feed. Whole-recording confirmation can resolve complete absence when the accepted recording matches, coverage is verified throughout, and every tile has a known identity.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}
+      },
+      "required": ["operation_id", "feed_id", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_feeds_confirm",
+    "description": "Confirm reviewed coverage for a feed. Whole-recording confirmation can resolve complete absence when the accepted recording matches, coverage is verified throughout, and every tile has a known identity.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}
+      },
+      "required": ["project_handle", "feed_id", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_angles_plan",
+    "description": "Plan synchronized ISO delivery for the selected feeds.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "all": {"type": "boolean", "description": "Select all feeds on the recording."},
+        "feed_id": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}, "description": "Repeat for multiple feed IDs."},
+        "size": {"type": "string", "minLength": 1, "description": "Output dimensions as WIDTHxHEIGHT."},
+        "frame_rate": {"type": "string", "minLength": 1, "description": "Output frame rate as a rational value."},
+        "fit": {"type": "string", "enum": ["fit", "fill"], "description": "Framing within each ISO canvas."},
+        "gap_color": {"type": "string", "minLength": 1, "description": "RGB color used for absent feeds."},
+        "camera_off": {"type": "string", "enum": ["keep", "blank"], "description": "Handling for camera-off appearances."},
+        "on_uncertain": {"type": "string", "enum": ["stop", "blank"], "description": "Handling for uncertain intervals."},
+        "no_meeting_mix": {"type": "boolean", "description": "Omit the standalone meeting mix."},
+        "no_isos": {"type": "boolean", "description": "Omit the individual ISO movies."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "output": {"type": "string", "pattern": "^/", "description": "The destination for the command’s output."}
+      },
+      "required": ["operation_id", "project_path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_editor_angles_plan",
+    "description": "Plan synchronized ISO delivery for the selected feeds.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "all": {"type": "boolean", "description": "Select all feeds on the recording."},
+        "feed_id": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}, "description": "Repeat for multiple feed IDs."},
+        "size": {"type": "string", "minLength": 1, "description": "Output dimensions as WIDTHxHEIGHT."},
+        "frame_rate": {"type": "string", "minLength": 1, "description": "Output frame rate as a rational value."},
+        "fit": {"type": "string", "enum": ["fit", "fill"], "description": "Framing within each ISO canvas."},
+        "gap_color": {"type": "string", "minLength": 1, "description": "RGB color used for absent feeds."},
+        "camera_off": {"type": "string", "enum": ["keep", "blank"], "description": "Handling for camera-off appearances."},
+        "on_uncertain": {"type": "string", "enum": ["stop", "blank"], "description": "Handling for uncertain intervals."},
+        "no_meeting_mix": {"type": "boolean", "description": "Omit the standalone meeting mix."},
+        "no_isos": {"type": "boolean", "description": "Omit the individual ISO movies."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "output": {"type": "string", "pattern": "^/", "description": "The destination for the command’s output."}
+      },
+      "required": ["project_handle"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_angles_render",
+    "description": "Render angles from a saved plan or a feed selection.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "all": {"type": "boolean", "description": "Select all feeds on the recording."},
+        "feed_id": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}, "description": "Repeat for multiple feed IDs."},
+        "size": {"type": "string", "minLength": 1, "description": "Output dimensions as WIDTHxHEIGHT."},
+        "frame_rate": {"type": "string", "minLength": 1, "description": "Output frame rate as a rational value."},
+        "fit": {"type": "string", "enum": ["fit", "fill"], "description": "Framing within each ISO canvas."},
+        "gap_color": {"type": "string", "minLength": 1, "description": "RGB color used for absent feeds."},
+        "camera_off": {"type": "string", "enum": ["keep", "blank"], "description": "Handling for camera-off appearances."},
+        "on_uncertain": {"type": "string", "enum": ["stop", "blank"], "description": "Handling for uncertain intervals."},
+        "no_meeting_mix": {"type": "boolean", "description": "Omit the standalone meeting mix."},
+        "no_isos": {"type": "boolean", "description": "Omit the individual ISO movies."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "plan": {"type": "string", "pattern": "^/", "description": "A saved executable Tiles angle plan."},
+        "output": {"type": "string", "pattern": "^/", "description": "The destination for the command’s output."},
+        "resume": {"type": "boolean", "description": "Resume a compatible delivery in the destination."}
+      },
+      "required": ["operation_id", "output"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["plan"]}, {"required": ["project_path"]}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_angles_render",
+    "description": "Render angles from a saved plan or a feed selection.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "all": {"type": "boolean", "description": "Select all feeds on the recording."},
+        "feed_id": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}, "description": "Repeat for multiple feed IDs."},
+        "size": {"type": "string", "minLength": 1, "description": "Output dimensions as WIDTHxHEIGHT."},
+        "frame_rate": {"type": "string", "minLength": 1, "description": "Output frame rate as a rational value."},
+        "fit": {"type": "string", "enum": ["fit", "fill"], "description": "Framing within each ISO canvas."},
+        "gap_color": {"type": "string", "minLength": 1, "description": "RGB color used for absent feeds."},
+        "camera_off": {"type": "string", "enum": ["keep", "blank"], "description": "Handling for camera-off appearances."},
+        "on_uncertain": {"type": "string", "enum": ["stop", "blank"], "description": "Handling for uncertain intervals."},
+        "no_meeting_mix": {"type": "boolean", "description": "Omit the standalone meeting mix."},
+        "no_isos": {"type": "boolean", "description": "Omit the individual ISO movies."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "plan": {"type": "string", "pattern": "^/", "description": "A saved executable Tiles angle plan."},
+        "output": {"type": "string", "pattern": "^/", "description": "The destination for the command’s output."},
+        "resume": {"type": "boolean", "description": "Resume a compatible delivery in the destination."}
+      },
+      "required": ["project_handle", "output"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_angles_verify",
+    "description": "Verify an existing ISO delivery against its manifest.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "output": {"type": "string", "pattern": "^/", "description": "Existing ISO delivery folder containing manifest.json."}
+      },
+      "required": ["operation_id", "output"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_editor_angles_verify",
+    "description": "Verify an existing ISO delivery against its manifest.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "output": {"type": "string", "pattern": "^/", "description": "Existing ISO delivery folder containing manifest.json."}
+      },
+      "required": ["project_handle", "output"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_angles_use",
+    "description": "Use selected feeds as angles in the existing multicam project.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "all": {"type": "boolean", "description": "Select all feeds on the recording."},
+        "feed_id": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}, "description": "Repeat for multiple feed IDs."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "clip_id": {"type": "string", "minLength": 1, "description": "The occurrence ID from the project timeline."}
+      },
+      "required": ["operation_id", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}, {"oneOf": [{"required": ["feed_id"]}, {"required": ["all"], "properties": {"all": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_angles_use",
+    "description": "Use selected feeds as angles in the existing multicam project.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "all": {"type": "boolean", "description": "Select all feeds on the recording."},
+        "feed_id": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}, "description": "Repeat for multiple feed IDs."},
+        "clip_id": {"type": "string", "minLength": 1, "description": "The occurrence ID from the project timeline."}
+      },
+      "required": ["project_handle", "expected_revision"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["feed_id"]}, {"required": ["all"], "properties": {"all": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_file_export_isos",
+    "description": "Plan, render and verify ISO delivery from a recording or reviewed project. Check for needs_review and resume from the returned review project.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "all": {"type": "boolean", "description": "Select all feeds on the recording."},
+        "feed_id": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}, "description": "Repeat for multiple feed IDs."},
+        "size": {"type": "string", "minLength": 1, "description": "Output dimensions as WIDTHxHEIGHT."},
+        "frame_rate": {"type": "string", "minLength": 1, "description": "Output frame rate as a rational value."},
+        "fit": {"type": "string", "enum": ["fit", "fill"], "description": "Framing within each ISO canvas."},
+        "gap_color": {"type": "string", "minLength": 1, "description": "RGB color used for absent feeds."},
+        "camera_off": {"type": "string", "enum": ["keep", "blank"], "description": "Handling for camera-off appearances."},
+        "on_uncertain": {"type": "string", "enum": ["stop", "blank"], "description": "Handling for uncertain intervals."},
+        "no_meeting_mix": {"type": "boolean", "description": "Omit the standalone meeting mix."},
+        "no_isos": {"type": "boolean", "description": "Omit the individual ISO movies."},
+        "backend": {"type": "string", "enum": ["auto", "cpu-only", "gpu-required"], "description": "Detector backend."},
+        "sampling": {"type": "string", "enum": ["adaptive", "every-frame", "sparse"], "description": "Frame sampling mode."},
+        "feed_layout": {"type": "string", "minLength": 1, "description": "Detector layout hint such as auto or 2x2."},
+        "gallery_grid": {"type": "string", "minLength": 1, "description": "Expected gallery grid as COLSxROWS."},
+        "expected_feeds": {"type": "integer", "minimum": 1, "description": "The expected number of unique feeds. A mismatch requires review."},
+        "max_visible_tiles": {"type": "integer", "minimum": 1, "description": "The expected maximum visible tiles in one frame. A mismatch requires review."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "file": {"type": "string", "pattern": "^/", "description": "The input recording."},
+        "output": {"type": "string", "pattern": "^/", "description": "The destination for the command’s output."},
+        "dry_run": {"type": "boolean", "description": "Review the plan without rendering deliverables."},
+        "resume": {"type": "boolean", "description": "Resume a compatible delivery in the destination."}
+      },
+      "required": ["operation_id"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["project_path"]}, {"required": ["file"]}]}, {"if": {"required": ["file"]}, "then": {"required": ["output"]}}, {"if": {"not": {"required": ["dry_run"], "properties": {"dry_run": {"const": true}}}}, "then": {"required": ["output"]}}]
+    }
+  },
+  {
+    "name": "tiles_editor_export_isos",
+    "description": "Plan, render and verify ISO delivery from a recording or reviewed project. Check for needs_review and resume from the returned review project.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "all": {"type": "boolean", "description": "Select all feeds on the recording."},
+        "feed_id": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}, "description": "Repeat for multiple feed IDs."},
+        "size": {"type": "string", "minLength": 1, "description": "Output dimensions as WIDTHxHEIGHT."},
+        "frame_rate": {"type": "string", "minLength": 1, "description": "Output frame rate as a rational value."},
+        "fit": {"type": "string", "enum": ["fit", "fill"], "description": "Framing within each ISO canvas."},
+        "gap_color": {"type": "string", "minLength": 1, "description": "RGB color used for absent feeds."},
+        "camera_off": {"type": "string", "enum": ["keep", "blank"], "description": "Handling for camera-off appearances."},
+        "on_uncertain": {"type": "string", "enum": ["stop", "blank"], "description": "Handling for uncertain intervals."},
+        "no_meeting_mix": {"type": "boolean", "description": "Omit the standalone meeting mix."},
+        "no_isos": {"type": "boolean", "description": "Omit the individual ISO movies."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "output": {"type": "string", "pattern": "^/", "description": "The destination for the command’s output."},
+        "dry_run": {"type": "boolean", "description": "Review the plan without rendering deliverables."},
+        "resume": {"type": "boolean", "description": "Resume a compatible delivery in the destination."}
+      },
+      "required": ["project_handle"],
+      "additionalProperties": false,
+      "allOf": [{"if": {"not": {"required": ["dry_run"], "properties": {"dry_run": {"const": true}}}}, "then": {"required": ["output"]}}]
+    }
+  },
+  {
+    "name": "tiles_file_switches_propose",
+    "description": "Propose multicam cuts from the project transcript.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "attachment_id": {"type": "string", "minLength": 1, "description": "The transcript attachment ID."},
+        "minimum_hold": {"type": "string", "minLength": 1, "description": "Minimum duration between proposed switches."},
+        "voice_angle": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "Assignment in SPEAKER_ID=ANGLE_ID format."}, "description": "Voice-to-angle assignments."}
+      },
+      "required": ["operation_id", "project_path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_editor_switches_propose",
+    "description": "Propose multicam cuts from the project transcript.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "attachment_id": {"type": "string", "minLength": 1, "description": "The transcript attachment ID."},
+        "minimum_hold": {"type": "string", "minLength": 1, "description": "Minimum duration between proposed switches."},
+        "voice_angle": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "Assignment in SPEAKER_ID=ANGLE_ID format."}, "description": "Voice-to-angle assignments."}
+      },
+      "required": ["project_handle"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_editor_switches_accept",
+    "description": "Accept proposed multicam cuts in one undoable edit.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "proposal": {"type": "object", "description": "The revision-bound proposal from tiles_editor_switches_propose."}
+      },
+      "required": ["project_handle", "proposal", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_reconcile",
+    "description": "Review the effect of replacing a recording, or apply a reviewed change.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."},
+        "apply": {"type": "boolean", "description": "Apply the reviewed reconciliation to the project.", "const": true},
+        "review": {"type": "string", "minLength": 1, "description": "Review token returned by a reconciliation preview."}
+      },
+      "required": ["operation_id", "analysis_file", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"if": {"required": ["apply"], "properties": {"apply": {"const": true}}}, "then": {"allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}, {"required": ["review"]}]}}]
+    }
+  },
+  {
+    "name": "tiles_editor_reconcile",
+    "description": "Review the effect of replacing a recording, or apply a reviewed change.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "analysis_file": {"type": "string", "pattern": "^/", "description": "A saved Tiles scan JSON file."},
+        "apply": {"type": "boolean", "description": "Apply the reviewed reconciliation to the project.", "const": true},
+        "review": {"type": "string", "minLength": 1, "description": "Review token returned by a reconciliation preview."}
+      },
+      "required": ["project_handle", "analysis_file"],
+      "additionalProperties": false,
+      "allOf": [{"if": {"required": ["apply"], "properties": {"apply": {"const": true}}}, "then": {"required": ["expected_revision", "review"]}}]
+    }
+  },
+  {
+    "name": "tiles_file_grid_correct",
+    "description": "Correct an even grid for a source-clock range and report carried links.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "grid": {"type": "string", "minLength": 1, "description": "Corrected even grid as COLSxROWS."}
+      },
+      "required": ["operation_id", "from", "to", "grid", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_grid_correct",
+    "description": "Correct an even grid for a source-clock range and report carried links.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "grid": {"type": "string", "minLength": 1, "description": "Corrected even grid as COLSxROWS."}
+      },
+      "required": ["project_handle", "from", "to", "grid", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_layout_set",
+    "description": "Set the output layout for a clip or group over a source-clock range.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "clip_id": {"type": "string", "minLength": 1, "description": "The occurrence ID from the project timeline."},
+        "layout": {"type": "string", "enum": ["original", "solo", "pair", "side-by-side", "grid", "flow", "arranged"], "description": "Clip or group layout."},
+        "feed_id": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}, "description": "Repeat for multiple feed IDs."},
+        "occurrence_id": {"type": "string", "minLength": 1, "description": "The assembly occurrence ID."},
+        "group": {"type": "boolean", "description": "Apply to the multicam group."},
+        "slot": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["id"], "properties": {"id": {"type": "string", "description": "Feed, camera or presentation ID. Use an empty string for an empty slot."}, "target": {"type": "string", "enum": ["participant", "camera", "presentation", "empty"], "description": "Slot source type."}, "framing": {"type": "string", "enum": ["fit", "fill"], "description": "Fit or fill the slot."}, "anchor_x": {"type": "number", "minimum": 0, "maximum": 1}, "anchor_y": {"type": "number", "minimum": 0, "maximum": 1}, "background": {"type": "integer", "minimum": 0, "maximum": 16777215, "description": "RGB value."}, "include_camera_off": {"type": "boolean", "description": "Include camera-off appearances."}, "destination_tile_id": {"type": "string", "minLength": 1, "description": "Tile position to target in an arranged layout."}}}, "description": "Explicit source, framing and destination assignments for the layout."},
+        "compact": {"type": "boolean", "description": "Compact the layout when a feed is absent."}
+      },
+      "required": ["operation_id", "layout", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}, {"oneOf": [{"required": ["clip_id"]}, {"required": ["occurrence_id"]}, {"required": ["group"], "properties": {"group": {"const": true}}}]}, {"not": {"required": ["feed_id", "slot"]}}]
+    }
+  },
+  {
+    "name": "tiles_editor_layout_set",
+    "description": "Set the output layout for a clip or group over a source-clock range.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "clip_id": {"type": "string", "minLength": 1, "description": "The occurrence ID from the project timeline."},
+        "layout": {"type": "string", "enum": ["original", "solo", "pair", "side-by-side", "grid", "flow", "arranged"], "description": "Clip or group layout."},
+        "feed_id": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."}, "description": "Repeat for multiple feed IDs."},
+        "occurrence_id": {"type": "string", "minLength": 1, "description": "The assembly occurrence ID."},
+        "group": {"type": "boolean", "description": "Apply to the multicam group."},
+        "slot": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["id"], "properties": {"id": {"type": "string", "description": "Feed, camera or presentation ID. Use an empty string for an empty slot."}, "target": {"type": "string", "enum": ["participant", "camera", "presentation", "empty"], "description": "Slot source type."}, "framing": {"type": "string", "enum": ["fit", "fill"], "description": "Fit or fill the slot."}, "anchor_x": {"type": "number", "minimum": 0, "maximum": 1}, "anchor_y": {"type": "number", "minimum": 0, "maximum": 1}, "background": {"type": "integer", "minimum": 0, "maximum": 16777215, "description": "RGB value."}, "include_camera_off": {"type": "boolean", "description": "Include camera-off appearances."}, "destination_tile_id": {"type": "string", "minLength": 1, "description": "Tile position to target in an arranged layout."}}}, "description": "Explicit source, framing and destination assignments for the layout."},
+        "compact": {"type": "boolean", "description": "Compact the layout when a feed is absent."}
+      },
+      "required": ["project_handle", "layout", "expected_revision"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["clip_id"]}, {"required": ["occurrence_id"]}, {"required": ["group"], "properties": {"group": {"const": true}}}]}, {"not": {"required": ["feed_id", "slot"]}}]
+    }
+  },
+  {
+    "name": "tiles_file_layout_list",
+    "description": "Read saved tile layouts in the project.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "clip_id": {"type": "string", "minLength": 1, "description": "The occurrence ID from the project timeline."}
+      },
+      "required": ["operation_id", "project_path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_editor_layout_list",
+    "description": "Read saved tile layouts in the project.",
+    "annotations": {"readOnlyHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "clip_id": {"type": "string", "minLength": 1, "description": "The occurrence ID from the project timeline."}
+      },
+      "required": ["project_handle"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_box_add",
+    "description": "Draw a tile in the source frame for a source-clock range.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "bounds": {"type": "object", "properties": {"x": {"type": "number", "minimum": 0, "maximum": 1}, "y": {"type": "number", "minimum": 0, "maximum": 1}, "width": {"type": "number", "minimum": 0, "maximum": 1}, "height": {"type": "number", "minimum": 0, "maximum": 1}}, "required": ["x", "y", "width", "height"], "additionalProperties": false, "description": "Normalized source-frame bounds."}
+      },
+      "required": ["operation_id", "from", "to", "bounds", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_box_add",
+    "description": "Draw a tile in the source frame for a source-clock range.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "bounds": {"type": "object", "properties": {"x": {"type": "number", "minimum": 0, "maximum": 1}, "y": {"type": "number", "minimum": 0, "maximum": 1}, "width": {"type": "number", "minimum": 0, "maximum": 1}, "height": {"type": "number", "minimum": 0, "maximum": 1}}, "required": ["x", "y", "width", "height"], "additionalProperties": false, "description": "Normalized source-frame bounds."}
+      },
+      "required": ["project_handle", "from", "to", "bounds", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_box_set",
+    "description": "Correct a tile’s bounds over a source-clock range.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "bounds": {"type": "object", "properties": {"x": {"type": "number", "minimum": 0, "maximum": 1}, "y": {"type": "number", "minimum": 0, "maximum": 1}, "width": {"type": "number", "minimum": 0, "maximum": 1}, "height": {"type": "number", "minimum": 0, "maximum": 1}}, "required": ["x", "y", "width", "height"], "additionalProperties": false, "description": "Normalized source-frame bounds."}
+      },
+      "required": ["operation_id", "tile_id", "from", "to", "bounds", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_box_set",
+    "description": "Correct a tile’s bounds over a source-clock range.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "feed_id": {"type": "string", "minLength": 1, "description": "The feed ID from feeds list."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "bounds": {"type": "object", "properties": {"x": {"type": "number", "minimum": 0, "maximum": 1}, "y": {"type": "number", "minimum": 0, "maximum": 1}, "width": {"type": "number", "minimum": 0, "maximum": 1}, "height": {"type": "number", "minimum": 0, "maximum": 1}}, "required": ["x", "y", "width", "height"], "additionalProperties": false, "description": "Normalized source-frame bounds."}
+      },
+      "required": ["project_handle", "tile_id", "from", "to", "bounds", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_tile_split",
+    "description": "Split one tile at a source-clock timestamp.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "at": {"type": "string", "minLength": 1, "description": "Source-clock timestamp."},
+        "new_tile_id": {"type": "string", "minLength": 1, "description": "Stable ID for the new tile."}
+      },
+      "required": ["operation_id", "tile_id", "at", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_tile_split",
+    "description": "Split one tile at a source-clock timestamp.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."},
+        "at": {"type": "string", "minLength": 1, "description": "Source-clock timestamp."},
+        "new_tile_id": {"type": "string", "minLength": 1, "description": "Stable ID for the new tile."}
+      },
+      "required": ["project_handle", "tile_id", "at", "expected_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "tiles_file_tile_screen_share",
+    "description": "Mark a tile as a screen share over the selected interval.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it for an identical retry."},
+        "working_directory": {"type": "string", "pattern": "^/", "description": "Base directory for relative paths inside requests and saved documents."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "The saved .cut project."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Write the updated project to this .cut path."},
+        "in_place": {"type": "boolean", "description": "Update the saved project in place.", "const": true},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."}
+      },
+      "required": ["operation_id", "tile_id", "project_path"],
+      "additionalProperties": false,
+      "allOf": [{"oneOf": [{"required": ["out_project"]}, {"required": ["in_place"], "properties": {"in_place": {"const": true}}}]}]
+    }
+  },
+  {
+    "name": "tiles_editor_tile_screen_share",
+    "description": "Mark a tile as a screen share over the selected interval.",
+    "annotations": {"readOnlyHint": false, "openWorldHint": false, "destructiveHint": true},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {"type": "string", "minLength": 1, "description": "The open window handle from project_windows_list."},
+        "expected_revision": {"type": "integer", "minimum": 0, "description": "The revision from the latest editor state or tool result."},
+        "source_id": {"type": "string", "minLength": 1, "description": "The recording ID. Select it when multiple recordings are eligible."},
+        "from": {"type": "string", "minLength": 1, "description": "Inclusive source-clock start as a timestamp."},
+        "to": {"type": "string", "minLength": 1, "description": "Exclusive source-clock end as a timestamp."},
+        "tile_id": {"type": "string", "minLength": 1, "description": "The tile ID from inspect."}
+      },
+      "required": ["project_handle", "tile_id", "expected_revision"],
+      "additionalProperties": false
+    }
+  }
+]

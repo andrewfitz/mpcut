@@ -32,7 +32,7 @@ extension CutProject {
         case .multicam(let project):
             for (index, item) in (project.assemblyItems ?? []).enumerated() {
                 switch item {
-                case .group(let range, _): try advance(index, range.to.subtracting(range.from))
+                case .group(let range, _, _, _): try advance(index, range.to.subtracting(range.from))
                 case .still(let insert): try advance(index, insert.duration, insert: insert)
                 }
             }

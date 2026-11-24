@@ -61,6 +61,13 @@ extension MulticamProject {
         let routes: [MulticamSwitchCoverage.Route] = proposal.plan.intervals.compactMap { interval in
             interval.audio.map { .init(group: interval.group, audio: $0) }
         }
+        let feed = angles.first { $0.id == angle }?.feedAngle
+        let feedGeometry = try feed.map {
+            try ParticipantGeometryIndex(participants, sourceID: $0.sourceID, slots: [$0.feedID], checkCancellation: {})
+        }
+        let feedOmitted = feed.map { feed in
+            participants.effectiveRedactions.contains { $0.participantID == feed.feedID && $0.treatment == .omit }
+        } ?? false
         let audioExpected = audio != .none || !routes.isEmpty
         var current: [String: Bool] = [:]
         func verified(_ id: String, _ info: MediaInfo) -> Bool {
@@ -75,7 +82,8 @@ extension MulticamProject {
             var covered: [AudioSpan] = []
             var unverified = false
             for span in spans {
-                guard let info = media[span.source], isAvailable(span), verified(span.source, info) else {
+                guard let info = media[span.source] ?? (picture ? feed.flatMap { media[$0.sourceID] } : nil),
+                      isAvailable(span), verified(span.source, info) else {
                     unverified = true
                     continue
                 }
@@ -92,10 +100,19 @@ extension MulticamProject {
                     }
                 }
                 if picture {
+                    if feedOmitted { continue }
+                    if let feed, participants.needsReconciliation(sourceID: feed.sourceID, identity: info.identity) {
+                        unverified = true
+                        continue
+                    }
                     let frames = info.frames
                     let start = max(0, frames.lowerBound { $0.time >= span.input.from } - 1)
                     for frame in frames[start...] {
                         if frame.time >= span.input.to { break }
+                        if let feed, let feedGeometry {
+                            let sourceTime = try frame.time.subtracting(info.multicamClockOffset)
+                            guard feedGeometry.appearance(.init(id: feed.feedID), at: sourceTime) != nil else { continue }
+                        }
                         try append(frame.time, min(info.duration, frame.time.adding(frame.duration)))
                     }
                 } else {

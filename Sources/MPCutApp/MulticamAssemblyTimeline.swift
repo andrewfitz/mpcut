@@ -9,6 +9,54 @@ struct MulticamAssemblyTimeline: View {
     @State private var layout: Layout?
     @Environment(\.openDroppedProjects) private var openDroppedProjects
 
+    private var showTileFeeds = false
+    private let tileContent: [UUID: TileTimelineContent]
+
+    init(model: MulticamEditorModel, preview: MulticamPreview, paddingSpans: [AudioSpan] = []) {
+        self.model = model
+        self.preview = preview
+        self.paddingSpans = paddingSpans
+        tileContent = Self.tileContent(for: model)
+    }
+
+    func showingTileFeeds(_ show: Bool) -> Self {
+        var result = self
+        result.showTileFeeds = show
+        return result
+    }
+
+    private static func tileContent(for model: MulticamEditorModel) -> [UUID: TileTimelineContent] {
+        guard let current = model.project else { return [:] }
+        let project = TileTimelineContent.layoutDisplayProject(current)
+        let items = project.assemblyItems ?? [.group(project.range)]
+        guard !project.participants.isEmpty || !project.groupTileLayouts.isEmpty
+            || items.contains(where: { !$0.tileLayouts.isEmpty }) else { return [:] }
+        let intervals = Dictionary(grouping: (try? project.plan().intervals) ?? [], by: \.assemblyIndex)
+        return Dictionary(uniqueKeysWithValues: items.enumerated().compactMap { index, item in
+            guard let group = item.group else { return nil }
+            var content = TileTimelineContent.group(project, media: model.media, intervals: intervals[index] ?? [])
+            let hasLayout = content.layouts.contains { $0.range.tileIntersection(group) != nil }
+            content.layouts = hasLayout || !item.tileLayouts.isEmpty
+                ? TileTimelineContent.fillingGaps(content.layouts, in: group) : []
+            content.overrides = item.tileLayouts
+            content.edited = content.hasLayouts || !content.feeds.isEmpty
+            return (Self.id(index), content)
+        })
+    }
+
+    var hasGroupTileLayouts: Bool { tileContent.values.contains { !$0.layouts.isEmpty || !$0.overrides.isEmpty } }
+    var hasTileOverrides: Bool { tileContent.values.contains { !$0.overrides.isEmpty } }
+    var hasTileFeeds: Bool { tileContent.values.contains { !$0.feeds.isEmpty } }
+
+    var tileFeedRows: [TileTimelineContent.Feed] {
+        guard showTileFeeds else { return [] }
+        return TileTimelineContent.feedRows(in: tileContent)
+    }
+
+    var tileLaneHeight: CGFloat {
+        (hasGroupTileLayouts ? 22 : 0) + (hasTileOverrides ? 22 : 0) + CGFloat(tileFeedRows.count) * 14
+    }
+
     var hasAssets: Bool {
         guard let project = model.project else { return false }
         let gaps = Set(project.stillAssets.filter(\.isGap).map(\.id))
@@ -120,6 +168,12 @@ struct MulticamAssemblyTimeline: View {
             }
         }
         result.onDropProjects = { openDroppedProjects($0) }
+        result.tileContent = tileContent
+        result.showTileFeeds = .constant(showTileFeeds)
+        if !model.isBusy {
+            result.onResizeTileSpan = model.resizeTimelineTile
+            if model.assemblySelection != nil { result.onClearTileLayouts = model.clearMarkedTileLayout }
+        }
         result.timelinePadding = paddingSpans
         result.assemblyAssets = current.assetSpans.map { span in
             var span = span

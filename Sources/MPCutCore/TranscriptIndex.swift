@@ -201,6 +201,7 @@ public struct TranscriptIndex: Sendable {
     package let cacheIdentity = CacheIdentity()
     let indexes: Clocks
     public let document: TranscriptDocument
+    let multicamClockOffsets: [String: RationalTime]
     public let timelineRevision: Int
     public let attachment: TranscriptAttachment?
     public let transcriptRevision: UInt64?
@@ -215,8 +216,9 @@ public struct TranscriptIndex: Sendable {
          timelineRevision: Int, attachment: TranscriptAttachment?, transcriptRevision: UInt64?,
          speakers: [TranscriptSpeaker], authoredReview: [TranscriptAuthoredReview],
          inputCoverageProvider: @escaping @Sendable (TranscriptSpace, TranscriptFilter) throws -> TranscriptInputCoverageRows,
-         usesMix: Bool, staleLead: Bool?) {
+         usesMix: Bool, staleLead: Bool?, multicamClockOffsets: [String: RationalTime]) {
         self.indexes = Clocks(clocks, gaps: gaps)
+        self.multicamClockOffsets = multicamClockOffsets
         self.document = document
         self.timelineRevision = timelineRevision
         self.attachment = attachment

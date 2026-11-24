@@ -55,6 +55,7 @@ struct TimelineTimeControl: View {
                 .overlay(alignment: .leading) {
                     if editing {
                         TextField("Timeline position", text: $input)
+                            .accessibilityIdentifier("timeline.position.input")
                             .font(Self.font.weight(.medium))
                             .textFieldStyle(.plain)
                             .focused($focused)
@@ -84,6 +85,7 @@ struct TimelineTimeControl: View {
                         .buttonStyle(.plain)
                         .help("Enter playhead time")
                         .accessibilityLabel("Timeline position")
+                        .accessibilityIdentifier("timeline.position")
                         .accessibilityValue(timelineTime(playhead, milliseconds: true))
                     }
                 }

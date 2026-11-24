@@ -198,7 +198,7 @@ final class ProjectMediaWatcher {
     private var retry = Set<URL>()
     private var perFile = false
     private var watches: [URL: DispatchSourceFileSystemObject] = [:]
-    private var debounce: Task<Void, Never>?
+    private var debounce: DispatchWorkItem?
     private var scheduledVolumes = Set<String>()
     private var allVolumesScheduled = false
     private var notifications = Set<AnyCancellable>()
@@ -281,15 +281,16 @@ final class ProjectMediaWatcher {
         if let volume { scheduledVolumes.insert(volume) }
         else { allVolumesScheduled = true }
         guard debounce == nil else { return }
-        debounce = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(180))
-            guard !Task.isCancelled, let self else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
             self.debounce = nil
             let volumes = self.allVolumesScheduled ? nil : self.scheduledVolumes
             self.scheduledVolumes.removeAll()
             self.allVolumesScheduled = false
             self.check(volumes)
         }
+        debounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(180), execute: work)
     }
 
     func checkNow() { check(nil) }

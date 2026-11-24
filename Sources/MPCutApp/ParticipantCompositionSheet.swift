@@ -288,7 +288,7 @@ struct ParticipantCompositionSheet: View {
 
     private func slotCapacity(_ layout: ParticipantShotLayout) -> Int {
         switch layout {
-        case .original: 0
+        case .original, .arranged: 0
         case .solo: 1
         case .pair: 2
         case .grid, .flow: 4

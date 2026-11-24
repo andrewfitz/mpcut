@@ -15,6 +15,7 @@ struct ProgramFrameManifest: Encodable {
         var sourceTime: RationalTime?
         var frameTime: RationalTime?
         var generatedGap: Bool?
+        var privacyIssues: [ParticipantPrivacyIssue]?
     }
 
     let ok = true
@@ -34,15 +35,48 @@ func writeProgramFrames(_ project: CutProject, media: CutProjectMedia, projectPa
                         format: FrameImageFormat = .jpeg,
                         documentIdentity: SourceIdentity?,
                         useSidecar: Bool, cancelled: @escaping @Sendable () -> Bool) throws -> ProgramFrameManifest {
-    guard project.participants.render == nil else {
-        throw ParticipantProjectExport.unsupported("Program frame export")
-    }
     let sequence = project.sequenceClips
     let requiredClock: StillOptions.Clock = sequence == nil ? .assembly : .sequence
-    guard clock == nil || clock == requiredClock else {
+    let groupClock = clock == .group && sequence == nil && project.requiresPictureProcessing
+    guard clock == nil || clock == requiredClock || groupClock else {
         throw CLIError("invalid_arguments", "Use --clock \(requiredClock.rawValue) for program frames in this project.")
     }
     try media.validateDestination(output, relativeTo: location, includesContents: true)
+    if project.requiresPictureProcessing {
+        // The rendered participant and Tiles picture is encoded as JPEG only. Refuse rather than mislabel it.
+        guard format == .jpeg else {
+            throw CLIError("invalid_arguments", "Rendered participant and Tiles frames are JPEG only. Omit --format.")
+        }
+        let snapshot: CutProject
+        let origin: RationalTime
+        if groupClock, case .multicam(let multicam) = project {
+            snapshot = .multicam(try multicam.pictureExportSnapshot(ranges: [multicam.range]))
+            origin = multicam.range.from
+        } else {
+            snapshot = project
+            origin = .zero
+        }
+        let renderer = try ProjectOutputJPEG(snapshot, document: location, cancelled: cancelled)
+        return try JPEGExport.writeProgramFrameDirectory(to: output, cancelled: cancelled, validate: {
+            if let documentIdentity, !documentIdentity.isCurrentSnapshot(at: location) {
+                throw CutError(code: "source_changed", message: "The project changed during frame export.")
+            }
+            try renderer.verifySources()
+        }) { staging in
+            let frames = try times.enumerated().map { index, time in
+                let frame = try renderer.frame(at: time.subtracting(origin), preset: preset)
+                let name = String(format: "frame-%06d.jpg", index + 1)
+                try frame.data.write(to: staging.appendingPathComponent(name), options: .withoutOverwriting)
+                let range = MulticamRange(from: try frame.range.from.adding(origin), to: try frame.range.to.adding(origin))
+                return ProgramFrameManifest.Frame(requestNumber: index + 1, requestedTime: time, outputRange: range,
+                                                  file: name, width: frame.width, height: frame.height,
+                                                  frameTime: try frame.frameTime.adding(origin),
+                                                  privacyIssues: frame.privacyIssues.isEmpty ? nil : frame.privacyIssues)
+            }
+            return ProgramFrameManifest(clock: (clock ?? requiredClock).rawValue, projectPath: projectPath,
+                                        outputDirectory: output.path, duration: renderer.timeline.duration, preset: preset, frames: frames)
+        }
+    }
     let timeline = try project.resolveStills()
     let engine = CutEngine(cancelled: cancelled, useSidecar: useSidecar, tracks: .video)
     let clips = Dictionary(uniqueKeysWithValues: (sequence ?? []).map { ($0.id, $0) })

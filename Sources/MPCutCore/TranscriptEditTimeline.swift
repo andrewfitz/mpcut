@@ -47,7 +47,7 @@ struct TranscriptEditTimeline {
             items = try (project.assemblyItems ?? [.group(project.range)]).map { item in
                 let from = cursor
                 switch item {
-                case .group(let group, _): cursor = try cursor.adding(group.to.subtracting(group.from))
+                case .group(let group, _, _, _): cursor = try cursor.adding(group.to.subtracting(group.from))
                 case .still(let still): cursor = try cursor.adding(still.duration)
                 }
                 return Item(sequence: nil, multicam: item, output: .init(from: from, to: cursor))
@@ -137,17 +137,21 @@ struct TranscriptEditTimeline {
                     clip.id = uniqueID(originalID)
                     // An original trim edge still has its authored source handles. A new
                     // edit edge must stop at the cut so removed coverage cannot reappear.
-                    retainedFragments[originalID, default: []].append((
-                        clipID: clip.id,
-                        from: preservingHiddenStillHandles && input.from == clip.from ? nil : input.from,
-                        to: preservingHiddenStillHandles && input.to == clip.to ? nil : input.to
-                    ))
+                    let lower = preservingHiddenStillHandles && input.from == clip.from ? nil : input.from
+                    let upper = preservingHiddenStillHandles && input.to == clip.to ? nil : input.to
+                    retainedFragments[originalID, default: []].append((clipID: clip.id, from: lower, to: upper))
+                    clip.tileLayouts = clip.tileLayouts.compactMap { $0.limited(from: lower, to: upper) }
                     clip.from = input.from
                     clip.to = input.to
                     onRetainedClip(clip.id, originalID)
                     sequenceItems.append(.source(clip))
-                } else {
-                    assemblyItems.append(.group(input, angle: item.multicam?.angleOverride))
+                } else if let group = item.multicam, let original = group.group {
+                    let id = group.occurrenceID.map(uniqueID)
+                    let coverage = group.tileLayouts.compactMap { span in
+                        span.limited(from: preservingHiddenStillHandles && input.from == original.from ? nil : input.from,
+                                     to: preservingHiddenStillHandles && input.to == original.to ? nil : input.to)
+                    }
+                    assemblyItems.append(.group(input, angle: group.angleOverride, id: id, layouts: coverage))
                 }
             }
         }

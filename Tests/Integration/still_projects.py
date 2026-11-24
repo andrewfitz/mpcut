@@ -10,7 +10,7 @@ import tempfile
 import unittest
 import zlib
 
-from saved_project import read_project, saved_file
+from saved_project import read_project
 
 
 CLI = None
@@ -149,7 +149,7 @@ class StillProjectCLI(unittest.TestCase):
         asset = report["timeline"]["transcripts"]["attachments"][0]["asset"]
         saved = read_project(copy)
         saved_asset = saved["transcripts"]["attachments"][0]["asset"]
-        self.assertEqual(asset, {**saved_asset, "file": saved_file(saved, saved_asset["file"])})
+        self.assertEqual(asset, saved_asset)
         self.assertEqual((self.root / asset["file"]).parent.name, copy.name + ".transcripts")
         self.assertTrue((self.root / asset["file"]).is_file())
         self.assertEqual(self.project.read_bytes(), original)

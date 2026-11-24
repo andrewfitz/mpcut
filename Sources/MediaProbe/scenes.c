@@ -983,8 +983,8 @@ typedef struct {
     // The first queued span that may still receive its key picture.
     int next_key;
     int64_t queued_bytes;
-    // Decoded pictures wait here to be converted side by side, then reach the
-    // frame visit in order.
+    // Software pictures wait for parallel reduction. For other decoders,
+    // these slots stay NULL and only the reduced RGB samples wait for analysis.
     AVFrame *batch[BATCH];
     Sample samples[BATCH];
     int batched, batch_limit, sample_limit;
@@ -997,7 +997,7 @@ typedef struct {
     bool streaming;
     // The first replayed picture can repeat the previously delivered boundary.
     bool skipping;
-    int64_t delivered;
+    int64_t delivered, resume_anchor;
     // Random access packets end a span only when none of the pictures after
     // them can be presented before them.
     bool boundaries, intra_only;
@@ -1068,7 +1068,7 @@ static void sample_discard(const Adaptive *a, Sample *sample)
 // Reduce one picture and let the caller analyze its pixels on this worker.
 static void adaptive_reduce_one(const Adaptive *a, Scan *worker, const AVFrame *picture, Sample *sample)
 {
-    reduce_picture(worker, picture, a->sample_limit, sample);
+    if (picture) reduce_picture(worker, picture, a->sample_limit, sample);
     if (a->prepare && sample->status == 0 && !sample->damaged)
         sample->prepared = a->prepare(a->scan.context, sample->pts, sample->rgb, sample->width, sample->height,
                                       sample->width * 3, sample->sar.num, sample->sar.den);
@@ -1102,7 +1102,7 @@ static int adaptive_flush(Adaptive *a)
     int ret = 0;
     for (int i = 0; i < count; i++) {
         Sample *sample = samples[i];
-        av_frame_unref(a->batch[i]);
+        if (a->batch[i]) av_frame_unref(a->batch[i]);
         if (ret == 0 && a->scan.cancelled(a->scan.context)) ret = AVERROR_EXIT;
         if (ret == 0) {
             a->scan.pictures++;
@@ -1141,11 +1141,34 @@ static int adaptive_deliver(Adaptive *a, AVFrame *frame)
         a->skipping = false;
         if (pts != AV_NOPTS_VALUE && pts == a->delivered) return 0;
     }
+    if (a->resume_anchor != AV_NOPTS_VALUE) {
+        if (pts == AV_NOPTS_VALUE) return 0;
+        if (pts < a->resume_anchor) {
+            // Keep span boundaries active while the decoder warms up.
+            a->delivered = pts;
+            return 0;
+        }
+        bool damaged = false;
+        if (pts != a->resume_anchor || picture_state(&a->scan, frame, &damaged) != 0 || damaged)
+            return MP_PARTICIPANT_RESUME_ANCHOR_MISSING;
+        a->resume_anchor = AV_NOPTS_VALUE;
+        a->delivered = pts;
+        a->scan.pictures++;
+        return 0;
+    }
     if (pts != AV_NOPTS_VALUE) a->delivered = pts;
     // Scene detection compares consecutive pictures on this thread, in order.
     int ret = a->scan.visit ? scene_picture(&a->scan, frame) : 0;
     if (ret != 0) return ret;
-    av_frame_move_ref(a->batch[a->batched++], frame);
+    if (a->batch[a->batched]) {
+        av_frame_move_ref(a->batch[a->batched], frame);
+    } else {
+        // Release the decoder surface before requesting another. Only the
+        // bounded measurement lattice needs to survive until parallel detection.
+        reduce_picture(&a->workers[0], frame, a->sample_limit, &a->samples[a->batched]);
+        av_frame_unref(frame);
+    }
+    a->batched++;
     return a->batched >= a->batch_limit ? adaptive_flush(a) : 0;
 }
 
@@ -1155,7 +1178,7 @@ static int adaptive_pump(Adaptive *a, const AVPacket *packet)
     if (a->scan.cancelled(a->scan.context)) return AVERROR_EXIT;
     int ret = avcodec_send_packet(a->dense, packet);
     if (packet && damaged_picture(a->dense, ret, &a->hardware_failures)) {
-        if (a->unplaced_damage) *a->unplaced_damage = 1;
+        if (a->unplaced_damage && a->resume_anchor == AV_NOPTS_VALUE) *a->unplaced_damage = 1;
         ret = 0;
     }
     if (ret < 0 && ret != AVERROR_EOF) return ret;
@@ -1163,7 +1186,7 @@ static int adaptive_pump(Adaptive *a, const AVPacket *packet)
     for (;;) {
         ret = avcodec_receive_frame(a->dense, a->frame);
         if (failures < 64 && damaged_picture(a->dense, ret, &a->hardware_failures)) {
-            if (a->unplaced_damage) *a->unplaced_damage = 1;
+            if (a->unplaced_damage && a->resume_anchor == AV_NOPTS_VALUE) *a->unplaced_damage = 1;
             failures++;
             continue;
         }
@@ -1320,7 +1343,7 @@ static int adaptive_settle(Adaptive *a, bool wait)
         bool accepted = false;
         int ret = adaptive_flush(a);
         if (ret != 0) return ret;
-        if (span->sampled && a->boundaries && first->pts == a->delivered) {
+        if (span->sampled && a->boundaries && a->resume_anchor == AV_NOPTS_VALUE && first->pts == a->delivered) {
             Sample *sample = &span->sample;
             // An invalid display transform keeps its exact status.
             if (sample->status > 0) return sample->status;
@@ -1455,16 +1478,19 @@ static int adaptive_packet(Adaptive *a, AVPacket **owned)
     return 0;
 }
 
-int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, MPProbeCancelled cancelled,
-                                 MPParticipantSampleVisit coarse, MPParticipantSampleVisit frame,
-                                 MPParticipantPrepare prepare, MPParticipantDiscard discard, MPSceneVisit scene,
-                                 void *context, int *unplaced_damage, char *error, size_t capacity)
+int mp_participant_scan_from(const char *path, int index, int sample_limit, int64_t resume_anchor,
+                             MPProbeCancelled cancelled,
+                             MPParticipantSampleVisit coarse, MPParticipantSampleVisit frame,
+                             MPParticipantPrepare prepare, MPParticipantDiscard discard, MPSceneVisit scene,
+                             void *context, int *unplaced_damage, MPParticipantEditTail *edit_tail, char *error, size_t capacity)
 {
-    if (!path || !cancelled || !frame || sample_limit < 0 || (prepare && !discard)) {
+    if (!path || !cancelled || !frame || sample_limit < 0 || (prepare && !discard) ||
+        (scene && resume_anchor != AV_NOPTS_VALUE)) {
         av_strerror(AVERROR(EINVAL), error, capacity);
         return AVERROR(EINVAL);
     }
     if (unplaced_damage) *unplaced_damage = 0;
+    if (edit_tail) *edit_tail = (MPParticipantEditTail){0};
     Adaptive *a = av_mallocz(sizeof(*a));
     AVFormatContext *format = avformat_alloc_context();
     AVPacket *packet = NULL;
@@ -1477,6 +1503,7 @@ int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, 
     a->discard = discard;
     a->unplaced_damage = unplaced_damage;
     a->delivered = AV_NOPTS_VALUE;
+    a->resume_anchor = resume_anchor;
     a->streaming = true;
     if (!(a->frame = av_frame_alloc()) || !(a->held = av_frame_alloc())) goto done;
     format->interrupt_callback = (AVIOInterruptCB){ cancelled, context };
@@ -1488,6 +1515,32 @@ int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, 
         goto done;
     }
     AVStream *stream = a->stream = format->streams[index];
+    if (edit_tail && av_match_name("mov", format->iformat->name) && !stream->codecpar->video_delay) {
+        // MOV may round a sub-frame edit past a whole preroll sample while
+        // retaining the fractional sample in its declared track duration.
+        int count = avformat_index_get_entries_count(stream);
+        if (count >= 2 && count == stream->nb_frames) {
+            const AVIndexEntry *first = avformat_index_get_entry(stream, 0);
+            const AVIndexEntry *second = avformat_index_get_entry(stream, 1);
+            const AVIndexEntry *last = avformat_index_get_entry(stream, count - 1);
+            if (first && second && last && (first->flags & AVINDEX_DISCARD_FRAME) &&
+                !(second->flags & AVINDEX_DISCARD_FRAME) && !(last->flags & AVINDEX_DISCARD_FRAME) &&
+                first->timestamp < stream->start_time && second->timestamp == stream->start_time) {
+                edit_tail->last_pts = last->timestamp;
+                edit_tail->preroll_ticks = av_sat_sub64(second->timestamp, first->timestamp);
+            }
+            // An edit can also end on the last stored sample's timestamp. The
+            // demuxer marks that sample for discard and the decoder never
+            // presents it, but the packet index still counts its width.
+            const AVIndexEntry *before = avformat_index_get_entry(stream, count - 2);
+            if (first && last && before && !(first->flags & AVINDEX_DISCARD_FRAME) &&
+                (last->flags & AVINDEX_DISCARD_FRAME) && !(before->flags & AVINDEX_DISCARD_FRAME) &&
+                last->timestamp > before->timestamp) {
+                edit_tail->last_pts = before->timestamp;
+                edit_tail->trailing_ticks = av_sat_sub64(last->timestamp, before->timestamp);
+            }
+        }
+    }
     a->scan.picture_format = format;
     a->scan.picture_stream = stream;
     const AVPacketSideData *display = av_packet_side_data_get(stream->codecpar->coded_side_data,
@@ -1497,6 +1550,17 @@ int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, 
            (const uint8_t *)identity, sizeof(identity));
     for (unsigned i = 0; i < format->nb_streams; i++)
         if (i != (unsigned)index) format->streams[i]->discard = AVDISCARD_ALL;
+    if (resume_anchor != AV_NOPTS_VALUE) {
+        // Reopen the nearest preceding random access region and require the
+        // exact saved presentation timestamp before submitting another frame.
+        const int64_t preroll = av_rescale_q(2, (AVRational){1, 1}, stream->time_base);
+        const int64_t target = av_sat_sub64(resume_anchor, preroll);
+        if ((stream->start_time == AV_NOPTS_VALUE || target > stream->start_time) &&
+            av_seek_frame(format, index, target, AVSEEK_FLAG_BACKWARD) < 0) {
+            ret = cancelled(context) ? AVERROR_EXIT : MP_PARTICIPANT_RESUME_ANCHOR_MISSING;
+            goto done;
+        }
+    }
     if (!(a->decoder = avcodec_find_decoder(stream->codecpar->codec_id))) { ret = AVERROR_DECODER_NOT_FOUND; goto done; }
     const AVCodecParameters *parameters = stream->codecpar;
     const enum AVCodecID id = parameters->codec_id;
@@ -1511,11 +1575,11 @@ int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, 
     // The hardware decoder returns these pictures as NV12. Present the same
     // planes to the converter so both decoders yield identical RGB.
     a->scan.pack_nv12 = a->software;
-    // Full pictures are large. Convert them one at a time unless the caller
-    // takes the reduced grid. Hardware pictures come from a small pool that
-    // the decoder waits on, so none of them may be held back either.
+    // Only reduced pictures may be batched. A hardware decoder needs its
+    // surfaces back immediately, so release each after reduction and batch
+    // only the small RGB samples when there is analysis to prepare.
     a->sample_limit = sample_limit;
-    a->batch_limit = sample_limit > 0 && a->software ? BATCH : 1;
+    a->batch_limit = sample_limit > 0 && (a->software || prepare) ? BATCH : 1;
     const int64_t picture_bytes = FFMAX(1, (int64_t)parameters->width * parameters->height * 3);
     a->worker_count = sample_limit > 0
         ? (int)FFMAX(1, FFMIN(FFMIN(av_cpu_count() / 2, WORKERS), WORKER_BYTES / picture_bytes)) : 1;
@@ -1528,7 +1592,7 @@ int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, 
         memcpy(worker->picture_display_matrix, a->scan.picture_display_matrix, sizeof(worker->picture_display_matrix));
         if (!(worker->rgb_frame = av_frame_alloc())) { ret = AVERROR(ENOMEM); goto done; }
     }
-    for (int i = 0; i < a->batch_limit; i++)
+    for (int i = 0; a->software && i < a->batch_limit; i++)
         if (!(a->batch[i] = av_frame_alloc())) { ret = AVERROR(ENOMEM); goto done; }
     a->backlog = FFMIN(SPAN_QUEUE - 1, a->worker_count + (a->software ? software_threads(true) - 1 : 0));
     for (;;) {
@@ -1550,7 +1614,8 @@ int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, 
     if (!a->streaming && (ret = adaptive_decode(a, a->packets, a->count, false)) != 0) goto done;
     if ((ret = adaptive_pump(a, NULL)) != 0 || (ret = adaptive_flush(a)) != 0) goto done;
     if (scene && a->scan.pending > 0) emit(&a->scan, &a->scan.frames[(a->scan.count - 1) % 3]);
-    ret = a->scan.pictures ? 0 : AVERROR_INVALIDDATA;
+    ret = a->resume_anchor != AV_NOPTS_VALUE ? MP_PARTICIPANT_RESUME_ANCHOR_MISSING :
+        a->scan.pictures ? 0 : AVERROR_INVALIDDATA;
 done:
     if (ret < 0) av_strerror(ret, error, capacity);
     if (a) {
@@ -1577,4 +1642,14 @@ done:
     avformat_close_input(&format);
     av_free(a);
     return ret == AVERROR_EXIT ? MP_SCENE_SCAN_CANCELLED : ret;
+}
+
+int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, MPProbeCancelled cancelled,
+                                 MPParticipantSampleVisit coarse, MPParticipantSampleVisit frame,
+                                 MPParticipantPrepare prepare, MPParticipantDiscard discard, MPSceneVisit scene,
+                                 void *context, int *unplaced_damage, char *error, size_t capacity)
+{
+    return mp_participant_scan_from(path, index, sample_limit, AV_NOPTS_VALUE, cancelled,
+                                    coarse, frame, prepare, discard, scene, context,
+                                    unplaced_damage, NULL, error, capacity);
 }

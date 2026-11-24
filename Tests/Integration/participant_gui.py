@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the participant editor through macOS Accessibility with synthetic media.
 
+The monitor check also uses Backstage's Screen Recording access.
 Set MPCUT_GUI_REQUIRE_SCAN=1 to verify that TileTrail scan review is available.
 """
 
@@ -26,15 +27,15 @@ def hidden_editor(bundle, project, folder):
     name = "mpcut-test-" + operation.hex
     endpoint = Path("/tmp") / name
     home = folder / "home"
-    (home / "Library" / "Preferences").mkdir(parents=True)
+    (home / "Library" / "Preferences").mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, BACKSTAGE_SESSION=name)
     result = subprocess.run(
-        ["backstage", "launch", str(bundle), "--env", f"CFFIXED_USER_HOME={home}",
+        ["backstage", "launch", str(bundle), "--timeout", "75", "--env", f"CFFIXED_USER_HOME={home}",
          "--env", f"MPCUT_TEST_SOCKET_DIRECTORY={name}", "--env", "MPCUT_MUTED=1",
          "--", "-automation_local_mcp_enabled", "YES",
          "-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO",
-         "-analysis_sidecar_reuse_enabled", "NO"],
-        env=env, capture_output=True, text=True, timeout=40)
+         "-analysis_sidecar_reuse_enabled", "NO", "-export_tier_downgrade_warning_enabled", "NO"],
+        env=env, capture_output=True, text=True, timeout=90)
     if result.returncode:
         raise RuntimeError(f"Backstage launch failed: {result.stdout} {result.stderr}")
     pid = json.loads(result.stdout)["pid"]
@@ -129,9 +130,6 @@ def verify_saved_project(cli, project):
         "range": interval(2, 3),
     }:
         raise AssertionError(f"Saved appearance override differs: {override}")
-    shot, = saved["render"]["shots"]
-    if shot["layout"] != "pair" or [slot["id"] for slot in shot["slots"]] != ["host", "guest"]:
-        raise AssertionError(f"Saved pair layout differs: {shot}")
 
 
 def main():
@@ -178,7 +176,10 @@ def main():
             print("Verified GUI scan, accept and save for four automatic camera feeds")
             return
         verify_saved_project(args.cli.resolve(), project)
-        print("Verified saved participant bindings, appearance override, and pair layout after reopening")
+        print("Verified saved participant bindings and appearance override")
+        with hidden_editor(args.app.resolve(), project, directory) as env:
+            env["MPCUT_GUI_REOPEN_ONLY"] = "1"
+            subprocess.run(command, check=True, timeout=120, env=env)
 
 
 if __name__ == "__main__":

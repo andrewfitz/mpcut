@@ -7,11 +7,52 @@
 // Multicam sync: swift Tests/Integration/transcript_gui.swift MPCut.app --reconcile FIXTURE_DIR HELPER
 import AppKit
 import ApplicationServices
+import Compression
 
 struct Failure: LocalizedError {
     let message: String
     init(_ message: String) { self.message = message }
     var errorDescription: String? { message }
+}
+
+/// A saved project as its plain JSON object. MPCut writes a project compressed (a 16-byte
+/// header, then raw DEFLATE), with media paths, repeated text and repeated history values
+/// listed once. A project written as plain JSON comes back as it is.
+func savedProjectObject(_ url: URL) -> [String: Any]? {
+    guard let data = try? Data(contentsOf: url) else { return nil }
+    guard var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+    // What a project repeats is listed once in a root `refs` table keyed by content: "~KEY" is a
+    // text entry, {"~": "KEY"} an object or list entry, and "~~x" the text "~x".
+    if let refs = root.removeValue(forKey: "refs") as? [String: Any] {
+        var failed = false
+        func resolved(_ node: Any, depth: Int) -> Any {
+            guard depth < 64 else { failed = true; return node }
+            if let text = node as? String {
+                guard text.hasPrefix("~") else { return text }
+                if text.hasPrefix("~~") { return String(text.dropFirst()) }
+                guard let literal = refs[String(text.dropFirst())] as? String else { failed = true; return text }
+                return literal
+            }
+            if let object = node as? [String: Any] {
+                if object.count == 1, let key = object["~"] as? String {
+                    guard let entry = refs[key], !(entry is String) else { failed = true; return node }
+                    return resolved(entry, depth: depth + 1)
+                }
+                return Dictionary(uniqueKeysWithValues: object.map {
+                    ($0.key, $0.key == "media_snapshot" ? $0.value : resolved($0.value, depth: depth + 1))
+                })
+            }
+            return (node as? [Any]).map { $0.map { resolved($0, depth: depth + 1) } } ?? node
+        }
+        var document = resolved(root, depth: 0) as? [String: Any]
+        // `base` marks the edit a history was saved for. Like `refs`, it belongs to the saved layout.
+        if var history = document?["history"] as? [String: Any] {
+            history["base"] = nil
+            document?["history"] = history
+        }
+        return failed ? nil : document
+    }
+    return root
 }
 
 func wait<T>(_ description: String, timeout: TimeInterval = 20, interval: TimeInterval = 0.1, _ inspect: () -> T?) throws -> T {
@@ -233,8 +274,7 @@ struct Editor {
     func expectSavedRanges(_ document: URL, _ expected: [[String]]) throws {
         try saveProject(document)
         _ = try wait("saved ranges " + String(describing: expected)) {
-            guard let bytes = try? Data(contentsOf: document),
-                  let project = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+            guard let project = savedProjectObject(document),
                   let clips = project["clips"] as? [[String: Any]],
                   let transcripts = project["transcripts"] as? [String: Any],
                   let attachments = transcripts["attachments"] as? [[String: Any]],
@@ -449,8 +489,7 @@ func exerciseMulticam(_ editor: Editor, transcript: URL) throws {
 }
 
 func projectJSON(_ url: URL) -> [String: Any]? {
-    guard let bytes = try? Data(contentsOf: url) else { return nil }
-    return (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any]
+    savedProjectObject(url)
 }
 
 func exerciseMulticamQueue(_ editor: Editor, project: URL, transcript: URL, snapshot: URL) throws {

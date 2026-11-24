@@ -82,6 +82,11 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
         if before.stillFormat != after.stillFormat { projectFields.append("still_format") }
         if before.stillAudioReference != after.stillAudioReference { projectFields.append("still_audio_reference") }
         if before.stillSoundtrack != after.stillSoundtrack { projectFields.append("still_soundtrack") }
+        let treatmentChanged = before.participants.effectiveRedactions != after.participants.effectiveRedactions
+        if treatmentChanged { projectFields.append("feed_treatments") }
+        if before.participants.tileOutput != after.participants.tileOutput { projectFields.append("tile_output") }
+        let groupLayoutsChanged = oldContents.groupLayouts != newContents.groupLayouts
+        if groupLayoutsChanged { projectFields.append("group_tile_layouts") }
         var groupChanges: [String] = []
         if case .multicam(let old) = before, case .multicam(let new) = after {
             if old.range != new.range { projectFields.append("group_range") }
@@ -92,15 +97,22 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
                 groupChanges.append("program_audio")
             }
             if old.switches != new.switches { groupChanges.append("switches") }
+            if old.speakerAngles != new.speakerAngles { projectFields.append("speaker_angles") }
         }
         projectFields += groupChanges
 
-        // Multicam group occurrences have revision-local indices. Pair equal
-        // ranges in order, while source clips and stills use their authored IDs.
+        // Match authored IDs first. A legacy group occurrence can acquire an ID
+        // when its first override is authored, so fall back to its range.
+        let currentIDs = Set(current.compactMap(Identity.init))
         var oldIndices: [Identity: [Int]] = [:]
         for item in previous.reversed() {
             try Task.checkCancellation()
-            if let key = Identity(item) { oldIndices[key, default: []].append(item.index) }
+            if let key = Identity(item) {
+                oldIndices[key, default: []].append(item.index)
+                if case .groupID = key, !currentIDs.contains(key), let range = item.input {
+                    oldIndices[.group(range), default: []].append(item.index)
+                }
+            }
         }
         let groupMetadataChanges = groupChanges.filter { $0 != "switches" }
         let compareSwitches = groupChanges.contains("switches")
@@ -109,7 +121,15 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
         var changes: [Change] = []
         for item in current {
             try Task.checkCancellation()
-            guard sameClock, let key = Identity(item), let index = oldIndices[key]?.popLast() else {
+            guard sameClock, let key = Identity(item) else {
+                changes.append(Change(kind: .added, before: nil, after: item, fields: []))
+                continue
+            }
+            var oldIndex = oldIndices[key]?.popLast()
+            if oldIndex == nil, case .groupID = key, let range = item.input {
+                oldIndex = oldIndices[.group(range)]?.popLast()
+            }
+            guard let index = oldIndex else {
                 changes.append(Change(kind: .added, before: nil, after: item, fields: []))
                 continue
             }
@@ -119,17 +139,23 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
             if old.index != item.index { fields.append("order") }
             if old.output != item.output { fields.append("output_range") }
             if old.input != item.input { fields.append("input_range") }
-            if let id = item.id {
+            if let id = item.id, !key.isGroup {
                 if oldContents.sourceChanged(id, comparedWith: newContents) { fields.append("source") }
                 if oldContents.cards[id] != newContents.cards[id] { fields.append("still") }
             }
+            if oldContents.tileLayouts(for: old) != newContents.tileLayouts(for: item) { fields.append("tile_layouts") }
+            if treatmentChanged, item.input != nil { fields.append("feed_treatments") }
             if oldContents.asset(old.assetID) != newContents.asset(item.assetID) { fields.append("still_asset") }
             if oldContents.replacementContents(for: old) != newContents.replacementContents(for: item) {
                 fields.append("picture_replacement")
             }
             if key.isGroup {
+                if old.id != item.id { fields.append("occurrence_id") }
                 if old.angleOverride != item.angleOverride { fields.append("angle_override") }
                 fields += groupMetadataChanges
+                if groupLayoutsChanged, oldContents.groupLayouts(in: old.input) != newContents.groupLayouts(in: item.input) {
+                    fields.append("group_tile_layouts")
+                }
                 if compareSwitches, let range = item.input {
                     let changed = groupSwitchChanges[range] ?? (oldContents.switches(in: range) != newContents.switches(in: range))
                     groupSwitchChanges[range] = changed
@@ -149,21 +175,23 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
     }
 
     private enum Identity: Hashable {
-        case clip(String), still(String), group(MulticamRange)
+        case clip(String), still(String), group(MulticamRange), groupID(String)
 
         init?(_ item: TimelineOccurrence) {
-            if let id = item.id {
+            if item.file == nil, let input = item.input {
+                self = item.id.map(Self.groupID) ?? .group(input)
+            } else if let id = item.id {
                 self = item.assetID != nil ? .still(id) : .clip(id)
-            } else if let input = item.input {
-                self = .group(input)
             } else {
                 return nil
             }
         }
 
         var isGroup: Bool {
-            if case .group = self { return true }
-            return false
+            switch self {
+            case .group, .groupID: return true
+            case .clip, .still: return false
+            }
         }
     }
 
@@ -189,6 +217,9 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
         let replacementsByClip: [String: [StillReplacement]]
         let groupReplacements: [(MulticamRange, StillReplacement)]
         let switches: [MulticamSwitch]
+        let groupLayouts: [TileLayoutSpan]
+        private let assembly: [StillAssemblyItem]
+        private let clipLayouts: [String: [TileLayoutSpan]]
 
         init(_ project: CutProject) {
             let sourceClips: [CutSequenceClip]
@@ -198,16 +229,23 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
                 sourceClips = clips
                 stillCards = []
                 switches = []
+                groupLayouts = []
+                assembly = []
             case .stillSequence(let sequence):
                 sourceClips = sequence.items.compactMap(\.source)
                 stillCards = sequence.items.compactMap(\.still)
                 switches = []
+                groupLayouts = []
+                assembly = []
             case .multicam(let multicam):
                 sourceClips = []
                 stillCards = multicam.assemblyItems?.compactMap(\.still) ?? []
                 switches = multicam.switches
+                groupLayouts = multicam.groupTileLayouts
+                assembly = multicam.assemblyItems ?? []
             }
             sources = Dictionary(sourceClips.map { ($0.id, Source($0)) }, uniquingKeysWith: { first, _ in first })
+            clipLayouts = Dictionary(sourceClips.map { ($0.id, $0.tileLayouts) }, uniquingKeysWith: { first, _ in first })
             cards = Dictionary(stillCards.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             assets = Dictionary(project.stillAssets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             replacements = project.stillReplacements
@@ -229,6 +267,23 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
             groupReplacements = group
         }
 
+        func groupLayouts(in range: MulticamRange?) -> [TileLayoutSpan] {
+            guard let range else { return [] }
+            return groupLayouts.compactMap { $0.limited(from: range.from, to: range.to) }
+        }
+
+        func tileLayouts(for item: TimelineOccurrence) -> [TileLayoutSpan] {
+            guard let input = item.input else { return [] }
+            let layouts: [TileLayoutSpan] = if item.file != nil, let id = item.id {
+                clipLayouts[id] ?? []
+            } else if assembly.indices.contains(item.index) {
+                assembly[item.index].tileLayouts
+            } else {
+                []
+            }
+            return layouts.compactMap { $0.limited(from: input.from, to: input.to) }
+        }
+
         func sourceChanged(_ id: String, comparedWith other: Self) -> Bool { sources[id] != other.sources[id] }
 
         func asset(_ id: String?) -> StillAsset? { id.flatMap { assets[$0] } }
@@ -240,7 +295,10 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
 
         func replacementContents(for item: TimelineOccurrence) -> [Replacement] {
             guard let input = item.input else { return [] }
-            let placements = item.id.map { replacementsByClip[$0] ?? [] } ?? groupReplacements.compactMap { range, placement in
+            if item.file != nil, let id = item.id {
+                return (replacementsByClip[id] ?? []).map { Replacement(placement: $0, asset: assets[$0.assetID]) }
+            }
+            let placements = groupReplacements.compactMap { range, placement -> StillReplacement? in
                 let from = max(range.from, input.from)
                 let to = min(range.to, input.to)
                 guard from < to else { return nil }

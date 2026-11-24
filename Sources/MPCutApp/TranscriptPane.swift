@@ -396,7 +396,9 @@ struct TranscriptPane: View {
                     } else {
                         Button("Recover Transcript Store…", action: locateTranscriptStore)
                     }
-                    Button("Export Transcript…", action: showExport)
+                    Button("Export Captions…") { showExport(captions: true) }
+                        .disabled(document == nil || loadedRevision != revision)
+                    Button("Export Transcript…") { showExport() }
                     Button("Detach Transcript", role: .destructive, action: confirmDetach)
                 }
             } label: {
@@ -1591,14 +1593,19 @@ extension TranscriptPane {
         }
     }
 
-    private func showExport() {
-        sheet = TranscriptPaneSheet("Export Transcript") {
-            TranscriptExportForm(space: space, isMulticam: isMulticam) { format, clock in
-                let requested = revision
-                let attachmentID = selectedAttachment?.id
+    private func showExport(captions: Bool = false) {
+        let requested = revision
+        guard let attachmentID = selectedAttachment?.id else { return }
+        sheet = TranscriptPaneSheet(captions ? "Export Captions" : "Export Transcript") {
+            TranscriptExportForm(space: captions ? .currentCut : space, isMulticam: isMulticam,
+                                 captions: captions, tracks: document?.tracks ?? [],
+                                 privacyWarning: controller.project.participants.transcriptExportWarning) { format, clock, trackID in
                 let panel = NSSavePanel()
                 panel.directoryURL = transcriptPanelDirectory
-                panel.nameFieldStringValue = "Transcript-\(clock.rawValue).\(format == .text ? "txt" : format.rawValue)"
+                let fileExtension = format == .text ? "txt" : format.rawValue
+                if let type = UTType(filenameExtension: fileExtension) { panel.allowedContentTypes = [type] }
+                let basename = captions ? "Captions" : "Transcript"
+                panel.nameFieldStringValue = "\(basename)-\(clock.rawValue).\(fileExtension)"
                 let save: (NSApplication.ModalResponse) -> Void = { result in
                     guard result == .OK, let url = panel.url else { return }
                     guard requested == revision else {
@@ -1610,7 +1617,9 @@ extension TranscriptPane {
                         do {
                             let index = try await controller.indexedTranscript(attachmentID: attachmentID, clocks: [clock])
                             try await Task.detached(priority: .userInitiated) {
-                                let data = try TranscriptCodec.encode(index, space: clock, format: format)
+                                let data = try captions
+                                    ? TranscriptCodec.encodeCaptions([index], space: clock, filter: .init(trackID: trackID))
+                                    : TranscriptCodec.encode(index, space: clock, format: format)
                                 try data.write(to: url, options: .atomic)
                             }.value
                             status = "Exported \(url.lastPathComponent)."

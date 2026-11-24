@@ -103,10 +103,6 @@ public struct ProjectMediaSnapshot: Codable, Equatable, Sendable {
     /// Preserve the existing history selection and append only whole entries that fit.
     func appending(to base: Data, current: Set<String>, retained: Set<String>, byteLimit: Int) throws -> Data {
         guard !entries.isEmpty else { return base }
-        // The compact on-disk layout can leave substantially more space than
-        // the expanded history bytes used to select steps.
-        let mayCompact = !ProjectSavedLayout.prefersExpanded && byteLimit == MulticamProject.maximumFileSize
-        let base = mayCompact ? ProjectSavedLayout.compacted(base) ?? base : base
         let prefix = Data(",\"media_snapshot\":{\"version\":\(Self.version),\"entries\":[".utf8)
         let suffix = Data("]}}".utf8)
         let budget = min(Self.maximumBytes, byteLimit - base.count + 1) - prefix.count - suffix.count
@@ -152,7 +148,10 @@ public struct ProjectMediaSnapshot: Codable, Equatable, Sendable {
         public var previousPath: String?
         public var relinkUses: [String]?
         public var ignored: Bool?
-        var evidence: MediaRefreshEvidence.Content?
+        /// The digest of the recording's content evidence, kept only when that evidence is a
+        /// complete proof. A project uses the evidence only to tell whether a file is the same
+        /// recording, and equal evidence has an equal digest.
+        var evidenceSHA256: String?
         var unknownFields: [String: TranscriptJSONValue] = [:]
 
         public struct Stream: Codable, Equatable, Sendable {
@@ -176,7 +175,8 @@ public struct ProjectMediaSnapshot: Codable, Equatable, Sendable {
         }
 
         private enum CodingKeys: String, CodingKey, CaseIterable {
-            case path, size, duration, origin, width, height, streams, evidence, ignored
+            case path, size, duration, origin, width, height, streams, ignored
+            case evidenceSHA256 = "evidence_sha256"
             case modifiedSeconds = "modified_seconds"
             case modifiedNanoseconds = "modified_nanoseconds"
             case frameRate = "frame_rate"
@@ -205,7 +205,7 @@ public struct ProjectMediaSnapshot: Codable, Equatable, Sendable {
             }
             sourceClock = media.snapshotSourceClock
             if let proof = media.snapshotEvidence {
-                evidence = proof.content
+                evidenceSHA256 = proof.content.proofDigest
                 sourceFingerprint = proof.identity.transcriptFingerprint
             }
         }
@@ -216,7 +216,7 @@ public struct ProjectMediaSnapshot: Codable, Equatable, Sendable {
             stillSHA256 = asset.fingerprint
         }
 
-        public var hasCompleteProof: Bool { evidence?.hasCompleteProof == true && sourceFingerprint != nil }
+        public var hasCompleteProof: Bool { evidenceSHA256 != nil && sourceFingerprint != nil }
 
         func coalescingAlias(_ other: Self) -> Self {
             // A proof and its generation fingerprint travel together. When two
@@ -239,7 +239,7 @@ public struct ProjectMediaSnapshot: Codable, Equatable, Sendable {
         public func verifies(_ media: MediaInfo) -> Bool {
             guard hasCompleteProof, let candidate = media.snapshotEvidence,
                   candidate.identity.isCurrentSnapshot(at: media.url) else { return false }
-            return candidate.content == evidence
+            return candidate.content.proofDigest.map { $0 == evidenceSHA256 } ?? false
         }
 
         public init(from decoder: Decoder) throws {
@@ -260,13 +260,14 @@ public struct ProjectMediaSnapshot: Codable, Equatable, Sendable {
             previousPath = try values.decodeIfPresent(String.self, forKey: .previousPath)
             relinkUses = try values.decodeIfPresent([String].self, forKey: .relinkUses)
             ignored = try values.decodeIfPresent(Bool.self, forKey: .ignored)
-            evidence = try values.decodeIfPresent(MediaRefreshEvidence.Content.self, forKey: .evidence)
+            evidenceSHA256 = try values.decodeIfPresent(String.self, forKey: .evidenceSHA256)
             let all = try decoder.container(keyedBy: ProjectField.self)
             for key in all.allKeys where CodingKeys(stringValue: key.stringValue) == nil {
                 unknownFields[key.stringValue] = try all.decode(TranscriptJSONValue.self, forKey: key)
             }
             guard ProjectFile.validMediaPath(path), previousPath.map(ProjectFile.validMediaPath) ?? true,
                   stillSHA256.map(TranscriptStore.validDigest) ?? true,
+                  evidenceSHA256.map(TranscriptStore.validDigest) ?? true,
                   sourceFingerprint.map(TranscriptStore.validDigest) ?? true else {
                 throw CutError(code: "invalid_cut_project", message: "Invalid path or fingerprint in media snapshot.")
             }
@@ -290,7 +291,7 @@ public struct ProjectMediaSnapshot: Codable, Equatable, Sendable {
             try values.encodeIfPresent(previousPath, forKey: .previousPath)
             try values.encodeIfPresent(relinkUses, forKey: .relinkUses)
             try values.encodeIfPresent(ignored, forKey: .ignored)
-            try values.encodeIfPresent(evidence, forKey: .evidence)
+            try values.encodeIfPresent(evidenceSHA256, forKey: .evidenceSHA256)
             var all = encoder.container(keyedBy: ProjectField.self)
             for (key, value) in unknownFields {
                 try all.encode(value, forKey: ProjectField(stringValue: key))

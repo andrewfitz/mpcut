@@ -17,9 +17,32 @@ The desktop run captured the [two speaking participants and the guest's simultan
 
 The real corpus measures geometry at an intersection-over-union threshold of 0.50, with one prediction per reference match. There are only two labeled frames per excerpt. This sample cannot estimate error rates across a platform, a whole meeting or a redacted deliverable. Editors should confirm identities, duplicate appearances and bounds on the material they deliver. Sparse samples may miss a brief appearance.
 
-## Final detector and independent recordings
+## Private Zoom archive evaluation, November 24, 2026
 
-The final native detector is TileTrail 0.1.0, commit `f1cdfb6292f7860ee7a3ca46c9c64e25fe480d7b`, C ABI 1. The app uses its single Rust tracker for CPU and Metal analysis. All final scores below use that revision.
+The archive contained 64 recordings from 63 sessions totaling 146.9 hours. Four reviewers labeled frames at 6%, 30%, 55%, 80% and 95% of each recording before seeing detector output. They labeled 1,154 participant tiles across 310 of 320 samples. Three-person layouts accounted for 194 of those 310 frames. The remaining ten samples had ambiguous camera or shared-content geometry and were excluded. The reference rectangles include pillarboxing inside a tile. Recordings and per-frame annotations are kept outside the repository.
+
+The scorer pairs each predicted participant rectangle with at most one reference rectangle. A match requires intersection over union of at least 0.75. Precision measures how many predicted boxes matched. Recall measures how many reference boxes were found. An exact frame has every reference box matched and zero extra predictions. Screen-share regions are scored separately from participant tiles. The evaluation also records a held-out group of 30 whole sessions with 146 scorable frames from 150 samples. The five probes per recording measure sampled geometry. Tracking through layout changes requires continuous video and is tested separately.
+
+These measurements use MPCut’s reduced-resolution reader and TileTrail’s default meeting profile. The earlier detector and the updated detector received the same frames.
+
+| Recordings | Detector | Precision | Recall | Exact frames |
+| --- | --- | ---: | ---: | ---: |
+| All | Before | 987/1,377 (71.7%) | 987/1,154 (85.5%) | 176/310 (56.8%) |
+| All | Updated | 1,129/1,167 (96.7%) | 1,129/1,154 (97.8%) | 294/310 (94.8%) |
+| Held-out sessions | Before | 461/650 (70.9%) | 461/535 (86.2%) | 75/146 (51.4%) |
+| Held-out sessions | Updated | 516/551 (93.6%) | 516/535 (96.4%) | 133/146 (91.1%) |
+
+Two continuous excerpts exercised layout changes. The share-to-gallery excerpt matched all participant boxes on 296 of 299 frames before and after the update. The change from three cameras to four improved from 170 to 276 exact frames out of 300. Across the two excerpts, 1,584 of 1,636 labeled adjacent tile pairs retained a matching box and a consistent track ID. The other 52 pairs lacked matching geometry. On a separate three-camera excerpt the updated detector kept three IDs throughout all 75 frames. The previous detector created 28 IDs.
+
+An additional end-to-end check used a short moving excerpt from each recording. The frame at 55% of each original call was an exact decoded RGB match to its labeled probe. On these frames MPCut’s adaptive GPU scan matched 222 of 225 reference tiles, with five extra boxes. It returned the exact layout in 58 of 61 scorable excerpts. Three reference frames had ambiguous geometry. These excerpts overlap the fixed-frame sample above.
+
+Shared content remains harder to distinguish from a camera. Of four labeled sample frames with a confirmed share and known camera geometry, the detector identified the main pane as a share in two. Nine of the ten excluded frames also appeared to contain a share or sidebar. The geometry scores do not establish meeting-wide identity, camera-state or screen-share classification accuracy.
+
+The frozen detector was also checked against the public suites below. At their IoU threshold of 0.50, both versions matched 4/20 boxes on the first independent set and 2/4 on the final-only set. The improvements on the private Zoom archive therefore should not be extrapolated to other conferencing layouts. All 949 synthetic gallery boxes matched on CPU and Metal. In the dense gallery case, the revised rectangles included more gutter pixels, reducing mean IoU from 0.983 to 0.972 and increasing the largest edge error from 1.75 to 5.5 pixels.
+
+## Earlier detector and independent recordings
+
+These earlier measurements used TileTrail 0.1.0, commit `f1cdfb6292f7860ee7a3ca46c9c64e25fe480d7b`, C ABI 1. The app used the same Rust tracker for CPU and Metal analysis.
 
 | Evaluation set | Correct boxes / labeled boxes | Extra boxes | Mean IoU among matches |
 | --- | ---: | ---: | ---: |

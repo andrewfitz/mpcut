@@ -753,6 +753,7 @@ extension ProjectSessions {
             let format: TranscriptFormat = try a.decode("format")
             let space = a.space
             let aggregate = a.attachmentID == nil && a.fields["result_id"] == nil && controller.state.attachments.count > 1
+            let privacyWarning = controller.project.participants.transcriptExportWarning
             let filter = a.filter
             let selected = aggregate ? controller.state.attachments : try [controller.attachment(id: attachment?.id)]
             let builders = try selected.map { try controller.prepareIndex(attachmentID: $0.id, clocks: [space]) }
@@ -775,7 +776,9 @@ extension ProjectSessions {
                                           "Could not publish transcript at \(output.path) (\(String(cString: strerror(failure)))).")
                 }
                 progress.published(output)
-                return ["output": output.path, "space": space.rawValue, "format": format.rawValue]
+                var receipt: [String: Any] = ["output": output.path, "space": space.rawValue, "format": format.rawValue]
+                if let privacyWarning { receipt["warnings"] = [privacyWarning] }
+                return receipt
             }
         default:
             throw MCPCommandError("invalid_arguments", "Unknown transcript attachment action.")

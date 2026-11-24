@@ -54,6 +54,35 @@ public enum ParticipantAnalysis {
         #endif
     }
 
+    public static var supportsGalleryHint: Bool {
+        #if canImport(CTileTrail)
+        isAvailable && mpcut_tiletrail_has_gallery_hint() != 0
+        #else
+        false
+        #endif
+    }
+
+    static var supportsCheckpoints: Bool {
+        #if canImport(CTileTrail)
+        mpcut_tiletrail_has_checkpoints() != 0
+        #else
+        false
+        #endif
+    }
+
+    /// Retire the journal after the caller has committed the scan or review
+    /// project. A cancelled write can continue using the same journal.
+    package static func discardCheckpoint(for scan: ParticipantScanResult, directory: URL?) {
+        #if canImport(CTileTrail)
+        guard scan.state != .paused,
+              let directory, FileManager.default.fileExists(atPath: directory.path),
+              let identity = try? SourceIdentity(URL(fileURLWithPath: scan.source.file)),
+              let journal = try? ParticipantScanCheckpoint(directory: directory, fingerprint: scan.analysisIdentity,
+                                                           identity: identity, duration: scan.source.duration) else { return }
+        journal.removeCommittedChunks()
+        #endif
+    }
+
     /// Adaptive scans skip unchanged stretches only when TileTrail can refuse a
     /// keyframe that differs. Without that, they analyze every frame.
     public static var supportsAdaptiveSampling: Bool {
@@ -97,16 +126,24 @@ public enum ParticipantAnalysis {
     private static func performScan(_ url: URL, options: ParticipantScanOptions,
                                     resuming partial: ParticipantScanResult?, cancelled: @escaping () -> Bool,
                                     progress: ((RationalTime) -> Void)?, reporter: ParticipantScanReporter?) throws -> ParticipantScanResult {
-        #if canImport(CTileTrail)
-        guard isAvailable else { throw unavailable }
         guard options.feedLayout.isValid else {
             throw CutError(code: "invalid_feed_layout", message: "Choose a grid with one to 64 feeds.")
         }
-        guard options.feedLayout == .meeting || supportsFeedLayouts else {
+        guard url.isFileURL else { throw CutError(code: "invalid_input", message: "Choose a local video file.") }
+        if case .fixed(let columns, let rows) = options.feedLayout, !supportsFeedLayouts {
+            return try fixedGridScan(url, columns: columns, rows: rows, options: options, partial: partial,
+                                     cancelled: cancelled, progress: progress)
+        }
+        #if canImport(CTileTrail)
+        guard isAvailable else { throw unavailable }
+        switch options.feedLayout {
+        case .gallery where !supportsGalleryHint:
+            throw CutError(code: "participant_gallery_hint_unavailable", message: "Gallery hints require a newer TileTrail build.")
+        case .automatic where !supportsFeedLayouts:
             throw CutError(code: "participant_feed_layout_unavailable",
                            message: "Scanning generic feeds requires a TileTrail build with feed layouts.")
+        default: break
         }
-        guard url.isFileURL else { throw CutError(code: "invalid_input", message: "Choose a local video file.") }
         let file = url.standardizedFileURL
         let identity = try SourceIdentity(file)
         let cache: AnalysisSidecar? = options.useSidecar && AnalysisSidecar.readsEnabled
@@ -126,25 +163,8 @@ public enum ParticipantAnalysis {
         guard let video = media.videoStream, media.duration > .zero else {
             throw CutError(code: "no_video", message: "Participant analysis requires a video track.")
         }
-        guard video.rotation.isMultiple(of: 90), video.rotationOnly || !video.hasDisplayMatrix else {
-            throw CutError(code: "unsupported_display_transform", message: "Participant analysis requires a quarter-turn display transform.")
-        }
-        let turns = ((-video.rotation % 360) + 360) % 360
-        let rotation: ParticipantDisplayTransform.Rotation
-        switch turns {
-        case 90: rotation = .r90
-        case 180: rotation = .r180
-        case 270: rotation = .r270
-        default: rotation = .r0
-        }
-        let transform = ParticipantDisplayTransform(
-            rotation: rotation,
-            pixelAspectNum: UInt32(exactly: video.sampleAspectRatio.numerator).flatMap { $0 > 0 ? $0 : nil } ?? 1,
-            pixelAspectDen: UInt32(exactly: video.sampleAspectRatio.denominator) ?? 1)
-        var source = ParticipantScanSource(file: file.path, stamp: SceneSourceStamp(identity: identity),
-                                           inode: identity.inode, stream: video.index,
-                                           origin: media.origin, timeBase: video.timeBase, duration: media.duration,
-                                           transform: transform)
+        var source = try ParticipantScanSource(file: file.path, media: media, video: video)
+        let transform = source.transform
         reporter?.duration = source.duration
         let configuration = ParticipantScanConfiguration(options)
         let key = ParticipantCacheKey(inode: identity.inode, stamp: source.stamp, stream: source.stream,
@@ -152,9 +172,12 @@ public enum ParticipantAnalysis {
                                       transform: transform, backend: options.backend, sampling: options.sampling,
                                       feedLayout: options.feedLayout == .meeting ? nil : options.feedLayout,
                                       feedDetectorRevision: options.feedLayout == .meeting ? nil : Int(mpcut_tiletrail_feed_detector_revision()),
+                                      galleryDetectorRevision: options.feedLayout.isMeeting && options.feedLayout != .meeting
+                                          ? Int(mpcut_tiletrail_meeting_detector_revision()) : nil,
                                       meetingDetectorRevision: options.feedLayout != .meeting
                                           || mpcut_tiletrail_meeting_detector_revision() <= 1
                                           ? nil : Int(mpcut_tiletrail_meeting_detector_revision()),
+                                      coverageRevision: media.format.split(separator: ",").contains { $0 == "matroska" || $0 == "mov" } ? 3 : nil,
                                       adaptiveRevision: options.sampling != .adaptive ? nil
                                           : supportsAdaptiveSampling && !options.includeScenes ? 1 : 0)
         let encoder = JSONEncoder()
@@ -241,13 +264,23 @@ public enum ParticipantAnalysis {
 
         try verifySource()
         if cancelled() { return try paused(partial?.analysis) }
-        reporter?.send(.scanning, at: .zero)
         if source.contentSHA256 == nil,
            cachedParticipantSourceDigest(identity, in: cache, cancelled: cancelled) == nil {
             earlyDigest = ParticipantDigestRun(file, identity: identity, cancelled: cancelled)
         }
+        let checkpoint: ParticipantScanCheckpoint?
+        if let directory = options.checkpointDirectory, !options.includeScenes, mpcut_tiletrail_has_checkpoints() != 0 {
+            checkpoint = try ParticipantScanCheckpoint(directory: directory, fingerprint: fingerprint,
+                                                        identity: identity, duration: source.duration)
+        } else {
+            checkpoint = nil
+        }
         let scan = try TileTrailScan(media: media, source: source, options: options,
-                                     cancelled: cancelled, progress: progress, reporter: reporter)
+                                     cancelled: cancelled, progress: progress, reporter: reporter,
+                                     checkpoint: checkpoint)
+        do { try scan.restoreCheckpoint() }
+        catch is CancellationError { return try paused(partial?.analysis) }
+        reporter?.send(.scanning, at: checkpoint?.anchor?.time ?? .zero)
         let result = try scan.run(file)
         try verifySource()
         if let checkpoint = partial?.analysis {
@@ -283,8 +316,13 @@ public enum ParticipantAnalysis {
             catch is CancellationError { return try pauseAfterDecode() }
             let cached = ParticipantCachedScan(analysis: result.analysis, sceneReport: result.sceneReport,
                                               contentSHA256: source.contentSHA256)
-            cache?.saveAutomatically(try [section: encoder.encode(cached), AnalysisSidecar.sceneClockKey: verifiedClock]
-                .compactMapValues { $0 }, retainingLatest: ["participant_tracking.v1.": 12], cancelled: cancelled)
+            // A dense history can exceed the cache's practical size. Long jobs
+            // write their reusable report in batches and skip the whole-report cache.
+            if let cache, result.analysis.observations.count <= 100_000,
+               result.analysis.observations.reduce(0, { $0 + $1.regions.count }) <= 100_000 {
+                cache.saveAutomatically(try [section: encoder.encode(cached), AnalysisSidecar.sceneClockKey: verifiedClock]
+                    .compactMapValues { $0 }, retainingLatest: ["participant_tracking.v1.": 12], cancelled: cancelled)
+            }
             if cancelled() { return try pauseAfterDecode() }
         }
         try verifySource()
@@ -393,8 +431,10 @@ private struct ParticipantCacheKey: Encodable {
     let sampling: ParticipantSampling
     let feedLayout: ParticipantFeedLayout?
     let feedDetectorRevision: Int?
+    let galleryDetectorRevision: Int?
     // Absent for libraries that predate the revision, which keeps their saved scans.
     let meetingDetectorRevision: Int?
+    let coverageRevision: Int?
     // Zero records an adaptive request that analyzed every frame.
     let adaptiveRevision: Int?
 }
@@ -405,7 +445,7 @@ private struct ParticipantCachedScan: Codable {
     let contentSHA256: String?
 }
 
-private func checkTileTrail(_ status: Int32, _ error: inout tiletrail_error_t) throws {
+func checkTileTrail(_ status: Int32, _ error: inout tiletrail_error_t) throws {
     guard status != TILETRAIL_OK else { return }
     let message = withUnsafeBytes(of: &error.message) { bytes in
         String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
@@ -458,9 +498,11 @@ private final class TileTrailScan {
     private var handle: OpaquePointer?
     let baseNum: UInt32
     let baseDen: UInt32
-    let end: tiletrail_timestamp_t
     let sampling: ParticipantSampling
     private let adaptive: Bool
+    private let matroskaCadenceInTicks: RationalTime?
+    private let frameRate: RationalTime
+    private var cadenceOffset: Int64 = 0
     /// Worker threads measure and detect pictures ahead of the pushes.
     private let preparesAhead: Bool
 
@@ -472,9 +514,14 @@ private final class TileTrailScan {
     private let reporter: ParticipantScanReporter?
     private var progressCount = 0
     private var lastSample: RationalTime?
+    private let checkpoint: ParticipantScanCheckpoint?
+    private var decoderDamage: UnsafeMutablePointer<Int32>?
+    private var lastCheckpointAnchor: ParticipantScanCheckpoint.Anchor?
 
     init(media: MediaInfo, source: ParticipantScanSource, options: ParticipantScanOptions,
-         cancelled: @escaping () -> Bool, progress: ((RationalTime) -> Void)?, reporter: ParticipantScanReporter?) throws {
+         cancelled: @escaping () -> Bool, progress: ((RationalTime) -> Void)?, reporter: ParticipantScanReporter?,
+         checkpoint: ParticipantScanCheckpoint?) throws {
+        self.checkpoint = checkpoint
         self.reporter = reporter
         self.source = source
         self.sampling = options.sampling
@@ -488,7 +535,19 @@ private final class TileTrailScan {
         }
         baseNum = numerator
         baseDen = denominator
-        end = try tiletrail_timestamp_t(source.origin.adding(source.duration))
+        // Matroska demuxers may round a fractional default block duration down.
+        // Corroborate a one-tick discrepancy against the declared frame cadence.
+        let rate = media.videoStream?.frameRate ?? .zero
+        frameRate = rate
+        if media.format.split(separator: ",").contains("matroska"), rate > .zero,
+           source.timeBase >= RationalTime(numerator: 1, denominator: 1_000_000),
+           let ticks = try? RationalTime(numerator: rate.denominator, denominator: rate.numerator)
+            .multiplied(by: RationalTime(numerator: source.timeBase.denominator, denominator: source.timeBase.numerator)),
+           ticks.denominator > 1, ticks.numerator >= ticks.denominator {
+            matroskaCadenceInTicks = ticks
+        } else {
+            matroskaCadenceInTicks = nil
+        }
         let mode: Int
         switch options.backend {
         case .automatic: mode = TILETRAIL_MODE_AUTO
@@ -500,9 +559,8 @@ private final class TileTrailScan {
         // The scene collector compares consecutive pictures and needs them all.
         adaptive = options.sampling == .adaptive && !options.includeScenes
             && ParticipantAnalysis.supportsAdaptiveSampling
-        // Preparation measures on the CPU, which a required GPU rules out.
         // Sparse sampling analyzes one frame in several; preparing all would waste the rest.
-        preparesAhead = mpcut_tiletrail_has_prepared_frames() != 0 && options.backend != .gpuRequired
+        preparesAhead = mpcut_tiletrail_has_prepared_frames(options.backend == .gpuRequired ? 1 : 0) != 0
             && options.sampling != .sparse
         var result: OpaquePointer?
         var error = tiletrail_error_t()
@@ -511,6 +569,8 @@ private final class TileTrailScan {
         switch options.feedLayout {
         case .meeting:
             status = tiletrail_analyzer_create(&config, start, &result, &error)
+        case .gallery(let columns, let rows):
+            status = mpcut_tiletrail_analyzer_create_gallery(&config, start, columns, rows, &result, &error)
         case .automatic:
             status = mpcut_tiletrail_analyzer_create_feeds(&config, start, 0, 0, &result, &error)
         case .fixed(let columns, let rows):
@@ -525,6 +585,35 @@ private final class TileTrailScan {
 
     deinit {
         tiletrail_analyzer_free(handle)
+    }
+
+    func restoreCheckpoint() throws {
+        guard let checkpoint, let anchor = checkpoint.anchor else { return }
+        let timestamp = tiletrail_timestamp_t(pts: anchor.pts, numerator: baseNum, denominator: baseDen)
+        guard try timestamp.localTime(origin: source.origin) == anchor.time else {
+            throw CutError(code: "participant_resume_mismatch", message: "The checkpoint frame uses a different source clock.")
+        }
+        try checkpoint.restore(handle, cancelled: cancelled)
+        var state = tiletrail_progress_t()
+        var error = tiletrail_error_t()
+        try checkTileTrail(tiletrail_analyzer_progress(handle, nil, &state, &error), &error)
+        guard state.frames_processed > 0,
+              try state.last_timestamp.localTime(origin: source.origin) == anchor.time else {
+            throw CutError(code: "participant_resume_mismatch", message: "The checkpoint anchor differs from the saved observations.")
+        }
+        previous = (anchor.time, anchor.end, true)
+        lastSample = anchor.time
+        lastCheckpointAnchor = anchor
+        progress?(anchor.time)
+    }
+
+    private func saveCheckpoint(force: Bool = false) throws {
+        guard let checkpoint, let anchor = lastCheckpointAnchor, deviceLoss == nil, previous?.valid == true,
+              holes.isEmpty, !unknownTimestamp, decoderDamage?.pointee == 0 else { return }
+        let since = checkpoint.anchor?.time ?? .zero
+        let interval = try anchor.time.subtracting(since)
+        guard force || interval >= RationalTime(numerator: 30) else { return }
+        try checkpoint.save(handle, after: anchor)
     }
 
     func run(_ url: URL) throws -> (state: ParticipantScanResult.State, analysis: ParticipantTrackingResult,
@@ -577,53 +666,107 @@ private final class TileTrailScan {
             return scan.failure != nil || scan.deviceLoss != nil || scan.cancelled() ? 1 : 0
         }
         var decoderMessage = [CChar](repeating: 0, count: 256)
-        var unplacedDamage: Int32 = 0
+        let unplacedDamage = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
+        unplacedDamage.initialize(to: 0)
+        decoderDamage = unplacedDamage
+        defer {
+            decoderDamage = nil
+            unplacedDamage.deinitialize(count: 1)
+            unplacedDamage.deallocate()
+        }
+        var editTail = MPParticipantEditTail()
         let status = url.withUnsafeFileSystemRepresentation { path in
             // One reader serves every mode. It decodes every frame in order
             // unless it has a coarse visit; sparse sampling selects from those
             // frames in the visit, and scene detection sees them all.
-            mp_participant_scan_adaptive(path, Int32(source.stream), mpcut_tiletrail_sample_limit(), stopped,
-                                         adaptive ? coarse : nil, sample, preparesAhead ? prepare : nil, discard,
-                                         scenes == nil ? nil : scene, context,
-                                         &unplacedDamage, &decoderMessage, decoderMessage.count)
+            if matroskaCadenceInTicks != nil, source.origin != .zero,
+               let rateNum = Int32(exactly: frameRate.numerator), let rateDen = Int32(exactly: frameRate.denominator),
+               let origin = try? source.origin.multiplied(by: RationalTime(numerator: Int64(baseDen), denominator: Int64(baseNum))),
+               origin.denominator == 1,
+               mp_scene_uses_segment_cadence(path, Int32(source.stream), origin.numerator, rateNum, rateDen, stopped, context) != 0 {
+                cadenceOffset = origin.numerator
+            }
+            return mp_participant_scan_from(path, Int32(source.stream), mpcut_tiletrail_sample_limit(),
+                                     checkpoint?.anchor?.pts ?? Int64.min, stopped,
+                                     adaptive ? coarse : nil, sample, preparesAhead ? prepare : nil, discard,
+                                     scenes == nil ? nil : scene, context,
+                                     unplacedDamage, &editTail, &decoderMessage, decoderMessage.count)
         }
         if let failure { throw failure }
         if status == MP_PARTICIPANT_UNSUPPORTED_DISPLAY_TRANSFORM {
             throw CutError(code: "unsupported_display_transform",
                            message: "Participant analysis requires decoded pictures to use the recording’s declared display rotation.")
         }
+        if status == MP_PARTICIPANT_RESUME_ANCHOR_MISSING {
+            throw CutError(code: "participant_resume_mismatch",
+                           message: "The decoder could not locate the saved checkpoint frame.")
+        }
         let paused = deviceLoss == nil && (status == MP_SCENE_SCAN_CANCELLED || cancelled())
         if status != 0 && !paused && deviceLoss == nil {
             throw CutError(code: "participant_decode_failed", message: String(cString: decoderMessage))
         }
 
+        if paused || status == 0 { try saveCheckpoint(force: true) }
+        var analyzedEnd = source.duration
         if let deviceLoss {
             addHole(from: deviceLoss, to: source.duration)
         } else if let previous {
             let tail = previous.end ?? (paused || !previous.valid ? previous.time : source.duration)
-            addHole(from: previous.valid ? tail : previous.time, to: source.duration)
+            let lastIndexed = tiletrail_timestamp_t(pts: editTail.last_pts, numerator: baseNum, denominator: baseDen)
+            if !paused, previous.valid, !unknownTimestamp, unplacedDamage.pointee == 0,
+               editTail.preroll_ticks > 0, tail < source.duration,
+               try lastIndexed.localTime(origin: source.origin) == previous.time,
+               try source.duration.subtracting(tail) < tail.subtracting(previous.time),
+               try source.duration.subtracting(tail) < source.timeBase.multiplied(by: .init(numerator: editTail.preroll_ticks)) {
+                // All presented samples were read. Keep the fractional edit tail
+                // in the report without extending the last box beyond its picture.
+                analyzedEnd = tail
+            } else if !paused, previous.valid, !unknownTimestamp, unplacedDamage.pointee == 0,
+                      editTail.trailing_ticks > 0, tail < source.duration,
+                      try lastIndexed.localTime(origin: source.origin) == previous.time,
+                      try source.duration.subtracting(tail)
+                        == source.timeBase.multiplied(by: .init(numerator: editTail.trailing_ticks)) {
+                // The edit ends on the last stored sample, which is never
+                // presented. Every presented sample was read; the report keeps
+                // that sample's width as unknown coverage with no tile boxes.
+                analyzedEnd = tail
+            } else if !previous.valid || paused || !isRoundedMatroskaFrame(from: previous.time, end: tail, next: source.duration) {
+                addHole(from: previous.valid ? tail : previous.time, to: source.duration)
+            }
         } else {
             addHole(from: .zero, to: source.duration)
         }
-        if unknownTimestamp || unplacedDamage != 0 {
+        if unknownTimestamp || unplacedDamage.pointee != 0 {
             // Damage without a decoded presentation timestamp cannot be
             // assigned to a narrower source interval.
             holes = [.zero..<source.duration]
         }
         reporter?.send(.finalizing, at: paused || deviceLoss != nil ? previous?.time : source.duration)
-        let output = TileTrailOutput()
-        var error = tiletrail_error_t()
-        try checkTileTrail(tiletrail_analyzer_result_json(handle, end, &output.buffer, &error), &error)
+        let end = try tiletrail_timestamp_t(source.origin.adding(analyzedEnd))
+        var analysis: ParticipantTrackingResult
+        if mpcut_tiletrail_has_result_chunks() != 0 {
+            analysis = try ParticipantScanChunks(origin: source.origin).result(handle, end: end)
+        } else {
+            let output = TileTrailOutput()
+            var error = tiletrail_error_t()
+            try checkTileTrail(tiletrail_analyzer_result_json(handle, end, &output.buffer, &error), &error)
+            tiletrail_analyzer_free(handle)
+            handle = nil
+            analysis = try ParticipantSourceTime.decodeOriginalClock(ParticipantTrackingResult.self,
+                                                                     data: output.contents, origin: source.origin)
+        }
         tiletrail_analyzer_free(handle)
         handle = nil
-        var analysis = try ParticipantSourceTime.decodeOriginalClock(ParticipantTrackingResult.self,
-                                                                      data: output.contents, origin: source.origin)
-        guard analysis.schemaVersion == 1, analysis.start == .zero, analysis.end == source.duration else {
+        guard analysis.schemaVersion == 1, analysis.start == .zero, analysis.end == analyzedEnd else {
             throw CutError(code: "participant_result_invalid", message: "TileTrail returned an unexpected result clock or schema version.")
+        }
+        if analyzedEnd < source.duration {
+            analysis.end = source.duration
+            analysis.coverage.append(.init(start: analyzedEnd, end: source.duration, status: .unknown))
         }
         analysis.coverage = coverage(analysis.coverage)
         if paused {
-            analysis.resumeAt = unknownTimestamp || unplacedDamage != 0 ? .zero : (previous?.valid == true ? previous?.end : nil)
+            analysis.resumeAt = unknownTimestamp || unplacedDamage.pointee != 0 ? .zero : (previous?.valid == true ? previous?.end : nil)
                 ?? previous?.time ?? .zero
         } else if let deviceLoss {
             analysis.resumeAt = deviceLoss
@@ -652,8 +795,13 @@ private final class TileTrailScan {
                 return false
             }
             let lastEnd = previous.end ?? time
-            if previous.valid { addHole(from: lastEnd, to: time) }
-            else { addHole(from: previous.time, to: time) }
+            if previous.valid {
+                if !isRoundedMatroskaFrame(from: previous.time, end: lastEnd, next: time) {
+                    addHole(from: lastEnd, to: time)
+                }
+            } else {
+                addHole(from: previous.time, to: time)
+            }
         } else {
             addHole(from: .zero, to: time)
         }
@@ -682,6 +830,22 @@ private final class TileTrailScan {
                           timestamp: tiletrail_timestamp_t(pts: pts, numerator: baseNum, denominator: baseDen))
     }
 
+    private func submit(_ frame: inout tiletrail_frame_t, prepared: inout UnsafeMutableRawPointer?,
+                        coarseOutcome: UnsafeMutablePointer<UInt32>?, error: inout tiletrail_error_t) -> Int32 {
+        if let ahead = prepared {
+            prepared = nil
+            let status = mpcut_tiletrail_analyzer_push_prepared(handle, ahead, coarseOutcome == nil ? 0 : 1,
+                                                                 coarseOutcome, &error)
+            if status != TILETRAIL_INVALID_FRAME { return status }
+            // An earlier ordered push can switch the backend after these workers
+            // prepared their batch. Replay the original pixels on the new backend.
+        }
+        if let coarseOutcome {
+            return mpcut_tiletrail_analyzer_push_coarse(handle, &frame, coarseOutcome, &error)
+        }
+        return tiletrail_analyzer_push(handle, &frame, &error)
+    }
+
     /// Offer a keyframe in place of the frames since the last analyzed one.
     /// The decoder has checked that their packets cover that interval, so an
     /// accepted keyframe leaves no hole. Returns 1 to skip them and 0 to
@@ -696,13 +860,7 @@ private final class TileTrailScan {
         var frame = picture(pts: pts, rgb: rgb, width: width, height: height, stride: stride, sarNum: sarNum, sarDen: sarDen)
         var error = tiletrail_error_t()
         var outcome: UInt32 = 1
-        let status: Int32
-        if let ahead = prepared {
-            prepared = nil
-            status = mpcut_tiletrail_analyzer_push_prepared(handle, ahead, 1, &outcome, &error)
-        } else {
-            status = mpcut_tiletrail_analyzer_push_coarse(handle, &frame, &outcome, &error)
-        }
+        let status = submit(&frame, prepared: &prepared, coarseOutcome: &outcome, error: &error)
         if status == TILETRAIL_DEVICE_LOST {
             // Nothing confirmed the skipped frames. Resume from the last analyzed one.
             deviceLoss = covered
@@ -713,6 +871,8 @@ private final class TileTrailScan {
         let end = min(source.duration, try time.adding(RationalTime(numerator: duration).multiplied(by: source.timeBase)))
         self.previous = (time, end, true)
         lastSample = time
+        lastCheckpointAnchor = .init(pts: pts, time: time, end: end)
+        try saveCheckpoint()
         reporter?.send(.scanning, at: time)
         reportProgress(time)
         return 1
@@ -727,25 +887,43 @@ private final class TileTrailScan {
         }
         var frame = picture(pts: pts, rgb: rgb, width: width, height: height, stride: stride, sarNum: sarNum, sarDen: sarDen)
         var error = tiletrail_error_t()
-        let status: Int32
-        if let ahead = prepared {
-            prepared = nil
-            status = mpcut_tiletrail_analyzer_push_prepared(handle, ahead, 0, nil, &error)
-        } else {
-            status = tiletrail_analyzer_push(handle, &frame, &error)
-        }
+        let status = submit(&frame, prepared: &prepared, coarseOutcome: nil, error: &error)
         if status == TILETRAIL_DEVICE_LOST {
             deviceLoss = error.has_resume != 0 ? try error.resume_at.localTime(origin: source.origin) : time
             return
         }
         try checkTileTrail(status, &error)
         lastSample = time
+        lastCheckpointAnchor = .init(pts: pts, time: time, end: previous?.end)
+        try saveCheckpoint()
         reportProgress(time)
     }
 
     private func reportProgress(_ time: RationalTime) {
         if progressCount % 8 == 0 { progress?(time) }
         progressCount += 1
+    }
+
+    private func isRoundedMatroskaFrame(from start: RationalTime, end: RationalTime, next: RationalTime) -> Bool {
+        guard let cadence = matroskaCadenceInTicks, end < next,
+              (try? next.subtracting(end)) == source.timeBase else { return false }
+        let ticksPerSecond = RationalTime(numerator: source.timeBase.denominator, denominator: source.timeBase.numerator)
+        let framesPerTick = RationalTime(numerator: cadence.denominator, denominator: cadence.numerator)
+        func roundedTick(_ frame: Int64) throws -> Int64 {
+            try cadence.roundedToSamples(Int(frame))
+        }
+        return (try? {
+            let startTick = try start.multiplied(by: ticksPerSecond).roundedToSamples(1)
+            let endTick = try end.multiplied(by: ticksPerSecond).roundedToSamples(1)
+            let nextTick = try next.multiplied(by: ticksPerSecond).roundedToSamples(1)
+            guard endTick - startTick == cadence.numerator / cadence.denominator else { return false }
+            let (startPTS, startOverflow) = startTick.addingReportingOverflow(cadenceOffset)
+            let (nextPTS, nextOverflow) = nextTick.addingReportingOverflow(cadenceOffset)
+            guard !startOverflow, !nextOverflow else { return false }
+            let frame = try framesPerTick.roundedToSamples(Int(startPTS))
+            guard frame < .max else { return false }
+            return try roundedTick(frame) == startPTS && roundedTick(frame + 1) == nextPTS
+        }()) == true
     }
 
     private func addHole(from start: RationalTime, to end: RationalTime) {
@@ -789,8 +967,7 @@ private final class TileTrailScan {
 }
 #endif
 
-#if canImport(CTileTrail)
-private extension StreamInfo {
+extension StreamInfo {
     var hasDisplayMatrix: Bool {
         codecMetadata.withUnsafeBytes { buffer in
             var offset = 0
@@ -805,4 +982,3 @@ private extension StreamInfo {
         }
     }
 }
-#endif

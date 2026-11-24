@@ -2,7 +2,7 @@
 
 This reference describes the inputs advertised by the bundled stdio helper. The connected host can retrieve the complete JSON Schemas through `tools/list`. Live tool calls use the running app and its local-control setting. The `--files-only` helper exposes saved-file tools through a private CLI worker. Results bound to a live project carry the `project_handle` and the current or applied revision. Starting a saved-file job returns a receipt with a `job_id`. Inspect `isError` first. MPCut domain errors carry a code and message in `structuredContent`. Invalid requests can also return an MCP protocol or SDK validation error. [Setup, clocks, history and recovery](MCP-AGENT-GUIDE.md)
 
-**232 tools.**
+**293 tools.**
 
 ## Live analysis
 
@@ -726,7 +726,7 @@ Additional schema rules
 
 Request cancellation. Poll status until completion to see any outputs the job already published.
 
-Returns `job_id` and `state`. For scene scans, refreshes, and transcript session staging, `progress_event` contains the latest available CLI event. Scene events include durable coverage when it has been saved. Terminal results include `exit_code` and `result_bytes`. Small output is available as `result` for JSON or `output_text` for text. Poll a cancelling job until its terminal state.
+Returns `job_id` and `state`. For scene scans, refreshes, and transcript session staging, `progress_event` contains the latest available CLI event. Scene events include durable coverage when it has been saved. Terminal results include `exit_code` and `result_bytes`. Small output is available as `result` for JSON or `output_text` for text. Tiles ISO delivery can also end in `needs_review` with a reviewable project. Poll a cancelling job until its terminal state.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -746,9 +746,9 @@ Returns a base64 byte page, `next_offset`, `result_bytes` and `done`. Decode eac
 
 ### `file_job_status_read`
 
-Get state, native progress and the terminal JSON result. Scene scans and refreshes include the latest available progress event. For large results, read result_bytes using file_job_result_read.
+Get state, native progress and the terminal JSON result. Scene scans, refreshes and Tiles delivery can include the latest available progress event. A Tiles ISO delivery job can finish in needs_review with exit code 3 and a reviewable project. For large results, read result_bytes using file_job_result_read.
 
-Returns `job_id` and `state`. For scene scans, refreshes, and transcript session staging, `progress_event` contains the latest available CLI event. Scene events include durable coverage when it has been saved. Terminal results include `exit_code` and `result_bytes`. Small output is available as `result` for JSON or `output_text` for text. Poll a cancelling job until its terminal state.
+Returns `job_id` and `state`. For scene scans, refreshes, and transcript session staging, `progress_event` contains the latest available CLI event. Scene events include durable coverage when it has been saved. Terminal results include `exit_code` and `result_bytes`. Small output is available as `result` for JSON or `output_text` for text. Tiles ISO delivery can also end in `needs_review` with a reviewable project. Poll a cancelling job until its terminal state.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -1172,7 +1172,7 @@ Additional schema rules
 
 ### `review_file_frames_export`
 
-Write JPEG review images and a manifest for a source or every angle at group times. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.
+Write JPEG review images and a manifest for a source, edited program, or synchronized multicam angles. With tile processing, group and assembly requests sample the rendered program. Poll file_job_status_read with the returned job_id and reuse the operation_id for an identical retry.
 
 Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
 
@@ -4241,9 +4241,9 @@ Returns a live job receipt for `export_editor_job_status_read`. Published `outpu
 
 ### `review_editor_frames_export`
 
-Export review JPEGs from the live editor. Still and playhead selections sample the program when still placements exist. Supply space to sample exact program times. With no space, times follow native source or multicam group and angle review.
+Export review JPEGs from the live editor. Programs with generated stills or tile edits use the rendered program for current-frame and program-time samples. Tile-edited multicam projects can sample switches on the group clock. Scene and non-silent source sampling require a project without tile processing.
 
-Returns a live job receipt for `export_editor_job_status_read`. A still produces a JPEG. A batch returns its `manifest` path and the written `frames` count, plus `unavailable` for multicam samples where an angle has no picture.
+Returns a live job receipt for `export_editor_job_status_read`. A still produces a JPEG. A batch returns its `manifest` path and written `frames` count. Tile output reports any applied `privacy_issues`. Ordinary multicam angle samples report `unavailable` when an angle has no picture.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -4252,7 +4252,7 @@ Returns a live job receipt for `export_editor_job_status_read`. A still produces
 | `operation_id` | required | string, minimum length `1` | Unique operation identifier; repeat the exact request after a lost reply. |
 | `output` | required | string, minimum length `1` | Absolute local output path. Existing media destinations are protected. |
 | `selection` | optional | `playhead` / `still` / `times` / `switches` / `scenes` / `non_silent` |  |
-| `space` | optional | `sequence` / `group` / `assembly` | Select the program clock for still, playhead or explicit time samples. Omit for the native source and angle review modes. |
+| `space` | optional | `sequence` / `group` / `assembly` | Still and playhead samples use the active program clock. For explicit times, select the clock of the supplied timestamps. With tile edits, omitting space uses the active program clock. Switch sampling uses multicam group time. |
 | `times` | optional | array of string, minimum length `1`, minimum items `1`, maximum items `4096` |  |
 | `preset` | optional | `review` / `full` |  |
 | `sample` | optional | `first` / `midpoint` |  |
@@ -4753,12 +4753,12 @@ Returns the window’s actual presentation state, including zoom, available scro
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` |  |
-| `action` | required | `zoom_in` / `zoom_out` / `set_zoom` / `fit` / `restore_zoom` / `set_large_thumbnails` / `set_inspector` / `set_transcript` / `set_waveform_span` / `set_pause_controls` / `set_scroll` / `set_track_label_width` / `set_timeline_height` / `set_inspector_width` |  |
+| `action` | required | `zoom_in` / `zoom_out` / `set_zoom` / `fit` / `restore_zoom` / `set_large_thumbnails` / `set_inspector` / `set_transcript` / `set_tiles` / `set_waveform_span` / `set_pause_controls` / `set_scroll` / `set_track_label_width` / `set_timeline_height` / `set_inspector_width` |  |
 | `zoom` | optional | number, minimum `0`, maximum `13` | Timeline zoom exponent. A value of 0 fits the timeline, and 1 doubles its width. |
 | `enabled` | optional | boolean | Used by set_large_thumbnails; shared across windows. |
 | `span` | optional | `timeline_zoom` / `whole_clip` / `10_seconds` / `1_second` / `100_milliseconds` / `10_milliseconds` |  |
-| `visible` | optional | boolean | Required for set_pause_controls and set_transcript. Defaults to true for set_inspector. |
-| `section` | optional | `switches` / `sources` / `assembly` / `export` / `transcript` |  |
+| `visible` | optional | boolean | Required for set_pause_controls, set_transcript and set_tiles. Defaults to true for set_inspector. |
+| `section` | optional | `switches` / `sources` / `assembly` / `export` / `transcript` / `tiles` |  |
 | `surface` | optional | `sequence` / `assembly` / `group` / `tracks` |  |
 | `fraction` | optional | number, minimum `0`, maximum `1` | Fraction of available scroll travel. Zero shows the beginning; one shows the far end. |
 | `points` | optional | number, minimum `1`, maximum `10000` | Divider size in screen points. Track labels accept 106 to 360. Native layout constraints apply. |
@@ -4769,6 +4769,7 @@ Returns the window’s actual presentation state, including zoom, available scro
 | `set_large_thumbnails` | `enabled` |
 | `set_waveform_span` | `span` |
 | `set_transcript` | `visible` |
+| `set_tiles` | `visible` |
 | `set_pause_controls` | `visible` |
 | `set_scroll` | `surface`, `fraction` |
 | `set_track_label_width` | `points` |
@@ -4788,7 +4789,7 @@ Returns the window’s actual presentation state, including zoom, available scro
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `project_handle` | required | string, minimum length `1` |  |
-| `action` | required | `show_about` / `show_settings` / `show_help` / `show_last_export` |  |
+| `action` | required | `show_about` / `show_settings` / `show_help` / `show_last_export` / `show_tiles` |  |
 | `topic` | optional | `guide` / `agent_guide` / `release_notes` |  |
 
 ## Project discovery
@@ -4818,9 +4819,9 @@ Pass an empty arguments object.
 
 ### `review_editor_frame_read`
 
-Return one JPEG image content block from the open project's current playhead, or specify an exact sequence, group or assembly time. For multicam, angle optionally selects a specific camera. Reads the current in-memory edit. Preserves playback, selection, history and disk contents. The longest image edge is at most 640 pixels. Metadata identifies the source frame or still placement, asset and program presentation time.
+Return one JPEG from the current in-memory program at the playhead or at an exact sequence, group or assembly time. Output applies tile layouts and feed treatments. Choose Source to inspect an untreated recording. An explicit angle_id also selects Source when view is omitted. The longest image edge is at most 640 pixels.
 
-Returns a JPEG image block in MCP `content` and decoded-frame metadata in `structuredContent`, including `source_time`, `duration`, `width` and `height`. A multicam result identifies the requested or active clock, timestamp, group time and camera. A still result identifies the asset and placement and reports program time. An image-capable host can inspect the picture directly.
+Returns a JPEG image block in MCP `content` and timing metadata in `structuredContent`. Read `view` to distinguish Output from untreated Source review. A rendered tile frame reports `frame_time`, `duration`, dimensions and any applied `privacy_issues`. Source review identifies the sampled `source_time` and camera when applicable. A still result identifies its asset and placement.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -4828,13 +4829,29 @@ Returns a JPEG image block in MCP `content` and decoded-frame metadata in `struc
 | `expected_revision` | optional | integer, minimum `0` |  |
 | `time` | optional | string | Rational seconds such as 1001/30000. Supply space with time. |
 | `space` | optional | `sequence` / `group` / `assembly` |  |
-| `angle_id` | optional | string, minimum length `1` |  |
+| `view` | optional | `output` / `source` | Output shows the rendered program. Source shows the untreated recording for correction and review. |
+| `angle_id` | optional | string, minimum length `1` | A multicam camera ID for Source review. Omit to use the camera selected at that time. |
 
 Additional schema rules
 
 ```json
 {
   "allOf": [
+    {
+      "if": {
+        "required": [
+          "angle_id",
+          "view"
+        ]
+      },
+      "then": {
+        "properties": {
+          "view": {
+            "const": "source"
+          }
+        }
+      }
+    },
     {
       "if": {
         "required": [
@@ -5377,6 +5394,2208 @@ Returns the observed `revision` and a `report` against the reference recording. 
 | `source_id` | optional | string, minimum length `1` | Analyze one recording other than the reference. Defaults to all other recordings. |
 | `reference_source_id` | optional | string, minimum length `1` | Select a recording on the reference camera. Defaults to its primary recording. |
 | `metadata_only` | optional | boolean | Skip waveform analysis and drift checks. |
+
+## Tiles and ISO delivery
+
+### `tiles_editor_accept`
+
+Accept a saved scan or revise the saved count hints for a recording.
+
+With a scan, reports the scan state, recording ID, feed count and analysis path. With count hints alone, returns the edit receipt. Both results include the total `review_issue_count` for the recording in the updated project. A change creates one history action. Use clear_count_hints to remove both stored expectations.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `expected_feeds` | optional | integer, minimum `1` | The expected number of unique feeds. A mismatch requires review. |
+| `max_visible_tiles` | optional | integer, minimum `1` | The expected maximum visible tiles in one frame. A mismatch requires review. |
+| `clear_count_hints` | optional | `true` | Clear both count hints without changing the accepted tiles or feed IDs. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "not": {
+        "allOf": [
+          {
+            "not": {
+              "required": [
+                "analysis_file"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "expected_feeds"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "max_visible_tiles"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "clear_count_hints"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "clear_count_hints",
+          "expected_feeds"
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "clear_count_hints",
+          "max_visible_tiles"
+        ]
+      }
+    }
+  ]
+}
+```
+
+### `tiles_editor_angles_plan`
+
+Plan synchronized ISO delivery for the selected feeds.
+
+Returns the requested plan or verification report.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `all` | optional | boolean | Select all feeds on the recording. |
+| `feed_id` | optional | array of string, minimum length `1`, minimum items `1` | Repeat for multiple feed IDs. |
+| `size` | optional | string, minimum length `1` | Output dimensions as WIDTHxHEIGHT. |
+| `frame_rate` | optional | string, minimum length `1` | Output frame rate as a rational value. |
+| `fit` | optional | `fit` / `fill` | Framing within each ISO canvas. |
+| `gap_color` | optional | string, minimum length `1` | RGB color used for absent feeds. |
+| `camera_off` | optional | `keep` / `blank` | Handling for camera-off appearances. |
+| `on_uncertain` | optional | `stop` / `blank` | Handling for uncertain intervals. |
+| `no_meeting_mix` | optional | boolean | Omit the standalone meeting mix. |
+| `no_isos` | optional | boolean | Omit the individual ISO movies. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `output` | optional | string, pattern `^/` | The destination for the command’s output. |
+
+### `tiles_editor_angles_render`
+
+Render angles from a saved plan or a feed selection.
+
+Starts a live job. Poll `analysis_job_status_read` with the same project handle and `job_id` for the delivery result. An export dry run returns its plan without rendering. An export with unresolved review issues reports `needs_review` and the plan.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `all` | optional | boolean | Select all feeds on the recording. |
+| `feed_id` | optional | array of string, minimum length `1`, minimum items `1` | Repeat for multiple feed IDs. |
+| `size` | optional | string, minimum length `1` | Output dimensions as WIDTHxHEIGHT. |
+| `frame_rate` | optional | string, minimum length `1` | Output frame rate as a rational value. |
+| `fit` | optional | `fit` / `fill` | Framing within each ISO canvas. |
+| `gap_color` | optional | string, minimum length `1` | RGB color used for absent feeds. |
+| `camera_off` | optional | `keep` / `blank` | Handling for camera-off appearances. |
+| `on_uncertain` | optional | `stop` / `blank` | Handling for uncertain intervals. |
+| `no_meeting_mix` | optional | boolean | Omit the standalone meeting mix. |
+| `no_isos` | optional | boolean | Omit the individual ISO movies. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `plan` | optional | string, pattern `^/` | A saved executable Tiles angle plan. |
+| `output` | required | string, pattern `^/` | The destination for the command’s output. |
+| `resume` | optional | boolean | Resume a compatible delivery in the destination. |
+
+### `tiles_editor_angles_use`
+
+Use selected feeds as angles in the existing multicam project.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `all` | optional | boolean | Select all feeds on the recording. |
+| `feed_id` | optional | array of string, minimum length `1`, minimum items `1` | Repeat for multiple feed IDs. |
+| `clip_id` | optional | string, minimum length `1` | The occurrence ID from the project timeline. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "feed_id"
+          ]
+        },
+        {
+          "required": [
+            "all"
+          ],
+          "properties": {
+            "all": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_editor_angles_verify`
+
+Verify an existing ISO delivery against its manifest.
+
+Returns the requested plan or verification report.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `output` | required | string, pattern `^/` | Existing ISO delivery folder containing manifest.json. |
+
+### `tiles_editor_box_add`
+
+Draw a tile in the source frame for a source-clock range.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `from` | required | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | required | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `feed_id` | optional | string, minimum length `1` | The feed ID from feeds list. |
+| `tile_id` | optional | string, minimum length `1` | The tile ID from inspect. |
+| `bounds` | required | object | Normalized source-frame bounds. |
+| `bounds.x` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.y` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.width` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.height` | required | number, minimum `0`, maximum `1` |  |
+
+### `tiles_editor_box_set`
+
+Correct a tile’s bounds over a source-clock range.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `from` | required | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | required | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `feed_id` | optional | string, minimum length `1` | The feed ID from feeds list. |
+| `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
+| `bounds` | required | object | Normalized source-frame bounds. |
+| `bounds.x` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.y` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.width` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.height` | required | number, minimum `0`, maximum `1` |  |
+
+### `tiles_editor_export_isos`
+
+Plan, render and verify ISO delivery from a recording or reviewed project. Check for needs_review and resume from the returned review project.
+
+Starts a live job. Poll `analysis_job_status_read` with the same project handle and `job_id` for the delivery result. An export dry run returns its plan without rendering. An export with unresolved review issues reports `needs_review` and the plan.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `all` | optional | boolean | Select all feeds on the recording. |
+| `feed_id` | optional | array of string, minimum length `1`, minimum items `1` | Repeat for multiple feed IDs. |
+| `size` | optional | string, minimum length `1` | Output dimensions as WIDTHxHEIGHT. |
+| `frame_rate` | optional | string, minimum length `1` | Output frame rate as a rational value. |
+| `fit` | optional | `fit` / `fill` | Framing within each ISO canvas. |
+| `gap_color` | optional | string, minimum length `1` | RGB color used for absent feeds. |
+| `camera_off` | optional | `keep` / `blank` | Handling for camera-off appearances. |
+| `on_uncertain` | optional | `stop` / `blank` | Handling for uncertain intervals. |
+| `no_meeting_mix` | optional | boolean | Omit the standalone meeting mix. |
+| `no_isos` | optional | boolean | Omit the individual ISO movies. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `output` | optional | string, pattern `^/` | The destination for the command’s output. |
+| `dry_run` | optional | boolean | Review the plan without rendering deliverables. |
+| `resume` | optional | boolean | Resume a compatible delivery in the destination. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "if": {
+        "not": {
+          "required": [
+            "dry_run"
+          ],
+          "properties": {
+            "dry_run": {
+              "const": true
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "output"
+        ]
+      }
+    }
+  ]
+}
+```
+
+### `tiles_editor_feeds_add`
+
+Add a project feed and return its feed_id for assigning tiles. The name defaults to Feed N.
+
+Returns the new feed_id and updated editor revision. Creating a feed adds one undo step.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `name` | optional | string, minimum length `1` | The display name for the feed. |
+
+### `tiles_editor_feeds_confirm`
+
+Confirm reviewed coverage for a feed. Whole-recording confirmation can resolve complete absence when the accepted recording matches, coverage is verified throughout, and every tile has a known identity.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+
+### `tiles_editor_feeds_inspect`
+
+Inspect one feed’s tiles, gaps, microphone and voice bindings.
+
+Returns Tiles review data, including the recording scope, feed identities and visible tile counts when applicable.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+
+### `tiles_editor_feeds_list`
+
+List distinct feeds in the selected recording.
+
+Returns Tiles review data, including the recording scope, feed identities and visible tile counts when applicable.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+
+### `tiles_editor_feeds_merge`
+
+Merge a duplicate feed into another feed.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `into_feed_id` | required | string, minimum length `1` | The feed that survives the merge. |
+
+### `tiles_editor_feeds_mic`
+
+Assign or clear an isolated microphone for the feed.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `mic_id` | optional | string, minimum length `1` | The microphone lane or source ID. |
+| `audio_stream_index` | optional | integer, minimum `0` | Zero-based absolute audio stream index. |
+| `clear` | optional | boolean | Clear the selected assignment. |
+| `binding` | optional | object | A ParticipantAudioBinding with a lane_id or stream selection. |
+
+### `tiles_editor_feeds_prefer`
+
+Choose the feed tile used when multiple tiles show it.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `tile_id` | optional | string, minimum length `1` | The tile ID from inspect. |
+| `clear` | optional | boolean | Clear the selected assignment. |
+
+### `tiles_editor_feeds_rename`
+
+Set the feed display name.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `name` | required | string, minimum length `1` | The display name for the feed. |
+
+### `tiles_editor_feeds_split`
+
+Split a tile and optional interval into a separate feed.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
+| `name` | optional | string, minimum length `1` | The display name for the feed. |
+| `new_feed_id` | optional | string, minimum length `1` | Stable ID for the new feed. |
+
+### `tiles_editor_feeds_treatment`
+
+Change the treatment for the feed’s visible appearances.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `treatment` | required | `none` / `blur` / `cover` / `remove` | Treatment applied to the feed’s visible appearances. |
+| `color` | optional | string, minimum length `1` | RGB color in hexadecimal. |
+
+### `tiles_editor_feeds_voice`
+
+Assign or clear a transcript voice for the feed.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `attachment_id` | optional | string, minimum length `1` | The transcript attachment ID. |
+| `track_id` | optional | string, minimum length `1` | The transcript track ID. |
+| `speaker_id` | optional | string, minimum length `1` | The transcript voice ID. |
+| `clear` | optional | boolean | Clear the selected assignment. |
+
+### `tiles_editor_grid_correct`
+
+Correct an even grid for a source-clock range and report carried links.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `from` | required | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | required | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `grid` | required | string, minimum length `1` | Corrected even grid as COLSxROWS. |
+
+### `tiles_editor_inspect`
+
+Inspect visible tiles, source-clock ranges, layout changes and review issues.
+
+Returns Tiles review data, including the recording scope, feed identities and visible tile counts when applicable.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `issues` | optional | boolean | Return review issues and timestamps. |
+| `at` | optional | string, minimum length `1` | Source-clock timestamp. |
+| `layout_changes` | optional | boolean | Return detected layout changes. |
+| `rule` | optional | object | Optional ParticipantMarkerRule for the layout-change query. |
+| `clock` | optional | `source` | Time coordinate for a Tiles query. |
+
+### `tiles_editor_layout_list`
+
+Read saved tile layouts in the project.
+
+Returns the layouts on the selected clips or group.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `clip_id` | optional | string, minimum length `1` | The occurrence ID from the project timeline. |
+
+### `tiles_editor_layout_set`
+
+Set the output layout for a clip or group over a source-clock range.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `clip_id` | optional | string, minimum length `1` | The occurrence ID from the project timeline. |
+| `layout` | required | `original` / `solo` / `pair` / `side-by-side` / `grid` / `flow` / `arranged` | Clip or group layout. |
+| `feed_id` | optional | array of string, minimum length `1`, minimum items `1` | Repeat for multiple feed IDs. |
+| `occurrence_id` | optional | string, minimum length `1` | The assembly occurrence ID. |
+| `group` | optional | boolean | Apply to the multicam group. |
+| `slot` | optional | array of object, minimum items `1` | Explicit source, framing and destination assignments for the layout. |
+| `slot[].id` | required | string | Feed, camera or presentation ID. Use an empty string for an empty slot. |
+| `slot[].target` | optional | `participant` / `camera` / `presentation` / `empty` | Slot source type. |
+| `slot[].framing` | optional | `fit` / `fill` | Fit or fill the slot. |
+| `slot[].anchor_x` | optional | number, minimum `0`, maximum `1` |  |
+| `slot[].anchor_y` | optional | number, minimum `0`, maximum `1` |  |
+| `slot[].background` | optional | integer, minimum `0`, maximum `16777215` | RGB value. |
+| `slot[].include_camera_off` | optional | boolean | Include camera-off appearances. |
+| `slot[].destination_tile_id` | optional | string, minimum length `1` | Tile position to target in an arranged layout. |
+| `compact` | optional | boolean | Compact the layout when a feed is absent. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "clip_id"
+          ]
+        },
+        {
+          "required": [
+            "occurrence_id"
+          ]
+        },
+        {
+          "required": [
+            "group"
+          ],
+          "properties": {
+            "group": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "not": {
+        "required": [
+          "feed_id",
+          "slot"
+        ]
+      }
+    }
+  ]
+}
+```
+
+### `tiles_editor_link`
+
+Assign a tile to a feed over a source-clock range.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
+| `feed_id` | optional | string, minimum length `1` | The feed ID from feeds list. |
+| `clear` | optional | boolean | Clear the selected assignment. |
+
+### `tiles_editor_preview`
+
+Write an annotated source frame for a timestamp or issue. This source review can show untreated pixels.
+
+Returns the path of the written annotated source frame.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `at` | optional | string, minimum length `1` | Source-clock timestamp. |
+| `clock` | optional | `source` | Time coordinate for a Tiles query. |
+| `issue_id` | optional | string, minimum length `1` | Review issue ID from Tiles inspect. |
+| `output` | required | string, pattern `^/` | The destination for the command’s output. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "at"
+          ]
+        },
+        {
+          "required": [
+            "issue_id"
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_editor_reconcile`
+
+Review the effect of replacing a recording, or apply a reviewed change.
+
+Returns a review token and affected tile, feed and treatment IDs. Apply that token at the same project revision to commit one edit.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `analysis_file` | required | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `apply` | optional | `true` | Apply the reviewed reconciliation to the project. |
+| `review` | optional | string, minimum length `1` | Review token returned by a reconciliation preview. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "apply"
+        ],
+        "properties": {
+          "apply": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "expected_revision",
+          "review"
+        ]
+      }
+    }
+  ]
+}
+```
+
+### `tiles_editor_scan`
+
+Scan a recording for visible tiles, distinct feeds and layout changes.
+
+Starts a live analysis job. Poll `analysis_job_status_read` with the same project handle and `job_id` for the scan state, recording ID, counts and `analysis_file` or `checkpoint_directory`. A scan with incomplete coverage returns a failed job with its partial result. Scan summary issues report count mismatches. The total `review_issue_count` includes every entry from `tiles_editor_inspect` with `issues: true` on the scan. With acceptance, a revision check precedes the history edit.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `output` | optional | string, pattern `^/` | The destination for the command’s output. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `backend` | optional | `auto` / `cpu-only` / `gpu-required` | Detector backend. |
+| `sampling` | optional | `adaptive` / `every-frame` / `sparse` | Frame sampling mode. |
+| `feed_layout` | optional | string, minimum length `1` | Detector layout hint such as auto or 2x2. |
+| `gallery_grid` | optional | string, minimum length `1` | Expected gallery grid as COLSxROWS. |
+| `expected_feeds` | optional | integer, minimum `1` | The expected number of unique feeds. A mismatch requires review. |
+| `max_visible_tiles` | optional | integer, minimum `1` | The expected maximum visible tiles in one frame. A mismatch requires review. |
+| `include_scenes` | optional | boolean | Include scene analysis in the scan. |
+| `no_sidecar` | optional | boolean | Skip reading or writing the recording analysis cache. |
+| `resume_file` | optional | string, pattern `^/` | A partial scan to resume. |
+| `resume` | optional | boolean | Resume this recording’s pending scan, or the checkpoint beside the supplied output path. |
+| `accept` | optional | boolean | Accept the completed scan as one project edit. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "accept"
+        ],
+        "properties": {
+          "accept": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "expected_revision"
+        ]
+      }
+    }
+  ]
+}
+```
+
+### `tiles_editor_switches_accept`
+
+Accept proposed multicam cuts in one undoable edit.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `proposal` | required | object | The revision-bound proposal from tiles_editor_switches_propose. |
+
+### `tiles_editor_switches_propose`
+
+Propose multicam cuts from the project transcript.
+
+Returns revision-bound switch proposals. Pass one proposal to `tiles_editor_switches_accept` with the same revision.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | optional | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `attachment_id` | optional | string, minimum length `1` | The transcript attachment ID. |
+| `minimum_hold` | optional | string, minimum length `1` | Minimum duration between proposed switches. |
+| `voice_angle` | optional | array of string, minimum length `1`, minimum items `1` | Voice-to-angle assignments. |
+
+### `tiles_editor_tile_screen_share`
+
+Mark a tile as a screen share over the selected interval.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
+
+### `tiles_editor_tile_split`
+
+Split one tile at a source-clock timestamp.
+
+Reports the edit at the resulting project revision and any affected IDs or correction details. A change creates one history action.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | The open window handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | The revision from the latest editor state or tool result. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
+| `at` | required | string, minimum length `1` | Source-clock timestamp. |
+| `new_tile_id` | optional | string, minimum length `1` | Stable ID for the new tile. |
+
+### `tiles_file_accept`
+
+Accept a saved scan or revise the saved count hints for a recording.
+
+Returns a file job receipt. Its result reports the saved edit and the total `review_issue_count` for the recording in the updated project.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `expected_feeds` | optional | integer, minimum `1` | The expected number of unique feeds. A mismatch requires review. |
+| `max_visible_tiles` | optional | integer, minimum `1` | The expected maximum visible tiles in one frame. A mismatch requires review. |
+| `clear_count_hints` | optional | `true` | Clear both count hints without changing the accepted tiles or feed IDs. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "not": {
+        "allOf": [
+          {
+            "not": {
+              "required": [
+                "analysis_file"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "expected_feeds"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "max_visible_tiles"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "clear_count_hints"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "clear_count_hints",
+          "expected_feeds"
+        ]
+      }
+    },
+    {
+      "not": {
+        "required": [
+          "clear_count_hints",
+          "max_visible_tiles"
+        ]
+      }
+    }
+  ]
+}
+```
+
+### `tiles_file_angles_plan`
+
+Plan synchronized ISO delivery for the selected feeds.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `all` | optional | boolean | Select all feeds on the recording. |
+| `feed_id` | optional | array of string, minimum length `1`, minimum items `1` | Repeat for multiple feed IDs. |
+| `size` | optional | string, minimum length `1` | Output dimensions as WIDTHxHEIGHT. |
+| `frame_rate` | optional | string, minimum length `1` | Output frame rate as a rational value. |
+| `fit` | optional | `fit` / `fill` | Framing within each ISO canvas. |
+| `gap_color` | optional | string, minimum length `1` | RGB color used for absent feeds. |
+| `camera_off` | optional | `keep` / `blank` | Handling for camera-off appearances. |
+| `on_uncertain` | optional | `stop` / `blank` | Handling for uncertain intervals. |
+| `no_meeting_mix` | optional | boolean | Omit the standalone meeting mix. |
+| `no_isos` | optional | boolean | Omit the individual ISO movies. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `output` | optional | string, pattern `^/` | The destination for the command’s output. |
+
+### `tiles_file_angles_render`
+
+Render angles from a saved plan or a feed selection.
+
+Returns a file job receipt. Poll `file_job_status_read` for the manifest and published paths. The terminal state `needs_review` has exit code 3 and a JSON result with `review_project_path`, timestamped `issues` and `suggested_next_command`. Use that saved project as the input after corrections.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | optional | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `all` | optional | boolean | Select all feeds on the recording. |
+| `feed_id` | optional | array of string, minimum length `1`, minimum items `1` | Repeat for multiple feed IDs. |
+| `size` | optional | string, minimum length `1` | Output dimensions as WIDTHxHEIGHT. |
+| `frame_rate` | optional | string, minimum length `1` | Output frame rate as a rational value. |
+| `fit` | optional | `fit` / `fill` | Framing within each ISO canvas. |
+| `gap_color` | optional | string, minimum length `1` | RGB color used for absent feeds. |
+| `camera_off` | optional | `keep` / `blank` | Handling for camera-off appearances. |
+| `on_uncertain` | optional | `stop` / `blank` | Handling for uncertain intervals. |
+| `no_meeting_mix` | optional | boolean | Omit the standalone meeting mix. |
+| `no_isos` | optional | boolean | Omit the individual ISO movies. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `plan` | optional | string, pattern `^/` | A saved executable Tiles angle plan. |
+| `output` | required | string, pattern `^/` | The destination for the command’s output. |
+| `resume` | optional | boolean | Resume a compatible delivery in the destination. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "plan"
+          ]
+        },
+        {
+          "required": [
+            "project_path"
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_angles_use`
+
+Use selected feeds as angles in the existing multicam project.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `all` | optional | boolean | Select all feeds on the recording. |
+| `feed_id` | optional | array of string, minimum length `1`, minimum items `1` | Repeat for multiple feed IDs. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `clip_id` | optional | string, minimum length `1` | The occurrence ID from the project timeline. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "oneOf": [
+        {
+          "required": [
+            "feed_id"
+          ]
+        },
+        {
+          "required": [
+            "all"
+          ],
+          "properties": {
+            "all": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_angles_verify`
+
+Verify an existing ISO delivery against its manifest.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `output` | required | string, pattern `^/` | Existing ISO delivery folder containing manifest.json. |
+
+### `tiles_file_box_add`
+
+Draw a tile in the source frame for a source-clock range.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `from` | required | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | required | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `feed_id` | optional | string, minimum length `1` | The feed ID from feeds list. |
+| `tile_id` | optional | string, minimum length `1` | The tile ID from inspect. |
+| `bounds` | required | object | Normalized source-frame bounds. |
+| `bounds.x` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.y` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.width` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.height` | required | number, minimum `0`, maximum `1` |  |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_box_set`
+
+Correct a tile’s bounds over a source-clock range.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `from` | required | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | required | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `feed_id` | optional | string, minimum length `1` | The feed ID from feeds list. |
+| `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
+| `bounds` | required | object | Normalized source-frame bounds. |
+| `bounds.x` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.y` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.width` | required | number, minimum `0`, maximum `1` |  |
+| `bounds.height` | required | number, minimum `0`, maximum `1` |  |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_export_isos`
+
+Plan, render and verify ISO delivery from a recording or reviewed project. Check for needs_review and resume from the returned review project.
+
+Returns a file job receipt. Poll `file_job_status_read` for the manifest and published paths. The terminal state `needs_review` has exit code 3 and a JSON result with `review_project_path`, timestamped `issues` and `suggested_next_command`. Use that saved project as the input after corrections.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | optional | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `all` | optional | boolean | Select all feeds on the recording. |
+| `feed_id` | optional | array of string, minimum length `1`, minimum items `1` | Repeat for multiple feed IDs. |
+| `size` | optional | string, minimum length `1` | Output dimensions as WIDTHxHEIGHT. |
+| `frame_rate` | optional | string, minimum length `1` | Output frame rate as a rational value. |
+| `fit` | optional | `fit` / `fill` | Framing within each ISO canvas. |
+| `gap_color` | optional | string, minimum length `1` | RGB color used for absent feeds. |
+| `camera_off` | optional | `keep` / `blank` | Handling for camera-off appearances. |
+| `on_uncertain` | optional | `stop` / `blank` | Handling for uncertain intervals. |
+| `no_meeting_mix` | optional | boolean | Omit the standalone meeting mix. |
+| `no_isos` | optional | boolean | Omit the individual ISO movies. |
+| `backend` | optional | `auto` / `cpu-only` / `gpu-required` | Detector backend. |
+| `sampling` | optional | `adaptive` / `every-frame` / `sparse` | Frame sampling mode. |
+| `feed_layout` | optional | string, minimum length `1` | Detector layout hint such as auto or 2x2. |
+| `gallery_grid` | optional | string, minimum length `1` | Expected gallery grid as COLSxROWS. |
+| `expected_feeds` | optional | integer, minimum `1` | The expected number of unique feeds. A mismatch requires review. |
+| `max_visible_tiles` | optional | integer, minimum `1` | The expected maximum visible tiles in one frame. A mismatch requires review. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `file` | optional | string, pattern `^/` | The input recording. |
+| `output` | optional | string, pattern `^/` | The destination for the command’s output. |
+| `dry_run` | optional | boolean | Review the plan without rendering deliverables. |
+| `resume` | optional | boolean | Resume a compatible delivery in the destination. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "project_path"
+          ]
+        },
+        {
+          "required": [
+            "file"
+          ]
+        }
+      ]
+    },
+    {
+      "if": {
+        "required": [
+          "file"
+        ]
+      },
+      "then": {
+        "required": [
+          "output"
+        ]
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "required": [
+            "dry_run"
+          ],
+          "properties": {
+            "dry_run": {
+              "const": true
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "output"
+        ]
+      }
+    }
+  ]
+}
+```
+
+### `tiles_file_feeds_add`
+
+Add a project feed and return its feed_id for assigning tiles. The name defaults to Feed N.
+
+Returns a file job receipt. Its result contains the new project feed_id for tiles_file_box_add or tiles_file_link.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `name` | optional | string, minimum length `1` | The display name for the feed. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_feeds_confirm`
+
+Confirm reviewed coverage for a feed. Whole-recording confirmation can resolve complete absence when the accepted recording matches, coverage is verified throughout, and every tile has a known identity.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_feeds_inspect`
+
+Inspect one feed’s tiles, gaps, microphone and voice bindings.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | optional | string, pattern `^/` | The saved .cut project. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "project_path"
+          ]
+        },
+        {
+          "required": [
+            "analysis_file"
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_feeds_list`
+
+List distinct feeds in the selected recording.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | optional | string, pattern `^/` | The saved .cut project. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "project_path"
+          ]
+        },
+        {
+          "required": [
+            "analysis_file"
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_feeds_merge`
+
+Merge a duplicate feed into another feed.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `into_feed_id` | required | string, minimum length `1` | The feed that survives the merge. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_feeds_mic`
+
+Assign or clear an isolated microphone for the feed.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `mic_id` | optional | string, minimum length `1` | The microphone lane or source ID. |
+| `audio_stream_index` | optional | integer, minimum `0` | Zero-based absolute audio stream index. |
+| `clear` | optional | boolean | Clear the selected assignment. |
+| `binding` | optional | object | A ParticipantAudioBinding with a lane_id or stream selection. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_feeds_prefer`
+
+Choose the feed tile used when multiple tiles show it.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `tile_id` | optional | string, minimum length `1` | The tile ID from inspect. |
+| `clear` | optional | boolean | Clear the selected assignment. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_feeds_rename`
+
+Set the feed display name.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `name` | required | string, minimum length `1` | The display name for the feed. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_feeds_split`
+
+Split a tile and optional interval into a separate feed.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
+| `name` | optional | string, minimum length `1` | The display name for the feed. |
+| `new_feed_id` | optional | string, minimum length `1` | Stable ID for the new feed. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_feeds_treatment`
+
+Change the treatment for the feed’s visible appearances.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `treatment` | required | `none` / `blur` / `cover` / `remove` | Treatment applied to the feed’s visible appearances. |
+| `color` | optional | string, minimum length `1` | RGB color in hexadecimal. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_feeds_voice`
+
+Assign or clear a transcript voice for the feed.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `feed_id` | required | string, minimum length `1` | The feed ID from feeds list. |
+| `attachment_id` | optional | string, minimum length `1` | The transcript attachment ID. |
+| `track_id` | optional | string, minimum length `1` | The transcript track ID. |
+| `speaker_id` | optional | string, minimum length `1` | The transcript voice ID. |
+| `clear` | optional | boolean | Clear the selected assignment. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_grid_correct`
+
+Correct an even grid for a source-clock range and report carried links.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `from` | required | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | required | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `grid` | required | string, minimum length `1` | Corrected even grid as COLSxROWS. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_inspect`
+
+Inspect visible tiles, source-clock ranges, layout changes and review issues.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | optional | string, pattern `^/` | The saved .cut project. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `issues` | optional | boolean | Return review issues and timestamps. |
+| `at` | optional | string, minimum length `1` | Source-clock timestamp. |
+| `layout_changes` | optional | boolean | Return detected layout changes. |
+| `rule` | optional | object | Optional ParticipantMarkerRule for the layout-change query. |
+| `clock` | optional | `source` | Time coordinate for a Tiles query. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "project_path"
+          ]
+        },
+        {
+          "required": [
+            "analysis_file"
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_layout_list`
+
+Read saved tile layouts in the project.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `clip_id` | optional | string, minimum length `1` | The occurrence ID from the project timeline. |
+
+### `tiles_file_layout_set`
+
+Set the output layout for a clip or group over a source-clock range.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `clip_id` | optional | string, minimum length `1` | The occurrence ID from the project timeline. |
+| `layout` | required | `original` / `solo` / `pair` / `side-by-side` / `grid` / `flow` / `arranged` | Clip or group layout. |
+| `feed_id` | optional | array of string, minimum length `1`, minimum items `1` | Repeat for multiple feed IDs. |
+| `occurrence_id` | optional | string, minimum length `1` | The assembly occurrence ID. |
+| `group` | optional | boolean | Apply to the multicam group. |
+| `slot` | optional | array of object, minimum items `1` | Explicit source, framing and destination assignments for the layout. |
+| `slot[].id` | required | string | Feed, camera or presentation ID. Use an empty string for an empty slot. |
+| `slot[].target` | optional | `participant` / `camera` / `presentation` / `empty` | Slot source type. |
+| `slot[].framing` | optional | `fit` / `fill` | Fit or fill the slot. |
+| `slot[].anchor_x` | optional | number, minimum `0`, maximum `1` |  |
+| `slot[].anchor_y` | optional | number, minimum `0`, maximum `1` |  |
+| `slot[].background` | optional | integer, minimum `0`, maximum `16777215` | RGB value. |
+| `slot[].include_camera_off` | optional | boolean | Include camera-off appearances. |
+| `slot[].destination_tile_id` | optional | string, minimum length `1` | Tile position to target in an arranged layout. |
+| `compact` | optional | boolean | Compact the layout when a feed is absent. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "oneOf": [
+        {
+          "required": [
+            "clip_id"
+          ]
+        },
+        {
+          "required": [
+            "occurrence_id"
+          ]
+        },
+        {
+          "required": [
+            "group"
+          ],
+          "properties": {
+            "group": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    {
+      "not": {
+        "required": [
+          "feed_id",
+          "slot"
+        ]
+      }
+    }
+  ]
+}
+```
+
+### `tiles_file_link`
+
+Assign a tile to a feed over a source-clock range.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
+| `feed_id` | optional | string, minimum length `1` | The feed ID from feeds list. |
+| `clear` | optional | boolean | Clear the selected assignment. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_preview`
+
+Write an annotated source frame for a timestamp or issue. This source review can show untreated pixels.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | optional | string, pattern `^/` | The saved .cut project. |
+| `analysis_file` | optional | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `at` | optional | string, minimum length `1` | Source-clock timestamp. |
+| `clock` | optional | `source` | Time coordinate for a Tiles query. |
+| `issue_id` | optional | string, minimum length `1` | Review issue ID from Tiles inspect. |
+| `output` | required | string, pattern `^/` | The destination for the command’s output. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "project_path"
+          ]
+        },
+        {
+          "required": [
+            "analysis_file"
+          ]
+        }
+      ]
+    },
+    {
+      "oneOf": [
+        {
+          "required": [
+            "at"
+          ]
+        },
+        {
+          "required": [
+            "issue_id"
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_reconcile`
+
+Review the effect of replacing a recording, or apply a reviewed change.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `analysis_file` | required | string, pattern `^/` | A saved Tiles scan JSON file. |
+| `apply` | optional | `true` | Apply the reviewed reconciliation to the project. |
+| `review` | optional | string, minimum length `1` | Review token returned by a reconciliation preview. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "apply"
+        ],
+        "properties": {
+          "apply": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "allOf": [
+          {
+            "oneOf": [
+              {
+                "required": [
+                  "out_project"
+                ]
+              },
+              {
+                "required": [
+                  "in_place"
+                ],
+                "properties": {
+                  "in_place": {
+                    "const": true
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "required": [
+              "review"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+### `tiles_file_scan`
+
+Scan a recording for visible tiles, distinct feeds and layout changes.
+
+Returns a file job receipt. With an output path, its compact result includes the saved paths, coverage and count mismatches. The total `review_issue_count` matches the number of entries from `tiles_file_inspect` with `issues: true` on the scan.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `file` | required | string, pattern `^/` | The input recording. |
+| `output` | optional | string, pattern `^/` | The output scan JSON. With this option the job returns a small scan summary. |
+| `backend` | optional | `auto` / `cpu-only` / `gpu-required` | Detector backend. |
+| `sampling` | optional | `adaptive` / `every-frame` / `sparse` | Frame sampling mode. |
+| `feed_layout` | optional | string, minimum length `1` | Detector layout hint such as auto or 2x2. |
+| `gallery_grid` | optional | string, minimum length `1` | Expected gallery grid as COLSxROWS. |
+| `expected_feeds` | optional | integer, minimum `1` | The expected number of unique feeds. A mismatch requires review. |
+| `max_visible_tiles` | optional | integer, minimum `1` | The expected maximum visible tiles in one frame. A mismatch requires review. |
+| `include_scenes` | optional | boolean | Include scene analysis in the scan. |
+| `no_sidecar` | optional | boolean | Skip reading or writing the recording analysis cache. |
+| `resume_file` | optional | string, pattern `^/` | A partial scan to resume. |
+
+### `tiles_file_switches_propose`
+
+Propose multicam cuts from the project transcript.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `attachment_id` | optional | string, minimum length `1` | The transcript attachment ID. |
+| `minimum_hold` | optional | string, minimum length `1` | Minimum duration between proposed switches. |
+| `voice_angle` | optional | array of string, minimum length `1`, minimum items `1` | Voice-to-angle assignments. |
+
+### `tiles_file_tile_screen_share`
+
+Mark a tile as a screen share over the selected interval.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `from` | optional | string, minimum length `1` | Inclusive source-clock start as a timestamp. |
+| `to` | optional | string, minimum length `1` | Exclusive source-clock end as a timestamp. |
+| `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `tiles_file_tile_split`
+
+Split one tile at a source-clock timestamp.
+
+Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it for an identical retry. |
+| `working_directory` | optional | string, pattern `^/` | Base directory for relative paths inside requests and saved documents. |
+| `project_path` | required | string, pattern `^/` | The saved .cut project. |
+| `source_id` | optional | string, minimum length `1` | The recording ID. Select it when multiple recordings are eligible. |
+| `out_project` | optional | string, pattern `^/` | Write the updated project to this .cut path. |
+| `in_place` | optional | `true` | Update the saved project in place. |
+| `tile_id` | required | string, minimum length `1` | The tile ID from inspect. |
+| `at` | required | string, minimum length `1` | Source-clock timestamp. |
+| `new_tile_id` | optional | string, minimum length `1` | Stable ID for the new tile. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
 
 ## Range mapping and revision comparison
 

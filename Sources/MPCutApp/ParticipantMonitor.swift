@@ -60,15 +60,23 @@ struct ParticipantAppearanceIndex {
 final class ParticipantMonitorGeometry {
     private let index: ParticipantAppearanceIndex
     private let intervals: [ParticipantCoverage]
+    private let representativeTiles: [String: ParticipantAppearance]
     let hasUncertainAppearance: Bool
 
     init(_ source: ParticipantSourceGeometry) {
         index = ParticipantAppearanceIndex(source.appearances)
         intervals = source.coverage.sorted { $0.range.from < $1.range.from }
+        representativeTiles = source.appearances.reduce(into: [:]) { thumbnails, tile in
+            guard let feed = tile.participantID, tile.state == .video || tile.state == .presentation,
+                  thumbnails[feed].map({ tile.range.from < $0.range.from }) ?? true else { return }
+            thumbnails[feed] = tile
+        }
         hasUncertainAppearance = source.appearances.contains { $0.participantID == nil && $0.state != .presentation }
     }
 
     func appearances(at time: RationalTime) -> [ParticipantAppearance] { index.at(time) }
+
+    func representativeTile(for feedID: String) -> ParticipantAppearance? { representativeTiles[feedID] }
 
     func coverage(at time: RationalTime) -> ParticipantCoverageState {
         let i = intervals.lowerBound { $0.range.to > time }
@@ -104,6 +112,16 @@ struct ParticipantMonitorPosition {
     func needsReconciliation(in project: ParticipantProject) -> Bool {
         project.needsReconciliation(sourceID: sourceID, identity: media.identity)
     }
+
+    struct DrawingFrame: Hashable {
+        let sourceID: String
+        let media: TilesThumbnailSource
+        let time: RationalTime
+    }
+
+    var drawingFrame: DrawingFrame {
+        .init(sourceID: sourceID, media: TilesThumbnailSource(media), time: time)
+    }
 }
 
 extension ProjectSession {
@@ -121,10 +139,11 @@ extension ProjectSession {
             guard let picture, picture.spanIndex >= 0,
                   let media = multicam.media[picture.source], media.identity == picture.identity,
                   let sourceTime = try? picture.frameTime.subtracting(picture.multicamClockOffset) else { return nil }
-            return .init(sourceID: picture.source, media: media, time: sourceTime)
+            let sourceID = multicam.project?.angles.first(where: { $0.id == picture.source })?.feedAngle?.sourceID ?? picture.source
+            return .init(sourceID: sourceID, media: multicam.media[sourceID] ?? media, time: sourceTime)
         }
-        guard let sequence, let source = editor.jpegSourceAtPlayhead, source.media.url == sequence.url else { return nil }
-        return .init(sourceID: source.media.url.path, media: source.media, time: sequence.time)
+        guard let sequence, let media = editor.participantMedia(displaying: sequence) else { return nil }
+        return .init(sourceID: media.url.path, media: media, time: sequence.time)
     }
 
     var participantTimelineTime: RationalTime {
@@ -141,9 +160,10 @@ extension ProjectSession {
         else { try editor.replaceParticipantProject(next, action: action) }
     }
 
-    func seekParticipant(sourceID: String, range: MulticamRange) {
-        if isMulticam { multicam.seekParticipantAppearance(sourceID: sourceID, range: range) }
-        else { editor.seekParticipantAppearance(sourceID: sourceID, range: range) }
+    @discardableResult
+    func seekParticipant(sourceID: String, range: MulticamRange, mark: Bool = false) -> Bool {
+        if isMulticam { return multicam.seekParticipantAppearance(sourceID: sourceID, range: range, mark: mark) }
+        return editor.seekParticipantAppearance(sourceID: sourceID, range: range, mark: mark)
     }
 
     func pauseParticipantPlayback() {
@@ -166,7 +186,11 @@ struct ParticipantMonitorOverlay: View {
     @State private var displayedPicture: MulticamPicturePosition?
     @State private var sequencePicture: SequenceSourcePicture?
     @State private var indexes: [TranscriptIndex] = []
-    @State private var drawing: CGRect?
+    @State private var matchedVoices: [ParticipantSpeakerBinding: String] = [:]
+    @State private var editingTile: ParticipantAppearance?
+    @State private var error: String?
+    @State private var resizing: CGRect?
+    @State private var outputCells: ParticipantPreviewCells?
 
     init(session: ProjectSession, interactive: Bool) {
         self.session = session
@@ -177,102 +201,170 @@ struct ParticipantMonitorOverlay: View {
     var body: some View {
         let project = session.participantProject
         let speakers = speakingParticipantIDs(project)
+        let editable = interactive || !project.isEmpty
         GeometryReader { geometry in
-            if let source = session.participantPosition(displaying: displayedPicture, sequence: sequencePicture),
-               !source.needsReconciliation(in: project) {
+            if presentation.participantMonitorSource,
+               let source = session.participantPosition(displaying: displayedPicture, sequence: sequencePicture) {
                 let picture = Self.pictureRect(in: geometry.size, aspect: source.aspect)
-                let appearances = session.participantGeometry(for: source.sourceID)?.appearances(at: source.time) ?? []
+                let pending = scanPreviewBoxes(for: source)
+                let canEdit = !source.needsReconciliation(in: project) && pending == nil
+                let appearances = canEdit ? session.participantGeometry(for: source.sourceID)?.appearances(at: source.time) ?? [] : []
                 ZStack(alignment: .topLeading) {
                     ForEach(appearances) { appearance in
                         let active = appearance.participantID.map(speakers.contains) ?? false
                         let pinned = appearance.participantID != nil && appearance.participantID == presentation.pinnedParticipant
-                        if interactive || active || pinned {
-                            tile(appearance, sourceID: source.sourceID, picture: picture, project: project, active: active, pinned: pinned)
+                        if editable || active || pinned {
+                            tile(appearance, source: source, picture: picture, project: project, active: active, pinned: pinned)
                         }
                     }
-                    if interactive && appearances.isEmpty && !presentation.participantDrawMode {
-                        ForEach(scanPreviewRegions(for: source), id: \.appearanceID) { region in
-                            let rect = CGRect(x: region.rect.x, y: region.rect.y,
-                                              width: region.rect.width, height: region.rect.height)
-                            outline(Self.position(rect, in: picture), color: .orange)
+                    if editable && !presentation.participantDrawMode,
+                       let picked = presentation.pickedParticipantAppearance, picked.sourceID == source.sourceID,
+                       let tile = appearances.first(where: { $0.id == picked.appearanceID }) {
+                        resizeHandles(tile, source: source, picture: picture)
+                    }
+                    if interactive && !presentation.participantDrawMode, let pending {
+                        ForEach(pending.indices, id: \.self) { index in
+                            outline(Self.position(pending[index], in: picture), color: .orange)
                                 .allowsHitTesting(false)
                                 .accessibilityHidden(true)
                         }
                     }
-                    if interactive && presentation.participantDrawMode {
-                        Rectangle()
-                            .fill(.clear)
-                            .contentShape(Rectangle())
-                            .frame(width: picture.width, height: picture.height)
-                            .gesture(DragGesture(minimumDistance: 4).onChanged { value in
-                                drawing = Self.normalizedRect(from: value.startLocation, to: value.location, size: picture.size)
-                            }.onEnded { value in
-                                let rect = Self.normalizedRect(from: value.startLocation, to: value.location, size: picture.size)
-                                drawing = nil
-                                guard rect.width >= 0.005, rect.height >= 0.005 else { return }
-                                presentation.participantDrawnBounds = .init(
-                                    sourceID: source.sourceID, time: source.time,
-                                    bounds: .init(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height))
-                                presentation.participantDrawMode = false
-                            })
-                            .position(x: picture.midX, y: picture.midY)
-                        if let drawing {
-                            outline(Self.position(drawing, in: picture), color: .accentColor)
-                                .allowsHitTesting(false)
+                    if canEdit && interactive && presentation.participantDrawMode {
+                        let frame = source.drawingFrame
+                        ParticipantBoxDrawing { rect in
+                            guard session.participantPosition?.drawingFrame == frame else { return }
+                            presentation.participantDrawnBounds = .init(
+                                sourceID: source.sourceID, time: source.time,
+                                bounds: .init(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height))
+                            presentation.participantDrawMode = false
                         }
+                        .id(frame)
+                        .frame(width: picture.width, height: picture.height)
+                        .position(x: picture.midX, y: picture.midY)
+                        .accessibilityHidden(true)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .allowsHitTesting(interactive)
+                .allowsHitTesting(editable)
+            } else if !presentation.participantMonitorSource, let outputCells {
+                outputControls(outputCells, in: geometry.size)
             }
+        }
+        .overlay(alignment: .topLeading) {
+            if editable || session.transcript.project.requiresPictureProcessing {
+                Picker("Monitor picture", selection: $presentation.participantMonitorSource) {
+                    Text("Output").tag(false).accessibilityIdentifier("tiles.monitor.output")
+                    Text("Source").tag(true).accessibilityIdentifier("tiles.monitor.source")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .padding(8)
+                .accessibilityIdentifier("tiles.monitor.picture")
+            }
+        }
+        .alert("Tile Edit", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+            Button("OK") { error = nil }
+        } message: {
+            Text(error ?? "")
+        }
+        .onChange(of: requestedEditorAppearance) { _, appearance in
+            if let appearance {
+                editingTile = appearance
+                presentation.requestedParticipantTileEditor = nil
+            }
+        }
+        .onChange(of: presentation.participantMonitorSource) { _, source in
+            if !source {
+                editingTile = nil
+                resizing = nil
+            }
+        }
+        .onChange(of: presentation.participantDrawMode) { _, drawing in
+            if drawing { presentation.participantMonitorSource = true }
+        }
+        .onReceive(session.isMulticam ? session.multicam.preview.participantPreviewCells : session.editor.preview.participantPreviewCells) {
+            outputCells = $0
         }
         .onReceive(session.participantPlayback.receive(on: DispatchQueue.main)) { next in
             if let selected = presentation.selectedTranscriptSpeaker, next != selected.time {
                 presentation.selectedTranscriptSpeaker = nil
             }
+            if next != time {
+                editingTile = nil
+                resizing = nil
+            }
             time = next
         }
         .onReceive(session.multicam.preview.$picture.receive(on: DispatchQueue.main)) { picture in
-            if session.isMulticam, displayedPicture != picture { displayedPicture = picture }
+            if session.isMulticam, displayedPicture != picture {
+                displayedPicture = picture
+                if picture == nil { editingTile = nil }
+            }
         }
         .onReceive(session.editor.preview.sourcePicture) { picture in
-            if !session.isMulticam, sequencePicture != picture { sequencePicture = picture }
+            if !session.isMulticam, sequencePicture != picture {
+                sequencePicture = picture
+                if picture == nil { editingTile = nil }
+            }
         }
         .onChange(of: speakers, initial: true) { _, value in
             presentation.speakingParticipants = value
         }
         .task(id: ParticipantSpeakerIndexKey(session: session)) {
             indexes = []
+            matchedVoices = [:]
+            guard !project.people.isEmpty else { return }
             let ids = Set(project.people.flatMap { $0.speakers.map(\.attachmentID) })
+            let multicam = session.isMulticam ? session.multicam.project : nil
             var loaded: [TranscriptIndex] = []
-            for attachment in session.transcript.state.attachments where ids.contains(attachment.id) {
+            for attachment in session.transcript.state.attachments where multicam != nil || ids.contains(attachment.id) {
+                if Task.isCancelled { return }
                 if let index = try? await session.transcript.indexedTranscript(attachmentID: attachment.id) {
                     loaded.append(index)
                 }
             }
-            if !Task.isCancelled { indexes = loaded }
+            let voices = if let multicam {
+                await Task.detached(priority: .utility) { [loaded] in
+                    TileFeedAttachments.voices(in: multicam, indexes: loaded)
+                }.value
+            } else { [:] as [ParticipantSpeakerBinding: String] }
+            guard !Task.isCancelled else { return }
+            indexes = loaded
+            matchedVoices = voices
         }
     }
 
-    private func scanPreviewRegions(for position: ParticipantMonitorPosition) -> [ParticipantRegion] {
+    private func scanPreviewBoxes(for position: ParticipantMonitorPosition) -> [CGRect]? {
         guard let preview = presentation.participantScanPreview, preview.sourceID == position.sourceID,
               preview.stamp == SceneSourceStamp(media: position.media),
-              preview.analysis.start <= position.time, position.time < preview.analysis.end else { return [] }
-        let observations = preview.analysis.observations
-        let after = observations.lowerBound { $0.time > position.time }
-        return after > 0 ? observations[after - 1].regions : []
+              preview.analysis.start <= position.time, position.time < preview.analysis.end else { return nil }
+        return preview.boxes(at: position.time)
     }
 
-    private func tile(_ appearance: ParticipantAppearance, sourceID: String, picture: CGRect,
+    private var requestedEditorAppearance: ParticipantAppearance? {
+        guard interactive, presentation.participantMonitorSource,
+              let request = presentation.requestedParticipantTileEditor,
+              let position = session.participantPosition(displaying: displayedPicture, sequence: sequencePicture),
+              request.sourceID == position.sourceID,
+              !position.needsReconciliation(in: session.participantProject) else { return nil }
+        return session.participantGeometry(for: request.sourceID)?.appearances(at: position.time)
+            .first { $0.id == request.appearanceID }
+    }
+
+    private func tile(_ appearance: ParticipantAppearance, source: ParticipantMonitorPosition, picture: CGRect,
                       project: ParticipantProject, active: Bool, pinned: Bool) -> some View {
         let name = project.people.first { $0.id == appearance.participantID }?.name
             ?? (appearance.state == .presentation ? "Presentation" : "Unassigned")
+        let sourceID = source.sourceID
         let selected = presentation.pickedParticipantAppearance == .init(sourceID: sourceID, appearanceID: appearance.id)
         let color: Color = active ? .yellow : pinned || selected ? .accentColor : .white
         let region = Self.position(appearance.bounds.rect, in: picture)
         return Button {
+            session.pauseParticipantPlayback()
             presentation.pickedParticipantAppearance = .init(sourceID: sourceID, appearanceID: appearance.id)
             presentation.pinnedParticipant = appearance.participantID
+            editingTile = appearance
         } label: {
             Rectangle()
                 .fill(color.opacity(0.07))
@@ -288,9 +380,90 @@ struct ParticipantMonitorOverlay: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(name)
-        .accessibilityHint("Select this appearance")
+        .accessibilityHint("Open tile edits")
+        .popover(isPresented: Binding(get: { editingTile?.id == appearance.id }, set: { if !$0 { editingTile = nil } })) {
+            if let editingTile {
+                ParticipantTileEditor(session: session, source: source, appearance: editingTile)
+                    .id(editingTile.id)
+            }
+        }
+        .accessibilityIdentifier("participant.appearance.\(sourceID).\(appearance.id)")
         .position(x: region.midX, y: region.midY)
-        .allowsHitTesting(interactive && !presentation.participantDrawMode)
+        .allowsHitTesting(!presentation.participantDrawMode)
+    }
+
+    @ViewBuilder
+    private func outputControls(_ output: ParticipantPreviewCells, in size: CGSize) -> some View {
+        if let layout = session.monitorTileLayout(at: output.time), output.size.width > 0, output.size.height > 0 {
+            let picture = Self.pictureRect(in: size, aspect: output.size.width / output.size.height)
+            let scale = picture.width / output.size.width
+            ZStack(alignment: .topLeading) {
+                ForEach(Array(output.cells.enumerated()), id: \.offset) { _, cell in
+                    if cell.slot.target != .empty {
+                        let label = session.participantProject.people.first { $0.id == cell.slot.id }?.name
+                            ?? session.multicam.project?.angles.first { $0.id == cell.slot.id }?.displayName
+                            ?? cell.slot.id
+                        ParticipantCellEditor(label: label, size: .init(width: cell.rect.width * scale, height: cell.rect.height * scale),
+                                              slot: cell.slot, begin: session.pauseParticipantPlayback) { x, y in
+                            try session.reframeMonitorCell(cell.slot, in: layout, at: output.time, anchorX: x, anchorY: y)
+                        }
+                        .position(x: picture.minX + cell.rect.midX * scale, y: picture.minY + cell.rect.midY * scale)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+
+    private func resizeHandles(_ tile: ParticipantAppearance, source: ParticipantMonitorPosition,
+                               picture: CGRect) -> some View {
+        let original = tile.bounds.rect
+        let visible = resizing ?? original
+        return ZStack(alignment: .topLeading) {
+            if let resizing {
+                outline(Self.position(resizing, in: picture), color: .accentColor).allowsHitTesting(false)
+            }
+            ForEach(0..<4) { corner in
+                let left = corner.isMultiple(of: 2)
+                let top = corner < 2
+                let moving = CGPoint(x: left ? original.minX : original.maxX, y: top ? original.minY : original.maxY)
+                let fixed = CGPoint(x: left ? original.maxX : original.minX, y: top ? original.maxY : original.minY)
+                Circle().fill(.white).overlay { Circle().strokeBorder(.black, lineWidth: 1) }
+                    .frame(width: 12, height: 12)
+                    .padding(5)
+                    .contentShape(Rectangle())
+                    .position(x: picture.minX + (left ? visible.minX : visible.maxX) * picture.width,
+                              y: picture.minY + (top ? visible.minY : visible.maxY) * picture.height)
+                    .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .global)
+                        .onChanged { value in
+                            if resizing == nil { session.pauseParticipantPlayback() }
+                            resizing = Self.resizedTile(moving: moving, fixed: fixed, translation: value.translation,
+                                                        picture: picture.size)
+                        }
+                        .onEnded { value in
+                            let rect = Self.resizedTile(moving: moving, fixed: fixed, translation: value.translation,
+                                                        picture: picture.size)
+                            resizing = nil
+                            guard rect.width >= 0.005, rect.height >= 0.005 else { return }
+                            do {
+                                let range = try presentation.participantTileExtent.range(session: session, source: source)
+                                var project = session.participantProject
+                                try project.correctBounds(sourceID: source.sourceID, appearanceID: tile.id,
+                                                          bounds: .init(x: rect.minX, y: rect.minY, width: rect.width,
+                                                                        height: rect.height), range: range)
+                                try session.commitParticipants(project, action: "Correct Tile Bounds")
+                            } catch { self.error = error.localizedDescription }
+                        })
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+
+    private static func resizedTile(moving: CGPoint, fixed: CGPoint, translation: CGSize, picture: CGSize) -> CGRect {
+        let start = CGPoint(x: fixed.x * picture.width, y: fixed.y * picture.height)
+        let end = CGPoint(x: moving.x * picture.width + translation.width,
+                          y: moving.y * picture.height + translation.height)
+        return normalizedRect(from: start, to: end, size: picture)
     }
 
     private func outline(_ region: CGRect, color: Color) -> some View {
@@ -301,7 +474,8 @@ struct ParticipantMonitorOverlay: View {
 
     private func speakingParticipantIDs(_ project: ParticipantProject) -> Set<String> {
         let words = ParticipantTranscriptPlayback.bindings(session: session, time: time, indexes: indexes)
-        return Set(project.people.filter { $0.speakers.contains(where: words.contains) }.map(\.id))
+        let explicit = project.people.filter { $0.speakers.contains(where: words.contains) }.map(\.id)
+        return Set(explicit + words.compactMap { matchedVoices[$0] })
     }
 
     static func pictureRect(in size: CGSize, aspect: CGFloat) -> CGRect {

@@ -69,8 +69,41 @@ struct MCPFileRequest {
         "cli_version_read": ("version", ["--version"]),
     ]
 
+    private static let tilesRoutes: [String: [String]] = [
+        "tiles_file_scan": ["tiles", "scan"],
+        "tiles_file_inspect": ["tiles", "inspect"],
+        "tiles_file_preview": ["tiles", "preview"],
+        "tiles_file_accept": ["tiles", "accept"],
+        "tiles_file_link": ["tiles", "link"],
+        "tiles_file_feeds_list": ["tiles", "feeds", "list"],
+        "tiles_file_feeds_inspect": ["tiles", "feeds", "inspect"],
+        "tiles_file_feeds_add": ["tiles", "feeds", "add"],
+        "tiles_file_feeds_rename": ["tiles", "feeds", "rename"],
+        "tiles_file_feeds_mic": ["tiles", "feeds", "mic"],
+        "tiles_file_feeds_voice": ["tiles", "feeds", "voice"],
+        "tiles_file_feeds_prefer": ["tiles", "feeds", "prefer"],
+        "tiles_file_feeds_merge": ["tiles", "feeds", "merge"],
+        "tiles_file_feeds_split": ["tiles", "feeds", "split"],
+        "tiles_file_feeds_treatment": ["tiles", "feeds", "treatment"],
+        "tiles_file_feeds_confirm": ["tiles", "feeds", "confirm"],
+        "tiles_file_angles_plan": ["tiles", "angles", "plan"],
+        "tiles_file_angles_render": ["tiles", "angles", "render"],
+        "tiles_file_angles_verify": ["tiles", "angles", "verify"],
+        "tiles_file_angles_use": ["tiles", "angles", "use"],
+        "tiles_file_export_isos": ["tiles", "export-isos"],
+        "tiles_file_switches_propose": ["tiles", "switches", "propose"],
+        "tiles_file_reconcile": ["tiles", "reconcile"],
+        "tiles_file_grid_correct": ["tiles", "grid", "correct"],
+        "tiles_file_layout_set": ["tiles", "layout", "set"],
+        "tiles_file_layout_list": ["tiles", "layout", "list"],
+        "tiles_file_box_add": ["tiles", "box", "add"],
+        "tiles_file_box_set": ["tiles", "box", "set"],
+        "tiles_file_tile_split": ["tiles", "tile", "split"],
+        "tiles_file_tile_screen_share": ["tiles", "tile", "screen-share"],
+    ]
+
     static func supports(_ tool: String) -> Bool {
-        routes[tool] != nil || transcriptCommand(for: tool) != nil
+        routes[tool] != nil || transcriptCommand(for: tool) != nil || tilesRoutes[tool] != nil
     }
 
     static func isFileTool(_ tool: String) -> Bool {
@@ -84,13 +117,26 @@ struct MCPFileRequest {
 
     init(tool: String, validatedFields fields: [String: Any]) throws {
         let transcript = Self.transcriptCommand(for: tool)
-        guard let route = Self.routes[tool] ?? transcript.map({ ("transcript", $0) }) else {
+        let tiles = Self.tilesRoutes[tool]
+        guard let route = Self.routes[tool] ?? transcript.map({ ("transcript", $0) }) ?? tiles.map({ ("tiles", $0) }) else {
             throw MCPCommandError("unknown_tool", "Unknown file tool.")
         }
         let command = route.family
         let a = Fields(values: fields)
         directory = try a.path("working_directory").map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? FileManager.default.homeDirectoryForCurrentUser
+        if let command = tiles {
+            for key in ["file", "project_path", "analysis_file", "resume_file", "out_project", "output", "plan"] {
+                _ = try a.path(key)
+            }
+            var request = fields.filter { !["operation_id", "working_directory"].contains($0.key) }
+            if ["tiles_file_scan", "tiles_file_angles_render", "tiles_file_export_isos"].contains(tool) {
+                request["progress"] = "jsonl"
+            }
+            arguments = command + ["--stdin", "--json"]
+            input = try a.jsonObject(request)
+            return
+        }
         if let command = transcript {
             guard var request = fields["request"] as? [String: Any] else {
                 throw a.invalid("Supply a JSON request object.")

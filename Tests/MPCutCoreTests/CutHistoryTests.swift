@@ -82,7 +82,7 @@ final class CutHistoryTests: XCTestCase {
         XCTAssertEqual(document.undo, undo)
         XCTAssertEqual(document.redo, redo)
         XCTAssertEqual(try CutProject.load(from: url), .sequence(current))
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectFile.documentJSON(Data(contentsOf: url))) as? [String: Any])
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectFile.documentJSON(at: url)) as? [String: Any])
         let history = try XCTUnwrap(object["history"])
         XCTAssertLessThan(try JSONSerialization.data(withJSONObject: history).count, 400)
         let limited = try CutProject.loadHistory(from: url, limit: 2)
@@ -100,6 +100,105 @@ final class CutHistoryTests: XCTestCase {
         XCTAssertEqual(loaded.undo.first?.origin, .unknown)
         try loaded.project.save(to: url, undo: loaded.undo, redo: loaded.redo)
         XCTAssertEqual(try CutProject.loadHistory(from: url, limit: 5).undo.first?.origin, .unknown)
+    }
+
+    func testTilesOnlyInRetainedHistorySelectTheTilesSchemaAndRoundTrip() throws {
+        let url = file()
+        var changed = clip(1)
+        changed.tileLayouts = [.init(range: .init(from: .zero, to: .init(numerator: 2)), layout: .original)]
+        let original = CutProject.sequence([clip(1)])
+        let edited = CutProject.sequence([changed])
+        let redo = [CutHistoryState(action: "Set Clip Layout", project: edited)]
+        try original.save(to: url, undo: [], redo: redo)
+
+        let loaded = try CutProject.loadDocument(from: url, limit: 1)
+        XCTAssertEqual(loaded.project, original)
+        XCTAssertEqual(loaded.redo, redo)
+        let json = try ProjectFile.documentJSON(at: url)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: json) as? [String: Any])
+        XCTAssertEqual(object["schema_version"] as? Int, CutProject.tilesSchemaVersion)
+        object["schema_version"] = CutProject.schemaVersion
+        try JSONSerialization.data(withJSONObject: object).write(to: url)
+        XCTAssertThrowsError(try CutProject.loadDocument(from: url, limit: 1)) {
+            XCTAssertEqual(($0 as? CutError)?.code, "invalid_cut_history")
+        }
+    }
+
+    func testMulticamTileEditsRoundTripThroughUndoAndRedoAcrossReopen() throws {
+        let url = file()
+        let range = MulticamRange(from: .zero, to: .init(numerator: 4))
+        let initial = MulticamProject(
+            referenceAngle: "camera", range: range, angles: [.init(id: "camera", file: "camera.mov")],
+            audio: .none, switches: [.init(at: .zero, angle: "camera")],
+            assemblyItems: [.group(range), .group(range)],
+            participants: .init(people: [.init(id: "feed", name: "Feed")])
+        )
+        var changed = initial
+        changed.angles.append(.init(id: "feed-angle", file: "camera.mov", name: "Feed",
+                                    feedAngle: .init(sourceID: "camera", feedID: "feed")))
+        changed.speakerAngles = [.init(voice: .init(attachmentID: "track", speakerID: "speaker"), angleID: "feed-angle")]
+        changed.participants.people[0].treatment = .init(mode: .blur)
+        changed.groupTileLayouts = [.init(range: range, layout: .original)]
+        changed.assemblyItems = [.group(range, id: "first"), .group(range, id: "again", layouts: changed.groupTileLayouts)]
+
+        let clean = CutProject.multicam(initial)
+        let edited = CutProject.multicam(changed)
+        let action = "Edit Tiles"
+        let undo = [CutHistoryState(action: action, project: clean)]
+        try edited.save(to: url, undo: undo, redo: [])
+        let reopened = try CutProject.loadDocument(from: url, limit: 1)
+        XCTAssertEqual(reopened.project, edited)
+        XCTAssertEqual(reopened.undo, undo)
+        let undone = try XCTUnwrap(reopened.undo.last?.project)
+        let redo = [CutHistoryState(action: action, project: reopened.project)]
+        try undone.save(to: url, undo: [], redo: redo)
+        let reopenedUndone = try CutProject.loadDocument(from: url, limit: 1)
+        XCTAssertEqual(reopenedUndone.project, clean)
+        XCTAssertEqual(reopenedUndone.redo, redo)
+        XCTAssertEqual(try MulticamProject.load(from: url), initial)
+        let redone = try XCTUnwrap(reopenedUndone.redo.last?.project)
+        try redone.save(to: url, undo: undo, redo: [])
+        XCTAssertEqual(try CutProject.loadDocument(from: url, limit: 1).project, edited)
+    }
+
+    func testConversionHistoryRoundTripsAcrossBothTimelineKinds() throws {
+        let url = file()
+        let range = MulticamRange(from: .zero, to: .init(numerator: 3))
+        var box = ParticipantAppearance(id: "tile", participantID: "feed", range: range,
+                                        bounds: .init(x: 0.17, y: 0.13, width: 0.62, height: 0.81))
+        box.detectedBounds = .init(x: 0.15, y: 0.15, width: 0.62, height: 0.81)
+        let model = ParticipantProject(people: [.init(id: "feed", name: "Feed")],
+            sources: [.init(sourceID: clip(1).file, appearances: [box])])
+        var first = CutProject.sequence([clip(1), clip(2)])
+        first.participants = model
+        var shortened = CutProject.sequence([clip(1)])
+        shortened.participants = model
+        let plain = try JSONEncoder().encode(shortened)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: plain) as? [String: Any])
+        XCTAssertEqual(json["schema_version"] as? Int, CutProject.tilesSchemaVersion)
+        json["schema_version"] = CutProject.schemaVersion
+        XCTAssertThrowsError(try CutProject.decode(JSONSerialization.data(withJSONObject: json)))
+        var convertedModel = model
+        convertedModel.sources[0].sourceID = "camera"
+        let group = MulticamProject(referenceAngle: "camera", range: range,
+                                    angles: [.init(id: "camera", file: clip(1).file)], audio: .none,
+                                    switches: [.init(at: .zero, angle: "camera")], participants: convertedModel)
+        let converted = CutProject.multicam(group)
+        let trim = CutHistoryState(action: "Trim Sequence", project: first)
+        let undo = [trim, CutHistoryState(action: "Use Feeds as Multicam Angles", project: shortened)]
+        try converted.save(to: url, undo: undo, redo: [])
+        let reopened = try CutProject.loadDocument(from: url, limit: 2)
+        XCTAssertEqual(reopened.project, converted)
+        XCTAssertEqual(reopened.undo, undo)
+        let protected = try CutProjectMedia.load(from: url).absoluteSources(relativeTo: url)
+        XCTAssertEqual(protected[CutProject.mediaURL(clip(2).file, relativeTo: url).path], clip(2).id)
+
+        let redo = [CutHistoryState(action: "Use Feeds as Multicam Angles", project: converted)]
+        try shortened.save(to: url, undo: [trim], redo: redo)
+        let undone = try CutProject.loadDocument(from: url, limit: 2)
+        XCTAssertEqual(undone.project, shortened)
+        XCTAssertEqual(undone.undo, [trim])
+        XCTAssertEqual(undone.redo, redo)
     }
 
     func testMulticamSettingsAndRepeatedAssembly() throws {
@@ -154,7 +253,7 @@ final class CutHistoryTests: XCTestCase {
         XCTAssertEqual(CutProject.historyCounts(undo: 10, redo: 12, limit: 3).undo, 2)
         XCTAssertEqual(CutProject.historyCounts(undo: 0, redo: 12, limit: 3).redo, 3)
         try edit.save(to: url, undo: [], redo: [])
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectFile.documentJSON(Data(contentsOf: url))) as? [String: Any])
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectFile.documentJSON(at: url)) as? [String: Any])
         XCTAssertNil(object["history"])
     }
 
@@ -258,7 +357,7 @@ final class CutHistoryTests: XCTestCase {
         let present = CutProject.sequence([clip(0)])
         try present.save(to: url)
         let original = try Data(contentsOf: url)
-        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectFile.documentJSON(original)) as? [String: Any])
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectFile.documentJSON(at: url)) as? [String: Any])
         let id = clip(0).id
         for bad: [String: Any] in [
             ["action": "Undo", "clips": [[0, 1], [0, 1]]],

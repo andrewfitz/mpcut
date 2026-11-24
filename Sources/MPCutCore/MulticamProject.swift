@@ -36,10 +36,11 @@ public struct MulticamSource: Codable, Hashable, Sendable, Identifiable {
     public var audioStream: Int?
     public var coverage: MulticamRange?
     public var additionalRecordings: [MulticamSource]
+    public var feedAngle: TileFeedAngle?
 
     public init(id: String, file: String, offset: RationalTime = .zero,
                 name: String? = nil, audioStream: Int? = nil, coverage: MulticamRange? = nil,
-                additionalRecordings: [MulticamSource] = []) {
+                additionalRecordings: [MulticamSource] = [], feedAngle: TileFeedAngle? = nil) {
         self.id = id
         self.file = file
         self.offset = offset
@@ -47,11 +48,13 @@ public struct MulticamSource: Codable, Hashable, Sendable, Identifiable {
         self.audioStream = audioStream
         self.coverage = coverage
         self.additionalRecordings = additionalRecordings
+        self.feedAngle = feedAngle
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, file, offset, name, coverage = "group_coverage", additionalRecordings = "additional_recordings"
         case audioStream = "audio_stream_index"
+        case feedAngle = "feed_angle"
     }
 
     /// Physical files are independent sources for indexing, audio selection and export.
@@ -97,23 +100,30 @@ public struct MulticamSource: Codable, Hashable, Sendable, Identifiable {
         if (!allowAdditional || !recordings.isEmpty) && coverage == nil {
             throw CutError(code: "invalid_multicam_project", message: "Each recording on a multi-file camera needs group coverage.")
         }
+        let reference = try values.decodeIfPresent(TileFeedAngle.self, forKey: .feedAngle)
+        let file = try reference == nil ? values.decode(String.self, forKey: .file)
+            : values.decodeIfPresent(String.self, forKey: .file) ?? ""
         self.init(id: try values.decode(String.self, forKey: .id),
-                  file: try values.decode(String.self, forKey: .file),
+                  file: file,
                   offset: try ProjectField.time(values, .offset, default: "0"),
                   name: try values.decodeIfPresent(String.self, forKey: .name),
                   audioStream: try values.decodeIfPresent(Int.self, forKey: .audioStream),
-                  coverage: coverage, additionalRecordings: recordings.map(\.value))
+                  coverage: coverage, additionalRecordings: recordings.map(\.value), feedAngle: reference)
     }
 
     public func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(id, forKey: .id)
-        try values.encode(file, forKey: .file)
-        try values.encode(offset.description, forKey: .offset)
         try values.encodeIfPresent(name, forKey: .name)
-        try values.encodeIfPresent(audioStream, forKey: .audioStream)
-        try values.encodeIfPresent(coverage, forKey: .coverage)
-        if !additionalRecordings.isEmpty { try values.encode(additionalRecordings, forKey: .additionalRecordings) }
+        if let feedAngle {
+            try values.encode(feedAngle, forKey: .feedAngle)
+        } else {
+            try values.encode(file, forKey: .file)
+            try values.encode(offset.description, forKey: .offset)
+            try values.encodeIfPresent(audioStream, forKey: .audioStream)
+            try values.encodeIfPresent(coverage, forKey: .coverage)
+            if !additionalRecordings.isEmpty { try values.encode(additionalRecordings, forKey: .additionalRecordings) }
+        }
     }
 }
 
@@ -223,11 +233,13 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     public var audioReplacements: [MulticamAudioReplacement]
     public var switches: [MulticamSwitch]
     public var assemblyItems: [StillAssemblyItem]?
+    public var groupTileLayouts: [TileLayoutSpan]
     public var stillAssets: [StillAsset]
     public var stillReplacements: [StillReplacement]
     public var programColorPolicy: StillProgramColorPolicy?
     public var transcripts: ProjectTranscripts
     public var participants: ParticipantProject
+    public var speakerAngles: [TileSpeakerAngle]
 
     /// Group ranges for clients that only work in group coordinates.
     public var assembly: [MulticamRange]? {
@@ -263,7 +275,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     /// Place the visible picture start of a new recording at an exact group time.
     package mutating func addRecording(id: String, media: MediaInfo, to angle: String, at start: RationalTime,
                                        primaryMedia: MediaInfo?) throws {
-        guard let index = angles.firstIndex(where: { $0.id == angle }) else {
+        guard let index = angles.firstIndex(where: { $0.id == angle && $0.feedAngle == nil }) else {
             throw Self.invalid("Unknown angle ‘\(angle)’")
         }
         func bounds(_ media: MediaInfo) throws -> MulticamRange {
@@ -287,6 +299,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
         var updated = self
         updated.angles[index] = camera
         updated.range.to = max(range.to, end)
+        updated.syncFeedAngleRecordings()
         try updated.validate()
         self = updated
     }
@@ -298,7 +311,8 @@ public struct MulticamProject: Codable, Equatable, Sendable {
                 stillReplacements: [StillReplacement] = [], programColorPolicy: StillProgramColorPolicy? = nil,
                 transcripts: ProjectTranscripts = .init(), fixedAudio: MulticamAudioSelection? = nil,
                 mixLanes: [MulticamAudioLane] = [], audioReplacements: [MulticamAudioReplacement] = [],
-                participants: ParticipantProject = .init()) {
+                participants: ParticipantProject = .init(), speakerAngles: [TileSpeakerAngle] = [],
+                groupTileLayouts: [TileLayoutSpan] = []) {
         self.referenceAngle = referenceAngle
         self.range = range
         self.angles = angles
@@ -310,11 +324,13 @@ public struct MulticamProject: Codable, Equatable, Sendable {
         self.audioReplacements = audioReplacements
         self.switches = switches
         self.assemblyItems = assemblyItems ?? assembly?.map { .group($0) }
+        self.groupTileLayouts = groupTileLayouts
         self.stillAssets = stillAssets
         self.stillReplacements = stillReplacements
         self.programColorPolicy = programColorPolicy
         self.transcripts = transcripts
         self.participants = participants
+        self.speakerAngles = speakerAngles
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -326,6 +342,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
         case angles
         case audioSources = "audio_sources"
         case audio, switches, assembly, history
+        case groupTileLayouts = "group_tile_layouts"
         case mediaSnapshot = "media_snapshot"
         case fixedAudio = "fixed_audio"
         case mixLanes = "mix_lanes"
@@ -334,6 +351,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
         case stillReplacements = "still_replacements"
         case programColorPolicy = "program_color_policy"
         case transcripts, participants
+        case speakerAngles = "speaker_angles"
     }
 
     public init(from decoder: Decoder) throws {
@@ -342,8 +360,8 @@ public struct MulticamProject: Codable, Equatable, Sendable {
             throw Self.invalid("Expected an MPCut project document")
         }
         guard let version = try values.decodeIfPresent(Int.self, forKey: .schemaVersion),
-              [3, Self.schemaVersion].contains(version) else {
-            throw CutError(code: "unsupported_multicam_version", message: "Expected MPCut project schema_version 3 or \(Self.schemaVersion)")
+              [3, Self.schemaVersion, CutProject.tilesSchemaVersion].contains(version) else {
+            throw CutError(code: "unsupported_multicam_version", message: "Unsupported MPCut multicam project schema version")
         }
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
         let mixFields: [CodingKeys] = [.fixedAudio, .mixLanes, .audioReplacements]
@@ -373,6 +391,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
                   fixedAudio: try values.decodeIfPresent(MulticamAudioSelection.self, forKey: .fixedAudio),
                   mixLanes: try values.decodeIfPresent([MulticamAudioLane].self, forKey: .mixLanes) ?? [],
                   audioReplacements: try values.decodeIfPresent([MulticamAudioReplacement].self, forKey: .audioReplacements) ?? [])
+        groupTileLayouts = try values.decodeIfPresent([TileLayoutSpan].self, forKey: .groupTileLayouts) ?? []
         if values.contains(.transcripts) {
             transcripts = try values.decode(ProjectTranscripts.self, forKey: .transcripts)
         }
@@ -380,17 +399,28 @@ public struct MulticamProject: Codable, Equatable, Sendable {
             guard version >= 4 else { throw invalidParticipantProject("Participant metadata requires project schema version 4.") }
             participants = try values.decode(ParticipantProject.self, forKey: .participants)
         }
+        speakerAngles = try values.decodeIfPresent([TileSpeakerAngle].self, forKey: .speakerAngles) ?? []
+        syncFeedAngleRecordings()
+        guard version == CutProject.tilesSchemaVersion || !CutProject.multicam(self).usesTilesFormat else {
+            throw Self.invalid("Tiles fields require project schema version \(CutProject.tilesSchemaVersion).")
+        }
         try validate()
     }
 
     public func encode(to encoder: Encoder) throws {
+        try encode(to: encoder, requiresTilesSchema: false)
+    }
+
+    func encode(to encoder: Encoder, requiresTilesSchema: Bool) throws {
         try validate()
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(CutProject.format, forKey: .format)
-        try values.encode(Self.schemaVersion, forKey: .schemaVersion)
+        try values.encode(requiresTilesSchema || CutProject.multicam(self).usesTilesFormat ? CutProject.tilesSchemaVersion : Self.schemaVersion,
+                          forKey: .schemaVersion)
         try values.encode("multicam", forKey: .kind)
         if !transcripts.isEmpty { try values.encode(transcripts, forKey: .transcripts) }
         if !participants.isEmpty { try values.encode(participants, forKey: .participants) }
+        if !speakerAngles.isEmpty { try values.encode(speakerAngles, forKey: .speakerAngles) }
         try values.encode(referenceAngle, forKey: .referenceAngle)
         try values.encode(range, forKey: .range)
         try values.encode(angles, forKey: .angles)
@@ -401,6 +431,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
         if !audioReplacements.isEmpty { try values.encode(audioReplacements, forKey: .audioReplacements) }
         try values.encode(switches, forKey: .switches)
         try values.encodeIfPresent(assemblyItems, forKey: .assembly)
+        if !groupTileLayouts.isEmpty { try values.encode(groupTileLayouts, forKey: .groupTileLayouts) }
         if !stillAssets.isEmpty { try values.encode(stillAssets, forKey: .stillAssets) }
         if !stillReplacements.isEmpty { try values.encode(stillReplacements, forKey: .stillReplacements) }
         try values.encodeIfPresent(programColorPolicy, forKey: .programColorPolicy)
@@ -446,6 +477,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     }
 
     public func validate() throws {
+        try validateTileLayouts()
         try transcripts.validate()
         try participants.validate()
         guard range.from == .zero, range.to > range.from else {
@@ -483,11 +515,29 @@ public struct MulticamProject: Codable, Equatable, Sendable {
             }
         }
         let angleIDs = Set(angles.map(\.id))
+        let physical = Dictionary(uniqueKeysWithValues: pictureSources.filter { $0.feedAngle == nil }.map { ($0.id, $0) })
+        let feeds = Set(participants.people.map(\.id))
+        var references = Set<TileFeedAngle>()
+        for source in sources {
+            guard let reference = source.feedAngle else { continue }
+            guard angleIDs.contains(source.id), let parent = physical[reference.sourceID], feeds.contains(reference.feedID),
+                  references.insert(reference).inserted,
+                  source.additionalRecordings.isEmpty, source.file == parent.file, source.offset == parent.offset,
+                  source.coverage == parent.coverage, source.audioStream == nil else {
+                throw Self.invalid("Feed angle ‘\(source.id)’ needs a physical parent and an existing feed.")
+            }
+        }
+        guard Set(speakerAngles.map(\.voice)).count == speakerAngles.count,
+              speakerAngles.allSatisfy({ angleIDs.contains($0.angleID)
+                  && validStillID($0.voice.attachmentID) && validStillID($0.voice.speakerID) }) else {
+            throw Self.invalid("A transcript voice may link to only one existing angle.")
+        }
         guard angleIDs.contains(referenceAngle) else {
             throw Self.invalid("Unknown reference angle ‘\(referenceAngle)’")
         }
+        let physicalAudioIDs = Set(sources.lazy.filter { $0.feedAngle == nil }.map(\.id))
         func validateAudio(_ selection: MulticamAudioSelection) throws {
-            guard sourceIDs.contains(selection.source), Self.streamIndices.contains(selection.stream) else {
+            guard physicalAudioIDs.contains(selection.source), Self.streamIndices.contains(selection.stream) else {
                 throw Self.invalid("Invalid audio selection ‘\(selection.source)’ stream \(selection.stream)")
             }
         }
@@ -631,6 +681,8 @@ public struct MulticamProject: Codable, Equatable, Sendable {
         if let ranges { try validateRanges(ranges) }
         let items = ranges.map { $0.map { .group($0) } } ?? assemblyItems ?? [.group(range)]
         let sourcesByID = Dictionary(uniqueKeysWithValues: sources.map { ($0.id, $0) })
+        let feedMicrophones = audio == .follow && angles.contains { $0.feedAngle != nil }
+            ? TileFeedAttachments.followAudioRoutes(in: self) : [:]
         let recordingsByAngle = Dictionary(uniqueKeysWithValues: angles.map { angle in
             (angle.id, angle.recordings.sorted { ($0.coverage?.from ?? .zero) < ($1.coverage?.from ?? .zero) })
         })
@@ -674,7 +726,18 @@ public struct MulticamProject: Codable, Equatable, Sendable {
                 if audio == .mix { selectedAudio = nil }
                 else if let override = marker.audio { selectedAudio = override }
                 else if case .fixed(let master) = audio { selectedAudio = master }
-                else { selectedAudio = followSource.flatMap { source in source.audioStream.map { .init(source: source.id, stream: $0) } } }
+                else {
+                    let recording = followSource.flatMap { source in
+                        source.feedAngle.flatMap { sourcesByID[$0.sourceID] } ?? source
+                    }
+                    let microphone = try followSource?.feedAngle.flatMap { try feedMicrophones[$0]?.get() }
+                    selectedAudio = microphone.flatMap { selection in
+                        sourcesByID[selection.source].map { $0.feedAngle == nil } == true ? selection : nil
+                    }
+                        ?? recording.flatMap { source in
+                            source.audioStream.map { .init(source: source.id, stream: $0) }
+                        }
+                }
                 let outputEnd = try outputStart.adding(end.subtracting(start))
                 let group = MulticamRange(from: start, to: end)
                 let output = MulticamRange(from: outputStart, to: outputEnd)
@@ -874,15 +937,10 @@ package enum JSONInputLocation: Hashable, Sendable {
 }
 
 private struct JSONInputContainer {
-    var keys: Set<String>?
-    var expectsKey: Bool
+    var keys: Set<String> = []
+    var isObject = false
+    var expectsKey = false
     var location: JSONInputLocation?
-
-    init(object: Bool) {
-        keys = object ? [] : nil
-        expectsKey = object
-        location = object ? nil : .index(0)
-    }
 }
 
 /// Check syntax that JSONDecoder accepts silently. Call after decoding syntactically valid UTF-8.
@@ -892,45 +950,64 @@ package func jsonInputIssue(_ data: Data, integerNumbersOnly: Bool = false,
                             inspectDecimal: (([JSONInputLocation], ArraySlice<UInt8>) -> Void)? = nil) -> String? {
     data.withUnsafeBytes { raw in
         let bytes = raw.bindMemory(to: UInt8.self)
+        let tracksLocation = allowsFraction != nil || inspectDecimal != nil
         var containers = [JSONInputContainer]()
+        var depth = 0
         var index = 0
-        var previous: UInt8?
+        var afterComma = false
         while index < bytes.count {
             let byte = bytes[index]
             switch byte {
-            case UInt8(ascii: "-"), UInt8(ascii: "0")...UInt8(ascii: "9"):
-                if integerNumbersOnly || inspectDecimal != nil {
-                    let start = index
-                    while index + 1 < bytes.count,
-                          ![9, 10, 13, 32, 44, 93, 125].contains(bytes[index + 1]) { index += 1 }
-                    let spelling = bytes[start...index]
-                    if spelling.contains(UInt8(ascii: ".")) || spelling.contains(UInt8(ascii: "e")) || spelling.contains(UInt8(ascii: "E")) {
-                        let token = Array(spelling)[...]
-                        let locations = containers.compactMap(\.location)
-                        if integerNumbersOnly, allowsFraction?(locations) != true, integralJSONParts(token) == nil {
+            case 45, 48...57: // Minus sign or digit
+                let start = index
+                var decimal = false
+                number: while index + 1 < bytes.count {
+                    switch bytes[index + 1] {
+                    case 43, 45, 48...57: break
+                    case 46, 69, 101: decimal = true // Decimal point or exponent
+                    default: break number
+                    }
+                    index += 1
+                }
+                if decimal && (integerNumbersOnly || inspectDecimal != nil) {
+                    let locations = tracksLocation ? containers.prefix(depth).compactMap(\.location) : []
+                    let rejectFraction = integerNumbersOnly && allowsFraction?(locations) != true
+                    if inspectDecimal != nil || rejectFraction {
+                        let token = Array(bytes[start...index])[...]
+                        if rejectFraction, integralJSONParts(token) == nil {
                             return "contains a non-integer JSON number"
                         }
                         inspectDecimal?(locations, token)
                     }
                 }
-            case UInt8(ascii: "{"): containers.append(JSONInputContainer(object: true))
-            case UInt8(ascii: "["): containers.append(JSONInputContainer(object: false))
-            case UInt8(ascii: "}"), UInt8(ascii: "]"):
-                if previous == UInt8(ascii: ",") {
-                    return "contains a trailing comma"
+            case 91, 123: // [ {
+                if depth == containers.count { containers.append(JSONInputContainer()) }
+                let object = byte == 123
+                containers[depth].isObject = object
+                containers[depth].expectsKey = object
+                containers[depth].location = tracksLocation && !object ? .index(0) : nil
+                depth += 1
+            case 93, 125: // ] }
+                if afterComma { return "contains a trailing comma" }
+                if depth > 0 {
+                    depth -= 1
+                    // Detector rows and project spans repeat the same fields at each depth.
+                    if containers[depth].isObject {
+                        containers[depth].keys.removeAll(keepingCapacity: true)
+                    }
                 }
-                _ = containers.popLast()
-            case UInt8(ascii: ","):
-                if let last = containers.indices.last {
-                    if containers[last].keys != nil { containers[last].expectsKey = true }
+            case 44: // ,
+                if depth > 0 {
+                    let last = depth - 1
+                    if containers[last].isObject { containers[last].expectsKey = true }
                     else if case let .index(item) = containers[last].location { containers[last].location = .index(item + 1) }
                 }
-            case UInt8(ascii: "\""):
+            case 34: // Quoted string
                 let start = index
                 index += 1
                 var escaped = false
-                while index < bytes.count, bytes[index] != UInt8(ascii: "\"") {
-                    if bytes[index] == UInt8(ascii: "\\") {
+                while index < bytes.count, bytes[index] != 34 {
+                    if bytes[index] == 92 {
                         escaped = true
                         index += 2
                     } else {
@@ -938,22 +1015,26 @@ package func jsonInputIssue(_ data: Data, integerNumbersOnly: Bool = false,
                     }
                 }
                 guard index < bytes.count else { return nil }
-                if let last = containers.indices.last, containers[last].expectsKey {
+                if depth > 0, containers[depth - 1].expectsKey {
+                    let last = depth - 1
                     let key: String
                     if escaped {
                         key = (try? JSONDecoder().decode(String.self, from: Data(bytes[start...index]))) ?? ""
                     } else {
                         key = String(decoding: bytes[(start + 1)..<index], as: UTF8.self)
                     }
-                    if containers[last].keys?.insert(key).inserted == false {
+                    if !containers[last].keys.insert(key).inserted {
                         return "repeats the field '\(key)'"
                     }
                     containers[last].expectsKey = false
-                    containers[last].location = .key(key)
+                    if tracksLocation { containers[last].location = .key(key) }
                 }
+            case 9, 10, 13, 32: // JSON whitespace
+                index += 1
+                continue
             default: break
             }
-            if byte != 0x20 && byte != 0x09 && byte != 0x0A && byte != 0x0D { previous = byte }
+            afterComma = byte == 44
             index += 1
         }
         return nil

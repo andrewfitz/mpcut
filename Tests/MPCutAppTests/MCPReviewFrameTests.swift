@@ -77,6 +77,97 @@ final class MCPReviewFrameTests: XCTestCase {
         XCTAssertEqual(result["occurrence"] as? String, "1")
     }
 
+    func testTileReviewSeparatesOutputAndExplicitSourceAndReportsFrameDuration() async throws {
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let registry = ProjectSessions(preferences: preferences)
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        defer { session.end() }
+        session.isMulticam = true
+        let model = session.multicam
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov", subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(fixture)
+        model.confirmSetup(drafts: [.init(source: .init(id: "wide", file: fixture.path), media: media)],
+                           opening: "wide", audio: .none)
+        let end = RationalTime(numerator: 7, denominator: 60)
+        XCTAssertTrue(model.edit("Set Output Canvas") { project in
+            project.assembly = [.init(from: .zero, to: end)]
+            project.participants.tileOutput = .init(canvas: .init(width: 192, height: 108), audio: .init(mode: .silence))
+        })
+
+        let output = try await registry.mcpReviewFrame(arguments: ["space": "assembly", "time": end.description],
+                                                       session: session, checkAccess: {})
+        XCTAssertEqual(output["view"] as? String, "output")
+        XCTAssertEqual(output["duration"] as? String, "1/60")
+        XCTAssertEqual(output["frame_time"] as? String, "1/10")
+        XCTAssertEqual(output["width"] as? Int, 192)
+        XCTAssertNil(output["source_id"])
+
+        let explicit = try await registry.mcpReviewFrame(arguments: ["space": "group", "time": "0", "view": "source"],
+                                                         session: session, checkAccess: {})
+        XCTAssertEqual(explicit["view"] as? String, "source")
+        XCTAssertEqual(explicit["source_id"] as? String, "wide")
+        XCTAssertNotEqual(explicit["width"] as? Int, output["width"] as? Int)
+        let named = try await registry.mcpReviewFrame(arguments: ["space": "group", "time": "0", "angle_id": "wide"],
+                                                      session: session, checkAccess: {})
+        XCTAssertEqual(named["view"] as? String, "source")
+        XCTAssertEqual(named["jpeg"] as? String, explicit["jpeg"] as? String)
+        do {
+            _ = try await registry.mcpReviewFrame(arguments: ["view": "output", "angle_id": "wide"],
+                                                  session: session, checkAccess: {})
+            XCTFail("Output with a named camera must not return untreated pixels.")
+        } catch let issue as MCPCommandError {
+            XCTAssertEqual(issue.code, "invalid_arguments")
+        }
+
+        let interval = MulticamRange(from: .zero, to: end)
+        XCTAssertTrue(model.edit("Set Occurrence Layout") { project in
+            project.participants.tileOutput = nil
+            project.assemblyItems = [.group(interval, id: "only-occurrence", layouts: [
+                .init(range: interval, layout: .original),
+            ])]
+        })
+        let group = try await registry.mcpReviewFrame(arguments: ["space": "group", "time": "0", "view": "output"],
+                                                      session: session, checkAccess: {})
+        XCTAssertEqual(group["view"] as? String, "output")
+        XCTAssertEqual(group["width"] as? Int, explicit["width"] as? Int)
+    }
+
+    func testProcessedFrameExportUsesActiveClockForPlayheadSamples() throws {
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let registry = ProjectSessions(preferences: preferences)
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        defer { session.end() }
+        session.isMulticam = true
+        let model = session.multicam
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov", subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspectMulticamSource(fixture)
+        model.confirmSetup(drafts: [.init(source: .init(id: "wide", file: fixture.path), media: media)],
+                           opening: "wide", audio: .none)
+        XCTAssertTrue(model.edit("Set Output Canvas") { project in
+            project.assembly = [.init(from: .zero, to: .init(numerator: 7, denominator: 60))]
+            project.participants.tileOutput = .init(canvas: .init(width: 192, height: 108), audio: .init(mode: .silence))
+        })
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        func request(_ mode: String, space: String, times: [RationalTime] = []) throws -> MCPLiveOutputJobs.Work? {
+            try registry.mcpProgramFrameExport(session: session, output: output, args: ["space": space],
+                                               mode: mode, times: times, preset: .review)
+        }
+        for (active, inactive) in [("group", "assembly"), ("assembly", "group")] {
+            model.setAssemblyPreview(active == "assembly")
+            XCTAssertEqual(model.assemblyPreview, active == "assembly")
+            for mode in ["still", "playhead"] {
+                XCTAssertThrowsError(try request(mode, space: inactive)) { error in
+                    XCTAssertEqual((error as? MCPCommandError)?.code, "invalid_target")
+                }
+                XCTAssertNotNil(try request(mode, space: active))
+            }
+            XCTAssertNotNil(try request("times", space: inactive, times: [.zero]))
+            XCTAssertNotNil(try request("switches", space: "group"))
+        }
+    }
+
     func testReviewFrameIdentifiesRecordingAndLogicalAngle() async throws {
         let preferences = EditorPreferences()
         preferences.useAnalysisSidecars = false

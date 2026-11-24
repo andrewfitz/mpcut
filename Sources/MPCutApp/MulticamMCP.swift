@@ -299,7 +299,7 @@ extension MulticamEditorModel {
             var row: [String: Any] = ["index": index, "assembly_from": start.description,
                                       "assembly_to": ends[index].description]
             switch items[index] {
-            case .group(let range, let angle):
+            case .group(let range, let angle, _, _):
                 row["angle_id"] = angle
                 row["type"] = "group"
                 row["group_from"] = range.from.description

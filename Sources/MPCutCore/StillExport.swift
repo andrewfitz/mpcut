@@ -129,7 +129,7 @@ public struct StillExportPlanner: Sendable {
                         videoCodec: ReencodeCodec? = nil) throws -> StillExportPlan {
         let engine = CutEngine(cancelled: cancelled)
         try engine.checkCancellation()
-        guard project.participants.render == nil else { throw ParticipantProjectExport.unsupported("Still export") }
+        guard !project.requiresPictureProcessing else { throw ParticipantProjectExport.unsupported("Still export") }
         let timeline = try project.resolveStills()
         let visible = timeline.spans.filter { $0.placementID != nil }
         let stillFormat = project.stillFormat

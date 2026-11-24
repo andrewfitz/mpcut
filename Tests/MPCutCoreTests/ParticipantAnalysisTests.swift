@@ -24,6 +24,133 @@ final class ParticipantAnalysisTests: XCTestCase {
         }
     }
 
+    func testGalleryHintRoundTripsSeparatelyFromFixedLayout() throws {
+        let gallery = try XCTUnwrap(ParticipantFeedLayout(galleryGrid: "5x5"))
+        XCTAssertEqual(gallery, .gallery(columns: 5, rows: 5))
+        XCTAssertNotEqual(gallery, ParticipantFeedLayout(feedLayout: "5x5"))
+        XCTAssertNil(ParticipantFeedLayout(galleryGrid: "9x9"))
+        let saved = try JSONEncoder().encode(ParticipantScanConfiguration(.init(feedLayout: gallery)))
+        XCTAssertEqual(try JSONDecoder().decode(ParticipantScanConfiguration.self, from: saved).feedLayout, gallery)
+    }
+
+    func testEvenGridWithoutAnalyzerProvidesCellIdentityAndInferredCoverage() throws {
+        let file = try fixture()
+        let options = ParticipantScanOptions(sampling: .everyFrame, useSidecar: false,
+                                             feedLayout: .fixed(columns: 2, rows: 2))
+        let gpu = ParticipantScanOptions(backend: .gpuRequired, sampling: .everyFrame, useSidecar: false,
+                                         feedLayout: options.feedLayout)
+        XCTAssertThrowsError(try ParticipantAnalysis.fixedGridScan(file, columns: 2, rows: 2, options: gpu,
+            partial: nil, cancelled: { false }, progress: nil)) { error in
+            XCTAssertEqual((error as? CutError)?.code, "participant_gpu_unavailable")
+        }
+        let scan: ParticipantScanResult
+        if ParticipantAnalysis.supportsFeedLayouts {
+            scan = try ParticipantAnalysis.fixedGridScan(file, columns: 2, rows: 2, options: options,
+                                                         partial: nil, cancelled: { false }, progress: nil)
+        } else {
+            scan = try ParticipantAnalysis.scan(file, options: options)
+        }
+        let analysis = try XCTUnwrap(scan.analysis)
+        XCTAssertEqual(analysis.observations.count, 1)
+        XCTAssertEqual(analysis.observations.first?.regions.map(\.participantID), [1, 2, 3, 4])
+        XCTAssertEqual(analysis.coverage.map(\.status), [.inferred])
+        var project = ParticipantProject()
+        try project.acceptAnalysis(scan, sourceID: file.path)
+        XCTAssertEqual(project.people.map(\.name), ["Feed 1", "Feed 2", "Feed 3", "Feed 4"])
+        XCTAssertEqual(project.appearances(sourceID: file.path, at: .zero).count, 4)
+        XCTAssertEqual(project.sources.first?.coverage.map(\.state), [.inferred])
+    }
+
+    func testStandaloneScanChecksProvenanceAndRetainsLayoutEvents() throws {
+        let file = try fixture()
+        let options = ParticipantScanOptions(backend: .cpu, sampling: .everyFrame, useSidecar: false,
+                                             feedLayout: .fixed(columns: 2, rows: 1))
+        let grid = try ParticipantAnalysis.fixedGridScan(file, columns: 2, rows: 1, options: options,
+                                                         partial: nil, cancelled: { false }, progress: nil)
+        let tiles = try XCTUnwrap(grid.analysis)
+        let first = try XCTUnwrap(tiles.observations.first)
+        let returnTime = try tiles.end.multiplied(by: .init(numerator: 1, denominator: 2))
+        let other = first.regions[1]
+        let returning = ParticipantRegion(appearanceID: other.appearanceID, participantID: nil, rect: other.rect,
+            kind: .video, role: .primary, confidence: 1, identityConfidence: nil, identityUncertain: true,
+            possibleMatches: [.init(participantID: first.regions[0].appearanceID, confidence: 0.8)])
+        // The candidate has left: a feed still shown in another tile could not be this one.
+        let later = ParticipantObservation(time: returnTime, display: first.display, confidence: 1,
+                                           regions: [returning])
+        let analysis = ParticipantTrackingResult(schemaVersion: tiles.schemaVersion, start: tiles.start, end: tiles.end,
+            sampling: tiles.sampling, observations: [first, later], tracks: tiles.tracks, appearances: tiles.appearances,
+            events: [.init(time: .zero, participantID: 1, appearanceID: 1, kind: .enter, uncertain: false)],
+            coverage: tiles.coverage, diagnostics: tiles.diagnostics, resumeAt: nil)
+        var source = grid.source
+        source.inode = nil
+        source.producer = "tiletrail"
+        func scan(_ source: ParticipantScanSource) -> ParticipantScanResult {
+            .init(state: .completed, source: source, configuration: grid.configuration, analysis: analysis,
+                  sceneReport: nil, analysisIdentity: "standalone")
+        }
+        let document = file.deletingLastPathComponent().appendingPathComponent("review.cut")
+        var project = CutProject.sequence([.init(id: "clip", file: file.path, from: .zero, to: source.duration)])
+        var missing = source
+        missing.contentSHA256 = nil
+        XCTAssertThrowsError(try project.acceptParticipantAnalysis(scan(missing), sourceID: file.path, relativeTo: document))
+        missing.contentSHA256 = String(repeating: "0", count: 64)
+        XCTAssertThrowsError(try project.acceptParticipantAnalysis(scan(missing), sourceID: file.path, relativeTo: document))
+        let wrongStream = ParticipantScanSource(file: source.file, stamp: source.stamp, inode: nil,
+            producer: "tiletrail", contentSHA256: source.contentSHA256, stream: source.stream + 1,
+            origin: source.origin, timeBase: source.timeBase, duration: source.duration, transform: source.transform)
+        XCTAssertThrowsError(try project.acceptParticipantAnalysis(scan(wrongStream), sourceID: file.path, relativeTo: document))
+        let envelope = try JSONEncoder().encode(scan(source))
+        var standalone = try XCTUnwrap(JSONSerialization.jsonObject(with: envelope) as? [String: Any])
+        standalone["analysis"] = try JSONSerialization.jsonObject(
+            with: ParticipantSourceTime.originalClockJSON(analysis, origin: .zero)
+        )
+        let imported = try JSONDecoder().decode(ParticipantScanResult.self, from: JSONSerialization.data(withJSONObject: standalone))
+        XCTAssertEqual(imported.analysis?.observations.map(\.time), [.zero, returnTime])
+        try project.acceptParticipantAnalysis(imported, sourceID: file.path, relativeTo: document)
+        let geometry = try XCTUnwrap(project.participants.sources.first)
+        XCTAssertEqual(geometry.sourceInode, grid.source.inode)
+        XCTAssertEqual(geometry.scanEvents.first?.tileID, geometry.appearances.first?.id)
+        XCTAssertEqual(geometry.layoutChangeTimes, [.zero])
+        let ambiguity = try XCTUnwrap(geometry.scanEvents.first { $0.identityEvidenceOnly == true })
+        XCTAssertEqual(ambiguity.time, returnTime)
+        XCTAssertEqual(ambiguity.candidates?.first?.precedingTime, .zero)
+        XCTAssertEqual(ambiguity.candidates?.first?.precedingTileID, geometry.scanEvents.first?.tileID)
+        let roundTrip = try JSONDecoder().decode(ParticipantProject.self, from: JSONEncoder().encode(project.participants))
+        XCTAssertEqual(roundTrip.sources.first?.scanEvents, geometry.scanEvents)
+    }
+
+    func testAFeedShownInAnotherTileOfTheSameRoleIsNotACandidate() {
+        let rect = ParticipantObservationRect(x: 0, y: 0, width: 0.5, height: 0.5)
+        func region(_ appearance: UInt64, _ participant: UInt64?, role: ParticipantRegion.Role = .primary,
+                    uncertain: Bool = false, matches: [UInt64] = []) -> ParticipantRegion {
+            .init(appearanceID: appearance, participantID: participant, rect: rect, kind: .video, role: role,
+                  confidence: 1, identityConfidence: nil, identityUncertain: uncertain,
+                  possibleMatches: matches.map { .init(participantID: $0, confidence: 0.6) })
+        }
+        func observation(_ regions: [ParticipantRegion]) -> ParticipantObservation {
+            .init(time: .zero, display: .init(rotation: .r0, pixelAspectNum: 1, pixelAspectDen: 1),
+                  confidence: 1, regions: regions)
+        }
+        // Feed 1 is confidently in the other tile, so only feed 3 remains to weigh.
+        let shown = observation([region(1, 1), region(2, 2, matches: [2, 1, 3])])
+        XCTAssertEqual(shown.competingMatches(for: shown.regions[1]).map(\.participantID), [3])
+        // With feed 1 as the only rival, a confident tile needs no review.
+        let settled = observation([region(1, 1), region(2, 2, matches: [2, 1])])
+        XCTAssertFalse(settled.needsIdentityReview(settled.regions[1]))
+        // An uncertain tile still needs review, even without a rival left.
+        let uncertain = observation([region(1, 1), region(2, 2, uncertain: true, matches: [1])])
+        XCTAssertTrue(uncertain.needsIdentityReview(uncertain.regions[1]))
+        // A stage and a thumbnail can show the same feed, and so can an unsure tile.
+        let thumbnail = observation([region(1, 1, role: .thumbnail), region(2, 2, matches: [1])])
+        XCTAssertEqual(thumbnail.competingMatches(for: thumbnail.regions[1]).map(\.participantID), [1])
+        let unsure = observation([region(1, 1, uncertain: true), region(2, 2, matches: [1])])
+        XCTAssertEqual(unsure.competingMatches(for: unsure.regions[1]).map(\.participantID), [1])
+        // Two tiles that each name the other's feed both stay in question.
+        let mutual = observation([region(1, 1, matches: [1, 2]), region(2, 2, matches: [2, 1])])
+        XCTAssertTrue(mutual.needsIdentityReview(mutual.regions[0]))
+        XCTAssertTrue(mutual.needsIdentityReview(mutual.regions[1]))
+    }
+
     func testFixedFeedsResumeAndAcceptWithFeedNames() throws {
         guard ParticipantAnalysis.supportsFeedLayouts else { throw XCTSkip("TileTrail feed layouts are unavailable.") }
         let file = try fixture()
@@ -49,6 +176,58 @@ final class ParticipantAnalysisTests: XCTestCase {
         var project = ParticipantProject()
         try project.acceptAnalysis(resumed, sourceID: file.path)
         XCTAssertEqual(project.people.map(\.name), tracks.map { "Feed \($0.id)" })
+    }
+
+    func testCheckpointRestoresWithoutResubmittingPrefix() throws {
+        guard ParticipantAnalysis.supportsCheckpoints else { throw XCTSkip("TileTrail checkpoints are unavailable.") }
+        guard let file = try swapFixture(["-c:v", "libx264", "-g", "10", "-keyint_min", "10",
+                                          "-sc_threshold", "0", "-bf", "2"]) else { throw XCTSkip("libx264 is unavailable.") }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        for sampling in [ParticipantSampling.everyFrame, .adaptive, .sparse] {
+            var options = ParticipantScanOptions(backend: .cpu, sampling: sampling, useSidecar: false,
+                                                 feedLayout: .automatic)
+            let continuous = try ParticipantAnalysis.scan(file, options: options)
+            let directory = file.deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
+            options.checkpointDirectory = directory
+            var cancelled = false
+            let paused = try ParticipantAnalysis.scan(file, options: options, cancelled: { cancelled }) { time in
+                if time >= RationalTime(numerator: 3) { cancelled = true }
+            }
+            XCTAssertEqual(paused.state, .paused)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("manifest.json").path))
+            if sampling == .everyFrame {
+                let chunk = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: directory,
+                    includingPropertiesForKeys: nil).first { $0.lastPathComponent != "manifest.json" && $0.pathExtension == "json" })
+                let bytes = try Data(contentsOf: chunk)
+                try (bytes + Data([0x20])).write(to: chunk)
+                XCTAssertThrowsError(try ParticipantAnalysis.scan(file, options: options)) {
+                    XCTAssertEqual(($0 as? CutError)?.code, "participant_resume_mismatch")
+                }
+                try bytes.write(to: chunk)
+                let manifestURL = directory.appendingPathComponent("manifest.json")
+                let manifest = try Data(contentsOf: manifestURL)
+                var unchecked = try XCTUnwrap(JSONSerialization.jsonObject(with: manifest) as? [String: Any])
+                unchecked["digests"] = [:] as [String: String]
+                try JSONSerialization.data(withJSONObject: unchecked).write(to: manifestURL)
+                XCTAssertThrowsError(try ParticipantAnalysis.scan(file, options: options)) {
+                    XCTAssertEqual(($0 as? CutError)?.code, "participant_resume_mismatch")
+                }
+                try manifest.write(to: manifestURL)
+            }
+
+            var firstProgress: RationalTime?
+            let resumed = try ParticipantAnalysis.scan(file, options: options, progress: { time in
+                if firstProgress == nil { firstProgress = time }
+            })
+            let prefix = try XCTUnwrap(paused.analysis?.observations.last?.time)
+            XCTAssertEqual(firstProgress, prefix, "\(sampling)")
+            XCTAssertGreaterThan(prefix, .zero)
+            XCTAssertEqual(resumed.state, .completed)
+            XCTAssertEqual(try encoder.encode(resumed.analysis), try encoder.encode(continuous.analysis), "\(sampling)")
+            ParticipantAnalysis.discardCheckpoint(for: resumed, directory: directory)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("manifest.json").path))
+        }
     }
 
     func testScanStatusShowsIntermediatePercentAndVerifiedCompletion() throws {
@@ -249,6 +428,49 @@ final class ParticipantAnalysisTests: XCTestCase {
         XCTAssertLessThan(try XCTUnwrap(updates.last?.percent), 100)
     }
 
+    func testCompleteMOVEditTailHasNoUnobservedBoxes() throws {
+        guard ParticipantAnalysis.supportsFeedLayouts else { throw XCTSkip("TileTrail feed layouts are unavailable.") }
+        let scan = try ParticipantAnalysis.scan(fixture(fractionalEdit: true),
+            options: .init(backend: .cpu, sampling: .everyFrame, useSidecar: false, feedLayout: .fixed(columns: 1, rows: 1)))
+        let result = try XCTUnwrap(scan.analysis)
+        let end = RationalTime(numerator: 3)
+        XCTAssertEqual(scan.state, .completed)
+        XCTAssertEqual(result.end, RationalTime(numerator: 30399, denominator: 10000))
+        XCTAssertEqual(result.coverage.map(\.status), [.observed, .unknown])
+        XCTAssertEqual(result.coverage.last?.start, end)
+        XCTAssertEqual(result.appearances.map(\.end), [end])
+        var project = ParticipantProject()
+        try project.acceptAnalysis(scan, sourceID: "clip")
+        XCTAssertTrue(project.appearances(sourceID: "clip", at: end).isEmpty)
+    }
+
+    func testMatroskaFractionalFrameDurationsPreserveOnlyActualGaps() throws {
+        guard ParticipantAnalysis.isAvailable else { throw XCTSkip("TileTrail is unavailable.") }
+        let options = ParticipantScanOptions(backend: .cpu, sampling: .everyFrame, useSidecar: false)
+        let continuous = try ParticipantAnalysis.scan(fixture(matroskaNTSC: .continuous), options: options)
+        XCTAssertEqual(continuous.state, .completed)
+        XCTAssertEqual(continuous.source.duration, RationalTime(numerator: 1001, denominator: 1000))
+        XCTAssertEqual(continuous.analysis?.observations.count, 30)
+        XCTAssertFalse(try XCTUnwrap(continuous.analysis).coverage.contains { $0.status == .incomplete })
+
+        let trimmed = try ParticipantAnalysis.scan(fixture(matroskaNTSC: .trimmedFirstFrame), options: options)
+        XCTAssertEqual(trimmed.source.origin, RationalTime(numerator: 33, denominator: 1000))
+        XCTAssertEqual(trimmed.state, .completed)
+        XCTAssertEqual(trimmed.analysis?.observations.count, 29)
+
+        let withGap = try ParticipantAnalysis.scan(fixture(matroskaNTSC: .droppedFrames), options: options)
+        XCTAssertEqual(withGap.state, .incomplete)
+        let gaps = try XCTUnwrap(withGap.analysis).coverage.filter { $0.status == .incomplete }
+        XCTAssertEqual(gaps.map(\.start), [RationalTime(numerator: 333, denominator: 1000)])
+        XCTAssertEqual(gaps.map(\.end), [RationalTime(numerator: 467, denominator: 1000)])
+
+        let shifted = try ParticipantAnalysis.scan(fixture(matroskaNTSC: .shiftedFrame), options: options)
+        XCTAssertEqual(shifted.state, .incomplete)
+        let shiftedGaps = try XCTUnwrap(shifted.analysis).coverage.filter { $0.status == .incomplete }
+        XCTAssertEqual(shiftedGaps.map(\.start), [RationalTime(numerator: 33, denominator: 1000)])
+        XCTAssertEqual(shiftedGaps.map(\.end), [RationalTime(numerator: 34, denominator: 1000)])
+    }
+
     func testPartialCachedScanRequiresFreshAnalysis() throws {
         guard ParticipantAnalysis.isAvailable else { throw XCTSkip("TileTrail is unavailable.") }
         let file = try fixture()
@@ -417,7 +639,10 @@ final class ParticipantAnalysisTests: XCTestCase {
         return process.terminationStatus == 0 ? file : nil
     }
 
-    private func fixture(withGap: Bool = false, adaptiveMultiview: Bool = false) throws -> URL {
+    private enum MatroskaNTSCFixture { case continuous, trimmedFirstFrame, droppedFrames, shiftedFrame }
+
+    private func fixture(withGap: Bool = false, adaptiveMultiview: Bool = false,
+                         matroskaNTSC: MatroskaNTSCFixture? = nil, fractionalEdit: Bool = false) throws -> URL {
         let paths = [ProcessInfo.processInfo.environment["MPCUT_TEST_FFMPEG"], "/opt/homebrew/bin/ffmpeg",
                      "/usr/local/bin/ffmpeg"].compactMap { $0 }
         guard let executable = paths.first(where: FileManager.default.isExecutableFile(atPath:)) else {
@@ -436,11 +661,35 @@ final class ParticipantAnalysisTests: XCTestCase {
             process.waitUntilExit()
             XCTAssertEqual(process.terminationStatus, 0)
         }
+        if fractionalEdit {
+            let source = folder.appendingPathComponent("closed-gop.mp4")
+            let clip = folder.appendingPathComponent("sub-frame-edit.mp4")
+            try ffmpeg(["-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25:duration=5",
+                        "-f", "lavfi", "-i", "sine=duration=5:sample_rate=48000",
+                        "-c:v", "libx264", "-g", "25", "-bf", "0", "-video_track_timescale", "30000",
+                        "-c:a", "aac", source.path])
+            try ffmpeg(["-ss", "1.0001", "-i", source.path, "-t", "3", "-c", "copy",
+                        "-movie_timescale", "240000", clip.path])
+            return clip
+        }
         if adaptiveMultiview {
             let file = folder.appendingPathComponent("multiview.mov")
             try ffmpeg(["-f", "lavfi", "-i", "color=c=red:s=96x64:r=10:d=4",
                         "-f", "lavfi", "-i", "color=c=blue:s=96x64:r=10:d=4",
                         "-filter_complex", "[0:v][1:v]hstack", "-c:v", "mjpeg", "-q:v", "3", file.path])
+            return file
+        }
+        if let matroskaNTSC {
+            let file = folder.appendingPathComponent("fractional-cadence.mkv")
+            let filters: [String]
+            switch matroskaNTSC {
+            case .continuous: filters = []
+            case .trimmedFirstFrame: filters = ["-vf", "select='gte(n,1)'"]
+            case .droppedFrames: filters = ["-vf", "select='not(between(n,10,13))'"]
+            case .shiftedFrame: filters = ["-vf", #"settb=1/1000,setpts=PTS+eq(N\,1)"#]
+            }
+            try ffmpeg(["-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30000/1001:duration=1"]
+                + filters + ["-fps_mode", "passthrough", "-enc_time_base", "1/1000", "-c:v", "libx264", file.path])
             return file
         }
         if withGap {

@@ -11,9 +11,12 @@ public struct CutSequenceClip: Hashable, Codable, Sendable, Identifiable {
     public var audioTrack: Int?
     public var originalFile: String?
     public var replacementNames: [Int: String]
+    public var tileLayouts: [TileLayoutSpan]
 
     public init(id: String, file: String, from: RationalTime, to: RationalTime,
-                audioTrack: Int? = nil, originalFile: String? = nil, replacementNames: [Int: String] = [:]) {
+                audioTrack: Int? = nil, originalFile: String? = nil, replacementNames: [Int: String] = [:],
+                tileLayouts: [TileLayoutSpan] = []) {
+        self.tileLayouts = tileLayouts
         self.audioTrack = audioTrack
         self.originalFile = originalFile
         self.replacementNames = replacementNames
@@ -28,11 +31,13 @@ public struct CutSequenceClip: Hashable, Codable, Sendable, Identifiable {
         case audioTrack = "track_ordinal"
         case originalFile = "original_file"
         case replacementNames = "replacement_names"
+        case tileLayouts = "tile_layouts"
     }
 
     public init(from decoder: Decoder) throws {
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_cut_project")
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        tileLayouts = try values.decodeIfPresent([TileLayoutSpan].self, forKey: .tileLayouts) ?? []
         audioTrack = try values.decodeIfPresent(Int.self, forKey: .audioTrack)
         originalFile = try values.decodeIfPresent(String.self, forKey: .originalFile)
         let names = try values.decodeIfPresent([String: String].self, forKey: .replacementNames) ?? [:]
@@ -51,6 +56,7 @@ public struct CutSequenceClip: Hashable, Codable, Sendable, Identifiable {
 
     public func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
+        if !tileLayouts.isEmpty { try values.encode(tileLayouts, forKey: .tileLayouts) }
         try values.encodeIfPresent(audioTrack, forKey: .audioTrack)
         try values.encodeIfPresent(originalFile, forKey: .originalFile)
         if !replacementNames.isEmpty { try values.encode(replacementNames, forKey: .replacementNames) }
@@ -61,6 +67,7 @@ public struct CutSequenceClip: Hashable, Codable, Sendable, Identifiable {
     }
 
     func validateFields() throws {
+        try TileLayoutSpan.validate(tileLayouts, minTime: .zero)
         guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw CutError(code: "invalid_cut_project", message: "Clip IDs must be nonempty and unique")
         }
@@ -89,7 +96,8 @@ struct SequenceClipOrderValidation {
 public enum CutProject: Equatable, Codable, Sendable {
     public static let format = "mpcut"
     public static let schemaVersion = 6
-    package static let readableSchemaVersions: Set<Int> = [3, 4, schemaVersion]
+    public static let tilesSchemaVersion = 8
+    package static let readableSchemaVersions: Set<Int> = [3, 4, schemaVersion, tilesSchemaVersion]
 
     case sequence([CutSequenceClip])
     case multicam(MulticamProject)
@@ -154,6 +162,7 @@ public enum CutProject: Equatable, Codable, Sendable {
                     ? .sequence(project.items.compactMap(\.source)) : .stillSequence(project)
             case .multicam(var project):
                 project.participants = newValue
+                project.syncFeedAngleRecordings()
                 self = .multicam(project)
             }
         }
@@ -166,7 +175,7 @@ public enum CutProject: Equatable, Codable, Sendable {
         }
         guard let version = try values.decodeIfPresent(Int.self, forKey: .schemaVersion),
               Self.readableSchemaVersions.contains(version) else {
-            throw CutError(code: "unsupported_cut_version", message: "Expected MPCut project schema_version 3, 4 or \(Self.schemaVersion)")
+            throw CutError(code: "unsupported_cut_version", message: "Unsupported MPCut project schema version")
         }
         switch try values.decode(String.self, forKey: .kind) {
         case "sequence":
@@ -197,6 +206,9 @@ public enum CutProject: Equatable, Codable, Sendable {
                 guard version >= 4 else { throw invalidParticipantProject("Participant metadata requires project schema version 4.") }
                 participants = try values.decode(ParticipantProject.self, forKey: .participants)
             }
+            guard version == Self.tilesSchemaVersion || !usesTilesFormat else {
+                throw CutError(code: "invalid_cut_project", message: "Tiles fields require project schema version \(Self.tilesSchemaVersion).")
+            }
             try validate()
         case "multicam": self = .multicam(try MulticamProject(from: decoder))
         default: throw CutError(code: "invalid_cut_project", message: "Unknown MPCut project kind")
@@ -211,18 +223,18 @@ public enum CutProject: Equatable, Codable, Sendable {
         try encode(to: encoder, requiresExtendedStillSchema: requiresExtendedStillSchema)
     }
 
-    func encode(to encoder: Encoder, requiresExtendedStillSchema: Bool) throws {
+    func encode(to encoder: Encoder, requiresExtendedStillSchema: Bool, requiresTilesSchema: Bool = false) throws {
         try validate()
         guard stillAudioReference == nil else {
             throw CutError(code: "transient_selection", message: "A still selection with inherited audio is an export snapshot.")
         }
         if case .multicam(let project) = self {
-            try project.encode(to: encoder)
+            try project.encode(to: encoder, requiresTilesSchema: requiresTilesSchema)
             return
         }
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(Self.format, forKey: .format)
-        try values.encode(requiresExtendedStillSchema ? Self.schemaVersion : 4, forKey: .schemaVersion)
+        try values.encode(usesTilesFormat || requiresTilesSchema ? Self.tilesSchemaVersion : requiresExtendedStillSchema ? Self.schemaVersion : 4, forKey: .schemaVersion)
         try values.encode("sequence", forKey: .kind)
         if !transcripts.isEmpty { try values.encode(transcripts, forKey: .transcripts) }
         if !participants.isEmpty { try values.encode(participants, forKey: .participants) }
@@ -251,6 +263,12 @@ public enum CutProject: Equatable, Codable, Sendable {
             for select in project.sourceSelects { try select.validate() }
             let clips = project.items.compactMap(\.source)
             try Self.sequence(clips).validate()
+            if !project.participants.isEmpty {
+                let roster = Set(project.participants.people.map(\.id))
+                for clip in clips {
+                    try TileLayoutSpan.validate(clip.tileLayouts, roster: roster)
+                }
+            }
             if let reference = project.stillAudioReference {
                 try Self.sequence([reference]).validate()
                 guard clips.isEmpty, project.stillFormat != nil else {
@@ -387,30 +405,25 @@ public enum CutProject: Equatable, Codable, Sendable {
     }
 
     package func mapMediaPaths(_ rebase: (String) -> String) -> Self {
+        func rebaseClip(_ clip: CutSequenceClip) -> CutSequenceClip {
+            var clip = clip
+            clip.file = rebase(clip.file)
+            clip.originalFile = clip.originalFile.map(rebase)
+            clip.mapTileCameraPaths(rebase)
+            return clip
+        }
         switch self {
         case .sequence(let clips):
-            return .sequence(clips.map {
-                var clip = $0
-                clip.file = rebase(clip.file)
-                clip.originalFile = clip.originalFile.map(rebase)
-                return clip
-            })
+            return .sequence(clips.map(rebaseClip))
         case .stillSequence(var project):
             project.items = project.items.map { item in
-                guard var clip = item.source else { return item }
-                clip.file = rebase(clip.file)
-                clip.originalFile = clip.originalFile.map(rebase)
-                return .source(clip)
+                item.source.map { .source(rebaseClip($0)) } ?? item
             }
-            for index in project.stillAssets.indices { project.stillAssets[index].file = rebase(project.stillAssets[index].file) }
-            func rebaseReference(_ clip: CutSequenceClip) -> CutSequenceClip {
-                var clip = clip
-                clip.file = rebase(clip.file)
-                clip.originalFile = clip.originalFile.map(rebase)
-                return clip
+            for index in project.stillAssets.indices where !project.stillAssets[index].isGap {
+                project.stillAssets[index].file = rebase(project.stillAssets[index].file)
             }
-            project.stillAudioReference = project.stillAudioReference.map(rebaseReference)
-            project.stillSoundtrack = project.stillSoundtrack.map(rebaseReference)
+            project.stillAudioReference = project.stillAudioReference.map(rebaseClip)
+            project.stillSoundtrack = project.stillSoundtrack.map(rebaseClip)
             project.sourceSelects = project.sourceSelects.map { $0.mapPath(rebase) }
             project.participants = project.participants.mapSourcePaths(rebase)
             project.transcripts = project.transcripts.mapSourcePaths(rebase)
@@ -418,7 +431,9 @@ public enum CutProject: Equatable, Codable, Sendable {
         case .multicam(var project):
             project.angles = project.angles.map { $0.mappingFiles(rebase) }
             project.audioSources = project.audioSources.map { $0.mappingFiles(rebase) }
-            for index in project.stillAssets.indices { project.stillAssets[index].file = rebase(project.stillAssets[index].file) }
+            for index in project.stillAssets.indices where !project.stillAssets[index].isGap {
+                project.stillAssets[index].file = rebase(project.stillAssets[index].file)
+            }
             project.transcripts = project.transcripts.mapSourcePaths(rebase)
             return .multicam(project)
         }
@@ -577,13 +592,13 @@ enum ProjectFile {
         guard data.count <= MulticamProject.maximumFileSize else {
             throw CutError(code: code, message: "Project exceeds the 64 MB limit")
         }
-        // A project on disk is compressed. One written as plain JSON reads as it always did.
-        let text = try ProjectSavedBytes.unpacked(data, code: code) ?? data
+        let text = data
         guard !text.contains(0), String(data: text, encoding: .utf8) != nil else {
             throw CutError(code: code, message: "Project must contain a UTF-8 JSON object")
         }
-        // A project saved in the shared layout is read as the document it stands for.
-        let data = try ProjectSavedLayout.expanded(text, code: code) ?? text
+        // A project saved with a table of what it repeats is read as the document it stands for.
+        // A history saved with another edit, as after a change made in the text or a merge, is left out.
+        let data = ProjectHistoryStamp.verified(try ProjectKeyedLayout.expanded(text, code: code) ?? text)
         do {
             let project = try JSONDecoder().decode(type, from: data)
             if let issue = jsonInputIssue(data, integerNumbersOnly: true, allowsFraction: allowsProjectFraction) {
@@ -601,21 +616,35 @@ enum ProjectFile {
             return key
         }
         if keys.first == "media_snapshot" { return true }
-        let fields: ArraySlice<String>
-        if keys.first == "participants" {
-            fields = keys.dropFirst()
-        } else if keys.starts(with: ["history", "undo", "participants"]) || keys.starts(with: ["history", "redo", "participants"]) {
-            fields = keys.dropFirst(3)
-        } else {
-            return false
+        // A history delta can wrap changed clips and occurrences in splice records.
+        // The same fractional anchors are valid in live and retained layout slots.
+        let end = keys.count
+        guard end >= 3 else { return false }
+        let field = keys[end - 1]
+        let parent = keys[end - 2]
+        let owner = keys[end - 3]
+        let anchor = field == "anchor_x" || field == "anchor_y"
+        if anchor, parent == "slots", owner == "tile_layouts" || owner == "group_tile_layouts" {
+            return true
         }
-        guard let last = fields.last else { return false }
-        let parent = fields.dropLast()
-        if parent.elementsEqual(["sources", "appearances", "bounds"])
-            || parent.elementsEqual(["sources", "appearances", "label_bounds"]) {
-            return ["x", "y", "width", "height"].contains(last)
+        guard end >= 5 else { return false }
+        let section = keys[end - 4]
+        switch end {
+        case 5:
+            guard keys[0] == "participants" else { return false }
+        case 7, 8:
+            guard keys[0] == "history", keys[1] == "undo" || keys[1] == "redo",
+                  keys[end - 5] == "participants", end == 7 || keys[2] == "timeline" else { return false }
+        default: return false
         }
-        return parent.elementsEqual(["render", "shots", "slots"]) && ["anchor_x", "anchor_y"].contains(last)
+        switch (section, owner, parent) {
+        case ("sources", "appearances", "bounds"), ("sources", "appearances", "label_bounds"),
+             ("sources", "appearances", "detected_bounds"):
+            return field == "x" || field == "y" || field == "width" || field == "height"
+        case ("sources", "scan_events", "candidates"): return field == "confidence"
+        case ("render", "shots", "slots"): return anchor
+        default: return false
+        }
     }
 
     static func encoded<T: Encodable>(_ project: T, compact: Bool) throws -> Data {
@@ -631,9 +660,9 @@ enum ProjectFile {
     }
 
     static func write(_ bytes: Data, to url: URL, sources: [(String, String)], prefix: String,
-                      replacingExisting: Bool = true) throws {
+                      replacingExisting: Bool = true, byteLimit: Int = MulticamProject.maximumFileSize) throws {
         _ = try writeRevision(bytes, to: url, sources: sources, prefix: prefix,
-                              replacingExisting: replacingExisting, expected: nil)
+                              replacingExisting: replacingExisting, expected: nil, byteLimit: byteLimit)
     }
 
     /// The caller holds the draft lease and publishes this private stage.
@@ -646,8 +675,9 @@ enum ProjectFile {
     static func writeRevision(_ bytes: Data, to url: URL, sources: [(String, String)], prefix: String,
                               replacingExisting: Bool, expected: ProjectDiskRevision?,
                               transcriptAssets: [TranscriptAsset]? = nil, hasTranscriptMetadata: Bool = false,
+                              byteLimit: Int = MulticamProject.maximumFileSize,
                               beforePublish: () throws -> Void = {}) throws -> ProjectDiskRevision {
-        let data = try diskBytes(bytes, prefix: prefix)
+        let data = try diskBytes(bytes, prefix: prefix, byteLimit: byteLimit)
         return try coordinatedWrite(to: url, prefix: prefix, expected: expected) { destination, verifyDestination in
             let target = replacingExisting ? destination : url
             try validateDestination(target, sourceDirectory: directory(of: target), sources: sources, prefix: prefix)
@@ -667,18 +697,31 @@ enum ProjectFile {
         }
     }
 
-    static func diskBytes(_ bytes: Data, prefix: String) throws -> Data {
-        // Every project is written the same way: what the document repeats is written once,
-        // and the result is compressed. MPCUT_PROJECT_VERSION=4 keeps the plain document for a
-        // build that predates this.
+    static func diskBytes(_ bytes: Data, prefix: String, byteLimit: Int = MulticamProject.maximumFileSize) throws -> Data {
         // The limit is on the document itself, whatever form it is written in.
-        guard bytes.count <= MulticamProject.maximumFileSize else {
+        let limit = min(byteLimit, MulticamProject.maximumFileSize)
+        guard bytes.count <= limit else {
+            if limit < MulticamProject.maximumFileSize {
+                throw CutError(code: "invalid_\(prefix)_project", message: "Project exceeds its \(limit)-byte limit")
+            }
             throw CutError(code: "invalid_\(prefix)_project", message: "Project exceeds the 64 MB limit")
         }
-        let text = ProjectSavedLayout.prefersExpanded ? bytes : ProjectSavedLayout.compacted(bytes) ?? bytes
-        if !ProjectSavedLayout.prefersExpanded, let packed = ProjectSavedBytes.packed(text) { return packed }
-        guard text.count < MulticamProject.maximumFileSize else { return text }
-        var data = text
+        // A project is written as text with one field to a line, so that version control can
+        // compare and merge it, and with what it repeats listed once under keys taken from
+        // the content. Nothing in it refers to another part by position.
+        var fitting = bytes
+        if let original = ProjectSavedLayout.parse(bytes), case .object = original {
+            let plain = ProjectHistoryStamp.stamped(original)
+            let keyed = ProjectKeyedLayout.compactedDocument(plain)
+            let text = ProjectSavedLayout.readable(keyed ?? plain, capacity: bytes.count)
+            if text.count <= limit { return text }
+            let compactBytes = ProjectSavedLayout.text(keyed ?? plain, capacity: bytes.count)
+            if compactBytes.count <= limit { fitting = compactBytes }
+        }
+        // Near the limit the project is written without the line breaks, and past that in
+        // whatever form it was given.
+        guard fitting.count < limit else { return fitting }
+        var data = fitting
         data.append(0x0A)
         return data
     }
@@ -877,4 +920,15 @@ enum ProjectFile {
         return .init(device: device, inode: inode)
     }
 
+}
+
+
+extension CutSequenceClip {
+    mutating func mapTileCameraPaths(_ transform: (String) -> String) {
+        for index in tileLayouts.indices {
+            for slot in tileLayouts[index].slots.indices where tileLayouts[index].slots[slot].target == .camera {
+                tileLayouts[index].slots[slot].id = transform(tileLayouts[index].slots[slot].id)
+            }
+        }
+    }
 }

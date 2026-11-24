@@ -72,7 +72,7 @@ struct EditorView: View {
                                         toolTip: "Show or hide the transcript (⌥⌘T)") {
                         presentation.setTranscriptVisible(!presentation.sequenceTranscriptVisible, multicam: false)
                     }
-                    EditorToolbarButton(title: "Feeds", symbol: "rectangle.split.2x2",
+                    EditorToolbarButton(title: "Tiles", symbol: "rectangle.split.2x2",
                                         toolTip: "Review camera feeds and meeting participants") {
                         presentation.sequenceParticipantsVisible.toggle()
                         if presentation.sequenceParticipantsVisible { presentation.sequenceTranscriptVisible = false }
@@ -85,6 +85,14 @@ struct EditorView: View {
                     EditorToolbarButton(title: "Export", symbol: "square.and.arrow.up", toolTip: "Export sequence (⌘E)",
                                         action: editor.chooseExport)
                         .disabled(!editor.canEdit)
+                    if let transcriptSession, !editor.isAudioOnly {
+                        EditorToolbarButton(title: "Export Settings", symbol: "slider.horizontal.3",
+                                            toolTip: "Set the output canvas and soundtrack") {
+                            transcriptSession.presentOutputSettings()
+                        }
+                        .disabled(!editor.canEdit)
+                        .accessibilityIdentifier("project.output.open")
+                    }
                 }
             }
         }
@@ -143,7 +151,7 @@ struct EditorView: View {
                             addMulticam: addMulticam)
                     .overlay {
                         if let transcriptSession,
-                           presentation.sequenceParticipantsVisible || !editor.participantProject.isEmpty {
+                           presentation.sequenceParticipantsVisible || !editor.participantProject.isEmpty || editor.stillProject.requiresPictureProcessing {
                             ParticipantMonitorOverlay(session: transcriptSession,
                                                       interactive: presentation.sequenceParticipantsVisible)
                         }
@@ -171,7 +179,13 @@ struct EditorView: View {
             split: .init(title: "Split at Playhead", perform: editor.split),
             delete: .init(title: editor.deleteTitle, enabled: editor.canDelete, perform: { editor.byHand(editor.deleteSelection) }),
             undo: .init(title: editor.undoTitle, enabled: editor.canUndo, perform: editor.undo),
-            redo: .init(title: editor.redoTitle, enabled: editor.canRedo, perform: editor.redo),
+            redo: .init(title: transcriptSession?.canRedoFeedAngleConversion == true
+                        ? "Redo " + (transcriptSession?.feedAngleConversionAction ?? "") : editor.redoTitle,
+                        enabled: editor.canRedo || transcriptSession?.canRedoFeedAngleConversion == true,
+                        perform: {
+                            if transcriptSession?.canRedoFeedAngleConversion == true { transcriptSession?.redoFeedAngleConversion() }
+                            else { editor.redo() }
+                        }),
             rangeTools: .init(active: $editor.rangeTool, canAct: editor.canActOnRange, canSplit: editor.canSplitSelectedRange,
                               canDelete: editor.canActOnRange, split: { editor.byHand(editor.splitSelectedRange) },
                               export: editor.chooseSelectionExport, delete: { editor.byHand(editor.deleteSelection) }),
@@ -185,6 +199,8 @@ struct EditorView: View {
             editor.validateHandle(id, edge: edge, target: target, commit: commit, completion: completion)
         }
     }
+
+    @State private var showTileFeeds = false
 
     private var timeline: some View {
         let soundtrack = editor.stillSoundtrackWaveform
@@ -226,6 +242,20 @@ struct EditorView: View {
             validateHandle: handleValidation,
             thumbnail: editor.thumbnail
         )
+        if let revision = editor.timelineOutputRevision {
+            timeline.outputThumbnailRevision = revision
+            timeline.outputThumbnail = { time, size in
+                await editor.outputThumbnail(at: time, size: size, revision: revision)
+            }
+        }
+        timeline.tileContent = editor.tileTimeline
+        timeline.showTileFeeds = $showTileFeeds
+        if editor.canEdit {
+            timeline.onResizeTileSpan = editor.resizeTimelineTile
+            if editor.markIn != nil && editor.markOut != nil {
+                timeline.onClearTileLayouts = editor.clearMarkedTileLayout
+            }
+        }
         timeline.onProjectMedia = editor.actOnTimelineMedia
         timeline.assemblyAssets = editor.stillAssetSpans
         if editor.canEdit {

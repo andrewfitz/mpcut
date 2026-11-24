@@ -202,6 +202,48 @@ final class QueueSnapshotTests: XCTestCase {
         XCTAssertTrue(editor.invalidatedQueueIDs.isEmpty)
     }
 
+    func testPicturePolicyInvalidatesEarlierQueueSnapshotAndReplanUsesProgramClock() async throws {
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let editor = EditorModel(preferences: preferences)
+        defer { editor.endSession() }
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4", subdirectory: "Fixtures"))
+        editor.importFiles([source])
+        let deadline = ContinuousClock.now + .seconds(15)
+        while editor.isBusy, .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(editor.isBusy)
+        editor.selectRange(0.2, 0.8)
+        editor.addMarkedRange()
+        let original = try XCTUnwrap(editor.queuedRanges.first)
+        XCTAssertNotNil(editor.readyQueuedRanges.first)
+
+        var policy = editor.participantProject
+        policy.tileOutput = .init(canvas: .init(width: 160, height: 90), audio: .init(mode: .silence))
+        try editor.replaceParticipantProject(policy, action: "Set Output Canvas")
+        XCTAssertEqual(editor.invalidatedQueueIDs, [original.id])
+        XCTAssertTrue(editor.readyQueuedRanges.isEmpty)
+
+        try editor.replanQueuedRange(original.id)
+        let replanned = try XCTUnwrap(editor.readyQueuedRanges.first)
+        XCTAssertEqual(replanned.id, original.id)
+        XCTAssertEqual(replanned.start, original.start)
+        XCTAssertEqual(replanned.end, original.end)
+        XCTAssertEqual(replanned.pictureProject, editor.stillProject)
+
+        var options = ExportSheetOptions()
+        options.mode = .copy
+        options.copyContainer = "mov"
+        let copyIssue = await editor.checkQueuedRanges(options: options)
+        XCTAssertEqual(copyIssue?.code, "participant_render_requires_encoding")
+        options.mode = .encode
+        options.encodeContainer = "mov"
+        let encodeIssue = await editor.checkQueuedRanges(options: options)
+        XCTAssertNil(encodeIssue)
+        options.tracks = .video
+        let pictureOnlyIssue = await editor.checkQueuedRanges(options: options)
+        XCTAssertNil(pictureOnlyIssue)
+    }
+
     func testMulticamQueueMarksUsedStillsAndUnresolvedRecordingsIndividually() throws {
         func t(_ seconds: Int64) -> RationalTime { .init(numerator: seconds) }
         func r(_ from: Int64, _ to: Int64) -> MulticamRange { .init(from: t(from), to: t(to)) }

@@ -281,6 +281,7 @@ struct TranscriptJobInput: Codable, Equatable, Sendable {
         case offset
         case onlyStream = "only_stream"
         case omittedStreams = "omitted_streams"
+        case microphoneNames = "microphone_names"
     }
     var id: String
     var sourceID: String?
@@ -289,6 +290,7 @@ struct TranscriptJobInput: Codable, Equatable, Sendable {
     var offset: RationalTime
     var onlyStream: Int? = nil
     var omittedStreams: [Int]? = nil
+    var microphoneNames: [Int: String]? = nil
 }
 
 public enum TranscriptJobPlan {
@@ -344,15 +346,25 @@ public enum TranscriptJobPlan {
             sources = sequence(project.items.compactMap(\.source))
         case .multicam(let project):
             let placements = try project.transcriptReplacementPlacements()
-            let sourcesByID = Dictionary(project.sources.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let physicalSources = project.sources.filter { $0.feedAngle == nil }
+            let sourcesByID = Dictionary(physicalSources.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let microphones = TileFeedAttachments.microphones(in: project)
+            let feedsByMicrophone = Dictionary(grouping: project.participants.people.compactMap { feed in
+                microphones[feed.id].map { (selection: $0, name: feed.name) }
+            }, by: { $0.selection })
+            var microphoneNames: [String: [Int: String]] = [:]
+            for (selection, feeds) in feedsByMicrophone where feeds.count == 1 {
+                microphoneNames[selection.source, default: [:]][selection.stream] = feeds[0].name
+            }
             let independent = Set(project.mixLanes.compactMap { lane -> MulticamAudioSelection? in
                 if case .recording(let selection) = lane.target { return selection }
                 return nil
             } + project.switches.compactMap(\.audio) + [project.fixedAudio].compactMap { $0 })
             let bound = Dictionary(grouping: placements.map(\.selection).filter { !independent.contains($0) }, by: \.source)
-            let originals = project.sources.map { source in
+            let originals = physicalSources.map { source in
                 TranscriptJobInput(id: source.id, sourceID: source.id, file: resolveFile(source.file), name: source.name,
-                                   offset: source.offset, omittedStreams: bound[source.id].map { Set($0.map(\.stream)).sorted() })
+                                   offset: source.offset, omittedStreams: bound[source.id].map { Set($0.map(\.stream)).sorted() },
+                                   microphoneNames: microphoneNames[source.id])
             }
             let replacements = placements.compactMap { placement -> TranscriptJobInput? in
                 guard let source = sourcesByID[placement.selection.source],
@@ -361,7 +373,8 @@ public enum TranscriptJobPlan {
                 let originalName = displayName(target.name, file: resolveFile(target.file))
                 let name = "\(displayName(source.name, file: media)) · \(originalName) (stream \(placement.original.stream))"
                 return .init(id: placement.trackID, sourceID: source.id, file: media, name: name,
-                             offset: placement.offset, onlyStream: placement.selection.stream)
+                             offset: placement.offset, onlyStream: placement.selection.stream,
+                             microphoneNames: microphoneNames[source.id])
             }
             sources = [originals + replacements]
         }
@@ -487,8 +500,9 @@ public enum TranscriptJobPlan {
                         id = input.onlyStream == nil ? "t-" + digest(Data("\(input.id)\n\(stream?.index ?? -1)".utf8)) : input.id
                     }
                     let participants = options.zoomParticipants?[id]
+                    let feedName = stream.flatMap { input.microphoneNames?[$0.index] }
                     let chosen = mixID != nil ? TranscriptJobTrackOptions(role: "isolated_mic", speaker: input.name)
-                        : options.trackOptions[id] ?? .init()
+                        : options.trackOptions[id] ?? .init(role: feedName == nil ? "unknown" : "isolated_mic", speaker: feedName)
                     let channelValid = chosen.channel.map { $0 >= 0 && $0 < (stream?.channels ?? 0) } ?? true
                     guard ["isolated_mic", "mixed_audio", "unknown"].contains(chosen.role),
                           channelValid || allowMissingSelections else {
@@ -504,7 +518,7 @@ public enum TranscriptJobPlan {
                         id: id, sourceID: input.sourceID ?? input.id, file: input.file, streamIndex: stream?.index,
                         zoomMixTrackID: mixID, zoomMixStream: mix?.streamIndex, sequenceStreamOrdinal: input.sourceID == nil && stream != nil ? ordinal : nil,
                         sequenceClockOrigin: media.multicamClockOffset, projectSourceID: input.sourceID,
-                        name: streams.count > 1 ? "\(name) (stream \(stream!.index))" : name, origin: .zero,
+                        name: feedName ?? (streams.count > 1 ? "\(name) (stream \(stream!.index))" : name), origin: .zero,
                         sessionStart: input.offset, duration: duration, channel: chosen.channel, role: chosen.role,
                         speaker: chosen.speaker, recognize: recognize, evidence: streamEvidence.digest,
                         hasReusableEvidence: streamEvidence.reusable, sourceStamp: media.identity,

@@ -15,11 +15,21 @@ struct MulticamTimeline: View {
     let moveSwitch: (RationalTime, RationalTime) -> Void
     let deleteSwitch: (RationalTime) -> Void
     let selectSwitch: (RationalTime) -> Void
+    var proposedSwitches: [TileSwitchProposal] = []
+    var onPreviewProposal: ((TileSwitchProposal) -> Void)?
+    var onAcceptProposal: ((TileSwitchProposal) -> Void)?
+    var onDiscardProposal: ((TileSwitchProposal) -> Void)?
+    var switchReview: TileSwitchLaneReview?
+    var tileContent = TileTimelineContent()
+    var onResizeTileSpan: ((TileTimelineContent.FeedSpan, TimelineEdge, Double) -> Void)?
+    var onClearTileLayouts: (() -> Void)?
     var onPreviewSwitch: ((RationalTime) -> Void)? = nil
     var sourceMediaStatus: ((MulticamSource) -> ProjectMediaStatus)?
     var onProjectMedia: ((ProjectMediaAction, MulticamSource) -> Void)?
     var useAnalysisSidecars = true
     let thumbnailService: MulticamThumbnailService
+    var outputThumbnailRevision: TimelineOutputRevision?
+    var outputThumbnail: ((RationalTime, String, CGSize) async -> CGImage?)?
     var selectedSwitch: RationalTime? = nil
     var scrubEnded: () -> Void = {}
     var zoom: Binding<Double> = .constant(0)
@@ -50,6 +60,11 @@ struct MulticamTimeline: View {
     @State private var scrollOrigin: CGFloat = 0
     @State private var verticalViewport: Range<CGFloat>?
     @State private var selection: RationalTime?
+    @State private var showTileFeeds = false
+    private var markerLaneHeight: CGFloat { Self.markerHeight + (proposedSwitches.isEmpty ? 0 : 14) }
+    private var layoutLaneHeight: CGFloat { tileContent.hasLayouts ? 22 : 0 }
+    private var tileFeedRows: [TileTimelineContent.Feed] { showTileFeeds ? tileContent.feeds : [] }
+    private var tileLanesHeight: CGFloat { layoutLaneHeight + CGFloat(tileFeedRows.count) * 14 }
     @State private var pendingReveal: Double?
     @State private var activeInterval: MulticamInterval?
     @GestureState private var drag: MarkerDrag?
@@ -100,13 +115,13 @@ struct MulticamTimeline: View {
         let intervals = analysis?.groupIntervals ?? (try? project.groupIntervals()) ?? []
         let routedAudio = routedTimelineLanes()
         let heights = cameraHeights
-        let contentHeight = Self.rulerHeight + Self.markerHeight + heights.reduce(0, +) + audioRowsHeight + groupAssetHeight
+        let contentHeight = Self.rulerHeight + markerLaneHeight + tileLanesHeight + heights.reduce(0, +) + audioRowsHeight + groupAssetHeight
         let scrollBarHeight = NSScroller.preferredScrollerStyle == .legacy
             ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
         let viewportHeight = contentHeight + scrollBarHeight
-        let idealHeight = Self.rulerHeight + Self.markerHeight + heights.prefix(4).reduce(0, +)
+        let idealHeight = Self.rulerHeight + markerLaneHeight + tileLanesHeight + heights.prefix(4).reduce(0, +)
             + (heights.count <= 4 ? audioRowsHeight + groupAssetHeight : 0) + scrollBarHeight
-            + (assembly == nil ? 0 : 70 + sourceRulerHeight + assemblyAssetHeight)
+            + (assembly == nil ? 0 : 70 + sourceRulerHeight + assemblyAssetHeight + (assembly?.showingTileFeeds(showTileFeeds).tileLaneHeight ?? 0))
 
         VStack(spacing: 0) {
             TimelineControlBar {
@@ -131,6 +146,12 @@ struct MulticamTimeline: View {
                                      markOut: assemblySelection?.to.seconds ?? markOut?.seconds)
                 SnapTargetMenu(selection: snapTarget)
                     .layoutPriority(1)
+                if !tileContent.feeds.isEmpty || assembly?.hasTileFeeds == true {
+                    Toggle("Feeds", isOn: $showTileFeeds)
+                        .toggleStyle(.button)
+                        .help("Show feed visibility on the timeline")
+                        .accessibilityIdentifier("timeline.tile-feeds")
+                }
                 TimelineViewControls(zoom: zoom, largeThumbnails: largeThumbnails)
                     .layoutPriority(1)
             }
@@ -144,9 +165,15 @@ struct MulticamTimeline: View {
                 ScrollView(.vertical) {
                     VStack(spacing: 0) {
                         if let assembly {
+                            let assembly = assembly.showingTileFeeds(showTileFeeds)
                             HStack(spacing: 0) {
                                 VStack(spacing: 0) {
                                     laneTitle("Assembly", height: 69 + sourceRulerHeight)
+                                    if assembly.hasGroupTileLayouts { laneTitle("Layouts", height: 22) }
+                                    if assembly.hasTileOverrides { laneTitle("Occurrence Layouts", height: 22) }
+                                    if showTileFeeds {
+                                        ForEach(assembly.tileFeedRows) { laneTitle($0.name, height: 14) }
+                                    }
                                     if assembly.hasAssets { laneTitle("Assets", height: 24) }
                                 }
                                 .frame(width: labelWidth + Self.trackDividerWidth)
@@ -274,7 +301,16 @@ struct MulticamTimeline: View {
     private func labels(heights: [CGFloat]) -> some View {
         VStack(spacing: 0) {
             laneTitle("Group time", height: Self.rulerHeight)
-            laneTitle("Switches", height: Self.markerHeight)
+            HStack(spacing: 0) {
+                Text("Switches").foregroundStyle(.secondary)
+                Spacer()
+                switchReview
+            }
+            .padding(.horizontal, 7)
+            .frame(height: markerLaneHeight)
+            .overlay(alignment: .bottom) { Divider() }
+            if tileContent.hasLayouts { laneTitle("Layouts", height: layoutLaneHeight) }
+            ForEach(tileFeedRows) { laneTitle($0.name, height: 14) }
             ForEach(Array(project.angles.enumerated()), id: \.element.id) { index, angle in
                 HStack(spacing: 5) {
                     let state = sourceMediaStatus?(angle) ?? .online
@@ -400,8 +436,12 @@ struct MulticamTimeline: View {
                     }
                 }
             markers(width: width, scale: scale, visible: visible)
-                .frame(height: Self.markerHeight)
+                .frame(height: markerLaneHeight)
                 .overlay(alignment: .bottom) { Divider() }
+            if tileContent.hasLayouts { layoutLane(scale: scale, visible: visible) }
+            ForEach(tileFeedRows) { feed in
+                tileFeedLane(feed, scale: scale, visible: visible)
+            }
             ForEach(Array(project.angles.enumerated()), id: \.element.id) { index, angle in
                 Group {
                     if cameraRowVisible(index, heights: heights, panelHeight: panelHeight) {
@@ -419,7 +459,7 @@ struct MulticamTimeline: View {
                 }
                 .frame(height: heights[index])
             }
-            let audioTop = Self.rulerHeight + Self.markerHeight + heights.reduce(0, +)
+            let audioTop = Self.rulerHeight + markerLaneHeight + tileLanesHeight + heights.reduce(0, +)
             let viewport = verticalViewport ?? 0..<max(0, panelHeight)
             let pauses = analysis?.routedPauses(project: project, media: media) ?? []
             if project.audio == .mix {
@@ -590,6 +630,7 @@ struct MulticamTimeline: View {
             Color.clear.contentShape(Rectangle())
                 .gesture(scrubGesture(scale: scale))
                 .help("Scrub switch lane")
+            tileTicks(scale: scale, visible: visible, height: markerLaneHeight)
             ForEach(visibleSwitches(scale: scale, visible: visible), id: \.at) { marker in
                 let opening = marker.at == project.range.from
                 let markerX = x(marker.at.seconds, scale: scale)
@@ -635,7 +676,153 @@ struct MulticamTimeline: View {
                     .help(opening ? "Select opening switch" : "Select or move switch")
                     .offset(x: position - 11)
             }
+            ForEach(proposedSwitches.filter { visible.contains(x($0.at.seconds, scale: scale)) }) { proposal in
+                let time = timelineTime(proposal.at.seconds, milliseconds: true)
+                let title = "Proposed switch to \(name(for: proposal.angleID)) at \(time)"
+                Menu {
+                    Button("Go to Proposal") { onPreviewProposal?(proposal); reveal(proposal.at.seconds) }
+                    Button("Accept Switch") { onAcceptProposal?(proposal) }.disabled(onAcceptProposal == nil)
+                    Button("Discard Proposal") { onDiscardProposal?(proposal) }
+                } label: {
+                    Image(systemName: "diamond.lefthalf.filled")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.orange)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .frame(width: 22, height: 14)
+                .accessibilityLabel(title)
+                .accessibilityIdentifier("timeline.proposed-switch.\(proposal.at.description)")
+                .help(title)
+                .offset(x: x(proposal.at.seconds, scale: scale) - 11, y: Self.markerHeight)
+            }
         }
+    }
+
+    private func layoutLane(scale: CGFloat, visible: Range<CGFloat>) -> some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear.contentShape(Rectangle()).gesture(scrubGesture(scale: scale))
+            ForEach(tileContent.layouts.filter {
+                x($0.range.to.seconds, scale: scale) > visible.lowerBound
+                    && x($0.range.from.seconds, scale: scale) < visible.upperBound
+            }, id: \.range) { layout in
+                let left = x(layout.range.from.seconds, scale: scale)
+                let right = x(layout.range.to.seconds, scale: scale)
+                Text(tileContent.layoutName(layout))
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .padding(.horizontal, 4)
+                    .frame(width: max(0, right - left - 1), height: 18, alignment: .leading)
+                    .background(.purple.opacity(0.28), in: RoundedRectangle(cornerRadius: 3))
+                    .clipped()
+                    .offset(x: left, y: 2)
+                    .accessibilityLabel(tileContent.layoutName(layout))
+                    .accessibilityIdentifier("timeline.tile-layout.\(layout.range.from.description)")
+            }
+        }
+        .frame(height: layoutLaneHeight)
+        .overlay(alignment: .bottom) { Divider() }
+        .contextMenu {
+            if let onClearTileLayouts { Button("Clear Layout in Marks", action: onClearTileLayouts) }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("timeline.tile-layouts")
+    }
+
+    private func tileFeedLane(_ feed: TileTimelineContent.Feed, scale: CGFloat, visible: Range<CGFloat>) -> some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear.contentShape(Rectangle()).gesture(scrubGesture(scale: scale))
+            ForEach(Array(feed.spans.enumerated()), id: \.offset) { _, span in
+                let left = x(span.range.from.seconds, scale: scale)
+                let right = x(span.range.to.seconds, scale: scale)
+                let minX = max(left, visible.lowerBound)
+                let maxX = min(right, visible.upperBound)
+                if minX < maxX {
+                    Canvas { context, size in
+                        let rect = CGRect(origin: .zero, size: size)
+                        var hatch = Path()
+                        for tick in stride(from: -size.height, to: size.width, by: 5) {
+                            hatch.move(to: .init(x: tick, y: size.height))
+                            hatch.addLine(to: .init(x: tick + size.height, y: 0))
+                        }
+                        context.fill(Path(rect), with: .color(.teal.opacity(0.32)))
+                        context.stroke(hatch, with: .color(.teal.opacity(0.65)))
+                        for coverage in span.coverage {
+                            let from = max(minX, x(coverage.range.from.seconds, scale: scale))
+                            let to = min(maxX, x(coverage.range.to.seconds, scale: scale))
+                            guard from < to else { continue }
+                            context.fill(Path(CGRect(x: from - minX, y: 0, width: to - from, height: size.height)),
+                                         with: .color(.teal))
+                        }
+                    }
+                    .frame(width: maxX - minX, height: 10)
+                    .clipped()
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(feed.name), \(timelineTime(span.range.from.seconds)) to \(timelineTime(span.range.to.seconds))")
+                    .contextMenu {
+                        if onResizeTileSpan != nil, span.hasStart {
+                            Button("Move Feed Start to Playhead") { moveTileEdge(span, edge: .start, to: currentPlayhead.seconds) }
+                                .disabled(currentPlayhead >= span.range.to)
+                        }
+                        if onResizeTileSpan != nil, span.hasEnd {
+                            Button("Move Feed End to Playhead") { moveTileEdge(span, edge: .end, to: currentPlayhead.seconds) }
+                                .disabled(currentPlayhead <= span.range.from)
+                        }
+                    }
+                    .accessibilityAction(named: "Move Feed Start to Playhead") {
+                        if span.hasStart { moveTileEdge(span, edge: .start, to: currentPlayhead.seconds) }
+                    }
+                    .accessibilityAction(named: "Move Feed End to Playhead") {
+                        if span.hasEnd { moveTileEdge(span, edge: .end, to: currentPlayhead.seconds) }
+                    }
+                    .offset(x: minX, y: 2)
+                    if onResizeTileSpan != nil {
+                        if span.hasStart && visible.contains(left) {
+                            tileEdge(span, edge: .start, at: left, scale: scale)
+                        }
+                        if span.hasEnd && visible.contains(right) {
+                            tileEdge(span, edge: .end, at: right, scale: scale)
+                        }
+                    }
+                }
+            }
+            tileTicks(scale: scale, visible: visible, height: 14)
+        }
+        .frame(height: 14)
+        .overlay(alignment: .bottom) { Divider() }
+        .accessibilityLabel("\(feed.name) feed")
+    }
+
+    private func tileEdge(_ span: TileTimelineContent.FeedSpan, edge: TimelineEdge, at point: CGFloat,
+                          scale: CGFloat) -> some View {
+        Rectangle().fill(.teal.opacity(0.85))
+            .frame(width: 2, height: 10)
+            .padding(.horizontal, 2)
+            .contentShape(Rectangle())
+            .offset(x: point - 3, y: 2)
+            .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .global)
+                .onEnded { drag in
+                    let start = edge == .start ? span.range.from.seconds : span.range.to.seconds
+                    moveTileEdge(span, edge: edge, to: start + drag.translation.width / scale)
+                })
+            .accessibilityHidden(true)
+    }
+
+    private func moveTileEdge(_ span: TileTimelineContent.FeedSpan, edge: TimelineEdge, to seconds: Double) {
+        onResizeTileSpan?(span, edge, seconds)
+    }
+
+    private func tileTicks(scale: CGFloat, visible: Range<CGFloat>, height: CGFloat) -> some View {
+        Canvas { context, _ in
+            let first = tileContent.ticks.lowerBound { x($0.seconds, scale: scale) >= visible.lowerBound }
+            for tick in tileContent.ticks[first...] {
+                let x = x(tick.seconds, scale: scale)
+                guard x < visible.upperBound else { break }
+                context.fill(Path(CGRect(x: x, y: 0, width: 1, height: height)), with: .color(.purple))
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     private func cameraLane(_ angle: MulticamSource, height: CGFloat, intervals: ArraySlice<MulticamInterval>,
@@ -719,8 +906,16 @@ struct MulticamTimeline: View {
                 ForEach(tiles, id: \.self) { index in
                     let range = layout.tileRange(index, origin: coveragePixels.lowerBound, displayScale: displayScale)
                     let times = MulticamFilmstrip.tileTimeRange(index, count: layout.count, coverage: coverage)
-                    if let sourceTime = MulticamFilmstrip.thumbnailTime(in: mediaInfo, from: times.lowerBound, to: times.upperBound) {
-                        let size = CGSize(width: targetWidth * displayScale, height: pictureHeight * displayScale)
+                    let size = CGSize(width: targetWidth * displayScale, height: pictureHeight * displayScale)
+                    if let revision = outputThumbnailRevision {
+                        let middle = times.lowerBound + (times.upperBound - times.lowerBound) / 2
+                        if let outputThumbnail, let group = timelineRationalTime(angle.offset.seconds + middle) {
+                            TimelineOutputThumbnail(revision: revision, time: group, recording: angle.id, size: size,
+                                                    thumbnail: outputThumbnail)
+                                .frame(width: range.upperBound - range.lowerBound, height: pictureHeight)
+                                .offset(x: range.lowerBound)
+                        }
+                    } else if let sourceTime = MulticamFilmstrip.thumbnailTime(in: mediaInfo, from: times.lowerBound, to: times.upperBound) {
                         MulticamThumbnail(service: thumbnailService, media: mediaInfo, time: sourceTime, size: size,
                                           useAnalysisSidecars: useAnalysisSidecars)
                             .frame(width: range.upperBound - range.lowerBound, height: pictureHeight)
@@ -1083,7 +1278,7 @@ struct MulticamTimeline: View {
     }
 
     private func cameraRowVisible(_ index: Int, heights: [CGFloat], panelHeight: CGFloat) -> Bool {
-        let top = Self.rulerHeight + Self.markerHeight + heights.prefix(index).reduce(0, +)
+        let top = Self.rulerHeight + markerLaneHeight + tileLanesHeight + heights.prefix(index).reduce(0, +)
         let visible = verticalViewport ?? 0..<max(0, panelHeight)
         return top < visible.upperBound && top + heights[index] > visible.lowerBound
     }

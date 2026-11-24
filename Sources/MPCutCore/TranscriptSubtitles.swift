@@ -140,18 +140,119 @@ enum TranscriptSubtitles {
         return result
     }
 
+    private struct CueLane: Hashable {
+        var attachment = 0
+        let speaker: String?
+        let track: String?
+        let clip: String?
+        let assembly: Int?
+    }
+
+    private struct Cue {
+        var text: String
+        var start: RationalTime
+        var end: RationalTime
+        let precision: TranscriptPrecision
+        let utteranceID: String?
+        let speakerName: String?
+        let lane: CueLane
+    }
+
+    private enum Recording: Equatable {
+        case file(String), source(String), unbound(Int, String?)
+    }
+
+    static func captionExport(_ indexes: [TranscriptIndex], space: TranscriptSpace,
+                                      filter: TranscriptFilter) throws -> (data: Data, wordCount: Int) {
+        var words: [Cue] = []
+        var recording: Recording?
+        var count = 0
+        for (position, index) in indexes.enumerated() {
+            let rows = index.readAll(space: space, filter: filter)
+            let speakers = Dictionary(uniqueKeysWithValues: index.speakers.map { ($0.id, $0.name) })
+            // Exported documents can carry a different clock on each word.
+            var originalClocks: [String: TranscriptClock]?
+            count += rows.count
+            for row in rows where !row.text.allSatisfy(\.isWhitespace) {
+                var range = row.range
+                if space == .source {
+                    if row.sourceRange == nil {
+                        if originalClocks == nil {
+                            originalClocks = Dictionary(uniqueKeysWithValues: index.document.words.compactMap { word in
+                                word.projection.map { (word.id, $0.clock) }
+                            })
+                        }
+                        guard (originalClocks?[row.wordID] ?? index.document.clock) == .presentation,
+                              row.candidateTrackIDs.count <= 1 else {
+                            throw TranscriptDocument.invalid("Source timing is unavailable for this dialogue. Choose its timeline clock or select a bound recording track.")
+                        }
+                    }
+                    let source = row.file.map(Recording.file) ?? row.sourceID.map(Recording.source) ?? .unbound(position, row.trackID)
+                    guard recording == nil || recording == source else {
+                        throw TranscriptDocument.invalid("Select one recording for source captions using an attachment, file, or track filter.")
+                    }
+                    recording = source
+                    if let relative = row.sequenceSourceRange { range = relative }
+                    else if let id = row.sourceID, let offset = index.multicamClockOffsets[id], let source = row.sourceRange {
+                        range = try MulticamRange(from: source.from.subtracting(offset), to: source.to.subtracting(offset))
+                    }
+                }
+                let lane = CueLane(attachment: position, speaker: row.speakerID, track: row.trackID,
+                                   clip: row.clipID, assembly: row.assemblyIndex)
+                words.append(Cue(text: row.text, start: range.from, end: range.to, precision: row.precision,
+                                 utteranceID: row.utteranceID, speakerName: row.speakerID.flatMap { speakers[$0] }, lane: lane))
+            }
+        }
+        // Index rows are ordered on the selected clock. Separate attachments need a merge.
+        if indexes.count > 1 { words.sort { $0.start == $1.start ? $0.end < $1.end : $0.start < $1.start } }
+        let cues = groupWords(words, captions: true)
+        let text = try encodeTimed(cues, format: .srt, singleTrack: true, clock: "")
+        guard !text.isEmpty else { throw TranscriptDocument.invalid("No captions are available on the selected clock.") }
+        return (Data(text.utf8), count)
+    }
+
     static func encode(_ document: TranscriptDocument, format: TranscriptFormat) throws -> String {
         let speakers = Dictionary(uniqueKeysWithValues: document.speakers.map { ($0.id, $0.name) })
-        let cues = groupWords(document.words.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+        let words = document.words.compactMap { word -> Cue? in
+            guard !word.text.allSatisfy(\.isWhitespace) else { return nil }
+            let lane = CueLane(speaker: word.speakerID, track: word.projection?.trackID,
+                               clip: word.projection?.clipID, assembly: word.projection?.assemblyIndex)
+            return Cue(text: word.text, start: word.start, end: word.end, precision: word.precision,
+                       utteranceID: word.utteranceID, speakerName: word.speakerID.flatMap { speakers[$0] }, lane: lane)
+        }
+        let cues = groupWords(words, captions: false)
         if format == .text {
-            let lines = cues.map { cue in
-                renderText(cue.text, speaker: cue.speakerID.flatMap { speakers[$0] }, isVTT: false)
-            }
+            let lines = cues.map { renderText($0.text, speaker: $0.speakerName, isVTT: false) }
             return (["Transcript (\(clockLabel(document)))"] + lines).joined(separator: "\n") + "\n"
         }
+        return try encodeTimed(cues, format: format, singleTrack: false, clock: clockLabel(document))
+    }
+
+    private static func encodeTimed(_ cues: [Cue], format: TranscriptFormat, singleTrack: Bool, clock: String) throws -> String {
         let isVTT = format == .vtt
-        var output = isVTT ? "WEBVTT\n\nNOTE Clock: \(clockLabel(document))\n\n" : ""
+        var output = isVTT ? "WEBVTT\n\nNOTE Clock: \(clock)\n\n" : ""
         var index = 0
+        func appendCue(from start: Int64, to end: Int64, text: String) {
+            index += 1
+            if !isVTT { output += "\(index)\n" }
+            output += "\(timestamp(start, isVTT: isVTT)) --> \(timestamp(end, isVTT: isVTT))\n\(text)\n\n"
+        }
+
+        // An editor can show just one caption at a time on a subtitle track. Emit
+        // the lines visible between each pair of speaker entrances and exits.
+        var active: [(end: Int64, text: String)] = []
+        var cursor: Int64 = 0
+        func flush(until limit: Int64) {
+            while cursor < limit, let firstEnd = active.lazy.map(\.end).min() {
+                let boundary = min(firstEnd, limit)
+                let text = active.count == 1 ? active[0].text : active.lazy.map(\.text).joined(separator: "\n")
+                appendCue(from: cursor, to: boundary, text: text)
+                cursor = boundary
+                active.removeAll { $0.end == boundary }
+            }
+            cursor = limit
+        }
+
         for cue in cues.sorted(by: { $0.start < $1.start }) {
             guard cue.end > .zero || cue.start == .zero else { continue }
             let start = try max(cue.start, .zero).roundedToSamples(1000)
@@ -160,11 +261,16 @@ enum TranscriptSubtitles {
             guard cueEnd > start else {
                 throw TranscriptDocument.invalid("Subtitle timestamp exceeds the supported millisecond range")
             }
-            index += 1
-            if !isVTT { output += "\(index)\n" }
-            let text = renderText(cue.text, speaker: cue.speakerID.flatMap { speakers[$0] }, isVTT: isVTT)
-            output += "\(timestamp(start, isVTT: isVTT)) --> \(timestamp(cueEnd, isVTT: isVTT))\n\(text)\n\n"
+            let payload = renderText(cue.text, speaker: cue.speakerName, isVTT: isVTT)
+            let text = singleTrack && cue.precision == .word ? captionLines(payload).joined(separator: "\n") : payload
+            if singleTrack {
+                flush(until: start)
+                active.append((cueEnd, text))
+            } else {
+                appendCue(from: start, to: cueEnd, text: text)
+            }
         }
+        if singleTrack { flush(until: .max) }
         return output
     }
 
@@ -179,41 +285,27 @@ enum TranscriptSubtitles {
         return label + (document.approximateClock ? " (approximate)" : "")
     }
 
-    /// The words one speaker says on one track of one edit interval.
-    private struct CueLane: Hashable {
-        let speaker: String?
-        let track: String?
-        let clip: String?
-        let assembly: Int?
-
-        init(_ word: TranscriptWord) {
-            speaker = word.speakerID
-            track = word.projection?.trackID
-            clip = word.projection?.clipID
-            assembly = word.projection?.assemblyIndex
-        }
-    }
-
     /// Joins the words of an utterance into one cue. People talk over each other, and in time
     /// order their words alternate; each speaker's cue carries on across the other's words
     /// instead of ending at every one. The cues stay in the order they begin, so overlapping
     /// speech reads as whole lines and as cues that overlap.
-    private static func groupWords(_ words: [TranscriptWord]) -> [TranscriptWord] {
-        var result: [TranscriptWord] = []
+    private static func groupWords(_ words: [Cue], captions: Bool) -> [Cue] {
+        var result: [Cue] = []
         // The cue each lane is still adding to, and the last word of every cue.
         var open: [CueLane: Int] = [:]
         var tails: [Int] = []
         var latest: Int?
         let pauseLimit = RationalTime(numerator: 1)
         for (position, word) in words.enumerated() {
-            let lane = CueLane(word)
+            let lane = word.lane
             let cue: Int?
-            if let latest, CueLane(result[latest]) == lane { cue = latest } else { cue = open[lane] }
+            if let latest, result[latest].lane == lane { cue = latest } else { cue = open[lane] }
             if let cue, word.precision == .word, result[cue].precision == .word,
-               let utteranceID = word.utteranceID, let spoken = words[tails[cue]].utteranceID,
                word.start >= result[cue].start,
                (try? word.start.subtracting(result[cue].end)).map({ $0 <= pauseLimit }) == true,
-               utteranceID == spoken || wasTalkedOver(result[cue], before: position, after: tails[cue], in: words) {
+               (word.utteranceID != nil && words[tails[cue]].utteranceID != nil || captions),
+               word.utteranceID == words[tails[cue]].utteranceID || wasTalkedOver(result[cue], before: position, after: tails[cue], in: words),
+               !captions || fitsCaption(result[cue], adding: word) {
                 result[cue].text += word.text
                 result[cue].end = max(result[cue].end, word.end)
                 tails[cue] = position
@@ -228,12 +320,41 @@ enum TranscriptSubtitles {
         return result
     }
 
+    private static func fitsCaption(_ cue: Cue, adding word: Cue) -> Bool {
+        guard let duration = try? max(cue.end, word.end).subtracting(cue.start),
+              duration <= RationalTime(numerator: 6) else { return false }
+        let body = (cue.text + word.text).trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = cue.speakerName.map { "[\($0)] " + body } ?? body
+        let length = text.count
+        return length <= 42 || length <= 85 && captionLines(text).count <= 2
+    }
+
+    private static func captionLines(_ text: String) -> [String] {
+        var lines: [String] = []
+        var line = ""
+        for token in text.split(whereSeparator: \.isWhitespace) {
+            var word = token
+            if !line.isEmpty && line.count + 1 + word.count > 42 {
+                lines.append(line)
+                line = ""
+            }
+            while let split = word.index(word.startIndex, offsetBy: 42, limitedBy: word.endIndex), split < word.endIndex {
+                lines.append(String(word[..<split]))
+                word = word[split...]
+            }
+            if !line.isEmpty { line += " " }
+            line += word
+        }
+        if !line.isEmpty { lines.append(line) }
+        return lines
+    }
+
     /// Whether another lane spoke across the join between a cue and its lane's next word.
     /// A recognizer that numbers utterances in conversation order starts a new one each time
     /// the speaker changes, so a sentence someone talked over arrives as fragments. A cue that
     /// already ended its sentence is left as it is.
-    private static func wasTalkedOver(_ cue: TranscriptWord, before next: Int, after tail: Int,
-                                      in words: [TranscriptWord]) -> Bool {
+    private static func wasTalkedOver(_ cue: Cue, before next: Int, after tail: Int,
+                                      in words: [Cue]) -> Bool {
         guard tail + 1 < next else { return false }
         let ending = cue.text.trimmingCharacters(in: .whitespacesAndNewlines.union(.init(charactersIn: "\"’”)]")))
         guard ending.last.map({ ".?!…".contains($0) }) != true else { return false }

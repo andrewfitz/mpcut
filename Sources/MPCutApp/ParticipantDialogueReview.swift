@@ -64,7 +64,7 @@ struct ParticipantDialogueReview: View {
             var rhs = new
             lhs.participants.render = nil
             rhs.participants.render = nil
-            if lhs != rhs || old.participants.render?.redactions != new.participants.render?.redactions { reset() }
+            if lhs != rhs || old.participants.effectiveRedactions != new.participants.effectiveRedactions { reset() }
         }
         .onChange(of: minimum) { _, _ in reset() }
         .onChange(of: overlap) { _, _ in reset() }

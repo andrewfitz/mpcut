@@ -156,9 +156,27 @@ int mp_participant_scan_adaptive(const char *path, int stream, int sample_limit,
                                  void *context, int *unplaced_damage, char *error, size_t capacity);
 
 typedef struct {
+    int64_t last_pts;
+    int64_t preroll_ticks;
+    // The width of a last stored sample that the edit ends before, so that it
+    // is never presented. last_pts is then the sample before it.
+    int64_t trailing_ticks;
+} MPParticipantEditTail;
+
+// Resume after this exact source-stream presentation timestamp (INT64_MIN for
+// a fresh scan). Pictures required for decoder preroll are never submitted.
+int mp_participant_scan_from(const char *path, int stream, int sample_limit, int64_t resume_anchor,
+                             MPProbeCancelled cancelled,
+                             MPParticipantSampleVisit coarse, MPParticipantSampleVisit frame,
+                             MPParticipantPrepare prepare, MPParticipantDiscard discard, MPSceneVisit scene,
+                             void *context, int *unplaced_damage, MPParticipantEditTail *edit_tail, char *error, size_t capacity);
+
+typedef struct {
     int valid, tb_num, tb_den;
     int64_t first_pts, origin, end;
 } MPSceneTiming;
+int mp_scene_uses_segment_cadence(const char *path, int stream, int64_t origin,
+                                  int rate_num, int rate_den, MPProbeCancelled cancelled, void *context);
 int mp_scene_verify_clock(const char *path, int stream, MPProbeCancelled cancelled,
                           void *context, MPSceneTiming *timing);
 int mp_scene_scan(const char *path, int stream, int allow_asset_reader,
@@ -166,7 +184,7 @@ int mp_scene_scan(const char *path, int stream, int allow_asset_reader,
                   void *context, MPSceneTiming *timing, char *error, size_t capacity);
 
 enum { MP_SCENE_RESUME_MISMATCH = 1, MP_SCENE_SCAN_CANCELLED = 2 };
-enum { MP_PARTICIPANT_UNSUPPORTED_DISPLAY_TRANSFORM = 3 };
+enum { MP_PARTICIPANT_UNSUPPORTED_DISPLAY_TRANSFORM = 3, MP_PARTICIPANT_RESUME_ANCHOR_MISSING = 8 };
 // Leading scene's descriptor, emitted separately from actual scene boundaries.
 #define MP_SCENE_RANGE_LEADING_PTS (INT64_MIN + 1)
 typedef struct {

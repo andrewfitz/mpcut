@@ -367,7 +367,7 @@ final class MulticamTierGate {
                 var items = project.assemblyItems ?? [.group(project.range)]
                 guard items.indices.contains(edge.range - 1), let range = items[edge.range - 1].group,
                       let moved = MulticamEdgeSuggestion(edge: edge, times: [to]).moving(range, to: to) else { return false }
-                items[edge.range - 1] = .group(moved, angle: items[edge.range - 1].angleOverride)
+                items[edge.range - 1] = items[edge.range - 1].trimmingGroup(to: moved)
                 project.assemblyItems = items
             }
             return true

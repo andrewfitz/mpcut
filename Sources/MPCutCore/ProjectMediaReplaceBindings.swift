@@ -6,44 +6,70 @@ extension ReplaceEdit {
         guard let media else { return }
         let existing = participants.sources.first { $0.sourceID == id }
         let existingDestination = id != newID ? participants.sources.first { $0.sourceID == newID } : nil
-        let redacted = participants.render?.redactions.map(\.participantID) ?? []
+        let redactions = participants.effectiveRedactions
+        let legacy = participants.render?.redactions ?? []
+        let legacyScope = redactions.contains(where: legacy.contains)
+        let roster = Set(participants.people.map(\.id))
+        let treated = Set(redactions.map(\.participantID))
+        func knownFeeds(_ source: ParticipantSourceGeometry) -> Set<String> {
+            Set(source.appearances.compactMap(\.participantID)).union(source.historicalParticipantIDs ?? [])
+                .union(source.unresolvedParticipantIDs).intersection(roster)
+        }
+        func scope(_ source: ParticipantSourceGeometry) -> Set<String> {
+            if legacyScope || source.appearances.contains(where: \.hasUnresolvedIdentity)
+                || (source.appearances.isEmpty && source.analysisIdentity == nil) { return roster }
+            return knownFeeds(source)
+        }
         if !preserveOriginal, id != newID {
             participants.render = participants.render?.mapSourcePaths { $0 == id ? newID : $0 }
         }
-        guard existing != nil || existingDestination != nil || !redacted.isEmpty else {
+        guard existing != nil || legacyScope else {
             remapParticipantAudio(&participants, id: id, newID: newID, preserveOriginal: preserveOriginal)
             return
         }
 
         let previousDigest = existing?.sourceContentSHA256
-        if previousDigest != nil, candidateDigest == nil {
+        if previousDigest != nil || existingDestination?.sourceContentSHA256 != nil, candidateDigest == nil {
             candidateDigest = try participantSourceDigest(candidate, identity: identity, cancelled: cancelled)
         }
+        let destinationIsCurrent = existingDestination?.sourceContentSHA256 != nil
+            && existingDestination?.sourceContentSHA256 == candidateDigest
         let compatibleLayout = existingDestination.map {
             ($0.feedLayout ?? .meeting) == (existing?.feedLayout ?? .meeting)
         } ?? true
         let copied = compatibleLayout && previousDigest != nil && previousDigest == candidateDigest
         var replacement = existing ?? .init(sourceID: newID)
         replacement.sourceID = newID
+        replacement.confirmations = nil
         replacement.sourceStamp = SceneSourceStamp(media: media)
         replacement.sourceInode = identity.inode
 
         let oldOverrides = participants.appearanceOverrides.filter { $0.sourceID == id }
-        if copied {
-            report.warnings.append("Accepted participant geometry is retained for the identical recording and feed layout.")
-        } else {
-            let affected = participants.people.map(\.id)
+        if copied, id != newID, !preserveOriginal {
+            for index in participants.people.indices where participants.people[index].legacyPresentation?.sourceID == id {
+                participants.people[index].legacyPresentation?.sourceID = newID
+            }
+        }
+        if !copied {
+            // The destination may already have its own accepted review, used by
+            // other clips. Only invalidate geometry that lacks content proof.
+            let geometry = [existing, destinationIsCurrent ? nil : existingDestination].compactMap { $0 }
+            let affected = legacyScope ? roster : geometry.reduce(into: Set<String>()) { $0.formUnion(scope($1)) }
+            let history = geometry.reduce(into: Set<String>()) { $0.formUnion(knownFeeds($1)) }
+            replacement.scanEvents = []
+            replacement.countHints = nil
+            replacement.layoutCapacityRanges = nil
             replacement.analysisIdentity = nil
             replacement.sourceContentSHA256 = nil
             replacement.appearances = []
             replacement.coverage = []
+            replacement.historicalParticipantIDs = history.isEmpty ? nil : history.sorted()
             replacement.unresolvedParticipantIDs = affected.sorted()
             report.participantIDs = Set(report.participantIDs + affected).sorted()
-            report.affectedRedactionIDs = Set(report.affectedRedactionIDs + redacted).sorted()
+            report.affectedRedactionIDs = Set(report.affectedRedactionIDs).union(affected.intersection(treated)).sorted()
             report.warnings.append("Participant geometry and privacy treatments require review before participant export.")
 
-            let removed = Set(existing?.appearances.map(\.id) ?? [])
-                .union(existingDestination?.appearances.map(\.id) ?? [])
+            let removed = Set(geometry.flatMap { $0.appearances.map(\.id) })
             report.removedAppearanceIDs = Set(report.removedAppearanceIDs).union(removed).sorted()
             let slots = participants.render?.shots.flatMap(\.slots) ?? []
             report.affectedParticipantSlotIDs = Set(report.affectedParticipantSlotIDs + slots.filter {
@@ -51,23 +77,36 @@ extension ReplaceEdit {
                     ($0.target == .presentation && removed.contains($0.id))
             }.map(\.id)).sorted()
             report.affectedParticipantBindingIDs = Set(report.affectedParticipantBindingIDs + participants.people.filter {
-                $0.audio != nil || !$0.speakers.isEmpty
+                affected.contains($0.id) && ($0.audio != nil || !$0.speakers.isEmpty)
             }.map(\.id)).sorted()
         }
         if !preserveOriginal {
             participants.appearanceOverrides.removeAll { $0.sourceID == id }
             participants.sources.removeAll { $0.sourceID == id }
         }
-        let destinationIsCurrent = existingDestination?.sourceContentSHA256 == candidateDigest
-            && existingDestination?.sourceContentSHA256 != nil
-        if copied, destinationIsCurrent, let index = participants.sources.firstIndex(where: { $0.sourceID == newID }) {
-            participants.sources[index].sourceStamp = replacement.sourceStamp
-            participants.sources[index].sourceInode = replacement.sourceInode
+        if destinationIsCurrent, let index = participants.sources.firstIndex(where: { $0.sourceID == newID }) {
+            var current = participants.sources[index]
+            let history = Set(current.historicalParticipantIDs ?? []).union(knownFeeds(replacement))
+            current.historicalParticipantIDs = history.isEmpty ? nil : history.sorted()
+            var unresolved = Set(current.unresolvedParticipantIDs).union(replacement.unresolvedParticipantIDs)
+            if copied && (current.appearances != replacement.appearances || current.coverage != replacement.coverage) {
+                let affected = scope(replacement)
+                unresolved.formUnion(affected)
+                report.participantIDs = Set(report.participantIDs).union(affected).sorted()
+                report.affectedRedactionIDs = Set(report.affectedRedactionIDs).union(affected.intersection(treated)).sorted()
+                report.warnings.append("The destination has a different tile review for the same recording. Resolve the conflicting assignments before participant export.")
+            }
+            current.unresolvedParticipantIDs = unresolved.sorted()
+            current.sourceStamp = replacement.sourceStamp
+            current.sourceInode = replacement.sourceInode
+            current.confirmations = nil
+            participants.sources[index] = current
         } else {
             participants.sources.removeAll { $0.sourceID == newID }
             participants.appearanceOverrides.removeAll { $0.sourceID == newID }
             participants.sources.append(replacement)
             if copied {
+                report.warnings.append("Accepted participant geometry is retained for the identical recording and feed layout.")
                 participants.appearanceOverrides += oldOverrides.map {
                     var copy = $0
                     copy.sourceID = newID
@@ -80,7 +119,8 @@ extension ReplaceEdit {
 
     private func remapParticipantAudio(_ participants: inout ParticipantProject, id: String, newID: String,
                                        preserveOriginal: Bool) {
-        guard id != newID, !preserveOriginal else { return }
+        guard !preserveOriginal else { return }
+        if case .multicam = project { return }
         for index in participants.people.indices {
             guard let selection = participants.people[index].audio?.selection, selection.source == id else { continue }
             participants.people[index].audio?.selection = .init(source: newID, stream: mapStream(selection.stream))

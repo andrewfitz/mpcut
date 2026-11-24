@@ -94,3 +94,17 @@ ffmpeg -hide_banner -loglevel error -nostdin -stream_loop 11 \
   --file /tmp/mpcut-participant-gallery/gallery-1080p.mov \
   --backend cpu-only --sampling sparse --no-sidecar --json
 ```
+
+## Forty-feed ISO export
+
+The core test `ParticipantISORenderTests/testFortyFeedRenderSharesOneDecoder` exports forty distinct solo crops from one second of the committed GOP fixture. It renders an 8 fps, 160 × 90 movie per crop, verifies each movie's timing, and checks that all crops use one picture reader in one pass. The test expects eight requests to the decoder for 320 composed output frames. A decoder can also read intervening dependency frames between those requests.
+
+```sh
+swift build --build-tests
+test_products=$(swift build --show-bin-path)
+backstage launch "$(xcrun --find xctest)" --env MPCUT_MUTED=1 -- \
+  -XCTest ParticipantISORenderTests/testFortyFeedRenderSharesOneDecoder \
+  "$test_products/MPCutCoreTests.xctest"
+```
+
+The test prints peak process RSS and wall time. The forty output pools account for at most 32 MiB of input pixel surfaces with the fixture's resolution and row alignment. The exporter schedules batches against a 192 MiB input-surface budget, with a minimum batch of one writer for canvases that individually exceed the budget. The decoder, encoder services, project indexes and Core Image can use additional memory. If an encoder cannot start or supply a surface, the exporter retries that batch in smaller groups. Each retry starts a new forward pass. Finished and verified movies are checkpointed by the delivery, so an interrupted encode reopens only the unfinished jobs.

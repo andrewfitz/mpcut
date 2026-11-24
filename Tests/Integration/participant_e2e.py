@@ -197,6 +197,25 @@ class ParticipantFixtureCase(unittest.TestCase):
         self.assertLessEqual(max(abs(value - target) for value, target in zip(actual, expected)), tolerance,
                              f"{context}, pixel ({x}, {y}): {actual} != {expected}")
 
+    def assert_render_parity(self, old_project, migrated_project, old_frames, migrated_frames):
+        frame_times = [flag for index in range(len(old_frames)) for flag in ("--at", str(Fraction(index, FPS)))]
+        images = []
+        for project in (old_project, migrated_project):
+            directory = self.folder / (project.stem + "-review")
+            result = self.cli("review", "frames", "export", "--project", str(project), "--clock", "assembly",
+                              "--preset", "full", "--output", str(directory), *frame_times)
+            self.assertEqual(len(result["frames"]), len(old_frames))
+            images.append([(directory / frame["file"]).read_bytes() for frame in result["frames"]])
+        for index, (old_image, migrated_image) in enumerate(zip(*images, strict=True)):
+            self.assertTrue(old_image == migrated_image, f"program review image differs at frame {index}")
+
+        # Independent H.264 encodes can quantize the same picture differently.
+        for index, (old_frame, migrated_frame) in enumerate(zip(old_frames, migrated_frames, strict=True)):
+            differences = [abs(old_value - new_value) for old_value, new_value in
+                           zip(old_frame, migrated_frame, strict=True)]
+            self.assertLessEqual(max(differences), 22, f"largest pixel difference in frame {index}")
+            self.assertLessEqual(sum(differences) / len(differences), 1, f"mean pixel difference in frame {index}")
+
     def iso_pcm(self):
         return bytes(2 * int(self.iso_offset * RATE)) + sound(self.recorder, 1)
 
@@ -225,7 +244,7 @@ class ParticipantE2E(ParticipantFixtureCase):
 
         assert_stale(document)
         # A later mask edit submitted without stamps cannot trust the new inode.
-        participants = read_project(document)["participants"]
+        participants = self.cli("participants", "project", "inspect", "--project", str(document))
         source, = participants["sources"]
         del source["source_stamp"], source["source_inode"]
         revised = self.folder / "edited.cut"
@@ -530,6 +549,31 @@ class ParticipantE2E(ParticipantFixtureCase):
         expected = sound(self.gallery)[2 * RATE: 6 * RATE] * 2
         self.assertEqual(sound(output), expected)
 
+        # A script that reads the old format, edits its JSON and renders a saved
+        # copy must keep the default and the occurrence-specific timing intact.
+        old = self.folder / "before-tiles.cut"
+        old_payload = read_project(base)
+        old_payload["participants"] = self.cli("participants", "project", "inspect", "--project", str(approved))
+        old_payload["participants"]["render"] = render
+        old.write_text(json.dumps(old_payload))
+        original = old.read_bytes()
+        inspected = self.cli("participants", "project", "inspect", "--project", str(old))
+        self.assertEqual(inspected["render"], render)
+        inspected["people"][0]["name"] = "The host"
+        migrated = self.folder / "after-tiles.cut"
+        self.cli("participants", "project", "apply", request={
+            "project_path": str(old), "out_project": str(migrated), "participants": inspected,
+        })
+        self.assertEqual(old.read_bytes(), original)
+        stored = read_project(migrated)
+        self.assertIn("tile_output", stored["participants"])
+        self.assertTrue(stored["assembly"][1]["tile_layouts"])
+        self.assertEqual(self.cli("participants", "project", "inspect", "--project", str(migrated)), inspected)
+        migrated_output, _ = self.export(migrated, "migrated-interview")
+        self.assert_render_parity(old, migrated, frames,
+                                  self.decode(migrated_output, size=(320, 90), frame_count=4 * FPS))
+        self.assertEqual(sound(migrated_output), expected)
+
         render["redactions"] = [{"participant_id": "guest", "treatment": "opaque", "color": color(COVER)}]
         output, _ = self.export(approved, "interview-redacted", render)
         frames = self.decode(output, size=(320, 90), frame_count=4 * FPS)
@@ -538,12 +582,84 @@ class ParticipantE2E(ParticipantFixtureCase):
             self.assert_color(frame, 320, 80, 45, left, f"redacted left frame {index}")
             self.assert_color(frame, 320, 240, 45, COVER, f"redacted right frame {index}")
 
+    def test_old_script_refuses_clip_layout_without_changing_project(self):
+        approved = self.approved(self.base())
+        participants = self.cli("participants", "project", "inspect", "--project", str(approved))
+        participants["sources"][0]["source_id"] = str(self.gallery)
+        participants["people"][1].pop("audio")
+        sequence = self.folder / "clip-layout.cut"
+        sequence.write_text(json.dumps({
+            "format": "mpcut", "schema_version": 4, "kind": "sequence",
+            "clips": [{"id": "first", "file": str(self.gallery), **interval(0, 2)},
+                      {"id": "second", "file": str(self.gallery), **interval(0, 2)}],
+            "participants": participants,
+        }))
+        self.cli("tiles", "layout", "set", "--project", str(sequence), "--clip-id", "second",
+                 "--layout", "solo", "--feed-id", "guest", "--in-place")
+        original = sequence.read_bytes()
+        inspected = self.cli("participants", "project", "inspect", "--project", str(sequence), ok=False)
+        self.assertEqual(inspected["error"]["code"], "unsupported_legacy_participant_edit")
+        applied = self.cli("participants", "project", "apply", request={
+            "project_path": str(sequence), "in_place": True, "participants": participants,
+        }, ok=False)
+        self.assertEqual(applied["error"]["code"], "unsupported_legacy_participant_edit")
+        self.assertEqual(sequence.read_bytes(), original)
+
+    def test_legacy_presentations_migrate_to_distinct_feeds_and_keep_old_wire_shape(self):
+        original = self.approved(self.base())
+        payload = read_project(original)
+        participants = payload["participants"]
+        source, = participants["sources"]
+        shared_bounds = {"x": 0.0, "y": 0.0, "width": 0.5, "height": 0.5}
+        for tile, start, end in [("slides", 0, 1), ("slides", 1, 3), ("second-share", 3, 5)]:
+            source["appearances"].append({
+                "id": tile, "range": interval(start, end), "bounds": shared_bounds,
+                "state": "presentation", "role": "presentation",
+            })
+        participants["render"] = plan("solo", slot("slides", target="presentation"))
+        original.write_text(json.dumps(payload))
+        old = self.cli("participants", "project", "inspect", "--project", str(original))
+        self.assertEqual([person["id"] for person in old["people"]], ["host", "guest"])
+        self.assertTrue(all("participant_id" not in tile for tile in old["sources"][0]["appearances"]
+                            if tile["role"] == "presentation"))
+        before, _ = self.export(original, "legacy-slides")
+
+        copy = self.folder / "slides-migrated.cut"
+        self.cli("participants", "project", "apply", request={
+            "project_path": str(original), "out_project": str(copy), "participants": old,
+        })
+        native = read_project(copy)["participants"]
+        shares = [tile["participant_id"] for tile in native["sources"][0]["appearances"]
+                  if tile["role"] == "presentation"]
+        self.assertEqual(shares[0], shares[1])
+        self.assertNotEqual(shares[0], shares[2])
+        self.assertEqual(len(native["people"]), 4)
+        self.assertEqual(self.cli("participants", "project", "inspect", "--project", str(copy)), old)
+        after, _ = self.export(copy, "migrated-slides")
+        self.assert_render_parity(original, copy, self.decode(before), self.decode(after))
+
+        old["people"][0]["name"] = "Host Edited by Script"
+        self.cli("participants", "project", "apply", request={
+            "project_path": str(copy), "in_place": True, "participants": old,
+        })
+        revised = read_project(copy)["participants"]
+        self.assertEqual([tile["participant_id"] for tile in revised["sources"][0]["appearances"]
+                          if tile["role"] == "presentation"], shares)
+        self.cli("tiles", "feeds", "rename", "--project", str(copy), "--feed-id", shares[0],
+                 "--name", "Laptop", "--in-place")
+        updated = copy.read_bytes()
+        refused = self.cli("participants", "project", "apply", ok=False, request={
+            "project_path": str(copy), "in_place": True, "participants": old,
+        })
+        self.assertEqual(refused["error"]["code"], "unsupported_legacy_participant_edit")
+        self.assertEqual(copy.read_bytes(), updated)
+
     def test_ordinary_project_export_keeps_saved_privacy(self):
         redaction = {"participant_id": "guest", "treatment": "opaque", "color": color(COVER)}
         render = plan("original", size=(WIDTH, HEIGHT), redactions=[redaction])
         multicam = self.approved(self.base(), render=render)
         sequence = self.folder / "sequence.cut"
-        participants = read_project(multicam)["participants"]
+        participants = self.cli("participants", "project", "inspect", "--project", str(multicam))
         participants["sources"][0]["source_id"] = str(self.gallery)
         participants["people"][1].pop("audio")
         sequence.write_text(json.dumps({"format": "mpcut", "schema_version": 4, "kind": "sequence",
@@ -581,15 +697,19 @@ class ParticipantE2E(ParticipantFixtureCase):
             self.assertFalse(output.exists())
 
 
-    def test_project_frame_export_refuses_saved_composition(self):
+    def test_project_frame_export_applies_saved_composition(self):
         redaction = {"participant_id": "guest", "treatment": "opaque", "color": color(COVER)}
-        project = self.approved(self.base(), render=plan("original", redactions=[redaction]))
-        frames = self.folder / "frames"
+        project = self.approved(self.base(), render=plan("original", size=(WIDTH, HEIGHT), redactions=[redaction]))
         for clock in ("group", "assembly"):
-            refused = self.cli("review", "frames", "export", "--project", str(project), "--at", "0",
-                               "--clock", clock, "--output", str(frames), ok=False)
-            self.assertEqual(refused["error"]["code"], "participant_render_unavailable", refused)
-            self.assertFalse(frames.exists())
+            frames = self.folder / clock
+            result = self.cli("review", "frames", "export", "--project", str(project), "--at", "0",
+                              "--clock", clock, "--preset", "full", "--output", str(frames))
+            frame, = result["frames"]
+            image = ffmpeg("-i", frames / frame["file"], "-pix_fmt", "rgb24", "-f", "rawvideo", "-")
+            for tile in tiles_at(0):
+                x, y, width, height = tile.rect
+                expected = COVER if tile.participant == "guest" else HOST
+                self.assert_color(image, frame["width"], x + width // 2, y + height // 2, expected, clock)
 
 
 if __name__ == "__main__":

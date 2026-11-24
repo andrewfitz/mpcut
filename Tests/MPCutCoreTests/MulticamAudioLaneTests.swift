@@ -180,7 +180,7 @@ final class MulticamAudioLaneTests: XCTestCase {
         let reopened = try CutProject.loadDocument(from: url, limit: 10)
         XCTAssertEqual(reopened.project, .multicam(mix))
         XCTAssertEqual(reopened.undo, undo)
-        var v4 = try XCTUnwrap(JSONSerialization.jsonObject(with: CutProject.documentJSON(saved: Data(contentsOf: url))) as? [String: Any])
+        var v4 = try XCTUnwrap(JSONSerialization.jsonObject(with: CutProject.documentJSON(at: url)) as? [String: Any])
         XCTAssertEqual(v4["schema_version"] as? Int, 4)
         v4["schema_version"] = 3
         XCTAssertThrowsError(try CutProject.decode(JSONSerialization.data(withJSONObject: v4)))

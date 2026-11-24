@@ -167,7 +167,7 @@ final class CutProjectTests: XCTestCase {
             "{\(header),\"clips\":[],\"clips\":[]}",
             "{\(header),\"clips\":[],\"unknown\":true}",
             #"{"schema_version":3,"kind":"sequence","clips":[]}"#,
-            #"{"schema_version":8,"format":"mpcut","kind":"sequence","clips":[]}"#,
+            #"{"schema_version":1000,"format":"mpcut","kind":"sequence","clips":[]}"#,
             "{\(header),\"clips\":[{\"id\":\"a\",\"file\":\"file\",\"from\":\"1\",\"to\":\"1\"}]}",
         ]
         for document in cases {

@@ -33,6 +33,7 @@ final class FFPreviewReader: @unchecked Sendable {
     private let audioOnly: Bool
     private var decoder: OpaquePointer?
     private var url: URL?
+    private var sourceIdentity: SourceIdentity?
     private var openedSoundOnly = false
     private var openedPictureOnly = false
     private var openedAudioTrack: Int?
@@ -74,6 +75,7 @@ final class FFPreviewReader: @unchecked Sendable {
         audioFinished = false
         func open() throws {
             mp_preview_close(decoder)
+            let identity = try? SourceIdentity(url)
             var error: UnsafePointer<CChar>?
             let context = Unmanaged.passUnretained(self).toOpaque()
             openedPictureOnly = !soundOnly && (videoOnly || !withAudio)
@@ -94,6 +96,7 @@ final class FFPreviewReader: @unchecked Sendable {
             openedOrigin = audioOrigin
             transform = mp_preview_transform(decoder)
             self.url = url
+            self.sourceIdentity = identity
             mp_preview_enable_audio(decoder, withAudio)
         }
         if self.url != url || decoder == nil || openedSoundOnly != soundOnly || openedOrigin != audioOrigin
@@ -173,7 +176,7 @@ final class FFPreviewReader: @unchecked Sendable {
             }
             guard let image else { continue }
             let frame = PreviewFrame(buffer: image, time: pts, transform: transform,
-                                     sourcePicture: .init(url: url, pts: pts))
+                                     sourcePicture: .init(url: url, pts: pts, identity: sourceIdentity))
             if nearbyKeyframe, !mp_preview_met_damage(decoder), frame.time.seconds >= target - 8,
                frame.time.seconds <= target, frame.time.seconds < end { return frame }
             if frame.time.seconds > target + 0.000_000_001, missing() {
@@ -250,7 +253,8 @@ final class FFPreviewReader: @unchecked Sendable {
                     }
                 } else if !videoFinished {
                     let frame = PreviewFrame(buffer: image, time: ffTime(max(sourceTime, target) + timelineOffset.seconds),
-                                             transform: transform, sourcePicture: .init(url: url, pts: sample.presentationTimeStamp))
+                                             transform: transform, sourcePicture: .init(url: url, pts: sample.presentationTimeStamp,
+                                                                                       identity: sourceIdentity))
                     let sourceEnd = sourceTime + sample.duration.seconds
                     // A held picture can cover the seek target while the next
                     // picture or EOF is still many batches of audio away.
@@ -656,7 +660,9 @@ final class WebSequencePlayback {
                 onGap()
             }
             if let last = video.lastIndex(where: { $0.time.seconds <= time }) {
-                onFrame(video[last])
+                var picture = video[last]
+                picture.timelinePictureTime = timelineRationalTime(picture.time.seconds)
+                onFrame(picture)
                 video.removeFirst(last + 1)
             }
             onTime(time)

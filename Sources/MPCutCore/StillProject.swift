@@ -373,10 +373,12 @@ public enum StillSequenceItem: Codable, Hashable, Sendable {
 }
 
 public enum StillAssemblyItem: Codable, Hashable, Sendable {
-    case group(MulticamRange, angle: String? = nil)
+    case group(MulticamRange, angle: String? = nil, id: String? = nil, layouts: [TileLayoutSpan] = [])
     case still(StillInsert)
 
-    private enum GroupKey: String, CodingKey { case kind, from, to, angle = "angle_id" }
+    private enum GroupKey: String, CodingKey {
+        case kind, from, to, id, angle = "angle_id", layouts = "tile_layouts"
+    }
 
     public init(from decoder: Decoder) throws {
         let v = try decoder.container(keyedBy: StillItemKey.self)
@@ -388,9 +390,12 @@ public enum StillAssemblyItem: Codable, Hashable, Sendable {
         if kind == "group" {
             try ProjectField.rejectUnknown(GroupKey.self, in: decoder)
             let group = try decoder.container(keyedBy: GroupKey.self)
+            let angle = try group.decodeIfPresent(String.self, forKey: .angle)
+            let id = try group.decodeIfPresent(String.self, forKey: .id)
+            let layouts = try group.decodeIfPresent([TileLayoutSpan].self, forKey: .layouts) ?? []
+            guard angle != nil || id != nil || !layouts.isEmpty else { throw stillError("Invalid typed group occurrence") }
             self = .group(.init(from: try ProjectField.time(group, .from),
-                                to: try ProjectField.time(group, .to)),
-                          angle: try group.decode(String.self, forKey: .angle))
+                                to: try ProjectField.time(group, .to)), angle: angle, id: id, layouts: layouts)
             return
         }
         try ProjectField.rejectUnknown(StillItemKey.self, in: decoder)
@@ -402,13 +407,15 @@ public enum StillAssemblyItem: Codable, Hashable, Sendable {
 
     public func encode(to encoder: Encoder) throws {
         switch self {
-        case .group(let range, let angle):
-            if let angle {
+        case .group(let range, let angle, let id, let layouts):
+            if angle != nil || id != nil || !layouts.isEmpty {
                 var v = encoder.container(keyedBy: GroupKey.self)
                 try v.encode("group", forKey: .kind)
                 try v.encode(range.from.description, forKey: .from)
                 try v.encode(range.to.description, forKey: .to)
-                try v.encode(angle, forKey: .angle)
+                try v.encodeIfPresent(angle, forKey: .angle)
+                try v.encodeIfPresent(id, forKey: .id)
+                if !layouts.isEmpty { try v.encode(layouts, forKey: .layouts) }
             } else {
                 try range.encode(to: encoder)
             }
@@ -420,13 +427,36 @@ public enum StillAssemblyItem: Codable, Hashable, Sendable {
     }
 
     public var group: MulticamRange? {
-        if case .group(let range, _) = self { return range }
+        if case .group(let range, _, _, _) = self { return range }
         return nil
     }
 
     public var angleOverride: String? {
-        if case .group(_, let angle) = self { return angle }
+        if case .group(_, let angle, _, _) = self { return angle }
         return nil
+    }
+
+    public var occurrenceID: String? {
+        if case .group(_, _, let id, _) = self { return id }
+        return nil
+    }
+
+    public var tileLayouts: [TileLayoutSpan] {
+        if case .group(_, _, _, let layouts) = self { return layouts }
+        return []
+    }
+
+    /// Trims keep authored coverage available beyond the current edge.
+    package func trimmingGroup(to range: MulticamRange) -> Self {
+        .group(range, angle: angleOverride, id: occurrenceID, layouts: tileLayouts)
+    }
+
+    package func groupPiece(_ range: MulticamRange, from: RationalTime? = nil,
+                            to: RationalTime? = nil, keepingID: Bool = true) -> Self {
+        let layouts = tileLayouts.compactMap { $0.limited(from: from, to: to) }
+        return .group(range, angle: angleOverride,
+                      id: keepingID ? occurrenceID : occurrenceID.map { _ in ProjectIdentifier.make() },
+                      layouts: layouts)
     }
 
     public var still: StillInsert? {

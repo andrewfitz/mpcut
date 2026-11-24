@@ -57,20 +57,26 @@ package struct CutProjectMedia {
     package let mediaSnapshot: ProjectMediaSnapshot
     private let paths: [String: String]
 
-    fileprivate init(_ document: Document, diskRevision: ProjectDiskRevision? = nil) {
-        project = document.project
+    fileprivate init(_ document: Document, diskRevision: ProjectDiskRevision? = nil,
+                     migratedProject: CutProject? = nil) throws {
+        project = try migratedProject ?? document.project.migratingLegacyTiles()
         mediaSnapshot = document.mediaSnapshot
         self.diskRevision = diskRevision
         var paths = Dictionary(project.mediaPaths.map { ($0.1, $0.0) }, uniquingKeysWith: { first, _ in first })
         // Every history reference originates in the current timeline or a literal.
         // Copy runs never introduce a path, even beyond the editor's retention budget.
         for branch in [document.history?.undo ?? [], document.history?.redo ?? []] {
+            var sequence = project.sequenceItems != nil
             for step in branch {
+                if let timeline = step.timeline {
+                    sequence = timeline.sequenceItems != nil
+                    for (id, path) in timeline.mediaPaths { paths[path] = id }
+                }
                 for case .insert(.source(let clip)) in step.sequenceItems?.pieces ?? [] {
                     paths[clip.file] = clip.id
                     if let original = clip.originalFile { paths[original] = clip.id }
                 }
-                if project.sequenceItems != nil, let participants = step.participants {
+                if sequence, let participants = step.participants {
                     for (id, path) in participants.protectedMediaPaths { paths[path] = id }
                 }
                 if let delta = step.sourceSelects {
@@ -85,7 +91,7 @@ package struct CutProjectMedia {
                     if let file = change.after.file { paths[file] = change.trackID }
                 }
                 for delta in [step.angles, step.audioSources] {
-                    for case .insert(let source) in delta?.pieces ?? [] {
+                    for case .insert(let source) in delta?.pieces ?? [] where source.feedAngle == nil {
                         paths[source.file] = source.id
                         for recording in source.additionalRecordings { paths[recording.file] = recording.id }
                     }
@@ -116,10 +122,10 @@ package struct CutProjectMedia {
     package static func load(from url: URL, multicam: Bool = false) throws -> Self {
         if multicam {
             let (snapshot, revision) = try ProjectFile.readSnapshot(MulticamDocument.self, from: url, multicam: true)
-            return Self(snapshot.document, diskRevision: revision)
+            return try Self(snapshot.document, diskRevision: revision)
         }
         let (document, revision) = try ProjectFile.readSnapshot(Document.self, from: url)
-        return Self(document, diskRevision: revision)
+        return try Self(document, diskRevision: revision)
     }
 
     package static func decode(_ data: Data) throws -> Self {
@@ -159,7 +165,7 @@ extension CutProject {
     public static let maximumHistorySteps = 500
     fileprivate static let maximumMaterializedHistoryRecords = 1_000_000
 
-    private var historyRecordCount: Int {
+    fileprivate var historyRecordCount: Int {
         let authoredRecords = transcripts.authoring.count
         let stillRecords = authoredRecords + stillAssets.count + stillReplacements.count + stillFragmentCount
             + (programColorPolicy == nil ? 0 : 1) + (stillFormat == nil ? 0 : 1)
@@ -169,8 +175,11 @@ extension CutProject {
         case .stillSequence(let project): return project.items.count + stillRecords + project.sourceSelects.count
         case .multicam(let p):
             let recordings = p.angles.reduce(p.angles.count) { $0 + $1.additionalRecordings.count }
-            return recordings + p.audioSources.count + p.switches.count + (p.assemblyItems?.count ?? 0)
-                + p.mixLanes.count + p.audioReplacements.count + (p.fixedAudio == nil ? 0 : 1) + stillRecords
+            let pictureRecords = recordings + p.switches.count + (p.assemblyItems?.count ?? 0)
+                + p.groupTileLayouts.count + p.speakerAngles.count
+            let audioRecords = p.audioSources.count + p.mixLanes.count + p.audioReplacements.count
+                + (p.fixedAudio == nil ? 0 : 1)
+            return pictureRecords + audioRecords + stillRecords
         }
     }
 
@@ -294,7 +303,8 @@ extension CutProject {
               mediaSnapshot: ProjectMediaSnapshot = .empty, byteLimit: Int,
               replacingExisting: Bool = true) throws {
         let (bytes, sources) = try encodedArchive(undo: undo, redo: redo, mediaSnapshot: mediaSnapshot, byteLimit: byteLimit)
-        try ProjectFile.write(bytes, to: url, sources: sources, prefix: "cut", replacingExisting: replacingExisting)
+        try ProjectFile.write(bytes, to: url, sources: sources, prefix: "cut", replacingExisting: replacingExisting,
+                              byteLimit: byteLimit)
     }
 
     func encodedArchive(undo: [CutHistoryState], redo: [CutHistoryState],
@@ -380,7 +390,10 @@ extension CutProject {
 
     static func decodeMulticamDocument(_ data: Data) throws -> (project: MulticamProject, mediaSnapshot: ProjectMediaSnapshot) {
         let document = try ProjectFile.decode(MulticamDocument.self, data: data, multicam: true)
-        return (document.project, document.document.mediaSnapshot)
+        guard case .multicam(let project) = try document.document.project.migratingLegacyTiles() else {
+            throw historyError("Expected a multicam timeline")
+        }
+        return (project, document.document.mediaSnapshot)
     }
 
     public static func decodeDocument(_ data: Data, limit: Int) throws
@@ -424,12 +437,14 @@ private extension Document {
     func editorSnapshot(limit: Int, diskRevision: ProjectDiskRevision?) throws
         -> (project: CutProject, undo: [CutHistoryState], redo: [CutHistoryState], media: CutProjectMedia) {
         let states = try materialize(limit: limit, recordBudget: CutProject.maximumMaterializedHistoryRecords)
-        return (states.project, states.undo, states.redo, CutProjectMedia(self, diskRevision: diskRevision))
+        return (states.project, states.undo, states.redo,
+                try CutProjectMedia(self, diskRevision: diskRevision, migratedProject: states.project))
     }
 
     func materialize(limit: Int, recordBudget: Int) throws
         -> (project: CutProject, undo: [CutHistoryState], redo: [CutHistoryState], mediaSnapshot: ProjectMediaSnapshot) {
-        guard let archive = history else { return (project, [], [], mediaSnapshot) }
+        let migratedProject = try project.migratingLegacyTiles()
+        guard let archive = history else { return (migratedProject, [], [], mediaSnapshot) }
         var budget = recordBudget
         var undo: [CutHistoryState] = []
         var redo: [CutHistoryState] = []
@@ -442,7 +457,13 @@ private extension Document {
             if backwards { undo.append(state) } else { redo.append(state) }
             return true
         }
-        return (project, undo.reversed(), redo.reversed(), mediaSnapshot)
+        func migrated(_ entries: [CutHistoryState]) throws -> [CutHistoryState] {
+            try entries.reversed().map { state in
+                CutHistoryState(action: state.action, origin: state.origin, project: try state.project.migratingLegacyTiles(),
+                                bindingChanges: state.bindingChanges)
+            }
+        }
+        return try (migratedProject, migrated(undo), migrated(redo), mediaSnapshot)
     }
 }
 
@@ -506,7 +527,8 @@ private struct Document: Codable {
     func encode(to encoder: Encoder) throws {
         // The writer appends the media snapshot after selecting the history budget.
         try project.encode(to: encoder, requiresExtendedStillSchema: project.requiresExtendedStillSchema
-                           || history?.requiresExtendedStillSchema == true)
+                           || history?.requiresExtendedStillSchema == true,
+                           requiresTilesSchema: history?.requiresTilesSchema == true)
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encodeIfPresent(history, forKey: .history)
     }
@@ -537,6 +559,10 @@ private struct Archive: Encodable {
         undo.contains(where: \.requiresExtendedStillSchema) || redo.contains(where: \.requiresExtendedStillSchema)
     }
 
+    var requiresTilesSchema: Bool {
+        undo.contains(where: \.requiresTilesSchema) || redo.contains(where: \.requiresTilesSchema)
+    }
+
     init(from decoder: Decoder, version: Int) throws {
         let legacy = version == 3
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_cut_history")
@@ -548,7 +574,8 @@ private struct Archive: Encodable {
         var remainingPieces = CutProject.maximumMaterializedHistoryRecords
         let listFields: [Step.CodingKeys] = [.angles, .audioSources, .switches, .mixLanes, .audioReplacements, .fixedAudio,
                                                 .sequenceItems, .assemblyItems, .stillAssets, .stillReplacements,
-                                                .programColorPolicy, .stillFormat, .stillSoundtrack, .transcriptAuthoring, .transcriptBindings, .sourceSelects]
+                                                .programColorPolicy, .stillFormat, .stillSoundtrack, .transcriptAuthoring,
+                                                .transcriptBindings, .sourceSelects, .groupTileLayouts, .speakerAngles]
         for key: CodingKeys in [.undo, .redo] where values.contains(key) {
             var steps = try values.nestedUnkeyedContainer(forKey: key)
             guard let count = steps.count, count <= remainingSteps else {
@@ -594,6 +621,18 @@ private struct Archive: Encodable {
             var result = try values.decodeIfPresent([Step].self, forKey: key) ?? []
             if version < CutProject.schemaVersion, result.contains(where: \.requiresExtendedStillSchema) {
                 throw historyError("These still history changes require project schema version \(CutProject.schemaVersion)")
+            }
+            if version < CutProject.tilesSchemaVersion, result.contains(where: \.requiresTilesSchema) {
+                throw historyError("Tile changes require project schema version \(CutProject.tilesSchemaVersion)")
+            }
+            for step in result {
+                if let timeline = step.timeline {
+                    let count = timeline.historyRecordCount
+                    guard count <= remainingPieces else {
+                        throw historyError("Project history exceeds the stored-record limit")
+                    }
+                    remainingPieces -= count
+                }
             }
             if legacy {
                 for index in result.indices {
@@ -744,6 +783,7 @@ extension ListDelta where Element == StillSequenceItem {
 private struct Step: Codable {
     var action: String
     var origin: HistoryOrigin
+    var timeline: CutProject?
     var referenceAngle: String?
     var range: MulticamRange?
     var audio: MulticamAudioPolicy?
@@ -756,6 +796,8 @@ private struct Step: Codable {
     var switches: ListDelta<MulticamSwitch>?
     var sequenceItems: ListDelta<StillSequenceItem>?
     var assemblyItems: ListDelta<StillAssemblyItem>?
+    var groupTileLayouts: ListDelta<TileLayoutSpan>?
+    var speakerAngles: ListDelta<TileSpeakerAngle>?
     var stillAssets: ListDelta<StillAsset>?
     var stillReplacements: ListDelta<StillReplacement>?
     var programColorPolicy: ListDelta<StillProgramColorPolicy>?
@@ -770,6 +812,27 @@ private struct Step: Codable {
             return false
         } == true
     }
+    var requiresTilesSchema: Bool {
+        if timeline != nil || groupTileLayouts != nil || speakerAngles != nil { return true }
+        if let participants, CutProject.stillSequence(.init(items: [], participants: participants)).usesTilesFormat { return true }
+        if angles?.pieces.contains(where: {
+            if case .insert(let angle) = $0 { return angle.feedAngle != nil }
+            return false
+        }) == true { return true }
+        if assemblyItems?.pieces.contains(where: {
+            if case .insert(let item) = $0 { return item.occurrenceID != nil || !item.tileLayouts.isEmpty }
+            return false
+        }) == true { return true }
+        if stillSoundtrack?.pieces.contains(where: {
+            if case .insert(let clip) = $0 { return !clip.tileLayouts.isEmpty }
+            return false
+        }) == true { return true }
+        return sequenceItems?.pieces.contains {
+            if case .insert(.source(let clip)) = $0 { return !clip.tileLayouts.isEmpty }
+            return false
+        } == true
+    }
+
     var transcriptAuthoring: ListDelta<TranscriptAuthoredRecord>?
     var transcriptBindings: [TranscriptBindingChange]?
     var sourceSelects: ListDelta<NamedSourceSelect>?
@@ -778,10 +841,11 @@ private struct Step: Codable {
     var changesTimelineItems: Bool {
         sequenceItems != nil || assemblyItems != nil || stillAssets != nil || stillReplacements != nil
             || programColorPolicy != nil || stillFormat != nil || stillSoundtrack != nil
+            || groupTileLayouts != nil
     }
 
     enum CodingKeys: String, CodingKey {
-        case action, origin
+        case action, origin, timeline
         case referenceAngle = "reference_angle_id"
         case range = "group_range"
         case audio, angles
@@ -792,6 +856,8 @@ private struct Step: Codable {
         case switches
         case sequenceItems = "clips"
         case assemblyItems = "assembly"
+        case groupTileLayouts = "group_tile_layouts"
+        case speakerAngles = "speaker_angles"
         case stillAssets = "still_assets"
         case stillReplacements = "still_replacements"
         case programColorPolicy = "program_color_policy"
@@ -808,6 +874,13 @@ private struct Step: Codable {
         self.action = action
         self.origin = origin
         try validateAction()
+        let changes = bindingChanges ?? TranscriptBindingChange.changes(from: from.transcripts, to: to.transcripts)
+        let effectiveChanges = changes.filter { $0.before != $0.after }
+        guard Set(effectiveChanges.map(\.key)).count == effectiveChanges.count else {
+            throw historyError("Repeated transcript binding change")
+        }
+        for change in effectiveChanges { try change.validate() }
+        transcriptBindings = effectiveChanges.isEmpty ? nil : effectiveChanges
         switch (from, to) {
         case (.sequence, .sequence), (.sequence, .stillSequence), (.stillSequence, .sequence), (.stillSequence, .stillSequence):
             sourceSelects = ListDelta(from: from.sourceSelects, to: to.sourceSelects)
@@ -826,17 +899,18 @@ private struct Step: Codable {
             fixedAudio = ListDelta(from: [old.fixedAudio].compactMap { $0 }, to: [new.fixedAudio].compactMap { $0 })
             switches = ListDelta(from: old.switches, to: new.switches)
             assemblyItems = ListDelta(from: old.assemblyItems ?? [], to: new.assemblyItems ?? [])
-        default: throw historyError("History states must have the same timeline kind")
+            groupTileLayouts = ListDelta(from: old.groupTileLayouts, to: new.groupTileLayouts)
+            speakerAngles = ListDelta(from: old.speakerAngles, to: new.speakerAngles)
+        default:
+            // A conversion replaces the timeline. Keep transcript assets in
+            // the current document and store only the historical authorship.
+            var timeline = to
+            timeline.transcripts = ProjectTranscripts(authoring: to.transcripts.authoring)
+            self.timeline = timeline
+            return
         }
         if from.participants != to.participants { participants = to.participants }
         transcriptAuthoring = ListDelta(from: from.transcripts.authoring, to: to.transcripts.authoring)
-        let changes = bindingChanges ?? TranscriptBindingChange.changes(from: from.transcripts, to: to.transcripts)
-        let effectiveChanges = changes.filter { $0.before != $0.after }
-        guard Set(effectiveChanges.map(\.key)).count == effectiveChanges.count else {
-            throw historyError("Repeated transcript binding change")
-        }
-        for change in effectiveChanges { try change.validate() }
-        transcriptBindings = effectiveChanges.isEmpty ? nil : effectiveChanges
         stillAssets = ListDelta(from: from.stillAssets, to: to.stillAssets)
         stillReplacements = ListDelta(from: from.stillReplacements, to: to.stillReplacements)
         programColorPolicy = ListDelta(from: [from.programColorPolicy].compactMap { $0 },
@@ -851,6 +925,13 @@ private struct Step: Codable {
         for key in values.allKeys where try values.decodeNil(forKey: key) {
             throw historyError("Null value in history field ‘\(key.stringValue)’")
         }
+        timeline = try values.decodeIfPresent(CutProject.self, forKey: .timeline)
+        if let timeline {
+            guard values.allKeys.allSatisfy({ [.action, .origin, .timeline, .transcriptBindings].contains($0) }),
+                  timeline.transcripts == ProjectTranscripts(authoring: timeline.transcripts.authoring) else {
+                throw historyError("Timeline conversion cannot include project deltas or transcript assets")
+            }
+        }
         referenceAngle = try values.decodeIfPresent(String.self, forKey: .referenceAngle)
         range = try values.decodeIfPresent(MulticamRange.self, forKey: .range)
         audio = try values.decodeIfPresent(MulticamAudioPolicy.self, forKey: .audio)
@@ -862,6 +943,8 @@ private struct Step: Codable {
         switches = try values.decodeIfPresent(ListDelta<MulticamSwitch>.self, forKey: .switches)
         sequenceItems = try values.decodeIfPresent(ListDelta<StillSequenceItem>.self, forKey: .sequenceItems)
         assemblyItems = try values.decodeIfPresent(ListDelta<StillAssemblyItem>.self, forKey: .assemblyItems)
+        groupTileLayouts = try values.decodeIfPresent(ListDelta<TileLayoutSpan>.self, forKey: .groupTileLayouts)
+        speakerAngles = try values.decodeIfPresent(ListDelta<TileSpeakerAngle>.self, forKey: .speakerAngles)
         stillAssets = try values.decodeIfPresent(ListDelta<StillAsset>.self, forKey: .stillAssets)
         stillReplacements = try values.decodeIfPresent(ListDelta<StillReplacement>.self, forKey: .stillReplacements)
         programColorPolicy = try values.decodeIfPresent(ListDelta<StillProgramColorPolicy>.self, forKey: .programColorPolicy)
@@ -909,7 +992,8 @@ private struct Step: Codable {
         case .sequence, .stillSequence:
             guard referenceAngle == nil, range == nil, audio == nil, angles == nil,
                   audioSources == nil, switches == nil, assemblyItems == nil,
-                  mixLanes == nil, audioReplacements == nil, fixedAudio == nil else {
+                  mixLanes == nil, audioReplacements == nil, fixedAudio == nil,
+                  groupTileLayouts == nil, speakerAngles == nil else {
                 throw historyError("Multicam field in sequence history")
             }
             let count: Int
@@ -931,6 +1015,8 @@ private struct Step: Codable {
             let assembly = try assemblyItems?.count(appliedTo: ranges) ?? ranges
             let lanes = try mixLanes?.count(appliedTo: old.mixLanes.count) ?? old.mixLanes.count
             let bindings = try audioReplacements?.count(appliedTo: old.audioReplacements.count) ?? old.audioReplacements.count
+            let layouts = try groupTileLayouts?.count(appliedTo: old.groupTileLayouts.count) ?? old.groupTileLayouts.count
+            let links = try speakerAngles?.count(appliedTo: old.speakerAngles.count) ?? old.speakerAngles.count
             let oldFixed = old.fixedAudio == nil ? 0 : 1
             let fixed: Int
             if let fixedAudio { fixed = try fixedAudio.count(appliedTo: oldFixed) }
@@ -938,11 +1024,25 @@ private struct Step: Codable {
             else if legacy, audio != nil { fixed = 0 }
             else { fixed = oldFixed }
             guard fixed <= 1 else { throw historyError("Repeated Fixed audio selection") }
-            return angles + audioSourceCount + switches + assembly + lanes + bindings + fixed + stillRecords
+            return angles + audioSourceCount + switches + assembly + lanes + bindings + fixed + layouts + links + stillRecords
         }
     }
 
     func apply(to source: CutProject, budget: inout Int) throws -> CutProject? {
+        if var timeline {
+            guard timeline.timelineOutputClock != source.timelineOutputClock else {
+                throw historyError("A history conversion must change the timeline kind")
+            }
+            let records = timeline.historyRecordCount + bindingRecordCount(in: source.transcripts)
+            guard records <= budget else { return nil }
+            budget -= records
+            var transcripts = source.transcripts
+            transcripts.authoring = timeline.transcripts.authoring
+            applyBindings(to: &transcripts)
+            timeline.transcripts = transcripts
+            try timeline.validate()
+            return timeline
+        }
         let records = try recordCount(appliedTo: source)
         guard records <= budget else { return nil }
         let assets = stillAssets?.apply(to: source.stillAssets) ?? source.stillAssets
@@ -962,7 +1062,8 @@ private struct Step: Codable {
         budget -= records + extraRecords
         if !changesTimelineItems && referenceAngle == nil && range == nil && audio == nil && angles == nil
             && audioSources == nil && switches == nil && transcriptAuthoring == nil && transcriptBindings == nil && sourceSelects == nil
-            && mixLanes == nil && audioReplacements == nil && fixedAudio == nil && participants == nil { return source }
+            && mixLanes == nil && audioReplacements == nil && fixedAudio == nil && participants == nil
+            && speakerAngles == nil { return source }
         if case .sequence(let clips) = source, let sequenceItems,
            stillAssets == nil, stillReplacements == nil, programColorPolicy == nil, stillFormat == nil, stillSoundtrack == nil,
            transcriptAuthoring == nil, transcriptBindings == nil, sourceSelects == nil, participants == nil,
@@ -1003,6 +1104,8 @@ private struct Step: Codable {
             if let resultingAngles { project.angles = resultingAngles }
             if let audioSources { project.audioSources = audioSources.apply(to: project.audioSources) }
             if let switches { project.switches = switches.apply(to: project.switches) }
+            if let groupTileLayouts { project.groupTileLayouts = groupTileLayouts.apply(to: project.groupTileLayouts) }
+            if let speakerAngles { project.speakerAngles = speakerAngles.apply(to: project.speakerAngles) }
             if let assemblyItems {
                 let items = assemblyItems.apply(to: project.assemblyItems ?? [])
                 project.assemblyItems = items.isEmpty ? nil : items
@@ -1010,17 +1113,22 @@ private struct Step: Codable {
             project.stillAssets = assets
             project.stillReplacements = replacements
             project.programColorPolicy = color
+            project.syncFeedAngleRecordings()
             result = .multicam(project)
         }
         var transcripts = source.transcripts
         if let transcriptAuthoring { transcripts.authoring = transcriptAuthoring.apply(to: transcripts.authoring) }
-        if let transcriptBindings, TranscriptBindingChange.apply(transcriptBindings, to: &transcripts),
-           transcripts.revision < UInt64.max {
-            transcripts.revision += 1
-        }
+        applyBindings(to: &transcripts)
         result.transcripts = transcripts
         if let participants { result.participants = participants }
         try result.validate()
         return result
+    }
+
+    private func applyBindings(to transcripts: inout ProjectTranscripts) {
+        if let transcriptBindings, TranscriptBindingChange.apply(transcriptBindings, to: &transcripts),
+           transcripts.revision < UInt64.max {
+            transcripts.revision += 1
+        }
     }
 }

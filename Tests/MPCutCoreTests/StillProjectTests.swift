@@ -312,7 +312,7 @@ final class StillProjectTests: XCTestCase {
         let media = folder.appendingPathComponent("photo.avif")
         let history = [CutHistoryState(action: "Insert Still", project: withStill)]
         try current.save(to: url, undo: [], redo: history)
-        let bytes = try ProjectFile.documentJSON(Data(contentsOf: url))
+        let bytes = try ProjectFile.documentJSON(at: url)
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
         XCTAssertEqual(root["schema_version"] as? Int, 4)
         let reopened = try CutProject.decodeDocument(bytes, limit: 10)

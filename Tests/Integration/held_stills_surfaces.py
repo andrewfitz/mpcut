@@ -17,7 +17,7 @@ from transcript_lifecycle import Desktop, eventually, operation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "docs"))
 from mcp_walkthrough import Client, timed_out
-from saved_project import read_saved
+from saved_project import media_paths, read_project
 
 
 def exercise(app, folder):
@@ -240,7 +240,7 @@ def check_exports(client, folder, project, cover, soundtrack, pcm, cli):
         assert ffmpeg("-i", relinked_movie, "-map", "0:a:0", "-c:a", "pcm_s32le", "-f", "s32le", "-") == pcm
         relinked_copy = folder / "relinked.cut"
         mutate("project_save", project_path=str(relinked_copy))
-        assert {"Relocated/cover.png", "Relocated/soundtrack.wav"} <= set(read_saved(relinked_copy)["files"])
+        assert {"Relocated/cover.png", "Relocated/soundtrack.wav"} <= set(media_paths(read_project(relinked_copy)))
         mutate("history_undo")
         assert state()["total"] == 2
         _, undone = live_render(folder / "undo.mov", mode="smart")

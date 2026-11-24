@@ -1007,7 +1007,7 @@
   },
   {
     "name": "review_file_frames_export",
-    "description": "Write JPEG review images and a manifest for a source or every angle at group times. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
+    "description": "Write JPEG review images and a manifest for a source, edited program, or synchronized multicam angles. With tile processing, group and assembly requests sample the rendered program. Poll file_job_status_read with the returned job_id and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2842,7 +2842,7 @@
   },
   {
     "name": "file_job_status_read",
-    "description": "Get state, native progress and the terminal JSON result. Scene scans and refreshes include the latest available progress event. For large results, read result_bytes using file_job_result_read.",
+    "description": "Get state, native progress and the terminal JSON result. Scene scans, refreshes and Tiles delivery can include the latest available progress event. A Tiles ISO delivery job can finish in needs_review with exit code 3 and a reviewable project. For large results, read result_bytes using file_job_result_read.",
     "inputSchema": {
       "type": "object",
       "properties": {

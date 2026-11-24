@@ -6,6 +6,7 @@ struct ExportSheetOptions: Sendable, Equatable {
     var organization = ExportOrganization()
     var placements: ExportPlacementScope = .none
     var requireCameraCopy = false
+    var requiresPictureProcessing = false
     var pictureTiming: StillPictureTiming?
     var stillVideoCodec: ReencodeCodec?
     var mode: ExportMode = ExportRules.defaultMode(for: .movie)
@@ -18,6 +19,7 @@ struct ExportSheetOptions: Sendable, Equatable {
     var convertsAudio: Bool { tracks == .audio && audioMode == .encode }
     /// The mode the pickers hold for the selected tracks. The export rules decide what it is written as.
     var effectiveMode: ExportMode {
+        if requiresPictureProcessing { return mode }
         let held = tracks == .audio ? audioMode : mode
         return ExportRules.cell(source: .movie, tracks: tracks, mode: held, placements: placements).resolvedMode
     }

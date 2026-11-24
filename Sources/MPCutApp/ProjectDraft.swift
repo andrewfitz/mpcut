@@ -53,6 +53,13 @@ final class ProjectDraft {
     private var writer: DraftWriter?
     var hasScheduledWrites: Bool { writer?.isBusy ?? false }
 
+    func move(to destination: ProjectDraft) {
+        writer?.invalidate()
+        writer = nil
+        if let reservation { destination.adopt(reservation) }
+        reservation = nil
+    }
+
     static let autosaveDirectory: URL = {
         let manager = FileManager.default
         if ProcessInfo.processInfo.processName == "xctest" {
@@ -194,6 +201,7 @@ final class ProjectDraft {
         guard lease.ownsFolder else { return }
         let folder = lease.url.deletingLastPathComponent()
         TranscriptStore.discardDraft(relativeTo: lease.url)
+        TilesPendingReviewStore.discardDraft(at: lease.url)
         unlinkat(lease.descriptor, lease.url.lastPathComponent, 0)
         for name in (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
             where name.hasPrefix(".pending-") && name.hasSuffix(".cut")

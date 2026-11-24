@@ -66,7 +66,7 @@ extension MulticamEditorModel {
         return items.map { item in
             let duration: RationalTime?
             switch item {
-            case .group(let range, _): duration = try? range.to.subtracting(range.from)
+            case .group(let range, _, _, _): duration = try? range.to.subtracting(range.from)
             case .still(let still): duration = still.duration
             }
             if let duration, let next = try? end.adding(duration) { end = next }
@@ -258,12 +258,24 @@ extension MulticamEditorModel {
                     if var insert = item.still, !used.insert(insert.id).inserted {
                         insert.id = ProjectIdentifier.make()
                         items.append(.still(insert))
+
                     } else {
                         items.append(item)
                     }
                 }
             }
             guard !items.isEmpty else { return }
+            let occurrences = Dictionary(grouping: items.indices.filter { items[$0].occurrenceID != nil }) {
+                items[$0].occurrenceID!
+            }
+            for indexes in occurrences.values where indexes.count > 1 {
+                for (position, index) in indexes.enumerated() {
+                    guard let range = items[index].group else { continue }
+                    let next = indexes.dropFirst(position + 1).first.flatMap { items[$0].group?.from }
+                    items[index] = items[index].groupPiece(range, from: position == 0 ? nil : range.from,
+                                                          to: next, keepingID: position == 0)
+                }
+            }
             preview.pause()
             if edit(delete ? "Delete Selected Range" : "Split Selected Range", { $0.assemblyItems = items }) {
                 focusAssemblyEdit()
@@ -566,7 +578,12 @@ extension MulticamEditorModel {
             let items: [StillAssemblyItem]
             switch item {
             case .still: items = [item]
-            case .group(_, let angle): items = (byOccurrence[index] ?? []).map { .group(MulticamSilencePlanner.range($0.span), angle: angle) }
+            case .group:
+                let pieces = (byOccurrence[index] ?? []).map { MulticamSilencePlanner.range($0.span) }
+                items = pieces.enumerated().map { position, piece in
+                    item.groupPiece(piece, from: position == 0 ? nil : piece.from,
+                                    to: pieces.dropFirst(position + 1).first?.from, keepingID: position == 0)
+                }
             }
             revised.append(contentsOf: items)
             origin.append(contentsOf: Array(repeating: index, count: items.count))
@@ -664,8 +681,10 @@ extension MulticamEditorModel {
                                                             MulticamSilencePlanner.span(original)) else { return }
         let kept = AudioAnalysis.retained(in: window, removing: [cut]).map(MulticamSilencePlanner.range)
         guard !kept.isEmpty else { return }
-        let angle = assemblyItems[pause.id.occurrence].angleOverride
-        project.assemblyItems = kept.map { .group($0, angle: angle) }
+        let item = assemblyItems[pause.id.occurrence]
+        project.assemblyItems = kept.enumerated().map { index, range in
+            item.groupPiece(range, keepingID: index == 0)
+        }
         guard let plan = try? project.plan() else { return }
         preview.pause()
         pauseEdits.review = .init(id: pause.id, plan: plan, project: .multicam(project))

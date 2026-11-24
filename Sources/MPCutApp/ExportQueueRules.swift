@@ -88,8 +88,14 @@ extension EditorModel {
                     }
                 }
                 let summaries = batch.items.compactMap { item -> String? in
-                    guard case .still(let plan) = item.payload else { return nil }
-                    return "\(item.output.lastPathComponent)\n\(plan.inspectorSummary)"
+                    switch item.payload {
+                    case .ordinary: return nil
+                    case .still(let plan): return "\(item.output.lastPathComponent)\n\(plan.inspectorSummary)"
+                    case .picture(let plan):
+                        let mode = ExportRules.displayName(mode: options.mode, soundOnly: options.tracks == .audio)
+                        return [item.output.lastPathComponent, mode, plan.report.picturePrivacyNotice, plan.report.audioPrivacyNotice]
+                            .compactMap { $0 }.joined(separator: "\n")
+                    }
                 }
                 return .success(batch.review(interleaving: summaries))
             } catch let issue as CutError {
@@ -160,6 +166,7 @@ struct SequenceQueuePlan: Sendable {
     enum Payload: Sendable {
         case ordinary(BulkExport.Item)
         case still(StillExportPlan)
+        case picture(ParticipantProjectExport)
     }
 
     struct Item: Sendable {
@@ -191,9 +198,6 @@ struct SequenceQueuePlan: Sendable {
         var indexed: [URL: MediaInfo] = [:]
         for range in ranges {
             if cancelled() { throw CutError(code: "cancelled", message: "Operation cancelled.") }
-            guard range.stillProject?.participants.render == nil else {
-                throw ParticipantProjectExport.unsupported("A queued range export")
-            }
             for (url, media) in range.media {
                 if let previous = indexed[url], !previous.identity.matchesSnapshot(media.identity) {
                     throw CutError(code: "source_changed", message: "Queued ranges refer to different versions of \(url.lastPathComponent).")
@@ -201,7 +205,7 @@ struct SequenceQueuePlan: Sendable {
                 indexed[url] = media
             }
         }
-        if !ranges.contains(where: { $0.stillProject != nil }) {
+        if !ranges.contains(where: { $0.stillProject != nil || $0.pictureProject != nil }) {
             let batch = try BulkExport(groups: ranges.map(\.clips), directory: directory,
                                        outputStems: ranges.map { $0.name ?? stem }, organization: organization, mode: mode,
                                        tracks: options.tracks, audioTrackOrdinal: options.audioTrackOrdinal,
@@ -222,7 +226,24 @@ struct SequenceQueuePlan: Sendable {
             let suffix = String(format: "%03ld", index + 1)
             let entryStem = range.name ?? stem
             do {
-                if let project = range.stillProject {
+                if let project = range.pictureProject ?? range.stillProject, project.requiresPictureProcessing {
+                    try verifyQueuedStillSources(range.media.values)
+                    guard !options.requireCameraCopy || options.tracks == .audio else {
+                        throw CutError(code: "camera_copy_required", message: "This range needs picture encoding for its tile edits.")
+                    }
+                    var pictureOptions = options
+                    pictureOptions.requiresPictureProcessing = true
+                    let output = try organization.destination(in: folder, stem: entryStem, suffix: suffix,
+                                                              container: pictureOptions.container.isEmpty ? "mov" : pictureOptions.container)
+                    let selection = range.pictureProject == nil ? nil : MulticamRange(from: range.start, to: range.end)
+                    let plan = try ParticipantProjectExport(project, relativeTo: range.pictureDocument, output: output,
+                        mode: ordinaryModeWhenUnspecified ?? options.mode, tracks: options.tracks, settings: options.batchSettings,
+                        audioAction: audioAction,
+                        plannedSubfolder: plannedSubfolder, range: selection,
+                        audioTrackOrdinal: options.audioTrackOrdinal, cancelled: cancelled)
+                    try verifyQueuedStillSources(range.media.values)
+                    result.append(.init(output: output, payload: .picture(plan)))
+                } else if let project = range.stillProject {
                     try verifyQueuedStillSources(range.media.values)
                     var requested = options
                     requested.placements = range.placements
@@ -282,6 +303,8 @@ struct SequenceQueuePlan: Sendable {
         switch item.payload {
         case .ordinary(let planned):
             try ExportPlanner(cancelled: cancelled, useSidecar: useSidecar).write(planned.plan, to: item.output, progress: progress)
+        case .picture(let plan):
+            try plan.write(to: item.output, cancelled: cancelled, progress: progress)
         case .still(let plan):
             try StillExportPlanner(useSidecar: useSidecar, cancelled: cancelled).write(plan, to: item.output, progress: progress)
         }

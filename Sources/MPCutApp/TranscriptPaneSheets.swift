@@ -497,32 +497,56 @@ struct TranscriptTextForm: View {
 
 struct TranscriptExportForm: View {
     let isMulticam: Bool
-    let export: (TranscriptFormat, TranscriptSpace) -> Void
-    @State private var format = TranscriptFormat.json
+    let tracks: [TranscriptTrack]
+    let export: (TranscriptFormat, TranscriptSpace, String?) -> Void
+    @State private var trackID: String?
+    let captions: Bool
+    let privacyWarning: String?
+    @State private var format: TranscriptFormat
     @State private var space: TranscriptSpace
 
-    init(space: TranscriptSpace, isMulticam: Bool, export: @escaping (TranscriptFormat, TranscriptSpace) -> Void) {
+    init(space: TranscriptSpace, isMulticam: Bool, captions: Bool, tracks: [TranscriptTrack], privacyWarning: String?,
+         export: @escaping (TranscriptFormat, TranscriptSpace, String?) -> Void) {
         self.isMulticam = isMulticam
+        self.privacyWarning = privacyWarning
+        self.captions = captions
+        self.tracks = tracks
+        _trackID = State(initialValue: tracks.first?.id)
+        _format = State(initialValue: captions ? .srt : .json)
         self.export = export
         _space = State(initialValue: space)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if let privacyWarning {
+                Label(privacyWarning, systemImage: "exclamationmark.triangle")
+            }
             Picker("Clock", selection: $space) {
                 ForEach(TranscriptSpace.allCases.filter { isMulticam || $0 != .group }, id: \.self) { clock in
                     Text(clock.label).tag(clock)
                 }
             }
-            Picker("Format", selection: $format) {
-                Text("Native JSON").tag(TranscriptFormat.json)
-                Text("Readable text").tag(TranscriptFormat.text)
-                Text("SubRip (.srt)").tag(TranscriptFormat.srt)
-                Text("WebVTT (.vtt)").tag(TranscriptFormat.vtt)
+            if captions {
+                if space == .source && tracks.count > 1 {
+                    Picker("Recording track", selection: $trackID) {
+                        ForEach(tracks, id: \.id) { track in Text(track.name).tag(Optional(track.id)) }
+                    }
+                }
+                Text("SubRip (.srt) for DaVinci Resolve, Final Cut Pro, and Premiere Pro.")
+                Text("Use Current Cut for the edited video or Source for the original recording.")
+                    .font(.caption)
+            } else {
+                Picker("Format", selection: $format) {
+                    Text("Native JSON").tag(TranscriptFormat.json)
+                    Text("Readable text").tag(TranscriptFormat.text)
+                    Text("SubRip (.srt)").tag(TranscriptFormat.srt)
+                    Text("WebVTT (.vtt)").tag(TranscriptFormat.vtt)
+                }
             }
             HStack {
                 Spacer()
-                Button("Choose Destination…") { export(format, space) }
+                Button("Choose Destination…") { export(format, space, captions && space == .source && tracks.count > 1 ? trackID : nil) }
                     .keyboardShortcut(.defaultAction)
             }
         }

@@ -191,6 +191,32 @@ final class ProjectMediaSnapshotTests: XCTestCase {
         XCTAssertEqual(cacheEntry.duration, original.duration)
     }
 
+    func testAProjectKeepsADigestOfTheEvidence() throws {
+        let directory = try temporaryDirectory()
+        let source = directory.appendingPathComponent("source.wav")
+        let copy = directory.appendingPathComponent("copy.wav")
+        let engine = CutEngine(useSidecar: false)
+        try wave(amplitude: 123).write(to: source)
+        try FileManager.default.copyItem(at: source, to: copy)
+        let media = try engine.inspect(source)
+        let entry = ProjectMediaSnapshot.Entry(path: "source.wav", media: media)
+
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(entry)) as? [String: Any])
+        XCTAssertNil(saved["evidence"])
+        let digest = try XCTUnwrap(saved["evidence_sha256"] as? String)
+        XCTAssertEqual(digest.count, 64)
+
+        let reread = try JSONDecoder().decode(ProjectMediaSnapshot.Entry.self, from: JSONEncoder().encode(entry))
+        XCTAssertTrue(reread.hasCompleteProof)
+        XCTAssertTrue(reread.verifies(try engine.inspect(copy)))
+
+        // A digest that is not one is refused.
+        var damaged = saved
+        damaged["evidence_sha256"] = "not a digest"
+        XCTAssertThrowsError(try JSONDecoder().decode(ProjectMediaSnapshot.Entry.self,
+                                                      from: JSONSerialization.data(withJSONObject: damaged)))
+    }
+
     func testInPlaceRewriteWithRestoredModificationTimeCannotReuseProof() throws {
         let source = try temporaryDirectory().appendingPathComponent("source.wav")
         try wave(amplitude: 123).write(to: source)

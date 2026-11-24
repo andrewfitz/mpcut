@@ -12,7 +12,7 @@ import tempfile
 
 from media_regression import ffmpeg, probe, ratio, sample_hashes
 from mixed_timeline import frame_count, gray, power, samples
-from saved_project import read_project, saved_file
+from saved_project import read_project
 
 
 SCRIPT = "Results are usually ready today."
@@ -147,7 +147,7 @@ def exercise(cli, directory):
     assert len(undo) == len(before["history"]["undo"]) + 1
     assert undo[0]["action"] == result["history_action"]
     clips = reopened["clips"]
-    assert [(Path(saved_file(reopened, clip["file"])).name, clip["from"], clip["to"]) for clip in clips] == [
+    assert [(Path(clip["file"]).name, clip["from"], clip["to"]) for clip in clips] == [
         (right.name, "2/5", "4/5"), (left.name, "31/25", "9/5")]
     records = call("transcript", "attachment", "inspect", "--project", project)["authoring"]["items"]
     assert {r["change"]["named_select"]["name"] for r in records if "named_select" in r["change"]} == {

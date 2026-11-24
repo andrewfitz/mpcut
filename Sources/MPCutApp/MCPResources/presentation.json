@@ -41,6 +41,7 @@
             "set_large_thumbnails",
             "set_inspector",
             "set_transcript",
+            "set_tiles",
             "set_waveform_span",
             "set_pause_controls",
             "set_scroll",
@@ -72,7 +73,7 @@
         },
         "visible": {
           "type": "boolean",
-          "description": "Required for set_pause_controls and set_transcript. Defaults to true for set_inspector."
+          "description": "Required for set_pause_controls, set_transcript and set_tiles. Defaults to true for set_inspector."
         },
         "section": {
           "type": "string",
@@ -81,7 +82,8 @@
             "sources",
             "assembly",
             "export",
-            "transcript"
+            "transcript",
+            "tiles"
           ]
         },
         "surface": {
@@ -159,6 +161,20 @@
             "properties": {
               "action": {
                 "const": "set_transcript"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "visible"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "set_tiles"
               }
             }
           },
@@ -258,7 +274,8 @@
             "show_about",
             "show_settings",
             "show_help",
-            "show_last_export"
+            "show_last_export",
+            "show_tiles"
           ]
         },
         "topic": {

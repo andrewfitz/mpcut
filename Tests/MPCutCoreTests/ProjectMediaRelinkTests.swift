@@ -210,6 +210,45 @@ final class ProjectMediaRelinkTests: XCTestCase {
         XCTAssertEqual(authoring.speakerReference?.binding.file, "Moved.wav")
     }
 
+    func testVerifiedRelinkKeepsTileLayoutsAndInvalidatesConfirmationsInHistory() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let document = folder.appendingPathComponent("Edit.cut")
+        let original = folder.appendingPathComponent("Original.mp4")
+        let candidate = folder.appendingPathComponent("Moved.mp4")
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures/SmartTrim-GOP.mp4")
+        try FileManager.default.copyItem(at: fixture, to: original)
+        let media = try Probe.read(original, forcePayload: true)
+        let saved = ProjectMediaSnapshot.Entry(path: original.lastPathComponent, media: media)
+        let digest = try participantSourceDigest(original, identity: media.identity)
+        try FileManager.default.copyItem(at: original, to: candidate)
+        try FileManager.default.removeItem(at: original)
+
+        let range = MulticamRange(from: .zero, to: .init(numerator: 1))
+        let layout = TileLayoutSpan(range: range, layout: .solo, slots: [.init(target: .camera, id: original.lastPathComponent)])
+        var project = CutProject.sequence([.init(id: "clip", file: original.lastPathComponent, from: range.from,
+                                                  to: range.to, tileLayouts: [layout])])
+        let box = ParticipantAppearance(id: "tile", participantID: "guest", range: range,
+                                        bounds: .init(x: 0, y: 0, width: 1, height: 1))
+        project.participants = .init(people: [.init(id: "guest", name: "Guest", treatment: .init(mode: .blur))], sources: [
+            .init(sourceID: original.lastPathComponent, analysisIdentity: "scan", sourceStamp: .init(media: media),
+                  sourceInode: media.identity.inode, sourceContentSHA256: digest, appearances: [box],
+                  coverage: [.init(range: range, state: .verified)])
+        ])
+        try project.participants.confirmPrivacy(sourceID: original.lastPathComponent, participantID: "guest", range: range)
+        let undo = [CutHistoryState(action: "Edit Tile Layout", project: project)]
+        let result = try ProjectMedia.relink(project: project, undo: undo, snapshot: .init(entries: [saved]),
+                                             relativeTo: document, from: original.lastPathComponent, to: candidate)
+        XCTAssertEqual(result.candidate.outcome, .verified)
+        for state in [result.project] + result.undo.map(\.project) {
+            XCTAssertEqual(state.sequenceClips?.first?.tileLayouts.first?.slots.first?.id, candidate.lastPathComponent)
+            XCTAssertEqual(state.participants.sources.first?.sourceID, candidate.lastPathComponent)
+            XCTAssertEqual(state.participants.sources.first?.appearances, [box])
+            XCTAssertNil(state.participants.sources.first?.confirmations)
+        }
+    }
+
     func testFreshReadVetoesSameSizeWaveRewriteAndHistoryRangeShortfall() throws {
         let folder = try temporaryFolder()
         defer { try? FileManager.default.removeItem(at: folder) }

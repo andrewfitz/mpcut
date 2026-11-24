@@ -12,7 +12,7 @@ final class EditorPresentation: ObservableObject {
         var label: String {
             switch self {
             case .switches: "Switch"
-            case .participants: "Feeds"
+            case .participants: "Tiles"
             default: rawValue.capitalized
             }
         }
@@ -23,8 +23,18 @@ final class EditorPresentation: ObservableObject {
     @Published var sequenceParticipantsVisible = false
     @Published var pinnedParticipant: String?
     @Published var pickedParticipantAppearance: ParticipantPickedAppearance?
+    @Published var requestedParticipantTileEditor: ParticipantPickedAppearance?
+    @Published var participantMonitorSource = false {
+        didSet {
+            guard oldValue != participantMonitorSource else { return }
+            participantMonitorSourceChanged?(participantMonitorSource)
+            if !participantMonitorSource { participantDrawMode = false }
+        }
+    }
+    var participantMonitorSourceChanged: ((Bool) -> Void)?
+    @Published var participantTileExtent: ParticipantTileEditExtent = .untilChange
     @Published var participantDrawMode = false
-    @Published var participantScanPreview: (sourceID: String, stamp: SceneSourceStamp, analysis: ParticipantTrackingResult)?
+    @Published var participantScanPreview: ParticipantPendingTilePreview?
     @Published var participantDrawnBounds: ParticipantDrawnBounds?
     @Published var participantTranscriptFilter: ParticipantSpeakerBinding?
     @Published var selectedTranscriptSpeaker: ParticipantTranscriptSelection?
@@ -122,12 +132,13 @@ extension ProjectSession {
             "timeline_large_previews_enabled": editor.largeThumbnails, "pause_controls_visible": presentation.pauseControls,
             "scope": isMulticam ? "multicam" : "sequence",
             "transcript_visible": presentation.transcriptVisible(multicam: isMulticam),
+            "tiles_visible": isMulticam ? presentation.inspectorVisible && presentation.inspector == .participants : presentation.sequenceParticipantsVisible,
             "history_visible": isHistoryPresented, "monitor_visible": monitor?.isVisible == true,
             "export_queue_visible": isMulticam ? multicam.isBulkQueuePresented : editor.isBulkQueuePresented
         ]
         if isMulticam {
             result["inspector_visible"] = presentation.inspectorVisible
-            result["inspector"] = presentation.inspector.rawValue
+            result["inspector"] = presentation.inspector == .participants ? "tiles" : presentation.inspector.rawValue
             result["report_visible"] = multicam.report != nil
             result["replacement_audio_visible"] = multicam.isReplacementAudioPresented
             if let size = split(vertical: false)?.arrangedSubviews.last?.frame.height { result["timeline_height"] = size }
@@ -201,7 +212,8 @@ extension ProjectSession {
             guard isMulticam, multicam.project != nil else { throw unavailable }
             let visible = args["visible"] == nil ? true : try flag("visible")
             if args["section"] != nil {
-                guard let section = EditorPresentation.Inspector(rawValue: try text("section")) else {
+                let name = try text("section")
+                guard let section = EditorPresentation.Inspector(rawValue: name == "tiles" ? "participants" : name) else {
                     throw MCPCommandError("invalid_arguments", "Choose an inspector section.")
                 }
                 presentation.inspector = section
@@ -210,6 +222,16 @@ extension ProjectSession {
         case "set_transcript":
             guard isMulticam ? multicam.project != nil : !editor.isEmpty else { throw unavailable }
             presentation.setTranscriptVisible(try flag("visible"), multicam: isMulticam)
+        case "set_tiles", "show_tiles":
+            guard isMulticam ? multicam.project != nil : !editor.isEmpty else { throw unavailable }
+            let visible = action == "show_tiles" ? true : try flag("visible")
+            if isMulticam {
+                if visible { presentation.inspector = .participants }
+                if presentation.inspector == .participants { presentation.inspectorVisible = visible }
+            } else {
+                presentation.sequenceParticipantsVisible = visible
+                if visible { presentation.sequenceTranscriptVisible = false }
+            }
         case "set_pause_controls":
             let visible = try flag("visible")
             if visible {

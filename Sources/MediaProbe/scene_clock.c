@@ -83,3 +83,37 @@ done:
     avformat_close_input(&file);
     return verified;
 }
+
+// A fractional Matroska cadence may be rounded relative to the segment clock
+// (trimmed recording) or to the start of the track (offset recording). Compare
+// a bounded prefix of packet PTS against both phases without decoding video.
+int mp_scene_uses_segment_cadence(const char *path, int index, int64_t origin,
+                                  int rate_num, int rate_den, MPProbeCancelled cancelled, void *context)
+{
+    AVFormatContext *file = avformat_alloc_context();
+    AVPacket *packet = av_packet_alloc();
+    int score = 0;
+    if (!file || !packet || !origin || rate_num <= 0 || rate_den <= 0) goto done;
+    file->interrupt_callback = (AVIOInterruptCB){cancelled, context};
+    if (avformat_open_input(&file, path, NULL, NULL) < 0 || index < 0 || (unsigned)index >= file->nb_streams)
+        goto done;
+    AVRational period = {rate_den, rate_num};
+    AVRational base = file->streams[index]->time_base;
+    for (int packets = 0, samples = 0; packets < 2048 && samples < 120 && !cancelled(context); packets++) {
+        if (av_read_frame(file, packet) < 0) break;
+        if (packet->stream_index == index && packet->pts != AV_NOPTS_VALUE && packet->pts >= origin) {
+            int64_t pts = packet->pts;
+            int64_t local = av_sat_sub64(pts, origin);
+            int64_t segment_frame = av_rescale_q(pts, base, period);
+            int64_t local_frame = av_rescale_q(local, base, period);
+            score += (av_rescale_q(segment_frame, period, base) == pts) -
+                     (av_rescale_q(local_frame, period, base) == local);
+            samples++;
+        }
+        av_packet_unref(packet);
+    }
+done:
+    av_packet_free(&packet);
+    avformat_close_input(&file);
+    return score >= 2;
+}

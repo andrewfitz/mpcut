@@ -298,6 +298,9 @@ func TestLiveBundle(t *testing.T) {
 	t.Log("live interchange job wrote the unsaved revision; original file retained its single clip")
 	call("project_save", object{"project_handle": a["project_handle"], "expected_revision": after["revision"], "operation_id": "save-a"}, "")
 	data, err := os.ReadFile(pathA)
+	if err == nil {
+		data, err = plainProject(data)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

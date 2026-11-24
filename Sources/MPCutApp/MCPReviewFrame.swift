@@ -101,6 +101,12 @@ private struct ProgramReviewManifest: Encodable {
     let selection = "program"
     let preset: JPEGPreset
     let frames: [Frame]
+    var privacyIssues: [ParticipantPrivacyIssue]? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, selection, preset, frames
+        case privacyIssues = "privacy_issues"
+    }
 }
 
 /// Review requests are independent of export jobs. Bound simultaneous decoder allocation.
@@ -126,9 +132,14 @@ extension ProjectSessions {
         let space = arguments["space"] as? String
         let project = session.isMulticam ? session.multicam.project.map(CutProject.multicam) : session.editor.stillProject
         let angle = arguments["angle_id"] as? String
-        if project?.participants.render != nil, angle == nil {
-            throw ParticipantProjectExport.unsupported("Program frame review")
+        let view = arguments["view"] as? String ?? (angle == nil ? "output" : "source")
+        guard ["source", "output"].contains(view), angle == nil || view == "source" else {
+            throw MCPCommandError("invalid_arguments", "Choose Source view to review an individual camera angle.")
         }
+        guard angle == nil || session.isMulticam else {
+            throw MCPCommandError("invalid_target", "Angles apply to multicam projects.")
+        }
+        let sourceOnly = view == "source"
         guard (time == nil) == (space == nil) else {
             throw MCPCommandError("invalid_arguments", "Supply time and space together, or omit both for the playhead.")
         }
@@ -137,14 +148,36 @@ extension ProjectSessions {
         defer { ReviewDecoders.active -= 1 }
         let revision = session.mcpRevision
         let handle = session.mcpHandle
+        if !sourceOnly, let project, project.requiresPictureProcessing {
+            let context = try outputFrameContext(session: session, project: project, clock: space)
+            let target = try (time ?? context.playhead).subtracting(context.origin)
+            let work = session.sidecarWork.detached(priority: .userInitiated) {
+                let renderer = try ProjectOutputJPEG(context.project, document: context.document, cancelled: { Task.isCancelled })
+                let frame = try renderer.frame(at: target, preset: .review)
+                try renderer.verifySources()
+                return frame
+            }
+            let frame = try await withTaskCancellationHandler {
+                try await work.value
+            } onCancel: { work.cancel() }
+            try checkAccess()
+            guard session.mcpHandle == handle, session.mcpRevision == revision else {
+                throw MCPCommandError("stale_revision", "The timeline changed. Request the frame again.")
+            }
+            var result: [String: Any] = ["view": view, "space": context.clock, "time": (time ?? context.playhead).description,
+                                         "width": frame.width, "height": frame.height, "duration": frame.duration.description,
+                                         "frame_time": try frame.frameTime.adding(context.origin).description,
+                                         "jpeg": frame.data.base64EncodedString()]
+            if !frame.privacyIssues.isEmpty { result["privacy_issues"] = try Self.outputJSON(frame.privacyIssues) }
+            return result
+        }
         var plans = ReviewPlans()
         let position: ReviewPosition
         if session.isMulticam {
             position = try multicamReview(session.multicam, time: time, space: space,
-                                          angle: angle, plans: &plans)
+                                          angle: angle, sourceOnly: sourceOnly, plans: &plans)
         } else {
-            guard arguments["angle_id"] == nil else { throw MCPCommandError("invalid_target", "Angles apply to multicam projects.") }
-            position = try sequenceReview(session.editor, time: time, space: space, plans: &plans)
+            position = try sequenceReview(session.editor, time: time, space: space, sourceOnly: sourceOnly, plans: &plans)
         }
         let picture = position.picture
         let work = session.sidecarWork.detached(priority: .userInitiated) {
@@ -160,12 +193,13 @@ extension ProjectSessions {
         }
         try picture.validateIdentity()
         var result = position.metadata(for: image)
+        result["view"] = view
         result["jpeg"] = jpeg
         return result
     }
 
     private func sequenceReview(_ editor: EditorModel, time: RationalTime?, space: String?,
-                                plans: inout ReviewPlans) throws -> ReviewPosition {
+                                sourceOnly: Bool = false, plans: inout ReviewPlans) throws -> ReviewPosition {
         let project = editor.stillProject
         if project.hasReviewStills {
             let plan = try plans.stills ?? project.resolveStills()
@@ -175,7 +209,7 @@ extension ProjectSessions {
                 throw MCPCommandError("invalid_target", "Choose a position on the open sequence.")
             }
             let span = plan.spans[index]
-            if let placement = span.placementID {
+            if !sourceOnly, let placement = span.placementID {
                 let frame = try project.stillReviewFrame(placementID: placement, interval: span.output,
                                                          document: editor.projectURL, canvas: editor.stillReviewCanvas)
                 let occurrence: String?
@@ -189,7 +223,7 @@ extension ProjectSessions {
             }
             if case let .source(clipID, range) = span.origin {
                 let (id, source, media) = try editor.stillReviewOccurrence(clipID)
-                if time == nil, let playhead = editor.jpegSourceAtPlayhead, let frame = playhead.frame {
+                if !sourceOnly, time == nil, let playhead = editor.jpegSourceAtPlayhead, let frame = playhead.frame {
                     return ReviewPosition(picture: .video(playhead.media, frame, exclusiveEnd: false),
                                           clock: "sequence", time: at, occurrence: id.uuidString,
                                           source: playhead.id.uuidString)
@@ -222,7 +256,7 @@ extension ProjectSessions {
     }
 
     private func multicamReview(_ model: MulticamEditorModel, time: RationalTime?, space: String?,
-                                angle: String?, plans: inout ReviewPlans) throws -> ReviewPosition {
+                                angle: String?, sourceOnly: Bool = false, plans: inout ReviewPlans) throws -> ReviewPosition {
         guard let project = model.project else { throw MCPCommandError("no_frame", "Open a multicam project.") }
         let clock = space ?? (model.assemblyPreview ? "assembly" : "group")
         if CutProject.multicam(project).hasReviewStills {
@@ -243,7 +277,7 @@ extension ProjectSessions {
                 group = nil
             }
             let addressedTime = clock == "group" ? group : context.time
-            if angle == nil, let placement = span.placementID {
+            if !sourceOnly, angle == nil, let placement = span.placementID {
                 let frame = try context.project.stillReviewFrame(placementID: placement, interval: span.output,
                                                                  document: model.projectURL, canvas: model.stillReviewCanvas)
                 return ReviewPosition(picture: .still(frame), clock: clock, time: addressedTime, group: group,
@@ -331,19 +365,100 @@ extension ProjectSessions {
         return ["source_time": frame.description, "frames": 1]
     }
 
+    private struct OutputFrameContext: Sendable {
+        let project: CutProject
+        let document: URL?
+        let clock: String
+        let origin: RationalTime
+        let playhead: RationalTime
+    }
+
+    private func outputFrameContext(session: ProjectSession, project: CutProject, clock: String?) throws -> OutputFrameContext {
+        if case .multicam(let value) = project {
+            let model = session.multicam
+            let clock = clock ?? (model.assemblyPreview ? "assembly" : "group")
+            if clock == "group" {
+                let snapshot = try value.pictureExportSnapshot(ranges: [value.range])
+                return .init(project: .multicam(snapshot), document: model.projectURL, clock: clock, origin: value.range.from,
+                             playhead: model.currentGroupTime())
+            }
+            guard clock == "assembly" else { throw MCPCommandError("invalid_target", "Choose group or assembly time.") }
+            return .init(project: project, document: model.projectURL, clock: clock, origin: .zero,
+                         playhead: model.preview.currentTime())
+        }
+        guard clock == nil || clock == "sequence" else {
+            throw MCPCommandError("invalid_target", "Choose sequence time.")
+        }
+        let editor = session.editor
+        let position = editor.stillReviewTime(in: try project.resolveStills())
+        return .init(project: project, document: editor.projectURL, clock: "sequence", origin: .zero, playhead: position)
+    }
+
     func mcpProgramFrameExport(session: ProjectSession, output: URL, args: [String: Any],
                                mode: String, times: [RationalTime], preset: JPEGPreset) throws -> MCPLiveOutputJobs.Work? {
         let clock = args["space"] as? String
+        if let clock, mode == "still" || mode == "playhead" {
+            let active = session.isMulticam ? (session.multicam.assemblyPreview ? "assembly" : "group") : "sequence"
+            guard clock == active else {
+                throw MCPCommandError("invalid_target", "The playhead uses \(active) time.")
+            }
+        }
         let project = session.isMulticam ? session.multicam.project.map(CutProject.multicam) : session.editor.stillProject
+        if let project, project.requiresPictureProcessing {
+            let context: OutputFrameContext
+            let requests: [RationalTime]
+            if mode == "switches" {
+                guard case .multicam(let value) = project, clock == nil || clock == "group" else {
+                    throw MCPCommandError("invalid_target", "Switch sampling uses multicam group time.")
+                }
+                context = try outputFrameContext(session: session, project: project, clock: "group")
+                requests = value.switches.map(\.at)
+            } else {
+                guard ["still", "playhead", "times"].contains(mode) else {
+                    throw ParticipantProjectExport.unsupported("Sampling source scenes or audio")
+                }
+                context = try outputFrameContext(session: session, project: project, clock: clock)
+                requests = mode == "times" ? times : [context.playhead]
+            }
+            let cancelled: @Sendable () -> Bool = { Task.isCancelled }
+            return { progress in
+                let renderer = try ProjectOutputJPEG(context.project, document: context.document, cancelled: cancelled)
+                if mode == "still", let time = requests.first {
+                    let frame = try renderer.writeStill(at: time.subtracting(context.origin), to: output, preset: preset)
+                    progress.published(output)
+                    var result: [String: Any] = ["frames": 1]
+                    if !frame.privacyIssues.isEmpty { result["privacy_issues"] = try Self.outputJSON(frame.privacyIssues) }
+                    return result
+                }
+                var privacyIssues: [ParticipantPrivacyIssue] = []
+                try context.project.validateDestination(output, relativeTo: renderer.document, includesContents: true)
+                let manifest = try JPEGExport.writeProgramFrameDirectory(to: output, cancelled: cancelled, validate: {
+                    try context.project.validateDestination(output, relativeTo: renderer.document, includesContents: true)
+                    try renderer.verifySources()
+                }) { staging in
+                    let frames = try requests.enumerated().map { index, time in
+                        let image = try renderer.frame(at: time.subtracting(context.origin), preset: preset)
+                        let name = String(format: "%06d.jpg", index + 1)
+                        try image.data.write(to: staging.appendingPathComponent(name), options: .withoutOverwriting)
+                        privacyIssues.append(contentsOf: image.privacyIssues)
+                        progress.update(Double(index + 1) / Double(requests.count))
+                        return ProgramReviewManifest.Frame(file: name, space: context.clock, time: time,
+                            playheadSeconds: nil, groupTime: context.clock == "group" ? time : nil, sourceTime: nil,
+                            duration: image.duration,
+                            from: try image.range.from.adding(context.origin), to: try image.range.to.adding(context.origin),
+                            occurrence: nil, source: nil, angle: nil, asset: nil, placement: nil, width: image.width, height: image.height)
+                    }
+                    return ProgramReviewManifest(preset: preset, frames: frames, privacyIssues: privacyIssues.isEmpty ? nil : privacyIssues)
+                }
+                progress.published(output)
+                var result: [String: Any] = ["manifest": output.appendingPathComponent("manifest.json").path, "frames": manifest.frames.count]
+                if !privacyIssues.isEmpty { result["privacy_issues"] = try Self.outputJSON(privacyIssues) }
+                return result
+            }
+        }
         guard clock != nil || (mode == "still" || mode == "playhead") && project?.hasReviewStills == true else { return nil }
         guard ["still", "playhead", "times"].contains(mode) else {
             throw MCPCommandError("invalid_arguments", "Program clocks support still, playhead, or explicit times.")
-        }
-        if let clock {
-            let available = session.isMulticam ? (session.multicam.assemblyPreview ? "assembly" : "group") : "sequence"
-            guard mode == "times" || clock == available else {
-                throw MCPCommandError("invalid_target", "The playhead uses \(available) time.")
-            }
         }
         let requests = mode == "times" ? times.map(Optional.some) : [nil]
         var plans = ReviewPlans()

@@ -113,6 +113,8 @@ final class MulticamAnalysisStore: ObservableObject {
     private var activeSilenceTracks = Set<MulticamAudioSelection>()
     private var selectedSilenceTracks = Set<MulticamAudioSelection>()
     private var routedSceneMarkers: [RationalTime] = []
+    private var tileSceneTimes: [String: [RationalTime]] = [:]
+    private var routedTileSceneMarkers: [RationalTime] = []
     private var routedKeyframeMarkers: [RationalTime] = []
     private var routedSilenceMarkers: [RationalTime] = []
     private var groupPauses: [AudioSpan] = []
@@ -338,6 +340,8 @@ final class MulticamAnalysisStore: ObservableObject {
         selectedSilenceTracks = []
         angleOffsets = [:]
         routedSceneMarkers = []
+        tileSceneTimes = [:]
+        routedTileSceneMarkers = []
         routedKeyframeMarkers = []
         routedSilenceMarkers = []
         groupPauses = []
@@ -522,6 +526,20 @@ final class MulticamAnalysisStore: ObservableObject {
             routedKeyframeMarkers = routedPictureMarkers(keyframes)
             updatePauses()
         }
+        let changesByRecording = Dictionary(project.participants.sources.map { ($0.sourceID, $0.layoutChangeTimes) },
+                                            uniquingKeysWith: { first, _ in first })
+        let nextTileSceneTimes = Dictionary(project.pictureSources.compactMap { source -> (String, [RationalTime])? in
+            let id = source.id
+            let recording = source.feedAngle?.sourceID ?? id
+            guard pictureSourceIDs.contains(id), let changes = changesByRecording[recording],
+                  !changes.isEmpty else { return nil }
+            let shift = offsets[id] ?? offsets[recording] ?? .zero
+            return (id, changes.compactMap { try? $0.adding(shift) })
+        }, uniquingKeysWith: { first, _ in first })
+        if routesChanged || tileSceneTimes != nextTileSceneTimes {
+            tileSceneTimes = nextTileSceneTimes
+            routedTileSceneMarkers = routedPictureMarkers(tileSceneTimes).compactMap { try? $0.adding(project.range.from) }
+        }
         if routesChanged || sidecarPolicyChanged {
             var routedMedia: [MulticamAudioSelection: MediaInfo] = [:]
             for route in activeSilenceTracks {
@@ -562,7 +580,14 @@ final class MulticamAnalysisStore: ObservableObject {
         return finishedWaves.contains(route) ? waves[route] : nil
     }
 
-    func sourceScenes(_ id: String) -> [RationalTime] { scenes[id] ?? partialScenes[id] ?? [] }
+    func sourceScenes(_ id: String) -> [RationalTime] {
+        mergedSceneTimes(scenes[id] ?? partialScenes[id] ?? [], tileSceneTimes[id] ?? [])
+    }
+
+    private func mergedSceneTimes(_ visual: [RationalTime], _ tiles: [RationalTime]) -> [RationalTime] {
+        guard !tiles.isEmpty else { return visual }
+        return Array(Set(visual + tiles)).sorted()
+    }
 
     struct ScenePosition {
         let source: String
@@ -1101,22 +1126,24 @@ extension MulticamAnalysisStore {
         switch target {
         case .off: return []
         case .silence: return routedSilenceMarkers
-        case .scenes: return routedSceneMarkers
+        case .scenes: return mergedSceneTimes(routedSceneMarkers, routedTileSceneMarkers)
         case .keyframes: return routedKeyframeMarkers
         }
     }
 
     func pictureSnapMarkers(_ target: TimelineSnapTarget, angle: String, project: MulticamProject,
                             near time: RationalTime, within range: MulticamRange, includeEnd: Bool) -> [RationalTime] {
-        let times = target == .scenes ? scenes : keyframes
         return project.recordings(for: angle).flatMap { recording -> [RationalTime] in
             let coverageEnd = min(project.range.to, recording.coverage?.to ?? project.range.to)
             let inclusive = includeEnd && range.to < coverageEnd
-            guard pictureSourceIDs.contains(recording.id), let local = times[recording.id],
+            guard pictureSourceIDs.contains(recording.id),
                   let requested = try? time.subtracting(recording.offset),
                   let lower = try? max(project.range.from, range.from, recording.coverage?.from ?? range.from).subtracting(recording.offset),
                   let upper = try? min(range.to, coverageEnd).subtracting(recording.offset)
             else { return [] }
+            let local = target == .scenes
+                ? mergedSceneTimes(scenes[recording.id] ?? [], tileSceneTimes[recording.id] ?? [])
+                : keyframes[recording.id] ?? []
             let first = local.lowerBound { $0 >= lower }
             let last = local.lowerBound { inclusive ? $0 > upper : $0 >= upper }
             guard first < last else { return [] }
@@ -1133,19 +1160,23 @@ extension MulticamAnalysisStore {
 
     func pictureOutputMarkers(_ target: TimelineSnapTarget, in plan: MulticamPlan) -> [RationalTime] {
         switch target {
-        case .scenes: return pictureMarkers(scenes, in: plan.picture)
+        case .scenes:
+            return mergedSceneTimes(pictureMarkers(scenes, in: plan.picture), pictureMarkers(tileSceneTimes, in: plan.picture))
         case .keyframes: return pictureMarkers(keyframes, in: plan.picture)
         default: return []
         }
     }
 
     func hasPictureMarker(_ target: TimelineSnapTarget, in plan: MulticamPlan) -> Bool {
-        let times = target == .scenes ? scenes : keyframes
-        return plan.picture.contains { span in
-            guard pictureSourceIDs.contains(span.source), let local = times[span.source] else { return false }
-            let index = local.lowerBound { $0 >= span.input.from }
-            return index < local.count && local[index] < span.input.to
+        func containsMarker(_ times: [String: [RationalTime]]) -> Bool {
+            plan.picture.contains { span in
+                guard pictureSourceIDs.contains(span.source), let local = times[span.source] else { return false }
+                let index = local.lowerBound { $0 >= span.input.from }
+                return index < local.count && local[index] < span.input.to
+            }
         }
+        if target == .scenes { return containsMarker(scenes) || containsMarker(tileSceneTimes) }
+        return containsMarker(keyframes)
     }
 
     private func pictureMarkers(_ times: [String: [RationalTime]], in spans: [MulticamSpan]) -> [RationalTime] {

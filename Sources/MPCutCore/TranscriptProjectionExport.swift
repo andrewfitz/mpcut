@@ -1,6 +1,24 @@
 import Foundation
 
+extension ParticipantProject {
+    package var transcriptExportWarning: String? {
+        guard hasEffectiveTreatments else { return nil }
+        return "The transcript and captions can include names and speech from feeds with picture treatments."
+    }
+}
+
 extension TranscriptCodec {
+    /// A single editable subtitle track. Clip-relative source times are used when available.
+    public static func encodeCaptions(_ indexes: [TranscriptIndex], space: TranscriptSpace,
+                                      filter: TranscriptFilter = .init()) throws -> Data {
+        try captionExport(indexes, space: space, filter: filter).data
+    }
+
+    package static func captionExport(_ indexes: [TranscriptIndex], space: TranscriptSpace,
+                                      filter: TranscriptFilter) throws -> (data: Data, wordCount: Int) {
+        try TranscriptSubtitles.captionExport(indexes, space: space, filter: filter)
+    }
+
     public static func encode(_ index: TranscriptIndex, space: TranscriptSpace, format: TranscriptFormat,
                               filter: TranscriptFilter = .init()) throws -> Data {
         try encode(projectedDocument(index, space: space, filter: filter), format: format)
@@ -8,8 +26,13 @@ extension TranscriptCodec {
 
     public static func encode(_ indexes: [TranscriptIndex], space: TranscriptSpace, format: TranscriptFormat,
                               filter: TranscriptFilter = .init()) throws -> Data {
+        try encode(projectedDocument(indexes, space: space, filter: filter), format: format)
+    }
+
+    private static func projectedDocument(_ indexes: [TranscriptIndex], space: TranscriptSpace,
+                                          filter: TranscriptFilter) -> TranscriptDocument {
         if let index = indexes.first, indexes.count == 1 {
-            return try encode(index, space: space, format: format, filter: filter)
+            return projectedDocument(index, space: space, filter: filter)
         }
         let documents = indexes.enumerated().map { position, index in
             projectedDocument(index, space: space, filter: filter, namespace: String(position))
@@ -17,10 +40,9 @@ extension TranscriptCodec {
         let words = documents.flatMap(\.words).sorted {
             $0.start == $1.start ? $0.end < $1.end : $0.start < $1.start
         }
-        let document = TranscriptDocument(clock: exportClock(space, words: words), tracks: documents.flatMap(\.tracks),
-                                          speakers: documents.flatMap(\.speakers), words: words,
-                                          approximateClock: documents.contains(where: \.approximateClock))
-        return try encode(document, format: format)
+        return TranscriptDocument(clock: exportClock(space, words: words), tracks: documents.flatMap(\.tracks),
+                                  speakers: documents.flatMap(\.speakers), words: words,
+                                  approximateClock: documents.contains(where: \.approximateClock))
     }
 
     private static func projectedDocument(_ index: TranscriptIndex, space: TranscriptSpace,

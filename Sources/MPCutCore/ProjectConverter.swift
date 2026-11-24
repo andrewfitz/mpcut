@@ -37,7 +37,14 @@ public enum ProjectConverter {
     /// Project the timeline into the destination format and report each omission before opening a host editor.
     static func prepareForInterchange(_ input: CutProject, for destination: String, allowLoss: Bool,
                               supportsStillInserts: Bool = false) throws -> (project: CutProject, warnings: [String]) {
-        guard input.participants.render == nil else { throw ParticipantProjectExport.unsupported(destination) }
+        if case let .multicam(group) = input {
+            let feedAngles = group.angles.filter { $0.feedAngle != nil }.map(\.id)
+            if !feedAngles.isEmpty {
+                throw CutError(code: "unsupported_feed_angles",
+                               message: "\(destination) requires rendered media for feed angles \(feedAngles.joined(separator: ", ")). Export ISOs for handoff.")
+            }
+        }
+        guard !input.requiresPictureProcessing else { throw ParticipantProjectExport.unsupported(destination) }
         var warnings = [String]()
         var project = input
         if !input.transcripts.isEmpty {
