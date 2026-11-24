@@ -65,14 +65,18 @@ Measured with an optimized build on an Apple M4 Max that was busy with other wor
 
 | Recording | Every frame, before | Adaptive | Every frame, now | Sparse, now |
 | --- | ---: | ---: | ---: | ---: |
-| 2 h 1 min, two layout changes | about 10 min | 1.6 to 1.9 s | 58 s | 52 s |
-| 2 h 30 min, frequent changes | about 16 min | 5.3 to 5.5 s | | |
+| 2 h 1 min, two layout changes | about 10 min | 1.4 to 1.9 s | 53 to 58 s | 52 s |
+| 2 h 30 min, frequent changes | about 16 min | 4 to 5.5 s | about 90 s | |
 
-The first “before” figure is projected from 90-second runs of the previous reader in an optimized build (15% scanned with Metal measurement, 18% on the CPU). A complete run in a debug build under heavier load took 808 seconds, and 950 seconds for the second recording. The adaptive scan of the first recording reported both layout changes on the same frames as the every-frame scan. The new every-frame and sparse scans return the same observations, tracks, appearances, events and coverage as the previous reader.
+The first “before” figure is projected from 90-second runs of the previous reader in an optimized build (15% scanned with Metal measurement, 18% on the CPU). A complete run in a debug build under heavier load took 808 seconds, and 950 seconds for the second recording. The adaptive scan of the first recording reports the same events on the same frames as the every-frame scan.
 
-H.264 pictures up to 1920×1088 decode in software on several threads. Ten minutes of the first recording decoded in 3.2 seconds that way and in 27.7 seconds through the hardware decoder. The pictures are converted exactly as the hardware decoder's were. Other pictures use the hardware decoder as before. Peak memory for the adaptive scans was 0.4 to 0.5 GB.
+One reader serves every mode, including combined scene scans, which return the same scene report as before. H.264 pictures up to 1920×1088 decode in software on several threads. Ten minutes of the first recording decoded in 3.2 seconds that way and in 27.7 seconds through the hardware decoder. The pictures are converted exactly as the hardware decoder's were. Other pictures use the hardware decoder as before. Peak memory for the adaptive scans was 0.4 to 0.5 GB.
+
+With TileTrail 0.4.1, meeting analysis keeps a video tile it has seen for eight frames in a row through detections that briefly cut it into pieces or merge it with its neighbours, while the picture in its bounds still matches and for at most three seconds. A dark band or a straight edge in someone's room used to read as a gutter for a few frames, and each such frame ended the appearance and started new tracks. On the first recording an every-frame scan went from 6 tracks and 25 events to 2 tracks and the 7 events of its two real layout changes. On the second it went from 1,838 tracks and 7,137 events to 416 and 2,279. Scans saved by earlier builds are rebuilt.
 
 A skipped stretch is never decoded, so damage inside it goes unnoticed: an adaptive scan can complete where an every-frame scan of the same file reports incomplete coverage.
+
+A long every-frame report can exceed 100 MB. With `--output`, add `--summary` (`summary` in a JSON or MCP request) to receive the scan's state, counts, coverage and resume point in place of a second copy of the report.
 
 Sparse analysis is intended for exploratory review. Check all appearances, including a second thumbnail and its nameplate, before delivering a redaction. The renderer reports unresolved coverage and can use an opaque cover for the affected frames. A wrong identity or missed detection can still expose someone. Inspect the delivered picture.
 

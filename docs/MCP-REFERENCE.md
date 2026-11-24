@@ -4717,6 +4717,7 @@ Returns a file job receipt. The completed result includes analysis identity, sou
 | `feed_layout` | optional | string, pattern `^(auto\|[0-9]+x[0-9]+)$` | Use auto or enter COLSxROWS for a fixed grid of up to 64 feeds. Omit for meeting analysis or to reuse a saved scan configuration. |
 | `no_sidecar` | optional | boolean |  |
 | `output` | optional | string, pattern `^/` | Optional absolute path for a new scan JSON file. Pass this file to participant project accept or marker building. |
+| `summary` | optional | boolean | With output, return the scan's state, counts, coverage and resume point in place of the full report. A long every-frame report can exceed 100 MB. |
 | `resume_file` | optional | string, pattern `^/` | Optional absolute path to a compatible saved partial scan to resume. |
 
 ## Window layout and monitoring

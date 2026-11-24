@@ -9,7 +9,8 @@ struct ParticipantCLI {
 
         var allowed: Set<String> {
             switch self {
-            case .scan: ["file", "backend", "sampling", "feed_layout", "include_scenes", "no_sidecar", "progress", "output", "resume_file"]
+            case .scan: ["file", "backend", "sampling", "feed_layout", "include_scenes", "no_sidecar", "progress", "output",
+                         "summary", "resume_file"]
             case .markers: ["analysis_file", "rule"]
             case .inspect: ["project_path"]
             case .accept: ["project_path", "source_id", "analysis_file", "out_project", "in_place"]
@@ -44,7 +45,7 @@ struct ParticipantCLI {
             return
         }
         requestFile = nil
-        let switches: Set<String> = ["include_scenes", "in_place", "include_original"]
+        let switches: Set<String> = ["include_scenes", "in_place", "include_original", "summary"]
         let strings: Set<String> = ["file", "project_path", "source_id", "analysis_file", "out_project",
                                     "output", "output_directory", "backend", "sampling", "feed_layout", "progress",
                                     "resume_file", "participants_file"]
@@ -109,6 +110,12 @@ struct ParticipantCLI {
                     throw CutError(code: "output_exists", message: "Choose a new analysis destination.")
                 }
             }
+            // A saved report can run to hundreds of megabytes. With a summary the
+            // caller gets its state, counts and coverage instead of a second copy.
+            let summary = try request.value("summary", as: Bool.self) ?? false
+            guard !summary || destination != nil else {
+                throw CLIError("invalid_arguments", "Supply --output to save the scan that --summary describes.")
+            }
             let progress = try request.progress()
             let options = try ParticipantScanOptions(
                 backend: backend, sampling: sampling,
@@ -134,7 +141,8 @@ struct ParticipantCLI {
                     // A completed scan or paused checkpoint still needs to be delivered.
                     emitScanProgress(progress, phase: "writing_result", percent: min(99, last.percent), time: last.time)
                 }
-                try outputScan(result, to: destination, pretty: destination == nil && !json, interruption: interruption)
+                try outputScan(result, to: destination, pretty: destination == nil && !json, summary: summary,
+                               summaryPretty: !json, interruption: interruption)
             } catch {
                 if let last {
                     let wasCancelled = error is CancellationError || (error as? CLIError)?.code == "cancelled"
@@ -277,8 +285,31 @@ struct ParticipantCLI {
         }
     }
 
+    /// What a scan saved to a file, without its observations.
+    private struct ScanSummary: Encodable {
+        struct Counts: Encodable {
+            let observations, tracks, appearances, events: Int
+        }
+
+        let state: ParticipantScanResult.State
+        let output: String
+        let bytes: Int
+        let source: ParticipantScanSource
+        let configuration: ParticipantScanConfiguration
+        let analysisIdentity: String
+        let counts: Counts?
+        let coverage: [ParticipantTrackingCoverage]?
+        @ParticipantOptionalSourceTime var resumeAt: RationalTime?
+
+        enum CodingKeys: String, CodingKey {
+            case state, output, bytes, source, configuration, counts, coverage
+            case analysisIdentity = "analysis_identity"
+            case resumeAt = "resume_at"
+        }
+    }
+
     private func outputScan(_ result: ParticipantScanResult, to destination: URL?, pretty: Bool,
-                            interruption: Interruption) throws {
+                            summary: Bool, summaryPretty: Bool, interruption: Interruption) throws {
         let directory = destination?.deletingLastPathComponent() ?? FileManager.default.temporaryDirectory
         let staging = directory.appendingPathComponent(".mpcut-participants-\(UUID().uuidString)")
         let fd = open(staging.path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, destination == nil ? 0o600 : 0o666)
@@ -307,6 +338,18 @@ struct ParticipantCLI {
             let code = publishExclusively(from: staging, to: destination)
             if code == EEXIST { throw CutError(code: "output_exists", message: "Choose a new analysis destination.") }
             if code != 0 { throw CutError(code: "participant_analysis_write_failed", message: String(cString: strerror(code))) }
+        }
+        if summary, let destination {
+            let analysis = result.analysis
+            try writeJSON(ScanSummary(
+                state: result.state, output: destination.path, bytes: count, source: result.source,
+                configuration: result.configuration, analysisIdentity: result.analysisIdentity,
+                counts: analysis.map {
+                    .init(observations: $0.observations.count, tracks: $0.tracks.count,
+                          appearances: $0.appearances.count, events: $0.events.count)
+                },
+                coverage: analysis?.coverage, resumeAt: analysis?.resumeAt), pretty: summaryPretty, checkCancellation: false)
+            return
         }
         try interruption.beginResponse(checkCancellation: false)
         while let bytes = try file.read(upToCount: 1 << 20), !bytes.isEmpty { try writeOutput(bytes) }

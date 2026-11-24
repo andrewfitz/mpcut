@@ -900,7 +900,7 @@ int mp_participant_scan(const char *path, int stream, MPProbeCancelled cancelled
 // without seeking. Closing pictures decode ahead of the offers on their own
 // decoder, several at a time, while closed spans wait in a queue.
 enum { SPAN_PACKETS = 1024, SPAN_BYTES = 48 << 20, SPAN_SHORTEST_SECONDS = 1, SPAN_LONGEST_SECONDS = 3,
-       SPAN_QUEUE = 24, SPAN_QUEUE_BYTES = 96 << 20, SOFTWARE_PIXELS = 1920 * 1088, SOFTWARE_THREADS = 8, KEY_THREADS = 12,
+       SPAN_QUEUE = 24, SPAN_QUEUE_BYTES = 96 << 20, SOFTWARE_PIXELS = 1920 * 1088, SOFTWARE_THREADS = 12, KEY_THREADS = 12,
        BATCH = 32, WORKERS = 6, WORKER_BYTES = 160 << 20 };
 
 // A decoded picture reduced to the pixels the analyzer measures.
@@ -1122,6 +1122,17 @@ static int adaptive_flush(Adaptive *a)
     return ret;
 }
 
+// Feed one decoded picture to the scene detector, as consume does for a
+// scan without checkpoints.
+static int scene_picture(Scan *scan, AVFrame *frame)
+{
+    if (frame->best_effort_timestamp == AV_NOPTS_VALUE) return 0;
+    ScenePicture *now = &scan->frames[scan->count % 3];
+    now->pts = frame->best_effort_timestamp;
+    int ret = sample(scan, frame, now);
+    return ret < 0 ? ret : advance(scan, now);
+}
+
 static int adaptive_deliver(Adaptive *a, AVFrame *frame)
 {
     if (a->scan.cancelled(a->scan.context)) return AVERROR_EXIT;
@@ -1131,6 +1142,9 @@ static int adaptive_deliver(Adaptive *a, AVFrame *frame)
         if (pts != AV_NOPTS_VALUE && pts == a->delivered) return 0;
     }
     if (pts != AV_NOPTS_VALUE) a->delivered = pts;
+    // Scene detection compares consecutive pictures on this thread, in order.
+    int ret = a->scan.visit ? scene_picture(&a->scan, frame) : 0;
+    if (ret != 0) return ret;
     av_frame_move_ref(a->batch[a->batched++], frame);
     return a->batched >= a->batch_limit ? adaptive_flush(a) : 0;
 }
@@ -1443,7 +1457,7 @@ static int adaptive_packet(Adaptive *a, AVPacket **owned)
 
 int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, MPProbeCancelled cancelled,
                                  MPParticipantSampleVisit coarse, MPParticipantSampleVisit frame,
-                                 MPParticipantPrepare prepare, MPParticipantDiscard discard,
+                                 MPParticipantPrepare prepare, MPParticipantDiscard discard, MPSceneVisit scene,
                                  void *context, int *unplaced_damage, char *error, size_t capacity)
 {
     if (!path || !cancelled || !frame || sample_limit < 0 || (prepare && !discard)) {
@@ -1456,7 +1470,7 @@ int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, 
     AVPacket *packet = NULL;
     int ret = AVERROR(ENOMEM);
     if (!a || !format) goto done;
-    a->scan = (Scan){ .cancelled = cancelled, .context = context };
+    a->scan = (Scan){ .cancelled = cancelled, .context = context, .visit = scene };
     a->visit = frame;
     a->offer = coarse;
     a->prepare = prepare;
@@ -1489,8 +1503,9 @@ int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, 
     const AVCodecDescriptor *descriptor = avcodec_descriptor_get(id);
     a->intra_only = descriptor && (descriptor->props & AV_CODEC_PROP_INTRA_ONLY) && id != AV_CODEC_ID_FFV1;
     // For H.26x, adaptive_boundary verifies the bitstream's actual access point.
-    // Without a coarse visit every picture is decoded in order.
-    a->boundaries = coarse && (a->intra_only || id == AV_CODEC_ID_H264 || id == AV_CODEC_ID_HEVC);
+    // Without a coarse visit every picture is decoded in order. Scene
+    // detection also needs every picture.
+    a->boundaries = coarse && !scene && (a->intra_only || id == AV_CODEC_ID_H264 || id == AV_CODEC_ID_HEVC);
     a->software = id == AV_CODEC_ID_H264 && (int64_t)parameters->width * parameters->height <= SOFTWARE_PIXELS &&
         (parameters->format == AV_PIX_FMT_YUV420P || parameters->format == AV_PIX_FMT_YUVJ420P);
     // The hardware decoder returns these pictures as NV12. Present the same
@@ -1534,6 +1549,7 @@ int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, 
     if (!a->dense && (ret = adaptive_decoder(a, &a->dense, NULL)) < 0) goto done;
     if (!a->streaming && (ret = adaptive_decode(a, a->packets, a->count, false)) != 0) goto done;
     if ((ret = adaptive_pump(a, NULL)) != 0 || (ret = adaptive_flush(a)) != 0) goto done;
+    if (scene && a->scan.pending > 0) emit(&a->scan, &a->scan.frames[(a->scan.count - 1) % 3]);
     ret = a->scan.pictures ? 0 : AVERROR_INVALIDDATA;
 done:
     if (ret < 0) av_strerror(ret, error, capacity);
@@ -1546,6 +1562,7 @@ done:
             av_free(a->workers[i].chroma);
         }
         av_free(a->workers);
+        sws_freeContext(a->scan.scale);
         for (int i = 0; i < BATCH; i++) {
             av_frame_free(&a->batch[i]);
             sample_discard(a, &a->samples[i]);

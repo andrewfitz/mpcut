@@ -22,7 +22,7 @@ import unittest
 
 from participant_e2e_fixture import (
     CARD, COVER, FPS, FRAME_COUNT, GAP, GUEST, HEIGHT, HOST, RATE, STAGE, THUMB, WIDTH,
-    frame_times, generate, generate_camera, pixel, probe, sound, tiles_at, video,
+    ffmpeg, frame_times, generate, generate_camera, pixel, probe, sound, tiles_at, video,
 )
 from saved_project import read_project
 
@@ -319,6 +319,23 @@ class ParticipantE2E(ParticipantFixtureCase):
         audio_source, = payload["audio_sources"]
         self.assertEqual(sound(isolated / audio_source["file"]), sound(self.gallery))
 
+    def test_scan_summary_describes_the_saved_report(self):
+        saved = self.folder / "scan.json"
+        summary = self.cli("participants", "scan", "--file", str(self.gallery), "--backend", "cpu-only",
+                           "--output", str(saved), "--summary")
+        report = json.loads(saved.read_text())
+        analysis = report["analysis"]
+        self.assertEqual(summary["state"], report["state"])
+        self.assertEqual(Path(summary["output"]).resolve(), saved.resolve())
+        self.assertEqual(summary["bytes"], saved.stat().st_size)
+        self.assertEqual(summary["counts"], {name: len(analysis[name])
+                                             for name in ("observations", "tracks", "appearances", "events")})
+        self.assertEqual(summary["coverage"], analysis["coverage"])
+        self.assertEqual(summary["analysis_identity"], report["analysis_identity"])
+        self.assertNotIn("analysis", summary)
+        failed = self.cli("participants", "scan", "--file", str(self.gallery), "--summary", ok=False)
+        self.assertEqual(failed["error"]["code"], "invalid_arguments")
+
     def test_scan_accept_and_render_tracks_a_seat_swap(self):
         report = self.cli("participants", "scan", "--file", str(self.gallery), "--backend", "cpu-only",
                           "--sampling", "every-frame", measurement="scan_cpu_every_frame")
@@ -351,6 +368,52 @@ class ParticipantE2E(ParticipantFixtureCase):
         frames = self.decode(output)
         for index, frame in enumerate(frames[:2 * FPS]):
             self.assert_color(frame, SIZE[0], SIZE[0] // 2, SIZE[1] // 2, GUEST, f"auto-tracked guest frame {index}")
+
+    def test_redaction_stops_or_covers_stretches_an_adaptive_scan_skipped(self):
+        # Hold the first picture for three seconds so the scan has a steady stretch to skip.
+        steady = self.folder / "steady.mov"
+        ffmpeg("-i", self.gallery, "-an", "-vf", "tpad=start_duration=3:start_mode=clone",
+               "-c:v", "prores_ks", "-profile:v", "standard", "-pix_fmt", "yuv422p10le", steady)
+        base = self.base("steady")
+        project = read_project(base)
+        project["angles"] = [{"id": "gallery", "file": str(steady)}]
+        project["audio"] = {"mode": "none"}
+        project["group_range"] = interval(0, 8)
+        base.write_text(json.dumps(project))
+
+        report = self.cli("participants", "scan", "--file", str(steady), "--backend", "cpu-only")
+        self.assertEqual(report["state"], "completed", report)
+        self.assertEqual(report["configuration"]["sampling"], "adaptive")
+        if all(item["status"] != "inferred" for item in report["analysis"]["coverage"]):
+            self.skipTest("This TileTrail build analyzes every frame of an adaptive scan.")
+        scan = self.folder / "adaptive-scan.json"
+        scan.write_text(json.dumps(report))
+        approved = self.folder / "adaptive-accepted.cut"
+        self.cli("participants", "project", "accept",
+                 request={"project_path": str(base), "source_id": "gallery",
+                          "analysis_file": str(scan), "out_project": str(approved)})
+        accepted = read_project(approved)["participants"]
+        source, = accepted["sources"]
+        skipped = [item["range"] for item in source["coverage"] if item["state"] == "inferred"]
+        self.assertTrue(skipped, source["coverage"])
+        self.assertTrue(any(item["state"] == "verified" for item in source["coverage"]), source["coverage"])
+
+        opaque = plan("original", size=(WIDTH, HEIGHT), redactions=(
+            {"participant_id": accepted["people"][0]["id"], "treatment": "opaque", "color": color(COVER)},))
+        preflight = self.cli("participants", "render", "plan",
+                             request={"project_path": str(approved), "plan": opaque})
+        self.assertFalse(preflight["publishable"])
+        unresolved = [(rational(issue["source"]["from"]), rational(issue["source"]["to"]))
+                      for issue in preflight["privacy_issues"]]
+        for stretch in skipped:
+            self.assertTrue(any(start <= rational(stretch["from"]) and rational(stretch["to"]) <= end
+                                for start, end in unresolved), (stretch, preflight["privacy_issues"]))
+        _, refusal = self.export(approved, "adaptive-must-stop", opaque, ok=False)
+        self.assertEqual(refusal["error"]["code"], "unresolved_participant_privacy")
+        opaque["unresolved_privacy"] = "cover"
+        _, covered = self.export(approved, "adaptive-covered", opaque)
+        self.assertTrue(covered["publishable"])
+        self.assertEqual(covered["privacy_issues"], preflight["privacy_issues"])
 
     def test_extraction_reopens_with_accepted_geometry_and_late_iso(self):
         # The approved project contains all geometry. No machine scan is run for

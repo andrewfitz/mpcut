@@ -91,6 +91,15 @@ static inline int mpcut_tiletrail_coarse_committed(uint32_t outcome) {
 #endif
 }
 
+// One before TileTrail published a revision for meeting analysis.
+static inline uint32_t mpcut_tiletrail_meeting_detector_revision(void) {
+#ifdef TILETRAIL_MEETING_DETECTOR_REVISION
+    return TILETRAIL_MEETING_DETECTOR_REVISION;
+#else
+    return 1;
+#endif
+}
+
 static inline int32_t mpcut_tiletrail_analyzer_create_feeds(
     const tiletrail_config_t *config, tiletrail_timestamp_t start,
     uint32_t columns, uint32_t rows, tiletrail_analyzer_t **out, tiletrail_error_t *error) {

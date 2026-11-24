@@ -14,6 +14,7 @@
         "feed_layout": {"type": "string", "pattern": "^(auto|[0-9]+x[0-9]+)$", "description": "Use auto or enter COLSxROWS for a fixed grid of up to 64 feeds. Omit for meeting analysis or to reuse a saved scan configuration."},
         "no_sidecar": {"type": "boolean"},
         "output": {"type": "string", "pattern": "^/", "description": "Optional absolute path for a new scan JSON file. Pass this file to participant project accept or marker building."},
+        "summary": {"type": "boolean", "description": "With output, return the scan's state, counts, coverage and resume point in place of the full report. A long every-frame report can exceed 100 MB."},
         "resume_file": {"type": "string", "pattern": "^/", "description": "Optional absolute path to a compatible saved partial scan to resume."}
       },
       "required": ["operation_id", "file"],

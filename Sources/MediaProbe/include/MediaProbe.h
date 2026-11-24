@@ -148,9 +148,11 @@ typedef void (*MPParticipantDiscard)(void *context, void *prepared);
 // the analyzer reads: the longer side becomes the limit, the other scales to
 // match, and sample i of n is source pixel (2i + 1) * size / 2n. Pictures then
 // convert side by side. Zero delivers whole pictures.
+// A scene visit receives the scene detector's markers, as in mp_scene_scan,
+// and makes the scan decode every picture.
 int mp_participant_scan_adaptive(const char *path, int stream, int sample_limit, MPProbeCancelled cancelled,
                                  MPParticipantSampleVisit coarse, MPParticipantSampleVisit frame,
-                                 MPParticipantPrepare prepare, MPParticipantDiscard discard,
+                                 MPParticipantPrepare prepare, MPParticipantDiscard discard, MPSceneVisit scene,
                                  void *context, int *unplaced_damage, char *error, size_t capacity);
 
 typedef struct {

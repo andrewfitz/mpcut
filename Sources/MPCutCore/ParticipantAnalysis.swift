@@ -152,6 +152,9 @@ public enum ParticipantAnalysis {
                                       transform: transform, backend: options.backend, sampling: options.sampling,
                                       feedLayout: options.feedLayout == .meeting ? nil : options.feedLayout,
                                       feedDetectorRevision: options.feedLayout == .meeting ? nil : Int(mpcut_tiletrail_feed_detector_revision()),
+                                      meetingDetectorRevision: options.feedLayout != .meeting
+                                          || mpcut_tiletrail_meeting_detector_revision() <= 1
+                                          ? nil : Int(mpcut_tiletrail_meeting_detector_revision()),
                                       adaptiveRevision: options.sampling != .adaptive ? nil
                                           : supportsAdaptiveSampling && !options.includeScenes ? 1 : 0)
         let encoder = JSONEncoder()
@@ -390,6 +393,8 @@ private struct ParticipantCacheKey: Encodable {
     let sampling: ParticipantSampling
     let feedLayout: ParticipantFeedLayout?
     let feedDetectorRevision: Int?
+    // Absent for libraries that predate the revision, which keeps their saved scans.
+    let meetingDetectorRevision: Int?
     // Zero records an adaptive request that analyzed every frame.
     let adaptiveRevision: Int?
 }
@@ -525,28 +530,6 @@ private final class TileTrailScan {
     func run(_ url: URL) throws -> (state: ParticipantScanResult.State, analysis: ParticipantTrackingResult,
                                     sceneReport: SceneReport?) {
         let context = Unmanaged.passUnretained(self).toOpaque()
-        let select: MPParticipantFrameSelect = { pointer, pts, duration, damaged in
-            let scan = Unmanaged<TileTrailScan>.fromOpaque(pointer!).takeUnretainedValue()
-            do {
-                return try scan.shouldSample(pts: pts, duration: duration, valid: damaged == 0) ? 1 : 0
-            } catch {
-                scan.failure = error
-                return -1
-            }
-        }
-        let frame: MPParticipantFrameVisit = { pointer, pts, duration, rgb, width, height, stride, sarNum, sarDen in
-            let scan = Unmanaged<TileTrailScan>.fromOpaque(pointer!).takeUnretainedValue()
-            do {
-                if scan.sampling != .sparse,
-                   try !scan.shouldSample(pts: pts, duration: duration, valid: rgb != nil) { return 0 }
-                try scan.push(pts: pts, rgb: rgb, width: width, height: height,
-                              stride: stride, sarNum: sarNum, sarDen: sarDen)
-                return scan.deviceLoss == nil ? 0 : 1
-            } catch {
-                scan.failure = error
-                return 1
-            }
-        }
         let scene: MPSceneVisit = { pointer, pts, feature in
             guard let feature else { return }
             let scan = Unmanaged<TileTrailScan>.fromOpaque(pointer!).takeUnretainedValue()
@@ -596,16 +579,13 @@ private final class TileTrailScan {
         var decoderMessage = [CChar](repeating: 0, count: 256)
         var unplacedDamage: Int32 = 0
         let status = url.withUnsafeFileSystemRepresentation { path in
-            // Without scene detection, the same reader decodes every frame in
-            // order when it has no coarse visit. Sparse sampling selects from
-            // those frames in the visit.
-            scenes == nil
-                ? mp_participant_scan_adaptive(path, Int32(source.stream), mpcut_tiletrail_sample_limit(), stopped,
-                                               adaptive ? coarse : nil, sample, preparesAhead ? prepare : nil, discard, context,
-                                               &unplacedDamage, &decoderMessage, decoderMessage.count)
-                : mp_participant_scan(path, Int32(source.stream), stopped, sampling == .sparse ? select : nil, frame,
-                                      scenes == nil ? nil : scene, context, &unplacedDamage,
-                                      &decoderMessage, decoderMessage.count)
+            // One reader serves every mode. It decodes every frame in order
+            // unless it has a coarse visit; sparse sampling selects from those
+            // frames in the visit, and scene detection sees them all.
+            mp_participant_scan_adaptive(path, Int32(source.stream), mpcut_tiletrail_sample_limit(), stopped,
+                                         adaptive ? coarse : nil, sample, preparesAhead ? prepare : nil, discard,
+                                         scenes == nil ? nil : scene, context,
+                                         &unplacedDamage, &decoderMessage, decoderMessage.count)
         }
         if let failure { throw failure }
         if status == MP_PARTICIPANT_UNSUPPORTED_DISPLAY_TRANSFORM {
@@ -736,13 +716,6 @@ private final class TileTrailScan {
         reporter?.send(.scanning, at: time)
         reportProgress(time)
         return 1
-    }
-
-    private func push(pts: Int64, rgb: UnsafePointer<UInt8>?,
-                      width: Int32, height: Int32, stride: Int32, sarNum: Int32, sarDen: Int32) throws {
-        var none: UnsafeMutableRawPointer?
-        try push(pts: pts, rgb: rgb, width: width, height: height, stride: stride, sarNum: sarNum, sarDen: sarDen,
-                 prepared: &none)
     }
 
     /// Commit a frame, from the analysis prepared for it when there is one.
