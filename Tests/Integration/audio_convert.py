@@ -861,19 +861,20 @@ class AudioConversionTests(unittest.TestCase):
         self.index_header(surround, earlier)
         self.assertEqual(self.layout(surround), (6, "5.1"))
         renewed = self.index_header(surround)
-        self.assertEqual((renewed["probe_revision"], renewed["streams"][0]["info"]["channel_layout"]), (8, "5.1"))
+        self.assertEqual((renewed["probe_revision"], renewed["streams"][0]["info"]["channel_layout"]), (9, "5.1"))
         self.assertGreater(renewed["audio"][0]["coded_bytes"], 0)
         # Every retired probe revision is rebuilt, including ordinary AAC movies.
         self.index_header(aac, earlier)
         self.assertEqual(rate(aac, "aac"), 96_000)
-        self.assertEqual(self.index_header(aac)["probe_revision"], 8)
+        self.assertEqual(self.index_header(aac)["probe_revision"], 9)
 
-        # Revision 8 adds decoded packet counts to lossless tracks. Only
-        # affected revision-7 indexes need another source scan.
+        # Revision 8 adds decoded packet counts to lossless tracks. Revision 9
+        # changes the end points of H.264 and HEVC and reads MOV-family files
+        # again. Only affected revision-7 indexes need another source scan.
         flac = folder / "soundtrack.flac"
         ffmpeg("-i", aac, "-map", "0:a:0", "-c:a", "flac", flac)
         self.layout(flac)
-        for source, expected in [(aac, 7), (flac, 8)]:
+        for source, expected in [(surround, 7), (flac, 9), (aac, 9)]:
             self.index_header(source, lambda header: header.update(probe_revision=7))
             self.layout(source)
             self.assertEqual(self.index_header(source)["probe_revision"], expected)

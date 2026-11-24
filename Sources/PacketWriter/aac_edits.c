@@ -816,35 +816,16 @@ static int relabel_chapter_track(Box trak, uint32_t movie_timescale, uint64_t mo
     }
     uint64_t length = media_width == 4 ? AV_RB32(media_header.begin + media_offset)
                                        : AV_RB64(media_header.begin + media_offset);
-    uint64_t delay = 0;
-    Box edits, list;
-    if (find_box(trak, BOX('e','d','t','s'), &edits) && find_box(edits, BOX('e','l','s','t'), &list)) {
-        const uint8_t *p = list.payload;
-        size_t size = (size_t)(list.end - p);
-        if (size >= 8 && AV_RB32(p + 4) > 1) {
-            /* A first chapter that starts after zero is preceded by an empty edit. */
-            if (p[0] == 1 && size >= 28 && AV_RB64(p + 16) == UINT64_MAX)
-                delay = AV_RB64(p + 8);
-            else if (p[0] == 0 && size >= 20 && AV_RB32(p + 12) == UINT32_MAX)
-                delay = AV_RB32(p + 8);
-        }
-    }
-    if (!length || length > INT64_MAX / movie_timescale || delay > INT64_MAX / movie_timescale) {
+    if (!length || length > INT64_MAX / movie_timescale || !movie_duration) {
         return 0;
     }
-    Edit entries[2];
-    AudioTrack layout = {.edits = entries};
-    int64_t start = av_rescale((int64_t)delay, movie_timescale, CHAPTER_TIMESCALE);
+    /* The muxer starts the first chapter sample at zero, so one edit presents the whole track. */
     int64_t extent = av_rescale((int64_t)length, movie_timescale, CHAPTER_TIMESCALE);
-    if ((uint64_t)start >= movie_duration) {
-        extent = 1; /* Keep a chapter that begins on the movie's final tick. */
-    } else if ((uint64_t)extent > movie_duration - (uint64_t)start) {
-        extent = (int64_t)(movie_duration - (uint64_t)start); /* The last chapter ends with the movie. */
+    if ((uint64_t)extent > movie_duration) {
+        extent = (int64_t)movie_duration; /* The last chapter ends with the movie. */
     }
-    if (start > 0) {
-        entries[layout.count++] = (Edit){start, -1};
-    }
-    entries[layout.count++] = (Edit){extent, 0};
+    Edit entry = {extent, 0};
+    AudioTrack layout = {.edits = &entry, .count = 1};
 
     uint8_t *new_trak = *output;
     AV_WB32(new_trak + 4, trak.type);
@@ -858,8 +839,7 @@ static int relabel_chapter_track(Box trak, uint32_t movie_timescale, uint64_t mo
             continue;
         }
         if (child.begin == header.begin) {
-            *output += write_duration_header(*output, child, duration_offset, duration_width,
-                                             (uint64_t)(start + extent));
+            *output += write_duration_header(*output, child, duration_offset, duration_width, (uint64_t)extent);
             continue;
         }
         size_t size = (size_t)(child.end - child.begin);
@@ -882,7 +862,7 @@ static uint32_t track_id(Box trak) {
 }
 
 int mpcut_mov_finish_chapters(const char *path, int movie_timescale, char *error, size_t cap) {
-    enum { GROWTH = 128 }; /* A 64-bit track header and a two-entry edit list. */
+    enum { GROWTH = 64 }; /* A 64-bit track header and edit list. */
     FILE *file = fopen(path, "r+b");
     if (!file) {
         return errorf(error, cap, "Cannot open movie to finish its chapter track: %s", path);

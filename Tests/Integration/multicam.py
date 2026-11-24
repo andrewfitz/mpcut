@@ -18,7 +18,7 @@ CLI = None
 
 
 def camera(path, *, marker_base, frequency, rate=FPS, gop=FPS, length="4",
-           audio_codec="pcm_s16le", delay=None, extra_audio=False):
+           audio_codec="pcm_s16le", delay=None, extra_audio=False, bframes=0):
     # Encode the camera and frame identity in luma so it survives Smart Trim.
     marker = ("geq=lum='if(lt(Y,16)*lt(X,128),"
               f"if(bitand(N+{marker_base},pow(2,floor(X/16))),210,32),lum(X,Y))'")
@@ -31,7 +31,7 @@ def camera(path, *, marker_base, frequency, rate=FPS, gop=FPS, length="4",
            *audio_input, "-map", "0:v:0", "-map", "1:a:0",
            *(["-map", "2:a:0"] if extra_audio else []),
            "-vf", marker, "-c:v", "libx264", "-threads", "1",
-           "-x264-params", f"keyint={gop}:min-keyint={gop}:scenecut=0:open-gop=0:bframes=0",
+           "-x264-params", f"keyint={gop}:min-keyint={gop}:scenecut=0:open-gop=0:bframes={bframes}:b-adapt=0",
            "-color_range", "tv", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
            "-c:a", audio_codec, "-channel_layout:a", "mono", path)
     return path
@@ -41,6 +41,11 @@ def wav(path, length):
     ffmpeg("-f", "lavfi", "-i", f"aevalsrc=0.2*sin(2*PI*(349*t+51*t*t)):s={RATE}:d={length}",
            "-c:a", "pcm_s16le", path)
     return path
+
+
+def picture_types(path):
+    report = probe(path, "-select_streams", "v:0", "-show_entries", "frame=pict_type")
+    return "".join(frame["pict_type"] for frame in report["frames"])
 
 
 def pcm_slice(pcm, start, end):
@@ -192,10 +197,13 @@ class MulticamTests(unittest.TestCase):
     def test_copy_alternatives_validate_ranges_clipped_at_the_original_switch(self):
         wide = self.root / "select-wide.mov"
         close = self.root / "select-close.mov"
+        # Reordered pictures keep both edges of a copy on keyframes: an outgoing angle ends only before one.
+        # Without them every picture is a verified end, and only the incoming start would restrict the switch.
         for source, keyframes in [(wide, "0,1,2,3"), (close, "0,1,1.04,2,3")]:
             ffmpeg("-f", "lavfi", "-i", "testsrc2=d=4:s=320x96:r=25", "-c:v", "libx264",
-                   "-threads", "1", "-x264-params", "keyint=100:min-keyint=1:scenecut=0:open-gop=0:bframes=0",
+                   "-threads", "1", "-x264-params", "keyint=100:min-keyint=1:scenecut=0:open-gop=0:bframes=3:b-adapt=0",
                    "-force_key_frames", keyframes, source)
+            self.assertIn("B", picture_types(source))
         first = {"group_time": "0", "angle_id": "wide"}
         switch = {"group_time": "1.04", "angle_id": "close"}
         for outgoing, incoming, clipped, expected in [
@@ -428,34 +436,54 @@ class MulticamTests(unittest.TestCase):
                 self.assertEqual(failure["code"], "invalid_cut_project")
 
     def test_smart_trim_encodes_edges_and_keeps_interior_video(self):
-        self.project(switches=[
-            {"group_time": "0", "angle_id": "wide"},
-            {"group_time": "32/25", "angle_id": "close"},
-            {"group_time": "69/25", "angle_id": "wide"},
-        ])
-        self.export("--dry-run", ok=False)
-        self.assertFalse(self.output.exists())
-        report = self.export("--dry-run", mode="smart")
-        self.assertEqual(rational_time(report["encoded_video_duration"]), 2)
-        self.assertEqual(rational_time(report["copied_video_duration"]), 2)
-        self.assertEqual([[times(edge) for edge in item.get("encoded_edges", [])] for item in report["picture"]],
-                         [[(1, Fraction(32, 25))], [(Fraction(32, 25), Fraction(69, 25))],
-                          [(Fraction(69, 25), 3)]])
-        self.assertEqual([item["track_actions"][0]["action"] for item in report["picture"]],
-                         ["copy_and_encode", "encode", "copy_and_encode"])
-        lane, = report["audio_lanes"]
-        self.assertEqual(lane["action"], "copy")
-        segment, = lane["segments"]
-        self.assertEqual([(track["index"], track["kind"]) for track in segment["tracks"]], [(0, "audio")])
-        self.export(mode="smart")
-        self.assert_program([(self.wide, 0, 32), (self.close, 32, 69), (self.wide, 69, 100)],
-                            audio(self.lav), copy=False)
-        wide = vcl_hashes(self.wide, "h264")
-        actual = vcl_hashes(self.output, "h264")
-        for number in list(range(25)) + list(range(75, 100)):
-            position = Fraction(number, FPS)
-            self.assertEqual(actual[position], wide[position], position)
-        self.assertNotEqual(actual[Fraction(69, FPS)], wide[Fraction(69, FPS)])
+        # Cameras that reorder pictures end a copy only before a keyframe, so both sides of each switch are encoded.
+        # The class cameras do not reorder: each may end at any picture, and only the two starts inside a picture
+        # group are encoded, up to the next keyframe. Rows: cameras, encoded duration, encoded edges and action of
+        # each picture interval, then the copied and the encoded pictures as (camera, picture numbers).
+        reordered = [camera(self.root / f"reordered-{name}.mov", marker_base=base, frequency=frequency, bframes=3)
+                     for name, base, frequency in [("wide", 0, 419), ("close", 128, 691)]]
+        for source in reordered:
+            self.assertIn("B", picture_types(source))
+        for cameras, encoded, edges, actions, copied, replaced in [
+            ([self.wide, self.close], Fraction(24, 25),
+             [[], [(Fraction(32, 25), 2)], [(Fraction(69, 25), 3)]], ["copy", "copy_and_encode", "copy_and_encode"],
+             [(0, range(32)), (1, range(50, 69)), (0, range(75, 100))], [(1, 32), (0, 69)]),
+            (reordered, 2,
+             [[(1, Fraction(32, 25))], [(Fraction(32, 25), Fraction(69, 25))], [(Fraction(69, 25), 3)]],
+             ["copy_and_encode", "encode", "copy_and_encode"],
+             [(0, range(25)), (0, range(75, 100))], [(0, 25), (1, 32), (1, 50), (0, 69)]),
+        ]:
+            with self.subTest(wide=cameras[0].name):
+                self.output = self.root / f"program-{cameras[0].stem}.mov"
+                self.project(wide=cameras[0], close=cameras[1], switches=[
+                    {"group_time": "0", "angle_id": "wide"},
+                    {"group_time": "32/25", "angle_id": "close"},
+                    {"group_time": "69/25", "angle_id": "wide"},
+                ])
+                self.export("--dry-run", ok=False)
+                self.assertFalse(self.output.exists())
+                report = self.export("--dry-run", mode="smart")
+                self.assertEqual(rational_time(report["encoded_video_duration"]), encoded)
+                self.assertEqual(rational_time(report["copied_video_duration"]), 4 - encoded)
+                self.assertEqual([[times(edge) for edge in item.get("encoded_edges", [])] for item in report["picture"]],
+                                 edges)
+                self.assertEqual([item["track_actions"][0]["action"] for item in report["picture"]], actions)
+                lane, = report["audio_lanes"]
+                self.assertEqual(lane["action"], "copy")
+                segment, = lane["segments"]
+                self.assertEqual([(track["index"], track["kind"]) for track in segment["tracks"]], [(0, "audio")])
+                self.export(mode="smart")
+                self.assert_program([(cameras[0], 0, 32), (cameras[1], 32, 69), (cameras[0], 69, 100)],
+                                    audio(self.lav), copy=False)
+                originals = [vcl_hashes(source, "h264") for source in cameras]
+                actual = vcl_hashes(self.output, "h264")
+                for source, numbers in copied:
+                    for number in numbers:
+                        position = Fraction(number, FPS)
+                        self.assertEqual(actual[position], originals[source][position], position)
+                for source, number in replaced:
+                    position = Fraction(number, FPS)
+                    self.assertNotEqual(actual[position], originals[source][position], position)
 
     def test_fractional_frame_switches_keep_sample_exact_wav(self):
         rate = "30000/1001"
@@ -540,10 +568,11 @@ class MulticamTests(unittest.TestCase):
 
     def test_picture_only_cut_without_alternatives_says_what_to_do(self):
         # The picture-only row of the export rules offers another container only, and no container takes a switch
-        # inside a picture group. The refusal then says what does help, and people read its times in seconds.
+        # inside the incoming camera's picture group. The refusal then says what does help, and people read its
+        # times in seconds.
         self.project(switches=[{"group_time": "0", "angle_id": "wide"}, {"group_time": "57/25", "angle_id": "close"}])
         failure = self.export("--dry-run", "--tracks", "video", ok=False)["error"]
-        self.assertEqual((failure["code"], failure["reason"]), ("unsafe_boundary", "cut_video_end"))
+        self.assertEqual((failure["code"], failure["reason"]), ("unsafe_boundary", "cut_video_start"))
         self.assertFalse(failure.get("alternatives"))
         self.assertTrue(failure["nearest"])
         self.assertIn("boundary at 57/25. A picture-only multicam export is a Lossless Copy, which needs a verified time "
@@ -557,7 +586,8 @@ class MulticamTests(unittest.TestCase):
         told = subprocess.run([CLI, "export", "project", "render", "--project", self.project_path, "--dry-run", "--mode", "copy", "--tracks", "video",
                                "--output", self.output], capture_output=True, text=True, cwd=self.root, timeout=90)
         self.assertEqual(told.returncode, 1)
-        self.assertIn("group 0.000–2.280 s", told.stderr)
+        # The refused edge is the incoming camera's start: the outgoing one may end at any picture.
+        self.assertIn("Source close stream 0, group 2.280–4.000 s", told.stderr)
         self.assertIn("boundary at 2.280 s. A picture-only multicam export", told.stderr)
         self.assertNotIn("57/25", told.stderr)
         self.assertIn("Verified alternatives: ", told.stderr)

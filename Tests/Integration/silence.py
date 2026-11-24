@@ -158,11 +158,13 @@ class Silence(unittest.TestCase):
                             for _, start, end, _, _ in self.intervals(report, "clips"))
         self.assertEqual(decoded_pcm(output), expected)
 
+        # A copy resumes on a keyframe and may stop at any picture of this source, which has no reordered ones.
+        # Camera a has a keyframe at 2 inside its pause. Camera b is one second late, so its pauses hold none.
         copy = self.cli(*args, "--mode", "copy", "--output", self.source.parent / "copy.mov", "--dry-run")
         self.assertEqual(copy["mode"], "copy")
-        self.assertEqual(copy["removals"], [])
-        self.assertEqual(copy["skipped_pauses"], 3)
-        self.assertEqual(seconds(copy["preflight"]["duration"]), 7)
+        self.assertEqual(self.intervals(copy, "removals"), [(1, Fraction(6, 5), 2, Fraction(16, 5), 4)])
+        self.assertEqual(copy["skipped_pauses"], 2)
+        self.assertEqual(seconds(copy["preflight"]["duration"]), Fraction(31, 5))
         self.assertEqual(project.read_bytes(), project_before)
 
     def test_shorten_preserves_occurrence_camera_override(self):
@@ -565,7 +567,8 @@ class Silence(unittest.TestCase):
 
     def test_replay_preflight_real_join_and_pcm(self):
         with tempfile.TemporaryDirectory() as temp:
-            for mode, duration in [("smart", Fraction(12, 5)), ("copy", 4)]:
+            # Smart Trim removes 6/5 to 24/5. A copy stops there too, and resumes on the keyframe at 4.
+            for mode, duration in [("smart", Fraction(12, 5)), ("copy", Fraction(16, 5))]:
                 data = self.cli("--mode", mode, self.source)
                 path = Path(temp) / f"{mode}.mov"
                 args = ["--stdin", "--output", path]
@@ -590,11 +593,21 @@ class Silence(unittest.TestCase):
                 self.assertEqual(self.cli(*args, report=data, success=False)["error"]["code"], "output_exists")
 
     def test_unusable_pause_and_stale_report(self):
-        data = self.cli("--mode", "copy", "--padding-per-side-seconds", "1.95", self.source)
-        self.assertEqual(data["skipped_pauses"], 1)
-        self.assertEqual(spans(data, "clips"), [(0, 6)])
-        data["source_stamp"]["bytes"] += 1
-        self.assertEqual(self.cli("--stdin", report=data, success=False)["error"]["code"], "source_changed")
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "Sparse keyframes.mov"
+            # Keyframes at 0, 2 and 4 leave none in the padded pause, 2.95 to 3.05, for the rest to resume on.
+            subprocess.run(["ffmpeg", "-v", "error", "-i", self.source, "-map", "0", "-c:v", "libx264", "-g", "50",
+                            "-sc_threshold", "0", "-bf", "0", "-c:a", "copy", source], check=True, timeout=120)
+            data = self.cli("--mode", "copy", "--padding-per-side-seconds", "1.95", source)
+            self.assertEqual(data["skipped_pauses"], 1)
+            self.assertEqual(spans(data, "clips"), [(0, 6)])
+            # Smart Trim can encode the picture it resumes on, and the class source has a keyframe at 3.
+            self.assertEqual(spans(self.cli("--padding-per-side-seconds", "1.95", source), "removals"),
+                             [(Fraction(74, 25), Fraction(76, 25))])
+            usable = self.cli("--mode", "copy", "--padding-per-side-seconds", "1.95", self.source)
+            self.assertEqual((usable["skipped_pauses"], spans(usable, "removals")), (0, [(Fraction(74, 25), 3)]))
+            data["source_stamp"]["bytes"] += 1
+            self.assertEqual(self.cli("--stdin", report=data, success=False)["error"]["code"], "source_changed")
 
     def test_default_smart_uses_copy_points_when_edges_cannot_be_encoded(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -607,7 +620,8 @@ class Silence(unittest.TestCase):
             data = self.cli(source)
             self.assertEqual(data["mode"], "smart")
             self.assertEqual(spans(data, "pauses"), [(1, 5)])
-            self.assertEqual(spans(data, "removals"), [(2, 4)])
+            # The retained start ends at the padded pause, on any picture. The rest resumes on a keyframe.
+            self.assertEqual(spans(data, "removals"), [(Fraction(6, 5), 4)])
             export = self.cli("--stdin", "--output", output, report=data)
             self.assertEqual(spans(export, "segments"), spans(data, "clips"))
             self.assertEqual(seconds(export["encoded_duration"]), 0)

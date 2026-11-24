@@ -464,7 +464,7 @@ public struct ReencodeEngine: Sendable {
                 let measured = tracks.compactMap { $0.stream.codec == "aac" ? $0.averageBitRate : nil }
                 written.codec = "aac"
                 written.bitRate = AudioExportEngine.aacBitRate(matching: measured.count == sources.count ? measured.max() : nil,
-                                                               channels: audio.stream.channels)
+                                                               channels: audio.stream.channels, neverBelowSource: true)
             } else if action == .pcm {
                 let pcm = AudioExportEngine.moviePCM(tracks.map(\.stream))
                 written.codec = pcm.codec

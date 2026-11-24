@@ -258,7 +258,7 @@ extension ReencodeEngine {
                     }
                     written.codec = "aac"
                     written.bitRate = AudioExportEngine.aacBitRate(
-                        matching: commonLayout && measured.count == present.count ? measured.max() : nil, channels: channels)
+                        matching: commonLayout && measured.count == present.count ? measured.max() : nil, channels: channels, neverBelowSource: true)
                 } else if action == .pcm {
                     // Sound that is neither resampled nor mixed keeps the word length of its integer sources.
                     let pcm = keepsRate && commonLayout ? AudioExportEngine.moviePCM(streams)

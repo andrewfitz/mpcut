@@ -913,6 +913,7 @@ private func runBatch(_ batch: BulkExport, indexedMedia: [URL: MediaInfo], dryRu
                 ?? ExportResult(dryRun: dryRun, output: item.output.path, edit: item.edit,
                                 mode: item.plan.mode, conversion: item.conversion)
             result.applied = item.applied
+            result.copyOmissions = item.plan.copyOmissions
             // A dry run and the export it plans report the same fields, the tier among them.
             result.tier = tiers.summary(item.request.clips, media: tierMedia, cancelled: { !interruption.isActive })
             if !dryRun {
@@ -1301,6 +1302,7 @@ private func runSilence(_ options: SilenceOptions, arguments: Arguments, request
         throw issue
     }
     var result = try ExportResult(dryRun: options.dryRun, output: output.path, edit: plan.edit, mode: plan.mode, conversion: nil)
+    result.copyOmissions = plan.copyOmissions
     result.silence = SilenceExportSummary(thresholdMode: thresholdMode, thresholdDB: threshold, maxBlip: maxBlip,
                                           padding: padding, detectedPauses: pauses.count, shortenedPauses: cuts.count,
                                           skippedPauses: pauses.count - cuts.count, removedDuration: removedDuration,

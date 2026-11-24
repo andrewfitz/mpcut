@@ -345,6 +345,15 @@ class ReencodeTests(unittest.TestCase):
         action = self.export(self.root / "named.mov", [(sources["s24"], *frames)], audio="aac", dry=True)["audio_actions"][0]
         self.assertEqual((action["action"], action["codec"], action["bit_rate"]), ("aac", "aac", 192_000))
         self.assertNotIn("reason", action)
+        # Matroska states no speaker positions for PCM, so a surround track stays lossless in MOV and becomes AAC in MKV.
+        surround = self.root / "surround.mov"
+        ffmpeg("-i", picture, *noise, "-map", "0:v", "-map", "1:a", "-ac", "6", "-channel_layout", "5.1", "-c:v", "copy",
+               "-c:a", "pcm_s24le", surround)
+        action = self.export(self.root / "surround-auto.mov", [(surround, *frames)], audio="auto", dry=True)["audio_actions"][0]
+        self.assertEqual((action["action"], action["codec"]), ("pcm", "pcm_s24le"))
+        action = self.export(self.root / "surround-auto.mkv", [(surround, *frames)], audio="auto", dry=True)["audio_actions"][0]
+        self.assertEqual((action["action"], action["codec"], action["bit_rate"]), ("aac", "aac", 512_000))
+        self.assertIn("MKV cannot keep the channel layout of PCM", action["reason"])
 
     def test_auto_decides_each_track_and_aac_follows_the_source_bit_rate(self):
         picture = self.ntsc_picture()

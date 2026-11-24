@@ -407,10 +407,14 @@ public struct AudioExportEngine: Sendable {
 
     /// The AAC rate that follows its sources: the customary step nearest their highest measured average, and at
     /// least 32 kbps for each channel. Without a measured AAC source it is 96 kbps for each channel, up to 512 kbps.
-    static func aacBitRate(matching average: Int?, channels: Int) -> Int {
+    /// A movie soundtrack passes `neverBelowSource`: the first step that is not under the source rate, and never
+    /// under the default for its channels, so a re-encode is not written at a lower rate than its source.
+    static func aacBitRate(matching average: Int?, channels: Int, neverBelowSource: Bool = false) -> Int {
         let fallback = max(96, min(512, channels * 96)) * 1000
         guard let average else { return fallback }
         let steps = [32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512].map { $0 * 1000 }
+        // A nominal 256 kbps encode averages a little either side of 256, so a step within 3% under counts as its own.
+        if neverBelowSource { return max(fallback, steps.first { $0 * 100 >= average * 97 } ?? steps[steps.count - 1]) }
         let rate = steps.min { abs($0 - average) < abs($1 - average) } ?? fallback
         return max(rate, 32_000 * channels)
     }

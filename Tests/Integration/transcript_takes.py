@@ -23,10 +23,16 @@ SIZE = (64, 48)
 def make_take(path, luma, frequency, readings):
     # Fixed one-second closed GOPs give the review both exact picture cuts
     # inside a GOP and verifiable stream-copy alternatives on the GOP grid.
+    # The B pictures are reordered, which keeps the end of a copy on that
+    # grid too: H.264 in presentation order could end at any picture.
     ffmpeg("-f", "lavfi", "-i", f"nullsrc=s=64x48:r=25:d=4,geq=lum={luma}:cb=128:cr=128",
            "-f", "lavfi", "-i", f"sine=frequency={frequency}:sample_rate={RATE}:duration=4",
            "-c:v", "libx264", "-preset", "ultrafast", "-g", "25", "-sc_threshold", "0",
+           "-bf", "2", "-x264-params", "b-adapt=0:open-gop=0",
            "-threads", "1", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", path)
+    types = "".join(frame["pict_type"] for frame in
+                    probe(path, "-select_streams", "v:0", "-show_entries", "frame=pict_type")["frames"])
+    assert "B" in types and [number for number, kind in enumerate(types) if kind == "I"] == [0, 25, 50, 75], types
     segments = [
         {"start": words[0][1], "end": words[-1][2], "speaker": 0,
          "words": [{"text": text, "start": start, "end": end} for text, start, end in words]}

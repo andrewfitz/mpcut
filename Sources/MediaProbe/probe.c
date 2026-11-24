@@ -757,13 +757,24 @@ static int build_video_index(MPProbeResult *result, const AVStream *input_video)
         }
     }
     bool source_start = packets[0].start != 0;
+    enum AVCodecID codec = input_video->codecpar->codec_id;
     if (!sorted) {
-        enum AVCodecID codec = input_video->codecpar->codec_id;
         bool matroska_avc_or_hevc = av_match_name("matroska", result->format) &&
                                     (codec == AV_CODEC_ID_H264 || codec == AV_CODEC_ID_HEVC);
         int status = reorder_video(video, &source_start, matroska_avc_or_hevc);
         if (status < 0)
             return status;
+    } else if ((codec == AV_CODEC_ID_H264 || codec == AV_CODEC_ID_HEVC) &&
+               (av_match_name("mov", result->format) || av_match_name("matroska", result->format)) &&
+               input_video->codecpar->extradata_size > 0 && input_video->codecpar->extradata[0] == 1 &&
+               video->field_order == AV_FIELD_PROGRESSIVE && !video->complex_picture &&
+               !video->multilayer && !video->multiple_descriptions) {
+        // Every sample is one displayed progressive picture, decoded in presentation
+        // order from earlier samples only. The pictures before any picture decode
+        // without it. A field-coded stream can split a frame across two samples.
+        // VP8, VP9 and AV1 packets can also carry pictures that are shown later.
+        for (size_t i = 0; i < video->count; i++)
+            packets[i].end = 1;
     }
     result->origin = video->start == AV_NOPTS_VALUE ? packets[0].pts : video->start;
     result->source_start_safe = source_start && packets[0].pts == result->origin;
@@ -963,6 +974,17 @@ fallback:
     result->issue[0] = 0;
 done:
     return status;
+}
+
+/* The MOV demuxer reads a track that other tracks name in a 'chap' reference into the
+ * file's chapters, and marks the track itself as discarded binary data. A copy writes
+ * those chapters into a new chapter track, so the source track is not an extra track. */
+static bool chapter_track(const AVFormatContext *file, const AVStream *stream)
+{
+    const AVCodecParameters *params = stream->codecpar;
+    return av_match_name("mov", file->iformat->name) && file->nb_chapters > 0 &&
+           params->codec_type == AVMEDIA_TYPE_DATA && params->codec_id == AV_CODEC_ID_BIN_DATA &&
+           stream->discard == AVDISCARD_ALL;
 }
 
 static bool prores_index_candidate(const AVFormatContext *file, AVStream **video)
@@ -1167,7 +1189,7 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
         } else if (type == AVMEDIA_TYPE_DATA && stream->codecpar->codec_tag == MKTAG('t', 'm', 'c', 'd') &&
                    av_match_name("mov", file->iformat->name) && !timecode) {
             timecode = true;
-        } else if (type != AVMEDIA_TYPE_AUDIO) {
+        } else if (type != AVMEDIA_TYPE_AUDIO && !chapter_track(file, stream)) {
             result->has_unsupported_auxiliary = 1;
         }
     }

@@ -18,11 +18,11 @@ SAMPLE_RATE = 48_000
 CLI = None
 
 
-def movie(path, codec, width=320, transfer="bt709", height=96, pixel_format="yuv420p"):
+def movie(path, codec, width=320, transfer="bt709", height=96, pixel_format="yuv420p", bframes=3):
     # Eight luma blocks encode the picture number, surviving both lossy encoders.
     marker = "geq=lum='if(lt(Y,16)*lt(X,128),if(bitand(N,pow(2,floor(X/16))),210,32),lum(X,Y))'"
     marker += f",setparams=range=limited:color_primaries=bt709:color_trc={transfer}:colorspace=bt709"
-    gop = "keyint=25:min-keyint=25:scenecut=0:open-gop=0:bframes=3:b-adapt=0"
+    gop = f"keyint=25:min-keyint=25:scenecut=0:open-gop=0:bframes={bframes}:b-adapt=0"
     settings = {
         "h264": ["-c:v", "libx264", "-x264-params", gop, "-threads", "1"],
         "hevc": ["-c:v", "libx265", "-x265-params", gop + ":pools=1:log-level=error", "-tag:v", "hvc1"],
@@ -257,6 +257,41 @@ class SmartTrimTests(unittest.TestCase):
         rejected = self.export(self.root / "lossless.webm", [(src, 7, 88)], smart=False, ok=False)
         self.assertEqual(rejected["error"]["code"], "unsafe_boundary")
         self.check_trim("av1", [(25, 75)], [[]])
+
+    def end_points(self, source):
+        info = json.loads(run([CLI, "media", "inspect", "--json", "--frames", source]))
+        self.assertEqual(len(info["media"]["frames"]), 5 * FPS)
+        return [index for index, picture in enumerate(info["media"]["frames"]) if picture["can_end"]]
+
+    def test_presentation_ordered_pictures_end_a_copy_at_every_picture(self):
+        # Without B pictures each packet depends only on earlier packets, so a copy can stop before any picture.
+        self.sources = {codec: movie(self.root / ("ordered-" + codec + ext), codec, bframes=0)
+                        for codec, ext in [("h264", ".mp4"), ("hevc", ".mov")]}
+        ranges = [(0, 88), (25, 37), (75, 99), (50, 51)]
+        for codec, source in self.sources.items():
+            with self.subTest(codec=codec):
+                self.assertEqual(self.end_points(source), list(range(5 * FPS)))
+                # Every range starts on a keyframe and ends inside a picture group. Nothing is encoded.
+                self.check_trim(codec, ranges, [[]] * len(ranges))
+                smart = self.root / (codec + "-" + "-".join(f"{a}-{b}" for a, b in ranges) + source.suffix)
+                copy = self.root / ("copy-" + codec + source.suffix)
+                requests = [(source, start, end) for start, end in ranges]
+                for report in [self.export(copy, requests, smart=False, dry=True), self.export(copy, requests, smart=False)]:
+                    self.assertEqual(ratio(report["encoded_duration"]), 0)
+                    self.assertEqual(report["copied_duration"], report["duration"])
+                self.assertEqual(timestamped_hashes(copy), timestamped_hashes(smart))
+                # The start of a copy still needs a keyframe. Smart Trim encodes up to the next one only.
+                refused = self.export(self.root / ("refused" + source.suffix), [(source, 7, 88)], smart=False, ok=False)
+                self.assertEqual((refused["error"]["boundary"], refused["error"]["reason"]), ("from", "cut_video_start"))
+                self.check_trim(codec, [(7, 88)], [[(7, 25)]])
+
+    def test_reordered_or_hidden_pictures_end_a_copy_at_keyframes_only(self):
+        # Reordered pictures can need a packet past the cut. An AV1 packet can carry a picture that is shown later.
+        for codec, source in self.sources.items():
+            with self.subTest(codec=codec):
+                self.assertEqual(self.end_points(source), list(range(0, 5 * FPS, FPS)))
+                rejected = self.export(self.root / ("end" + source.suffix), [(source, 0, 88)], smart=False, ok=False)
+                self.assertEqual((rejected["error"]["boundary"], rejected["error"]["reason"]), ("to", "cut_video_end"))
 
     def test_adjacent_source_ranges_copy_through_a_nonkeyframe_seam(self):
         for codec in ["av1", "h264"]:

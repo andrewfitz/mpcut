@@ -603,15 +603,16 @@ class MixedTimelineTests(unittest.TestCase):
             for track in ("v:0", "a:0"):
                 self.assertEqual(sample_hashes(joined, track), sample_hashes(self.wide, track))
 
-        # With one frame removed the pieces no longer meet: the cut is inside a picture group again.
+        # With one frame removed the pieces no longer meet: the second piece starts inside a picture group again.
+        # The first piece may still end there, since this H.264 has no reordered pictures.
         removed = [(self.wide, "0", "13/25"), (self.wide, "14/25", "2")]
         refused = self.export(self.root / "removed.mp4", removed, mode="copy", dry=True, ok=False)["error"]
         self.assertEqual((refused["code"], refused["reason"], refused["segment"], refused["boundary"]),
-                         ("unsafe_boundary", "cut_video_end", 1, "to"))
+                         ("unsafe_boundary", "cut_video_start", 2, "from"))
         self.assertTrue(refused["nearest"])
         encoded = self.export(self.root / "removed.mp4", removed, mode="smart", dry=True)
         self.assertEqual(encoded["tier"]["id"], "lossless")
-        self.assertEqual([factor["id"] for factor in encoded["tier"]["factors"]], ["cut_video_end", "cut_video_start"])
+        self.assertEqual([factor["id"] for factor in encoded["tier"]["factors"]], ["cut_video_start"])
         self.assertGreater(Fraction(encoded["encoded_duration"]["numerator"], encoded["encoded_duration"]["denominator"]), 0)
 
     # MARK: Batches and interruption

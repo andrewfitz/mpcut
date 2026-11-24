@@ -308,6 +308,16 @@ static int timecode_track(const AVStream *stream) {
     return stream->codecpar->codec_type == AVMEDIA_TYPE_DATA && stream->codecpar->codec_tag == MPCUT_TIMECODE_TAG;
 }
 
+/* The MOV demuxer reads a track that other tracks name in a 'chap' reference into the
+ * file's chapters, and marks the track itself as discarded binary data. The copy writes
+ * those chapters into a new chapter track, so the source track is never copied as a stream.
+ * This reads the demuxer's own mark: call it before the writer discards unmapped streams. */
+static int chapter_track(const AVStream *stream) {
+    const AVCodecParameters *codec = stream->codecpar;
+    return codec->codec_type == AVMEDIA_TYPE_DATA && codec->codec_id == AV_CODEC_ID_BIN_DATA &&
+        stream->discard == AVDISCARD_ALL;
+}
+
 static int selected_stream(const Writer *writer, const AVStream *stream) {
     switch (writer->tracks) {
         case MPCUT_TRACKS_AUDIO:
@@ -316,7 +326,7 @@ static int selected_stream(const Writer *writer, const AVStream *stream) {
         case MPCUT_TRACKS_VIDEO:
             // Timecode describes the picture, so a delivered picture-only movie can keep it.
             return primary_video(stream) || (writer->keep_timecode && timecode_track(stream));
-        default: return 1;
+        default: return !chapter_track(stream);
     }
 }
 
@@ -334,6 +344,10 @@ static int validate_streams(Writer *writer, const AVFormatContext *input, int *t
     for (unsigned index = 0; index < input->nb_streams; index++) {
         const AVStream *stream = input->streams[index];
         const AVCodecParameters *codec = stream->codecpar;
+        // A chapter track is left out only when its chapters were read and can be written again.
+        if (writer->tracks == MPCUT_TRACKS_ALL && chapter_track(stream) &&
+            (!input->nb_chapters || !av_match_name("mov", input->iformat->name)))
+            return fail(writer, "Track %u in %s cannot be carried as linked video or audio", index, input->url);
         if (!selected_stream(writer, stream))
             continue;
         if (primary_video(stream)) {
@@ -862,6 +876,7 @@ typedef struct {
     Chapter *items;
     size_t count;
     int unplaced;         /* A range could not be placed on the output timeline. */
+    int64_t moved_start;  /* Milliseconds by which a MOV chapter track moves the first chapter back to zero. */
 } Chapters;
 
 static void free_chapters(Chapters *chapters) {
@@ -913,6 +928,9 @@ static int plan_chapters(const Writer *writer, const MPCutSegment *segments, siz
         int whole = count == 1 && segment->start.numerator == 0 && segment->reaches_end;
         if (whole && movie_clock && is_mov(writer->output->oformat))
             shift = time_add(shift, mov_audio_lead(segment), 1);
+        // A whole MP3 keeps its frames and its decoder delay, so its chapter times still describe it.
+        if (whole && !strcmp(writer->output->oformat->name, "mp3"))
+            shift = (MPCutTime){0, 1};
         cursor = time_add(cursor, time_add(segment->end, segment->start, -1), 1);
         if (origin.denominator <= 0 || !source_start.denominator || !source_end.denominator ||
             !shift.denominator || !cursor.denominator) {
@@ -960,6 +978,13 @@ static int plan_chapters(const Writer *writer, const MPCutSegment *segments, siz
                 last->end = end;
                 continue;
             }
+            if (last && last->source == source && !time_compare(last->start, start) && !time_compare(last->end, end)) {
+                // A movie can list one chapter twice, in its chapter track and in a Nero chapter list.
+                const AVDictionaryEntry *title = av_dict_get(chapter->metadata, "title", NULL, 0);
+                const AVDictionaryEntry *listed = av_dict_get(last->metadata, "title", NULL, 0);
+                if (!strcmp(title ? title->value : "", listed ? listed->value : ""))
+                    continue;
+            }
             Chapter *grown = av_realloc_array(plan->items, plan->count + 1, sizeof(*grown));
             if (!grown) {
                 result = AVERROR(ENOMEM);
@@ -977,13 +1002,17 @@ static int plan_chapters(const Writer *writer, const MPCutSegment *segments, siz
     return result;
 }
 
-/* The MOV chapter track counts whole milliseconds and needs each chapter to start after the one before. */
+/* The MOV chapter track counts whole milliseconds and needs each chapter to start after the one before.
+ * Its first sample always starts with the movie: the muxer places it at zero whatever time it is given. */
 static int mov_chapter_times(const Chapter *chapter, int64_t previous_start, int64_t *start, int64_t *end) {
     const AVRational milliseconds = {1, 1000};
     *start = time_round(chapter->start, milliseconds);
     *end = time_round(chapter->end, milliseconds);
-    return *start != AV_NOPTS_VALUE && *end != AV_NOPTS_VALUE && *start > previous_start &&
-        *end > *start && *end - *start < INT_MAX;
+    if (*start == AV_NOPTS_VALUE || *end == AV_NOPTS_VALUE || *start <= previous_start || *end <= *start)
+        return 0;
+    if (previous_start < 0)
+        *start = 0;
+    return *end - *start < INT_MAX;
 }
 
 /* Hand the planned chapters to the muxer, or with no output only count those its container cannot hold. */
@@ -992,6 +1021,7 @@ static int store_chapters(Writer *writer, Chapters *plan, int movie_timescale, i
     int form = chapter_form(output->oformat);
     int64_t previous = -1;
     *unstored = 0;
+    plan->moved_start = 0;
     for (size_t i = 0; i < plan->count; i++) {
         Chapter *planned = &plan->items[i];
         AVRational base = {1, 1000000000};
@@ -1003,6 +1033,8 @@ static int store_chapters(Writer *writer, Chapters *plan, int movie_timescale, i
              * track is then relabelled with the millisecond clock they were counted on. */
             base = (AVRational){1, movie_timescale};
             usable = mov_chapter_times(planned, previous, &start, &end);
+            if (usable && previous < 0)
+                plan->moved_start = time_round(planned->start, (AVRational){1, 1000});
         }
         if (!usable) {
             (*unstored)++;
@@ -2800,7 +2832,7 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
     Chapters chapters = {0};
     int result = prepare_output(&writer) || avformat_open_input(&input, segments[0].path, NULL, NULL) < 0;
     if (!result) {
-        char container[16] = "This format";
+        char container[16] = "this format";
         const char *extension = strrchr(output_path, '.');
         if (extension && extension[1] && strlen(extension + 1) < sizeof(container)) {
             size_t length = strlen(extension + 1);
@@ -2829,10 +2861,10 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
         if (!kept)
             dropped += later;
         if (dropped && art_form(writer.output->oformat) == ART_NONE) {
-            add_note(notes, capacity, "%s cannot store cover art. %u embedded picture%s not copied.",
+            add_note(notes, capacity, "Cover art cannot be written to %s. %u embedded picture%s not copied.",
                      container, dropped, dropped == 1 ? " is" : "s are");
         } else if (dropped) {
-            add_note(notes, capacity, "%u embedded picture%s cannot be stored in %s and %s not copied.",
+            add_note(notes, capacity, "%u embedded picture%s cannot be written to %s and %s not copied.",
                      dropped, dropped == 1 ? "" : "s", container, dropped == 1 ? "is" : "are");
         }
         if (kept && later) {
@@ -2848,11 +2880,15 @@ int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char 
         } else if (!result && chapters.count) {
             store_chapters(&writer, &chapters, movie_timescale, 0, &unstored);
             if (unstored && chapter_form(writer.output->oformat) == CHAPTERS_NONE) {
-                add_note(notes, capacity, "%s cannot store chapters. %u chapter%s not copied.",
+                add_note(notes, capacity, "Chapters cannot be written to %s. %u chapter%s not copied.",
                          container, unstored, unstored == 1 ? " is" : "s are");
             } else if (unstored) {
-                add_note(notes, capacity, "%u chapter%s cannot be stored in %s and %s not copied.",
+                add_note(notes, capacity, "%u chapter%s cannot be written to %s and %s not copied.",
                          unstored, unstored == 1 ? "" : "s", container, unstored == 1 ? "is" : "are");
+            }
+            if (chapters.moved_start > 0) {
+                add_note(notes, capacity, "%s chapters begin with the file, so the first chapter starts at 0 instead of %"
+                         PRId64 ".%03" PRId64 " s.", container, chapters.moved_start / 1000, chapters.moved_start % 1000);
             }
         }
     }

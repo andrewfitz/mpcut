@@ -551,7 +551,7 @@ extension MulticamEngine {
                     ? input.audio.averageBitRate : nil
             }
             let rate = AudioExportEngine.aacBitRate(matching: !sources.isEmpty && measured.count == sources.count ? measured.max() : nil,
-                                                    channels: plan.channels)
+                                                    channels: plan.channels, neverBelowSource: true)
             arguments += ["-c:a", "aac", "-b:a", "\(rate)"]
         } else {
             if container == "mkv" {
