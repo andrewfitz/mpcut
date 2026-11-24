@@ -11,6 +11,9 @@ struct MCPFileRequest {
     // Each callable operation has a fixed CLI path. Catalog validation rejects fields
     // belonging to a different operation before any process can start.
     private static let routes: [String: (family: String, path: [String])] = [
+        "still_file_soundtrack_attach": ("still", ["still", "soundtrack", "attach"]),
+        "still_file_soundtrack_fit": ("still", ["still", "soundtrack", "fit"]),
+        "still_file_soundtrack_detach": ("still", ["still", "soundtrack", "detach"]),
         "still_file_project_create": ("still", ["still", "project", "create"]),
         "still_file_placement_insert": ("still", ["still", "placement", "insert"]),
         "still_file_picture_replace": ("still", ["still", "picture", "replace"]),
@@ -28,6 +31,7 @@ struct MCPFileRequest {
         "participants_file_render_plan": ("participants", ["participants", "render", "plan"]),
         "participants_file_render_export": ("participants", ["participants", "render", "export"]),
         "participants_file_angles_list": ("participants", ["participants", "angles", "list"]),
+        "participants_file_angles_take": ("participants", ["participants", "angles", "take"]),
         "participants_file_angles_plan": ("participants", ["participants", "angles", "plan"]),
         "participants_file_angles_render": ("participants", ["participants", "angles", "render"]),
         "media_file_inspect": ("inspect", ["media", "inspect"]),
@@ -46,6 +50,10 @@ struct MCPFileRequest {
         "scenes_file_scan": ("scenes", ["scenes", "scan"]),
         "scenes_file_export": ("scenes", ["scenes", "export"]),
         "project_file_media_refresh": ("refresh", ["project", "media", "refresh"]),
+        "project_file_media_list": ("project_media", ["project", "media", "list"]),
+        "project_file_media_locate": ("project_media", ["project", "media", "locate"]),
+        "project_file_media_relink": ("project_media", ["project", "media", "relink"]),
+        "project_file_media_replace": ("project_media", ["project", "media", "replace"]),
         "review_file_frames_export": ("frames", ["review", "frames", "export"]),
         "analysis_file_sidecar_inspect": ("sidecar", ["analysis", "sidecar", "inspect"]),
         "analysis_file_sidecar_build": ("sidecar", ["analysis", "sidecar", "build"]),
@@ -112,6 +120,36 @@ struct MCPFileRequest {
             return
         }
         arguments = route.path + ["--json"]
+        if command == "project_media" {
+            guard let project = try a.path("project_path") else { throw a.invalid("Supply an absolute project_path.") }
+            arguments.append(project)
+            for key in ["folder", "to", "with", "out_project"] {
+                if let value = try a.path(key) { arguments += [a.flag(key), value] }
+            }
+            for key in ["from", "source", "conform", "use_id", "clock", "loss", "replacement_offset", "transcript", "resync"] {
+                if let value = try a.string(key) { arguments += [a.flag(key), value] }
+            }
+            for row in fields["mappings"] as? [[String: Any]] ?? [] {
+                let mapping = Fields(values: row)
+                guard let source = try mapping.string("from"),
+                      let candidate = try mapping.path("to") else { throw a.invalid("Invalid media mapping.") }
+                arguments += ["--from", source, "--to", candidate]
+            }
+            if let from = try a.path("from_prefix"), let to = try a.path("to_prefix") {
+                guard !from.contains("=") else { throw a.invalid("The old folder root must not contain an equals sign.") }
+                arguments += ["--map-prefix", from + "=" + to]
+            }
+            for row in fields["stream_mapping"] as? [[String: Any]] ?? [] {
+                let mapping = Fields(values: row)
+                let from = try mapping.number("from", integer: true)
+                let to = try mapping.number("to", integer: true)
+                arguments += ["--stream-map", from + "=" + to]
+            }
+            for key in ["in_place", "allow_loss", "reset_crop", "shared_time_of_day"] where fields[key] != nil {
+                if try a.bool(key) { arguments.append(a.flag(key)) }
+            }
+            return
+        }
         if command == "participants" {
             for key in ["file", "project_path", "analysis_file", "resume_file", "participants_file", "out_project", "output", "output_directory"] {
                 _ = try a.path(key)
@@ -169,11 +207,11 @@ struct MCPFileRequest {
             for key in fields.keys.sorted() where !["operation_id", "working_directory"].contains(key) {
                 let flag = key == "project_path" ? "--project" : a.flag(key)
                 switch key {
-                case "in_place", "gap", "source_timing":
+                case "in_place", "gap", "source_timing", "fit_soundtrack":
                     if try a.bool(key) { arguments.append(flag) }
-                case "width", "height", "frames", "fragment_index":
+                case "width", "height", "frames", "fragment_index", "audio_stream":
                     arguments += [flag, try a.number(key, integer: true)]
-                case "image", "out_project", "project_path":
+                case "image", "out_project", "project_path", "soundtrack":
                     if let path = try a.path(key) { arguments += [flag, path] }
                 default:
                     if let value = try a.string(key) { arguments += [flag, value] }
@@ -243,7 +281,7 @@ struct MCPFileRequest {
         if let selection = try a.string("select") {
             arguments += ["--select", selection == "non_silent" ? "non-silent" : selection]
         }
-        for name in ["sample", "preset", "group_by", "audio", "audio_output", "mode", "video", "quality", "tracks", "snap"] {
+        for name in ["sample", "preset", "group_by", "audio", "audio_output", "mode", "video", "quality", "tracks", "snap", "still_timing"] {
             if let value = try a.string(name) { arguments += [a.flag(name), value] }
         }
         if command == "scenes" {
@@ -365,7 +403,10 @@ struct MCPFileRequest {
         default:
             break
         }
-        if let project = try a.path("project_path") {
+        if command == "sidecar", let project = try a.path("project_path") {
+            guard let file = try a.path("file") else { throw a.invalid("Supply a source file.") }
+            arguments += ["--project", project, "--", file]
+        } else if let project = try a.path("project_path") {
             arguments += ["--project", project]
         } else if let project = fields["project_data"] {
             arguments += ["--project", "-"]
@@ -413,7 +454,7 @@ struct MCPFileRequest {
         }
     }
 
-    private struct Fields {
+    struct Fields {
         let values: [String: Any]
         func invalid(_ message: String) -> MCPCommandError { MCPCommandError("invalid_arguments", message) }
         func flag(_ key: String) -> String { "--" + key.replacingOccurrences(of: "_", with: "-") }

@@ -280,6 +280,8 @@ public struct AudioExportEngine: Sendable {
                 warnings.append("FLAC stores 24-bit samples. The 32-bit source will be reduced to 24 bits.")
             } else if integerDepth != nil {
                 lossless = true
+            } else if streams.contains(where: { $0.codec.hasPrefix("pcm_f") }) {
+                warnings.append("FLAC stores integer samples. The floating-point source will be reduced to 24 bits, and samples above full scale will clip. Choose PCM to keep them.")
             }
             written.codec = "flac"
             written.bitDepth = depth
@@ -287,13 +289,8 @@ public struct AudioExportEngine: Sendable {
                 : ["-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24"]
         case .aac:
             let measured = sources.compactMap { Self.averageBitRate($0.audio, in: indexed[$0.media.url]) }
-            let fallback = max(96, min(512, plan.channels * 96)) * 1000
-            var rate = fallback
-            if native == .aac, measured.count == sources.count, let highest = measured.max() {
-                let steps = [32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512].map { $0 * 1000 }
-                rate = steps.min { abs($0 - highest) < abs($1 - highest) } ?? fallback
-                rate = max(rate, 32_000 * plan.channels)
-            }
+            let rate = Self.aacBitRate(matching: native == .aac && measured.count == sources.count ? measured.max() : nil,
+                                       channels: plan.channels)
             written.codec = "aac"
             written.bitRate = rate
             estimate = estimatedSize(at: rate)
@@ -392,14 +389,72 @@ public struct AudioExportEngine: Sendable {
                         boundary: copyFailure?.boundary, track: copyFailure?.track)
     }
 
-    private static func integerDepth(_ stream: StreamInfo) -> Int? {
+    static func integerDepth(_ stream: StreamInfo) -> Int? {
         if stream.codec.hasPrefix("pcm_") {
             guard !stream.codec.hasPrefix("pcm_f"), !stream.codec.contains("law") else { return nil }
             let digits = stream.codec.dropFirst(5).prefix { $0.isNumber }
             return Int(digits)
         }
         guard stream.codec == "flac" || stream.codec == "alac" else { return nil }
-        return stream.bitDepth > 0 ? stream.bitDepth : 24
+        return declaredDepth(stream) ?? 24
+    }
+
+    /// The word length a stream states: its own field, or the codec header of FLAC and ALAC. Nil when neither states one.
+    static func declaredDepth(_ stream: StreamInfo) -> Int? {
+        if stream.bitDepth > 0 { return stream.bitDepth }
+        return stream.codec == "flac" || stream.codec == "alac" ? headerDepth(stream) : nil
+    }
+
+    /// The AAC rate that follows its sources: the customary step nearest their highest measured average, and at
+    /// least 32 kbps for each channel. Without a measured AAC source it is 96 kbps for each channel, up to 512 kbps.
+    static func aacBitRate(matching average: Int?, channels: Int) -> Int {
+        let fallback = max(96, min(512, channels * 96)) * 1000
+        guard let average else { return fallback }
+        let steps = [32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512].map { $0 * 1000 }
+        let rate = steps.min { abs($0 - average) < abs($1 - average) } ?? fallback
+        return max(rate, 32_000 * channels)
+    }
+
+    /// The PCM codec of a movie re-encode for the streams one output track decodes. Integer sources keep the
+    /// longest word length among them. Float PCM and decoded lossy sound are written as float, because a decoder
+    /// that works in floating point can exceed full scale and integer PCM would clip there.
+    static func moviePCM(_ streams: [StreamInfo]) -> (codec: String, bitDepth: Int) {
+        var depth = 0
+        for stream in streams {
+            if stream.codec == "pcm_alaw" || stream.codec == "pcm_mulaw" {
+                // Companded telephone PCM decodes to 16-bit integers.
+                depth = max(depth, 16)
+            } else if stream.codec.hasPrefix("pcm_") && !stream.codec.hasPrefix("pcm_f") {
+                // A PCM variant whose name states no word length (Blu-ray, DVD) is written in full.
+                depth = max(depth, integerDepth(stream) ?? 32)
+            } else if stream.codec == "flac" || stream.codec == "alac" {
+                // An unreadable header gives no word length to trust.
+                depth = max(depth, declaredDepth(stream) ?? 32)
+            } else if ExportRules.losslessAudioCodecs.contains(stream.codec) {
+                depth = 32
+            } else {
+                return ("pcm_f32le", 32)
+            }
+        }
+        return depth <= 16 ? ("pcm_s16le", 16) : depth <= 24 ? ("pcm_s24le", 24) : ("pcm_s32le", 32)
+    }
+
+    /// MOV, Matroska and CAF leave the word length of FLAC and ALAC to the decoder. This reads it from the codec header.
+    private static func headerDepth(_ stream: StreamInfo) -> Int? {
+        let header = [UInt8](stream.configuration)
+        let depth: Int
+        if stream.codec == "flac" {
+            // STREAMINFO, alone or after "fLaC" and a metadata block header. The word length follows
+            // 20 bits of sample rate and 3 of channel count, 80 bits in.
+            let start = header.count >= 42 && header.starts(with: Array("fLaC".utf8)) ? 8 : header.count == 34 ? 0 : -1
+            guard start >= 0 else { return nil }
+            depth = Int((header[start + 12] & 1) << 4 | header[start + 13] >> 4) + 1
+        } else {
+            // The ALAC cookie: size, "alac", version, frame length, compatible version, then the word length.
+            guard header.count >= 36, header[4..<8].elementsEqual("alac".utf8) else { return nil }
+            depth = Int(header[17])
+        }
+        return (8...32).contains(depth) ? depth : nil
     }
 
     /// The average rate of the selected sound from the size of its packets. An index without that size gives
@@ -463,13 +518,18 @@ public struct AudioExportEngine: Sendable {
         switch action {
         case .mp3: name = "libmp3lame"
         case .flac: name = "flac"
+        case .alac: name = "alac"
         case .aac: name = "aac"
         case .opus: name = "libopus"
         default: return
         }
+        try requireEncoder(named: name, displayName: ExportRules.displayName(audio: action), helper: helper)
+    }
+
+    static func requireEncoder(named name: String, displayName: String? = nil, helper: URL) throws {
         guard encoderCache.encoders(of: helper).contains(name) else {
             throw CutError(code: "encoder_unavailable",
-                           message: "The installed FFmpeg helper has no \(ExportRules.displayName(audio: action)) encoder. Choose PCM, or update the helper.")
+                           message: "The installed FFmpeg helper has no \(displayName ?? name) encoder. Choose another format, or update the helper.")
         }
     }
 }

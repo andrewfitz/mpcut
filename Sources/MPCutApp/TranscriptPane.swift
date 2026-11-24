@@ -15,15 +15,15 @@ extension EnvironmentValues {
     }
 }
 
-private let transcriptPageSize = 160
+private let transcriptMatchBatchSize = 160
 
 /// Counts reader work so tests can hold the pane to its budget while the playhead moves.
 @MainActor
 enum TranscriptPaneProbe {
     static var initializations = 0
     static var bodyEvaluations = 0
-    static var wordEvaluations = 0
-    static var page = ""
+    static var lineConfigurations = 0
+    static var status = ""
 }
 
 @MainActor
@@ -58,16 +58,6 @@ private final class TranscriptPaneObservation: ObservableObject {
     }
 }
 
-@MainActor
-private final class TranscriptReaderGeometry {
-    var wordFrames: [String: CGRect] = [:]
-    var viewportHeight: CGFloat = 0
-    var lastFollowedParagraph: Int?
-    var keepsScrollPosition = false
-    var revealsAtTop = false
-    var followedTime: RationalTime?
-}
-
 private struct TranscriptTimeSelection {
     let first: TranscriptOccurrence
     let last: TranscriptOccurrence
@@ -99,22 +89,19 @@ struct TranscriptPane: View {
     @State private var includeInferred = false
     @State private var filteredWords: TranscriptPaneWordList?
     @State private var offset = 0
-    @State private var topRequest = 0
+    @State private var scrollRequest: TranscriptFlowScroll?
     @State private var pendingSheet: TranscriptPaneSheet?
     @State private var pendingSelection: (TranscriptSpace, TranscriptTimeSelection)?
-    @State private var revealWordID: String?
     @State private var total = 0
-    @State private var words: [TranscriptOccurrence] = []
-    @State private var paragraphs: [[TranscriptOccurrence]] = []
-    @State private var paragraphForWord: [String: Int] = [:]
-    @State private var readerGeometry = TranscriptReaderGeometry()
+    @State private var flowSource: TranscriptFlowSource?
+    @State private var viewport = TranscriptFlowViewport()
+    private var words: [TranscriptOccurrence] { flowSource?.words ?? [] }
     @State private var matches: [TranscriptMatch] = []
     @State private var matchNumber: Int?
     @State private var selectionStart: TranscriptOccurrence?
     @State private var selectionEnd: TranscriptOccurrence?
-    @State private var activeWordID: String?
+    @State private var activePositions: [Int] = []
     @State private var followPlayback = true
-    @State private var dragging = false
     @State private var alert: String?
     @State private var sheet: TranscriptPaneSheet?
     @State private var detail: String?
@@ -123,6 +110,8 @@ struct TranscriptPane: View {
     @State private var loadingIndex = false
     @State private var loadedRevision: Revision?
     @State private var loadTask: Task<Void, Never>?
+    @State private var clockTask: Task<Void, Never>?
+    @State private var buildingClocks = false
     @State private var indexGeneration = 0
     @State private var restoring: TranscriptReaderPlace?
     @State private var queuedChoice: (word: TranscriptOccurrence, extending: Bool, seek: Bool)?
@@ -188,7 +177,19 @@ struct TranscriptPane: View {
                  projectURL: isMulticam ? multicam.projectURL : editor.projectURL, owner: session.mcpHandle)
     }
 
-    private var readerReady: Bool { !loadingIndex && loadedRevision == revision }
+    private var readerReady: Bool { !loadingIndex && !buildingClocks && loadedRevision == revision }
+
+    /// The clocks the reader reads while it shows one. The index builds these and no others,
+    /// so the usual reader, open on Current Cut, holds one clock and an edit rebuilds one.
+    /// The other two also read Current Cut, for its coverage gaps and to seek in a sequence,
+    /// and Source follows the playhead through whichever clock is playing.
+    private func readerClocks(_ space: TranscriptSpace) -> Set<TranscriptSpace> {
+        switch space {
+        case .currentCut: [.currentCut]
+        case .group: [.group, .currentCut]
+        case .source: isMulticam ? Set(TranscriptSpace.allCases) : [.source, .currentCut]
+        }
+    }
 
     /// The reader keeps showing the revision it has while an edit to the same result is
     /// indexed. Dimming it for every trim makes the pane flash. Its words stay unusable
@@ -218,7 +219,7 @@ struct TranscriptPane: View {
 
     var body: some View {
         let _ = TranscriptPaneProbe.bodyEvaluations += 1
-        let _ = TranscriptPaneProbe.page = pageLabel
+        let _ = TranscriptPaneProbe.status = resultsLabel
         VStack(spacing: 0) {
             header
             if let detail {
@@ -256,6 +257,11 @@ struct TranscriptPane: View {
             }
         }
         .background(.background)
+        .onChange(of: controller.replacementSetup, initial: true) { _, request in
+            guard let request else { return }
+            controller.replacementSetup = nil
+            showSetup(targets: request.targets)
+        }
         .onChange(of: session.mcpHandle, initial: true) { previous, owner in
             basket.bind(to: owner)
             if previous != owner { pendingSelection = nil }
@@ -286,12 +292,9 @@ struct TranscriptPane: View {
                 clipID = nil
                 return
             }
-            refresh(reset: true)
-            followPlayhead(turningPages: false)
-            if let pending = pendingSelection, pending.0 == next.space, pending.1.first.attachmentID == index?.attachment?.id, !hasFilter {
-                pendingSelection = nil
-                reveal(pending.1, in: next.space)
-            }
+            // A click that waits for an edit to be indexed chose a word of the clock it was made in.
+            if previous.space != next.space { queuedChoice = nil }
+            showScope(next)
         }
         .onReceive(editor.$playhead) { seconds in
             if !isMulticam, let time = timelineRationalTime(seconds) { follow(time) }
@@ -300,13 +303,14 @@ struct TranscriptPane: View {
             if isMulticam { followMulticam(output) }
         }
         .onChange(of: multicam.assemblyPreview) { _, _ in
-            if isMulticam { followPlayhead(turningPages: false) }
+            if isMulticam { followPlayhead(scrolling: false) }
         }
         .onDisappear {
             session.transcriptPaneMemory.place = restoring ?? place()
             stopContextPlayback()
             controller.closeSourceAudition()
             loadTask?.cancel()
+            clockTask?.cancel()
             searchTask?.cancel()
             searchTask = nil
             importTask?.cancel()
@@ -373,11 +377,13 @@ struct TranscriptPane: View {
                 .accessibilityIdentifier("transcript.attachment")
             }
             if !isMulticam { PanelDockToggle() }
-            PaneIconButton(title: "Import Transcript…", symbol: "square.and.arrow.down",
-                           help: "Import Transcriberrr JSON, SubRip, or WebVTT", action: chooseImport)
-                .accessibilityIdentifier("transcript.import")
+            if selectedAttachment != nil || controller.activeJobID != nil {
+                PaneIconButton(title: "Import Transcript…", symbol: "square.and.arrow.down",
+                               help: "Import Transcriberrr JSON, SubRip, or WebVTT", action: chooseImport)
+                    .accessibilityIdentifier("transcript.import")
+            }
             Menu {
-                Button("Transcribe with Transcriberrr…", action: showSetup)
+                Button("Transcribe Audio…", action: showSetup)
                 Button("Import Transcript…", action: chooseImport)
                 Button("Transcription Jobs…", action: showJobs)
                 if !basket.items.isEmpty { Button("Ordered Selects…", action: showOrderedSelects) }
@@ -436,6 +442,7 @@ struct TranscriptPane: View {
                 .accessibilityIdentifier("transcript.recoverStore")
         }
         Button("Import Transcript…", action: chooseImport)
+            .accessibilityIdentifier(selectedAttachment == nil ? "transcript.import" : "transcript.import.empty")
         if selectedAttachment != nil {
             Button("Transcribe Audio…", action: showSetup)
                 .accessibilityIdentifier("transcript.transcribe")
@@ -594,107 +601,29 @@ struct TranscriptPane: View {
         .padding(.horizontal, EditorMetrics.paneInset).padding(.bottom, 10)
     }
 
-    private var transcriptBody: some View {
-        ScrollViewReader { scroll in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
-                    if (searchTask != nil || (loadingIndex && !query.isEmpty)) && matches.isEmpty {
-                        ProgressView("Finding dialogue…").controlSize(.small)
-                            .frame(maxWidth: .infinity)
-                    } else if total == 0 {
-                        emptyDialogue
-                    } else if query.isEmpty {
-                        // A row is its place on the page. An edit gives every word a new
-                        // occurrence ID, and rows named by one would all be torn down and the
-                        // scroll position lost.
-                        ForEach(Array(paragraphs.enumerated()), id: \.offset) { entry in
-                            if let first = entry.element.first {
-                                passage(entry.element, header: first)
-                                    .id(TranscriptScrollTarget.paragraph(entry.offset))
-                            }
-                        }
-                    } else {
-                        ForEach(Array(matches.enumerated()), id: \.offset) { entry in
-                            if let first = entry.element.words.first {
-                                VStack(alignment: .leading, spacing: 5) {
-                                    passage(entry.element.words, header: first, primary: .accentColor)
-                                    let context = contextText(entry.element)
-                                    if !context.isEmpty {
-                                        Text(context)
-                                            .font(.callout).foregroundStyle(.secondary)
-                                            .lineLimit(3)
-                                    }
-                                }
-                                .id(TranscriptScrollTarget.match(offset + entry.offset))
-                            }
-                        }
-                    }
-                }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { height in
-                readerGeometry.viewportHeight = height
-            }
-            .onChange(of: topRequest) { _, _ in
-                readerGeometry.lastFollowedParagraph = nil
-                if !paragraphs.isEmpty {
-                    scroll.scrollTo(TranscriptScrollTarget.paragraph(0), anchor: .top)
-                } else if !matches.isEmpty {
-                    scroll.scrollTo(TranscriptScrollTarget.match(offset), anchor: .top)
-                }
-            }
-            .onChange(of: activeWordID) { _, id in
-                if readerGeometry.keepsScrollPosition {
-                    readerGeometry.keepsScrollPosition = false
-                    return
-                }
-                guard followPlayback, query.isEmpty, let id, let paragraph = paragraphForWord[id] else { return }
-                let height = readerGeometry.viewportHeight
-                if let frame = readerGeometry.wordFrames[id], height > 0 {
-                    guard frame.minY < 0 || frame.maxY > height else {
-                        readerGeometry.lastFollowedParagraph = nil
-                        return
-                    }
-                } else if readerGeometry.lastFollowedParagraph == paragraph {
-                    return
-                }
-                readerGeometry.lastFollowedParagraph = paragraph
-                scroll.scrollTo(TranscriptScrollTarget.paragraph(paragraph), anchor: .center)
-            }
-            .onChange(of: revealWordID) { _, id in
-                guard let id, let paragraph = paragraphForWord[id] else { return }
-                scroll.scrollTo(TranscriptScrollTarget.paragraph(paragraph), anchor: readerGeometry.revealsAtTop ? .top : .center)
-                readerGeometry.revealsAtTop = false
-                revealWordID = nil
-            }
-            .onChange(of: matchNumber) { _, position in
-                if let position { scroll.scrollTo(TranscriptScrollTarget.match(position), anchor: .center) }
-            }
-        }
-        .frame(maxHeight: .infinity)
-        .focusable(true, interactions: .edit)
-        .focused($dialogueFocused)
-        .accessibilityIdentifier("transcript.dialogue")
-        .coordinateSpace(name: "transcript.words")
-        .onPreferenceChange(TranscriptWordFrames.self) { readerGeometry.wordFrames = $0 }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 8, coordinateSpace: .named("transcript.words"))
-                .onChanged { gesture in
-                    guard readerReady, abs(gesture.translation.width) >= abs(gesture.translation.height) || dragging,
-                          let start = wordAt(gesture.startLocation), let end = wordAt(gesture.location) else { return }
-                    if !dragging {
-                        selectionStart = start
-                        selectionEnd = start
-                    }
-                    dragging = true
+    @ViewBuilder private var transcriptBody: some View {
+        if let flowSource, !flowSource.words.isEmpty {
+            let selection = flowSelection
+            let active = activePositions
+            let scroll = scrollRequest
+            GeometryReader { geometry in
+                TranscriptFlowReader(source: flowSource, viewport: viewport, active: active,
+                                     selection: selection, scroll: scroll,
+                                     choose: { word, extending, seek in
                     dialogueFocused = true
-                    if space != .source || start.trackID == end.trackID {
-                        selectionEnd = end
-                    }
-                }
-                .onEnded { _ in dragging = false }
-        )
+                    choose(word, extending: extending, seek: seek)
+                }, inspect: showEvidence, describe: wordDescription)
+                .frame(width: geometry.size.width, height: geometry.size.height)
+                .focused($dialogueFocused)
+            }
+            .frame(minHeight: 70)
+        } else if buildingClocks {
+            ProgressView()
+                .controlSize(.small)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            emptyDialogue.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
     }
 
     private var emptyDialogue: some View {
@@ -729,77 +658,25 @@ struct TranscriptPane: View {
         }
     }
 
-    private func wordAt(_ location: CGPoint) -> TranscriptOccurrence? {
-        guard let id = readerGeometry.wordFrames.first(where: { $0.value.contains(location) })?.key else { return nil }
-        return index?.occurrence(id: id, space: space)
-    }
-
-    private func passage(_ words: [TranscriptOccurrence], header: TranscriptOccurrence, primary: Color = .primary) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 5) {
-                Text(timelineTime(header.range.from.seconds, milliseconds: true))
-                    .font(.caption.monospacedDigit())
-                    .accessibilityLabel("At \(timelineTime(header.range.from.seconds, milliseconds: true))")
-                Text(speakerName(header.speakerID)).font(.caption.weight(.semibold))
-                if let laneLabel = header.laneLabel, let slot = header.laneColorSlot {
-                    TranscriptLaneChip(label: laneLabel, colorSlot: slot)
-                    if let laneID, laneID != header.laneID, header.heardOnLaneIDs?.contains(laneID) == true,
-                       let lane = multicam.project?.mixLanes.first(where: { $0.id == laneID }) {
-                        TranscriptLaneChip(label: lane.label, colorSlot: lane.colorSlot)
-                            .help("Also heard on \(lane.label)")
-                    }
-                } else if let track = header.trackID, (document?.tracks.count ?? 0) > 1, let detail = document?.tracks.first(where: { $0.id == track }) {
-                    Text(trackLabel(detail)).font(.caption).lineLimit(1)
-                }
-                Spacer(minLength: 0)
-                if words.contains(where: \.staleMatches) {
-                    Image(systemName: "clock.arrow.circlepath")
-                        .font(.caption)
-                        .accessibilityLabel("Cross-track alignment is out of date")
-                        .help("Cross-track alignment is out of date")
-                }
-                if let occurrence = header.assemblyIndex, hasMultipleOccurrences {
-                    Text("Take \(occurrence + 1)").font(.caption2)
-                }
-            }
-            .foregroundStyle(.secondary)
-            let chosen = selectedPositions
-            TranscriptWordFlow {
-                ForEach(Array(words.enumerated()), id: \.offset) { entry in
-                    let word = entry.element
-                    TranscriptWordView(word: word, selected: isSelected(word, within: chosen),
-                                       active: activeWordID == word.id, accented: primary == .accentColor,
-                                       generation: indexGeneration, describe: wordDescription,
-                                       press: { word, extending in
-                        guard !dragging else { return }
-                        dialogueFocused = true
-                        choose(word, extending: extending)
-                    }, choose: { choose($0, extending: $1, seek: $2) }, inspect: showEvidence)
-                    .equatable()
-                }
-            }
-        }
-    }
-
     private var footer: some View {
         VStack(spacing: 6) {
             HStack(spacing: 6) {
-                iconButton(query.isEmpty ? "Previous page" : "Previous match", symbol: "chevron.left") {
-                    move(-1)
+                if !query.isEmpty {
+                    iconButton("Previous match", symbol: "chevron.left") { move(-1) }
+                        .accessibilityIdentifier("transcript.previousMatch")
+                        .disabled(searchTask != nil || total == 0)
                 }
-                .accessibilityIdentifier("transcript.previousMatch")
-                .disabled(searchTask != nil || total == 0 || (query.isEmpty && offset == 0))
-                Text(pageLabel)
+                Text(resultsLabel)
                     .foregroundStyle(.secondary)
                     .font(.caption.monospacedDigit())
                     .accessibilityIdentifier("transcript.results")
-                iconButton(query.isEmpty ? "Next page" : "Next match", symbol: "chevron.right") {
-                    move(1)
+                if !query.isEmpty {
+                    iconButton("Next match", symbol: "chevron.right") { move(1) }
+                        .accessibilityIdentifier("transcript.nextMatch")
+                        .disabled(searchTask != nil || total == 0)
                 }
-                .accessibilityIdentifier("transcript.nextMatch")
-                .disabled(searchTask != nil || total == 0 || (query.isEmpty && offset + transcriptPageSize >= total))
                 Spacer(minLength: 0)
-                if let index {
+                if let index, !buildingClocks {
                     let count = laneID.map { selected in index.gaps.lazy.filter { $0.laneID == selected }.count } ?? index.gaps.count
                     if space != .currentCut || count > 0 {
                         let title = space == .currentCut ? "Coverage gaps (\(count))" : "Transcript coverage"
@@ -810,8 +687,8 @@ struct TranscriptPane: View {
                 PaneIconButton(title: "Follow Playback", symbol: followPlayback ? "scope" : "location.slash",
                                active: followPlayback, help: "Follow the active word as the playhead moves") {
                     followPlayback.toggle()
-                    if followPlayback { followPlayhead(turningPages: false) }
-                    else { activeWordID = nil }
+                    if followPlayback { followPlayhead(scrolling: true) }
+                    else { activePositions = [] }
                 }
                 .accessibilityValue(followPlayback ? "On" : "Off")
             }
@@ -828,12 +705,12 @@ struct TranscriptPane: View {
         .background(.bar)
     }
 
-    private var pageLabel: String {
+    private var resultsLabel: String {
         if !query.isEmpty {
             if let matchNumber { return "Match \(matchNumber + 1) of \(total)" }
             return total == 1 ? "1 match" : "\(total) matches"
         }
-        return total == 0 ? "0 words" : "\(offset + 1)–\(min(offset + transcriptPageSize, total)) of \(total)"
+        return words.count == 1 ? "1 word" : "\(words.count) words"
     }
 
     private func iconButton(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
@@ -841,9 +718,11 @@ struct TranscriptPane: View {
     }
 
     private func reload() {
-        let reopened = restoring != nil
         let previous = restoring ?? place()
         loadTask?.cancel()
+        clockTask?.cancel()
+        clockTask = nil
+        buildingClocks = false
         searchTask?.cancel()
         searchTask = nil
         preparedSearch = nil
@@ -852,7 +731,7 @@ struct TranscriptPane: View {
             self.attachmentID = nil
         }
         if index?.attachment?.id != selectedAttachment?.id || controller.state.attachments.isEmpty {
-            activeWordID = nil
+            activePositions = []
             detail = nil
             needsReconciliation = false
         }
@@ -860,28 +739,30 @@ struct TranscriptPane: View {
             loadedRevision = nil
             index = nil
             document = nil
-            refresh(reset: true)
+            refresh()
         }
         guard !controller.state.attachments.isEmpty else {
             restoring = nil
             loadedRevision = nil
             index = nil
             document = nil
-            refresh(reset: true)
+            refresh()
             return
         }
         let requested = revision
         let attachmentID = attachmentID
-        if let built = controller.cachedIndex(attachmentID: attachmentID) {
-            show(built, for: requested, returningTo: previous, reopened: reopened)
+        if let built = controller.cachedIndex(attachmentID: attachmentID, clocks: readerClocks(space)) {
+            show(built, for: requested, returningTo: previous)
             return
         }
         loadingIndex = true
         loadTask = Task { @MainActor in
             do {
-                let result = try await controller.indexedTranscript(attachmentID: attachmentID)
+                let result = try await controller.indexedTranscript(attachmentID: attachmentID, clocks: readerClocks(space))
+                // The reader can move to another clock while the index is built.
+                try await controller.extend(result, with: readerClocks(space))
                 guard !Task.isCancelled, requested == revision else { return }
-                show(result, for: requested, returningTo: previous, reopened: reopened)
+                show(result, for: requested, returningTo: previous)
             } catch {
                 guard !Task.isCancelled, requested == revision else { return }
                 index = nil
@@ -889,16 +770,69 @@ struct TranscriptPane: View {
                 loadedRevision = nil
                 queuedChoice = nil
                 needsReconciliation = false
-                refresh(reset: true)
+                buildingClocks = false
+                refresh()
                 loadingIndex = false
                 detail = error.localizedDescription
             }
         }
     }
 
-    private func show(_ result: TranscriptIndex, for requested: Revision, returningTo previous: TranscriptReaderPlace,
-                      reopened: Bool) {
+    /// Shows the scope the reader has moved to. A clock its index has not built is built away
+    /// from the main thread first, and until then the reader has no words of it to show.
+    private func showScope(_ next: BrowseScope) {
+        clockTask?.cancel()
+        clockTask = nil
+        buildingClocks = false
+        func present() {
+            refresh()
+            followPlayhead(scrolling: false)
+            if let pending = pendingSelection, pending.0 == next.space, pending.1.first.attachmentID == index?.attachment?.id, !hasFilter {
+                pendingSelection = nil
+                reveal(pending.1, in: next.space)
+            }
+        }
+        let clocks = readerClocks(next.space)
+        guard let held = index, !held.holds(clocks) else { return present() }
+        clearReader()
+        buildingClocks = true
+        // An index that is being replaced is not added to. The one replacing it is built
+        // with these clocks, and showing it ends the wait.
+        guard !loadingIndex else { return }
+        clockTask = Task { @MainActor in
+            do {
+                try await controller.extend(held, with: clocks)
+            } catch {
+                guard !Task.isCancelled, browseScope == next else { return }
+                buildingClocks = false
+                detail = error.localizedDescription
+                return
+            }
+            guard !Task.isCancelled, browseScope == next, index?.cacheIdentity === held.cacheIdentity else { return }
+            buildingClocks = false
+            present()
+        }
+    }
+
+    /// Empties the reader of the words, matches and selection it shows.
+    private func clearReader() {
+        searchTask?.cancel()
+        searchTask = nil
+        preparedSearch = nil
+        offset = 0
+        matchNumber = nil
+        matches = []
+        total = 0
+        selectionStart = nil
+        selectionEnd = nil
+        activePositions = []
+        flowSource = nil
+        filteredWords = nil
+    }
+
+    private func show(_ result: TranscriptIndex, for requested: Revision, returningTo previous: TranscriptReaderPlace) {
         restoring = nil
+        buildingClocks = false
         let earlier = index
         document = result.document
         index = result
@@ -906,8 +840,7 @@ struct TranscriptPane: View {
         loadedRevision = requested
         needsReconciliation = false
         if result.attachment?.fingerprint != nil, isMulticam {
-            needsReconciliation = result.read(space: .source, limit: 1).items.first?.staleMatches == true
-                || result.read(space: .group, limit: 1).items.first?.staleMatches == true
+            needsReconciliation = result.staleMatches
         }
         if needsReconciliation {
             detail = "Cross-track alignment is out of date."
@@ -919,15 +852,11 @@ struct TranscriptPane: View {
         loadingIndex = false
         if previous.owner == requested.owner, previous.attachmentID == requested.attachment,
            previous.resultID == requested.resultID, previous.scope == browseScope {
-            restore(previous, in: result, after: earlier, reopened: reopened)
+            restore(previous, in: result, after: earlier)
         } else {
-            refresh(reset: true)
+            refresh()
         }
-        // The playhead has not moved, so nothing else marks the word under it again.
-        // Marking it must not scroll a reader who is looking elsewhere on the page.
-        let marked = activeWordID
-        followPlayhead(turningPages: false)
-        if activeWordID != marked { readerGeometry.keepsScrollPosition = true }
+        followPlayhead(scrolling: false)
         if let pending = pendingSelection, pending.1.first.attachmentID == result.attachment?.id {
             pendingSelection = nil
             reveal(pending.1, in: pending.0)
@@ -942,36 +871,31 @@ struct TranscriptPane: View {
 
     /// What the reader shows now, described by words that a later index can find again.
     private func place() -> TranscriptReaderPlace {
-        // The first word in view marks the place. Before the reader has been laid out it is the page's first.
-        let height = readerGeometry.viewportHeight
-        let top = query.isEmpty ? words.firstIndex { word in
-            readerGeometry.wordFrames[word.id].map { $0.maxY > 0 && $0.minY < height } ?? false
-        } ?? (words.isEmpty ? nil : 0) : nil
+        let top = viewport.view?.topWord ?? viewport.lastTopWord ?? 0
         return TranscriptReaderPlace(owner: loadedRevision?.owner ?? session.mcpHandle, attachmentID: loadedRevision?.attachment,
                               resultID: loadedRevision?.resultID, selectedAttachmentID: attachmentID, scope: browseScope,
                               searchText: searchText, query: query, followPlayback: followPlayback,
-                              anchor: top.map { words[$0] }, anchorIndex: top ?? 0, selectionStart: selectionStart,
+                              anchor: words.indices.contains(top) ? words[top] : nil, anchorIndex: top, selectionStart: selectionStart,
                               selectionEnd: selectionEnd, matchNumber: matchNumber,
                               matchWord: matchNumber.flatMap { number in
                                   matches.indices.contains(number - offset) ? matches[number - offset].words.first : nil
                               })
     }
 
-    /// Returns to the page, selection and match the reader showed before its index was replaced.
-    private func restore(_ place: TranscriptReaderPlace, in result: TranscriptIndex, after earlier: TranscriptIndex?,
-                         reopened: Bool) {
+    /// Restores the scroll position, selection and match the reader showed before its index was replaced.
+    private func restore(_ place: TranscriptReaderPlace, in result: TranscriptIndex, after earlier: TranscriptIndex?) {
         searchTask?.cancel()
         searchTask = nil
-        filteredWords = hasFilter && query.isEmpty ? TranscriptPaneWordList(result.readAll(space: space, filter: filter)) : nil
-        guard place.query == query else { return refresh(reset: true) }
+        loadWords(from: result)
+        guard place.query == query else { return refresh() }
         guard query.isEmpty else {
             let number = place.matchNumber ?? 0
-            searchPage(in: result, pageOffset: number / transcriptPageSize * transcriptPageSize,
+            searchPage(in: result, pageOffset: number / transcriptMatchBatchSize * transcriptMatchBatchSize,
                        revealMatch: number, seek: false, returningTo: place.matchWord, after: earlier)
             return
         }
         // A word names one occurrence. It is followed into a renamed clip only when the cut
-        // held it once before the edit, so neither the selection nor the page moves to a replay.
+        // held it once before the edit, so neither the selection nor the reader moves to a replay.
         func found(_ word: TranscriptOccurrence?) -> TranscriptOccurrence? {
             word.flatMap { word in
                 result.revalidatedPaneWord(word, in: space, after: earlier)
@@ -988,60 +912,36 @@ struct TranscriptPane: View {
             filteredWords.map { $0.nearestPosition(to: anchor.range.from) }
                 ?? result.nearestPanePosition(to: anchor.range.from, in: space)
         }
-        // The page starts as many words before that word as it did, so words keep their rows
-        // when an edit earlier in the cut moves every position after it.
-        let count = filteredWords?.words.count ?? result.read(space: space, limit: 1).total
-        offset = max(0, min(count - 1, (position ?? place.anchorIndex) - place.anchorIndex))
         matchNumber = nil
-        refresh(reset: false)
         selectionStart = end == nil ? nil : start
         selectionEnd = start == nil ? nil : end
-        if reopened, words.indices.contains(place.anchorIndex) {
-            readerGeometry.revealsAtTop = true
-            revealWordID = words[place.anchorIndex].id
-        }
+        let anchor = position ?? place.anchorIndex
+        scrollRequest = .init(word: max(0, min(words.count - 1, anchor)), atTop: true)
     }
 
-    private func refresh(reset: Bool) {
+    private func loadWords(from index: TranscriptIndex) {
+        let items = index.readAll(space: space, filter: filter)
+        filteredWords = hasFilter ? TranscriptPaneWordList(items) : nil
+        let lane = laneID.flatMap { id in multicam.project?.mixLanes.first { $0.id == id } }
+        flowSource = TranscriptFlowSource(words: items, speakers: index.speakers, tracks: index.document.tracks,
+                                          lane: lane.map { ($0.id, $0.label) }, showsTakes: hasMultipleOccurrences)
+    }
+
+    private func refresh() {
         searchTask?.cancel()
         searchTask = nil
-        if reset {
-            preparedSearch = nil
-            offset = 0
-            matchNumber = nil
-            selectionStart = nil
-            selectionEnd = nil
-            activeWordID = nil
-            topRequest += 1
-            filteredWords = nil
-        }
-        guard let index else { words = []; paragraphs = []; paragraphForWord = [:]; matches = []; total = 0; return }
-        if query.isEmpty {
-            preparedSearch = nil
-            if hasFilter, filteredWords == nil { filteredWords = TranscriptPaneWordList(index.readAll(space: space, filter: filter)) }
-            if let filteredWords {
-                total = filteredWords.words.count
-                words = Array(filteredWords.words.dropFirst(offset).prefix(transcriptPageSize))
-            } else {
-                let page = index.read(space: space, offset: offset, limit: transcriptPageSize)
-                total = page.total
-                words = page.items
-            }
-            paragraphs = Self.paragraphs(words)
-            var targets: [String: Int] = [:]
-            for (ordinal, paragraph) in paragraphs.enumerated() {
-                for word in paragraph { targets[word.id] = ordinal }
-            }
-            paragraphForWord = targets
-            matches = []
-        } else {
-            total = 0
-            words = []
-            matches = []
-            paragraphs = []
-            paragraphForWord = [:]
-            searchPage(in: index, pageOffset: offset, revealMatch: reset ? 0 : nil, seek: false)
-        }
+        preparedSearch = nil
+        offset = 0
+        matchNumber = nil
+        matches = []
+        total = 0
+        selectionStart = nil
+        selectionEnd = nil
+        activePositions = []
+        scrollRequest = .init(word: 0, atTop: true)
+        guard let index else { flowSource = nil; filteredWords = nil; return }
+        loadWords(from: index)
+        if !query.isEmpty { searchPage(in: index, pageOffset: 0, revealMatch: 0, seek: false) }
     }
 
     private func searchPage(in index: TranscriptIndex, pageOffset: Int, revealMatch: Int?, seek: Bool,
@@ -1061,7 +961,7 @@ struct TranscriptPane: View {
             let worker = Task.detached(priority: .userInitiated) { () -> (TranscriptIndex.PreparedSearch, TranscriptPage<TranscriptMatch>)? in
                 guard let search = cachedSearch ?? (try? index.prepareSearch(query, space: clock, filter: filter)),
                       !Task.isCancelled else { return nil }
-                return (search, search.page(offset: pageOffset, limit: transcriptPageSize))
+                return (search, search.page(offset: pageOffset, limit: transcriptMatchBatchSize))
             }
             let result = await withTaskCancellationHandler {
                 await worker.value
@@ -1077,15 +977,13 @@ struct TranscriptPane: View {
             }
             if page.total > 0, pageOffset >= page.total {
                 let last = page.total - 1
-                searchPage(in: index, pageOffset: last / transcriptPageSize * transcriptPageSize,
+                searchPage(in: index, pageOffset: last / transcriptMatchBatchSize * transcriptMatchBatchSize,
                            revealMatch: last, seek: seek, returningTo: previous, after: earlier)
                 return
             }
             offset = pageOffset
             total = page.total
             matches = page.items
-            var seen = Set<String>()
-            words = matches.flatMap(\.words).filter { seen.insert($0.id).inserted }
             if total == 0 {
                 matchNumber = nil
                 selectionStart = nil
@@ -1104,42 +1002,32 @@ struct TranscriptPane: View {
         }
     }
 
-    private static func paragraphs(_ words: [TranscriptOccurrence]) -> [[TranscriptOccurrence]] {
-        var paragraphs: [[TranscriptOccurrence]] = []
-        for word in words {
-            if let previous = paragraphs.last?.last, let count = paragraphs.last?.count,
-               count < 28, previous.laneID == word.laneID, previous.speakerID == word.speakerID, previous.trackID == word.trackID,
-               previous.assemblyIndex == word.assemblyIndex, previous.clipID == word.clipID,
-               word.range.from.seconds - previous.range.to.seconds < 2 {
-                paragraphs[paragraphs.count - 1].append(word)
-            } else {
-                paragraphs.append([word])
-            }
-        }
-        return paragraphs
-    }
-
     private func runSearch() {
         query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        refresh(reset: true)
+        searchTask?.cancel()
+        searchTask = nil
+        preparedSearch = nil
+        matchNumber = nil
+        matches = []
+        total = 0
+        selectionStart = nil
+        selectionEnd = nil
+        if query.isEmpty {
+            followPlayhead(scrolling: false)
+        } else if let index {
+            searchPage(in: index, pageOffset: 0, revealMatch: 0, seek: false)
+        }
     }
 
     private func move(_ direction: Int) {
-        if query.isEmpty {
-            // A page that an edit has moved off a multiple of the page size still turns by whole pages.
-            let turned = offset + direction * transcriptPageSize
-            offset = direction > 0 ? (turned < total ? turned : offset) : max(0, turned)
-            refresh(reset: false)
-            topRequest += 1
-        } else if total > 0 {
-            showMatch(((matchNumber ?? (direction < 0 ? 0 : -1)) + direction + total) % total)
-        }
+        guard total > 0 else { return }
+        showMatch(((matchNumber ?? (direction < 0 ? 0 : -1)) + direction + total) % total)
     }
 
     private func showMatch(_ number: Int, seek: Bool = true) {
         if !(offset..<offset + matches.count).contains(number) {
             guard let index else { return }
-            searchPage(in: index, pageOffset: number / transcriptPageSize * transcriptPageSize, revealMatch: number, seek: seek)
+            searchPage(in: index, pageOffset: number / transcriptMatchBatchSize * transcriptMatchBatchSize, revealMatch: number, seek: seek)
             return
         }
         guard matches.indices.contains(number - offset),
@@ -1148,6 +1036,7 @@ struct TranscriptPane: View {
         matchNumber = number
         choose(first, extending: false, seek: seek)
         selectionEnd = last
+        if let pos = readerPosition(first) { scrollRequest = .init(word: pos) }
     }
 
     private func choose(_ word: TranscriptOccurrence, extending: Bool, seek: Bool = true) {
@@ -1177,52 +1066,35 @@ struct TranscriptPane: View {
         }
     }
 
-    private func followMulticam(_ output: RationalTime, turningPages: Bool = true) {
-        guard readerReady, followPlayback, query.isEmpty else { return }
+    private func followMulticam(_ output: RationalTime, scrolling: Bool = true) {
+        guard readerReady, followPlayback else { return }
         guard let position = MulticamTranscriptPlaybackPosition.resolve(
             output: output, readerSpace: space, assemblyPreview: multicam.assemblyPreview,
             interval: multicam.interval(at: output), assemblyItems: multicam.assemblyItems,
             assemblyStart: multicam.assemblyStart(at:)
         ) else {
-            readerGeometry.followedTime = nil
-            if activeWordID != nil { activeWordID = nil }
+            if !activePositions.isEmpty { activePositions = [] }
             return
         }
-        follow(position.time, playbackSpace: position.space, turningPages: turningPages)
+        follow(position.time, playbackSpace: position.space, scrolling: scrolling)
     }
 
-    private func followPlayhead(turningPages: Bool) {
+    private func followPlayhead(scrolling: Bool) {
         if isMulticam {
-            followMulticam(multicam.preview.time, turningPages: turningPages)
+            followMulticam(multicam.preview.time, scrolling: scrolling)
         } else if let time = timelineRationalTime(editor.playhead) {
-            follow(time, turningPages: turningPages)
+            follow(time, scrolling: scrolling)
         }
     }
 
-    private func follow(_ time: RationalTime, playbackSpace: TranscriptSpace = .currentCut, turningPages: Bool = true) {
-        guard readerReady, followPlayback, query.isEmpty, let index else { return }
-        let scoped = filteredWords
-        var position: Int?
-        if space == .source {
-            position = index.sourcePanePosition(at: time, playbackSpace: playbackSpace, scoped: scoped)
-        } else {
-            guard space == playbackSpace else { return }
-            position = if let scoped { scoped.position(at: time) }
-                else { index.position(at: time, space: space) }
+    private func follow(_ time: RationalTime, playbackSpace: TranscriptSpace = .currentCut, scrolling: Bool = true) {
+        guard readerReady, followPlayback, let index else { return }
+        let positions = index.activePanePositions(at: time, playbackSpace: playbackSpace,
+                                                  readerSpace: space, scoped: filteredWords)
+        if activePositions != positions {
+            activePositions = positions
+            if scrolling, query.isEmpty, let position = positions.first { scrollRequest = .init(word: position) }
         }
-        // A publisher repeats its value to a pane that has just opened. Only a playhead that
-        // has moved takes the reader to another page.
-        let moved = readerGeometry.followedTime != time
-        readerGeometry.followedTime = time
-        if turningPages, moved, let position, !(offset..<offset + words.count).contains(position) {
-            offset = position / transcriptPageSize * transcriptPageSize
-            refresh(reset: false)
-        }
-        let active = position.flatMap { pos in
-            let visibleIndex = pos - offset
-            return words.indices.contains(visibleIndex) ? words[visibleIndex].id : nil
-        }
-        if activeWordID != active { activeWordID = active }
     }
 
     private func handleKey(_ event: NSEvent, _ modifiers: NSEvent.ModifierFlags) -> Bool {
@@ -1248,24 +1120,13 @@ struct TranscriptPane: View {
             perform { try controller.seek(adjacent, space: space, attachmentID: adjacent.attachmentID ?? attachmentID) }
             return true
         }
-        let current = words.firstIndex { $0.id == selectionEnd?.id } ?? (direction == 1 ? -1 : words.count)
+        let current = selectionEnd.flatMap(readerPosition) ?? (direction == 1 ? -1 : words.count)
         let destination = current + direction
         if words.indices.contains(destination) {
             if space == .source, modifiers == .shift, let start = selectionStart,
                words[destination].trackID != start.trackID { return true }
             choose(words[destination], extending: modifiers == .shift)
-            return true
-        }
-        if query.isEmpty, (direction < 0 && offset > 0) || (direction > 0 && offset + words.count < total) {
-            let edge = direction < 0 ? words.first?.id : words.last?.id
-            move(direction)
-            // The first page can overlap the one after it. The step is taken from the word it left.
-            let shared = edge.flatMap { id in words.firstIndex { $0.id == id } }
-            let neighbour = shared.flatMap { words.indices.contains($0 + direction) ? words[$0 + direction] : nil }
-            if let next = neighbour ?? (direction < 0 ? words.last : words.first),
-               space != .source || modifiers != .shift || next.trackID == selectionStart?.trackID {
-                choose(next, extending: modifiers == .shift)
-            }
+            scrollRequest = .init(word: destination)
             return true
         }
         return true
@@ -1295,33 +1156,24 @@ struct TranscriptPane: View {
         }
         searchText = ""
         query = ""
-        offset = position / transcriptPageSize * transcriptPageSize
-        filteredWords = nil
-        refresh(reset: false)
+        searchTask?.cancel()
+        searchTask = nil
+        matchNumber = nil
         selectionStart = first
         selectionEnd = last
-        revealWordID = first.id
+        scrollRequest = .init(word: position)
         dialogueFocused = true
     }
 
-    /// The positions a selection of several words spans, looked up once for a passage.
-    private var selectedPositions: ClosedRange<Int>? {
-        guard let start = selectionStart, let end = selectionEnd, start.id != end.id, let index,
-              let first = index.position(of: start.id, space: space),
-              let last = index.position(of: end.id, space: space) else { return nil }
-        return min(first, last)...max(first, last)
+    private func readerPosition(_ word: TranscriptOccurrence) -> Int? {
+        if let filteredWords { return filteredWords.position(of: word.id) }
+        return index?.position(of: word.id, space: space)
     }
 
-    private func isSelected(_ word: TranscriptOccurrence, within chosen: ClosedRange<Int>?) -> Bool {
-        guard let start = selectionStart, let end = selectionEnd else { return false }
-        if start.id == end.id { return word.id == start.id }
-        if space == .source, word.trackID != start.trackID { return false }
-        guard let chosen, let point = index?.position(of: word.id, space: space) else { return false }
-        return chosen.contains(point)
-    }
-
-    private func contextText(_ match: TranscriptMatch) -> String {
-        (match.before + match.words + match.after).map(\.text).joined(separator: " ")
+    private var flowSelection: TranscriptFlowSelection? {
+        guard let start = selectionStart, let end = selectionEnd,
+              let first = readerPosition(start), let last = readerPosition(end) else { return nil }
+        return .init(positions: min(first, last)...max(first, last), track: space == .source ? start.trackID : nil)
     }
 
     private func speakerName(_ id: String?) -> String {
@@ -1366,131 +1218,11 @@ struct TranscriptPane: View {
     }
 }
 
-private enum TranscriptScrollTarget: Hashable {
-    case paragraph(Int)
-    case match(Int)
-}
-
 extension TranscriptPane: Equatable {
     /// The pane reads its session through its own observers. An editor that redraws for
     /// every preview frame hands it the same session each time.
     nonisolated static func == (first: TranscriptPane, second: TranscriptPane) -> Bool {
         first.session === second.session
-    }
-}
-
-/// One word of a passage. Its appearance depends only on these values, so a moving
-/// playhead redraws the word it leaves and the word it reaches.
-private struct TranscriptWordView: View, Equatable {
-    let word: TranscriptOccurrence
-    let selected: Bool
-    let active: Bool
-    let accented: Bool
-    /// Corrections change a word's text or speaker under the same occurrence ID.
-    let generation: Int
-    let describe: (TranscriptOccurrence) -> String
-    let press: (_ word: TranscriptOccurrence, _ extending: Bool) -> Void
-    let choose: (_ word: TranscriptOccurrence, _ extending: Bool, _ seek: Bool) -> Void
-    let inspect: () -> Void
-
-    static func == (first: Self, second: Self) -> Bool {
-        first.word.id == second.word.id && first.selected == second.selected && first.active == second.active
-            && first.accented == second.accented && first.generation == second.generation
-    }
-
-    var body: some View {
-        let _ = TranscriptPaneProbe.wordEvaluations += 1
-        let description = describe(word)
-        Button {
-            press(word, NSEvent.modifierFlags.contains(.shift))
-        } label: {
-            HStack(spacing: 2) {
-                Text(word.text)
-                    .foregroundStyle(accented && !selected ? Color(nsColor: .linkColor) : .primary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if word.partial || word.audibility == .inferred {
-                    Image(systemName: word.partial ? "scissors" : "circle.dotted")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .accessibilityHidden(true)
-                }
-            }
-            .padding(.horizontal, 2).padding(.vertical, 1)
-            .background(selected ? Color.accentColor.opacity(0.22) :
-                            active ? Color.accentColor.opacity(0.11) : .clear,
-                        in: RoundedRectangle(cornerRadius: 3))
-        }
-        .buttonStyle(.plain)
-        .background {
-            GeometryReader { proxy in
-                Color.clear.preference(key: TranscriptWordFrames.self,
-                                       value: [word.id: proxy.frame(in: .named("transcript.words"))])
-            }
-        }
-        .help(description)
-        .accessibilityIdentifier("transcript.word.\(word.id)")
-        .accessibilityHint(description)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-        .contextMenu {
-            Button("Seek to Word") { choose(word, false, true) }
-            Button("Extend Selection to Word") { choose(word, true, true) }
-            Button("Inspect Word Evidence") { choose(word, false, false); inspect() }
-        }
-    }
-}
-
-private struct TranscriptWordFrames: PreferenceKey {
-    static let defaultValue: [String: CGRect] = [:]
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
-private struct TranscriptWordFlow: Layout {
-    struct Cache {
-        var width: CGFloat?
-        var height: CGFloat = 0
-        var frames: [CGRect] = []
-    }
-
-    func makeCache(subviews: Subviews) -> Cache { Cache() }
-
-    func updateCache(_ cache: inout Cache, subviews: Subviews) { cache = Cache() }
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
-        let width = proposal.width ?? 320
-        arrange(width: width, subviews: subviews, cache: &cache)
-        return CGSize(width: width, height: cache.height)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
-        arrange(width: bounds.width, subviews: subviews, cache: &cache)
-        for (subview, frame) in zip(subviews, cache.frames) {
-            subview.place(at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY),
-                          anchor: .topLeading, proposal: ProposedViewSize(frame.size))
-        }
-    }
-
-    private func arrange(width: CGFloat, subviews: Subviews, cache: inout Cache) {
-        guard cache.width != width else { return }
-        cache.width = width
-        cache.frames.removeAll(keepingCapacity: true)
-        let proposal = ProposedViewSize(width: width, height: nil)
-        var x: CGFloat = 0
-        var y: CGFloat = 0
-        var lineHeight: CGFloat = 0
-        for subview in subviews {
-            let size = subview.sizeThatFits(proposal)
-            if x > 0 && x + size.width > width {
-                x = 0
-                y += lineHeight + 1
-                lineHeight = 0
-            }
-            cache.frames.append(CGRect(origin: CGPoint(x: x, y: y), size: size))
-            x += size.width + 1
-            lineHeight = max(lineHeight, size.height)
-        }
-        cache.height = y + lineHeight
     }
 }
 
@@ -1580,7 +1312,7 @@ extension TranscriptPane {
                     ForEach(index?.speakers ?? document?.speakers ?? [], id: \.id) { speaker in
                         Button(speaker.name) { correct(.assignSpeaker(speakerID: speaker.id)) }
                     }
-                    Button("New Speaker…") { showNamedChange("New Speaker") { .splitSpeaker(speakerID: UUID().uuidString, name: $0) } }
+                    Button("New Speaker…") { showNamedChange("New Speaker") { .splitSpeaker(speakerID: ProjectIdentifier.make(), name: $0) } }
                 }
                 if let speaker = selection?.first.speakerID {
                     Menu("Merge Speaker Into") {
@@ -1876,7 +1608,7 @@ extension TranscriptPane {
                     status = "Exporting transcript…"
                     Task { @MainActor in
                         do {
-                            let index = try await controller.indexedTranscript(attachmentID: attachmentID)
+                            let index = try await controller.indexedTranscript(attachmentID: attachmentID, clocks: [clock])
                             try await Task.detached(priority: .userInitiated) {
                                 let data = try TranscriptCodec.encode(index, space: clock, format: format)
                                 try data.write(to: url, options: .atomic)
@@ -2034,6 +1766,11 @@ extension TranscriptPane {
     private func showEdit(_ action: TranscriptEditRequest.Action, defaultName: String = "") {
         guard let selection else { return }
         let chosenSpace = space
+        // The review plans against every clock of this revision. They are built while the
+        // options are chosen, so the review does not begin by waiting for them.
+        if let index {
+            Task { @MainActor in try? await controller.extend(index, with: Set(TranscriptSpace.allCases)) }
+        }
         sheet = TranscriptPaneSheet(editTitle(action)) {
             TranscriptEditOptionsForm(action: action, queueName: defaultName,
                                       startAngles: action == .switchAngle ? angleChoices(selection.first, edge: .start) : [],
@@ -2247,6 +1984,8 @@ extension TranscriptPane {
         let attachment = attachmentID
         // The sheet can stay open while a job or another client replaces what was selected.
         let read = try? controller.editRevision(attachmentID: attachment ?? subject.attachmentID)
+        // The record is anchored to Source words, which are built while the sheet is filled in.
+        withSource {}
         sheet = TranscriptPaneSheet(title) {
             TranscriptTextForm(label: title == "Correct Text" ? "Corrected text" : "Name", initial: starting) { value in
                 _ = try controller.correct(transform(value), selection: subject, attachmentID: attachment, expecting: read)
@@ -2258,12 +1997,25 @@ extension TranscriptPane {
 
     private func correct(_ change: TranscriptAuthoredChange, anchored: Bool = true,
                          expecting read: TranscriptEditRevision? = nil) {
-        perform {
-            let subject = anchored ? selection.map { address($0, in: space) } : nil
-            _ = try controller.correct(change, selection: subject, attachmentID: subject?.attachmentID ?? attachmentID,
-                                       expecting: read)
-            sheet = nil
-            status = "Saved transcript correction."
+        let subject = anchored ? selection.map { address($0, in: space) } : nil
+        let attachment = subject?.attachmentID ?? attachmentID
+        withSource {
+            perform {
+                _ = try controller.correct(change, selection: subject, attachmentID: attachment, expecting: read)
+                sheet = nil
+                status = "Saved transcript correction."
+            }
+        }
+    }
+
+    /// Runs an action that reads Source words once the reader's index has built them. The
+    /// reader holds only the clocks it shows, and building another belongs off the main thread.
+    private func withSource(_ action: @escaping () -> Void) {
+        guard let index, !index.holds([.source]) else { return action() }
+        Task { @MainActor in
+            // An index that cannot build Source leaves the action to report why.
+            try? await controller.extend(index, with: [.source])
+            action()
         }
     }
 
@@ -2347,7 +2099,8 @@ extension TranscriptPane {
             }
         }
         let pair = TranscriptTimeSelection(first: words[from], last: words[to])
-        if self.words.contains(where: { $0.id == pair.first.id }) {
+        if let position = readerPosition(pair.first) {
+            scrollRequest = .init(word: position)
             selectionStart = pair.first
             selectionEnd = pair.last
         } else {
@@ -2374,7 +2127,7 @@ extension TranscriptPane {
             let processed = tracks.filter { [.recognized, .cached, .failed].contains($0.state) }.count
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Label(jobLabel(job.state), systemImage: "waveform.badge.mic")
+                    Label(jobLabel(job.state), systemImage: job.state == .completed ? "checkmark.circle" : "waveform.badge.mic")
                         .font(.subheadline.weight(.semibold))
                         .accessibilityIdentifier("transcript.job.status")
                     Spacer(minLength: 0)
@@ -2452,9 +2205,11 @@ extension TranscriptPane {
         }
     }
 
-    private func showSetup() {
-        sheet = TranscriptPaneSheet("Transcribe with Transcriberrr") {
-            TranscriptJobSetup(controller: controller) { options, download in
+    private func showSetup() { showSetup(targets: []) }
+
+    private func showSetup(targets: Set<TranscriptSetupTarget>) {
+        sheet = TranscriptPaneSheet("Transcribe Audio", contentHasActions: true) {
+            TranscriptJobSetup(controller: controller, targets: targets) { options, download in
                 _ = try controller.start(options: options, download: download)
                 sheet = nil
             }
@@ -2462,7 +2217,7 @@ extension TranscriptPane {
     }
 
     private func showRetry(_ job: TranscriptJobRecord) {
-        sheet = TranscriptPaneSheet("Retry Transcription") {
+        sheet = TranscriptPaneSheet("Retry Transcription", contentHasActions: true) {
             TranscriptRetryForm(message: job.message ?? controller.jobError) { download in
                 try controller.retry(job.id, download: download)
                 sheet = nil
@@ -2485,6 +2240,7 @@ extension TranscriptPane {
 struct TranscriptJobList: View {
     @ObservedObject var controller: LiveTranscriptController
     let stored: [TranscriptJobRecord]
+    @State private var expandedJobs: [UUID: Bool] = [:]
     let label: (TranscriptJobState) -> String
     let retry: (TranscriptJobRecord) -> Void
 
@@ -2503,12 +2259,27 @@ struct TranscriptJobList: View {
             LazyVStack(alignment: .leading, spacing: 12) {
                 if jobs.isEmpty { Text("This project has no transcription jobs.").foregroundStyle(.secondary) }
                 ForEach(jobs) { job in
-                    VStack(alignment: .leading, spacing: 4) {
-                        LabeledContent(label(job.state), value: job.updatedAt.formatted(date: .abbreviated, time: .shortened))
-                        ForEach(job.sessions.flatMap(\.tracks)) { track in
-                            LabeledContent(track.name, value: track.state.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
-                            if let message = track.message {
-                                Text(message).font(.caption).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 7) {
+                        DisclosureGroup(isExpanded: Binding(
+                            get: { expandedJobs[job.id] ?? (controller.activeJobID == job.id) },
+                            set: { expandedJobs[job.id] = $0 }
+                        )) {
+                            ForEach(job.sessions.flatMap(\.tracks)) { track in
+                                VStack(alignment: .leading, spacing: 3) {
+                                    LabeledContent(track.name, value: track.state.rawValue.replacingOccurrences(of: "_", with: " ").capitalized)
+                                        .font(.callout)
+                                    if let message = track.message {
+                                        Text(message).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                                .padding(.vertical, 3)
+                            }
+                        } label: {
+                            LabeledContent {
+                                Text(job.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            } label: {
+                                Text(label(job.state)).fontWeight(.medium)
                             }
                         }
                         ForEach(job.warnings, id: \.self) { warning in
@@ -2628,7 +2399,8 @@ extension TranscriptPane {
 extension TranscriptPane {
     private func addToOrderedSelects() {
         guard let selection, let index else { return }
-        appendOrdered(selection, in: space, index: index)
+        let clock = space
+        withSource { appendOrdered(selection, in: clock, index: index) }
     }
 
     private func appendOrdered(_ selection: TranscriptTimeSelection, in clock: TranscriptSpace, index: TranscriptIndex) {

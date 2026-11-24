@@ -75,6 +75,17 @@ func previewTime(_ time: RationalTime) -> CMTime {
     return CMTime(value: time.numerator, timescale: timescale)
 }
 
+struct SequenceSourcePicture: Equatable {
+    let url: URL
+    let time: RationalTime
+
+    init?(url: URL?, pts: CMTime) {
+        guard let url, pts.isNumeric, pts.timescale > 0 else { return nil }
+        self.url = url
+        time = RationalTime(numerator: pts.value, denominator: Int64(pts.timescale))
+    }
+}
+
 struct PreviewFrame: @unchecked Sendable {
     let buffer: CVPixelBuffer
     let time: CMTime
@@ -82,6 +93,7 @@ struct PreviewFrame: @unchecked Sendable {
     var programTransfer: String? = nil
     var sourceRendition: String? = nil
     var cameraTransfer: String? = nil
+    var sourcePicture: SequenceSourcePicture? = nil
 
     func tagged(transfer: String?, cameraTransfer: String? = nil) -> Self {
         var result = self
@@ -187,7 +199,10 @@ final class HardwareFrames: @unchecked Sendable {
         cursor = start
         sessionStart = start.decodeTimeStamp
 
-        let specification = [
+        let format = start.copyCurrentSampleFormatDescription()
+        // Photo JPEG MOV uses the native image decoder without a hardware session.
+        let isPhotoJPEG = CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_JPEG
+        let specification: CFDictionary? = isPhotoJPEG ? nil : [
             kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder as String: true
         ] as CFDictionary
         let attributes = [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary
@@ -203,13 +218,13 @@ final class HardwareFrames: @unchecked Sendable {
                     let time = CMTimeMapTimeFromRangeToRange(pts, fromRange: decoder.mapping.source, toRange: decoder.mapping.target)
                     // Keep later pictures that arrive first in decode order.
                     if time >= decoder.requestedPicture {
-                        decoder.frames.append(PreviewFrame(buffer: pixelBuffer, time: time, transform: decoder.transform))
+                        decoder.frames.append(PreviewFrame(buffer: pixelBuffer, time: time, transform: decoder.transform,
+                            sourcePicture: .init(url: decoder.asset.url, pts: time - decoder.origin)))
                     }
                 }
             },
             decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque()
         )
-        let format = start.copyCurrentSampleFormatDescription()
         sessionFormat = format
         let status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault, formatDescription: format,
@@ -217,8 +232,10 @@ final class HardwareFrames: @unchecked Sendable {
             outputCallback: &callback, decompressionSessionOut: &session
         )
         guard status == noErr, let session else {
-            throw PreviewFailure("Hardware video decoding is unavailable for \(asset.url.lastPathComponent) (\(status)).")
+            let decoder = isPhotoJPEG ? "Photo JPEG" : "Hardware video"
+            throw PreviewFailure("\(decoder) decoding is unavailable for \(asset.url.lastPathComponent) (\(status)).")
         }
+        if isPhotoJPEG { return }
         var accelerated: CFTypeRef?
         let propertyStatus = withUnsafeMutablePointer(to: &accelerated) { output in
             VTSessionCopyProperty(session, key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
@@ -605,9 +622,10 @@ final class SequencePreview: ObservableObject {
     private var offsets: [Double] = []
     private var duration = 0.0
     private var playable = false
+    private(set) var hasSoundtrack = false
     var readyForTransport: Bool {
         frame != nil || (canPlayWithoutPicture && fallback != nil)
-            || (currentRange?.isAudioOnly == true && (playable || fallback != nil))
+            || ((hasSoundtrack || currentRange?.isAudioOnly == true) && (playable || fallback != nil))
     }
     // The position has no picture to show. The fallback transport can still play on from it.
     private var canPlayWithoutPicture = false
@@ -625,7 +643,12 @@ final class SequencePreview: ObservableObject {
     private var audioSeekGeneration = 0
     private var audioSeeking = false
     private var auditionPosition: (range: PreviewRange, time: Double)?
-    private var frame: PreviewFrame?
+    let sourcePicture = CurrentValueSubject<SequenceSourcePicture?, Never>(nil)
+    private var frame: PreviewFrame? {
+        didSet {
+            if sourcePicture.value != frame?.sourcePicture { sourcePicture.send(frame?.sourcePicture) }
+        }
+    }
     private var programStills: ProgramPreviewStills?
     private var programTransfer: String?
     private let stillPreview = ProgramStillPreview()
@@ -678,11 +701,22 @@ final class SequencePreview: ObservableObject {
         clearPicture()
     }
 
-    func update(_ sourceRanges: [PreviewRange], at time: Double, project: CutProject? = nil, reference: MediaInfo? = nil) {
+    func update(_ sourceRanges: [PreviewRange], at time: Double, project: CutProject? = nil, reference: MediaInfo? = nil,
+                soundtrack: PreviewRange? = nil) {
         let programStills = ProgramPreviewStills(project: project, reference: reference)
         var ranges = sourceRanges
         var indices = Array(sourceRanges.indices)
-        if let project, case .stillSequence(let sequence) = project {
+        let hasSoundtrack = soundtrack != nil && programStills != nil
+        if let soundtrack, let programStills {
+            ranges = [soundtrack]
+            let audibleDuration = soundtrack.exactEnd - soundtrack.exactStart
+            if audibleDuration < programStills.duration {
+                ranges.append(PreviewRange(url: soundtrack.url, exactStart: .zero,
+                                           exactEnd: programStills.duration - audibleDuration,
+                                           isAudioOnly: true, isSilentInsert: true))
+            }
+            indices = []
+        } else if let project, case .stillSequence(let sequence) = project {
             let items = sequence.items
             var source = sourceRanges.makeIterator()
             var expanded: [PreviewRange] = []
@@ -707,7 +741,8 @@ final class SequencePreview: ObservableObject {
         self.sourceRangeIndices = indices
         pause()
         let transfer = project?.programColorPolicy?.transfer ?? programStills?.canvas.transfer
-        if self.ranges == ranges, self.programStills == programStills, self.programTransfer == transfer {
+        if self.ranges == ranges, self.programStills == programStills, self.programTransfer == transfer,
+           self.hasSoundtrack == hasSoundtrack {
             seek(to: time)
             return
         }
@@ -718,6 +753,7 @@ final class SequencePreview: ObservableObject {
         programPictureIssue = nil
         self.programStills = programStills
         self.programTransfer = transfer
+        self.hasSoundtrack = hasSoundtrack
         fallback = nil
         sequenceGeneration += 1
         _ = requests.next()
@@ -752,11 +788,15 @@ final class SequencePreview: ObservableObject {
                 let composition = try await Self.makeAudioComposition(ranges)
                 let audioEnd = try await composition.load(.duration).seconds
                 guard let self, !Task.isCancelled, self.fallback == nil else { return }
+                if hasSoundtrack && (!audioEnd.isFinite || audioEnd <= 0) {
+                    throw PreviewFailure("macOS could not read the soundtrack’s selected audio range.")
+                }
                 if audioEnd.isFinite && audioEnd > 0 {
                     self.audioEnd = audioEnd
                     let item = AVPlayerItem(asset: composition)
                     let player = self.audioPlayer ?? AVPlayer()
                     player.volume = previewAudioGain(volume: self.volume, muted: self.isMuted)
+                    MutedLaunch.mute(player)
                     self.audioPlayer = player
                     player.replaceCurrentItem(with: item)
                     self.observedAudioItem = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
@@ -1011,7 +1051,16 @@ final class SequencePreview: ObservableObject {
 
     func scrub(to position: Double, rangeIndex sourceIndex: Int, sourceFrame: Double) {
         guard sourceRangeIndices.indices.contains(sourceIndex) else { return }
-        let rangeIndex = sourceRangeIndices[sourceIndex]
+        scrub(to: position, using: sourceRangeIndices[sourceIndex], sourceFrame: sourceFrame)
+    }
+
+    func scrubSoundtrack(to position: Double) {
+        guard hasSoundtrack, !offsets.isEmpty else { return }
+        let index = max(0, offsets.lowerBound { $0 > position } - 1)
+        scrub(to: position, using: index, sourceFrame: 0)
+    }
+
+    private func scrub(to position: Double, using rangeIndex: Int, sourceFrame: Double) {
         let range = ranges[rangeIndex]
         let start = offsets[rangeIndex]
         let end = rangeIndex + 1 < offsets.count ? offsets[rangeIndex + 1] : duration
@@ -1043,7 +1092,7 @@ final class SequencePreview: ObservableObject {
                 }
             }
         }
-        guard scrubSoundEnabled, !isMuted, volume > 0 else { return }
+        guard scrubSoundEnabled, !isMuted, volume > 0, !range.isSilentInsert else { return }
         let composition = audioPlayer?.currentItem?.asset
         guard composition != nil || fallback != nil else { return }
         let point = composition == nil ? min(range.end, range.start + (target - start)) : target

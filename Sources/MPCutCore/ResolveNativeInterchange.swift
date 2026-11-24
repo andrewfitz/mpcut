@@ -24,7 +24,6 @@ public enum ResolveNativeInterchange {
             guard allowLoss else { throw CutError(code: "conversion_loss", message: message) }
             warnings.append(message)
         }
-        let helper = try host()
         let token = UUID().uuidString
         let parent = output.deletingLastPathComponent()
         let media = parent.appendingPathComponent("\(output.deletingPathExtension().lastPathComponent) Media \(token)")
@@ -38,7 +37,9 @@ public enum ResolveNativeInterchange {
         defer { try? files.removeItem(at: xml) }
         warnings += try ResolveExport.writeFCP(project, relativeTo: location, to: xml, package: nil,
                                                   allowLoss: allowLoss, isolateSequenceAudio: true,
-                                                  preserveMulticamEditing: false, cancelled: cancelled)
+                                                  preserveMulticamEditing: false, preserveSequenceMetadata: false,
+                                                  cancelled: cancelled)
+        let helper = try host()
         let staged = media.appendingPathComponent(".mpcut-\(token).\(ext)")
         defer { try? files.removeItem(at: staged) }
         try ProjectConverter.checkCancellation(cancelled)
@@ -64,6 +65,13 @@ public enum ResolveNativeInterchange {
 
     public static func read(_ url: URL, allowLoss: Bool,
                             cancelled: @escaping @Sendable () -> Bool = { false }) throws -> (CutProject, [String]) {
+        let imported = try readDocument(url, allowLoss: allowLoss, cancelled: cancelled)
+        return (imported.project, imported.warnings)
+    }
+
+    package static func readDocument(_ url: URL, allowLoss: Bool,
+                                     cancelled: @escaping @Sendable () -> Bool) throws
+        -> (project: CutProject, warnings: [String], mediaSnapshot: ProjectMediaSnapshot) {
         try ProjectConverter.checkCancellation(cancelled)
         let ext = try archiveExtension(url)
         let nativeWarning = "Resolve exports timeline edits through FCPXML. Grades, Fusion compositions, Fairlight processing, render settings and Media Pool organization cannot be verified or retained in .cut."
@@ -75,13 +83,13 @@ public enum ResolveNativeInterchange {
         defer { try? FileManager.default.removeItem(at: dir) }
         let xml = dir.appendingPathComponent("Timeline.fcpxmld")
         try run(helper, operation: "read", native: url, xml: xml, ext: ext, cancelled: cancelled)
-        let (project, warnings) = try FCPInterchange.read(xml, allowLoss: allowLoss)
-        let paths = project.mediaPaths.map { $0.1 }
+        let imported = try FCPInterchange.readDocument(xml, allowLoss: allowLoss)
+        let paths = imported.project.mediaPaths.map(\.1)
         let temporaryPrefix = dir.resolvingSymlinksInPath().standardizedFileURL.path + "/"
         guard !paths.contains(where: { URL(fileURLWithPath: $0).resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(temporaryPrefix) }) else {
             throw CutError(code: "resolve_embedded_media", message: "This timeline references embedded temporary media. Relink those clips to permanent source files in Resolve and export the archive again.")
         }
-        return (project, [nativeWarning] + warnings)
+        return (imported.project, [nativeWarning] + imported.warnings, imported.mediaSnapshot)
     }
 
     private static func archiveExtension(_ url: URL) throws -> String {

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import participant_e2e as fixture
 from participant_e2e_fixture import ffmpeg
+from saved_project import read_project
 
 
 def verify_rotated_vfr(harness):
@@ -24,7 +25,7 @@ def verify_rotated_vfr(harness):
 
     end, switch = Fraction(31, 16), Fraction(9, 8)
     base = harness.base("rotated")
-    project = json.loads(base.read_text())
+    project = read_project(base)
     project["angles"] = [{"id": "gallery", "file": str(rotated)}]
     project["audio"] = {"mode": "none"}
     project["group_range"] = fixture.interval(0, end)
@@ -50,16 +51,58 @@ def verify_rotated_vfr(harness):
     output, report = harness.export(approved, "rotated-masked", render)
     harness.assertEqual(report["privacy_issues"], [])
     stream, frames = fixture.video(output)
+    harness.assertEqual((stream["width"], stream["height"]), (180, 426))
     cadence = Fraction(1001, 24000)
     times = [i * cadence for i in range(len(frames))]
     harness.assertEqual(fixture.frame_times(output, stream), times)
     harness.assertLess(times[-1], end)
     harness.assertGreater(times[-1] + cadence, end)
-    harness.assertEqual(Fraction(stream["time_base"]) * stream["duration_ts"], end)
+    time_base = Fraction(stream["time_base"])
+    harness.assertEqual(time_base * int(stream["duration_ts"]), end)
+    packets = fixture.probe(output, "-select_streams", "v:0", "-show_packets")["packets"]
+    harness.assertEqual(time_base * int(packets[-1]["duration"]), end - times[-1])
     for time, frame in zip(times, frames):
         guest_y, host_y = (107, 319) if time < switch else (319, 107)
         harness.assert_color(frame, 180, 90, guest_y, fixture.COVER, f"rotated guest at {time}")
         harness.assert_color(frame, 180, 90, host_y, fixture.HOST, f"rotated host at {time}")
+
+
+def verify_bitstream_rotation_refuses_scanned_geometry(harness):
+    source = harness.folder / "orientation-sei.mp4"
+    ffmpeg("-i", harness.gallery, "-an", "-c:v", "libx264", "-g", "8", "-bf", "0",
+           "-bsf:v", "h264_metadata=display_orientation=insert:rotate=90", source)
+    stream, = fixture.probe(source, "-select_streams", "v:0", "-show_streams")["streams"]
+    harness.assertFalse(stream.get("side_data_list"))
+    first, = fixture.probe(source, "-read_intervals", "%+#1", "-select_streams", "v:0", "-show_frames")["frames"]
+    harness.assertTrue(any(item.get("rotation") == 90 for item in first["side_data_list"]))
+    base = harness.base("bitstream-rotation")
+    project = read_project(base)
+    project["angles"] = [{"id": "gallery", "file": str(source)}]
+    project["audio"] = {"mode": "none"}
+    base.write_text(json.dumps(project))
+
+    geometry = fixture.geometry()
+    geometry["analysis_identity"] = "scan-with-container-orientation"
+    approved = harness.approved(base, "bitstream-approved", edited_geometry=geometry)
+    render = fixture.plan("original", size=(180, 320), redactions=(
+        {"participant_id": "guest", "treatment": "opaque", "color": fixture.color(fixture.COVER)},
+    ))
+    _, report = harness.export(approved, "bitstream-redaction", render, ok=False)
+    harness.assertEqual(report["error"]["code"], "participant_display_transform_changed")
+    report = harness.cli("participants", "scan", "--file", str(source), "--backend", "cpu-only",
+                         "--sampling", "sparse", ok=False)
+    harness.assertEqual(report["error"]["code"], "unsupported_display_transform")
+
+    geometry.pop("analysis_identity")
+    for appearance in geometry["appearances"]:
+        bounds = appearance["bounds"]
+        appearance["bounds"] = {"x": bounds["y"], "y": max(0, 1 - bounds["x"] - bounds["width"]),
+                                "width": bounds["height"], "height": bounds["width"]}
+    manually_corrected = harness.approved(base, "bitstream-manual", edited_geometry=geometry)
+    output, _ = harness.export(manually_corrected, "bitstream-manual-output", render)
+    frame = harness.decode(output, size=(180, 320))[0]
+    harness.assert_color(frame, 180, 45, 85, fixture.COVER, "rotated guest with manual bounds")
+    harness.assert_color(frame, 180, 90, 235, fixture.HOST, "rotated host with manual bounds")
 
 
 def main():
@@ -78,7 +121,7 @@ def main():
         # A stage appearance is still resolved during this interval. It cannot
         # vouch for the identity of the simultaneous thumbnail.
         approved = harness.approved(base, edited_geometry=geometry)
-        malformed = json.loads(approved.read_text())["participants"]
+        malformed = read_project(approved)["participants"]
         thumbnail = next(a for a in malformed["sources"][0]["appearances"] if a["id"] == second["id"])
         thumbnail["role"] = "presentation"
         invalid = harness.folder / "invalid.cut"
@@ -131,6 +174,7 @@ def main():
         harness.assert_color(frame, 320, 80, 45, fixture.HOST, "preserved host seat")
         harness.assert_color(frame, 320, 240, 45, fixture.GAP, "held unresolved guest seat")
         verify_rotated_vfr(harness)
+        verify_bitstream_rotation_refuses_scanned_geometry(harness)
     finally:
         harness.doClassCleanups()
 

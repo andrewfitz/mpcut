@@ -314,7 +314,7 @@ final class ExportSheetTests: XCTestCase {
 
     @MainActor
     func testMonitorClosesIndependentlyAndReopensForTheProject() throws {
-        _ = NSApplication.shared
+        _ = WindowTestHost.application
         let session = ProjectSession(id: UUID(), preferences: EditorPreferences())
         session.showMonitor()
         let first = try XCTUnwrap(session.monitor)

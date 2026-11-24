@@ -9,8 +9,9 @@
         "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
         "file": {"type": "string", "pattern": "^/", "description": "Absolute input recording path."},
         "backend": {"type": "string", "enum": ["auto", "cpu-only", "gpu-required"]},
-        "sampling": {"type": "string", "enum": ["every-frame", "sparse"]},
+        "sampling": {"type": "string", "enum": ["adaptive", "every-frame", "sparse"]},
         "include_scenes": {"type": "boolean"},
+        "feed_layout": {"type": "string", "pattern": "^(auto|[0-9]+x[0-9]+)$", "description": "Use auto or enter COLSxROWS for a fixed grid of up to 64 feeds. Omit for meeting analysis or to reuse a saved scan configuration."},
         "no_sidecar": {"type": "boolean"},
         "output": {"type": "string", "pattern": "^/", "description": "Optional absolute path for a new scan JSON file. Pass this file to participant project accept or marker building."},
         "resume_file": {"type": "string", "pattern": "^/", "description": "Optional absolute path to a compatible saved partial scan to resume."}
@@ -137,6 +138,25 @@
       "required": ["operation_id", "project_path", "source_id", "range"],
       "additionalProperties": false,
       "anyOf": [{"required": ["participant_ids"], "properties": {"participant_ids": {"minItems": 1}}}, {"required": ["include_original"], "properties": {"include_original": {"const": true}}}, {"required": ["presentation_ids"], "properties": {"presentation_ids": {"minItems": 1}}}]
+    }
+  },
+  {
+    "name": "participants_file_angles_take",
+    "description": "Take a virtual angle at an exact output timestamp and save the resulting timed picture decision.",
+    "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false},
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {"type": "string", "format": "uuid", "description": "A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session."},
+        "project_path": {"type": "string", "pattern": "^/", "description": "Absolute path to an existing .cut project."},
+        "angle": {"type": "object", "description": "A virtual angle from participants_file_angles_list."},
+        "output_time": {"type": "string", "minLength": 1, "description": "Exact timestamp on the edited output clock."},
+        "out_project": {"type": "string", "pattern": "^/", "description": "Absolute path for a new .cut project."},
+        "in_place": {"type": "boolean", "const": true, "description": "Replace the project using its current disk revision."}
+      },
+      "required": ["operation_id", "project_path", "angle", "output_time"],
+      "additionalProperties": false,
+      "oneOf": [{"required": ["out_project"]}, {"required": ["in_place"]}]
     }
   },
   {

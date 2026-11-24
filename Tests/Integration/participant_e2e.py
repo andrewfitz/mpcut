@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ from participant_e2e_fixture import (
     CARD, COVER, FPS, FRAME_COUNT, GAP, GUEST, HEIGHT, HOST, RATE, STAGE, THUMB, WIDTH,
     frame_times, generate, generate_camera, pixel, probe, sound, tiles_at, video,
 )
+from saved_project import read_project
 
 CLI = None
 BENCHMARK_RUNS = 0
@@ -91,7 +93,7 @@ def geometry():
             "coverage": [{"range": interval(0, 5), "state": "verified"}]}
 
 
-class ParticipantE2E(unittest.TestCase):
+class ParticipantFixtureCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         workspace = tempfile.TemporaryDirectory(prefix="mpcut-participant-")
@@ -198,6 +200,40 @@ class ParticipantE2E(unittest.TestCase):
     def iso_pcm(self):
         return bytes(2 * int(self.iso_offset * RATE)) + sound(self.recorder, 1)
 
+
+class ParticipantE2E(ParticipantFixtureCase):
+    def test_manual_geometry_remains_bound_to_the_reviewed_recording(self):
+        recording = self.folder / "camera.mov"
+        shutil.copy2(self.gallery, recording)
+        base = self.base()
+        payload = read_project(base)
+        payload["angles"][0]["file"] = str(recording)
+        base.write_text(json.dumps(payload))
+        render = plan("original", redactions=[{"participant_id": "guest", "treatment": "opaque"}])
+        document = self.approved(base, render=render)
+        approved = self.cli("participants", "render", "plan", request={"project_path": str(document)})
+        self.assertTrue(approved["publishable"])
+        replacement = self.folder / "replacement.mov"
+        shutil.copy2(recording, replacement)
+        replacement.replace(recording)
+
+        def assert_stale(project):
+            report = self.cli("participants", "render", "plan", request={"project_path": str(project)})
+            self.assertFalse(report["publishable"])
+            self.assertEqual(report["stale_source_ids"], ["gallery"])
+            self.assertEqual(report["privacy_issues"][0]["output"], interval(0, 5))
+
+        assert_stale(document)
+        # A later mask edit submitted without stamps cannot trust the new inode.
+        participants = read_project(document)["participants"]
+        source, = participants["sources"]
+        del source["source_stamp"], source["source_inode"]
+        revised = self.folder / "edited.cut"
+        self.cli("participants", "project", "apply", request={
+            "project_path": str(document), "out_project": str(revised), "participants": participants,
+        })
+        assert_stale(revised)
+
     def test_sequence_iso_accepts_another_path_to_the_same_recording(self):
         alias = self.folder / "linked-gallery.mov"
         os.link(self.gallery, alias)
@@ -214,6 +250,34 @@ class ParticipantE2E(unittest.TestCase):
         self.assertEqual(report["audio_actions"][0]["generated_silence"], [])
         self.assertEqual(sound(output), sound(self.gallery))
 
+    def test_iso_retains_replacement_sync_without_the_camera_fallback(self):
+        base = self.base()
+        payload = read_project(base)
+        payload["audio_sources"][0]["offset"] = "0"
+        payload["audio_replacements"] = [{
+            "id": "synced-iso",
+            "original": {"source_id": "gallery", "audio_stream_index": 1},
+            "replacement": {"source_id": "recorder", "audio_stream_index": 1},
+            "relative_offset": str(self.iso_offset),
+            "uncovered": "keep_original",
+        }]
+        base.write_text(json.dumps(payload))
+        document = self.approved(base, render=plan("solo", slot("guest"), audio="iso", ids=("guest",)))
+        output, report = self.export(document, "replacement")
+        self.assertEqual(report["audio_actions"][0]["generated_silence"], [interval(0, self.iso_offset)])
+        self.assertEqual(sound(output), self.iso_pcm())
+
+        # Selecting the physical camera stream must also remain exact when the
+        # program has replaced that stream with someone else's microphone.
+        payload = read_project(document)
+        guest = next(person for person in payload["participants"]["people"] if person["id"] == "guest")
+        guest["audio"]["selection"] = payload["audio_replacements"][0]["original"]
+        document.write_text(json.dumps(payload))
+        output, report = self.export(document, "original-microphone")
+        self.assertEqual({Path(source["file"]).name for source in report["audio_actions"][0]["sources"]},
+                         {self.gallery.name})
+        self.assertTrue(sound(output) == sound(self.gallery), "ISO contains a different microphone")
+
     def test_materialized_angles_share_clock_and_one_meeting_mix(self):
         approved = self.approved(self.base())
         request = {"project_path": str(approved), "source_id": "gallery",
@@ -226,7 +290,7 @@ class ParticipantE2E(unittest.TestCase):
         self.cli("participants", "angles", "render",
                  request={**request, "canvas": canvas(), "output_directory": str(delivery)})
         reopened = delivery / "multicam.cut"
-        payload = json.loads(reopened.read_text())
+        payload = read_project(reopened)
         self.assertEqual(payload["group_range"], interval(0, 5))
         self.assertEqual([angle["id"] for angle in payload["angles"]], ["guest", "host"])
         for person, angle in zip(("guest", "host"), payload["angles"]):
@@ -245,7 +309,7 @@ class ParticipantE2E(unittest.TestCase):
         self.cli("participants", "angles", "render",
                  request={**request, "canvas": canvas(), "audio": {"include_isos": True},
                           "output_directory": str(isolated)})
-        payload = json.loads((isolated / "multicam.cut").read_text())
+        payload = read_project((isolated / "multicam.cut"))
         guest, host = payload["angles"]
         self.assertNotIn("audio_stream_index", host)
         self.assertEqual(sound(isolated / guest["file"]), self.iso_pcm())
@@ -255,7 +319,7 @@ class ParticipantE2E(unittest.TestCase):
         audio_source, = payload["audio_sources"]
         self.assertEqual(sound(isolated / audio_source["file"]), sound(self.gallery))
 
-    def test_scan_generated_gallery(self):
+    def test_scan_accept_and_render_tracks_a_seat_swap(self):
         report = self.cli("participants", "scan", "--file", str(self.gallery), "--backend", "cpu-only",
                           "--sampling", "every-frame", measurement="scan_cpu_every_frame")
         self.assertEqual(report["state"], "completed", report)
@@ -264,6 +328,29 @@ class ParticipantE2E(unittest.TestCase):
                          [Fraction(index, FPS) for index in range(FRAME_COUNT)])
         self.assertEqual({item["backend"] for item in analysis["diagnostics"]}, {"cpu"})
         self.assertFalse(self.gallery.with_name("gallery.mov.cutdb").exists())
+
+        scan = self.folder / "gallery-scan.json"
+        scan.write_text(json.dumps(report))
+        approved = self.folder / "auto-accepted.cut"
+        self.cli("participants", "project", "accept",
+                 request={"project_path": str(self.base()), "source_id": "gallery",
+                          "analysis_file": str(scan), "out_project": str(approved)})
+        accepted = read_project(approved)["participants"]
+        source, = accepted["sources"]
+        self.assertEqual(source["analysis_identity"], report["analysis_identity"])
+        appearances = source["appearances"]
+        guest, = [appearance for appearance in appearances if appearance["range"]["from"] == "0"
+                  and appearance["bounds"]["x"] > 0.5 and appearance["state"] == "video"]
+        guest_id = guest["participant_id"]
+        self.assertIn(guest_id, {person["id"] for person in accepted["people"]})
+        swapped, = [appearance for appearance in appearances if appearance.get("participant_id") == guest_id
+                    and rational(appearance["range"]["from"]) <= 1 < rational(appearance["range"]["to"])]
+        self.assertLess(swapped["bounds"]["x"], 0.5)
+
+        output, _ = self.export(approved, "auto-tracked-guest", plan("solo", slot(guest_id)))
+        frames = self.decode(output)
+        for index, frame in enumerate(frames[:2 * FPS]):
+            self.assert_color(frame, SIZE[0], SIZE[0] // 2, SIZE[1] // 2, GUEST, f"auto-tracked guest frame {index}")
 
     def test_extraction_reopens_with_accepted_geometry_and_late_iso(self):
         # The approved project contains all geometry. No machine scan is run for
@@ -393,7 +480,7 @@ class ParticipantE2E(unittest.TestCase):
         render = plan("original", size=(WIDTH, HEIGHT), redactions=[redaction])
         multicam = self.approved(self.base(), render=render)
         sequence = self.folder / "sequence.cut"
-        participants = json.loads(multicam.read_text())["participants"]
+        participants = read_project(multicam)["participants"]
         participants["sources"][0]["source_id"] = str(self.gallery)
         participants["people"][1].pop("audio")
         sequence.write_text(json.dumps({"format": "mpcut", "schema_version": 4, "kind": "sequence",
@@ -401,11 +488,6 @@ class ParticipantE2E(unittest.TestCase):
                                         "participants": participants}))
         for project in (multicam, sequence):
             with self.subTest(project=project.name):
-                frames = self.folder / (project.stem + "-frames")
-                refused = self.cli("review", "frames", "export", "--project", str(project), "--at", "0",
-                                   "--output", str(frames), ok=False)
-                self.assertEqual(refused["error"]["code"], "participant_render_unavailable", refused)
-                self.assertFalse(frames.exists())
                 output = self.folder / (project.stem + ".mov")
                 args = ("export", "project", "render", "--project", str(project), "--output", str(output))
                 for mode in ("copy", "smart"):
@@ -434,6 +516,17 @@ class ParticipantE2E(unittest.TestCase):
             refused = self.cli(*args, *options, ok=False)
             self.assertEqual(refused["error"]["code"], "unresolved_participant_privacy", refused)
             self.assertFalse(output.exists())
+
+
+    def test_project_frame_export_refuses_saved_composition(self):
+        redaction = {"participant_id": "guest", "treatment": "opaque", "color": color(COVER)}
+        project = self.approved(self.base(), render=plan("original", redactions=[redaction]))
+        frames = self.folder / "frames"
+        for clock in ("group", "assembly"):
+            refused = self.cli("review", "frames", "export", "--project", str(project), "--at", "0",
+                               "--clock", clock, "--output", str(frames), ok=False)
+            self.assertEqual(refused["error"]["code"], "participant_render_unavailable", refused)
+            self.assertFalse(frames.exists())
 
 
 if __name__ == "__main__":

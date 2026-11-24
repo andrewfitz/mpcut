@@ -330,7 +330,7 @@ func withEditor(_ bundle: URL, opening document: URL, home: URL, helper: URL? = 
         "-AppleLanguages", "(en)", "-automation_local_mcp_enabled", "NO", "-analysis_sidecar_reuse_enabled", "NO",
         "-timeline_snap_target", "off", "-export_movie_default_mode", "copy",
     ]
-    var environment = ["CFFIXED_USER_HOME": home.path, "MPCUT_TEST_SOCKET_DIRECTORY": testInstance]
+    var environment = ["CFFIXED_USER_HOME": home.path, "MPCUT_TEST_SOCKET_DIRECTORY": testInstance, "MPCUT_MUTED": "1"]
     if let helper { environment["MPCUT_TRANSCRIBERRR_HELPER"] = helper.path }
     config.environment = environment
     let previousPIDs = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
@@ -625,7 +625,7 @@ func runBenchmark(_ bundle: URL, scratch: URL, home: URL, output: URL) throws {
         }
         let attach = try measure {
             try editor.press("transcript.binding.apply", role: "AXButton")
-            try editor.expectResults("1–160 of 28800", timeout: 120, interval: 0.02)
+            try editor.expectResults("28800 words", timeout: 120, interval: 0.02)
         }
         var metrics: [String: Any] = [
             "durationSeconds": duration, "word_count": duration * 4,
@@ -729,12 +729,14 @@ func runBenchmark(_ bundle: URL, scratch: URL, home: URL, output: URL) throws {
 func exerciseTranscription(_ editor: Editor, project: URL) throws {
     try editor.showTranscript()
     try editor.press("transcript.transcribe", role: "AXButton")
+    try editor.press("Recognition options", role: "AXDisclosureTriangle")
     let download = try editor.control("transcript.setup.download")
     guard value(download, "AXValue") as Int? == 0 else {
         throw Failure("The default setup unexpectedly enabled model downloads")
     }
     if let engine = ProcessInfo.processInfo.environment["MPCUT_GUI_TEST_ENGINE"] {
-        try editor.chooseValue(engine, from: "transcript.setup.engine")
+        let title = ["apple-native": "Apple Speech", "parakeet-v3": "Parakeet v3", "qwen3": "Qwen3"][engine] ?? engine
+        try editor.chooseValue(title, from: "transcript.setup.engine")
         let identify = try editor.control("Identify speakers in mixed audio", role: "AXCheckBox")
         guard value(identify, "AXEnabled") as Bool? == true else {
             throw Failure("Mixed-audio speaker identification is unavailable for " + engine)

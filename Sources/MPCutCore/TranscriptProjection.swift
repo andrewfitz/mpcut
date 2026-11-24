@@ -154,27 +154,110 @@ extension TranscriptIndex {
                  sequenceMedia: [String: MediaInfo] = [:], multicamMedia: [String: MediaInfo] = [:],
                  timelineRevision: Int = 0, staleMatches: Bool = false,
                  records: [TranscriptAuthoredRecord] = [], spaces: Set<TranscriptSpace>) throws {
-        try document.validate()
-        self.document = document
-        self.attachment = attachment
-        self.transcriptRevision = project?.transcripts.revision
-        self.timelineRevision = timelineRevision
-        let projection = try TranscriptProjection(document: document, attachment: attachment, project: project,
-                                                  projectURL: projectURL, sequenceMedia: sequenceMedia,
-                                                  multicamMedia: multicamMedia, timelineRevision: timelineRevision,
-                                                  staleMatches: staleMatches, needsWords: !spaces.isEmpty)
-        let coverageInputs = try projection.inputCoverageTracks()
-        let groupRange = projection.multicam?.range
-        self.inputCoverageProvider = { space, filter in
-            try TranscriptProjection.inputCoverage(coverageInputs, space: space, filter: filter, group: groupRange)
+        try self.init(Groundwork(document: document, attachment: attachment, project: project, projectURL: projectURL,
+                                 sequenceMedia: sequenceMedia, multicamMedia: multicamMedia,
+                                 timelineRevision: timelineRevision, staleMatches: staleMatches, records: records,
+                                 needsWords: !spaces.isEmpty), spaces: spaces)
+    }
+
+    /// What every clock of one build reads: the checked document, what each track is bound
+    /// to, the source words, and the corrections resolved against them. Group and Current Cut
+    /// are projected from the source words, so a build of several clocks prepares this once.
+    struct Groundwork {
+        let document: TranscriptDocument
+        let attachment: TranscriptAttachment?
+        let project: CutProject?
+        let transcriptRevision: UInt64?
+        let timelineRevision: Int
+        let inputCoverageProvider: @Sendable (TranscriptSpace, TranscriptFilter) throws -> TranscriptInputCoverageRows
+        let review: [TranscriptAuthoredReview]
+        let speakers: [TranscriptSpeaker]
+        /// Whether the first Source or Group word reports stale matches, where that follows
+        /// from the project alone. Nil when a word carries a stale flag of its own or the
+        /// project's applies to no source word, and only the rows can say.
+        let staleLead: Bool?
+        fileprivate var projection: TranscriptProjection
+        fileprivate var source: [TranscriptOccurrence]
+
+        init(document: TranscriptDocument, attachment: TranscriptAttachment?, project: CutProject?, projectURL: URL?,
+             sequenceMedia: [String: MediaInfo], multicamMedia: [String: MediaInfo], timelineRevision: Int,
+             staleMatches: Bool, records: [TranscriptAuthoredRecord], needsWords: Bool) throws {
+            try document.validate()
+            self.document = document
+            self.attachment = attachment
+            self.project = project
+            self.transcriptRevision = project?.transcripts.revision
+            self.timelineRevision = timelineRevision
+            let projection = try TranscriptProjection(document: document, attachment: attachment, project: project,
+                                                      projectURL: projectURL, sequenceMedia: sequenceMedia,
+                                                      multicamMedia: multicamMedia, timelineRevision: timelineRevision,
+                                                      staleMatches: staleMatches, needsWords: needsWords)
+            let coverageInputs = try projection.inputCoverageTracks()
+            let groupRange = projection.multicam?.range
+            self.inputCoverageProvider = { space, filter in
+                try TranscriptProjection.inputCoverage(coverageInputs, space: space, filter: filter, group: groupRange)
+            }
+            let source = needsWords ? try projection.sourceWords() : []
+            let review = records.isEmpty || !needsWords
+                ? [] : TranscriptEditorial.review(records: records, sourceWords: source, attachmentID: attachment?.id)
+            self.review = review
+            self.speakers = TranscriptEditorial.correctedSpeakers(document.speakers + projection.localSpeakers, review: review)
+            func marked(_ words: [TranscriptWord]?) -> Bool {
+                words?.contains { $0.projection?.staleMatches == true } == true
+            }
+            if !needsWords {
+                self.staleLead = false
+            } else if marked(document.words) || document.tracks.contains(where: { marked($0.words) })
+                        || (projection.staleMatches && source.isEmpty) {
+                self.staleLead = nil
+            } else {
+                self.staleLead = projection.staleMatches
+            }
+            self.projection = projection
+            self.source = source
         }
-        var source = spaces.isEmpty ? [] : try projection.sourceWords()
+
+        /// The same groundwork for one of several clocks that are built side by side. The
+        /// clocks read the same source words, and each takes a projection of its own.
+        func forOneClock() -> Groundwork {
+            var copy = self
+            copy.projection = projection.separate()
+            return copy
+        }
+
+        /// What an index keeps so that it can build another clock later. The source words and
+        /// the tables they are projected through are most of the groundwork, and are made
+        /// again from the document when that happens. What each track is bound to stays as it
+        /// was first resolved, so a later clock agrees with the earlier ones.
+        func withoutSourceWords() -> Groundwork {
+            var copy = self
+            copy.source = []
+            copy.projection = projection.withoutWordTables()
+            return copy
+        }
+
+        func withSourceWords() throws -> Groundwork {
+            var copy = self
+            copy.projection = projection.withWordTables()
+            copy.source = try copy.projection.sourceWords()
+            return copy
+        }
+    }
+
+    /// Projects and indexes the clocks asked for. The build takes the groundwork over, which
+    /// lets the Source index order the source list in place when nothing else holds the list.
+    init(_ groundwork: consuming Groundwork, spaces: Set<TranscriptSpace>) throws {
+        var source: [TranscriptOccurrence] = []
+        swap(&source, &groundwork.source)
+        let projection = groundwork.projection
+        let document = groundwork.document
+        let review = groundwork.review
         var group: [TranscriptOccurrence] = []
         var currentCut: [TranscriptOccurrence] = []
         var gaps: [TranscriptCoverageGap] = []
         let needsCut = spaces.contains(.currentCut)
         let needsGroup = spaces.contains(.group)
-        switch project {
+        switch groundwork.project {
         case .multicam(let multicam) where needsGroup || needsCut:
             (group, currentCut, gaps) = try projection.multicamWords(source, project: multicam,
                                                                    needsGroup: needsGroup, needsCut: needsCut)
@@ -190,12 +273,7 @@ extension TranscriptIndex {
         if needsGroup, projection.multicam == nil, document.clock == .session || document.clock == .group {
             group = try projection.sessionWords(source, space: .group)
         }
-        self.gaps = gaps
         let usesMix = projection.multicam?.audio == .mix
-        self.usesMix = usesMix
-        let review = records.isEmpty || spaces.isEmpty ? [] : TranscriptEditorial.review(records: records, sourceWords: source, attachmentID: attachment?.id)
-        self.authoredReview = review
-        self.speakers = TranscriptEditorial.correctedSpeakers(document.speakers + projection.localSpeakers, review: review)
         // Each list is handed to its index and forgotten here, so the index holds the only
         // reference and orders it in place.
         var indexes: [TranscriptSpace: WordIndex] = [:]
@@ -214,7 +292,11 @@ extension TranscriptIndex {
             currentCut = []
             indexes[.currentCut] = WordIndex(consume words, space: .currentCut, gaps: gaps, usesMix: usesMix)
         }
-        self.indexes = indexes
+        self.init(clocks: indexes, gaps: gaps, document: document, timelineRevision: groundwork.timelineRevision,
+                  attachment: groundwork.attachment, transcriptRevision: groundwork.transcriptRevision,
+                  speakers: groundwork.speakers, authoredReview: review,
+                  inputCoverageProvider: groundwork.inputCoverageProvider, usesMix: usesMix,
+                  staleLead: groundwork.staleLead)
     }
 }
 
@@ -284,9 +366,9 @@ private struct TranscriptProjection {
     let occurrencePrefix: String
     let staleMatches: Bool
     let tracks: [String: LocalTrack]
-    let words: [String: TranscriptWord]
-    let localWords: [String: [TranscriptWord]]
-    let trackWordText: [String: [String: String]]
+    private(set) var words: [String: TranscriptWord]
+    private(set) var localWords: [String: [TranscriptWord]]
+    private(set) var trackWordText: [String: [String: String]]
     let localSpeakers: [TranscriptSpeaker]
     let importOrigin: RationalTime
     let approximate: Bool
@@ -296,7 +378,87 @@ private struct TranscriptProjection {
     let replacementOffsets: [String: RationalTime]
     let sourceFiles: [String: String]
     let lanesByTrack: [String: TranscriptLaneMetadata]
-    private let angleCoverageCache = AngleCoverageCache()
+    private var angleCoverageCache = AngleCoverageCache()
+
+    /// The same projection for a clock that is built on another thread. The picture coverage
+    /// last looked up is remembered without a lock, so each thread remembers its own.
+    func separate() -> TranscriptProjection {
+        var copy = self
+        copy.angleCoverageCache = AngleCoverageCache()
+        return copy
+    }
+
+    /// The projection without its word tables. They are most of what it holds and follow
+    /// from the document alone, while what each track is bound to was read from the disk.
+    func withoutWordTables() -> TranscriptProjection {
+        var copy = self
+        copy.words = [:]
+        copy.localWords = [:]
+        copy.trackWordText = [:]
+        return copy
+    }
+
+    func withWordTables() -> TranscriptProjection {
+        var copy = separate()
+        let tables = Self.wordTables(of: document, needsWords: true)
+        copy.words = tables.words
+        copy.localWords = tables.localWords
+        copy.trackWordText = tables.trackWordText
+        return copy
+    }
+
+    /// The words every clock is projected from: the conversation's, and each recording's own
+    /// that no conversation word stands for, under an ID and a speaker the document does not use.
+    private static func wordTables(of document: TranscriptDocument, needsWords: Bool)
+        -> (words: [String: TranscriptWord], localWords: [String: [TranscriptWord]],
+            trackWordText: [String: [String: String]], localSpeakers: [TranscriptSpeaker]) {
+        var words = Dictionary(uniqueKeysWithValues: (needsWords ? document.words : []).map { ($0.id, $0) })
+        var referenced: [String: Set<String>] = [:]
+        // A recording's different reading of a spoken word is attached to that word as an
+        // inferred observation that names the recording's own word. The spoken word stands for
+        // it on every clock, so the recording's copy is not listed a second time.
+        for word in needsWords ? document.words : [] {
+            for observation in word.observations {
+                if let id = observation.wordID { referenced[observation.trackID, default: []].insert(id) }
+            }
+        }
+        var localWords: [String: [TranscriptWord]] = [:]
+        var localSpeakers: [TranscriptSpeaker] = []
+        var speakerIDs = Set(document.speakers.map(\.id))
+        for track in document.tracks where needsWords && track.coverage == .recognized {
+            let known = referenced[track.id] ?? []
+            let local = track.words ?? []
+            let speakerNames = Dictionary((track.speakers ?? []).map { ($0.id, $0.name) },
+                                          uniquingKeysWith: { first, _ in first })
+            var trackSpeakerIDs: [String: String] = [:]
+            for (position, rawWord) in local.enumerated() where !known.contains(rawWord.id) {
+                var word = rawWord
+                word.id = "\(track.id.count):\(track.id):\(position):\(rawWord.id)"
+                while words[word.id] != nil { word.id = "local:" + word.id }
+                if let speakerID = rawWord.speakerID {
+                    if let mapped = trackSpeakerIDs[speakerID] {
+                        word.speakerID = mapped
+                    } else {
+                        var mapped = "\(track.id.count):\(track.id):\(speakerID)"
+                        while !speakerIDs.insert(mapped).inserted { mapped = "local:" + mapped }
+                        localSpeakers.append(.init(id: mapped, name: speakerNames[speakerID] ?? speakerID))
+                        trackSpeakerIDs[speakerID] = mapped
+                        word.speakerID = mapped
+                    }
+                }
+                word.observations = [.init(trackID: track.id, wordID: rawWord.id, text: rawWord.text,
+                                           start: rawWord.start, end: rawWord.end, evidence: .recognized,
+                                           speakerID: word.speakerID, confidence: rawWord.confidence)]
+                localWords[track.id, default: []].append(word)
+                words[word.id] = word
+            }
+        }
+        let trackWordText = Dictionary(uniqueKeysWithValues: document.tracks.compactMap { track -> (String, [String: String])? in
+            guard let words = track.words, let known = referenced[track.id] else { return nil }
+            return (track.id, Dictionary(uniqueKeysWithValues: words.filter { known.contains($0.id) }.map { ($0.id, $0.text) }))
+        })
+        return (words, localWords, trackWordText, localSpeakers)
+    }
 
     init(document: TranscriptDocument, attachment: TranscriptAttachment?, project: CutProject?,
          projectURL: URL?, sequenceMedia: [String: MediaInfo], multicamMedia: [String: MediaInfo],
@@ -357,54 +519,11 @@ private struct TranscriptProjection {
                                          hasSequenceMedia: media.map { !$0.audio.isEmpty } ?? false,
                                          sequenceMedia: media, usesEmbeddedBinding: attachment == nil))
         })
-        var words = Dictionary(uniqueKeysWithValues: (needsWords ? document.words : []).map { ($0.id, $0) })
-        var referenced: [String: Set<String>] = [:]
-        // A recording's different reading of a spoken word is attached to that word as an
-        // inferred observation that names the recording's own word. The spoken word stands for
-        // it on every clock, so the recording's copy is not listed a second time.
-        for word in needsWords ? document.words : [] {
-            for observation in word.observations {
-                if let id = observation.wordID { referenced[observation.trackID, default: []].insert(id) }
-            }
-        }
-        var localWords: [String: [TranscriptWord]] = [:]
-        var localSpeakers: [TranscriptSpeaker] = []
-        var speakerIDs = Set(document.speakers.map(\.id))
-        for track in document.tracks where needsWords && track.coverage == .recognized {
-            let known = referenced[track.id] ?? []
-            let local = track.words ?? []
-            let speakerNames = Dictionary((track.speakers ?? []).map { ($0.id, $0.name) },
-                                          uniquingKeysWith: { first, _ in first })
-            var trackSpeakerIDs: [String: String] = [:]
-            for (position, rawWord) in local.enumerated() where !known.contains(rawWord.id) {
-                var word = rawWord
-                word.id = "\(track.id.count):\(track.id):\(position):\(rawWord.id)"
-                while words[word.id] != nil { word.id = "local:" + word.id }
-                if let speakerID = rawWord.speakerID {
-                    if let mapped = trackSpeakerIDs[speakerID] {
-                        word.speakerID = mapped
-                    } else {
-                        var mapped = "\(track.id.count):\(track.id):\(speakerID)"
-                        while !speakerIDs.insert(mapped).inserted { mapped = "local:" + mapped }
-                        localSpeakers.append(.init(id: mapped, name: speakerNames[speakerID] ?? speakerID))
-                        trackSpeakerIDs[speakerID] = mapped
-                        word.speakerID = mapped
-                    }
-                }
-                word.observations = [.init(trackID: track.id, wordID: rawWord.id, text: rawWord.text,
-                                           start: rawWord.start, end: rawWord.end, evidence: .recognized,
-                                           speakerID: word.speakerID, confidence: rawWord.confidence)]
-                localWords[track.id, default: []].append(word)
-                words[word.id] = word
-            }
-        }
-        self.localWords = localWords
-        self.trackWordText = Dictionary(uniqueKeysWithValues: document.tracks.compactMap { track in
-            guard let words = track.words, let known = referenced[track.id] else { return nil }
-            return (track.id, Dictionary(uniqueKeysWithValues: words.filter { known.contains($0.id) }.map { ($0.id, $0.text) }))
-        })
-        self.localSpeakers = localSpeakers
-        self.words = words
+        let tables = Self.wordTables(of: document, needsWords: needsWords)
+        self.localWords = tables.localWords
+        self.trackWordText = tables.trackWordText
+        self.localSpeakers = tables.localSpeakers
+        self.words = tables.words
         self.importOrigin = attachment?.importOrigin ?? .zero
         self.approximate = document.approximateClock && attachment?.importOrigin == nil
         if case .multicam(let multicam) = project {
@@ -749,9 +868,11 @@ private extension TranscriptProjection {
                            observation: sourceWords[position].observation, audibility: sourceWords[position].audibility,
                            useLocalText: staleMatches, knownAngles: sourceWords[position].angles)
         }
-        let supplemental = document.tracks.flatMap { localWords[$0.id] ?? [] }
+        // The words are read from the lists that hold them. Joining hours of them into one
+        // list copies every word.
+        let lists = [document.words] + document.tracks.compactMap { localWords[$0.id] }
         var mapped: [(position: Int, track: LocalTrack, source: MulticamRange, group: MulticamRange)] = []
-        for word in document.words + supplemental {
+        for word in lists.joined() {
             let local = occurrencesByWord[word.id] ?? []
             mapped.removeAll(keepingCapacity: true)
             for position in local {

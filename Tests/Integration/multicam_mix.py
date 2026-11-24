@@ -13,6 +13,7 @@ import unittest
 
 from media_regression import ffmpeg, packets, probe, sample_hashes, timestamped_hashes
 from multicam import camera, pcm_slice, rational_time, times
+from saved_project import read_project
 
 CLI = None
 RATE = 48_000
@@ -270,7 +271,7 @@ class MulticamMixTests(unittest.TestCase):
         ffmpeg("-f", "lavfi", "-i", "anoisesrc=sample_rate=44100:duration=10.01:seed=23",
                "-c:a", "pcm_s16le", "-movflags", "+faststart", recorder)
         self.project(replacement=False)
-        payload = json.loads(self.project_path.read_text())
+        payload = read_project(self.project_path)
         payload["group_range"]["to"] = "1001/100"
         payload["angles"] = [
             {"id": "a", "file": str(wide), "audio_stream_index": 1},
@@ -291,7 +292,7 @@ class MulticamMixTests(unittest.TestCase):
 
     def test_mp4_and_matroska_mark_the_first_lane_as_default(self):
         self.project(replacement=False, surround=True)
-        payload = json.loads(self.project_path.read_text())
+        payload = read_project(self.project_path)
         payload["audio_sources"].append({"id": "stereo", "file": str(self.stereo)})
         payload["mix_lanes"][0]["target"] = {"kind": "recording", "source_id": "stereo", "audio_stream_index": 0}
         self.project_path.write_text(json.dumps(payload))
@@ -320,7 +321,7 @@ class MulticamMixTests(unittest.TestCase):
 
     def test_matroska_pcm_layout_is_checked_before_export(self):
         self.project(replacement=False)
-        project = json.loads(self.project_path.read_text())
+        project = read_project(self.project_path)
         surround = self.root / "pcm-surround.mov"
         project["audio_sources"] = [{"id": "surround", "file": str(surround)}]
         project["mix_lanes"][1]["target"] = {
@@ -366,7 +367,7 @@ class MulticamMixTests(unittest.TestCase):
         ffmpeg("-f", "lavfi", "-i", "testsrc2=d=4:s=96x64:r=25",
                "-vf", "format=yuva420p,colorchannelmixer=aa=0.5", "-c:v", "libvpx",
                "-pix_fmt", "yuva420p", "-auto-alt-ref", "0", "-an", picture)
-        project = json.loads(self.project_path.read_text())
+        project = read_project(self.project_path)
         project["angles"][0] = {"id": "a", "file": str(picture)}
         project["mix_lanes"].pop(0)
         self.project_path.write_text(json.dumps(project))
@@ -447,7 +448,7 @@ class MulticamMixTests(unittest.TestCase):
 
     def test_nested_mix_with_visible_still_preserves_bound_audio(self):
         self.project()
-        project = json.loads(self.project_path.read_text())
+        project = read_project(self.project_path)
         title = self.root / "title.png"
         ffmpeg("-i", self.a, "-an", "-frames:v", "1", title)
         project["still_assets"] = [{
@@ -466,7 +467,7 @@ class MulticamMixTests(unittest.TestCase):
 
     def test_nested_follow_with_bound_audio_can_join_an_ordinary_recording(self):
         self.project()
-        project = json.loads(self.project_path.read_text())
+        project = read_project(self.project_path)
         del project["mix_lanes"]
         project["audio"] = {"mode": "follow"}
         project["switches"].append({"group_time": "2", "angle_id": "b"})
@@ -542,7 +543,7 @@ class MulticamMixTests(unittest.TestCase):
     def test_legacy_multicam_modes_keep_the_same_routes_after_saving_v4(self):
         self.project(replacement=False)
         original_path = self.project_path
-        payload = json.loads(original_path.read_text())
+        payload = read_project(original_path)
         del payload["mix_lanes"]
         payload["schema_version"] = 3
         for mode in ("fixed", "follow", "none"):
@@ -571,7 +572,7 @@ class MulticamMixTests(unittest.TestCase):
                 saved = subprocess.run(command, input=json.dumps(request), capture_output=True, text=True, timeout=90)
                 self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
                 self.assertEqual(original_path.read_bytes(), contents)
-                reopened = json.loads(upgraded.read_text())
+                reopened = read_project(upgraded)
                 self.assertEqual(reopened["schema_version"], 4)
                 self.assertEqual(reopened["switches"], payload["switches"])
                 self.project_path = upgraded

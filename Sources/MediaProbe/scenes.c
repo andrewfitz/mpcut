@@ -14,8 +14,12 @@
 #include <libavutil/avstring.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <libswscale/swscale.h>
+#include <dispatch/dispatch.h>
 #include <math.h>
 #include <string.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 // Equal-area spatial samples compare color and composition without decoding a
 // full-resolution RGB image. Hardware NV12/P010 surfaces stay in shared memory.
@@ -26,7 +30,8 @@ typedef struct {
 } ScenePicture;
 
 enum { DIGEST_SIZE = 32, CHECKPOINT_VERSION = 1 };
-enum { SCAN_RANGE_END = 3, SCAN_RETRY_FROM_START = 4, SCAN_RETRY_SOFTWARE = 5 };
+enum { SCAN_RANGE_END = MP_PARTICIPANT_UNSUPPORTED_DISPLAY_TRANSFORM + 1,
+       SCAN_RETRY_FROM_START, SCAN_RETRY_SOFTWARE };
 typedef struct {
     int64_t position, dts;
     bool independent;
@@ -56,7 +61,15 @@ typedef struct {
     size_t width, height;
     size_t luma_x[W], chroma_x[W], sample_y[H];
     MPSceneVisit visit;
+    MPParticipantFrameSelect select_picture;
     MPParticipantFrameVisit picture;
+    // Interleave planar 4:2:0 chroma so software pictures convert as NV12.
+    bool pack_nv12;
+    uint8_t *chroma;
+    unsigned chroma_size;
+    AVFormatContext *picture_format;
+    AVStream *picture_stream;
+    int32_t picture_display_matrix[9];
     struct SwsContext *rgb_scale;
     AVFrame *rgb_frame;
     int rgb_source_width, rgb_source_height, rgb_source_format;
@@ -317,18 +330,42 @@ static int rgb_matrix(enum AVColorSpace space)
     }
 }
 
-static int visit_picture(Scan *scan, const AVFrame *frame)
+static void interleave_chroma(uint8_t *restrict out, const uint8_t *restrict u, const uint8_t *restrict v, int count)
 {
-    const int64_t pts = frame->best_effort_timestamp;
-    const int64_t duration = frame->duration;
-    const AVRational sar = frame->sample_aspect_ratio;
+    int x = 0;
+#if defined(__aarch64__)
+    for (; x + 16 <= count; x += 16) {
+        const uint8x16x2_t pair = { { vld1q_u8(u + x), vld1q_u8(v + x) } };
+        vst2q_u8(out + 2 * x, pair);
+    }
+#endif
+    for (; x < count; x++) {
+        out[2 * x] = u[x];
+        out[2 * x + 1] = v[x];
+    }
+}
+
+// Participant coordinates use the recording's declared rotation. A decoded
+// override changes the display space independently of short or sparse sampling.
+static int picture_state(const Scan *scan, const AVFrame *frame, bool *damaged)
+{
+    *damaged = frame->best_effort_timestamp == AV_NOPTS_VALUE || frame->decode_error_flags ||
+        (frame->flags & AV_FRAME_FLAG_CORRUPT);
+    const AVFrameSideData *display = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
+    if (!*damaged && display &&
+        (display->size != sizeof(scan->picture_display_matrix) ||
+         memcmp(display->data, scan->picture_display_matrix, 6 * sizeof(int32_t)) ||
+         memcmp(display->data + 8 * sizeof(int32_t), scan->picture_display_matrix + 8, sizeof(int32_t)))) {
+        return MP_PARTICIPANT_UNSUPPORTED_DISPLAY_TRANSFORM;
+    }
+    return 0;
+}
+
+// Convert a decoded picture to RGB24 in scan->rgb_frame.
+static int render_picture(Scan *scan, const AVFrame *frame)
+{
     const enum AVColorSpace color_space = frame->colorspace;
     const enum AVColorRange color_range = frame->color_range;
-    scan->pictures++;
-    if (pts == AV_NOPTS_VALUE || frame->decode_error_flags || (frame->flags & AV_FRAME_FLAG_CORRUPT)) {
-        return scan->picture(scan->context, pts, duration, NULL, frame->width, frame->height,
-                             0, sar.num, sar.den) ? AVERROR_EXIT : 0;
-    }
     AVFrame *mapped = NULL;
     int ret = 0;
     if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
@@ -348,15 +385,32 @@ static int visit_picture(Scan *scan, const AVFrame *frame)
         rgb->height = frame->height;
         if ((ret = av_frame_get_buffer(rgb, 32)) < 0) goto done;
     }
+    const uint8_t *planes[4] = { frame->data[0], frame->data[1], frame->data[2], frame->data[3] };
+    int strides[4] = { frame->linesize[0], frame->linesize[1], frame->linesize[2], frame->linesize[3] };
+    int source_format = frame->format;
+    if (scan->pack_nv12 && (source_format == AV_PIX_FMT_YUV420P || source_format == AV_PIX_FMT_YUVJ420P)) {
+        const int columns = (frame->width + 1) / 2, rows = (frame->height + 1) / 2;
+        const int stride = FFALIGN(2 * columns, 64);
+        av_fast_malloc(&scan->chroma, &scan->chroma_size, (size_t)stride * rows + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (!scan->chroma) { ret = AVERROR(ENOMEM); goto done; }
+        for (int y = 0; y < rows; y++)
+            interleave_chroma(scan->chroma + (size_t)y * stride, frame->data[1] + (ptrdiff_t)y * frame->linesize[1],
+                              frame->data[2] + (ptrdiff_t)y * frame->linesize[2], columns);
+        planes[1] = scan->chroma;
+        strides[1] = stride;
+        planes[2] = NULL;
+        strides[2] = 0;
+        source_format = AV_PIX_FMT_NV12;
+    }
     if (!scan->rgb_scale || scan->rgb_source_width != frame->width ||
-        scan->rgb_source_height != frame->height || scan->rgb_source_format != frame->format ||
+        scan->rgb_source_height != frame->height || scan->rgb_source_format != source_format ||
         scan->rgb_source_space != color_space || scan->rgb_source_range != color_range) {
         if (color_range == AVCOL_RANGE_UNSPECIFIED && scan->rgb_source_range != color_range) {
             // Recover the format default if the preceding frame declared an override.
             sws_freeContext(scan->rgb_scale);
             scan->rgb_scale = NULL;
         }
-        scan->rgb_scale = sws_getCachedContext(scan->rgb_scale, frame->width, frame->height, frame->format,
+        scan->rgb_scale = sws_getCachedContext(scan->rgb_scale, frame->width, frame->height, source_format,
                                                rgb->width, rgb->height, rgb->format, SWS_BILINEAR,
                                                NULL, NULL, NULL);
         if (!scan->rgb_scale) { ret = AVERROR(ENOMEM); goto done; }
@@ -371,18 +425,39 @@ static int visit_picture(Scan *scan, const AVFrame *frame)
         }
         scan->rgb_source_width = frame->width;
         scan->rgb_source_height = frame->height;
-        scan->rgb_source_format = frame->format;
+        scan->rgb_source_format = source_format;
         scan->rgb_source_space = color_space;
         scan->rgb_source_range = color_range;
     }
-    ret = sws_scale(scan->rgb_scale, (const uint8_t *const *)frame->data, frame->linesize,
-                    0, frame->height, rgb->data, rgb->linesize);
+    ret = sws_scale(scan->rgb_scale, planes, strides, 0, frame->height, rgb->data, rgb->linesize);
     if (ret != rgb->height) { ret = AVERROR_INVALIDDATA; goto done; }
-    ret = scan->picture(scan->context, pts, duration, rgb->data[0], rgb->width, rgb->height,
-                        rgb->linesize[0], sar.num, sar.den) ? AVERROR_EXIT : 0;
+    ret = 0;
 done:
     av_frame_free(&mapped);
     return ret;
+}
+
+static int visit_picture(Scan *scan, AVFrame *frame)
+{
+    const int64_t pts = frame->best_effort_timestamp;
+    const int64_t duration = frame->duration;
+    const AVRational sar = av_guess_sample_aspect_ratio(scan->picture_format, scan->picture_stream, frame);
+    scan->pictures++;
+    bool damaged;
+    int ret = picture_state(scan, frame, &damaged);
+    if (ret != 0) return ret;
+    if (scan->select_picture) {
+        int selection = scan->select_picture(scan->context, pts, duration, damaged);
+        if (selection < 0) return AVERROR_EXIT;
+        if (!selection || damaged) return 0;
+    } else if (damaged) {
+        return scan->picture(scan->context, pts, duration, NULL, frame->width, frame->height,
+                             0, sar.num, sar.den) ? AVERROR_EXIT : 0;
+    }
+    if ((ret = render_picture(scan, frame)) < 0) return ret;
+    const AVFrame *rgb = scan->rgb_frame;
+    return scan->picture(scan->context, pts, duration, rgb->data[0], rgb->width, rgb->height,
+                         rgb->linesize[0], sar.num, sar.den) ? AVERROR_EXIT : 0;
 }
 
 static int consume(Scan *scan, AVFrame *frame)
@@ -390,7 +465,7 @@ static int consume(Scan *scan, AVFrame *frame)
     if (scan->cancelled(scan->context)) return AVERROR_EXIT;
     if (scan->picture) {
         int ret = visit_picture(scan, frame);
-        if (ret < 0 || !scan->visit) return ret;
+        if (ret != 0 || !scan->visit) return ret;
     }
     // A picture without a timestamp cannot start a scene. Compare its neighbors instead.
     if (frame->best_effort_timestamp == AV_NOPTS_VALUE) return 0;
@@ -486,7 +561,7 @@ static int ffv1_slice_count(const AVPacket *packet, int trailer)
     return remaining == 0 ? count : 0;
 }
 
-static int open_decoder(AVCodecContext *codec, const AVCodec *decoder, const AVPacket *first, bool software)
+static void configure_decoder(AVCodecContext *codec, const AVCodec *decoder, const AVPacket *first, bool software)
 {
     codec->thread_count = 2;
     if (codec->codec_id == AV_CODEC_ID_FFV1 && codec->extradata_size && first) {
@@ -515,6 +590,11 @@ static int open_decoder(AVCodecContext *codec, const AVCodec *decoder, const AVP
             break;
         }
     }
+}
+
+static int open_decoder(AVCodecContext *codec, const AVCodec *decoder, const AVPacket *first, bool software)
+{
+    configure_decoder(codec, decoder, first, software);
     return avcodec_open2(codec, decoder, NULL);
 }
 
@@ -586,7 +666,7 @@ static int scan_video(const char *path, int index, int allow_asset_reader,
                       MPProbeCancelled cancelled, MPSceneVisit visit, void *context,
                       MPSceneTiming *timing, const MPSceneScanOptions *options,
                       MPSceneCheckpointVisit progress, bool seek_range, bool software,
-                      MPParticipantFrameVisit picture, int *unplaced_damage,
+                      MPParticipantFrameSelect select_picture, MPParticipantFrameVisit picture, int *unplaced_damage,
                       char *error, size_t capacity)
 {
     AVFormatContext *format = avformat_alloc_context();
@@ -595,7 +675,7 @@ static int scan_video(const char *path, int index, int allow_asset_reader,
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
     Scan scan = { .visit = visit, .cancelled = cancelled, .context = context,
-                  .options = options, .checkpoint = progress, .picture = picture };
+                  .options = options, .checkpoint = progress, .select_picture = select_picture, .picture = picture };
     int64_t first_pts = INT64_MAX, last_pts = INT64_MIN, packet_end = INT64_MIN;
     bool complete_clock = true;
     int hardware_failures = 0;
@@ -609,6 +689,15 @@ static int scan_video(const char *path, int index, int allow_asset_reader,
     if (index < 0 || index >= format->nb_streams) { ret = AVERROR_STREAM_NOT_FOUND; goto done; }
     AVStream *stream = format->streams[index];
     if (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) { ret = AVERROR_STREAM_NOT_FOUND; goto done; }
+    if (picture) {
+        scan.picture_format = format;
+        scan.picture_stream = stream;
+        const AVPacketSideData *display = av_packet_side_data_get(stream->codecpar->coded_side_data,
+            stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+        const int32_t identity[9] = { 1 << 16, 0, 0, 0, 1 << 16, 0, 0, 0, 1 << 30 };
+        memcpy(scan.picture_display_matrix, display && display->size == sizeof(identity) ? display->data :
+               (const uint8_t *)identity, sizeof(identity));
+    }
     if (allow_asset_reader && av_match_name("mov", format->iformat->name)) {
         int result = mp_scene_read_asset(path, stream, consume_surface, asset_cancelled, &scan);
         if (result < 0 || cancelled(context)) { ret = AVERROR_EXIT; goto done; }
@@ -767,7 +856,7 @@ int mp_scene_scan(const char *path, int index, int allow_asset_reader,
                   void *context, MPSceneTiming *timing, char *error, size_t capacity)
 {
     return scan_video(path, index, allow_asset_reader, cancelled, visit, context, timing,
-                      NULL, NULL, false, false, NULL, NULL, error, capacity);
+                      NULL, NULL, false, false, NULL, NULL, NULL, error, capacity);
 }
 
 int mp_scene_scan_resumable(const char *path, int index, const MPSceneScanOptions *options,
@@ -780,18 +869,19 @@ int mp_scene_scan_resumable(const char *path, int index, const MPSceneScanOption
         return AVERROR(EINVAL);
     }
     int ret = scan_video(path, index, 0, cancelled, visit, context, NULL,
-                         options, progress, true, false, NULL, NULL, error, capacity);
+                         options, progress, true, false, NULL, NULL, NULL, error, capacity);
     if (ret == SCAN_RETRY_SOFTWARE)
         ret = scan_video(path, index, 0, cancelled, visit, context, NULL,
-                         options, progress, true, true, NULL, NULL, error, capacity);
+                         options, progress, true, true, NULL, NULL, NULL, error, capacity);
     if (ret == SCAN_RETRY_FROM_START)
         ret = scan_video(path, index, 0, cancelled, visit, context, NULL,
-                         options, progress, false, false, NULL, NULL, error, capacity);
+                         options, progress, false, false, NULL, NULL, NULL, error, capacity);
     return ret == AVERROR_EXIT ? MP_SCENE_SCAN_CANCELLED : ret;
 }
 
 int mp_participant_scan(const char *path, int stream, MPProbeCancelled cancelled,
-                        MPParticipantFrameVisit frame, MPSceneVisit scene, void *context,
+                        MPParticipantFrameSelect select_frame, MPParticipantFrameVisit frame,
+                        MPSceneVisit scene, void *context,
                         int *unplaced_damage, char *error, size_t capacity)
 {
     if (!path || !cancelled || !frame) {
@@ -800,6 +890,674 @@ int mp_participant_scan(const char *path, int stream, MPProbeCancelled cancelled
     }
     if (unplaced_damage) *unplaced_damage = 0;
     int ret = scan_video(path, stream, 0, cancelled, scene, context, NULL,
-                         NULL, NULL, false, false, frame, unplaced_damage, error, capacity);
+                         NULL, NULL, false, false, select_frame, frame, unplaced_damage, error, capacity);
+    return ret == AVERROR_EXIT ? MP_SCENE_SCAN_CANCELLED : ret;
+}
+
+// Adaptive participant scan. Spans run from one delivered random access
+// picture to the next. The packets of a span stay buffered until its closing
+// picture has been offered to the coarse visit, so a refusal can decode them
+// without seeking. Closing pictures decode ahead of the offers on their own
+// decoder, several at a time, while closed spans wait in a queue.
+enum { SPAN_PACKETS = 1024, SPAN_BYTES = 48 << 20, SPAN_SHORTEST_SECONDS = 1, SPAN_LONGEST_SECONDS = 3,
+       SPAN_QUEUE = 24, SPAN_QUEUE_BYTES = 96 << 20, SOFTWARE_PIXELS = 1920 * 1088, SOFTWARE_THREADS = 8, KEY_THREADS = 12,
+       BATCH = 32, WORKERS = 6, WORKER_BYTES = 160 << 20 };
+
+// A decoded picture reduced to the pixels the analyzer measures.
+typedef struct {
+    int64_t pts, duration;
+    AVRational sar;
+    int width, height, status;
+    bool damaged;
+    uint8_t *rgb;
+    unsigned capacity;
+    // The caller's analysis of the pixels, until a visit takes it.
+    void *prepared;
+} Sample;
+
+typedef struct {
+    AVPacket **packets;
+    int count;
+    int64_t bytes;
+    // The closing packet went to the key decoder.
+    bool offered;
+    // Its picture arrived and was reduced, or will not arrive.
+    bool sampled, missing;
+    AVFrame *picture;
+    Sample sample;
+} Span;
+
+// Check a decoded picture and convert it. With a limit, keep the grid of
+// point samples TileTrail would read from the full picture: the longer side
+// becomes the limit and sample i of n reads source pixel (2i + 1) * size / 2n.
+static void reduce_picture(Scan *worker, const AVFrame *frame, int limit, Sample *out)
+{
+    out->pts = frame->best_effort_timestamp;
+    out->duration = frame->duration;
+    out->sar = av_guess_sample_aspect_ratio(worker->picture_format, worker->picture_stream, (AVFrame *)frame);
+    out->width = frame->width;
+    out->height = frame->height;
+    out->status = picture_state(worker, frame, &out->damaged);
+    if (out->status != 0 || out->damaged || (out->status = render_picture(worker, frame)) < 0) return;
+    const AVFrame *rgb = worker->rgb_frame;
+    const int longest = FFMAX(rgb->width, rgb->height);
+    int width = rgb->width, height = rgb->height;
+    if (limit > 0 && longest > limit) {
+        width = FFMAX(1, (int)(((int64_t)rgb->width * limit + longest / 2) / longest));
+        height = FFMAX(1, (int)(((int64_t)rgb->height * limit + longest / 2) / longest));
+    }
+    av_fast_malloc(&out->rgb, &out->capacity, (size_t)width * height * 3 + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!out->rgb) {
+        out->status = AVERROR(ENOMEM);
+        return;
+    }
+    for (int y = 0; y < height; y++) {
+        const int64_t source_y = ((2 * (int64_t)y + 1) * rgb->height) / (2 * (int64_t)height);
+        const uint8_t *row = rgb->data[0] + source_y * rgb->linesize[0];
+        uint8_t *target = out->rgb + (size_t)y * width * 3;
+        if (width == rgb->width) {
+            memcpy(target, row, (size_t)width * 3);
+            continue;
+        }
+        for (int x = 0; x < width; x++)
+            memcpy(target + 3 * x, row + 3 * (((2 * (int64_t)x + 1) * rgb->width) / (2 * (int64_t)width)), 3);
+    }
+    out->width = width;
+    out->height = height;
+}
+
+typedef struct {
+    Scan scan;
+    MPParticipantSampleVisit visit, offer;
+    MPParticipantPrepare prepare;
+    MPParticipantDiscard discard;
+    AVStream *stream;
+    const AVCodec *decoder;
+    AVCodecContext *dense, *key;
+    AVFrame *frame, *held;
+    AVPacket *packets[SPAN_PACKETS];
+    int count;
+    int64_t bytes;
+    Span queue[SPAN_QUEUE];
+    int queued;
+    // The first queued span that may still receive its key picture.
+    int next_key;
+    int64_t queued_bytes;
+    // Decoded pictures wait here to be converted side by side, then reach the
+    // frame visit in order.
+    AVFrame *batch[BATCH];
+    Sample samples[BATCH];
+    int batched, batch_limit, sample_limit;
+    // Let this many spans queue before settling, so their closing pictures
+    // arrive in groups the workers can convert together.
+    int backlog;
+    Scan *workers;
+    int worker_count;
+    // Pass packets straight to the dense decoder until the next boundary.
+    bool streaming;
+    // The first replayed picture can repeat the previously delivered boundary.
+    bool skipping;
+    int64_t delivered;
+    // Random access packets end a span only when none of the pictures after
+    // them can be presented before them.
+    bool boundaries, intra_only;
+    // The key decoder reached end of stream and must be reset before reuse.
+    bool key_drained;
+    // held carries a key picture that no queued span has claimed yet.
+    bool has_held;
+    // Frame-threaded software decoding outruns the hardware decoder on small
+    // H.264 pictures and lets independent key pictures decode side by side.
+    bool software;
+    int hardware_failures;
+    int *unplaced_damage;
+} Adaptive;
+
+// Key pictures are independent, so their decoder scales with every core.
+// Pictures that refer to each other gain little beyond a few threads.
+static int software_threads(bool key)
+{
+    const int cores = av_cpu_count();
+    return key ? FFMAX(2, FFMIN(cores - 2, KEY_THREADS)) : FFMAX(2, FFMIN(cores, SOFTWARE_THREADS));
+}
+
+static int adaptive_decoder(Adaptive *a, AVCodecContext **codec, const AVPacket *first)
+{
+    const bool key = codec == &a->key;
+    if (*codec) {
+        if (!key || a->key_drained) avcodec_flush_buffers(*codec);
+        a->key_drained = a->key_drained && !key;
+        return 0;
+    }
+    if (!(*codec = avcodec_alloc_context3(a->decoder))) return AVERROR(ENOMEM);
+    int ret = avcodec_parameters_to_context(*codec, a->stream->codecpar);
+    if (ret >= 0) {
+        (*codec)->pkt_timebase = a->stream->time_base;
+        if (a->software) {
+            (*codec)->thread_count = software_threads(key);
+            (*codec)->thread_type = FF_THREAD_FRAME;
+        } else {
+            configure_decoder(*codec, a->decoder, first, false);
+            if (key) {
+                // Each packet is one independent picture. Return it without
+                // waiting for a successor or a second worker.
+                (*codec)->thread_count = 1;
+                (*codec)->flags |= AV_CODEC_FLAG_LOW_DELAY;
+            }
+        }
+        ret = avcodec_open2(*codec, a->decoder, NULL);
+    }
+    if (ret < 0) avcodec_free_context(codec);
+    return ret;
+}
+
+static bool span_reaches(const Adaptive *a, const AVPacket *first, const AVPacket *last, int seconds, bool beyond)
+{
+    AVRational base = a->stream->time_base;
+    if (base.num <= 0 || base.den <= 0 || last->pts <= first->pts) return false;
+    uint64_t ticks = (uint64_t)last->pts - (uint64_t)first->pts;
+    uint64_t limit = (uint64_t)seconds * base.den;
+    return beyond ? ticks > limit / base.num : ticks >= (limit + base.num - 1) / base.num;
+}
+
+static void sample_discard(const Adaptive *a, Sample *sample)
+{
+    if (sample->prepared) a->discard(a->scan.context, sample->prepared);
+    sample->prepared = NULL;
+}
+
+// Reduce one picture and let the caller analyze its pixels on this worker.
+static void adaptive_reduce_one(const Adaptive *a, Scan *worker, const AVFrame *picture, Sample *sample)
+{
+    reduce_picture(worker, picture, a->sample_limit, sample);
+    if (a->prepare && sample->status == 0 && !sample->damaged)
+        sample->prepared = a->prepare(a->scan.context, sample->pts, sample->rgb, sample->width, sample->height,
+                                      sample->width * 3, sample->sar.num, sample->sar.den);
+}
+
+// Convert pictures on the workers. Each worker owns one converter.
+static void adaptive_reduce(Adaptive *a, AVFrame *const *pictures, Sample *const *samples, int count)
+{
+    const int workers = FFMIN(a->worker_count, count);
+    const Adaptive *const state = a;
+    Scan *const scans = a->workers;
+    if (workers <= 1) {
+        for (int i = 0; i < count; i++) adaptive_reduce_one(state, &scans[0], pictures[i], samples[i]);
+        return;
+    }
+    dispatch_apply((size_t)workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t worker) {
+        for (int i = (int)worker; i < count; i += workers)
+            adaptive_reduce_one(state, &scans[worker], pictures[i], samples[i]);
+    });
+}
+
+// Present the waiting pictures to the frame visit in order.
+static int adaptive_flush(Adaptive *a)
+{
+    const int count = a->batched;
+    if (!count) return 0;
+    a->batched = 0;
+    Sample *samples[BATCH];
+    for (int i = 0; i < count; i++) samples[i] = &a->samples[i];
+    adaptive_reduce(a, a->batch, samples, count);
+    int ret = 0;
+    for (int i = 0; i < count; i++) {
+        Sample *sample = samples[i];
+        av_frame_unref(a->batch[i]);
+        if (ret == 0 && a->scan.cancelled(a->scan.context)) ret = AVERROR_EXIT;
+        if (ret == 0) {
+            a->scan.pictures++;
+            ret = sample->status;
+        }
+        if (ret != 0) {
+            sample_discard(a, sample);
+            continue;
+        }
+        const bool pixels = !sample->damaged;
+        void *prepared = sample->prepared;
+        sample->prepared = NULL;
+        ret = a->visit(a->scan.context, sample->pts, sample->duration, pixels ? sample->rgb : NULL,
+                       sample->width, sample->height, pixels ? sample->width * 3 : 0,
+                       sample->sar.num, sample->sar.den, prepared) ? AVERROR_EXIT : 0;
+    }
+    return ret;
+}
+
+static int adaptive_deliver(Adaptive *a, AVFrame *frame)
+{
+    if (a->scan.cancelled(a->scan.context)) return AVERROR_EXIT;
+    const int64_t pts = frame->best_effort_timestamp;
+    if (a->skipping) {
+        a->skipping = false;
+        if (pts != AV_NOPTS_VALUE && pts == a->delivered) return 0;
+    }
+    if (pts != AV_NOPTS_VALUE) a->delivered = pts;
+    av_frame_move_ref(a->batch[a->batched++], frame);
+    return a->batched >= a->batch_limit ? adaptive_flush(a) : 0;
+}
+
+// Send one packet, or drain with a null packet, and deliver what comes out.
+static int adaptive_pump(Adaptive *a, const AVPacket *packet)
+{
+    if (a->scan.cancelled(a->scan.context)) return AVERROR_EXIT;
+    int ret = avcodec_send_packet(a->dense, packet);
+    if (packet && damaged_picture(a->dense, ret, &a->hardware_failures)) {
+        if (a->unplaced_damage) *a->unplaced_damage = 1;
+        ret = 0;
+    }
+    if (ret < 0 && ret != AVERROR_EOF) return ret;
+    int failures = 0;
+    for (;;) {
+        ret = avcodec_receive_frame(a->dense, a->frame);
+        if (failures < 64 && damaged_picture(a->dense, ret, &a->hardware_failures)) {
+            if (a->unplaced_damage) *a->unplaced_damage = 1;
+            failures++;
+            continue;
+        }
+        if (ret < 0) break;
+        failures = 0;
+        a->hardware_failures = 0;
+        ret = adaptive_deliver(a, a->frame);
+        av_frame_unref(a->frame);
+        if (ret != 0) return ret;
+    }
+    return ret == AVERROR(EAGAIN) || ret == AVERROR_EOF ? 0 : ret;
+}
+
+static void adaptive_clear(Adaptive *a)
+{
+    for (int i = 0; i < a->count; i++) av_packet_free(&a->packets[i]);
+    a->count = 0;
+    a->bytes = 0;
+}
+
+static void span_free(const Adaptive *a, Span *span)
+{
+    for (int i = 0; i < span->count; i++) av_packet_free(&span->packets[i]);
+    av_freep(&span->packets);
+    av_frame_free(&span->picture);
+    sample_discard(a, &span->sample);
+    av_free(span->sample.rgb);
+    *span = (Span){0};
+}
+
+// Decode packets from their random access picture. The first picture was
+// delivered when the preceding span closed.
+static int adaptive_decode(Adaptive *a, AVPacket *const *packets, int count, bool drain)
+{
+    int ret = adaptive_decoder(a, &a->dense, count ? packets[0] : NULL);
+    if (ret < 0) return ret;
+    a->skipping = a->delivered != AV_NOPTS_VALUE;
+    for (int i = 0; i < count; i++)
+        if ((ret = adaptive_pump(a, packets[i])) != 0) return ret;
+    if (!drain) return 0;
+    if ((ret = adaptive_pump(a, NULL)) != 0) return ret;
+    return adaptive_flush(a);
+}
+
+static bool adaptive_boundary(const Adaptive *a, const AVPacket *packet)
+{
+    if (!a->boundaries || !(packet->flags & AV_PKT_FLAG_KEY) || (packet->flags & AV_PKT_FLAG_CORRUPT) ||
+        packet->pts == AV_NOPTS_VALUE || packet->duration <= 0) return false;
+    if (a->intra_only) return true;
+    return mp_h26x_no_leading_random_access(packet, a->stream->codecpar);
+}
+
+static int compare_pts(const void *left, const void *right)
+{
+    const AVPacket *a = *(AVPacket *const *)left, *b = *(AVPacket *const *)right;
+    return (a->pts > b->pts) - (a->pts < b->pts);
+}
+
+// The open span may be skipped when its packets present back to back from its
+// first picture up to the closing one, within the longest allowed span.
+static bool adaptive_tiled(const Adaptive *a)
+{
+    const AVPacket *first = a->packets[0], *last = a->packets[a->count - 1];
+    if (a->count < 2 || first->pts == AV_NOPTS_VALUE) return false;
+    if (span_reaches(a, first, last, SPAN_LONGEST_SECONDS, true)) return false;
+    const AVPacket *ordered[SPAN_PACKETS];
+    memcpy(ordered, a->packets, (size_t)(a->count - 1) * sizeof(*ordered));
+    for (int i = 0; i < a->count - 1; i++)
+        if (ordered[i]->pts == AV_NOPTS_VALUE || ordered[i]->duration <= 0 ||
+            (ordered[i]->flags & AV_PKT_FLAG_CORRUPT)) return false;
+    qsort(ordered, (size_t)(a->count - 1), sizeof(*ordered), compare_pts);
+    if (ordered[0] != first) return false;
+    int64_t end = first->pts;
+    for (int i = 0; i < a->count - 1; i++) {
+        if (ordered[i]->pts != end || ordered[i]->pts > INT64_MAX - ordered[i]->duration) return false;
+        end += ordered[i]->duration;
+    }
+    return end == last->pts;
+}
+
+// Pair the key decoder's finished pictures with their spans, in order, and
+// reduce the new ones side by side.
+static void adaptive_collect(Adaptive *a)
+{
+    AVFrame *pictures[SPAN_QUEUE];
+    Sample *samples[SPAN_QUEUE];
+    Span *owners[SPAN_QUEUE];
+    int count = 0;
+    for (int failures = 0; a->key && a->next_key < a->queued && failures < 64;) {
+        Span *span = &a->queue[a->next_key];
+        if (!span->offered || span->picture || span->sampled || span->missing) {
+            a->next_key++;
+            continue;
+        }
+        if (!a->has_held) {
+            int ret = avcodec_receive_frame(a->key, a->held);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+            // A picture the decoder could not read is simply absent. Its span
+            // sees a later timestamp, or none, and is decoded in full.
+            if (ret < 0) {
+                failures++;
+                continue;
+            }
+            a->has_held = true;
+        }
+        const int64_t pts = a->held->best_effort_timestamp;
+        const int64_t closing = span->packets[span->count - 1]->pts;
+        if (pts != AV_NOPTS_VALUE && pts > closing) {
+            span->missing = true;
+            a->next_key++;
+            continue;
+        }
+        if (pts == closing && (span->picture = av_frame_alloc())) {
+            av_frame_move_ref(span->picture, a->held);
+            pictures[count] = span->picture;
+            samples[count] = &span->sample;
+            owners[count++] = span;
+            a->next_key++;
+        } else {
+            av_frame_unref(a->held);
+        }
+        a->has_held = false;
+    }
+    if (!count) return;
+    adaptive_reduce(a, pictures, samples, count);
+    for (int i = 0; i < count; i++) {
+        av_frame_free(&owners[i]->picture);
+        owners[i]->sampled = true;
+    }
+}
+
+// Settle queued spans in order: offer each closing picture and decode the
+// spans it does not replace. Without wait, stop at the first span whose
+// picture is still decoding.
+static int adaptive_settle(Adaptive *a, bool wait)
+{
+    for (;;) {
+        adaptive_collect(a);
+        if (!a->queued) break;
+        Span *span = &a->queue[0];
+        const AVPacket *first = span->packets[0], *last = span->packets[span->count - 1];
+        if (span->offered && !span->sampled && !span->missing) {
+            if (a->key_drained) {
+                span->missing = true;
+            } else if (!wait) {
+                return 0;
+            } else {
+                // Ask the decoder for the pictures it still holds.
+                avcodec_send_packet(a->key, NULL);
+                a->key_drained = true;
+                continue;
+            }
+        }
+        bool accepted = false;
+        int ret = adaptive_flush(a);
+        if (ret != 0) return ret;
+        if (span->sampled && a->boundaries && first->pts == a->delivered) {
+            Sample *sample = &span->sample;
+            // An invalid display transform keeps its exact status.
+            if (sample->status > 0) return sample->status;
+            if (sample->status < 0) {
+                // A key picture can fail to convert where the dense decoder
+                // delivers the same frame. No callback committed it.
+                a->boundaries = false;
+            } else if (!sample->damaged) {
+                if (a->scan.cancelled(a->scan.context)) return AVERROR_EXIT;
+                a->scan.pictures++;
+                void *prepared = sample->prepared;
+                sample->prepared = NULL;
+                int answer = a->offer(a->scan.context, sample->pts, sample->duration, sample->rgb,
+                                      sample->width, sample->height, sample->width * 3,
+                                      sample->sar.num, sample->sar.den, prepared);
+                if (answer < 0) return AVERROR_EXIT;
+                accepted = answer > 0;
+            }
+        }
+        if (accepted) {
+            a->delivered = last->pts;
+        } else {
+            if ((ret = adaptive_decode(a, span->packets, span->count, true)) != 0) return ret;
+            // Without the closing picture nothing anchors the spans after it.
+            if (a->delivered != last->pts) a->boundaries = false;
+        }
+        a->queued_bytes -= span->bytes;
+        span_free(a, span);
+        memmove(a->queue, a->queue + 1, (size_t)--a->queued * sizeof(*a->queue));
+        a->queue[a->queued] = (Span){0};
+        if (a->next_key > 0) a->next_key--;
+    }
+    if (a->key_drained && a->key) {
+        // Every queued span has settled. Drop pictures nobody claimed.
+        av_frame_unref(a->held);
+        a->has_held = false;
+        avcodec_flush_buffers(a->key);
+        a->key_drained = false;
+    }
+    a->next_key = 0;
+    return 0;
+}
+
+// Queue the open span behind its closing packet and start the next span on it.
+static int adaptive_close(Adaptive *a, AVPacket *closing)
+{
+    int ret;
+    // The key decoder accepts packets only between drains.
+    if (a->key_drained && (ret = adaptive_settle(a, true)) != 0) return ret;
+    Span span = { .count = a->count, .bytes = a->bytes };
+    AVPacket *next = av_packet_clone(closing);
+    span.packets = av_malloc_array((size_t)a->count, sizeof(*span.packets));
+    if (!next || !span.packets) {
+        av_packet_free(&next);
+        av_free(span.packets);
+        return AVERROR(ENOMEM);
+    }
+    if (a->boundaries && adaptive_tiled(a)) {
+        if (adaptive_decoder(a, &a->key, closing) < 0) {
+            // The dense decoder is already open. Decode this span and continue
+            // in order without buffering more speculative spans.
+            a->boundaries = false;
+        } else {
+            ret = avcodec_send_packet(a->key, closing);
+            if (ret == AVERROR(EAGAIN)) {
+                // Make room by collecting finished pictures.
+                adaptive_collect(a);
+                ret = avcodec_send_packet(a->key, closing);
+            }
+            span.offered = ret >= 0;
+        }
+    }
+    memcpy(span.packets, a->packets, (size_t)a->count * sizeof(*span.packets));
+    a->queue[a->queued++] = span;
+    a->queued_bytes += span.bytes;
+    a->packets[0] = next;
+    a->count = 1;
+    a->bytes = next->size;
+    const bool full = !a->boundaries || a->queued == SPAN_QUEUE || a->queued_bytes > SPAN_QUEUE_BYTES;
+    return full || a->queued >= a->backlog ? adaptive_settle(a, full) : 0;
+}
+
+static int adaptive_packet(Adaptive *a, AVPacket **owned)
+{
+    AVPacket *packet = *owned;
+    const bool boundary = adaptive_boundary(a, packet);
+    int ret;
+    if (a->streaming) {
+        if ((ret = adaptive_pump(a, packet)) != 0) return ret;
+        if (!boundary) return 0;
+        // Everything through the boundary has been presented. Start a span on it.
+        if ((ret = adaptive_pump(a, NULL)) != 0 || (ret = adaptive_flush(a)) != 0) return ret;
+        if (a->delivered != packet->pts) {
+            // The decoder did not return this picture, so nothing anchors a span.
+            avcodec_flush_buffers(a->dense);
+            a->boundaries = false;
+            a->skipping = a->delivered != AV_NOPTS_VALUE;
+            return adaptive_pump(a, packet);
+        }
+        *owned = NULL;
+        a->packets[a->count++] = packet;
+        a->bytes = packet->size;
+        a->streaming = false;
+        return 0;
+    }
+    if (packet->pts != AV_NOPTS_VALUE && a->packets[0]->pts != AV_NOPTS_VALUE &&
+        packet->pts < a->packets[0]->pts) {
+        // A later picture presents before its random access picture. Decode
+        // the rest of the stream in order.
+        a->boundaries = false;
+    }
+    *owned = NULL;
+    a->packets[a->count++] = packet;
+    a->bytes += packet->size;
+    const AVPacket *first = a->packets[0];
+    if (boundary && a->boundaries && span_reaches(a, first, packet, SPAN_SHORTEST_SECONDS, false)) {
+        if ((ret = adaptive_close(a, packet)) != 0) return ret;
+        if (a->boundaries) return 0;
+        // Decode on in order. The later pictures refer to the closing one.
+        first = a->packets[0];
+        packet = a->packets[a->count - 1];
+    }
+    const bool long_span = packet->pts != AV_NOPTS_VALUE && first->pts != AV_NOPTS_VALUE &&
+        span_reaches(a, first, packet, SPAN_LONGEST_SECONDS, true);
+    if (!a->boundaries || long_span || a->count == SPAN_PACKETS || a->bytes > SPAN_BYTES) {
+        // Earlier spans present first.
+        if ((ret = adaptive_settle(a, true)) != 0) return ret;
+        if ((ret = adaptive_decode(a, a->packets, a->count, false)) != 0) return ret;
+        adaptive_clear(a);
+        a->streaming = true;
+    }
+    return 0;
+}
+
+int mp_participant_scan_adaptive(const char *path, int index, int sample_limit, MPProbeCancelled cancelled,
+                                 MPParticipantSampleVisit coarse, MPParticipantSampleVisit frame,
+                                 MPParticipantPrepare prepare, MPParticipantDiscard discard,
+                                 void *context, int *unplaced_damage, char *error, size_t capacity)
+{
+    if (!path || !cancelled || !frame || sample_limit < 0 || (prepare && !discard)) {
+        av_strerror(AVERROR(EINVAL), error, capacity);
+        return AVERROR(EINVAL);
+    }
+    if (unplaced_damage) *unplaced_damage = 0;
+    Adaptive *a = av_mallocz(sizeof(*a));
+    AVFormatContext *format = avformat_alloc_context();
+    AVPacket *packet = NULL;
+    int ret = AVERROR(ENOMEM);
+    if (!a || !format) goto done;
+    a->scan = (Scan){ .cancelled = cancelled, .context = context };
+    a->visit = frame;
+    a->offer = coarse;
+    a->prepare = prepare;
+    a->discard = discard;
+    a->unplaced_damage = unplaced_damage;
+    a->delivered = AV_NOPTS_VALUE;
+    a->streaming = true;
+    if (!(a->frame = av_frame_alloc()) || !(a->held = av_frame_alloc())) goto done;
+    format->interrupt_callback = (AVIOInterruptCB){ cancelled, context };
+    if ((ret = avformat_open_input(&format, path, NULL, NULL)) < 0 ||
+        (ret = avformat_find_stream_info(format, NULL)) < 0) goto done;
+    if (index < 0 || index >= (int)format->nb_streams ||
+        format->streams[index]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
+        ret = AVERROR_STREAM_NOT_FOUND;
+        goto done;
+    }
+    AVStream *stream = a->stream = format->streams[index];
+    a->scan.picture_format = format;
+    a->scan.picture_stream = stream;
+    const AVPacketSideData *display = av_packet_side_data_get(stream->codecpar->coded_side_data,
+        stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+    const int32_t identity[9] = { 1 << 16, 0, 0, 0, 1 << 16, 0, 0, 0, 1 << 30 };
+    memcpy(a->scan.picture_display_matrix, display && display->size == sizeof(identity) ? display->data :
+           (const uint8_t *)identity, sizeof(identity));
+    for (unsigned i = 0; i < format->nb_streams; i++)
+        if (i != (unsigned)index) format->streams[i]->discard = AVDISCARD_ALL;
+    if (!(a->decoder = avcodec_find_decoder(stream->codecpar->codec_id))) { ret = AVERROR_DECODER_NOT_FOUND; goto done; }
+    const AVCodecParameters *parameters = stream->codecpar;
+    const enum AVCodecID id = parameters->codec_id;
+    const AVCodecDescriptor *descriptor = avcodec_descriptor_get(id);
+    a->intra_only = descriptor && (descriptor->props & AV_CODEC_PROP_INTRA_ONLY) && id != AV_CODEC_ID_FFV1;
+    // For H.26x, adaptive_boundary verifies the bitstream's actual access point.
+    // Without a coarse visit every picture is decoded in order.
+    a->boundaries = coarse && (a->intra_only || id == AV_CODEC_ID_H264 || id == AV_CODEC_ID_HEVC);
+    a->software = id == AV_CODEC_ID_H264 && (int64_t)parameters->width * parameters->height <= SOFTWARE_PIXELS &&
+        (parameters->format == AV_PIX_FMT_YUV420P || parameters->format == AV_PIX_FMT_YUVJ420P);
+    // The hardware decoder returns these pictures as NV12. Present the same
+    // planes to the converter so both decoders yield identical RGB.
+    a->scan.pack_nv12 = a->software;
+    // Full pictures are large. Convert them one at a time unless the caller
+    // takes the reduced grid. Hardware pictures come from a small pool that
+    // the decoder waits on, so none of them may be held back either.
+    a->sample_limit = sample_limit;
+    a->batch_limit = sample_limit > 0 && a->software ? BATCH : 1;
+    const int64_t picture_bytes = FFMAX(1, (int64_t)parameters->width * parameters->height * 3);
+    a->worker_count = sample_limit > 0
+        ? (int)FFMAX(1, FFMIN(FFMIN(av_cpu_count() / 2, WORKERS), WORKER_BYTES / picture_bytes)) : 1;
+    if (!(a->workers = av_calloc((size_t)a->worker_count, sizeof(*a->workers)))) { ret = AVERROR(ENOMEM); goto done; }
+    for (int i = 0; i < a->worker_count; i++) {
+        Scan *worker = &a->workers[i];
+        worker->picture_format = format;
+        worker->picture_stream = stream;
+        worker->pack_nv12 = a->software;
+        memcpy(worker->picture_display_matrix, a->scan.picture_display_matrix, sizeof(worker->picture_display_matrix));
+        if (!(worker->rgb_frame = av_frame_alloc())) { ret = AVERROR(ENOMEM); goto done; }
+    }
+    for (int i = 0; i < a->batch_limit; i++)
+        if (!(a->batch[i] = av_frame_alloc())) { ret = AVERROR(ENOMEM); goto done; }
+    a->backlog = FFMIN(SPAN_QUEUE - 1, a->worker_count + (a->software ? software_threads(true) - 1 : 0));
+    for (;;) {
+        if (cancelled(context)) { ret = AVERROR_EXIT; goto done; }
+        if (!packet && !(packet = av_packet_alloc())) { ret = AVERROR(ENOMEM); goto done; }
+        ret = av_read_frame(format, packet);
+        if (ret == AVERROR_EOF) break;
+        if (ret < 0) goto done;
+        if (packet->stream_index != index) { av_packet_unref(packet); continue; }
+        if (!a->dense && (ret = adaptive_decoder(a, &a->dense, packet)) < 0) goto done;
+        ret = adaptive_packet(a, &packet);
+        if (packet) av_packet_unref(packet);
+        if (ret != 0) goto done;
+    }
+    if (cancelled(context)) { ret = AVERROR_EXIT; goto done; }
+    // The last span has no closing picture. Present all of it.
+    if ((ret = adaptive_settle(a, true)) != 0) goto done;
+    if (!a->dense && (ret = adaptive_decoder(a, &a->dense, NULL)) < 0) goto done;
+    if (!a->streaming && (ret = adaptive_decode(a, a->packets, a->count, false)) != 0) goto done;
+    if ((ret = adaptive_pump(a, NULL)) != 0 || (ret = adaptive_flush(a)) != 0) goto done;
+    ret = a->scan.pictures ? 0 : AVERROR_INVALIDDATA;
+done:
+    if (ret < 0) av_strerror(ret, error, capacity);
+    if (a) {
+        adaptive_clear(a);
+        for (int i = 0; i < a->queued; i++) span_free(a, &a->queue[i]);
+        for (int i = 0; a->workers && i < a->worker_count; i++) {
+            sws_freeContext(a->workers[i].rgb_scale);
+            av_frame_free(&a->workers[i].rgb_frame);
+            av_free(a->workers[i].chroma);
+        }
+        av_free(a->workers);
+        for (int i = 0; i < BATCH; i++) {
+            av_frame_free(&a->batch[i]);
+            sample_discard(a, &a->samples[i]);
+            av_free(a->samples[i].rgb);
+        }
+        av_frame_free(&a->frame);
+        av_frame_free(&a->held);
+        avcodec_free_context(&a->dense);
+        avcodec_free_context(&a->key);
+    }
+    av_packet_free(&packet);
+    avformat_close_input(&format);
+    av_free(a);
     return ret == AVERROR_EXIT ? MP_SCENE_SCAN_CANCELLED : ret;
 }

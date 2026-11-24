@@ -15,6 +15,7 @@ private struct MediaRefreshReference: Hashable {
     var mayStartWithSilence = false
     var participantStamp: SceneSourceStamp?
     var participantInode: UInt64?
+    var presenceOnly = false
 
     func collectIssues(in evidence: MediaRefreshEvidence, audioIndices: [Int], multicamOffset: RationalTime,
                        reviewStreams: Set<Int>, into issues: inout Set<MediaRefreshReferenceIssue>) throws {
@@ -55,19 +56,24 @@ private struct MediaRefreshReference: Hashable {
 }
 
 extension MediaRefresh {
-    /// Checks each distinct recording in the saved timeline and its edit history.
+    /// Checks each distinct media file referenced by the current project.
     /// Refresh is a media operation and does not write the project document.
     public static func project(at url: URL, verification: MediaRefreshVerification = .stamp,
                                persist: Bool = true, progress: ((Double) -> Void)? = nil,
                                cancelled: @escaping () -> Bool = { Task.isCancelled }) throws -> [MediaRefreshResult] {
         try checkCancellation(cancelled)
-        let document = try CutProject.loadEditorDocument(from: url, limit: CutProject.maximumHistorySteps)
-        let history = document.undo.map(\.project) + document.redo.map(\.project)
+        let document = try CutProject.loadEditorDocument(from: url, limit: 0)
         var references: [URL: Set<MediaRefreshReference>] = [:]
         var resolved: [String: URL] = [:]
         func add(_ path: String, _ reference: MediaRefreshReference) {
-            let source = resolved[path] ?? AnalysisSidecar.canonicalSource(CutProject.mediaURL(path, relativeTo: url))
-            resolved[path] = source
+            let source: URL
+            if let cached = resolved[path] {
+                source = cached
+            } else {
+                let media = CutProject.mediaURL(path, relativeTo: url)
+                source = media.path.split(separator: "/").contains("..") ? media : AnalysisSidecar.canonicalSource(media)
+                resolved[path] = source
+            }
             references[source, default: []].insert(reference)
         }
         func add(_ clips: [CutSequenceClip]) {
@@ -85,59 +91,79 @@ extension MediaRefresh {
                 }
             }
         }
-        for project in [document.project] + history {
-            try checkCancellation(cancelled)
-            switch project {
-            case .sequence(let clips):
-                add(clips)
-            case .stillSequence(let project):
-                add(project.items.compactMap(\.source))
-            case .multicam(let project):
-                let sources = Dictionary(uniqueKeysWithValues: project.sources.map { ($0.id, $0) })
-                for source in project.sources {
-                    add(source.file, .init(id: source.id, track: source.audioStream.map(MediaRefreshReference.Track.audioStream)))
-                }
-                for geometry in project.participants.sources {
-                    if let source = sources[geometry.sourceID] {
-                        add(source.file, .init(id: geometry.sourceID, participantStamp: geometry.sourceStamp,
-                                              participantInode: geometry.sourceInode))
-                    }
-                }
-                let selections = project.switches.compactMap(\.audio) + [project.fixedAudio].compactMap { $0 }
-                    + project.mixLanes.compactMap { lane -> MulticamAudioSelection? in
-                        if case .recording(let selection) = lane.target { return selection }
-                        return nil
-                    }
-                    + project.audioReplacements.flatMap { [$0.original, $0.replacement] }
-                    + project.participants.people.compactMap { $0.audio?.selection }
-                for selection in selections {
-                    guard let source = sources[selection.source] else { continue }
-                    add(source.file, .init(id: source.id, track: .audioStream(selection.stream)))
-                }
-                let plan = try project.plan()
-                for span in plan.picture {
-                    guard let source = sources[span.source] else { continue }
-                    add(source.file, .init(id: source.id, range: span.input.from..<span.input.to,
-                                           track: .video, multicam: true))
-                }
-                for lane in plan.audioLanes {
-                    for (index, span) in lane.spans.enumerated() {
-                        guard let source = sources[span.source], let stream = span.stream else { continue }
-                        add(source.file, .init(id: source.id, range: span.input.from..<span.input.to,
-                                               track: .audioStream(stream), multicam: true, mayStartWithSilence: index == 0))
-                    }
+        let project = document.project
+        try checkCancellation(cancelled)
+        switch project {
+        case .sequence(let clips):
+            add(clips)
+        case .stillSequence(let project):
+            add(project.items.compactMap(\.source))
+            if let reference = project.stillAudioReference { add([reference]) }
+            if let soundtrack = project.stillSoundtrack, let ordinal = soundtrack.audioTrack {
+                add(soundtrack.file, .init(id: soundtrack.id, range: soundtrack.from..<soundtrack.to,
+                                           track: .audioOrdinal(ordinal)))
+                if let original = soundtrack.originalFile {
+                    add(original, .init(id: soundtrack.id, range: soundtrack.from..<soundtrack.to))
                 }
             }
-            if project.sequenceItems != nil {
-                for geometry in project.participants.sources {
-                    add(geometry.sourceID, .init(id: geometry.sourceID, participantStamp: geometry.sourceStamp,
-                                                 participantInode: geometry.sourceInode))
+        case .multicam(let project):
+            let sources = Dictionary(uniqueKeysWithValues: project.sources.map { ($0.id, $0) })
+            for source in project.sources {
+                add(source.file, .init(id: source.id, track: source.audioStream.map(MediaRefreshReference.Track.audioStream)))
+            }
+            for geometry in project.participants.sources {
+                if let source = sources[geometry.sourceID] {
+                    add(source.file, .init(id: geometry.sourceID, participantStamp: geometry.sourceStamp,
+                                          participantInode: geometry.sourceInode))
                 }
-                for person in project.participants.people {
-                    if let selection = person.audio?.selection {
-                        add(selection.source, .init(id: person.id, track: .audioStream(selection.stream)))
-                    }
+            }
+            let participantSelections = project.participants.people.compactMap { $0.audio?.selection }
+            let selections = project.switches.compactMap(\.audio) + [project.fixedAudio].compactMap { $0 }
+                + project.mixLanes.compactMap { lane -> MulticamAudioSelection? in
+                    if case .recording(let selection) = lane.target { return selection }
+                    return nil
                 }
+                + project.audioReplacements.flatMap { [$0.original, $0.replacement] }
+                + participantSelections
+            for selection in selections {
+                guard let source = sources[selection.source] else { continue }
+                add(source.file, .init(id: source.id, track: .audioStream(selection.stream)))
+            }
+            let plan = try project.plan()
+            for span in plan.picture {
+                guard let source = sources[span.source] else { continue }
+                add(source.file, .init(id: source.id, range: span.input.from..<span.input.to,
+                                       track: .video, multicam: true))
+            }
+            for lane in plan.audioLanes {
+                for (index, span) in lane.spans.enumerated() {
+                    guard let source = sources[span.source], let stream = span.stream else { continue }
+                    add(source.file, .init(id: source.id, range: span.input.from..<span.input.to,
+                                           track: .audioStream(stream), multicam: true, mayStartWithSilence: index == 0))
+                }
+            }
+        }
+        if project.sequenceItems != nil {
+            for geometry in project.participants.sources {
+                add(geometry.sourceID, .init(id: geometry.sourceID, participantStamp: geometry.sourceStamp,
+                                             participantInode: geometry.sourceInode))
+            }
+            for person in project.participants.people {
+                if let selection = person.audio?.selection {
+                    add(selection.source, .init(id: person.id, track: .audioStream(selection.stream)))
+                }
+            }
+        }
+        for use in ProjectMedia.references(in: project, includePlannedSpans: false) {
+            switch use.kind {
+            case .still:
+                add(use.path, .init(id: use.id, presenceOnly: true))
+            case .select, .transcript, .transcriptAnchor, .participant:
+                let track = use.stream.map(MediaRefreshReference.Track.audioStream)
+                    ?? use.ordinal.map(MediaRefreshReference.Track.audioOrdinal)
+                add(use.path, .init(id: use.id, range: use.range.map { $0.from..<$0.to }, track: track,
+                                    multicam: use.sourceID != nil))
+            default: break
             }
         }
         var grouped: [(url: URL, identity: SourceIdentity?, refs: Set<MediaRefreshReference>)] = []
@@ -156,8 +182,15 @@ extension MediaRefresh {
             let sourceProgress = progress.map { report in
                 { (fraction: Double) in report((Double(position) + fraction) / Double(grouped.count)) }
             }
-            var result = try check(group.url, identity: group.identity, previous: nil, verification: verification,
+            var result: MediaRefreshResult
+            if group.refs.allSatisfy(\.presenceOnly) {
+                try checkCancellation(cancelled)
+                result = presence(of: group.url, identity: group.identity)
+                sourceProgress?(1)
+            } else {
+                result = try check(group.url, identity: group.identity, previous: nil, verification: verification,
                                    persist: persist, exclusions: exclusions, progress: sourceProgress, cancelled: cancelled)
+            }
             var issues: Set<MediaRefreshReferenceIssue> = []
             if result.state == .offline {
                 for reference in group.refs {

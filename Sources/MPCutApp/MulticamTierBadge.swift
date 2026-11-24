@@ -45,7 +45,7 @@ extension MulticamEditorModel {
             // Edits arrive in bursts while a switch is dragged. Only the program that stays is planned.
             try? await Task.sleep(for: .milliseconds(120))
             guard let self, self.tierGeneration == generation, !token.isCancelled else { return }
-            let state = await Task.detached(priority: .utility) {
+            let state = await sidecarWork.detached(priority: .utility) {
                 AnalysisSidecar.$excludedSources.withValue(excluded) {
                     AnalysisSidecar.$readsEnabled.withValue(useSidecars) {
                         MulticamEngine(cancelled: { token.isCancelled }).tier(project, relativeTo: documentURL, indexedSources: indexed)
@@ -74,7 +74,7 @@ struct MulticamTierBadge: View {
 
     var body: some View {
         if let state = model.tierState {
-            TierBadge(state: state, help: Self.help(state)) { dismiss in
+            TierBadge(state: state, help: Self.help(state), tintOverride: availabilityTint(state)) { dismiss in
                 TierDetails(state: state, summary: Self.summary(state), title: { $0 == 0 ? "Program" : "Range \($0)" },
                             segmentName: "range", canGo: !model.isBusy && model.tierIsCurrent, go: { factor in
                     model.goToTierFactor(factor)
@@ -82,6 +82,16 @@ struct MulticamTierBadge: View {
                 }, describe: model.namingSources(model.project)) { EmptyView() }
             }
         }
+    }
+
+    private func availabilityTint(_ state: TierState) -> Color? {
+        guard case .unavailable(let issue) = state else { return nil }
+        if model.projectMediaSummary.offline > 0 { return Color(nsColor: ProjectMediaStatus.offline.editorColor) }
+        if issue.code == "missing_source" || issue.code == "source_needs_review" ||
+            issue.code.contains("coverage") || issue.code.contains("track") {
+            return Color(nsColor: ProjectMediaStatus.needsReview.editorColor)
+        }
+        return nil
     }
 
     static func help(_ state: TierState) -> String {

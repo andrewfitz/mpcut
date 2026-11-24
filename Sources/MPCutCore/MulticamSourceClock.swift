@@ -3,6 +3,10 @@ import Foundation
 extension MediaInfo {
     /// Offset from the ordinary source editing clock to a movie's presentation clock.
     public var multicamSourceOffset: RationalTime {
+        Self.multicamSourceOffset(origin: origin, format: format)
+    }
+
+    static func multicamSourceOffset(origin: RationalTime, format: String) -> RationalTime {
         origin > .zero && format.split(separator: ",").contains("mov") ? origin : .zero
     }
 }
@@ -67,5 +71,6 @@ extension CutEngine {
                              videoIndex: videoIndex ?? -1, timelineIssue: media.timelineIssue, metadataOnly: provisional,
                              hasProvisionalClock: media.hasProvisionalClock, multicamClockOffset: offset,
                              audioIssues: media.audioIssues, refreshEvidence: media.refreshEvidence)
+            .inheritingSidecarContext(from: media)
     }
 }

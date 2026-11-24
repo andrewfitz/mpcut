@@ -524,6 +524,7 @@ final class MulticamPreview: ObservableObject {
         let clock = AVSampleBufferRenderSynchronizer()
         let renderer = AVSampleBufferAudioRenderer()
         renderer.volume = previewAudioGain(volume: volume, muted: isMuted)
+        MutedLaunch.mute(renderer)
         clock.addRenderer(renderer)
         clock.delaysRateChangeUntilHasSufficientMediaData = false
         self.clock = clock

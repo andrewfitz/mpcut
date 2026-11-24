@@ -60,6 +60,7 @@ struct ProjectSilenceReport: Encodable {
     let indexedSources: [String: MediaInfo]
     var outProject: String?
     var output: String?
+    var outputBytes: Int64?
     var dryRun: Bool?
     var preflight: MulticamExportPlan?
     var stillPreflight: StillExportReport?
@@ -69,7 +70,7 @@ struct ProjectSilenceReport: Encodable {
     private enum CodingKeys: String, CodingKey {
         case ok, project = "project_path", duration, thresholdMode, thresholds, mode
         case maxBlip = "max_blip_seconds", minimumPause = "min_pause_seconds", padding = "padding_per_side_seconds"
-        case pauses, removals, clips, skippedPauses, removedDuration, output, dryRun, preflight, stillPreflight, tier
+        case pauses, removals, clips, skippedPauses, removedDuration, output, outputBytes, dryRun, preflight, stillPreflight, tier
         case outProject = "out_project"
         case cards, retainedDuration, takeCandidates
     }

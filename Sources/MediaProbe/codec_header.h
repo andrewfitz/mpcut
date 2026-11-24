@@ -10,6 +10,8 @@ bool mp_read_video_header(AVCodecParameters *params, const AVPacket *packet, boo
 bool mp_h26x_random_access(const AVPacket *packet, const AVCodecParameters *params,
                             bool source_start, int *multilayer);
 
+bool mp_h26x_no_leading_random_access(const AVPacket *packet, const AVCodecParameters *params);
+
 static inline bool mp_hevc_multilayer_unit(const uint8_t *unit, size_t size)
 {
     if (size < 2)

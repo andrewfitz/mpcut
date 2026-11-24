@@ -175,6 +175,41 @@ class Frames(unittest.TestCase):
             for hardware_channel, software_channel in zip(hardware_pixel, software_pixel, strict=True):
                 self.assertAlmostEqual(hardware_channel, software_channel, delta=4)
 
+    def test_hlg_ramp_is_tone_mapped_and_sdr_ramp_is_not(self):
+        # A neutral ramp from black to peak signal. Converted to sRGB without
+        # tone mapping, the upper half of an HLG ramp is one flat white.
+        def ramp(name, depth, tags, codec):
+            source = self.root / name
+            low, span, mid, fmt = (64, 876, 512, "yuv420p10le") if depth == 10 else (16, 219, 128, "yuv420p")
+            primaries, transfer, matrix = tags
+            run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                 f"nullsrc=s=640x360:r=1:d=1,format={fmt},geq=lum='{low}+{span}*X/(W-1)':cb={mid}:cr={mid},"
+                 f"setparams=color_primaries={primaries}:color_trc={transfer}:colorspace={matrix}:range=tv",
+                 *codec, "-color_primaries", primaries, "-color_trc", transfer, "-colorspace", matrix,
+                 "-color_range", "tv", source])
+            dest, report = self.export(name + "-picture", "--at", "0", "--preset", "full", count=1, source=source)
+            image = dest / report["frames"][0]["file"]
+            return [rgb(image, xfrac=x)[1] for x in (0.6, 0.9)]
+
+        hlg = ("bt2020", "arib-std-b67", "bt2020nc")
+        encoders = run(["ffmpeg", "-hide_banner", "-encoders"]).decode()
+        sources = [("hlg-software.mkv", ["-c:v", "ffv1"])]
+        # HEVC Main 10 takes the VideoToolbox decoder.
+        if " libx265 " in encoders:
+            sources.append(("hlg-hardware.mov", ["-c:v", "libx265", "-x265-params", "log-level=error", "-tag:v", "hvc1"]))
+        elif " hevc_videotoolbox " in encoders:
+            sources.append(("hlg-hardware.mov", ["-c:v", "hevc_videotoolbox", "-profile:v", "main10", "-tag:v", "hvc1"]))
+        for name, codec in sources:
+            with self.subTest(source=name):
+                upper_middle, near_peak = ramp(name, 10, hlg, codec)
+                self.assertLess(upper_middle, 160)
+                self.assertGreater(near_peak, 180)
+                self.assertGreater(near_peak - upper_middle, 60)
+        # The same ramp as BT.709 SDR keeps its plain conversion.
+        upper_middle, near_peak = ramp("sdr-ramp.mkv", 8, ("bt709", "bt709", "bt709"), ["-c:v", "ffv1"])
+        self.assertAlmostEqual(upper_middle, 163, delta=6)
+        self.assertAlmostEqual(near_peak, 233, delta=6)
+
     def test_anamorphic_bitstream_rotation_survives_first_seek(self):
         # The H.264 display orientation SEI occurs on the first decoded picture.
         # The MOV container has no display matrix. Seek past several closed GOPs.

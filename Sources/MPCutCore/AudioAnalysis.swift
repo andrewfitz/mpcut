@@ -65,11 +65,16 @@ public struct AudioWaveform: Sendable {
     }
 
     init?(peakBytes: Data, media: MediaInfo, stream: Int, cancelled: () -> Bool) {
+        self.init(peakBytes: peakBytes, duration: media.duration, cancelled: cancelled)
+        finish(for: media, stream: stream)
+    }
+
+    init?(peakBytes: Data, duration: RationalTime, cancelled: () -> Bool) {
         let stride = MemoryLayout<Float>.stride
         let bins = peakBytes.count / stride
         guard peakBytes.count.isMultiple(of: stride),
-              Double(bins) <= ceil(media.duration.seconds * Double(Self.rate)) + 1 else { return nil }
-        self.init(duration: media.duration)
+              Double(bins) <= ceil(duration.seconds * Double(Self.rate)) + 1 else { return nil }
+        self.init(duration: duration)
         pages.reserveCapacity((bins + Self.pageSize - 1) / Self.pageSize)
         var offset = 0
         while offset < bins {
@@ -84,7 +89,6 @@ public struct AudioWaveform: Sendable {
             offset += length
         }
         count = bins
-        finish(for: media, stream: stream)
     }
 
     var syncPeaks: [Float] { pages.flatMap(\.samples) }

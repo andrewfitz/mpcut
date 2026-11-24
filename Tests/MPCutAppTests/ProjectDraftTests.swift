@@ -65,7 +65,7 @@ final class ProjectDraftTests: XCTestCase {
             .init(id: "clip", file: "offline.mov", from: .zero, to: .init(numerator: 1))
         ])
         let undo: [CutHistoryState] = [.init(action: "Add Clip", project: .sequence([]))]
-        try draft.schedule({ try project.saveStaged(to: $0, undo: undo, redo: []) },
+        try draft.schedule({ try project.saveStaged(to: $0, undo: undo, redo: [], mediaSnapshot: .empty) },
                            onError: { XCTFail($0.localizedDescription) })
 
         let deadline = Date().addingTimeInterval(10)
@@ -101,7 +101,7 @@ final class ProjectDraftTests: XCTestCase {
                 XCTAssertEqual(input.undo.first?.project.sourceSelects.count, 2)
             }
             var draft: ProjectDraft? = ProjectDraft(directory: directory)
-            try draft?.write { try input.project.saveStaged(to: $0, undo: input.undo, redo: input.redo) }
+            try draft?.write { try input.project.saveStaged(to: $0, undo: input.undo, redo: input.redo, mediaSnapshot: input.mediaSnapshot) }
             let file = try XCTUnwrap(draft?.url)
             draft = nil
             XCTAssertTrue(try ProjectDraft.recoverable(in: directory).contains {

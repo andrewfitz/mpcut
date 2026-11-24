@@ -1,4 +1,5 @@
 import AppKit
+import MPCutCore
 import SwiftUI
 
 struct EditorView: View {
@@ -13,7 +14,7 @@ struct EditorView: View {
     var body: some View {
         EditorWorkspace(viewer: viewer, transport: transport, timeline: timeline, status: status,
                         showsTimeline: !editor.isEmpty || editor.hasHistory,
-                        showsStatus: !editor.isEmpty || editor.isBusy || editor.lastExportedURL != nil,
+                        showsStatus: !editor.isEmpty || editor.hasHistory || editor.isBusy || editor.lastExportedURL != nil,
                         showsSidebar: (presentation.sequenceTranscriptVisible || presentation.sequenceParticipantsVisible) &&
                             transcriptSession != nil) {
             if let transcriptSession {
@@ -22,6 +23,29 @@ struct EditorView: View {
                 } else {
                     TranscriptPane(session: transcriptSession).equatable()
                 }
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if let url = editor.projectURL {
+                ProjectMediaBanner(count: editor.projectMediaSummary.offline) {
+                    editor.presentProjectMedia(offlineOnly: true)
+                }
+                .id(url)
+            }
+        }
+        .sheet(item: $editor.projectMediaRequest, onDismiss: openReplacementTranscription) { request in
+            ProjectMediaSheet(jobs: editor.projectMediaJobs, request: request, archive: { editor.projectMediaArchive },
+                              revision: { .init(generation: editor.mcpGeneration, edit: editor.mcpRevision) }, isMulticam: false,
+                              status: editor.mediaStatus(for:),
+                              relinkBatch: { try await editor.relinkProjectMedia($0) },
+                              revert: { try await editor.revertProjectMedia($0) },
+                              ignore: editor.ignoreProjectMedia,
+                              replace: { try await editor.applyProjectMediaReplacement($0) },
+                              showUse: editor.showProjectMediaUse)
+        }
+        .onReceive(editor.projectMediaJobs.$transcriptSetup) { request in
+            if request != nil, editor.projectMediaRequest == nil {
+                Task { @MainActor in openReplacementTranscription() }
             }
         }
         .background(EditorKeyboardMonitor(handle: handleKey))
@@ -41,14 +65,15 @@ struct EditorView: View {
                 StillAuthoringControls(rows: editor.stillPlacementRows, enabled: !editor.isBusy,
                                        canReplace: editor.canReplacePicture, canInsert: editor.canInsertStill,
                                        replace: editor.chooseReplacePicture, insert: editor.chooseInsertStill,
-                                       insertGap: editor.chooseInsertGap, spaceClips: editor.chooseSpaceClips, canSpace: editor.canSpaceClips, manage: editor.manageStill)
+                                       insertGap: editor.chooseInsertGap, spaceClips: editor.chooseSpaceClips, canSpace: editor.canSpaceClips,
+                                       manage: editor.manageStill, soundtrack: editor.stillSoundtrackControls)
                 if !editor.isEmpty {
                     EditorToolbarButton(title: "Transcript", symbol: "text.alignleft",
                                         toolTip: "Show or hide the transcript (⌥⌘T)") {
                         presentation.setTranscriptVisible(!presentation.sequenceTranscriptVisible, multicam: false)
                     }
-                    EditorToolbarButton(title: "Participants", symbol: "person.2",
-                                        toolTip: "Review and edit recording participants") {
+                    EditorToolbarButton(title: "Feeds", symbol: "rectangle.split.2x2",
+                                        toolTip: "Review camera feeds and meeting participants") {
                         presentation.sequenceParticipantsVisible.toggle()
                         if presentation.sequenceParticipantsVisible { presentation.sequenceTranscriptVisible = false }
                     }
@@ -78,9 +103,19 @@ struct EditorView: View {
         }
     }
 
+    private func openReplacementTranscription() {
+        guard let transcriptSession, let request = editor.projectMediaJobs.takeTranscription() else { return }
+        presentation.setTranscriptVisible(true, multicam: false)
+        transcriptSession.transcript.replacementSetup = request
+    }
+
     private var viewer: some View {
         Group {
-            if let audio = editor.audioPreviewClip {
+            if let url = editor.projectMediaPreviewURL, editor.mediaStatus(for: url).hidesMedia {
+                ProjectMediaSlate(url: url, status: editor.mediaStatus(for: url)) {
+                    editor.presentProjectMedia(.locate, path: url.path)
+                }
+            } else if let audio = editor.audioPreviewClip {
                 AudioWaveformViewer(clip: audio.clip, offset: audio.offset, sourceTime: editor.audioPreviewSourceTime ?? audio.clip.sourceStart,
                                     zoom: editor.timelineZoom, span: presentation.waveformSpan, revision: editor.waveformRevision, store: editor.audioStore.detail,
                                     coarse: editor.audioStore.waves[audio.clip.sourceID], pauses: editor.sourcePauses[audio.clip.sourceID] ?? [],
@@ -108,7 +143,7 @@ struct EditorView: View {
                             addMulticam: addMulticam)
                     .overlay {
                         if let transcriptSession,
-                           presentation.sequenceParticipantsVisible || !editor.stillProject.participants.isEmpty {
+                           presentation.sequenceParticipantsVisible || !editor.participantProject.isEmpty {
                             ParticipantMonitorOverlay(session: transcriptSession,
                                                       interactive: presentation.sequenceParticipantsVisible)
                         }
@@ -152,6 +187,7 @@ struct EditorView: View {
     }
 
     private var timeline: some View {
+        let soundtrack = editor.stillSoundtrackWaveform
         var timeline = SequenceTimeline(
             clips: editor.timelineClips,
             playhead: editor.playhead,
@@ -160,11 +196,13 @@ struct EditorView: View {
             markOut: editor.markOut,
             thumbnailHeight: editor.timelineThumbnailHeight,
             sequenceDuration: editor.duration,
+            showsSourceRuler: editor.preferences.sourceTimeTicks,
             scenesBySource: editor.scenesBySource, sceneOverlaysByClip: editor.sceneOverlaysByClip,
             viewNamesBySource: editor.viewNamesBySource,
             sceneRevision: editor.sceneRevision,
             audioOnly: editor.isAudioOnly,
-            showsWaveform: !editor.isAudioOnly && !editor.audioTracks.isEmpty,
+            showsWaveform: soundtrack != nil || (!editor.isAudioOnly && !editor.audioTracks.isEmpty),
+            soundtrack: soundtrack,
             envelopeStore: editor.audioStore.detail,
             waveforms: editor.audioStore.waves, openingWaveform: editor.audioStore.openingWaveform,
             waveformPauses: editor.sourcePauses, timelinePadding: editor.timelinePadding,
@@ -174,6 +212,7 @@ struct EditorView: View {
             zoom: $editor.timelineZoom,
             timeEntryRequest: editor.timeEntryRequest,
             allowsClipEdits: !editor.isBusy,
+            allowsStillEndResize: true,
             onSelect: editor.select,
             onSeek: editor.seek,
             onTrim: editor.trim,
@@ -187,6 +226,7 @@ struct EditorView: View {
             validateHandle: handleValidation,
             thumbnail: editor.thumbnail
         )
+        timeline.onProjectMedia = editor.actOnTimelineMedia
         timeline.assemblyAssets = editor.stillAssetSpans
         if editor.canEdit {
             timeline.onPreviewJoin = { _ = editor.previewExistingJoin(before: $0) }
@@ -216,6 +256,13 @@ struct EditorView: View {
                 Button("Cancel", action: editor.cancelExport)
                     .disabled(editor.isCancelling)
                     .help("Cancel export")
+            } else if let progress = editor.mediaRelinkProgress {
+                ProgressView(value: progress).frame(width: 100).barLeading()
+                    .accessibilityLabel("Relink indexing progress")
+                Text("Indexing relinked media… \(progressPercent(progress))").monospacedDigit()
+                Spacer()
+                Button("Cancel", action: editor.cancelProjectMediaIndexing)
+                    .help("Cancel relink indexing")
             } else if let progress = editor.mediaRefreshProgress {
                 ProgressView(value: progress).frame(width: 100).barLeading()
                 Text("Refreshing project media…")
@@ -274,6 +321,15 @@ struct EditorView: View {
                     .help("Monitor or replace audio")
                     silenceControls
                     StatusBarDivider()
+                } else if let soundtrack = editor.stillSoundtrackControls {
+                    Menu {
+                        soundtrack.menuItems
+                    } label: {
+                        Label(soundtrack.name == nil ? "Add Soundtrack" : "Soundtrack", systemImage: "music.note")
+                    }
+                    .barMenu()
+                    .help(soundtrack.name.map { "Manage soundtrack · \($0)" } ?? "Attach a soundtrack")
+                    StatusBarDivider()
                 } else if !editor.isEmpty {
                     Label("No audio track", systemImage: "speaker.slash")
                         .foregroundStyle(.tertiary)
@@ -313,16 +369,13 @@ struct EditorView: View {
                         StatusBarDivider()
                     }
                 }
-                let mediaIssues = Set(editor.mediaRefreshIssues.values).sorted()
-                if !mediaIssues.isEmpty {
-                    Menu {
-                        ForEach(mediaIssues, id: \.self) { Text($0) }
-                    } label: {
-                        Label(editor.mediaClipReview.isEmpty ? "Media refresh" : "Media needs review",
-                              systemImage: "exclamationmark.triangle")
-                    }
-                    .barMenu()
-                    .help("Show media refresh issues")
+                ProjectMediaJobStatus(jobs: editor.projectMediaJobs) { editor.presentProjectMedia() }
+                let mediaSummary = editor.projectMediaSummary
+                if let title = mediaSummary.title {
+                    let state: ProjectMediaStatus = mediaSummary.offline > 0 ? .offline : .needsReview
+                    BarButton(title, symbol: state.editorIcon) { editor.presentProjectMedia() }
+                        .foregroundStyle(Color(nsColor: state.editorColor))
+                        .help("Open Project Media")
                     StatusBarDivider()
                 }
                 TimelineTierBadge(editor: editor)

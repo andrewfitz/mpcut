@@ -1,10 +1,12 @@
 #include "MediaProbe.h"
 #include "codec_header.h"
+#include "jpeg_frame.h"
 #include "../CFFmpeg/layer3_frame.h"
 #include "../CFFmpeg/copy_probe.h"
 #include "mov_index.h"
 #include "probe_evidence.h"
 #include "video_clock.h"
+#include "source_timecode.h"
 #include "wave_pcm.h"
 #include "../CFFmpeg/opus_packet.h"
 
@@ -201,6 +203,13 @@ static int describe_stream(AVFormatContext *file, AVStream *input, MPProbeStream
         if (!stream->language)
             return AVERROR(ENOMEM);
     }
+    if (params->codec_type == AVMEDIA_TYPE_AUDIO) {
+        const AVDictionaryEntry *title = av_dict_get(input->metadata, "title", NULL, 0);
+        if (!title || !title->value[0])
+            title = av_dict_get(input->metadata, "handler_name", NULL, 0);
+        if (title)
+            av_strlcpy(stream->name, title->value, sizeof(stream->name));
+    }
     stream->kind = (input->disposition & AV_DISPOSITION_ATTACHED_PIC) ? "attachment" : av_get_media_type_string(params->codec_type);
     stream->codec = avcodec_get_name(params->codec_id);
     av_fourcc_make_string(stream->codec_tag, params->codec_tag);
@@ -335,6 +344,8 @@ static bool independent(const AVPacket *packet, const AVCodecParameters *params,
     switch (params->codec_id) {
     case AV_CODEC_ID_H264: case AV_CODEC_ID_HEVC:
         return mp_h26x_random_access(packet, params, source_start, multilayer);
+    case AV_CODEC_ID_MJPEG:
+        return self_contained_jpeg(packet->data, packet->size, params->width, params->height, NULL) || source_start;
     case AV_CODEC_ID_VP8:
         return vp8_start(packet->data, packet->size);
     case AV_CODEC_ID_VP9:
@@ -525,7 +536,8 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
                     sample->start = 0;
             }
         }
-        sample->end = sample->key && interior_cut_codec(params->codec_id);
+        sample->end = sample->key && (interior_cut_codec(params->codec_id) ||
+                                      (params->codec_id == AV_CODEC_ID_MJPEG && sample->start == 1));
         if (packet->flags & AV_PKT_FLAG_DISCARD)
             issue(result, "The video track contains disposable packets from a presentation edit.");
         if (params->codec_id == AV_CODEC_ID_PRORES) {
@@ -559,7 +571,7 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
             if (bits % 8 == 0 && align > 0 && packet->size % align == 0)
                 sample->decoded_samples = packet->size / align;
         }
-        if (coarse_audio && params->codec_id == AV_CODEC_ID_FLAC && packet->size > 0) {
+        if (params->codec_id == AV_CODEC_ID_FLAC && packet->size > 0) {
             if (!stream->flac_parser) {
                 stream->flac_parser = av_parser_init(AV_CODEC_ID_FLAC);
                 stream->flac_context = avcodec_alloc_context3(NULL);
@@ -575,6 +587,18 @@ static int record_packet(MPProbeResult *result, const AVCodecParameters *params,
                                  packet->data, packet->size, packet->pts, packet->dts, packet->pos) == packet->size &&
                 parsed_size == packet->size && stream->flac_parser->duration > 0)
                 sample->decoded_samples = stream->flac_parser->duration;
+        }
+        if (params->codec_id == AV_CODEC_ID_ALAC && packet->size >= 3) {
+            // The first ALAC channel element gives the packet's frame count.
+            // Full frames use the maximum frame size from the ALAC magic cookie.
+            const bool partial_frame = (packet->data[2] & 0x10) != 0;
+            uint32_t frames = 0;
+            if (partial_frame && packet->size >= 7)
+                frames = (AV_RB32(packet->data + 2) << 7) | (packet->data[6] >> 1);
+            else if (!partial_frame && params->extradata_size >= 16)
+                frames = AV_RB32(params->extradata + 12);
+            if (frames <= INT_MAX)
+                sample->decoded_samples = frames;
         }
         if (params->codec_id == AV_CODEC_ID_OPUS)
             sample->decoded_samples = mpcut_opus_samples(packet->data, packet->size);
@@ -1045,6 +1069,25 @@ static int indexed_wave_audio(AVFormatContext *file, MPProbeResult *result)
     return status < 0 ? status : 1;
 }
 
+static void capture_source_stamp(AVFormatContext *file, MPProbeResult *result, int primary)
+{
+    const MPProbeStream *track = &result->streams[primary];
+    result->source_stamp_stream = primary;
+    result->source_stamp_kind = mp_source_sync_stamp_in_input(file, primary, track->rate_num, track->rate_den,
+                                                               &result->source_stamp_units, &result->source_stamp_num,
+                                                               &result->source_stamp_den);
+    if (result->source_stamp_kind != 0 || result->video_index < 0)
+        return;
+    for (int i = 0; i < result->stream_count; i++) {
+        if (file->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO || result->streams[i].sample_rate <= 0)
+            continue;
+        result->source_stamp_stream = i;
+        result->source_stamp_kind = mp_source_sync_stamp_in_input(file, i, 0, 0, &result->source_stamp_units,
+                                                                   &result->source_stamp_num, &result->source_stamp_den);
+        return;
+    }
+}
+
 MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only, int audio_analysis, int force_payload,
                             MPProbeCancelled cancelled, MPProbeProgress progress, void *context,
                             char *error, size_t error_capacity)
@@ -1195,6 +1238,18 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
             if ((packet_number++ % 128) == 0)
                 progress(context, fmin(1.0, packet_bytes / file_size));
         }
+        if (packet->stream_index == result->video_index && video_params->codec_id == AV_CODEC_ID_MJPEG &&
+            video_params->format == AV_PIX_FMT_NONE && result->streams[result->video_index].count == 0) {
+            enum AVPixelFormat format = AV_PIX_FMT_NONE;
+            if (self_contained_jpeg(packet->data, packet->size, video_params->width, video_params->height, &format) &&
+                format != AV_PIX_FMT_NONE) {
+                video_params->format = format;
+                video_params->profile = AV_PROFILE_MJPEG_HUFFMAN_BASELINE_DCT;
+                if (video_params->color_range == AVCOL_RANGE_UNSPECIFIED)
+                    video_params->color_range = AVCOL_RANGE_JPEG;
+                update_header_description(&result->streams[result->video_index], video_params);
+            }
+        }
         if ((needs_video_header || inspect_scan) && packet->stream_index == result->video_index &&
             (prores_video || (packet->flags & AV_PKT_FLAG_KEY))) {
             bool may_interlace = false;
@@ -1232,6 +1287,7 @@ MPProbeResult *mp_probe_read(const char *path, int conversion, int preview_only,
         // own sample clock to establish the audible start and end.
         result->source_start_safe = 1;
     }
+    capture_source_stamp(file, result, primary);
     av_packet_free(&packet);
     mp_probe_evidence_free(evidence);
     avformat_close_input(&file);

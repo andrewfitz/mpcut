@@ -44,6 +44,12 @@ private struct InspectionSummary: Encodable {
 }
 
 private struct CLIHelp: Encodable {
+    struct StillLosslessFormat: Encodable {
+        let container: String
+        let videoCodec: ReencodeCodec
+        let audioOptions: [ReencodeAudio]
+    }
+
     let sidecarSections = SidecarContent.allCases.map(\.rawValue)
     let readsSidecarsByDefault = true
     let framePresets = JPEGPreset.allCases.map(\.rawValue)
@@ -56,6 +62,13 @@ private struct CLIHelp: Encodable {
     let exportTracks = ExportTracks.allCases.map(\.rawValue)
     let supportsAudioReplacement = true
     let videoCodecs = ReencodeCodec.allCases.map(\.rawValue)
+    let stillPictureTimings = StillPictureTiming.allCases.map(\.rawValue)
+    let stillLosslessFormats: [StillLosslessFormat] = ExportRules.stillMovieContainers.flatMap { container in
+        ReencodeCodec.allCases.compactMap { codec in
+            let actions = ExportRules.stillLosslessAudioActions(codec: codec, container: container)
+            return actions.isEmpty ? nil : StillLosslessFormat(container: container, videoCodec: codec, audioOptions: actions)
+        }
+    }
     let qualities = ReencodeQuality.allCases.map(\.rawValue)
     let audioOptions = ReencodeAudio.allCases.map(\.rawValue)
     let snapOptions = SnapMode.allCases.map(\.rawValue)
@@ -247,6 +260,8 @@ private struct ExportResult: Encodable {
     /// The alternative that `--audio auto` applied, and the treatment that was asked for.
     var applied: ExportAlternative?
     var requestedAudio: ReencodeAudio?
+    /// Cover art, chapters or timecode that a packet copy leaves behind. Reported under `warnings`.
+    var copyOmissions: [String] = []
 
     /// A plan from the shared export rules.
     init(dryRun: Bool, output: String, plan: ExportPlan, requested: ExportRequest, applied: ExportAlternative?,
@@ -362,12 +377,16 @@ private struct ExportResult: Encodable {
         if let audioExport {
             try fields.encode(requestedAudio ?? audioExport.requested, forKey: .audio)
             try fields.encode(audioExport.actions, forKey: .audioActions)
-            try fields.encode(audioExport.warnings + (applied?.warnings.filter { !audioExport.warnings.contains($0) } ?? []), forKey: .warnings)
+            try fields.encode(audioExport.warnings + (applied?.warnings.filter { !audioExport.warnings.contains($0) } ?? [])
+                              + copyOmissions, forKey: .warnings)
         } else if let requestedAudio, conversion == nil {
             try fields.encode(requestedAudio, forKey: .audio)
             let copied = edit.segments.first?.tracks.filter { $0.kind == "audio" } ?? []
             try fields.encode(copied.map { ReencodeAudioAction(track: $0.index, action: .copyOriginal, reason: nil) }, forKey: .audioActions)
-            try fields.encode(applied?.warnings ?? [], forKey: .warnings)
+            try fields.encode((applied?.warnings ?? []) + copyOmissions, forKey: .warnings)
+        } else if conversion == nil, !copyOmissions.isEmpty {
+            // A plain packet copy has no `warnings` field unless it leaves something behind.
+            try fields.encode(copyOmissions, forKey: .warnings)
         }
         try fields.encodeIfPresent(applied?.id, forKey: .applied)
         try fields.encodeIfPresent(tier, forKey: .tier)
@@ -588,7 +607,7 @@ private struct OutputError: Error {
     let code: Int32
 }
 
-private func writeOutput(_ text: String) throws {
+func writeOutput(_ text: String) throws {
     try writeOutput(Data((text + "\n").utf8))
 }
 
@@ -645,7 +664,7 @@ private struct LoadedProject<Project> {
     }
 }
 
-private func isStandardInput(_ path: String) -> Bool {
+func isStandardInput(_ path: String) -> Bool {
     ["-", "/dev/stdin", "/dev/fd/0"].contains(path)
 }
 
@@ -1306,7 +1325,8 @@ private func saveShortened<T>(_ updated: CutProject, loaded: LoadedProject<T>, d
     guard archive.media.diskRevision == loaded.media.diskRevision else { throw CutError(code: "source_changed", message: "The project changed during analysis.") }
     try archive.media.validateDestination(destination, relativeTo: file)
     try saveEditedProject(updated, source: file, destination: destination, action: "Shorten Pauses", original: archive.project,
-                          undo: archive.undo, redo: archive.redo, interruption: interruption)
+                          undo: archive.undo, redo: archive.redo, mediaSnapshot: archive.media.mediaSnapshot,
+                          interruption: interruption)
 }
 
 private func runProjectSilence(_ options: SilenceOptions, loaded: LoadedProject<MulticamProject>, json: Bool,
@@ -1373,7 +1393,10 @@ private func runProjectSilence(_ options: SilenceOptions, loaded: LoadedProject<
         try report.checkSources(cancelled: cancelled)
         if let output, !options.dryRun {
             let progress = ExportProgress(interruption: interruption)
-            if let stillPlan { try stillPlanner.write(stillPlan, to: output, progress: progress.report) }
+            if let stillPlan {
+                try stillPlanner.write(stillPlan, to: output, progress: progress.report)
+                report.outputBytes = ExportOutputSize.bytes(at: output)
+            }
             if let preflight = report.preflight { try engine.write(preflight, to: output) { _ = progress.report($0) } }
         }
         try writeJSON(report, pretty: !json, checkCancellation: options.outProject == nil && (output == nil || options.dryRun))
@@ -1413,10 +1436,18 @@ private struct MixedProjectInput {
 
     let clips: [Clip]
     let excludedSidecarSources: Set<URL>
+    let projectsBySource: [URL: URL]
+
+    static func withSidecarContext(_ mixed: Self?, exclusions: Set<URL>, _ body: () throws -> Void) rethrows {
+        try SidecarLocations.$projectsBySource.withValue(mixed?.projectsBySource ?? SidecarLocations.projectsBySource) {
+            try AnalysisSidecar.$excludedSources.withValue(exclusions, operation: body)
+        }
+    }
 
     init(_ input: InputEdit, order: [Int]?, output: URL, interruption: Interruption) throws {
         var projects: [URL: MulticamProject] = [:]
         var references: [String: String] = [:]
+        var owners: [URL: URL] = [:]
         var candidates = Set<URL>()
         var clips: [Clip] = []
         for number in order ?? Array(1...input.clips.count) {
@@ -1445,7 +1476,10 @@ private struct MixedProjectInput {
                         if AnalysisSidecar.readsEnabled {
                             references.merge(media.absoluteSources(relativeTo: location)) { first, _ in first }
                             for recording in project.sources {
-                                candidates.insert(project.sourceURL(for: recording, relativeTo: location))
+                                let file = project.sourceURL(for: recording, relativeTo: location)
+                                candidates.insert(file)
+                                let key = SidecarLocations.sourceKey(file)
+                                if owners[key] == nil { owners[key] = location }
                             }
                         }
                         projects[location] = project
@@ -1467,8 +1501,10 @@ private struct MixedProjectInput {
             clips.append(Clip(number: number, from: from, to: to, source: source))
         }
         self.clips = clips
-        excludedSidecarSources = AnalysisSidecar.readsEnabled
-            ? CutProject.sidecarExclusions(absoluteSources: references, candidates: Array(candidates)) : []
+        projectsBySource = owners
+        excludedSidecarSources = SidecarLocations.$projectsBySource.withValue(owners) {
+            AnalysisSidecar.readsEnabled ? CutProject.sidecarExclusions(absoluteSources: references, candidates: Array(candidates)) : []
+        }
     }
 }
 
@@ -1512,6 +1548,25 @@ private func runStill(_ options: StillOptions, json: Bool, interruption: Interru
         throw CLIError("invalid_arguments", "Use --in-place to change the input project.")
     }
     try media.validateDestination(destination, relativeTo: location)
+    if options.operation == .relink {
+        let archive = CLIProjectMediaArchive(location: location, project: current, undo: undo, redo: redo, media: media)
+        guard let id = options.asset, let asset = current.stillAssets.first(where: { $0.id == id && !$0.isGap }),
+              let image = options.image else {
+            throw CutError(code: "still_asset_missing", message: "Choose an existing still image asset.")
+        }
+        let result = try ProjectMedia.relink(project: current, undo: undo, redo: redo, snapshot: media.mediaSnapshot,
+                                             relativeTo: location, from: asset.file, to: fileURL(image, label: "Image"),
+                                             cancelled: { !interruption.isActive })
+        let rebased = try result.project.rebased(from: location, to: destination)
+        var report = try StillInspection(rebased, location: destination, input: destination.path)
+        let saved = try archive.save(result.project, undo: result.undo, redo: result.redo, snapshot: result.snapshot,
+                                     destination: .init(url: destination, inPlace: options.inPlace), interruption: interruption,
+                                     beforePublish: result.candidate.checkGeneration)
+        report.timeline = saved
+        report.assetID = id
+        try writeJSON(report, pretty: !json, checkCancellation: false)
+        return
+    }
     let edit = try AnalysisSidecar.$excludedSources.withValue(
         AnalysisSidecar.excludedSources.union(media.sidecarExclusions(relativeTo: location))
     ) {
@@ -1524,19 +1579,37 @@ private func runStill(_ options: StillOptions, json: Bool, interruption: Interru
     report.assetID = edit.assetID
     let changed = edit.project != current
     if changed || !options.inPlace {
+        let existingAssets = Set(current.stillAssets)
+        var newEntries = edit.project.stillAssets.filter { !existingAssets.contains($0) }.compactMap {
+            ProjectMediaSnapshot.Entry(path: $0.file, asset: $0)
+        }
+        if let clip = edit.project.stillSoundtrack, let media = edit.soundtrackMedia {
+            newEntries.append(.init(path: clip.file, media: media))
+        }
+        let snapshot = media.mediaSnapshot.merging(.init(entries: newEntries)).rebased(from: location, to: destination)
         func rebase(_ state: CutHistoryState) throws -> CutHistoryState {
-            CutHistoryState(action: state.action, origin: state.origin, project: try state.project.rebased(from: location, to: destination, paths: &paths))
+            try state.rebased(from: location, to: destination, paths: &paths)
         }
         let history = changed ? undo + [CutHistoryState(action: edit.action, project: current)] : undo
         let savedUndo = try history.map(rebase)
         let savedRedo = try changed ? [] : redo.map(rebase)
-        try interruption.check()
+        let beforePublish = {
+            try interruption.check()
+            if let media = edit.soundtrackMedia {
+                guard media.identity.isCurrentSnapshot(at: media.url) else {
+                    throw CutError(code: "source_changed", message: "The soundtrack changed while the project was being saved.")
+                }
+            }
+        }
+        try beforePublish()
         if options.inPlace {
             _ = try saved.saveRevision(to: destination, undo: savedUndo, redo: savedRedo,
-                                       expected: media.diskRevision, beforePublish: interruption.check)
+                                       mediaSnapshot: snapshot,
+                                       expected: media.diskRevision, beforePublish: beforePublish)
         } else {
             report.timeline = try saved.saveNewCopy(to: destination, copyingTranscriptsFrom: location,
-                                                    undo: savedUndo, redo: savedRedo, check: interruption.check)
+                                                    undo: savedUndo, redo: savedRedo, mediaSnapshot: snapshot,
+                                                    check: beforePublish)
         }
     }
     try writeJSON(report, pretty: !json, checkCancellation: false)
@@ -1545,9 +1618,16 @@ private func runStill(_ options: StillOptions, json: Bool, interruption: Interru
 private func runStillExport(_ loaded: LoadedProject<CutProject>, output: URL, dryRun: Bool,
                             options: ExportOptions, json: Bool, useSidecar: Bool,
                             interruption: Interruption) throws {
+    let soundtrackIdentity: SourceIdentity?
+    if options.tracks != .video, options.audio != .removeAudio, let clip = loaded.project.stillSoundtrack {
+        soundtrackIdentity = try loaded.media.mediaSnapshot.expectedStillSoundtrack(clip, relativeTo: loaded.location)
+    } else {
+        soundtrackIdentity = nil
+    }
     try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
         try runStillExport(loaded.project, location: loaded.location, output: output, dryRun: dryRun, options: options,
-                           json: json, useSidecar: useSidecar, interruption: interruption)
+                           json: json, useSidecar: useSidecar, interruption: interruption,
+                           expectedSoundtrackIdentity: soundtrackIdentity)
     }
 }
 
@@ -1596,7 +1676,8 @@ private func clipSequence(_ clips: [ClipRequest], media: [URL: MediaInfo], engin
 
 private func runStillExport(_ project: CutProject, location: URL?, output: URL, dryRun: Bool,
                             options: ExportOptions, json: Bool, useSidecar: Bool,
-                            interruption: Interruption, replacementReferenceAngles: [String: String] = [:]) throws {
+                            interruption: Interruption, replacementReferenceAngles: [String: String] = [:],
+                            expectedSoundtrackIdentity: SourceIdentity? = nil) throws {
     let tracks = options.tracks ?? .all
     let spacingRequiresCopy = options.spaceClips != nil && project.hasInteriorSpacingGaps && options.mode != .encode
     if spacingRequiresCopy && options.requireCameraCopy == false {
@@ -1606,8 +1687,8 @@ private func runStillExport(_ project: CutProject, location: URL?, output: URL, 
     guard options.replaceAudio == nil, options.snap != .nearest else {
         throw CLIError("invalid_arguments", "Set the project soundtrack and edit exact still boundaries before exporting.")
     }
-    if options.mode != .encode && (options.video != nil || options.quality != nil) {
-        throw CLIError("invalid_arguments", "Video and quality settings require --mode encode.")
+    if options.mode == .copy && (options.video != nil || options.quality != nil) {
+        throw CLIError("invalid_arguments", "Video and quality settings require Smart Trim or Re-encode.")
     }
     if tracks == .audio && (options.video != nil || options.quality != nil) {
         throw CLIError(ExportRules.soundSettingsRefusal.code, ExportRules.soundSettingsRefusal.message)
@@ -1620,20 +1701,19 @@ private func runStillExport(_ project: CutProject, location: URL?, output: URL, 
     if !isMulticam && options.mode == .copy && (options.audio ?? .copyOriginal) != .copyOriginal {
         throw CLIError("invalid_arguments", "Use Smart Trim or Re-encode when converting sound.")
     }
-    if let format = project.stillFormat, let codec = options.video, codec != format.codec {
-        throw CLIError("invalid_arguments", "This project uses the stored \(format.codec.rawValue) canvas codec.")
-    }
     let settings = ReencodeSettings(codec: options.video ?? project.stillFormat?.codec ?? ExportRules.defaultCodec,
                                     quality: options.quality, audio: options.audio ?? .auto)
     let planner = StillExportPlanner(useSidecar: useSidecar, cancelled: { !interruption.isActive },
-                                     replacementReferenceAngles: replacementReferenceAngles)
+                                     replacementReferenceAngles: replacementReferenceAngles,
+                                     expectedSoundtrackIdentity: expectedSoundtrackIdentity)
     let plan: StillExportPlan
     do {
         plan = try planner.resolve(project, relativeTo: location, tracks: tracks,
                                    audioStream: options.audioStream, mode: options.mode,
                                    requireCameraCopy: options.requireCameraCopy ?? spacingRequiresCopy,
-                                   output: output, settings: settings, audioOutput: options.audioOutput ?? .separateTracks,
-                                   audioAction: isMulticam ? options.audio : nil)
+                                   container: options.container, output: output, settings: settings,
+                                   audioOutput: options.audioOutput ?? .separateTracks, audioAction: options.audio,
+                                   pictureTiming: options.stillTiming, videoCodec: options.video)
     } catch var issue as CutError where options.spaceClips != nil && (spacingRequiresCopy || options.requireCameraCopy == true) {
         let replayable = issue.alternatives?.filter { offer in
             offer.arguments.contains("--require-camera-copy") ||
@@ -1646,13 +1726,15 @@ private func runStillExport(_ project: CutProject, location: URL?, output: URL, 
         let progress = ExportProgress(interruption: interruption)
         try planner.write(plan, to: output, progress: progress.report)
     }
+    let outputBytes = dryRun ? nil : ExportOutputSize.bytes(at: output)
     if json || dryRun {
-        try writeJSON(StillCLIExportReport(dryRun: dryRun, output: output.path, report: plan.report,
+        try writeJSON(StillCLIExportReport(dryRun: dryRun, output: output.path, outputBytes: outputBytes, report: plan.report,
                                            audioStream: options.audioStream), pretty: !json,
                       checkCancellation: dryRun)
     } else {
         try interruption.beginResponse(checkCancellation: false)
-        try writeOutput("Exported " + output.path)
+        let size = outputBytes.map { " (\($0) bytes)" } ?? ""
+        try writeOutput("Exported " + output.path + size)
     }
 }
 
@@ -1692,7 +1774,7 @@ private func runMulticamExport(project loaded: LoadedProject<MulticamProject>? =
                                     audio: options.audio ?? .auto)
     var applied: ExportAlternative?
     let exclusions = loaded?.excludedSidecarSources ?? AnalysisSidecar.excludedSources.union(mixed?.excludedSidecarSources ?? [])
-    try AnalysisSidecar.$excludedSources.withValue(exclusions) {
+    try MixedProjectInput.withSidecarContext(mixed, exclusions: exclusions) {
         let engine = MulticamEngine(cancelled: { !interruption.isActive })
         var extraRangeInputs: [Int: Int] = [:]
         var tier: TierSummary?
@@ -1865,6 +1947,9 @@ private func renderLoadedProject(_ loaded: LoadedProject<CutProject>, output: UR
                            useSidecar: arguments.useSidecar, interruption: interruption)
         return
     }
+    guard flags.stillTiming == nil, flags.container == nil else {
+        throw CLIError("invalid_arguments", "--still-timing and --container apply to still project exports.")
+    }
     var options = flags
     options.spaceClips = nil
     switch loaded.project {
@@ -1937,7 +2022,32 @@ private func renderLoadedProject(_ loaded: LoadedProject<CutProject>, output: UR
     }
 }
 
+/// Project commands carry their own context, including recursive command dispatch for JSON requests.
 private func run(_ arguments: Arguments, interruption: Interruption) async throws {
+    let path: String?
+    switch arguments.command {
+    case .inspectProject(let project), .resolve(let project, _, _), .exportProject(let project, _, _, _):
+        path = project
+    case .convert(let source, _, _, _):
+        path = URL(fileURLWithPath: source).pathExtension.lowercased() == "cut" ? source : nil
+    case .multicamSync(let options): path = options.project
+    case .refresh(let options): path = options.project
+    case .projectMedia(let options): path = options.project
+    case .still(let options): path = options.project
+    case .silence(let options): path = options.project
+    case .frames(let options):
+        if case .project(let file, _, _) = options.source { path = file } else { path = nil }
+    case .scenes(let options):
+        if case .project(let project, _) = options.input { path = project } else { path = nil }
+    default: path = nil
+    }
+    let project = try path.flatMap { isStandardInput($0) ? nil : try fileURL($0, label: "Project") }
+    try await SidecarLocations.$projectURL.withValue(project ?? SidecarLocations.projectURL) {
+        try await runCommand(arguments, interruption: interruption)
+    }
+}
+
+private func runCommand(_ arguments: Arguments, interruption: Interruption) async throws {
     switch arguments.command {
     case let .multicamSync(options):
         let loaded = try loadProject(options.project, interruption: interruption)
@@ -1998,8 +2108,16 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
         try writeJSON(report, pretty: !arguments.json)
     case let .sidecar(options):
         let source = try fileURL(options.file, label: "Input")
-        let result = try await AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
-            try await options.run(source: source, cancelled: { !interruption.isActive })
+        if let path = options.project, isStandardInput(path) {
+            throw CLIError("invalid_arguments", "--project requires a saved project file.")
+        }
+        let project = try options.project.map { try loadDocument($0, interruption: interruption) }
+        let result = try await SidecarLocations.$projectURL.withValue(project?.file) {
+            try await AnalysisSidecar.$excludedSources.withValue(project?.excludedSidecarSources ?? AnalysisSidecar.excludedSources) {
+                try await AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
+                    try await options.run(source: source, cancelled: { !interruption.isActive })
+                }
+            }
         }
         try writeJSON(result, pretty: !arguments.json, checkCancellation: options.statusOnly)
     case .version:
@@ -2040,11 +2158,14 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
         try runSceneScan(options, json: arguments.json, useSidecar: arguments.useSidecar, interruption: interruption)
     case let .sceneExport(file, options):
         try runSceneExport(file: file, requestFile: arguments.requestFile, options: options, json: arguments.json, interruption: interruption)
+    case let .projectMedia(options):
+        try options.run(json: arguments.json, interruption: interruption)
     case let .refresh(options):
         struct Response: Encodable {
             let ok = true
             let projectPath: String
             let sources: [MediaRefreshResult]
+            let media: [ProjectMediaRow]
         }
         let project = try fileURL(options.project, label: "Project")
         var lastUpdate = -Double.infinity
@@ -2057,7 +2178,17 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
         let result = try MediaRefresh.project(at: project, verification: options.deep ? .deep : .stamp,
                                               persist: arguments.useSidecar, progress: progress,
                                               cancelled: { !interruption.isActive })
-        try writeJSON(Response(projectPath: project.path, sources: result), pretty: !arguments.json, checkCancellation: false)
+        let archive = try CLIProjectMediaArchive(at: project)
+        let statuses: [URL: ProjectMediaStatus] = Dictionary(uniqueKeysWithValues: result.compactMap { source in
+            if source.state == .offline { return (source.source, .offline) }
+            if !source.referenceIssues.isEmpty { return (source.source, .needsReview) }
+            return nil
+        })
+        let rows = ProjectMedia.inventory(project: archive.project, undo: archive.undo, redo: archive.redo,
+                                          relativeTo: project, snapshot: archive.media.mediaSnapshot,
+                                          statuses: statuses)
+        try writeJSON(Response(projectPath: project.path, sources: result, media: rows), pretty: !arguments.json,
+                      checkCancellation: false)
     case let .waveform(options):
         let result = try options.run(fileURL(options.file, label: "Input"), cancelled: { !interruption.isActive })
         try writeJSON(result, pretty: !arguments.json)
@@ -2085,6 +2216,9 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
         case let .project(file, times, clock):
             let identity = isStandardInput(file) ? nil : (try? SourceIdentity(fileURL(file, label: "Project")))
             let loaded = try loadDocument(file, interruption: interruption)
+            guard loaded.project.participants.render == nil else {
+                throw ParticipantProjectExport.unsupported("Program frame export")
+            }
             try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
                 if case .multicam(let multicam) = loaded.project, clock == nil || clock == .group {
                     let result = try JPEGExport.writeMulticam(multicam, document: loaded.file, at: times, to: output,
@@ -2127,17 +2261,9 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
         let loaded = try loadDocument(path, interruption: interruption)
         let output = try fileURL(destination, label: "Output")
         try checkProjectOutput(output, media: loaded.media, location: loaded.location)
-        try ResolveExport.validateTimelineHandoff(loaded.project)
         try AnalysisSidecar.$excludedSources.withValue(loaded.excludedSidecarSources) {
-            switch loaded.project {
-            case .multicam(let project):
-                try ResolveExport.write(project, relativeTo: loaded.location, to: output, useSidecar: arguments.useSidecar,
-                                        cancelled: { !interruption.isActive })
-            case .sequence, .stillSequence:
-                let sequence = CutProject.sequence(loaded.project.sequenceClips ?? [])
-                try ResolveExport.write(sequence.requests(relativeTo: loaded.location), to: output, useSidecar: arguments.useSidecar,
-                                        cancelled: { !interruption.isActive })
-            }
+            try ResolveExport.write(loaded.project, relativeTo: loaded.location, to: output,
+                                    useSidecar: arguments.useSidecar, cancelled: { !interruption.isActive })
         }
         try finishResolveExport(output, open: open, json: arguments.json, interruption: interruption)
     case let .inspectProject(path):
@@ -2166,12 +2292,32 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
             switch loaded.project {
             case .sequence, .stillSequence:
                 let clips = loaded.project.sequenceClips ?? []
-                let requests = try loaded.project.requests(relativeTo: loaded.location)
+                var paths: [String: URL] = [:]
+                var unavailable: CutError?
+                let requests = clips.map { clip -> ClipRequest in
+                    let file: URL
+                    if let cached = paths[clip.file] {
+                        file = cached
+                    } else {
+                        do {
+                            file = try CutProject.checkedMediaURL(clip.file, relativeTo: loaded.location)
+                        } catch {
+                            file = ProjectMediaVolume.watchURL(clip.file, relativeTo: loaded.location)
+                            if unavailable == nil {
+                                unavailable = CutError(code: "missing_source", message: error.localizedDescription)
+                            }
+                        }
+                        paths[clip.file] = file
+                    }
+                    return ClipRequest(file: file, from: clip.from, to: clip.to)
+                }
                 let sources = Dictionary(uniqueKeysWithValues: zip(clips, requests).map { ($0.id, $1.file.path) })
                 let duration = try clips.reduce(RationalTime.zero) { try $0.adding($1.to.subtracting($1.from)) }
                 // A project is inspected to be exported, so its sources are indexed for the tier. An empty one has none.
                 let tier: TierSummary?
-                if loaded.project.participants.render != nil {
+                if let unavailable {
+                    tier = TierState.unavailable(unavailable).summary(source: .movie)
+                } else if loaded.project.participants.render != nil {
                     tier = ParticipantProjectExport.tier(loaded.project, relativeTo: loaded.location,
                                                          cancelled: { !interruption.isActive }).summary(source: .movie)
                 } else {
@@ -2326,6 +2472,9 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
                                                                      dryRun: dryRun, options: options)),
                           interruption: interruption)
             return
+        }
+        guard options.stillTiming == nil, options.container == nil else {
+            throw CLIError("invalid_arguments", "Specify still timing and container with a saved still project.")
         }
         guard !input.clips.isEmpty else {
             throw CLIError("invalid_arguments", "Export requires at least one clip.")
@@ -2571,6 +2720,7 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
         switch planner.resolve(request, output: output, media: indexedMedia) {
         case .ready(let plan, _, let applied):
             result = try ExportResult(dryRun: dryRun, output: output.path, plan: plan, requested: request, applied: applied, order: order)
+            result.copyOmissions = plan.copyOmissions
             if options.requireCameraCopy == true, result.encodedDuration > .zero,
                result.edit.tracks != .audio,
                result.edit.segments.contains(where: { $0.tracks.contains(where: { $0.kind == "video" }) }) {
@@ -2634,7 +2784,8 @@ private func run(_ arguments: Arguments, interruption: Interruption) async throw
         } else {
             try interruption.beginResponse(checkCancellation: false)
             if let applied = result.applied { errorOutput("mpcut: \(applied.label)") }
-            for warning in result.conversion?.warnings ?? result.audioExport?.warnings ?? result.applied?.warnings ?? [] {
+            for warning in (result.conversion?.warnings ?? result.audioExport?.warnings ?? result.applied?.warnings ?? [])
+                + result.copyOmissions {
                 errorOutput("mpcut: \(warning)")
             }
             try writeOutput("Exported \(output.path)")

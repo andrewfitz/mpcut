@@ -316,9 +316,14 @@ public enum MulticamSync {
                                          Int32(exactly: track.frameRate.numerator) ?? 0,
                                          Int32(exactly: track.frameRate.denominator) ?? 0,
                                          &units, &numerator, &denominator)
+        return try stamp(status: status, units: units, numerator: numerator, denominator: denominator, track: track, url: media.url)
+    }
+
+    static func stamp(status: Int32, units: Int64, numerator: Int32, denominator: Int32, track: StreamInfo,
+                      url: URL) throws -> Stamp? {
         if status == 0 { return nil }
         guard status > 0, status != MP_SOURCE_SYNC_BWF || units >= 0 else {
-            throw CutError(code: "invalid_sync_metadata", message: "Unable to read sync metadata from \(media.url.lastPathComponent).")
+            throw CutError(code: "invalid_sync_metadata", message: "Unable to read sync metadata from \(url.lastPathComponent).")
         }
         let start = try RationalTime(numerator: units, denominator: Int64(denominator))
             .multiplied(by: RationalTime(numerator: Int64(numerator))).subtracting(track.start)

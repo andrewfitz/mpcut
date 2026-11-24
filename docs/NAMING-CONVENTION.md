@@ -15,10 +15,11 @@ A person reading one setting should know what it controls. A person choosing an 
 | Swift preference | Standalone name | Settings tab, section and control |
 |---|---|---|
 | localMCPEnabled | automation_local_mcp_enabled | General → Automation → Enable local MCP control |
-| automaticallyRefreshMedia | media_auto_refresh_enabled | General → Media → Automatically refresh changed recordings |
-| useAnalysisSidecars | analysis_sidecar_reuse_enabled | Analysis → Analysis sidecars → Save and reuse analysis beside recordings |
+| automaticallyRefreshMedia | media_auto_refresh_enabled | General → Media → Watch recordings for changes while editing |
+| useAnalysisSidecars | analysis_sidecar_reuse_enabled | Analysis → Analysis sidecars → Save and reuse analysis |
 | historyLimit | history_max_steps | General → History → Maximum undo and redo steps |
 | snapTarget | timeline_snap_target | General → Timeline → Snap to |
+| sourceTimeTicks | timeline_source_time_ticks_enabled | General → Timeline → Show source time ticks inside clips |
 | largeThumbnails | timeline_large_previews_enabled | General → Timeline → Enlarge thumbnails and waveforms |
 | volume | playback_preview_volume_fraction | General → Playback → Preview volume |
 | isMuted | playback_preview_muted | General → Playback → Mute preview audio |

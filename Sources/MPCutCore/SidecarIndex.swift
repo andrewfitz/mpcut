@@ -54,7 +54,7 @@ private struct IndexStream: Codable {
             fieldOrder: field(.fieldOrder), chromaLocation: field(.chromaLocation), colorRange: field(.colorRange),
             configuration: extra(.configuration), codecMetadata: extra(.codecMetadata),
             multipleDescriptions: extra(.multipleDescriptions), complexPicture: extra(.complexPicture),
-            reconstructedDTS: extra(.reconstructedDTS))
+            reconstructedDTS: extra(.reconstructedDTS), name: info.decodeIfPresent(String.self, forKey: .name))
     }
 }
 
@@ -73,7 +73,9 @@ private struct IndexHeader: Codable {
         case sourceStartSafe = "source_start_safe"
     }
 
-    private static let currentProbeRevision = 7
+    // Revision 8 adds independent JPEG entry points and decoded packet counts
+    // for lossless audio. Other stream indexes from revision 7 remain usable.
+    private static let currentProbeRevision = 8
     let probeRevision: Int
     let identity: SourceIdentity
     let sourceExtension: String
@@ -163,7 +165,8 @@ private struct IndexHeader: Codable {
 
     var isUsable: Bool {
         let descriptions = streams.map(\.value)
-        guard probeRevision == Self.currentProbeRevision else { return false }
+        let needsNewIndex = descriptions.contains { ["mjpeg", "alac", "flac"].contains($0.codec) }
+        guard probeRevision == Self.currentProbeRevision || (probeRevision == 7 && !needsNewIndex) else { return false }
         guard duration > .zero, descriptions.enumerated().allSatisfy({ $0.offset == $0.element.index }),
               audio.map(\.index) == descriptions.filter({ $0.kind == "audio" }).map(\.index),
               audio.allSatisfy({ $0.packetCount >= 0 && $0.editCount >= 0 }) else { return false }
@@ -194,7 +197,7 @@ private struct IndexHeader: Codable {
 }
 
 private enum IndexCodingError: Error { case invalid }
-enum SidecarIndexDetail { case preview, summary, analysis, audio, full }
+enum SidecarIndexDetail { case preview, summary, analysis, audio, full, validation }
 
 private struct CachedSceneClock: Codable {
     private enum CodingKeys: String, CodingKey {
@@ -226,8 +229,13 @@ extension AnalysisSidecar {
     }
 
     func loadSceneClock(cancelled: () -> Bool) -> MediaInfo? {
+        try? withReadSnapshot(orderedBy: Self.sceneClockKey, cancelled: cancelled) { read in
+            read(Self.sceneClockKey).flatMap(decodeSceneClock)
+        }
+    }
+
+    func decodeSceneClock(_ data: Data) -> MediaInfo? {
         guard let change = identity.changeTime,
-              let data = read(Self.sceneClockKey, cancelled: cancelled),
               let clock = try? PropertyListDecoder().decode(CachedSceneClock.self, from: data),
               clock.changedSeconds == change.seconds, clock.changedNanoseconds == change.nanoseconds,
               clock.duration > .zero, clock.video.value.kind == "video",
@@ -419,7 +427,7 @@ extension AnalysisSidecar {
     /// An explicit build needs both the typed index and its serialized rows. Keep the bytes
     /// validated by the full decoder so publishing the archive need not serialize every row again.
     package func indexForSaving(cancelled: () -> Bool) throws -> (MediaInfo, [String: Data])? {
-        try withReadSnapshot(cancelled: cancelled) { read in
+        try withReadSnapshot(orderedBy: "media_index.v1", cancelled: cancelled) { read in
             var frames: Data?
             var audio: Data?
             let media = try decodeIndex(detail: .full, read: { key in
@@ -437,18 +445,32 @@ extension AnalysisSidecar {
     }
 
     func loadIndex(detail: SidecarIndexDetail, progress: ((Double) -> Void)? = nil, cancelled: () -> Bool) throws -> MediaInfo? {
-        try withReadSnapshot(cancelled: cancelled) { read in
+        try withReadSnapshot(orderedBy: "media_index.v1", cancelled: cancelled) { read in
             try decodeIndex(detail: detail, read: read, progress: progress, cancelled: cancelled)
         }
     }
 
-    private func decodeIndex(detail: SidecarIndexDetail, read: (String) -> Data?, progress: ((Double) -> Void)?,
+    /// Validate the joint archive with the same decoder as an edit. A copy
+    /// needs its serialized rows, so avoid allocating full frame and packet arrays.
+    func verifiedIndex(in db: SidecarDatabase, stamp: String, cancelled: () -> Bool) throws -> [String: Data]? {
+        var rows: [String: Data] = [:]
+        let media = try decodeIndex(detail: .validation, read: { key in
+            guard Self.indexKeys.contains(key),
+                  let bytes = try verifiedSection(key, in: db, stamp: stamp, maxBytes: nil, cancelled: cancelled) else { return nil }
+            rows[key] = bytes
+            return bytes
+        }, progress: nil, cancelled: cancelled)
+        return media == nil ? nil : rows
+    }
+
+    private func decodeIndex(detail: SidecarIndexDetail, read: (String) throws -> Data?, progress: ((Double) -> Void)?,
                              cancelled: () -> Bool) throws -> MediaInfo? {
-        guard let metadata = read("media_index.v1"),
+        guard let metadata = try read("media_index.v1"),
               let header = try? PropertyListDecoder().decode(IndexHeader.self, from: metadata),
               identity.matches(saved: header.identity), header.isUsable
         else { return nil }
-        let frameRows = detail == .full ? header.frameCount : 0
+        let parseFrames = detail == .full || detail == .validation
+        let frameRows = parseFrames ? header.frameCount : 0
         let total = max(1, header.audio.reduce(Double(frameRows)) {
             $0 + Double($1.packetCount) + Double($1.editCount) + Double($1.opus?.count ?? 0)
         })
@@ -459,13 +481,14 @@ extension AnalysisSidecar {
         var frames: [FrameInfo] = []
         var audio: [AudioIndex] = []
         do {
-            if detail == .full {
-                guard let data = read("media_index_frames.v1") else { return nil }
+            if parseFrames {
+                guard let data = try read("media_index_frames.v1") else { return nil }
                 frames = try data.withUnsafeBytes { bytes in
                     var reader = IndexReader(bytes: bytes)
                     try reader.checkCount(header.frameCount, minimumBytes: 6)
                     var rows: [FrameInfo] = []
-                    rows.reserveCapacity(header.frameCount)
+                    if detail == .full { rows.reserveCapacity(header.frameCount) }
+                    var previousTime: RationalTime?
                     for i in 0..<header.frameCount {
                         if i.isMultiple(of: 1024) {
                             try checkIndexCancellation(cancelled)
@@ -474,9 +497,12 @@ extension AnalysisSidecar {
                         let (flags, pts, dts) = try reader.timestamps(allowedFlags: 28)
                         let duration = try reader.duration()
                         guard let size = UInt32(exactly: try reader.unsigned()), duration > .zero,
-                              rows.last.map({ $0.time <= pts }) ?? true else { throw IndexCodingError.invalid }
-                        rows.append(FrameInfo(dts: dts, time: pts, duration: duration, keyframe: flags & 4 != 0,
-                                              canStart: flags & 8 != 0, canEnd: flags & 16 != 0, byteCount: size))
+                              previousTime.map({ $0 <= pts }) ?? true else { throw IndexCodingError.invalid }
+                        previousTime = pts
+                        if detail == .full {
+                            rows.append(FrameInfo(dts: dts, time: pts, duration: duration, keyframe: flags & 4 != 0,
+                                                  canStart: flags & 8 != 0, canEnd: flags & 16 != 0, byteCount: size))
+                        }
                     }
                     guard reader.remaining == 0 else { throw IndexCodingError.invalid }
                     return rows
@@ -502,11 +528,11 @@ extension AnalysisSidecar {
                                pcmGaps: $0.pcmGaps ?? [], codedBytes: $0.codedBytes)
                 }
             } else if detail != .preview {
-                guard let data = read("media_index_audio.v1") else { return nil }
+                guard let data = try read("media_index_audio.v1") else { return nil }
                 audio = try data.withUnsafeBytes { bytes in
                     var reader = IndexReader(bytes: bytes)
                     let tracks = try header.audio.map { track in
-                        let result = try reader.audio(track, stream: streams[track.index], keepPackets: detail != .analysis,
+                        let result = try reader.audio(track, stream: streams[track.index], keepPackets: detail != .analysis && detail != .validation,
                                          keepOpusWindow: detail == .full || (detail == .audio && header.videoIndex < 0),
                                          progress: { progress?((done + $0) / total) }, cancelled: cancelled)
                         done += Double(track.packetCount) + Double(track.editCount) + Double(track.opus?.count ?? 0)
@@ -524,7 +550,8 @@ extension AnalysisSidecar {
                          timelineIssue: header.timelineIssue, reportedContainers: suggestions,
                          metadataOnly: detail == .preview || detail == .summary || detail == .analysis,
                          audioIssues: header.audioIssues ?? [:],
-                         refreshEvidence: MediaRefreshEvidence.decode(read(MediaRefreshEvidence.sectionKey)))
+                         refreshEvidence: MediaRefreshEvidence.decode(try read(MediaRefreshEvidence.sectionKey)),
+                         isFromSavedIndex: true)
     }
 }
 

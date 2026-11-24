@@ -216,21 +216,87 @@ final class TranscriptResponsivenessTests: XCTestCase {
     }
 
     @MainActor
+    func testContinuousReaderScrollsTheFullTwoHourTranscript() async throws {
+        let fixture = try await Fixture(seconds: 7_200)
+        defer { fixture.end() }
+        _ = try await fixture.attach()
+        let reader = HostedReader(fixture.session)
+        defer { reader.close() }
+        try await reader.wait(for: "all 28,800 words") { reader.flow?.layoutResult?.ranges.count == 28_800 }
+        reader.showWindow()
+        try await reader.settle()
+        let flow = try XCTUnwrap(reader.flow)
+        let table = try XCTUnwrap(flow.documentView as? NSTableView)
+        let layout = try XCTUnwrap(flow.layoutResult)
+        XCTAssertTrue(flow.wantsLayer)
+        XCTAssertGreaterThan(flow.frame.height, 150)
+        XCTAssertGreaterThan(table.numberOfRows, 2400)
+        var durations: [Duration] = []
+        var maxCells = 0
+        for fraction in 0...100 {
+            let word = fraction * (layout.ranges.count - 1) / 100
+            let row = try XCTUnwrap(layout.row(for: word))
+            let start = ContinuousClock.now
+            flow.reveal(word, atTop: false)
+            table.layoutSubtreeIfNeeded()
+            flow.displayIfNeeded()
+            durations.append(ContinuousClock.now - start)
+            XCTAssertTrue(NSLocationInRange(row, table.rows(in: table.visibleRect)))
+            var available = 0
+            table.enumerateAvailableRowViews { _, _ in available += 1 }
+            maxCells = max(maxCells, available)
+        }
+        // Click a word well beyond the former 160-word boundary through AppKit hit testing.
+        let target = 14_401
+        flow.reveal(target, atTop: true)
+        table.layoutSubtreeIfNeeded()
+        let row = try XCTUnwrap(layout.row(for: target))
+        let cell = try XCTUnwrap(table.view(atColumn: 0, row: row, makeIfNecessary: true))
+        let id = "transcript.word." + layout.source.words[target].id
+        let ax = try XCTUnwrap((cell.accessibilityChildren() as? [NSAccessibilityElement])?.first {
+            $0.accessibilityIdentifier() == id
+        })
+        let rect = ax.accessibilityFrameInParentSpace()
+        let location = cell.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+        let window = try XCTUnwrap(cell.window)
+        let hit = try XCTUnwrap(window.contentView?.hitTest(location))
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+            let event = try XCTUnwrap(NSEvent.mouseEvent(with: type, location: location, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+            if type == .leftMouseDown { hit.mouseDown(with: event) } else { hit.mouseUp(with: event) }
+        }
+        XCTAssertEqual(fixture.session.editor.playhead, layout.source.words[target].range.from.seconds, accuracy: 0.001)
+        try await reader.settle()
+        let right = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.shift],
+            timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "", charactersIgnoringModifiers: "",
+            isARepeat: false, keyCode: 124))
+        XCTAssertEqual(fixture.session.presentation.transcriptKeyHandler?(right, [.shift]), true)
+        try await reader.settle()
+        XCTAssertEqual(fixture.session.editor.playhead, layout.source.words[target + 1].range.from.seconds, accuracy: 0.001)
+        try await reader.wait(for: "extended word selection") { reader.flow?.selection?.positions == target...(target + 1) }
+        XCTAssertGreaterThan(maxCells, 0)
+        XCTAssertLessThan(maxCells, 100)
+        XCTAssertTrue(flow.layoutResult === layout)
+        report("28,800 words, median scroll and layout across 101 positions", median(durations),
+               "\(table.numberOfRows) lines, at most \(maxCells) materialized rows")
+    }
+
+    @MainActor
     func testPlayheadTicksDoNotRebuildThePane() async throws {
         let fixture = try await Fixture(seconds: 600)
         defer { fixture.end() }
         _ = try await fixture.attach()
-        TranscriptPaneProbe.page = ""
+        TranscriptPaneProbe.status = ""
         let reader = HostedReader(fixture.session)
         defer { reader.close() }
-        try await reader.wait(for: "the first page") { TranscriptPaneProbe.page == "1–160 of 2400" }
+        try await reader.wait(for: "the transcript") { reader.flow?.layoutResult?.source.words.count == 2400 }
         for _ in 0..<10 { try await reader.settle() }
 
         // Four seconds of preview at 30 ticks a second. A word lasts a quarter of a second.
         let ticks = 120
         let initializations = TranscriptPaneProbe.initializations
         let bodies = TranscriptPaneProbe.bodyEvaluations
-        let words = TranscriptPaneProbe.wordEvaluations
+        let lines = TranscriptPaneProbe.lineConfigurations
         let started = ContinuousClock.now
         for tick in 0..<ticks {
             fixture.session.editor.seek(1 + Double(tick) / 30)
@@ -239,11 +305,11 @@ final class TranscriptResponsivenessTests: XCTestCase {
         let elapsed = ContinuousClock.now - started
         report("pane per 120 playhead ticks (16 word changes)", elapsed,
                "init \(TranscriptPaneProbe.initializations - initializations), body \(TranscriptPaneProbe.bodyEvaluations - bodies), "
-               + "word rows \(TranscriptPaneProbe.wordEvaluations - words)")
+               + "line configurations \(TranscriptPaneProbe.lineConfigurations - lines)")
         // The pane redraws when the word under the playhead changes, and then only the word
         // left and the word reached.
         XCTAssertLessThanOrEqual(TranscriptPaneProbe.bodyEvaluations - bodies, 20)
-        XCTAssertLessThanOrEqual(TranscriptPaneProbe.wordEvaluations - words, 40)
+        XCTAssertLessThanOrEqual(TranscriptPaneProbe.lineConfigurations - lines, 40)
     }
 }
 
@@ -359,21 +425,20 @@ extension TranscriptResponsivenessTests {
                                   matchNumber: match?.0, matchWord: match?.1)
         }
 
-        // The reader is on the fourth page with five words selected when it is hidden.
+        // The reader was hidden at word 480 with five words selected.
         let memory = fixture.session.transcriptPaneMemory
         memory.place = place(anchor: try word(480), selection: (try word(500), try word(504)))
-        TranscriptPaneProbe.page = ""
+        TranscriptPaneProbe.status = ""
         let reader = HostedReader(fixture.session)
         defer { reader.close() }
-        try await reader.wait(for: "the remembered page") { TranscriptPaneProbe.page == "481–640 of 2400" }
+        try await reader.wait(for: "the remembered word") { reader.flow?.topWord == 480 }
 
-        // A word is removed from the first page. Every later position moves down by one, and
-        // the page keeps the words it had.
+        // Removing an earlier word moves the viewport anchor down by one index.
         try await delete(100)
-        try await reader.wait(for: "the same words after an edit before the page") {
-            TranscriptPaneProbe.page == "480–639 of 2399"
+        try await reader.wait(for: "the same visible word after an earlier edit") {
+            reader.flow?.layoutResult?.source.words.count == 2399 && reader.flow?.topWord == 479
         }
-        // Hiding the pane, as another inspector tab does, keeps the page and the whole selection.
+        // Hiding the pane, as another inspector tab does, keeps the viewport and the whole selection.
         memory.place = nil
         reader.state.showsTranscript = false
         try await reader.wait(for: "the pane to leave") { memory.place?.anchor != nil }
@@ -383,9 +448,9 @@ extension TranscriptResponsivenessTests {
         XCTAssertEqual(kept.selectionStart?.wordID, try word(500).wordID)
         XCTAssertEqual(kept.selectionEnd?.wordID, try word(504).wordID)
         XCTAssertEqual(kept.selectionStart?.timelineRevision, controller.timelineRevision)
-        TranscriptPaneProbe.page = ""
+        TranscriptPaneProbe.status = ""
         reader.state.showsTranscript = true
-        try await reader.wait(for: "the page after the pane returns") { TranscriptPaneProbe.page == "480–639 of 2399" }
+        try await reader.wait(for: "the scroll position after the pane returns") { reader.flow?.layoutResult?.source.words.count == 2399 && reader.flow?.topWord == 479 }
         memory.place = nil
         reader.state.showsTranscript = false
         try await reader.wait(for: "the pane to leave again") { memory.place != nil }
@@ -395,23 +460,23 @@ extension TranscriptResponsivenessTests {
         let matches = index.search("lantern", space: .currentCut).items
         XCTAssertEqual(matches.count, 10)
         memory.place = place(query: "lantern", match: (5, try XCTUnwrap(matches[5].words.first)))
-        TranscriptPaneProbe.page = ""
+        TranscriptPaneProbe.status = ""
         reader.state.showsTranscript = true
-        try await reader.wait(for: "the remembered match") { TranscriptPaneProbe.page == "Match 6 of 10" }
+        try await reader.wait(for: "the remembered match") { TranscriptPaneProbe.status == "Match 6 of 10" }
         try await delete(50)
         let revision = controller.timelineRevision
         try await reader.wait(for: "the reader to index the edit") {
             fixture.session.transcript.cachedIndex(attachmentID: attachment.id)?.timelineRevision == revision
         }
         for _ in 0..<40 { try await reader.settle() }
-        XCTAssertEqual(TranscriptPaneProbe.page, "Match 6 of 10")
+        XCTAssertEqual(TranscriptPaneProbe.status, "Match 6 of 10")
         // Removing an earlier match makes it the fifth of nine.
         let earlier = try await controller.indexedTranscript(attachmentID: attachment.id)
         let target = try XCTUnwrap(earlier.search("lantern", space: .currentCut).items[1].words.first)
         _ = try controller.apply(controller.plan(.init(action: .delete, selections: [
             .init(firstWordID: target.wordID, firstOccurrenceID: target.id)
         ], boundaryPolicy: .exact)))
-        try await reader.wait(for: "the same match under its new number") { TranscriptPaneProbe.page == "Match 5 of 9" }
+        try await reader.wait(for: "the same match under its new number") { TranscriptPaneProbe.status == "Match 5 of 9" }
     }
 
     func testRestoredWordFollowsACutButNeverMovesToAReplay() throws {
@@ -687,8 +752,10 @@ private struct PlaybackHost: View {
             if host.showsTranscript {
                 TranscriptPane(session: session).equatable()
                     .frame(minWidth: 315, idealWidth: 380, maxWidth: 650)
+                    .frame(height: 700)
             }
         }
+        .frame(width: 900, height: 700)
     }
 }
 
@@ -697,7 +764,7 @@ private final class HostState: ObservableObject {
     @Published var showsTranscript = true
 }
 
-/// A window that is never ordered in, holding the reader beside a view that redraws for every tick.
+/// A window holding the reader beside a view that redraws for every tick.
 @MainActor
 private final class HostedReader {
     let state = HostState()
@@ -709,6 +776,7 @@ private final class HostedReader {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 700), styleMask: [.titled],
                           backing: .buffered, defer: true)
         window.contentView = host
+        window.setContentSize(NSSize(width: 900, height: 700))
     }
 
     func settle() async throws {
@@ -721,14 +789,25 @@ private final class HostedReader {
         let deadline = ContinuousClock.now + .seconds(60)
         while !condition() {
             guard ContinuousClock.now < deadline else {
-                XCTFail("Timed out waiting for \(description). The reader shows ‘\(TranscriptPaneProbe.page)’.")
+                XCTFail("Timed out waiting for \(description). The reader shows ‘\(TranscriptPaneProbe.status)’.")
                 throw CancellationError()
             }
             try await settle()
         }
     }
 
-    func close() { window.contentView = nil }
+    var flow: TranscriptFlowScrollView? {
+        func find(in view: NSView) -> TranscriptFlowScrollView? {
+            if let flow = view as? TranscriptFlowScrollView { return flow }
+            for child in view.subviews { if let result = find(in: child) { return result } }
+            return nil
+        }
+        return find(in: host)
+    }
+
+    func showWindow() { window.orderBack(nil) }
+
+    func close() { window.orderOut(nil); window.contentView = nil }
 }
 
 /// The longest interval in which the main queue ran nothing, in milliseconds.

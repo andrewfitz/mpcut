@@ -5,6 +5,26 @@ import XCTest
 @testable import MPCutApp
 
 final class LiveTranscriptTests: XCTestCase {
+    func testQueuedExcerptSavesOnlyItsOwnRebasedMediaEvidence() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let location = directory.appendingPathComponent("Interview.cut")
+        let destination = directory.appendingPathComponent("Quote.cut")
+        let take = directory.appendingPathComponent("moved.wav")
+        let project = CutProject.sequence([.init(id: "quote", file: take.path, from: .zero, to: .init(numerator: 1))])
+        var offline = ProjectMediaSnapshot.Entry(path: take.path)
+        offline.ignored = true
+        let snapshot = ProjectMediaSnapshot(entries: [offline, .init(path: directory.appendingPathComponent("other.wav").path)])
+        let excerpt = TranscriptQueueExcerpt(name: "Quote", project: project, location: location, mediaSnapshot: snapshot)
+        try excerpt.save(to: destination)
+
+        let archive = try CutProject.loadDocument(from: destination, limit: 1)
+        XCTAssertEqual(archive.project.sequenceClips?.first?.file, "moved.wav")
+        XCTAssertEqual(archive.mediaSnapshot.entries.map(\.path), ["moved.wav"])
+        XCTAssertEqual(archive.mediaSnapshot.entries.first?.ignored, true)
+    }
+
     func testMulticamTranscriptFollowUsesTheVisiblePlaybackClock() {
         func t(_ seconds: Int64) -> RationalTime { .init(numerator: seconds) }
         func range(_ from: Int64, _ to: Int64) -> MulticamRange { .init(from: t(from), to: t(to)) }
@@ -50,10 +70,35 @@ final class LiveTranscriptTests: XCTestCase {
             bindings: [.init(trackID: track.id, file: "recording.mov", streamIndex: 1)])
         let project = CutProject.sequence([.init(id: "clip", file: "recording.mov", from: .zero, to: t(5))])
         let index = try TranscriptIndex(document: document, attachment: attachment, project: project)
-        let scoped = TranscriptPaneWordList(index.readAll(space: .source).filter { $0.wordID == "long" })
-        XCTAssertEqual(scoped.words.count, 1)
-        XCTAssertEqual(index.sourcePanePosition(at: t(2), playbackSpace: .currentCut, scoped: scoped), 0)
-        XCTAssertNil(index.sourcePanePosition(at: t(4), playbackSpace: .currentCut, scoped: scoped))
+        for space in [TranscriptSpace.currentCut, .source] {
+            let scoped = TranscriptPaneWordList(index.readAll(space: space).filter { $0.wordID == "long" })
+            func active(_ time: Int64, scoped: TranscriptPaneWordList? = nil) -> [Int] {
+                index.activePanePositions(at: t(time), playbackSpace: .currentCut, readerSpace: space, scoped: scoped)
+            }
+            XCTAssertEqual(active(1), [0])
+            XCTAssertEqual(active(2), [1, 0])
+            XCTAssertEqual(active(2, scoped: scoped), [0])
+            XCTAssertEqual(active(3), [0])
+            XCTAssertEqual(active(4), [])
+        }
+    }
+
+    func testPlaybackShowsBothWordsWhenTheAlignerAssignedOneSampleToTheFirst() throws {
+        func t(_ samples: Int64) -> RationalTime { .init(numerator: samples, denominator: 16_000) }
+        let track = TranscriptTrack(id: "mic", name: "Mic")
+        let document = TranscriptDocument(clock: .presentation, tracks: [track], words: [
+            .init(id: "a", text: "a", start: t(0), end: t(1), utteranceID: "phrase"),
+            .init(id: "lot", text: "lot", start: t(0), end: t(3840), utteranceID: "phrase")
+        ])
+        let index = try TranscriptIndex(document: document)
+        func words(_ samples: Int64) -> [String] {
+            index.activeWords(at: t(samples), space: .source).map(\.wordID)
+        }
+        XCTAssertEqual(words(0), ["a"])
+        XCTAssertEqual(words(640), ["a"])
+        XCTAssertEqual(words(1280), ["lot"])
+        XCTAssertEqual(words(3840), [])
+        XCTAssertEqual(index.locate(wordID: "a", space: .source).first?.range.to, t(1))
     }
 
     func testReaderRestoresOnlyUnambiguousOccurrencesAfterAssemblyEdit() throws {

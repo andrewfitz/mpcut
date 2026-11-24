@@ -4,7 +4,7 @@ import MPCutCore
 
 struct ExportResultFile {
     let url: URL
-    let data: Data
+    private let encode: (Int64?) throws -> Data
 
     @MainActor
     static func checkbox() -> NSButton {
@@ -20,16 +20,19 @@ struct ExportResultFile {
     init(output: URL, plan: some Encodable, cutMap: ExportCutMap) throws {
         url = Self.destination(beside: output)
         try CutEngine().checkDestination(url)
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        data = try encoder.encode(Result(output: output.path, plan: plan, cutMap: cutMap))
+        encode = { outputBytes in
+            let encoder = JSONEncoder()
+            encoder.keyEncodingStrategy = .convertToSnakeCase
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            return try encoder.encode(Result(output: output.path, outputBytes: outputBytes, plan: plan, cutMap: cutMap))
+        }
     }
 
     private struct Result<Plan: Encodable>: Encodable {
         let ok = true
         let dryRun = false
         let output: String
+        let outputBytes: Int64?
         let plan: Plan
         let cutMap: ExportCutMap
     }
@@ -42,8 +45,24 @@ struct ExportResultFile {
         let warnings: [String]
     }
 
-    func completionMessage(for output: URL) -> String {
+    static func stillCompletionMessage(for output: URL, result: ExportResultFile?) -> String {
+        let bytes = ExportOutputSize.bytes(at: output)
+        return result?.completionMessage(for: output, outputBytes: bytes) ?? exportMessage(for: output, outputBytes: bytes) + "."
+    }
+
+    private static func exportMessage(for output: URL, outputBytes: Int64?) -> String {
+        let message = "Exported " + output.lastPathComponent
+        guard let outputBytes else { return message }
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.includesActualByteCount = true
+        return message + " · " + formatter.string(fromByteCount: outputBytes)
+    }
+
+    func completionMessage(for output: URL, outputBytes: Int64? = nil) -> String {
+        let message = Self.exportMessage(for: output, outputBytes: outputBytes)
         do {
+            let data = try encode(outputBytes)
             let folder = url.deletingLastPathComponent().appendingPathComponent(".mpcut-export-\(UUID())", isDirectory: true)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false,
                                                     attributes: [.posixPermissions: 0o700])
@@ -52,9 +71,9 @@ struct ExportResultFile {
             try data.write(to: staged)
             let result = publishExclusively(from: staged, to: url)
             guard result == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(result)) }
-            return "Exported \(output.lastPathComponent) and \(url.lastPathComponent)."
+            return "\(message) and \(url.lastPathComponent)."
         } catch {
-            return "Exported \(output.lastPathComponent). Couldn’t save \(url.lastPathComponent): \(error.localizedDescription)"
+            return "\(message). Couldn’t save \(url.lastPathComponent): \(error.localizedDescription)"
         }
     }
 }

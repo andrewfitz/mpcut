@@ -1,7 +1,7 @@
 [
   {
     "name": "export_queue_list",
-    "description": "Read the native export queue and its captured contents. Each entry includes its identifier, exact marked range, and ordered source trims. Mix audio rows include lane_id, lane_label and lane_color_slot. Uncovered audio intervals have kind audio_gap.",
+    "description": "Read the native export queue and its captured contents. Each entry includes its identifier, exact marked range, ordered source trims, and whether a media change requires replanning. Mix audio rows include lane_id, lane_label and lane_color_slot. Uncovered audio intervals have kind audio_gap.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -122,7 +122,7 @@
   },
   {
     "name": "export_queue_entry_revise",
-    "description": "Recapture the current marked range for an existing queue entry. Extend requires a strict superset in the same coordinate space. Both modes capture the live edit.",
+    "description": "Recapture the live edit for an existing queue entry. Replace uses the current marks. Extend requires a strict superset in the same coordinate space. Replan applies an affected entry’s original bounds to the current timeline. For an affected transcript excerpt, mark the range to recapture.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -148,7 +148,8 @@
           "type": "string",
           "enum": [
             "replace",
-            "extend"
+            "extend",
+            "replan"
           ]
         }
       },
@@ -221,12 +222,13 @@
           "enum": [
             "h264",
             "hevc",
-            "prores"
+            "prores",
+            "jpeg"
           ]
         },
         "quality": {
           "type": "string",
-          "description": "Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. Requires movie encode mode.",
+          "description": "Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim.",
           "enum": [
             "smaller",
             "balanced",
@@ -246,7 +248,8 @@
             "remove",
             "mp3",
             "flac",
-            "opus"
+            "opus",
+            "alac"
           ]
         },
         "audio_track_ordinal": {
@@ -266,6 +269,30 @@
             "downmix_stereo"
           ],
           "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track."
+        },
+        "still_timing": {
+          "type": "string",
+          "enum": [
+            "cadence",
+            "held"
+          ],
+          "description": "Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule."
+        },
+        "container": {
+          "type": "string",
+          "enum": [
+            "mov",
+            "mp4",
+            "m4v",
+            "mkv",
+            "m4a",
+            "mka",
+            "wav",
+            "wave",
+            "caf",
+            "flac"
+          ],
+          "description": "Explicit container for a still project export. Match the destination filename extension and selected tracks."
         }
       },
       "required": [
@@ -336,12 +363,13 @@
           "enum": [
             "h264",
             "hevc",
-            "prores"
+            "prores",
+            "jpeg"
           ]
         },
         "quality": {
           "type": "string",
-          "description": "Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. Requires movie encode mode.",
+          "description": "Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim.",
           "enum": [
             "smaller",
             "balanced",
@@ -361,7 +389,8 @@
             "remove",
             "mp3",
             "flac",
-            "opus"
+            "opus",
+            "alac"
           ]
         },
         "audio_track_ordinal": {
@@ -381,6 +410,30 @@
             "downmix_stereo"
           ],
           "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track."
+        },
+        "still_timing": {
+          "type": "string",
+          "enum": [
+            "cadence",
+            "held"
+          ],
+          "description": "Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule."
+        },
+        "container": {
+          "type": "string",
+          "enum": [
+            "mov",
+            "mp4",
+            "m4v",
+            "mkv",
+            "m4a",
+            "mka",
+            "wav",
+            "wave",
+            "caf",
+            "flac"
+          ],
+          "description": "Explicit container for a still project export. Match the destination filename extension and selected tracks."
         }
       },
       "required": [
@@ -599,7 +652,8 @@
           "enum": [
             "h264",
             "hevc",
-            "prores"
+            "prores",
+            "jpeg"
           ]
         },
         "quality": {
@@ -623,7 +677,8 @@
             "remove",
             "mp3",
             "flac",
-            "opus"
+            "opus",
+            "alac"
           ]
         },
         "audio_track_ordinal": {
@@ -649,6 +704,14 @@
             "downmix_stereo"
           ],
           "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track."
+        },
+        "still_timing": {
+          "type": "string",
+          "enum": [
+            "cadence",
+            "held"
+          ],
+          "description": "Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule."
         }
       },
       "required": [
@@ -714,7 +777,8 @@
           "enum": [
             "h264",
             "hevc",
-            "prores"
+            "prores",
+            "jpeg"
           ]
         },
         "quality": {
@@ -738,7 +802,8 @@
             "remove",
             "mp3",
             "flac",
-            "opus"
+            "opus",
+            "alac"
           ]
         },
         "audio_track_ordinal": {
@@ -764,6 +829,14 @@
             "downmix_stereo"
           ],
           "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track."
+        },
+        "still_timing": {
+          "type": "string",
+          "enum": [
+            "cadence",
+            "held"
+          ],
+          "description": "Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule."
         }
       },
       "required": [

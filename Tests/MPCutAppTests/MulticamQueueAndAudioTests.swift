@@ -236,16 +236,26 @@ final class MulticamQueueAndAudioTests: XCTestCase {
         XCTAssertEqual(try engine.inspect(output).audio.count, 1)
 
         let wrong = try fixture("Standalone-Multitrack", extension: "mov")
-        reopened.relink(selection.source, to: wrong)
-        let relinkDeadline = ContinuousClock.now + .seconds(5)
-        while reopened.isBusy && .now < relinkDeadline { try await Task.sleep(for: .milliseconds(5)) }
-        XCTAssertTrue(reopened.notice?.message.contains("missing selected audio stream") == true)
+        do {
+            _ = try await reopened.relink(selection.source, to: wrong, validateCommit: {})
+            XCTFail("A recording with a different layout cannot be relinked.")
+        } catch let error as CutError {
+            XCTAssertEqual(error.code, "media_relink_different")
+        }
         XCTAssertEqual(reopened.project?.audioSources.first?.file, donor.path)
-        reopened.notice = nil
-        reopened.relink(selection.source, to: movie)
+        let donorCopy = directory.appendingPathComponent("relocated.mov")
+        try FileManager.default.moveItem(at: donor, to: donorCopy)
+        let relink = try await reopened.relink(selection.source, to: donorCopy, validateCommit: {})
+        XCTAssertTrue(relink.changed)
         try await waitForOperation(reopened)
-        XCTAssertEqual(reopened.project?.audioSources.first?.file, movie.path)
+        XCTAssertEqual(reopened.project?.audioSources.first?.file, donorCopy.path)
         XCTAssertEqual(reopened.project?.audio, .fixed(selection))
+        let relocatedDeadline = ContinuousClock.now + .seconds(5)
+        while reopened.media[selection.source]?.hasFullEditIndex != true && .now < relocatedDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(reopened.media[selection.source]?.url, donorCopy.standardizedFileURL)
+        XCTAssertTrue(reopened.media[selection.source]?.hasFullEditIndex == true)
         let first = MulticamAudioSelection(source: selection.source, stream: 1)
         XCTAssertTrue(reopened.replaceProgramAudio(with: first))
         XCTAssertEqual(reopened.project?.audio, .fixed(first))

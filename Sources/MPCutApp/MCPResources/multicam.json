@@ -119,7 +119,7 @@
   },
   {
     "name": "multicam_source_edit",
-    "description": "Edit a camera or recorder. rename requires name; offset requires offset; nudge/move require direction; nudge also accepts a group time; microphone sets stream (omit to clear); relink requires an absolute path; add_recording requires angle_id, an absolute path and group_start.",
+    "description": "Edit a camera or recorder. rename requires name; offset requires offset; nudge/move require direction; nudge also accepts a group time; microphone sets stream (omit to clear); relink uses project_editor_media_relink and requires the same recording at an absolute path; add_recording requires angle_id, an absolute path and group_start.",
     "inputSchema": {
       "type": "object",
       "properties": {

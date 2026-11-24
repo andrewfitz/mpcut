@@ -22,6 +22,38 @@ final class StillExportTests: XCTestCase {
         XCTAssertEqual(partial.runs.last?.duration, RationalTime(numerator: 1, denominator: 60))
     }
 
+    func testHeldScheduleAndMatroskaBoundaries() throws {
+        let end = RationalTime(numerator: 48_001, denominator: 48_000)
+        let held = try StillSampleSchedule(hold: end, cadence: frame)
+        XCTAssertEqual(held.runs, [.init(count: 1, duration: end)])
+        XCTAssertEqual(try held.exactTimescale(), 48_000)
+        XCTAssertEqual(try StillSampleSchedule.matroskaBoundary(end, final: true),
+                       .init(numerator: 1_001, denominator: 1_000))
+        let exact = RationalTime(numerator: 1)
+        XCTAssertEqual(try StillSampleSchedule.matroskaBoundary(exact, final: true), exact)
+        let halfTick = RationalTime(numerator: 2_001, denominator: 2_000)
+        XCTAssertEqual(try StillSampleSchedule.matroskaBoundary(halfTick, final: false),
+                       .init(numerator: 1_001, denominator: 1_000))
+    }
+
+    func testHeldMatroskaPreflightRefusesCollapsedImageBeforeOpeningAssets() throws {
+        let change = RationalTime(numerator: 1, denominator: 4_000)
+        let end = RationalTime(numerator: 1)
+        let timeline = StillTimelinePlan(duration: end, spans: [
+            .init(output: .init(from: .zero, to: change), origin: .insert, placementID: "first"),
+            .init(output: .init(from: change, to: end), origin: .insert, placementID: "second")
+        ])
+        let planner = StillExportPlanner()
+        let document = FileManager.default.temporaryDirectory.appendingPathComponent("fixture.cut")
+        XCTAssertThrowsError(try planner.planPicture(.sequence([]), document: document, timeline: timeline,
+                                                      mode: .smart, requireCameraCopy: false, container: "mkv",
+                                                      settings: .init(), tracks: .video, pictureTiming: .held)) {
+            let issue = $0 as? CutError
+            XCTAssertEqual(issue?.code, "unsupported_still_timing")
+            XCTAssertTrue(issue?.message.contains("collapse") == true)
+        }
+    }
+
     func testExplicitCopyRefusesVisibleStillBeforeOpeningOfflineMedia() throws {
         let card = StillAsset(id: "art", file: "offline.png", displayName: "Card", fingerprint: "offline")
         let item = StillInsert(id: "title", assetID: card.id, duration: frame, cadence: frame)

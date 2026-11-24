@@ -59,12 +59,37 @@ public struct CutSequenceClip: Hashable, Codable, Sendable, Identifiable {
         try values.encode(from.description, forKey: .from)
         try values.encode(to.description, forKey: .to)
     }
+
+    func validateFields() throws {
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CutError(code: "invalid_cut_project", message: "Clip IDs must be nonempty and unique")
+        }
+        guard ProjectFile.validMediaPath(file), originalFile.map(ProjectFile.validMediaPath) ?? true,
+              from >= .zero, to > from,
+              audioTrack.map({ (0...Int(Int32.max)).contains($0) }) ?? true,
+              replacementNames.keys.allSatisfy({ (0...Int(Int32.max)).contains($0) }) else {
+            throw CutError(code: "invalid_cut_project", message: "Invalid media path, source range or audio track for clip ‘\(id)’")
+        }
+    }
+}
+
+/// Invariants that depend on the other clips or their order, including the exact duration sum.
+struct SequenceClipOrderValidation {
+    private var ids = Set<String>()
+    private var duration = RationalTime.zero
+
+    mutating func append(_ clip: CutSequenceClip) throws {
+        guard ids.insert(clip.id).inserted else {
+            throw CutError(code: "invalid_cut_project", message: "Clip IDs must be nonempty and unique")
+        }
+        duration = try duration.adding(clip.to.subtracting(clip.from))
+    }
 }
 
 public enum CutProject: Equatable, Codable, Sendable {
     public static let format = "mpcut"
-    public static let schemaVersion = 4
-    package static let readableSchemaVersions: Set<Int> = [3, schemaVersion]
+    public static let schemaVersion = 6
+    package static let readableSchemaVersions: Set<Int> = [3, 4, schemaVersion]
 
     case sequence([CutSequenceClip])
     case multicam(MulticamProject)
@@ -74,10 +99,12 @@ public enum CutProject: Equatable, Codable, Sendable {
         case format
         case schemaVersion = "schema_version"
         case kind, clips, history
+        case mediaSnapshot = "media_snapshot"
         case stillAssets = "still_assets"
         case stillReplacements = "still_replacements"
         case programColorPolicy = "program_color_policy"
         case stillFormat = "still_format"
+        case stillSoundtrack = "still_soundtrack"
         case transcripts, participants
         case sourceSelects = "source_selects"
     }
@@ -139,12 +166,12 @@ public enum CutProject: Equatable, Codable, Sendable {
         }
         guard let version = try values.decodeIfPresent(Int.self, forKey: .schemaVersion),
               Self.readableSchemaVersions.contains(version) else {
-            throw CutError(code: "unsupported_cut_version", message: "Expected MPCut project schema_version 3 or \(Self.schemaVersion)")
+            throw CutError(code: "unsupported_cut_version", message: "Expected MPCut project schema_version 3, 4 or \(Self.schemaVersion)")
         }
         switch try values.decode(String.self, forKey: .kind) {
         case "sequence":
             try ProjectField.rejectUnknown(CodingKeys.self, in: decoder, code: "invalid_cut_project")
-            let stillFields: [CodingKeys] = [.stillAssets, .stillReplacements, .programColorPolicy, .stillFormat]
+            let stillFields: [CodingKeys] = [.stillAssets, .stillReplacements, .programColorPolicy, .stillFormat, .stillSoundtrack]
             for key in stillFields where values.contains(key) {
                 guard try !values.decodeNil(forKey: key) else {
                     throw stillError("Null value in still project field ‘\(key.stringValue)’")
@@ -156,9 +183,13 @@ public enum CutProject: Equatable, Codable, Sendable {
                 stillReplacements: values.decodeIfPresent([StillReplacement].self, forKey: .stillReplacements) ?? [],
                 programColorPolicy: values.decodeIfPresent(StillProgramColorPolicy.self, forKey: .programColorPolicy),
                 stillFormat: values.decodeIfPresent(StillTimelineFormat.self, forKey: .stillFormat),
-                sourceSelects: values.contains(.sourceSelects) ? values.decode([NamedSourceSelect].self, forKey: .sourceSelects) : []
+                sourceSelects: values.contains(.sourceSelects) ? values.decode([NamedSourceSelect].self, forKey: .sourceSelects) : [],
+                stillSoundtrack: values.decodeIfPresent(CutSequenceClip.self, forKey: .stillSoundtrack)
             )
             self = project.hasStillContent || !project.sourceSelects.isEmpty ? .stillSequence(project) : .sequence(project.items.compactMap(\.source))
+            if version < Self.schemaVersion, requiresExtendedStillSchema {
+                throw stillError("These still sequence settings require project schema version \(Self.schemaVersion)")
+            }
             if values.contains(.transcripts) {
                 transcripts = try values.decode(ProjectTranscripts.self, forKey: .transcripts)
             }
@@ -172,7 +203,15 @@ public enum CutProject: Equatable, Codable, Sendable {
         }
     }
 
+    var requiresExtendedStillSchema: Bool {
+        stillSoundtrack != nil || stillFormat?.requiresExtendedStillSchema == true || stillInserts.contains(where: \.usesExactDuration)
+    }
+
     public func encode(to encoder: Encoder) throws {
+        try encode(to: encoder, requiresExtendedStillSchema: requiresExtendedStillSchema)
+    }
+
+    func encode(to encoder: Encoder, requiresExtendedStillSchema: Bool) throws {
         try validate()
         guard stillAudioReference == nil else {
             throw CutError(code: "transient_selection", message: "A still selection with inherited audio is an export snapshot.")
@@ -183,7 +222,7 @@ public enum CutProject: Equatable, Codable, Sendable {
         }
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(Self.format, forKey: .format)
-        try values.encode(Self.schemaVersion, forKey: .schemaVersion)
+        try values.encode(requiresExtendedStillSchema ? Self.schemaVersion : 4, forKey: .schemaVersion)
         try values.encode("sequence", forKey: .kind)
         if !transcripts.isEmpty { try values.encode(transcripts, forKey: .transcripts) }
         if !participants.isEmpty { try values.encode(participants, forKey: .participants) }
@@ -194,6 +233,7 @@ public enum CutProject: Equatable, Codable, Sendable {
         if !project.stillReplacements.isEmpty { try values.encode(project.stillReplacements, forKey: .stillReplacements) }
         try values.encodeIfPresent(project.programColorPolicy, forKey: .programColorPolicy)
         try values.encodeIfPresent(project.stillFormat, forKey: .stillFormat)
+        try values.encodeIfPresent(project.stillSoundtrack, forKey: .stillSoundtrack)
     }
 
     public func validate() throws {
@@ -217,6 +257,13 @@ public enum CutProject: Equatable, Codable, Sendable {
                     throw stillError("An inherited soundtrack layout requires an insert-only export selection")
                 }
             }
+            if let soundtrack = project.stillSoundtrack {
+                try soundtrack.validateFields()
+                guard validStillID(soundtrack.id), clips.isEmpty, project.stillFormat != nil,
+                      project.stillAudioReference == nil, soundtrack.audioTrack != nil else {
+                    throw stillError("A still soundtrack requires an explicit still-only sequence and a selected audio track")
+                }
+            }
             try validateStillCollections(assets: project.stillAssets, inserts: project.items.compactMap(\.still),
                                          replacements: project.stillReplacements, color: project.programColorPolicy,
                                          clipIDs: Set(clips.map(\.id)))
@@ -228,30 +275,20 @@ public enum CutProject: Equatable, Codable, Sendable {
                     guard insert.cadence == format.cadence else {
                         throw stillError("Still ‘\(insert.id)’ cadence differs from the project format")
                     }
-                    _ = try format.frameCount(for: insert.duration)
+                    if !insert.usesExactDuration { _ = try format.frameCount(for: insert.duration) }
                 }
             } else if clips.isEmpty && !inserts.isEmpty {
                 throw stillError("A still-only sequence requires an explicit program format")
             }
             let duration = try stillTimelineDuration()
-            if let format = project.stillFormat, !inserts.isEmpty {
+            if let format = project.stillFormat, !inserts.isEmpty, !inserts.contains(where: \.usesExactDuration) {
                 _ = try format.frameCount(for: duration)
             }
         case .sequence(let clips):
-            var ids = Set<String>()
-            var duration = RationalTime.zero
+            var order = SequenceClipOrderValidation()
             for clip in clips {
-                guard !clip.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                      ids.insert(clip.id).inserted else {
-                    throw CutError(code: "invalid_cut_project", message: "Clip IDs must be nonempty and unique")
-                }
-                let paths = [clip.file, clip.originalFile].compactMap { $0 }
-                guard paths.allSatisfy(ProjectFile.validMediaPath), clip.from >= .zero, clip.to > clip.from,
-                      clip.audioTrack.map({ (0...Int(Int32.max)).contains($0) }) ?? true,
-                      clip.replacementNames.keys.allSatisfy({ (0...Int(Int32.max)).contains($0) }) else {
-                    throw CutError(code: "invalid_cut_project", message: "Invalid media path, source range or audio track for clip ‘\(clip.id)’")
-                }
-                duration = try duration.adding(clip.to.subtracting(clip.from))
+                try clip.validateFields()
+                try order.append(clip)
             }
         }
     }
@@ -264,7 +301,7 @@ public enum CutProject: Equatable, Codable, Sendable {
         try Self.decodeDocument(data, limit: 0).project
     }
 
-    var mediaPaths: [(String, String)] {
+    package var mediaPaths: [(String, String)] {
         switch self {
         case .sequence(let clips):
             return clips.flatMap { clip in
@@ -274,7 +311,7 @@ public enum CutProject: Equatable, Codable, Sendable {
             return project.sources.map { ($0.id, $0.file) } + project.stillAssets.map { ($0.id, $0.file) }
                 + project.transcripts.protectedPaths
         case .stillSequence(let project):
-            let references = project.stillAudioReference.map { [$0] } ?? []
+            let references = [project.stillAudioReference, project.stillSoundtrack].compactMap { $0 }
             return Self.sequence(project.items.compactMap(\.source) + references).mediaPaths + project.stillAssets.map { ($0.id, $0.file) }
                 + project.transcripts.protectedPaths + project.sourceSelects.map { ($0.id, $0.range.file) }
                 + project.participants.protectedMediaPaths
@@ -299,17 +336,14 @@ public enum CutProject: Equatable, Codable, Sendable {
     }
 
     /// Protect media referenced by this document from SQLite cache or journal I/O.
-    package static func sidecarExclusions(absoluteSources: [String: String], candidates: [URL]) -> Set<URL> {
+    package static func sidecarExclusions(absoluteSources: [String: String], candidates: [URL],
+                                          projectURL: URL? = SidecarLocations.projectURL) -> Set<URL> {
         guard !absoluteSources.isEmpty, !candidates.isEmpty else { return [] }
-        return ProjectFile.sidecarExclusions(sources: absoluteSources.keys, candidates: Set(candidates))
+        return ProjectFile.sidecarExclusions(sources: absoluteSources.keys, candidates: Set(candidates), projectURL: projectURL)
     }
 
-    public func save(to url: URL) throws {
-        if transcripts.isEmpty, !TranscriptStore.hasStore(relativeTo: url) {
-            try ProjectFile.write(self, to: url, sources: mediaPaths)
-        } else {
-            _ = try saveRevision(to: url, undo: [], redo: [], expected: nil)
-        }
+    public func save(to url: URL, mediaSnapshot: ProjectMediaSnapshot = .empty) throws {
+        try save(to: url, undo: [], redo: [], mediaSnapshot: mediaSnapshot)
     }
 
     public static func mediaURL(_ path: String, relativeTo projectURL: URL) -> URL {
@@ -352,7 +386,7 @@ public enum CutProject: Equatable, Codable, Sendable {
         }
     }
 
-    private func mapMediaPaths(_ rebase: (String) -> String) -> Self {
+    package func mapMediaPaths(_ rebase: (String) -> String) -> Self {
         switch self {
         case .sequence(let clips):
             return .sequence(clips.map {
@@ -369,11 +403,14 @@ public enum CutProject: Equatable, Codable, Sendable {
                 return .source(clip)
             }
             for index in project.stillAssets.indices { project.stillAssets[index].file = rebase(project.stillAssets[index].file) }
-            if var reference = project.stillAudioReference {
-                reference.file = rebase(reference.file)
-                reference.originalFile = reference.originalFile.map(rebase)
-                project.stillAudioReference = reference
+            func rebaseReference(_ clip: CutSequenceClip) -> CutSequenceClip {
+                var clip = clip
+                clip.file = rebase(clip.file)
+                clip.originalFile = clip.originalFile.map(rebase)
+                return clip
             }
+            project.stillAudioReference = project.stillAudioReference.map(rebaseReference)
+            project.stillSoundtrack = project.stillSoundtrack.map(rebaseReference)
             project.sourceSelects = project.sourceSelects.map { $0.mapPath(rebase) }
             project.participants = project.participants.mapSourcePaths(rebase)
             project.transcripts = project.transcripts.mapSourcePaths(rebase)
@@ -388,7 +425,9 @@ public enum CutProject: Equatable, Codable, Sendable {
     }
 
     public static func relativeMediaPath(_ path: String, to url: URL) -> String {
-        guard !path.split(separator: "/").contains("..") else { return path }
+        guard !path.split(separator: "/").contains(".."),
+              !ProjectMediaVolume.isChecking(URL(fileURLWithPath: path, isDirectory: false)),
+              !ProjectMediaVolume.isChecking(url) else { return path }
         let directory = physicalParent(of: ProjectFile.documentURL(url))
         let recording = URL(fileURLWithPath: path)
         let target = physicalParent(of: recording) + [recording.lastPathComponent]
@@ -486,6 +525,7 @@ enum ProjectFile {
     // An opened project can be a shortcut in a different folder from its media.
     // Keep the original spelling of ordinary paths, including /var on macOS.
     static func documentURL(_ url: URL) -> URL {
+        guard !ProjectMediaVolume.isChecking(url) else { return url }
         var info = stat()
         guard lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFLNK else { return url }
         return url.resolvingSymlinksInPath()
@@ -537,12 +577,16 @@ enum ProjectFile {
         guard data.count <= MulticamProject.maximumFileSize else {
             throw CutError(code: code, message: "Project exceeds the 64 MB limit")
         }
-        guard !data.contains(0), String(data: data, encoding: .utf8) != nil else {
+        // A project on disk is compressed. One written as plain JSON reads as it always did.
+        let text = try ProjectSavedBytes.unpacked(data, code: code) ?? data
+        guard !text.contains(0), String(data: text, encoding: .utf8) != nil else {
             throw CutError(code: code, message: "Project must contain a UTF-8 JSON object")
         }
+        // A project saved in the shared layout is read as the document it stands for.
+        let data = try ProjectSavedLayout.expanded(text, code: code) ?? text
         do {
             let project = try JSONDecoder().decode(type, from: data)
-            if let issue = jsonInputIssue(data, integerNumbersOnly: true, allowsFraction: participantFraction) {
+            if let issue = jsonInputIssue(data, integerNumbersOnly: true, allowsFraction: allowsProjectFraction) {
                 throw CutError(code: code, message: "Project \(issue)")
             }
             return project
@@ -551,11 +595,12 @@ enum ProjectFile {
         }
     }
 
-    private static func participantFraction(_ locations: [JSONInputLocation]) -> Bool {
+    private static func allowsProjectFraction(_ locations: [JSONInputLocation]) -> Bool {
         let keys = locations.compactMap { location -> String? in
             guard case .key(let key) = location else { return nil }
             return key
         }
+        if keys.first == "media_snapshot" { return true }
         let fields: ArraySlice<String>
         if keys.first == "participants" {
             fields = keys.dropFirst()
@@ -571,12 +616,6 @@ enum ProjectFile {
             return ["x", "y", "width", "height"].contains(last)
         }
         return parent.elementsEqual(["render", "shots", "slots"]) && ["anchor_x", "anchor_y"].contains(last)
-    }
-
-    static func write<T: Encodable>(_ project: T, to url: URL, sources: [(String, String)],
-                                    multicam: Bool = false, compact: Bool = false, replacingExisting: Bool = true) throws {
-        let data = try encoded(project, compact: compact)
-        try write(data, to: url, sources: sources, prefix: multicam ? "multicam" : "cut", replacingExisting: replacingExisting)
     }
 
     static func encoded<T: Encodable>(_ project: T, compact: Bool) throws -> Data {
@@ -629,11 +668,17 @@ enum ProjectFile {
     }
 
     static func diskBytes(_ bytes: Data, prefix: String) throws -> Data {
+        // Every project is written the same way: what the document repeats is written once,
+        // and the result is compressed. MPCUT_PROJECT_VERSION=4 keeps the plain document for a
+        // build that predates this.
+        // The limit is on the document itself, whatever form it is written in.
         guard bytes.count <= MulticamProject.maximumFileSize else {
             throw CutError(code: "invalid_\(prefix)_project", message: "Project exceeds the 64 MB limit")
         }
-        guard bytes.count < MulticamProject.maximumFileSize else { return bytes }
-        var data = bytes
+        let text = ProjectSavedLayout.prefersExpanded ? bytes : ProjectSavedLayout.compacted(bytes) ?? bytes
+        if !ProjectSavedLayout.prefersExpanded, let packed = ProjectSavedBytes.packed(text) { return packed }
+        guard text.count < MulticamProject.maximumFileSize else { return text }
+        var data = text
         data.append(0x0A)
         return data
     }
@@ -665,6 +710,9 @@ enum ProjectFile {
 
     static func validateDestination(_ output: URL, sourceDirectory: URL,
                                     sources: [(String, String)], prefix: String, includesContents: Bool = false) throws {
+        guard !ProjectMediaVolume.isChecking(output) else {
+            throw CutError(code: "media_volume_checking", message: "The destination volume is still checking: \(output.path)")
+        }
         let destination = canonicalFileURL(output)
         let destinationIdentity = fileIdentity(destination)
         var volumeDirectory = destination.deletingLastPathComponent()
@@ -675,9 +723,12 @@ enum ProjectFile {
         let caseInsensitive = (try? volumeDirectory.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?.volumeSupportsCaseSensitiveNames == false
         var checked = Set<String>()
         for (id, file) in sources where checked.insert(file).inserted {
-            let location = sourceURL(file: file, in: sourceDirectory)
+            let path = file.hasPrefix("/") ? file : sourceDirectory.path + "/" + file
+            let lexical = URL(fileURLWithPath: path, isDirectory: false)
+            let checking = ProjectMediaVolume.isChecking(lexical)
+            let location = checking ? ProjectMediaVolume.watchURL(lexical) : sourceURL(file: file, in: sourceDirectory)
             guard !location.path.split(separator: "/").contains("..") else { continue }
-            let media = canonicalFileURL(location)
+            let media = checking ? location : canonicalFileURL(location)
             let matchesMissingDestination = destinationIdentity == nil && caseInsensitive
                 && media.path.caseInsensitiveCompare(destination.path) == .orderedSame
             if includesContents {
@@ -689,7 +740,7 @@ enum ProjectFile {
                 }
             }
             guard media.path != destination.path, !matchesMissingDestination,
-                  destinationIdentity.map({ $0 != fileIdentity(media) }) ?? true else {
+                  checking || (destinationIdentity.map({ $0 != fileIdentity(media) }) ?? true) else {
                 throw CutError(code: "\(prefix)_project_source_collision",
                                message: "Project destination overlaps source ‘\(id)’ at \(media.path)")
             }
@@ -707,23 +758,17 @@ enum ProjectFile {
     static func sourceURL(file: String, in directory: URL) -> URL {
         let path = file.hasPrefix("/") ? file :
             directory.path + "/" + file
+        let url = URL(fileURLWithPath: path, isDirectory: false)
         let components = path.split(separator: "/")
-        guard let parent = components.lastIndex(of: "..") else {
-            return URL(fileURLWithPath: path).standardizedFileURL
-        }
+        guard let parent = components.lastIndex(of: "..") else { return url.standardizedFileURL }
+        // Preserve unresolved parent traversal even while a mount is checking.
+        // Lexically collapsing it could select a different recording.
+        guard !ProjectMediaVolume.isChecking(url) else { return url }
         let prefix = "/" + components[...parent].joined(separator: "/")
-        if let resolved = realpath(prefix, nil) {
-            defer { free(resolved) }
-            let path = String(cString: resolved) + "/" + components[(parent + 1)...].joined(separator: "/")
-            return URL(fileURLWithPath: path).standardizedFileURL
-        }
-        // Preserve the unresolved traversal for diagnostics and missing-source
-        // checks. Standardizing here could select another recording.
-        var url = URLComponents()
-        url.scheme = "file"
-        url.host = ""
-        url.path = path
-        return url.url!
+        guard let resolved = realpath(prefix, nil) else { return url }
+        defer { free(resolved) }
+        let result = String(cString: resolved) + "/" + components[(parent + 1)...].joined(separator: "/")
+        return URL(fileURLWithPath: result, isDirectory: false).standardizedFileURL
     }
 
     static func canonicalFileURL(_ url: URL, remainingLinks: Int = 32) -> URL {
@@ -761,16 +806,20 @@ enum ProjectFile {
         return resolved
     }
 
-    static func sidecarExclusions(sources: Dictionary<String, String>.Keys, candidates: Set<URL>) -> Set<URL> {
+    static func sidecarExclusions(sources: Dictionary<String, String>.Keys, candidates: Set<URL>,
+                                  projectURL: URL?) -> Set<URL> {
         var names = Set<String>()
         var foldedNames = Set<String>()
         var basenames = Set<String>()
         var linkedFiles = Set<FileIdentity>()
         for path in sources where !path.split(separator: "/").contains("..") {
-            let physical = canonicalFileURL(URL(fileURLWithPath: path))
+            let source = URL(fileURLWithPath: path, isDirectory: false)
+            let checking = ProjectMediaVolume.isChecking(source)
+            let physical = checking ? source : canonicalFileURL(source)
             names.insert(physical.path)
             foldedNames.insert(physical.path.folding(options: .caseInsensitive, locale: nil))
             basenames.insert(physical.lastPathComponent.folding(options: .caseInsensitive, locale: nil))
+            guard !checking else { continue }
             var info = stat()
             if stat(physical.path, &info) == 0 && info.st_nlink > 1 {
                 linkedFiles.insert(FileIdentity(device: NSNumber(value: info.st_dev), inode: NSNumber(value: info.st_ino)))
@@ -779,6 +828,7 @@ enum ProjectFile {
         var exclusions = Set<URL>()
         var caseInsensitiveFolders: [URL: Bool] = [:]
         func overlaps(_ destination: URL) -> Bool {
+            if ProjectMediaVolume.isChecking(destination) { return true }
             // A new cache with a different basename cannot resolve to an existing
             // recording or hard link. Avoid resolving each missing SQLite sibling.
             if !basenames.contains(destination.lastPathComponent.folding(options: .caseInsensitive, locale: nil)) {
@@ -797,12 +847,16 @@ enum ProjectFile {
             return insensitive
         }
         for source in candidates {
+            if ProjectMediaVolume.isChecking(source) {
+                exclusions.insert(ProjectMediaVolume.watchURL(source))
+                continue
+            }
             let canonical = AnalysisSidecar.canonicalSource(source)
-            // Some probes use the selected path, others open the resolved source.
-            let siblings = Set([source.standardizedFileURL, canonical])
-            if siblings.contains(where: { sibling in
-                let base = AnalysisSidecar.url(for: sibling).path
-                return ["", "-journal", "-wal", "-shm"].contains { overlaps(URL(fileURLWithPath: base + $0)) }
+            let locations = SidecarLocations(source: source, project: projectURL)
+            var paths = Set(locations.candidates)
+            if let destination = locations.destination { paths.insert(destination) }
+            if paths.contains(where: { cache in
+                ["", "-journal", "-wal", "-shm"].contains { overlaps(URL(fileURLWithPath: cache.path + $0)) }
             }) {
                 exclusions.insert(source.standardizedFileURL)
                 exclusions.insert(canonical)

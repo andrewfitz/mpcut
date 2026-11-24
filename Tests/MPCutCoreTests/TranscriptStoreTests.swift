@@ -28,7 +28,7 @@ final class TranscriptStoreTests: XCTestCase {
         current.transcripts.attachments[0].asset = accepted
         try current.transcripts.advanceRevision()
         current.transcripts.authoring = [.init(attachmentID: "dialogue", change: .renameSpeaker(speakerID: "a", name: "Host"), anchors: [])]
-        _ = try current.saveRevision(to: source, undo: [.init(action: "Rename Speaker", project: previous)], redo: [],
+        _ = try current.saveRevision(to: source, undo: [.init(action: "Rename Speaker", project: previous)], redo: [], mediaSnapshot: .empty,
                                  expected: nil)
         let loaded = try CutProject.loadDocument(from: source, limit: 5)
         XCTAssertEqual(loaded.project, current)
@@ -94,7 +94,7 @@ final class TranscriptStoreTests: XCTestCase {
 
         enum Cancelled: Error { case test }
         XCTAssertThrowsError(try project.saveNewCopy(to: destination, copyingTranscriptsFrom: source,
-                                                    undo: [], redo: []) {
+                                                    undo: [], redo: [], mediaSnapshot: .empty) {
             if try FileManager.default.contentsOfDirectory(atPath: root.path).contains(where: { $0.hasPrefix(".mpcut-") }) {
                 XCTAssertTrue(FileManager.default.fileExists(atPath: copiedPath.path))
                 throw Cancelled.test
@@ -112,14 +112,14 @@ final class TranscriptStoreTests: XCTestCase {
         previous.transcripts.authoring = [.init(attachmentID: "dialogue",
                                                 change: .renameSpeaker(speakerID: "a", name: "Host"), anchors: [])]
         try project.saveNewCopy(to: destination, copyingTranscriptsFrom: source,
-                                undo: [.init(action: "Rename Speaker", project: previous)], redo: [], check: {})
+                                undo: [.init(action: "Rename Speaker", project: previous)], redo: [], mediaSnapshot: .empty, check: {})
         let copy = try CutProject.loadDocument(from: destination, limit: 1)
         let attached = try XCTUnwrap(copy.project.transcripts.attachments.first?.asset)
         XCTAssertEqual(try TranscriptStore.read(attached, relativeTo: destination), bytes)
         XCTAssertEqual(copy.undo.first?.project.transcripts.attachments, copy.project.transcripts.attachments)
         XCTAssertEqual(copy.undo.first?.project.transcripts.authoring, previous.transcripts.authoring)
         XCTAssertThrowsError(try project.saveNewCopy(to: destination, copyingTranscriptsFrom: source,
-                                                    undo: [], redo: [], check: {})) {
+                                                    undo: [], redo: [], mediaSnapshot: .empty, check: {})) {
             XCTAssertEqual(($0 as? CutError)?.code, "destination_exists")
         }
     }
@@ -137,7 +137,7 @@ final class TranscriptStoreTests: XCTestCase {
         updated.transcripts.attachments = [.init(id: "dialogue", asset: asset, bindings: [])]
 
         enum Cancelled: Error { case test }
-        XCTAssertThrowsError(try updated.saveCopy(to: url, copyingTranscriptsFrom: url, undo: [], redo: [],
+        XCTAssertThrowsError(try updated.saveCopy(to: url, copyingTranscriptsFrom: url, undo: [], redo: [], mediaSnapshot: .empty,
                                                  replacingExisting: true, expected: revision, assetData: [asset: bytes],
                                                  beforePublish: { throw Cancelled.test }, check: {})) {
             XCTAssertEqual($0 as? Cancelled, .test)
@@ -145,14 +145,14 @@ final class TranscriptStoreTests: XCTestCase {
         XCTAssertEqual(try CutProject.load(from: url), current)
         XCTAssertFalse(FileManager.default.fileExists(atPath: TranscriptStore.folder(relativeTo: url).path))
 
-        try updated.saveCopy(to: url, copyingTranscriptsFrom: url, undo: [], redo: [],
+        try updated.saveCopy(to: url, copyingTranscriptsFrom: url, undo: [], redo: [], mediaSnapshot: .empty,
                              replacingExisting: true, expected: revision, assetData: [asset: bytes], check: {})
         XCTAssertEqual(try TranscriptStore.read(asset, relativeTo: url), bytes)
 
         let staleBytes = Data("stale transcript".utf8)
         let staleAsset = TranscriptStore.reference(for: staleBytes, relativeTo: url)
         updated.transcripts.attachments[0].asset = staleAsset
-        XCTAssertThrowsError(try updated.saveCopy(to: url, copyingTranscriptsFrom: url, undo: [], redo: [],
+        XCTAssertThrowsError(try updated.saveCopy(to: url, copyingTranscriptsFrom: url, undo: [], redo: [], mediaSnapshot: .empty,
                                                  replacingExisting: true, expected: revision,
                                                  assetData: [staleAsset: staleBytes], check: {})) {
             XCTAssertEqual(($0 as? CutError)?.code, "project_save_conflict")
@@ -275,7 +275,7 @@ final class TranscriptStoreTests: XCTestCase {
         let draftURL = draftFolder.appendingPathComponent("Untitled.cut")
         var recovery = project
         recovery.transcripts = try TranscriptStore.copy(in: project.transcripts, from: source, to: draftURL, draft: true)
-        try recovery.saveStaged(to: draftURL, undo: [], redo: [])
+        try recovery.saveStaged(to: draftURL, undo: [], redo: [], mediaSnapshot: .empty)
         let recovered = try CutProject.load(from: draftURL)
         XCTAssertEqual(recovered.transcripts.attachments.map(\.asset.unavailable), [.missing, .invalid])
 

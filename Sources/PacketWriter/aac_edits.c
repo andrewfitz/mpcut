@@ -794,3 +794,161 @@ int mpcut_restore_copied_aac(const char *source_path, int source_id, int sample_
     mpcut_aac_source_free(source);
     return status;
 }
+
+/* --- Chapter track ---
+ * The MOV muxer times its chapter track on the movie clock. At this writer's movie
+ * timescale a 32-bit sample duration holds about three seconds, so the muxer would
+ * drop every longer chapter. The writer therefore hands the muxer chapter times
+ * counted in milliseconds. This pass gives the finished track the clock those
+ * numbers were counted on and restates its length in movie time. */
+static int relabel_chapter_track(Box trak, uint32_t movie_timescale, uint64_t movie_duration, uint8_t **output) {
+    enum { CHAPTER_TIMESCALE = 1000 };
+    Box header, media, media_header;
+    uint32_t id, timescale;
+    size_t duration_offset, duration_width, media_offset, media_width;
+    if (!find_box(trak, BOX('t','k','h','d'), &header)
+        || !time_fields(header, 8, &id, &duration_offset, &duration_width)
+        || !find_box(trak, BOX('m','d','i','a'), &media)
+        || !find_box(media, BOX('m','d','h','d'), &media_header)
+        || !time_fields(media_header, 4, &timescale, &media_offset, &media_width)
+        || timescale != movie_timescale) {
+        return 0;
+    }
+    uint64_t length = media_width == 4 ? AV_RB32(media_header.begin + media_offset)
+                                       : AV_RB64(media_header.begin + media_offset);
+    uint64_t delay = 0;
+    Box edits, list;
+    if (find_box(trak, BOX('e','d','t','s'), &edits) && find_box(edits, BOX('e','l','s','t'), &list)) {
+        const uint8_t *p = list.payload;
+        size_t size = (size_t)(list.end - p);
+        if (size >= 8 && AV_RB32(p + 4) > 1) {
+            /* A first chapter that starts after zero is preceded by an empty edit. */
+            if (p[0] == 1 && size >= 28 && AV_RB64(p + 16) == UINT64_MAX)
+                delay = AV_RB64(p + 8);
+            else if (p[0] == 0 && size >= 20 && AV_RB32(p + 12) == UINT32_MAX)
+                delay = AV_RB32(p + 8);
+        }
+    }
+    if (!length || length > INT64_MAX / movie_timescale || delay > INT64_MAX / movie_timescale) {
+        return 0;
+    }
+    Edit entries[2];
+    AudioTrack layout = {.edits = entries};
+    int64_t start = av_rescale((int64_t)delay, movie_timescale, CHAPTER_TIMESCALE);
+    int64_t extent = av_rescale((int64_t)length, movie_timescale, CHAPTER_TIMESCALE);
+    if ((uint64_t)start >= movie_duration) {
+        extent = 1; /* Keep a chapter that begins on the movie's final tick. */
+    } else if ((uint64_t)extent > movie_duration - (uint64_t)start) {
+        extent = (int64_t)(movie_duration - (uint64_t)start); /* The last chapter ends with the movie. */
+    }
+    if (start > 0) {
+        entries[layout.count++] = (Edit){start, -1};
+    }
+    entries[layout.count++] = (Edit){extent, 0};
+
+    uint8_t *new_trak = *output;
+    AV_WB32(new_trak + 4, trak.type);
+    *output = new_trak + 8;
+    for (const uint8_t *next = trak.payload; next < trak.end;) {
+        Box child;
+        if (!next_box(&next, trak.end, &child)) {
+            return 0;
+        }
+        if (child.type == BOX('e','d','t','s')) {
+            continue;
+        }
+        if (child.begin == header.begin) {
+            *output += write_duration_header(*output, child, duration_offset, duration_width,
+                                             (uint64_t)(start + extent));
+            continue;
+        }
+        size_t size = (size_t)(child.end - child.begin);
+        memcpy(*output, child.begin, size);
+        if (child.begin == media.begin) {
+            AV_WB32(*output + (media_header.begin - media.begin) + media_offset - 4, CHAPTER_TIMESCALE);
+        }
+        *output += size;
+    }
+    *output = write_edits(*output, &layout);
+    AV_WB32(new_trak, (uint32_t)(*output - new_trak));
+    return 1;
+}
+
+static uint32_t track_id(Box trak) {
+    Box header;
+    uint32_t id;
+    size_t offset, width;
+    return find_box(trak, BOX('t','k','h','d'), &header) && time_fields(header, 8, &id, &offset, &width) ? id : 0;
+}
+
+int mpcut_mov_finish_chapters(const char *path, int movie_timescale, char *error, size_t cap) {
+    enum { GROWTH = 128 }; /* A 64-bit track header and a two-entry edit list. */
+    FILE *file = fopen(path, "r+b");
+    if (!file) {
+        return errorf(error, cap, "Cannot open movie to finish its chapter track: %s", path);
+    }
+    off_t offset = 0;
+    size_t original_size = 0;
+    uint8_t *original = NULL;
+    uint8_t *replacement = NULL;
+    uint8_t *output = NULL;
+    int ok = movie_timescale > 0 && locate_movie(file, 1, &offset, &original_size)
+        && original_size <= UINT32_MAX - GROWTH && !fseeko(file, offset, SEEK_SET);
+    if (ok) {
+        original = malloc(original_size);
+        replacement = malloc(original_size + GROWTH);
+        ok = original && replacement && fread(original, 1, original_size, file) == original_size;
+    }
+    const uint8_t *position = original;
+    Box moov = {0}, movie_header;
+    uint32_t timescale = 0, chapters = 0;
+    size_t duration_offset = 0, duration_width = 0;
+    ok = ok && next_box(&position, original + original_size, &moov)
+        && find_box(moov, BOX('m','v','h','d'), &movie_header)
+        && time_fields(movie_header, 4, &timescale, &duration_offset, &duration_width)
+        && timescale == (uint32_t)movie_timescale;
+    /* Every media track names the chapter track in a 'chap' reference. */
+    for (position = moov.payload; ok && !chapters && position < moov.end;) {
+        Box child, references, reference;
+        if (!next_box(&position, moov.end, &child)) {
+            ok = 0;
+        } else if (child.type == BOX('t','r','a','k') && find_box(child, BOX('t','r','e','f'), &references)
+                   && find_box(references, BOX('c','h','a','p'), &reference) && reference.end - reference.payload >= 4) {
+            chapters = AV_RB32(reference.payload);
+        }
+    }
+    ok = ok && chapters;
+    unsigned relabeled = 0;
+    if (ok) {
+        uint64_t movie_duration = duration_width == 4 ? AV_RB32(movie_header.begin + duration_offset)
+                                                      : AV_RB64(movie_header.begin + duration_offset);
+        AV_WB32(replacement + 4, moov.type);
+        output = replacement + 8;
+        for (position = moov.payload; ok && position < moov.end;) {
+            Box child;
+            if (!next_box(&position, moov.end, &child)) {
+                ok = 0;
+            } else if (child.type == BOX('t','r','a','k') && track_id(child) == chapters) {
+                ok = !relabeled++ && relabel_chapter_track(child, timescale, movie_duration, &output);
+            } else {
+                size_t size = (size_t)(child.end - child.begin);
+                memcpy(output, child.begin, size);
+                output += size;
+            }
+        }
+        ok = ok && relabeled == 1;
+    }
+    if (ok) {
+        size_t replacement_size = (size_t)(output - replacement);
+        AV_WB32(replacement, (uint32_t)replacement_size);
+        ok = !fseeko(file, offset, SEEK_SET)
+            && fwrite(replacement, 1, replacement_size, file) == replacement_size
+            && !fflush(file) && !ftruncate(fileno(file), offset + (off_t)replacement_size);
+    }
+    if (fclose(file)) {
+        ok = 0;
+    }
+    free(original);
+    free(replacement);
+    return ok ? 0 : errorf(error, cap, "Cannot finish the chapter track in %s", path);
+}

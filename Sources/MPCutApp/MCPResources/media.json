@@ -1,0 +1,424 @@
+[
+  {
+    "name": "project_editor_media_list",
+    "description": "List current project media references, their statuses and uses.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "description": "Opaque handle from project_windows_list.",
+          "minLength": 1
+        },
+        "offset": {
+          "type": "integer",
+          "description": "Zero-based page offset.",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Maximum number of media rows to return.",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Pin pagination to the revision from the previous page."
+        }
+      },
+      "required": [
+        "project_handle"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "project_editor_media_locate",
+    "description": "Search a folder for relink candidates. Poll analysis_job_status_read for candidate rows and use project_editor_media_relink to apply your choices.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "description": "Opaque handle from project_windows_list.",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "integer",
+          "description": "Revision from the editor state or the candidate receipt.",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "description": "Fresh UUID for this request. Reuse it to retry an identical request.",
+          "format": "uuid"
+        },
+        "folder": {
+          "type": "string",
+          "description": "Absolute path to the folder to search, including its subdirectories.",
+          "pattern": "^/"
+        }
+      },
+      "required": [
+        "project_handle",
+        "folder",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "project_editor_media_relink",
+    "description": "Relink one or more paths to the same media, including references in retained undo and redo history.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "description": "Opaque handle from project_windows_list.",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "integer",
+          "description": "Revision from the editor state or the candidate receipt.",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "description": "Fresh UUID for this request. Reuse it to retry an identical request.",
+          "format": "uuid"
+        },
+        "from": {
+          "type": "string",
+          "description": "Path returned by the project media list, or an absolute source path.",
+          "minLength": 1
+        },
+        "to": {
+          "type": "string",
+          "description": "Absolute path to the candidate media file.",
+          "pattern": "^/"
+        },
+        "mappings": {
+          "type": "array",
+          "description": "Explicit old-to-new path mappings.",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "string",
+                "description": "Path returned by the project media list, or an absolute source path.",
+                "minLength": 1
+              },
+              "to": {
+                "type": "string",
+                "description": "Absolute path to the candidate media file.",
+                "pattern": "^/"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "from_prefix": {
+          "type": "string",
+          "description": "Previous folder root.",
+          "pattern": "^/"
+        },
+        "to_prefix": {
+          "type": "string",
+          "description": "New folder root.",
+          "pattern": "^/"
+        },
+        "locate_job_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Use candidate generations from this completed locate job. Supply exact from and to paths from its candidate rows."
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "from",
+            "to"
+          ],
+          "not": {
+            "required": [
+              "mappings"
+            ]
+          },
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "from_prefix"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "to_prefix"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "required": [
+            "mappings"
+          ],
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "from"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "to"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "from_prefix"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "to_prefix"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "required": [
+            "from_prefix",
+            "to_prefix"
+          ],
+          "allOf": [
+            {
+              "not": {
+                "required": [
+                  "from"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "to"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "mappings"
+                ]
+              }
+            },
+            {
+              "not": {
+                "required": [
+                  "locate_job_id"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "project_editor_media_replace",
+    "description": "Preview the consequences of replacing a source. Set confirm to true to apply the replacement.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "description": "Opaque handle from project_windows_list.",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "integer",
+          "description": "Revision from the editor state or the candidate receipt.",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "description": "Fresh UUID for this request. Reuse it to retry an identical request.",
+          "format": "uuid"
+        },
+        "source": {
+          "type": "string",
+          "description": "Path returned by the project media list, or an absolute source path.",
+          "minLength": 1
+        },
+        "with": {
+          "type": "string",
+          "description": "Absolute path to the candidate media file.",
+          "pattern": "^/"
+        },
+        "conform": {
+          "type": "string",
+          "description": "Trim overlapping ranges to the new end, or keep affected ranges offline. Defaults to trim.",
+          "enum": [
+            "trim",
+            "keep"
+          ]
+        },
+        "allow_loss": {
+          "type": "boolean",
+          "description": "Approve the selected handling of ranges beyond the new end."
+        },
+        "confirm": {
+          "type": "boolean",
+          "description": "Apply the replacement. Omit or set false to preview."
+        },
+        "use_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Apply to one use ID from project_editor_media_list. Omit to replace all uses."
+        },
+        "loss": {
+          "type": "string",
+          "enum": [
+            "remove",
+            "keep_offline"
+          ],
+          "description": "Explicit treatment of uses starting beyond the new source extent."
+        },
+        "clock": {
+          "type": "string",
+          "enum": [
+            "source_relative",
+            "source_timecode"
+          ],
+          "description": "Preserve relative times or map cuts through comparable source clocks."
+        },
+        "stream_mapping": {
+          "type": "array",
+          "maxItems": 256,
+          "description": "Map selected old audio streams to candidate audio streams.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "to": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "reset_crop": {
+          "type": "boolean",
+          "description": "Reset authored still crop to fit the new image."
+        },
+        "replacement_offset": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact multicam source offset in seconds or as a rational."
+        },
+        "shared_time_of_day": {
+          "type": "boolean",
+          "description": "Confirm that comparable mixed clock kinds share a time of day."
+        },
+        "transcript": {
+          "type": "string",
+          "enum": [
+            "keep_unverified",
+            "retranscribe"
+          ],
+          "description": "Keep the transcript unverified or remove the affected binding for retranscription."
+        },
+        "resync": {
+          "type": "string",
+          "enum": [
+            "timecode",
+            "waveform"
+          ],
+          "description": "Recompute multicam alignment using the selected method."
+        },
+        "preview_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "Apply the exact reviewed preview. Repeat the same source, candidate and options with confirm true."
+        }
+      },
+      "required": [
+        "project_handle",
+        "source",
+        "with",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "preview_id"
+            ]
+          },
+          "then": {
+            "required": [
+              "confirm"
+            ],
+            "properties": {
+              "confirm": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    }
+  }
+]

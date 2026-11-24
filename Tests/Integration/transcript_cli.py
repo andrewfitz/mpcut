@@ -13,6 +13,7 @@ import sys
 import tempfile
 import uuid
 import wave
+from saved_project import read_project
 
 
 PROVIDER = """#!/usr/bin/env python3
@@ -51,7 +52,8 @@ Path(manifest["output"]).write_text(json.dumps(result))
 
 
 def exercise(cli, directory):
-    env = os.environ | {"MPCUT_TRANSCRIBERRR_HELPER": str(directory / "provider")}
+    env = os.environ | {"MPCUT_TRANSCRIBERRR_HELPER": str(directory / "provider"),
+                        "MPCUT_TRANSCRIPT_CLAIMS_HOME": str(directory / "claims")}
 
     def call(verb, *args, request=None, fail=None):
         cmd = [cli, "transcript", *verb.split(), "--json", *map(str, args)]
@@ -146,7 +148,7 @@ def exercise(cli, directory):
     result = call("edit apply", "--project", project, "--plan-file", plan_path, "--out-project", reviewed)
     assert result["history_action"] and project.read_bytes() == before_replay
     assert call("words read", "--project", reviewed, "--limit", 1)["total"] == 2
-    assert len(json.loads(reviewed.read_text())["history"]["undo"]) == 1
+    assert len(read_project(reviewed)["history"]["undo"]) == 1
 
     receipt = call("excerpt queue", request={"project_path": str(project), "out_project": "Expected benefit.cut",
                                      "request": {"action": "queue", "name": "Expected benefit", "selections": [selection]}})

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import wave
+from saved_project import read_project
 
 
 def exercise(cli, folder):
@@ -52,19 +53,19 @@ def exercise(cli, folder):
         results = list(executor.map(lambda _: author("create", create), range(2)))
     assert sum(result["ok"] for result in results) == 1
     assert next(result for result in results if not result["ok"])["error"]["code"] == "output_exists"
-    assert len(json.loads(raced.read_bytes())["clips"]) == 2
+    assert len(read_project(raced)["clips"]) == 2
 
     source = folder / "original.cut"
     create["out_project"] = str(source)
     assert author("create", create)["operation_count"] == 3
-    assert [clip["id"] for clip in json.loads(source.read_bytes())["clips"]] == ["b", "a"]
+    assert [clip["id"] for clip in read_project(source)["clips"]] == ["b", "a"]
 
     subdirectory = folder / "copies"
     subdirectory.mkdir()
     copy = subdirectory / "revised.cut"
     assert author("edit", {"project_path": str(source), "out_project": str(copy),
                            "operations": [{"action": "remove", "id": "b"}]})["ok"]
-    archive = json.loads(copy.read_bytes())
+    archive = read_project(copy)
     assert archive["clips"][0]["file"] == "../take.wav"
     assert len(archive["history"]["undo"]) == 1
 
@@ -76,7 +77,7 @@ def exercise(cli, folder):
     unchanged = folder / "multicam-copy.cut"
     assert author("edit", {"project_path": str(multicam), "out_project": str(unchanged),
                            "operations": [{"action": "move", "index": 0, "to_index": 0}]})["ok"]
-    assert json.loads(unchanged.read_bytes()) == json.loads(multicam.read_bytes())
+    assert read_project(unchanged) == read_project(multicam)
 
     with_sound = camera.with_name("Multicam-Delayed-PCM.mov")
     mix = folder / "mix.cut"
@@ -90,7 +91,7 @@ def exercise(cli, folder):
                                   "relative_offset": "1/8000", "uncovered": "keep_original"},
                                  {"action": "audio_set", "mode": "mix"}
                              ]})["ok"]
-    authored = json.loads(mix.read_bytes())
+    authored = read_project(mix)
     assert authored["audio"] == {"mode": "mix"}
     assert authored["fixed_audio"] == {"source_id": "A", "audio_stream_index": 1}
     assert authored["mix_lanes"][0]["target"] == {"kind": "camera", "angle_id": "A"}
@@ -110,7 +111,7 @@ def exercise(cli, folder):
     assert author("edit", {"project_path": str(mix), "out_project": str(restored), "operations": [
         {"action": "audio_set", "mode": "fixed"}, {"action": "audio_replacement_remove", "id": "donor"}
     ]})["ok"]
-    after = json.loads(restored.read_bytes())
+    after = read_project(restored)
     assert after["audio"] == {"mode": "fixed", "source_id": "A", "audio_stream_index": 1}
     assert after["mix_lanes"] == authored["mix_lanes"]
     assert not after.get("audio_replacements")
@@ -123,7 +124,7 @@ def exercise(cli, folder):
                                   "replacement_source_id": "sound", "replacement_stream_index": 0,
                                   "reference_source_id": "A", "relative_offset": "-1/10"}
                              ]})["ok"]
-    program_audio = json.loads(program.read_bytes())
+    program_audio = read_project(program)
     assert program_audio["audio"] == {"mode": "fixed", "source_id": "sound", "audio_stream_index": 0}
     assert program_audio["audio_sources"][0]["offset"] == "-1/20"
     suggest = subprocess.run([

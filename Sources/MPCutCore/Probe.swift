@@ -47,9 +47,10 @@ public struct StreamInfo: Encodable, Sendable {
     public let multipleDescriptions: Bool
     let complexPicture: Bool
     let reconstructedDTS: Bool
+    public internal(set) var name: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case index, kind, codec, profile, width, height, rotation, start, duration, channels, language, disposition
+        case index, kind, codec, profile, width, height, rotation, start, duration, channels, language, disposition, name
         case codecTag = "codec_tag"
         case displayWidth = "display_width"
         case displayHeight = "display_height"
@@ -189,8 +190,52 @@ public struct MediaInfo: Encodable, Sendable {
     private let videoIndex: Int
     private let metadataOnly: Bool
     let hasProvisionalClock: Bool
+    private(set) var isFromSavedIndex: Bool
     let refreshEvidence: MediaRefreshEvidence?
+    fileprivate(set) var snapshotSourceClock: ProjectMediaSnapshot.Entry.SourceClock?
+
+    var snapshotEvidence: MediaRefreshEvidence? {
+        guard let evidence = refreshEvidence, let changeTime = evidence.identity.changeTime,
+              identity.changeTime == changeTime, evidence.identity == identity,
+              evidence.hasCompleteProof else { return nil }
+        return evidence
+    }
     package let multicamClockOffset: RationalTime
+    // Desktop sources follow their owning document through Save As. This context
+    // is session state and is deliberately excluded from the media wire format.
+    private var sidecarDocument: @Sendable () -> URL?
+    package var sidecarProjectURL: URL? { sidecarDocument() }
+    package private(set) var sidecarWriteLocations: SidecarLocations?
+    package private(set) var sidecarClearEpoch: SidecarClearEpoch?
+
+    /// Pin a single operation before dispatch. The long-lived index remains reusable
+    /// when the user next requests analysis after clearing caches or changing locations.
+    package func pinningSidecarWrites() -> Self {
+        var copy = self
+        let locations = SidecarLocations(source: url, project: SidecarLocations.projectURL ?? sidecarProjectURL)
+        copy.sidecarWriteLocations = locations
+        copy.sidecarClearEpoch = locations.destination.map { SidecarClearEpoch.capture(sidecar: $0) }
+        return copy
+    }
+
+    package func inheritingSidecarContext(from original: Self) -> Self {
+        var copy = self
+        copy.sidecarDocument = original.sidecarDocument
+        copy.sidecarWriteLocations = original.sidecarWriteLocations
+        copy.sidecarClearEpoch = original.sidecarClearEpoch
+        if let originalChangeTime = original.identity.changeTime,
+           copy.identity == original.identity, copy.identity.changeTime == originalChangeTime {
+            copy.snapshotSourceClock = original.snapshotSourceClock
+            copy.isFromSavedIndex = copy.isFromSavedIndex || original.isFromSavedIndex
+        }
+        return copy
+    }
+
+    package func withSidecarDocument(_ document: @escaping @Sendable () -> URL?) -> Self {
+        var copy = self
+        copy.sidecarDocument = document
+        return copy
+    }
 
     public var hasVideo: Bool { videoIndex >= 0 }
     package var hasFullEditIndex: Bool {
@@ -222,7 +267,7 @@ public struct MediaInfo: Encodable, Sendable {
                   frames: [], audio: tracks, copyIssue: copyIssue, sourceStartSafe: sourceStartSafe,
                   identity: identity, videoIndex: videoIndex, timelineIssue: timelineIssue,
                   reportedContainers: reportedContainers, metadataOnly: metadataOnly, hasProvisionalClock: hasProvisionalClock,
-                  multicamClockOffset: multicamClockOffset, audioIssues: audioIssues, refreshEvidence: refreshEvidence)
+                  multicamClockOffset: multicamClockOffset, audioIssues: audioIssues, refreshEvidence: refreshEvidence).inheritingSidecarContext(from: self)
     }
 
     package func forRefreshAlias(_ url: URL) -> MediaInfo {
@@ -235,7 +280,7 @@ public struct MediaInfo: Encodable, Sendable {
                   frames: frames, audio: audio, copyIssue: copyIssue, sourceStartSafe: sourceStartSafe,
                   identity: refreshedIdentity ?? identity, videoIndex: videoIndex, timelineIssue: timelineIssue,
                   reportedContainers: reportedContainers, metadataOnly: metadataOnly, hasProvisionalClock: hasProvisionalClock,
-                  multicamClockOffset: multicamClockOffset, audioIssues: audioIssues, refreshEvidence: evidence)
+                  multicamClockOffset: multicamClockOffset, audioIssues: audioIssues, refreshEvidence: evidence).inheritingSidecarContext(from: self)
     }
 
     public var videoStream: StreamInfo? { hasVideo ? streams[videoIndex] : nil }
@@ -254,7 +299,9 @@ public struct MediaInfo: Encodable, Sendable {
          identity: SourceIdentity, videoIndex: Int, timelineIssue: String? = nil,
          reportedContainers: Set<String>? = nil, metadataOnly: Bool = false, hasProvisionalClock: Bool = false,
          multicamClockOffset: RationalTime = .zero, audioIssues: [Int: String] = [:],
-         refreshEvidence: MediaRefreshEvidence? = nil) {
+         refreshEvidence: MediaRefreshEvidence? = nil, isFromSavedIndex: Bool = false) {
+        let document = SidecarLocations.projectURL
+        sidecarDocument = { document }
         self.url = url
         self.audioIssues = audioIssues
         self.format = format
@@ -269,6 +316,7 @@ public struct MediaInfo: Encodable, Sendable {
         self.reportedContainers = reportedContainers
         self.metadataOnly = metadataOnly
         self.hasProvisionalClock = hasProvisionalClock
+        self.isFromSavedIndex = isFromSavedIndex
         self.refreshEvidence = refreshEvidence
         self.multicamClockOffset = multicamClockOffset
         self.identity = identity
@@ -287,7 +335,7 @@ public struct MediaInfo: Encodable, Sendable {
                          frames: frames, audio: audio, copyIssue: copyIssue, sourceStartSafe: sourceStartSafe,
                          identity: identity, videoIndex: videoIndex, timelineIssue: timelineIssue,
                          reportedContainers: reportedContainers, metadataOnly: metadataOnly, hasProvisionalClock: hasProvisionalClock,
-                         audioIssues: audioIssues, refreshEvidence: refreshEvidence)
+                         audioIssues: audioIssues, refreshEvidence: refreshEvidence).inheritingSidecarContext(from: self)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -440,8 +488,16 @@ enum Probe {
         }
         defer { mp_probe_free(pointer) }
         progress?(packetScanShare)
-        let media = try makeMedia(pointer.pointee, url: url, identity: before,
+        var media = try makeMedia(pointer.pointee, url: url, identity: before,
                                   keyframes: keyframes, previewOnly: previewOnly, progress: progress, cancelled: cancelled)
+        let stamp = pointer.pointee
+        let stampStream = Int(stamp.source_stamp_stream)
+        if stamp.source_stamp_kind > 0, media.streams.indices.contains(stampStream),
+           let clock = try? MulticamSync.stamp(status: stamp.source_stamp_kind, units: stamp.source_stamp_units,
+                                              numerator: stamp.source_stamp_num, denominator: stamp.source_stamp_den,
+                                              track: media.streams[stampStream], url: url) {
+            media.snapshotSourceClock = .init(kind: clock.kind, start: clock.start)
+        }
         guard before.isCurrentSnapshot(at: url) else {
             // Equality ignores ctime, so a match here means only metadata moved.
             if let after = try? SourceIdentity(url), after == before { throw MetadataChanged() }
@@ -697,7 +753,7 @@ private extension Probe {
                            origin: RationalTime, standalone: Bool, progress: (Int) -> Void, cancelled: (() -> Bool)?) throws -> AudioIndex {
         let sampleRate = Int64(max(1, stream.sampleRate))
         let samplePeriod = RationalTime(numerator: 1, denominator: sampleRate)
-        let useSampleClock = standalone && (stream.isPCM || stream.codec == "flac") && stream.timeBase > samplePeriod
+        let useSampleClock = (stream.codec == "flac" || (stream.isPCM && standalone)) && stream.timeBase > samplePeriod
         let pcmGapTolerance = stream.isPCM && !useSampleClock && stream.timeBase > samplePeriod
             ? try stream.timeBase.adding(RationalTime(numerator: 1, denominator: sampleRate * 2)) : .zero
         var start: RationalTime?
@@ -805,7 +861,8 @@ private extension Probe {
 
     static func describe(_ value: MPProbeStream, index: Int, base: RationalTime,
                          start: RationalTime, duration: RationalTime) -> StreamInfo {
-        StreamInfo(
+        let name = fixedString(value.name).trimmingCharacters(in: .whitespacesAndNewlines)
+        return StreamInfo(
             index: index, trackID: value.track_id, kind: string(value.kind), codec: string(value.codec),
             codecTag: fixedString(value.codec_tag),
             profile: Int(value.profile), width: Int(value.width), height: Int(value.height),
@@ -825,7 +882,8 @@ private extension Probe {
             fieldOrder: fieldOrder(value.field_order), chromaLocation: string(value.chroma_location),
             colorRange: string(value.range),
             configuration: data(value.config, size: value.config_size), codecMetadata: data(value.metadata, size: value.metadata_size),
-            multipleDescriptions: value.multiple_descriptions != 0, complexPicture: value.complex_picture != 0, reconstructedDTS: value.reconstructed_dts != 0)
+            multipleDescriptions: value.multiple_descriptions != 0, complexPicture: value.complex_picture != 0,
+            reconstructedDTS: value.reconstructed_dts != 0, name: name.isEmpty ? nil : name)
     }
 
     static func fieldOrder(_ value: Int32) -> String {

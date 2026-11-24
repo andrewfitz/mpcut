@@ -5,6 +5,13 @@ import Foundation
 /// through its documented Open Document and File > Export XML interfaces.
 public enum FCPLibraryInterchange {
     public static func read(_ url: URL, allowLoss: Bool, cancelled: @escaping @Sendable () -> Bool = { false }) throws -> (CutProject, [String]) {
+        let imported = try readDocument(url, allowLoss: allowLoss, cancelled: cancelled)
+        return (imported.project, imported.warnings)
+    }
+
+    package static func readDocument(_ url: URL, allowLoss: Bool,
+                                     cancelled: @escaping @Sendable () -> Bool) throws
+        -> (project: CutProject, warnings: [String], mediaSnapshot: ProjectMediaSnapshot) {
         try ProjectConverter.checkCancellation(cancelled)
         let library = url.standardizedFileURL
         guard try library.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
@@ -31,8 +38,9 @@ public enum FCPLibraryInterchange {
         guard !path.isEmpty else {
             throw CutError(code: "cancelled", message: "Final Cut Pro project selection was cancelled.")
         }
-        let (project, warnings) = try FCPInterchange.read(URL(fileURLWithPath: path), allowLoss: allowLoss)
-        return (project, warnings + ["Imported the selected Final Cut project snapshot at \(path). Other projects, events and library organization stay in the Final Cut library."])
+        let imported = try FCPInterchange.readDocument(URL(fileURLWithPath: path), allowLoss: allowLoss)
+        let warnings = imported.warnings + ["Imported the selected Final Cut project snapshot at \(path). Other projects, events and library organization stay in the Final Cut library."]
+        return (imported.project, warnings, imported.mediaSnapshot)
     }
 
     public static func write(_ project: CutProject, relativeTo location: URL, to output: URL,

@@ -107,6 +107,33 @@ final class SourceRangesTests: XCTestCase {
         XCTAssertTrue(AnalysisSidecar.isExcluded(file, in: editor.sidecarExclusions))
     }
 
+    func testCancelledSourceRangeRequestDoesNotReadOrEditMedia() async throws {
+        let editor = EditorModel()
+        defer { editor.endSession() }
+        let revision = editor.mcpRevision
+        let missing = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let range = try SequenceSourceRange(file: missing.path, from: .zero, to: .init(numerator: 1))
+        let select = try NamedSourceSelect(id: "cutaway", name: "Cutaway", range: range)
+        for saveSelect in [true, false] {
+            let request = Task { @MainActor in
+                withUnsafeCurrentTask { $0?.cancel() }
+                if saveSelect {
+                    try await editor.saveSourceSelect(select, expectedRevision: revision)
+                } else {
+                    try await editor.applySourceRanges([range], destination: .init(from: .zero, to: .zero),
+                                                       expectedRevision: revision)
+                }
+            }
+            do {
+                try await request.value
+                XCTFail("Expected cancellation before opening the missing recording")
+            } catch is CancellationError { }
+        }
+        XCTAssertEqual(editor.mcpRevision, revision)
+        XCTAssertTrue(editor.stillProject.sourceSelects.isEmpty)
+        XCTAssertTrue(editor.sequenceClips.isEmpty)
+    }
+
     private func fixture(_ name: String) throws -> URL {
         try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "mov", subdirectory: "Fixtures"))
     }

@@ -70,12 +70,34 @@ public final class ResolveExport {
         _ = try ProjectConverter.prepareForInterchange(project, for: "DaVinci Resolve timeline handoff", allowLoss: false)
     }
 
+    public static func write(_ project: CutProject, relativeTo location: URL, to output: URL,
+                             useSidecar: Bool = true, matching imported: [MediaInfo] = [],
+                             matchingMulticam indexed: [String: MediaInfo] = [:],
+                             auxiliaryOutput: ((URL) -> Void)? = nil,
+                             cancelled: (@Sendable () -> Bool)? = nil) throws {
+        try ProjectConverter.checkCancellation(cancelled ?? { false })
+        switch project {
+        case .multicam(let group):
+            try write(group, relativeTo: location, to: output, useSidecar: useSidecar, matching: indexed,
+                      auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
+        case .sequence, .stillSequence:
+            try validateTimelineHandoff(project)
+            let clips = project.sequenceClips ?? []
+            let sequence = CutProject.sequence(clips)
+            try InterchangeMediaPreflight.require(clips.map(\.file), relativeTo: location)
+            try write(sequence.requests(relativeTo: location), to: output, useSidecar: useSidecar, matching: imported,
+                      auxiliaryOutput: auxiliaryOutput, cancelled: cancelled)
+        }
+    }
+
     public static func write(_ project: MulticamProject, relativeTo location: URL, to output: URL,
                              useSidecar: Bool = true, matching imported: [String: MediaInfo] = [:],
                              auxiliaryOutput: ((URL) -> Void)? = nil,
                              cancelled: (@Sendable () -> Bool)? = nil) throws {
+        try ProjectConverter.checkCancellation(cancelled ?? { false })
         try validateTimelineHandoff(.multicam(project))
         let writer = try ResolveExport(output, useSidecar: useSidecar, cancelled: cancelled)
+        try InterchangeMediaPreflight.require(project.sources.map(\.file), relativeTo: location)
         try writer.multicam(project, location: location, imported: imported)
         if let audio = writer.audioDirectory { auxiliaryOutput?(audio) }
     }
@@ -83,8 +105,11 @@ public final class ResolveExport {
     public static func write(_ clips: [ClipRequest], to output: URL, useSidecar: Bool = true, matching imported: [MediaInfo] = [],
                              auxiliaryOutput: ((URL) -> Void)? = nil,
                              cancelled: (@Sendable () -> Bool)? = nil) throws {
+        try ProjectConverter.checkCancellation(cancelled ?? { false })
         let writer = try ResolveExport(output, useSidecar: useSidecar, cancelled: cancelled)
-        try writer.remember(imported)
+        try InterchangeMediaPreflight.require(clips.map(\.file))
+        let dependencies = Set(clips.map { $0.file.standardizedFileURL })
+        try writer.remember(imported.filter { dependencies.contains($0.url.standardizedFileURL) })
         try writer.sequence(clips)
         if let audio = writer.audioDirectory { auxiliaryOutput?(audio) }
     }
@@ -92,20 +117,34 @@ public final class ResolveExport {
     static func writeFCP(_ project: CutProject, relativeTo location: URL, to xml: URL,
                          package: URL?, allowLoss: Bool, isolateSequenceAudio: Bool = false,
                          preserveMulticamEditing: Bool = true,
+                         preserveSequenceMetadata: Bool = true,
                          auxiliaryOutput: ((URL) -> Void)? = nil,
                          cancelled: @escaping @Sendable () -> Bool = { false }) throws -> [String] {
         try ProjectConverter.checkCancellation(cancelled)
         try project.validate()
         let writer = try ResolveExport(xml, useSidecar: false, cancelled: cancelled)
+        let stillIDs = Set(project.stillInserts.map(\.assetID))
+        let stillFiles = project.stillAssets.filter { !$0.isGap && stillIDs.contains($0.id) }.map(\.file)
+        let recordingFiles: [String]
+        switch project {
+        case .sequence, .stillSequence:
+            let clips = project.sequenceClips ?? []
+            recordingFiles = clips.map(\.file) + (preserveSequenceMetadata ? clips.compactMap(\.originalFile) : [])
+        case .multicam(let group):
+            recordingFiles = group.sources.map(\.file)
+        }
+        try InterchangeMediaPreflight.require(recordingFiles + stillFiles, relativeTo: location)
         writer.fcpDocument = true
         writer.preserveMulticamEditing = preserveMulticamEditing
         writer.isolateSequenceAudio = isolateSequenceAudio
         writer.allowLoss = allowLoss
         writer.bundleDestination = package
-        writer.clipMetadata = try (project.sequenceClips ?? []).map { clip in
-            try FCPClipMetadata(id: clip.id, audioTrack: clip.audioTrack,
-                                originalFile: clip.originalFile.map { try CutProject.checkedMediaURL($0, relativeTo: location).path },
-                                replacementNames: clip.replacementNames)
+        if preserveSequenceMetadata {
+            writer.clipMetadata = try (project.sequenceClips ?? []).map { clip in
+                try FCPClipMetadata(id: clip.id, audioTrack: clip.audioTrack,
+                                    originalFile: clip.originalFile.map { try CutProject.checkedMediaURL($0, relativeTo: location).path },
+                                    replacementNames: clip.replacementNames)
+            }
         }
         switch project {
         case .sequence:

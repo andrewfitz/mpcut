@@ -118,7 +118,11 @@ extension AnalysisSidecar {
         guard !current || refresh?.force == true else { return saved }
 
         let previous = try generation(db)
-        try db.execute("CREATE TEMP TABLE retained_sections(name TEXT PRIMARY KEY)")
+        // A file from a build without this limit can hold a pause list for every setting
+        // ever tried. Apply the limit before a copy of each goes into the archive.
+        // The glob below covers both layouts of the name, `.v1.` and `.v2.`.
+        try Self.pruneSilenceResults(in: db)
+        try db.execute("DROP TABLE IF EXISTS temp.retained_sections; CREATE TEMP TABLE retained_sections(name TEXT PRIMARY KEY)")
         if let refresh {
             for key in refresh.preserving.sorted() where key != Self.evidenceKey && key != Self.silenceThresholdOverridesKey {
                 if let bytes = try verifiedSection(key, in: db, stamp: saved, maxBytes: nil, cancelled: cancelled) {
@@ -178,21 +182,26 @@ extension AnalysisSidecar {
 
     func currentGenerationEvidence() -> (current: Bool, evidence: Data?) {
         guard Self.readsEnabled, !isExcluded else { return (false, nil) }
-        do {
-            guard try exists() else { return (false, nil) }
-            let db = try SidecarDatabase(url, writing: false)
-            try db.execute("BEGIN")
-            try validate(db)
-            guard let stamp = try currentStamp(db) else { return (false, nil) }
-            let evidence = try? verifiedSection(Self.evidenceKey, in: db, stamp: stamp,
-                                                maxBytes: Self.evidenceLimit, cancelled: { Task.isCancelled })
-            try checkSource()
-            return (true, evidence)
-        } catch { return (false, nil) }
+        let copies = readSnapshots(orderedBy: Self.evidenceKey)
+        guard !copies.isEmpty else { return (false, nil) }
+        for copy in copies {
+            guard let bytes = try? verifiedSection(Self.evidenceKey, in: copy.db, stamp: copy.stamp,
+                                                   maxBytes: Self.evidenceLimit, cancelled: { Task.isCancelled }) else { continue }
+            if copies.count > 1, MediaRefreshEvidence.decode(bytes) == nil { continue }
+            guard (try? checkSource()) != nil else { return (false, nil) }
+            return (true, bytes)
+        }
+        return ((try? checkSource()) != nil, nil)
     }
 
     public func previousGenerationSnapshot() -> (evidence: Data, keys: Set<String>)? {
         guard Self.readsEnabled, !isExcluded else { return nil }
+        if physicalURL == nil {
+            for copy in readSnapshots(orderedBy: Self.evidenceKey, includeStale: true) {
+                if let snapshot = copy.store.previousGenerationSnapshot() { return snapshot }
+            }
+            return nil
+        }
         do {
             guard try exists() else { return nil }
             try checkSource()
@@ -242,6 +251,7 @@ extension AnalysisSidecar {
     }
 
     public func persistedGenerations() -> [PersistedGeneration] {
+        if physicalURL == nil { return readSnapshots(includeStale: true).first?.store.persistedGenerations() ?? [] }
         guard !isExcluded else { return [] }
         do {
             guard try exists() else { return [] }
@@ -271,7 +281,11 @@ extension AnalysisSidecar {
 
     package struct InventorySnapshot {
         package let status: String
+        package var locations: [URL] = []
+        package var location: URL? { locations.first }
         package var sections: [String] = []
+        package var hasCompleteIndex = false
+        package var staleReason: String?
         package var generations: [PersistedGeneration] = []
         package var attempts: [PersistedSceneAttempt] = []
     }
@@ -279,23 +293,66 @@ extension AnalysisSidecar {
     /// A refresh can archive keys and publish a new scene generation in one commit.
     /// Inspect all three inventories in that same SQLite snapshot.
     package static func inventorySnapshot(source: URL) -> InventorySnapshot {
-        inspectInventory(source: source, store: try? AnalysisSidecar(source: source), includeHistory: true)
+        inventorySnapshot(source: source, store: try? AnalysisSidecar(source: source))
+    }
+
+    static func inventorySnapshot(source: URL, store: AnalysisSidecar?) -> InventorySnapshot {
+        if let store {
+            var unresolved: [URL] = []
+            let copies = store.readSnapshots(includeStale: true) { unresolved = $0 }
+            if !unresolved.isEmpty {
+                return .init(status: "stale", locations: unresolved,
+                             staleReason: "Cached stream evidence differs across sidecars. Refresh the source to verify its current contents.")
+            }
+            let previews = copies.map { snapshot(db: $0.db, location: $0.store.url, store: store, includeHistory: true) }
+            if var result = previews.first(where: { $0.status == "current" }) {
+                var names = Set(result.sections), seen = Set(result.attempts.map(\.id))
+                for other in previews where other.status == "current" && other.location != result.location {
+                    result.locations.append(contentsOf: other.locations)
+                    names.formUnion(other.sections)
+                    result.hasCompleteIndex = result.hasCompleteIndex || other.hasCompleteIndex
+                    result.attempts += other.attempts.filter { seen.insert($0.id).inserted }
+                }
+                result.sections = names.sorted()
+                return result
+            }
+            if let stale = previews.first(where: { $0.status == "stale" }) { return stale }
+            if let failure = previews.first { return failure }
+        }
+        let paths = store?.locations.candidates ?? SidecarLocations(source: source).candidates
+        var firstFailure: InventorySnapshot?
+        for path in paths {
+            let result = inspectInventory(source: source, url: path, store: store, includeHistory: true)
+            if ["current", "stale", "offline", "excluded"].contains(result.status) { return result }
+            if result.status != "missing" && firstFailure == nil { firstFailure = result }
+        }
+        return firstFailure ?? .init(status: "missing")
     }
 
     package func savedSectionInventory() -> InventorySnapshot {
-        Self.inspectInventory(source: source, store: self, includeHistory: false)
+        Self.inspectInventory(source: source, url: url, store: self, includeHistory: false)
     }
 
-    private static func inspectInventory(source: URL, store: AnalysisSidecar?, includeHistory: Bool) -> InventorySnapshot {
+    private static func inspectInventory(source: URL, url: URL, store: AnalysisSidecar?, includeHistory: Bool) -> InventorySnapshot {
         guard source.isFileURL else { return .init(status: "unreadable") }
         let source = source.standardizedFileURL
         if isExcluded(source, in: excludedSources) { return .init(status: "excluded") }
-        let url = url(for: source)
         do {
             guard try exists(url, sourceIdentity: store?.identity) else { return .init(status: "missing") }
             let db = try SidecarDatabase(url, writing: false)
             try db.execute("BEGIN")
             try validate(db, at: url)
+            try checkLocation(url, in: db, locations: store?.locations ?? SidecarLocations(source: source))
+            return snapshot(db: db, location: url, store: store, includeHistory: includeHistory)
+        } catch let error as CutError where error.code == "unsupported_sidecar" {
+            return .init(status: "unsupported", locations: [url])
+        } catch {
+            return .init(status: "unreadable", locations: [url])
+        }
+    }
+
+    private static func snapshot(db: SidecarDatabase, location: URL, store: AnalysisSidecar?, includeHistory: Bool) -> InventorySnapshot {
+        do {
             let matching: Bool
             if let store {
                 matching = try store.currentStamp(db) != nil
@@ -304,9 +361,10 @@ extension AnalysisSidecar {
                 matching = false
             }
             let names = try matching && readsEnabled ? sectionNames(in: db) : []
-            let current = matching && store?.identity.isCurrentSnapshot(at: source) == true
+            let current = matching && (store.map { $0.identity.isCurrentSnapshot(at: $0.source) } ?? false)
             let status = store == nil ? "offline" : (current ? "current" : "stale")
-            var result = InventorySnapshot(status: status, sections: current ? names : [])
+            var result = InventorySnapshot(status: status, locations: [location], sections: current ? names : [],
+                                           hasCompleteIndex: current && indexKeys.isSubset(of: names))
             if includeHistory {
                 result.generations = try persistedGenerations(in: db, current: current)
                 result.attempts = try persistedSceneAttempts(in: db, current: current)
@@ -327,6 +385,10 @@ extension AnalysisSidecar {
 
     public func readArchived(_ key: String, generation: Int64, maxBytes: Int? = nil,
                              cancelled: () -> Bool = { Task.isCancelled }) -> Data? {
+        if physicalURL == nil {
+            return readSnapshots(includeStale: true).first?.store.readArchived(key, generation: generation, maxBytes: maxBytes,
+                                                                              cancelled: cancelled)
+        }
         guard !isExcluded, Self.validKey(key), !cancelled() else { return nil }
         do {
             guard try exists() else { return nil }

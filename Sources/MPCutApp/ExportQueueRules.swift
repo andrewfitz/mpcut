@@ -66,27 +66,36 @@ struct ExportQueueChoices {
 extension EditorModel {
     /// Checks the queued ranges with these settings: nil, or the failure with the alternatives of the export rules.
     func checkQueuedRanges(options: ExportSheetOptions) async -> CutError? {
-        if let issue = queuedMediaRefreshIssue() { return issue }
-        let ranges = queuedRanges
+        if case .failure(let issue) = await reviewQueuedRanges(options: options) { return issue }
+        return nil
+    }
+
+    func reviewQueuedRanges(options: ExportSheetOptions) async -> Result<String?, CutError> {
+        let ranges = readyQueuedRanges
+        guard !ranges.isEmpty else { return .failure(noReadyQueueEntries) }
         let useSidecar = useAnalysisSidecars
         let excludedSources = sidecarExclusions
-        let task = Task.detached(priority: .userInitiated) { () -> CutError? in
+        let task = sidecarWork.detached(priority: .userInitiated) { () -> Result<String?, CutError> in
             let scratch = FileManager.default.temporaryDirectory
                 .appendingPathComponent("mpcut-queue-check-\(UUID())", isDirectory: true)
             do {
                 try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: false)
                 defer { try? FileManager.default.removeItem(at: scratch) }
-                try AnalysisSidecar.$excludedSources.withValue(excludedSources) {
+                let batch = try AnalysisSidecar.$excludedSources.withValue(excludedSources) {
                     try AnalysisSidecar.$readsEnabled.withValue(useSidecar) {
-                        _ = try SequenceQueuePlan(ranges, directory: scratch, options: options, useSidecar: useSidecar,
-                                                  cancelled: { Task.isCancelled })
+                        try SequenceQueuePlan(ranges, directory: scratch, options: options, useSidecar: useSidecar,
+                                              cancelled: { Task.isCancelled })
                     }
                 }
-                return nil
+                let summaries = batch.items.compactMap { item -> String? in
+                    guard case .still(let plan) = item.payload else { return nil }
+                    return "\(item.output.lastPathComponent)\n\(plan.inspectorSummary)"
+                }
+                return .success(summaries.isEmpty ? nil : summaries.joined(separator: "\n\n"))
             } catch let issue as CutError {
-                return issue
+                return .failure(issue)
             } catch {
-                return CutError(code: "export_failed", message: error.localizedDescription)
+                return .failure(CutError(code: "export_failed", message: error.localizedDescription))
             }
         }
         return await withTaskCancellationHandler {
@@ -166,7 +175,8 @@ struct SequenceQueuePlan: Sendable {
     private let cancelled: @Sendable () -> Bool
 
     init(_ ranges: [QueuedRange], directory: URL, options: ExportSheetOptions, useSidecar: Bool = true,
-         ordinaryModeWhenUnspecified: ExportMode? = nil, cancelled: @escaping @Sendable () -> Bool) throws {
+         ordinaryModeWhenUnspecified: ExportMode? = nil, audioAction: ReencodeAudio? = nil,
+         cancelled: @escaping @Sendable () -> Bool) throws {
         self.directory = directory
         organization = options.organization
         self.useSidecar = useSidecar
@@ -216,7 +226,12 @@ struct SequenceQueuePlan: Sendable {
                     try verifyQueuedStillSources(range.media.values)
                     var requested = options
                     requested.placements = range.placements
-                    let plan = try requested.planStills(project, useSidecar: useSidecar, cancelled: cancelled)
+                    requested.pictureTiming = requested.pictureTiming ?? range.pictureTiming
+                    let expectedSoundtrackIdentity = project.stillSoundtrack.flatMap {
+                        range.media[URL(fileURLWithPath: $0.file)]?.identity
+                    }
+                    let plan = try requested.planStills(project, useSidecar: useSidecar, audioAction: audioAction,
+                                                         expectedSoundtrackIdentity: expectedSoundtrackIdentity, cancelled: cancelled)
                     try verifyQueuedStillSources(range.media.values)
                     let output = try organization.destination(in: folder, stem: entryStem, suffix: suffix, container: plan.container)
                     try destinationCheck.checkDestination(output, plannedSubfolder: plannedSubfolder)

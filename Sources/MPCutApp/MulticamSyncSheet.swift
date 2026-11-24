@@ -13,7 +13,7 @@ extension MulticamEditorModel {
             analysis.completedWaveform(sourceID: query.referenceSourceID, stream: $0)
         }
         let protected = AnalysisSidecar.excludedSources.union(sidecarExclusions).union([incoming.url])
-        let task = Task.detached(priority: .userInitiated) {
+        let task = sidecarWork.detached(priority: .userInitiated) {
             try AnalysisSidecar.$excludedSources.withValue(protected) {
                 try AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
                     try MulticamSync.analyzeReplacement(project, request: query, relativeTo: location,
@@ -35,7 +35,7 @@ extension MulticamEditorModel {
         let indexed = media
         let useSidecar = useAnalysisSidecars
         let protected = AnalysisSidecar.excludedSources.union(sidecarExclusions)
-        let task = Task.detached(priority: .userInitiated) {
+        let task = sidecarWork.detached(priority: .userInitiated) {
             try AnalysisSidecar.$excludedSources.withValue(protected) {
                 try AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
                     try MulticamSync.analyze(project, relativeTo: location, indexed: indexed, sourceID: sourceID,

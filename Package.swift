@@ -63,7 +63,9 @@ let package = Package(
         .executableTarget(name: "MPCutApp", dependencies: ["MPCutCore", "FFPreview"],
                           resources: [.copy("MCPResources")], swiftSettings: tileTrailSwiftSettings),
         .testTarget(name: "MPCutCoreTests", dependencies: ["MPCutCore"], swiftSettings: tileTrailSwiftSettings),
-        .testTarget(name: "MPCutAppTests", dependencies: ["MPCutApp"],
+        // Sets MPCUT_MUTED=1 as the app test bundle loads, so in-process tests are never heard.
+        .target(name: "MPCutTestSupport", path: "Tests/MPCutTestSupport"),
+        .testTarget(name: "MPCutAppTests", dependencies: ["MPCutApp", "MPCutTestSupport"],
                     resources: [.copy("Fixtures")], swiftSettings: tileTrailSwiftSettings)
     ]
 )

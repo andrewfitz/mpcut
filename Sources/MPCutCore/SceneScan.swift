@@ -80,6 +80,7 @@ private struct SceneScanRecord {
     var markers: [SceneStart] = []
     var outcome: SceneScanOutcome?
     var durableCheckpointDigest: SHA256.Digest?
+    var cacheEpoch: SidecarClearEpoch?
 
     var reportMarkers: [SceneStart] {
         if let leading = checkpoint?.leading { return [leading] + markers }
@@ -120,6 +121,7 @@ public final class SceneScanSession: @unchecked Sendable {
         guard let request = try? SceneRequest(media, scope: .fullSource) else { return }
         lock.lock()
         defer { lock.unlock() }
+        discardCleared(request.key)
         touch(request.key)
         editedNames[request.key, default: [:]].updateValue(name, forKey: view)
         if var record = completed[request.key], let outcome = record.outcome, var report = outcome.report {
@@ -139,6 +141,21 @@ public final class SceneScanSession: @unchecked Sendable {
             operations.removeValue(forKey: expired)
             editedNames.removeValue(forKey: expired)
         }
+    }
+
+    /// A different editor or process can explicitly clear a paused or completed
+    /// result. Its session copy cannot be replayed or saved again afterward.
+    fileprivate func discardCleared(_ key: SceneScanKey) {
+        let epochs = Set([completed[key]?.cacheEpoch, partial[key]?.cacheEpoch].compactMap { $0 })
+            .union(operations[key]?.values.compactMap(\.cacheEpoch) ?? [])
+        let cleared = epochs.filter { (try? $0.check()) == nil }
+        guard !cleared.isEmpty else { return }
+        if let epoch = completed[key]?.cacheEpoch, cleared.contains(epoch) {
+            completed.removeValue(forKey: key)
+            editedNames.removeValue(forKey: key)
+        }
+        if let epoch = partial[key]?.cacheEpoch, cleared.contains(epoch) { partial.removeValue(forKey: key) }
+        operations[key] = operations[key]?.filter { $0.value.cacheEpoch.map(cleared.contains) != true }
     }
 }
 
@@ -366,7 +383,8 @@ extension SceneAnalysis {
                 progress?(state)
                 return SceneScanOutcome(state: .paused, report: nil, progress: state)
             }
-            return try run(exact, scope: scope, policy: policy, useSidecar: useSidecar, session: session,
+            return try run(exact.inheritingSidecarContext(from: media),
+                           scope: scope, policy: policy, useSidecar: useSidecar, session: session,
                            allowAutomaticSave: allowAutomaticSave, cancelled: cancelled, progress: progress,
                            onScene: onScene, onReset: onReset)
         }
@@ -409,6 +427,7 @@ extension SceneAnalysis {
 
         let canWrite = AnalysisSidecar.automaticWritesEnabled
         let permission = SceneScanWritePermission(allowed: allowAutomaticSave)
+        let storageDirectory = SidecarLocations.storageDirectory
         DispatchQueue.global(qos: .userInitiated).async {
             func publish(_ state: SceneScanProgress, _ markers: [SceneStart], _ reset: Bool) {
                 session.lock.lock()
@@ -425,8 +444,10 @@ extension SceneAnalysis {
                 return work.stopping
             }
             let result = Result {
-                try perform(request, policy: policy, cache: cache, session: session, verifiedClock: verifiedClock,
-                            allowSave: { canWrite && permission.allowed() }, cancelled: shouldStop, publish: publish)
+                try SidecarLocations.$storageDirectory.withValue(storageDirectory) {
+                    try perform(request, policy: policy, cache: cache, session: session, verifiedClock: verifiedClock,
+                                allowSave: { canWrite && permission.allowed() }, cancelled: shouldStop, publish: publish)
+                }
             }
             session.lock.lock()
             work.result = result
@@ -462,6 +483,7 @@ extension SceneAnalysis {
         if let report = cachedResult(request, cache: cache, session: session, policy: policy) { return report }
         guard includePartial else { return nil }
         session.lock.lock()
+        session.discardCleared(request.key)
         let local = session.partial[request.key]?.outcome
         session.lock.unlock()
         if let local { return local }
@@ -516,7 +538,7 @@ extension SceneAnalysis {
 
     private static func sidecar(for media: MediaInfo, enabled: Bool) -> AnalysisSidecar? {
         guard enabled, AnalysisSidecar.readsEnabled, !AnalysisSidecar.isExcluded(media.url, in: AnalysisSidecar.excludedSources) else { return nil }
-        return AnalysisSidecar(source: AnalysisSidecar.canonicalSource(media.url), identity: media.identity)
+        return AnalysisSidecar(media: media, source: AnalysisSidecar.canonicalSource(media.url))
     }
 
     private static func compatible(_ running: SceneScanPolicy, _ requested: SceneScanPolicy) -> Bool {
@@ -583,6 +605,8 @@ extension SceneAnalysis {
         guard policy == .reuse else { return nil }
         let fullRequest = try? SceneRequest(request.media, scope: .fullSource)
         session.lock.lock()
+        session.discardCleared(request.key)
+        if let fullRequest, fullRequest.key != request.key { session.discardCleared(fullRequest.key) }
         let currentRecord = session.completed[request.key]
         let current = currentRecord?.outcome
         if current != nil || session.partial[request.key] != nil { session.touch(request.key) }
@@ -738,6 +762,7 @@ extension SceneAnalysis {
         }
 
         session.lock.lock()
+        session.discardCleared(request.key)
         let operation: String?
         let local: SceneScanRecord?
         if case let .restart(operationID) = policy {
@@ -762,6 +787,7 @@ extension SceneAnalysis {
 
         let owner = UUID().uuidString
         var claim: SceneAttemptClaim?
+        var cacheEpoch = cache?.clearEpoch
         var writeError: String?
         var durable: RationalTime?
         var storedCount = 0
@@ -793,6 +819,7 @@ extension SceneAnalysis {
                     }
                 } while claim == nil
                 if let claim {
+                    cacheEpoch = cache.pinned(to: claim.database).clearEpoch
                     stored = cache.sceneAttempt(claim).flatMap { decode($0, operationID: operation) }
                     if claim.superseded {
                         throw CutError(code: "operation_superseded", message: "This restart was superseded by a newer scene scan.")
@@ -994,6 +1021,7 @@ extension SceneAnalysis {
         let outcome = SceneScanOutcome(state: paused ? .paused : .completed, report: report, progress: final)
         record.outcome = outcome
         record.durableCheckpointDigest = durableCheckpointDigest
+        record.cacheEpoch = cacheEpoch
         session.lock.lock()
         session.touch(request.key)
         if paused { session.partial[request.key] = record }
@@ -1019,10 +1047,11 @@ extension SceneAnalysis {
                                       session: SceneScanSession = .shared) throws -> SceneScanProgress? {
         let request = try SceneRequest(media, scope: scope)
         session.lock.lock()
+        session.discardCleared(request.key)
         let record = session.partial[request.key]
         session.lock.unlock()
         guard let record, let checkpoint = record.checkpoint else { return nil }
-        let cache = AnalysisSidecar(source: AnalysisSidecar.canonicalSource(media.url), identity: media.identity)
+        let cache = AnalysisSidecar(media: media, source: AnalysisSidecar.canonicalSource(media.url))
         return try AnalysisSidecar.$readsEnabled.withValue(true) {
             try AnalysisSidecar.$automaticWritesEnabled.withValue(true) {
                 var operation = record.operationID
@@ -1060,6 +1089,7 @@ extension SceneAnalysis {
                                                 durable: checkpoint.decoded)
                 var updated = record
                 updated.operationID = operation
+                updated.cacheEpoch = cache.pinned(to: claim.database).clearEpoch
                 updated.durableCheckpointDigest = SHA256.hash(data: payload)
                 updated.outcome = SceneScanOutcome(state: .paused, report: nil, progress: progress)
                 session.lock.lock()

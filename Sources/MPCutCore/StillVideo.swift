@@ -93,9 +93,25 @@ struct StillVideoGenerator {
         let directory = output.deletingLastPathComponent()
         let filters = settings.packetFilters
         let packetArguments = filters.isEmpty ? [] : ["-bsf:v", filters.joined(separator: ",")]
-        try ReencodeEngine(cancelled: cancelled).runHelper(helper, arguments: ["-xerror"] + input
-            + settings.outputArguments + packetArguments + ["-frames:v", String(schedule.count), "-n", output.path],
+        let processor = ReencodeEngine(cancelled: cancelled)
+        let writesJPEG = settings.codec == "mjpeg"
+        let encoded = writesJPEG ? directory.appendingPathComponent("still-encoded-\(UUID().uuidString).mov") : output
+        defer { if writesJPEG { try? FileManager.default.removeItem(at: encoded) } }
+        try processor.runHelper(helper, arguments: ["-xerror"] + input
+            + settings.outputArguments + packetArguments + ["-frames:v", String(schedule.count), "-n", encoded.path],
             in: directory, timeout: timeout, duration: schedule.duration)
+        if writesJPEG {
+            // The software MJPEG encoder omits color metadata from its output
+            // parameters. Write the authored color description during stream copy.
+            let arguments = ["-xerror", "-copyts", "-i", encoded.path, "-map", "0:v:0", "-c:v", "copy",
+                             "-color_range", settings.range, "-color_primaries", settings.primaries,
+                             "-color_trc", settings.transfer, "-colorspace", settings.matrix,
+                             "-movflags", "+write_colr", "-video_track_timescale", String(settings.timescale),
+                             "-movie_timescale", String(settings.timescale), "-use_editlist", "0",
+                             "-write_tmcd", "0", "-n", output.path]
+            try processor.runHelper(helper, arguments: arguments, in: directory,
+                                    timeout: timeout, duration: schedule.duration)
+        }
         if schedule.requiresRetime(at: stagingCadence(for: schedule, timescale: settings.timescale)) {
             try ReencodeEngine(cancelled: cancelled).checkCancellation()
             try MulticamMOV.retimeStill(output, schedule: schedule, timescale: settings.timescale)
@@ -186,7 +202,7 @@ struct StillVideoGenerator {
     }
 
     private struct CacheParameters: Encodable {
-        let policyVersion = 4
+        let policyVersion = 5
         let framing: StillImageFraming
         let width: Int
         let height: Int
@@ -289,7 +305,7 @@ extension StillVideoGenerator {
                 throw Self.unsupported("This picture geometry, stream layout, metadata or output container needs conversion.")
             }
             timescale = video.timeBase.denominator
-            range = normalized(policy?.range ?? video.colorRange, fallback: "tv")
+            range = video.codec == "mjpeg" ? "pc" : normalized(policy?.range ?? video.colorRange, fallback: "tv")
             matrix = normalized(policy?.matrix ?? video.colorMatrix, fallback: hdr ? "bt2020nc" : "bt709")
             guard ["tv", "pc"].contains(range), ["bt709", "smpte170m", "bt470bg", "bt2020nc"].contains(matrix) else {
                 throw Self.unsupported("The camera color matrix or range is unsupported.")
@@ -302,9 +318,15 @@ extension StillVideoGenerator {
             }
             codec = video.codec
             tag = video.codecTag
-            profile = video.profile
+            profile = codec == "mjpeg" ? nil : video.profile
             depth = video.bitDepth
             switch (video.codec, video.profile, hdr) {
+            case ("mjpeg", _, false) where container == "mov" && tag == "jpeg" && depth == 8:
+                profileName = nil
+                // AVPlayer's Photo JPEG path accepts 4:2:0 pictures.
+                pixelFormat = "yuvj420p"
+                chroma = 420
+                chromaLocation = nil
             case ("prores", 2, _) where container == "mov" && tag == "apcn" && depth == 10 && (!hdr || standalone):
                 profileName = "standard"
                 pixelFormat = "p210le"
@@ -359,6 +381,8 @@ extension StillVideoGenerator {
             if let profileName {
                 result += ["-c:v", "\(codec)_videotoolbox", "-allow_sw", "0", "-profile:v", profileName, "-bf", "0"]
                 if codec != "prores" { result += ["-g", "60", "-q:v", "75"] }
+            } else if codec == "mjpeg" {
+                result += ["-c:v", "mjpeg", "-q:v", "2"]
             } else {
                 result += ["-c:v", "rawvideo"]
             }

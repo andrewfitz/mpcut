@@ -810,7 +810,7 @@
         },
         "clip_id": {
           "type": "string",
-          "format": "uuid",
+          "minLength": 1,
           "description": "Stable sequence occurrence ID in the saved project."
         },
         "camera_id": {
@@ -1135,7 +1135,7 @@
   },
   {
     "name": "analysis_file_sidecar_inspect",
-    "description": "Inspect the analysis sections saved beside a recording. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
+    "description": "Inspect the analysis sections available for a recording. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1148,6 +1148,11 @@
           "type": "string",
           "pattern": "^/",
           "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Optional absolute path to a saved project for project-folder cache lookup and storage."
         },
         "file": {
           "type": "string",
@@ -1167,7 +1172,7 @@
   },
   {
     "name": "analysis_file_sidecar_build",
-    "description": "Build selected analysis sections beside a recording. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
+    "description": "Build selected analysis sections in the configured sidecar location. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1180,6 +1185,11 @@
           "type": "string",
           "pattern": "^/",
           "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Optional absolute path to a saved project for project-folder cache lookup and storage."
         },
         "file": {
           "type": "string",
@@ -1292,7 +1302,8 @@
           "enum": [
             "h264",
             "hevc",
-            "prores"
+            "prores",
+            "jpeg"
           ]
         },
         "quality": {
@@ -1316,7 +1327,8 @@
             "remove",
             "mp3",
             "flac",
-            "opus"
+            "opus",
+            "alac"
           ]
         },
         "snap": {
@@ -1340,6 +1352,30 @@
             "downmix_stereo"
           ],
           "description": "Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track."
+        },
+        "still_timing": {
+          "type": "string",
+          "enum": [
+            "cadence",
+            "held"
+          ],
+          "description": "Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule."
+        },
+        "container": {
+          "type": "string",
+          "enum": [
+            "mov",
+            "mp4",
+            "m4v",
+            "mkv",
+            "m4a",
+            "mka",
+            "wav",
+            "wave",
+            "caf",
+            "flac"
+          ],
+          "description": "Explicit container for a still project export. Match the destination filename extension and selected tracks."
         }
       },
       "additionalProperties": false,
@@ -2869,7 +2905,7 @@
   },
   {
     "name": "still_file_project_create",
-    "description": "Run still project create on a saved project. See cli_help_read for timing and destination options.",
+    "description": "Create a new still-only project, optionally with a recording at program zero. See cli_help_read for timeline and destination options.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -2908,14 +2944,17 @@
           "enum": [
             "h264",
             "hevc",
-            "prores"
+            "prores",
+            "jpeg"
           ]
         },
         "container": {
           "type": "string",
           "enum": [
+            "mov",
             "mp4",
-            "mov"
+            "m4v",
+            "mkv"
           ]
         },
         "background": {
@@ -2938,6 +2977,29 @@
         },
         "rate": {
           "type": "string"
+        },
+        "soundtrack": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the recording."
+        },
+        "audio_stream": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional absolute audio stream index. Defaults to the first audio stream."
+        },
+        "from": {
+          "type": "string",
+          "description": "Optional source in-point on an audio sample boundary, as exact rational seconds."
+        },
+        "to": {
+          "type": "string",
+          "description": "Optional source out-point on an audio sample boundary, as exact rational seconds."
+        },
+        "fit_soundtrack": {
+          "type": "boolean",
+          "const": true,
+          "description": "Fit the single image to the recording’s exact audible duration in the same edit."
         }
       },
       "required": [
@@ -2945,9 +3007,7 @@
         "out_project",
         "width",
         "height",
-        "rate",
-        "codec",
-        "container"
+        "rate"
       ],
       "additionalProperties": false,
       "allOf": [
@@ -2976,7 +3036,190 @@
               "required": [
                 "frames"
               ]
+            },
+            {
+              "required": [
+                "fit_soundtrack",
+                "image",
+                "soundtrack"
+              ]
             }
+          ]
+        }
+      ],
+      "dependentRequired": {
+        "audio_stream": [
+          "soundtrack"
+        ],
+        "from": [
+          "soundtrack"
+        ],
+        "to": [
+          "soundtrack"
+        ]
+      }
+    }
+  },
+  {
+    "name": "still_file_soundtrack_detach",
+    "description": "Detach the recording from a still-only sequence and keep its picture timing. Returns a file job receipt.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "out_project": {
+          "type": "string"
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "in_place": {
+          "type": "boolean",
+          "const": true
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "still_file_soundtrack_fit",
+    "description": "Fit the single image in a still-only sequence to its attached soundtrack’s exact audible duration. Returns a file job receipt.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "out_project": {
+          "type": "string"
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "in_place": {
+          "type": "boolean",
+          "const": true
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "still_file_soundtrack_attach",
+    "description": "Attach a recording at program zero in a still-only sequence. Optionally fit its single image to the selected audio range. Returns a file job receipt.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active."
+        },
+        "working_directory": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Existing base directory for relative paths embedded in reports or project documents."
+        },
+        "out_project": {
+          "type": "string"
+        },
+        "project_path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "in_place": {
+          "type": "boolean",
+          "const": true
+        },
+        "soundtrack": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the recording."
+        },
+        "audio_stream": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional absolute audio stream index. Defaults to the first audio stream."
+        },
+        "from": {
+          "type": "string",
+          "description": "Optional source in-point on an audio sample boundary, as exact rational seconds."
+        },
+        "to": {
+          "type": "string",
+          "description": "Optional source out-point on an audio sample boundary, as exact rational seconds."
+        },
+        "fit_soundtrack": {
+          "type": "boolean",
+          "const": true,
+          "description": "Fit the single image to the recording’s exact audible duration in the same edit."
+        }
+      },
+      "required": [
+        "operation_id",
+        "project_path",
+        "soundtrack"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
           ]
         }
       ]
@@ -3506,7 +3749,7 @@
   },
   {
     "name": "still_file_asset_relink",
-    "description": "Run still asset relink on a saved project. See cli_help_read for timing and destination options.",
+    "description": "Relink a still asset to the same image at a new location in a saved project. This is an asset-ID alias for project_file_media_relink.",
     "inputSchema": {
       "type": "object",
       "properties": {

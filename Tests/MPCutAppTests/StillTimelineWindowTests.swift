@@ -21,7 +21,7 @@ final class StillTimelineWindowTests: XCTestCase {
     }
 
     private func exerciseWindow(multicam: Bool) async throws {
-        _ = NSApplication.shared
+        _ = WindowTestHost.application
         let manager = FileManager.default
         let directory = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try manager.createDirectory(at: directory, withIntermediateDirectories: false)

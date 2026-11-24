@@ -19,6 +19,16 @@ package struct ProjectDiskRevision: Equatable, Sendable {
         openedPath == url.absoluteURL || Self.sameDestination(destination, Self.saveDestination(url))
     }
 
+    package func checkCurrent(at url: URL) throws {
+        let target = Self.saveDestination(url)
+        var current = stat()
+        guard let verified = verifiedFile(at: target),
+              lstat(target.path, &current) == 0, Self.sameFile(verified, current),
+              Self.sameDestination(target, Self.saveDestination(url)) else {
+            throw CutError(code: "project_save_conflict", message: "The project at \(url.path) changed. Reopen it before editing media.")
+        }
+    }
+
     fileprivate func verifiedFile(at destination: URL) -> stat? {
         guard Self.sameDestination(self.destination, destination) else { return nil }
         let descriptor = open(destination.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)

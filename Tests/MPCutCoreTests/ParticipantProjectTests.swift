@@ -42,6 +42,26 @@ final class ParticipantProjectTests: XCTestCase {
         try project.validate()
     }
 
+    func testOverwritingPinPreservesBothSidesOfScopedEdit() throws {
+        let source = "gallery.mov"
+        var project = accepted()
+        let guest = ParticipantAppearanceOverride(participantID: "guest", sourceID: source, appearanceID: "return",
+                                                  range: range(0, 10))
+        project.appearanceOverrides = [
+            .init(participantID: "host", sourceID: source, appearanceID: "thumb", range: range(0, 5)), guest
+        ]
+        project.setAppearanceOverride(.init(participantID: "host", sourceID: source, appearanceID: "stage", range: range(1, 2)))
+        try project.validate()
+        func selected(at second: Int64) -> String? {
+            project.resolveAppearance(participantID: "host", sourceID: source, at: time(second))?.id
+        }
+        XCTAssertEqual(selected(at: 0), "thumb")
+        XCTAssertEqual(selected(at: 1), "stage")
+        XCTAssertEqual(selected(at: 2), "thumb")
+        XCTAssertNil(selected(at: 3))
+        XCTAssertTrue(project.appearanceOverrides.contains(guest))
+    }
+
     func testSequenceSaveReopenHistoryAndSaveAs() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -112,6 +132,11 @@ final class ParticipantProjectTests: XCTestCase {
         XCTAssertEqual(reopened.project, current)
         XCTAssertEqual(reopened.undo, undo)
         XCTAssertEqual(reopened.redo, redo)
+        let bytes = try JSONEncoder().encode(current)
+        let json = String(decoding: bytes, as: UTF8.self)
+        let invalid = json.replacingOccurrences(of: "\"width\":640", with: "\"width\":640.00000000000001")
+        XCTAssertNotEqual(invalid, json)
+        XCTAssertThrowsError(try CutProject.decode(Data(invalid.utf8)))
     }
 
     func testOccurrenceShotAppliesOnlyToSelectedRepeat() throws {
@@ -135,6 +160,23 @@ final class ParticipantProjectTests: XCTestCase {
         XCTAssertEqual(timeline.window(at: time(3))?.shot.layout, .pair)
         XCTAssertEqual(timeline.window(at: time(1))?.base?.displacement, time(2))
         XCTAssertEqual(timeline.window(at: time(3))?.base?.displacement, .zero)
+    }
+
+    func testISOUsingAReplacementRetainsItsSyncAndFillsGapsWithSilence() throws {
+        let camera = MulticamAudioSelection(source: "gallery", stream: 1)
+        let external = MulticamAudioSelection(source: "recorder", stream: 0)
+        var project = MulticamProject(referenceAngle: "gallery", range: range(0, 10),
+                                      angles: [.init(id: "gallery", file: "gallery.mov", audioStream: 1)],
+                                      audioSources: [.init(id: "recorder", file: "recorder.wav")],
+                                      audio: .follow, switches: [.init(at: .zero, angle: "gallery")],
+                                      audioReplacements: [.init(id: "sync", original: camera, replacement: external,
+                                                                 relativeOffset: time(2), uncovered: .keepOriginal)])
+        try project.validate()
+        try ParticipantRenderSound.apply(.init(selection: external), to: &project)
+        try project.validate()
+        XCTAssertEqual(project.audio, .fixed(camera))
+        XCTAssertEqual(project.audioReplacements.first?.relativeOffset, time(2))
+        XCTAssertEqual(project.audioReplacements.first?.uncovered, .leaveUncovered)
     }
 
     func testAttachmentScopedSpeakerBindingHonorsOverlapAndBoundaries() throws {
@@ -161,35 +203,14 @@ final class ParticipantProjectTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let media = directory.appendingPathComponent("gallery.mov")
         try Data([1, 2, 3]).write(to: media)
-        let stamp = try JSONEncoder().encode(SceneSourceStamp(identity: SourceIdentity(media)))
-        let stampObject = try JSONSerialization.jsonObject(with: stamp)
-        let zero = ["numerator": 0, "denominator": 1]
-        let one = ["numerator": 1, "denominator": 1]
-        let transform: [String: Any] = ["rotation": "R0", "pixel_aspect_num": 1, "pixel_aspect_den": 1]
-        let region: [String: Any] = [
-            "appearance_id": 2, "participant_id": 1, "rect": ["x": 0, "y": 0, "width": 1, "height": 1],
-            "kind": "video", "role": "primary", "confidence": 1, "possible_matches": []
-        ]
-        let analysis: [String: Any] = [
-            "schema_version": 1, "start": zero, "end": one, "sampling": "sparse",
-            "observations": [["timestamp": zero, "display": transform, "confidence": 1, "regions": [region]]],
-            "tracks": [["id": 1, "appearance_ids": [2]]],
-            "appearances": [["id": 2, "participant_id": 1, "start": zero, "end": one]],
-            "events": [], "coverage": [["start": zero, "end": one, "status": "observed"]],
-            "diagnostics": [], "resume_at": NSNull()
-        ]
-        let source: [String: Any] = [
-            "file": media.path, "stamp": stampObject, "inode": try SourceIdentity(media).inode,
-            "stream": 0, "origin": zero, "time_base": one,
-            "duration": one, "transform": transform
-        ]
-        let result: [String: Any] = [
-            "state": "completed", "source": source, "analysis_identity": "fixture",
-            "configuration": ["backend": "cpu", "sampling": "sparse", "include_scenes": false], "analysis": analysis
-        ]
-        let scan = try JSONDecoder().decode(ParticipantScanResult.self, from: JSONSerialization.data(withJSONObject: result))
+        let scan = try fixtureScan(media, analysisIdentity: "initial")
         let document = directory.appendingPathComponent("gallery.cut")
         var project = CutProject.sequence([.init(id: "source", file: "gallery.mov", from: .zero, to: time(1))])
+        XCTAssertThrowsError(try project.acceptParticipantAnalysis(scan, sourceID: "gallery.mov", relativeTo: document,
+                                                                    cancelled: { true })) {
+            XCTAssertTrue($0 is CancellationError)
+        }
+        XCTAssertTrue(project.participants.isEmpty)
         try project.acceptParticipantAnalysis(scan, sourceID: "gallery.mov", relativeTo: document)
         XCTAssertEqual(project.participants.people.count, 1)
         XCTAssertEqual(project.participants.appearances(sourceID: "gallery.mov", at: .zero).count, 1)
@@ -210,6 +231,148 @@ final class ParticipantProjectTests: XCTestCase {
         XCTAssertTrue(project.participants.needsReconciliation(sourceID: "gallery.mov", mediaURL: media))
         XCTAssertThrowsError(try project.acceptParticipantAnalysis(scan, sourceID: "gallery.mov", relativeTo: document))
         XCTAssertEqual(project.participants, accepted)
+    }
+
+    func testReconcileCopyRetainsReviewWhileChangedMediaRequiresNewIdentityReview() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let document = directory.appendingPathComponent("edit.cut")
+        let media = directory.appendingPathComponent("original.mov")
+        let copy = directory.appendingPathComponent("copied.mov")
+        let edited = directory.appendingPathComponent("changed.mov")
+        try Data([1, 2, 3]).write(to: media)
+        try FileManager.default.copyItem(at: media, to: copy)
+        try Data([4, 5, 6]).write(to: edited)
+        let projectRange = range(0, 1)
+        let original = try fixtureScan(media, analysisIdentity: "original-analysis")
+        let copied = try fixtureScan(copy, analysisIdentity: "copy-analysis")
+        let changed = try fixtureScan(edited, analysisIdentity: "changed-analysis")
+        XCTAssertNotEqual(original.source.inode, copied.source.inode)
+        XCTAssertEqual(original.source.contentSHA256, copied.source.contentSHA256)
+        XCTAssertNotEqual(original.source.contentSHA256, changed.source.contentSHA256)
+        var group = MulticamProject(referenceAngle: "gallery", range: projectRange,
+            angles: [.init(id: "gallery", file: media.path)], audio: .none,
+            switches: [.init(at: .zero, angle: "gallery")])
+        var project = CutProject.multicam(group)
+        try project.acceptParticipantAnalysis(original, sourceID: "gallery", relativeTo: document)
+        let participant = try XCTUnwrap(project.participants.people.first?.id)
+        let appearance = try XCTUnwrap(project.participants.sources.first?.appearances.first?.id)
+        try project.participants.correctBounds(sourceID: "gallery", appearanceID: appearance, bounds: stage, range: projectRange)
+        project.participants.people[0].speakers = [.init(attachmentID: "meeting", speakerID: "host")]
+        project.participants.appearanceOverrides = [.init(participantID: participant, sourceID: "gallery",
+                                                          appearanceID: appearance, range: projectRange)]
+        project.participants.render = .init(shots: [.init(layout: .original)],
+                                            redactions: [.init(participantID: participant, treatment: .opaque)])
+        let reviewed = project.participants
+        group.participants = reviewed
+        group.angles[0].file = copy.path
+        project = .multicam(group)
+        let copyReview = try reviewed.reconciliation(for: copied, sourceID: "gallery")
+        XCTAssertTrue(copyReview.retainedCopiedGeometry)
+        XCTAssertFalse(copyReview.sourceChanged)
+        try project.reconcileParticipantAnalysis(copied, sourceID: "gallery", relativeTo: document, reviewed: copyReview)
+        XCTAssertEqual(project.participants.people, reviewed.people)
+        XCTAssertEqual(project.participants.render, reviewed.render)
+        XCTAssertEqual(project.participants.appearanceOverrides, reviewed.appearanceOverrides)
+        XCTAssertEqual(project.participants.sources[0].appearances, reviewed.sources[0].appearances)
+        XCTAssertEqual(project.participants.sources[0].sourceInode, copied.source.inode)
+        XCTAssertFalse(project.participants.needsReconciliation(sourceID: "gallery", mediaURL: copy))
+
+        group.participants = project.participants
+        group.angles[0].file = edited.path
+        project = .multicam(group)
+        let replacement = try project.participants.reconciliation(for: changed, sourceID: "gallery")
+        XCTAssertTrue(replacement.sourceChanged)
+        XCTAssertEqual(replacement.affectedParticipantIDs, [participant])
+        XCTAssertEqual(replacement.affectedRedactionIDs, [participant])
+        XCTAssertEqual(replacement.affectedBindingIDs, [participant])
+        XCTAssertEqual(replacement.removedAppearanceIDs, [appearance])
+        XCTAssertEqual(replacement.removedOverrideCount, 1)
+        var concurrent = project
+        try concurrent.participants.correctBounds(sourceID: "gallery", appearanceID: appearance,
+                                                  bounds: thumbnail, range: projectRange)
+        XCTAssertThrowsError(try concurrent.reconcileParticipantAnalysis(changed, sourceID: "gallery",
+                                                                         relativeTo: document, reviewed: replacement))
+        let beforeReplacement = project
+        try project.reconcileParticipantAnalysis(changed, sourceID: "gallery", relativeTo: document, reviewed: replacement)
+        XCTAssertEqual(project.participants.sources[0].unresolvedParticipantIDs, [participant])
+        XCTAssertNil(project.participants.appearances(sourceID: "gallery", at: .zero).first { $0.participantID == participant })
+        XCTAssertEqual(project.participants.render, reviewed.render)
+        XCTAssertEqual(project.participants.people.first, reviewed.people.first)
+        XCTAssertTrue(project.participants.appearanceOverrides.isEmpty)
+        try project.save(to: document, undo: [.init(action: "Adopt replacement scan", project: beforeReplacement)], redo: [])
+        let reopened = try CutProject.loadDocument(from: document, limit: 1)
+        XCTAssertEqual(reopened.project.participants.sources[0].unresolvedParticipantIDs, [participant])
+        XCTAssertEqual(reopened.undo.first?.project, beforeReplacement)
+        try project.participants.confirmReconciledParticipant(sourceID: "gallery", participantID: participant)
+        XCTAssertTrue(project.participants.sources[0].unresolvedParticipantIDs.isEmpty)
+    }
+
+    func testChangingLayoutReconcilesWithoutReusingOldTrackIdentity() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let original = directory.appendingPathComponent("original.mov")
+        let copy = directory.appendingPathComponent("copy.mov")
+        try Data([1, 2, 3]).write(to: original)
+        try FileManager.default.copyItem(at: original, to: copy)
+        let meeting = try fixtureScan(original, analysisIdentity: "meeting")
+        var accepted = ParticipantProject()
+        try accepted.acceptAnalysis(meeting, sourceID: "source")
+        let participant = try XCTUnwrap(accepted.people.first)
+        let appearance = try XCTUnwrap(accepted.sources[0].appearances.first)
+        XCTAssertNil(accepted.sources[0].feedLayout)
+
+        for file in [original, copy] {
+            let feeds = try fixtureScan(file, analysisIdentity: "feeds", feedLayout: "1x1")
+            var revised = accepted
+            let review = try revised.reconciliation(for: feeds, sourceID: "source")
+            XCTAssertFalse(review.retainedCopiedGeometry)
+            XCTAssertFalse(review.sourceChanged)
+            XCTAssertEqual(review.removedAppearanceIDs, [appearance.id])
+            XCTAssertEqual(review.affectedParticipantIDs, [participant.id])
+            try revised.reconcileAnalysis(feeds, sourceID: "source", reviewed: review)
+            XCTAssertEqual(revised.sources[0].feedLayout, .fixed(columns: 1, rows: 1))
+            XCTAssertEqual(revised.sources[0].unresolvedParticipantIDs, [participant.id])
+            XCTAssertEqual(revised.people.map(\.name), ["Participant 1", "Feed 1"])
+            XCTAssertNotEqual(revised.sources[0].appearances.first?.participantID, participant.id)
+            let reopened = try JSONDecoder().decode(ParticipantProject.self, from: JSONEncoder().encode(revised))
+            XCTAssertEqual(reopened, revised)
+        }
+    }
+
+    private func fixtureScan(_ media: URL, analysisIdentity: String, feedLayout: String? = nil) throws -> ParticipantScanResult {
+        let stamp = try JSONEncoder().encode(SceneSourceStamp(identity: SourceIdentity(media)))
+        let stampObject = try JSONSerialization.jsonObject(with: stamp)
+        let zero = ["numerator": 0, "denominator": 1]
+        let one = ["numerator": 1, "denominator": 1]
+        let transform: [String: Any] = ["rotation": "R0", "pixel_aspect_num": 1, "pixel_aspect_den": 1]
+        let region: [String: Any] = [
+            "appearance_id": 2, "participant_id": 1, "rect": ["x": 0, "y": 0, "width": 1, "height": 1],
+            "kind": "video", "role": "primary", "confidence": 1, "identity_uncertain": false, "possible_matches": []
+        ]
+        let analysis: [String: Any] = [
+            "schema_version": 1, "start": zero, "end": one, "sampling": "sparse",
+            "observations": [["timestamp": zero, "display": transform, "confidence": 1, "regions": [region]]],
+            "tracks": [["id": 1, "appearance_ids": [2]]],
+            "appearances": [["id": 2, "participant_id": 1, "start": zero, "end": one]],
+            "events": [], "coverage": [["start": zero, "end": one, "status": "observed"]],
+            "diagnostics": [], "resume_at": NSNull()
+        ]
+        let source: [String: Any] = [
+            "file": media.path, "stamp": stampObject, "inode": try SourceIdentity(media).inode,
+            "content_sha256": try participantSourceDigest(media, identity: SourceIdentity(media)),
+            "stream": 0, "origin": zero, "time_base": one,
+            "duration": one, "transform": transform
+        ]
+        var configuration: [String: Any] = ["backend": "cpu", "sampling": "sparse", "include_scenes": false]
+        configuration["feed_layout"] = feedLayout
+        let result: [String: Any] = [
+            "state": "completed", "source": source, "analysis_identity": analysisIdentity,
+            "configuration": configuration, "analysis": analysis
+        ]
+        return try JSONDecoder().decode(ParticipantScanResult.self, from: JSONSerialization.data(withJSONObject: result))
     }
 
 }

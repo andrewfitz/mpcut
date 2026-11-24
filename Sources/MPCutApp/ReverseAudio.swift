@@ -258,7 +258,10 @@ final class ReverseAudioPlayer {
         }
         if !node.isPlaying && (scheduled - playedBeforeRestart >= 2 * Self.blockFrames || cursor == 0) {
             do {
-                if !engine.isRunning { try engine.start() }
+                if !engine.isRunning {
+                    MutedLaunch.mute(engine)
+                    try engine.start()
+                }
                 if engine.isInManualRenderingMode { manualStart = engine.manualRenderingSampleTime }
                 node.play()
             } catch {

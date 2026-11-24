@@ -707,6 +707,8 @@ final class JPEGRenderer {
     }
     deinit { mp_jpeg_close(reader) }
 
+    var displayTransform: CGAffineTransform { mp_jpeg_transform(reader) }
+
     func picture(at pts: Int64, seekDTS: Int64, preset: JPEGPreset) throws -> CIImage {
         var buffer: CVPixelBuffer?
         var error = [CChar](repeating: 0, count: 256)
@@ -715,11 +717,17 @@ final class JPEGRenderer {
             try control.check()
             throw CutError(code: "frame_export_failed", message: "Could not decode source picture at PTS \(pts): " + String(cString: error))
         }
-        var image = CIImage(cvPixelBuffer: buffer)
+        // Converting an HDR picture to sRGB without this request can clip it: the upper
+        // half of an HLG signal came out flat white. The SDR preview makes the same
+        // request, so the JPEG shows the same rendition. SDR pictures are left alone.
+        let transfer = CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil) as? String
+        let isHDR = transfer == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String) ||
+            transfer == (kCVImageBufferTransferFunction_ITU_R_2100_HLG as String)
+        var image = isHDR ? CIImage(cvPixelBuffer: buffer, options: [.toneMapHDRtoSDR: true]) : CIImage(cvPixelBuffer: buffer)
         let display = mp_jpeg_display_size(reader)
         let natural = CGAffineTransform(scaleX: display.width / image.extent.width,
                                        y: display.height / image.extent.height)
-        image = image.transformed(by: natural.concatenating(mp_jpeg_transform(reader)))
+        image = image.transformed(by: natural.concatenating(displayTransform))
         let extent = image.extent
         guard extent.width.isFinite, extent.height.isFinite, extent.width >= 0.5, extent.height >= 0.5 else { throw Self.failure }
         let scale = preset == .review ? min(1, 640 / max(extent.width, extent.height)) : 1

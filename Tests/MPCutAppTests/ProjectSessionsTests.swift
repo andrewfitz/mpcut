@@ -384,7 +384,7 @@ final class ProjectSessionsTests: XCTestCase {
             let session = sessions.session(for: nil)
             session.isMulticam = true
             sessions.register(session, window: window)
-            try session.multicam.draft.write { try CutProject.sequence([]).saveStaged(to: $0, undo: [], redo: []) }
+            try session.multicam.draft.write { try CutProject.sequence([]).saveStaged(to: $0, undo: [], redo: [], mediaSnapshot: .empty) }
             return try XCTUnwrap(session.multicam.draft.url)
         }
         XCTAssertTrue(files.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })

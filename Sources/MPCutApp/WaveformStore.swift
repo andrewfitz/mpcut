@@ -139,6 +139,7 @@ final class WaveformStore {
             let useSidecar = useSidecar && !AnalysisSidecar.isExcluded(media.url, in: excludedSources)
             let token = EditCancellation()
             jobs[id] = token
+            let media = useSidecar ? media.pinningSidecarWrites() : media
             EditorAnalysisQueues.scans.addOperation { [weak self] in
                 guard !token.isCancelled else { return }
                 do {

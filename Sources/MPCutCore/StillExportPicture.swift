@@ -25,13 +25,36 @@ extension StillExportPlanner {
         let camera: CameraSpan?
         let authoredClockRange: MulticamRange?
         var recordingGap = false
+        var heldSources: [String] = []
+        var heldEnd: RationalTime?
+        var heldEndSource: String?
     }
 
     func planPicture(_ project: CutProject, document: URL, timeline: StillTimelinePlan, mode: ExportMode,
                      requireCameraCopy: Bool, container: String, settings: ReencodeSettings,
-                     tracks: ExportTracks) throws -> StillPicturePlan {
+                     tracks: ExportTracks, pictureTiming: StillPictureTiming = .cadence,
+                     format: StillTimelineFormat? = nil, videoCodec: ReencodeCodec? = nil) throws -> StillPicturePlan {
         let engine = CutEngine(cancelled: cancelled, useSidecar: useSidecar, tracks: .video)
-        let windows = try pictureWindows(project, document: document, timeline: timeline)
+        let authored = try pictureWindows(project, document: document, timeline: timeline)
+        let held = pictureTiming == .held
+        let windows = held ? coalesceHeldWindows(authored) : authored
+        let matroska = held && container == "mkv"
+        let written = try windows.enumerated().map { index, window -> MulticamRange in
+            guard matroska else { return window.output }
+            let from = try StillSampleSchedule.matroskaBoundary(window.output.from, final: false)
+            let to = try StillSampleSchedule.matroskaBoundary(window.output.to, final: index == windows.count - 1)
+            guard to > from else {
+                throw CutError(code: "unsupported_still_timing",
+                               message: "The hold at \(window.output.from) would collapse on the MKV clock. Use MOV, MP4, or M4V.")
+            }
+            if mode != .encode, window.placementID == nil, !window.recordingGap,
+               from != window.output.from || to != window.output.to {
+                throw CutError(code: "unsupported_still_timing",
+                               message: "The MKV clock would shift a camera boundary. Use MOV, MP4, or M4V.")
+            }
+            return .init(from: from, to: to)
+        }
+        let stagingContainer = matroska ? "mov" : ExportRules.multicamMuxContainer(container)
         let isMulticam: Bool
         if case .multicam = project { isMulticam = true } else { isMulticam = false }
         var indexed: [URL: MediaInfo] = [:]
@@ -39,7 +62,7 @@ extension StillExportPlanner {
         var sourceExtents: [String: MulticamRange] = [:]
         var reference: StreamInfo?
         var cameraReference: MediaInfo?
-        for window in windows {
+        for window in authored {
             guard let camera = window.camera else { continue }
             if indexed[camera.file] == nil {
                 let original = try isMulticam ? engine.inspectMulticamSource(camera.file) : engine.inspect(camera.file, keyframes: true)
@@ -76,6 +99,10 @@ extension StillExportPlanner {
             let muxContainer = ExportRules.multicamMuxContainer(container)
             for camera in cameraSpans where checked.insert(camera.file).inserted {
                 let media = indexed[camera.file]!
+                if let videoCodec, media.video.codec != (videoCodec == .jpeg ? "mjpeg" : videoCodec.rawValue) {
+                    throw CutError(code: "camera_copy_required",
+                                   message: "Smart Trim retains the selected camera codec. Use Re-encode to change the picture codec.")
+                }
                 if let issue = media.copyIssue {
                     throw CutError(code: "unsupported_tracks", message: issue)
                 }
@@ -89,9 +116,13 @@ extension StillExportPlanner {
             }
         }
         if let cameraReference { reference = cameraReference.video }
-        if reference == nil, let format = project.stillFormat {
+        let effectiveFormat = format ?? project.stillFormat
+        let exactStandaloneClock = held || project.stillSoundtrack != nil
+        if reference == nil, let format = effectiveFormat {
+            let pictureClock = exactStandaloneClock ? try StillSampleSchedule.pictureClock(
+                [format.cadence.denominator] + written.flatMap { [$0.from.denominator, $0.to.denominator] }) : nil
             reference = try format.targetStream(color: project.programColorPolicy ?? StillTimelineFormat.sdrColorPolicy,
-                                                duration: timeline.duration)
+                                                duration: timeline.duration, pictureClock: pictureClock)
         }
         if reference == nil, case .multicam(let multicam) = project,
            let angle = multicam.angles.first(where: { $0.id == multicam.referenceAngle }) {
@@ -104,13 +135,26 @@ extension StillExportPlanner {
             indexed[file] = media
             identities[file] = media.identity
         }
-        guard let reference else {
+        guard var reference else {
             throw CutError(code: "missing_still_format", message: "Select a video timeline or define the picture format for this project.")
         }
 
-        let policy = try project.programColorPolicy ?? StillProgramColorPolicy.resolving(source: reference)
-        if mode != .encode && windows.contains(where: { $0.placementID != nil }) {
+        var policy = try project.programColorPolicy ?? StillProgramColorPolicy.resolving(source: reference)
+        if mode != .encode, effectiveFormat == nil, cameraSpans.isEmpty, let videoCodec {
+            let rate = reference.frameRate
+            let cadence = rate > .zero ? RationalTime(numerator: rate.denominator, denominator: rate.numerator) :
+                RationalTime(numerator: 1, denominator: 30)
+            let target = StillTimelineFormat(width: reference.displayWidth, height: reference.displayHeight,
+                                             cadence: cadence, codec: videoCodec, container: container)
+            let scale = held ? try StillSampleSchedule.pictureClock(
+                [cadence.denominator] + written.flatMap { [$0.from.denominator, $0.to.denominator] }) : nil
+            reference = try target.targetStream(color: policy, duration: timeline.duration, pictureClock: scale)
+        }
+        if mode != .encode && (!cameraSpans.isEmpty || (effectiveFormat == nil && videoCodec == nil)) && windows.contains(where: { $0.placementID != nil }) {
             try policy.validateSourceCompatibility(reference)
+        }
+        if mode == .encode ? settings.codec == .jpeg : reference.codec == "mjpeg" {
+            policy.range = "pc"
         }
         if mode == .encode {
             guard ["tv", "pc"].contains(policy.range),
@@ -135,7 +179,7 @@ extension StillExportPlanner {
                            message: "The output must use PQ to retain the camera mastering-display metadata.")
         }
 
-        let generator = StillVideoGenerator(cancelled: cancelled, colorPolicy: policy, standalone: indexed.isEmpty)
+        let generator = StillVideoGenerator(cancelled: cancelled, colorPolicy: policy, standalone: indexed.isEmpty || (cameraSpans.isEmpty && videoCodec != nil))
         let assets = Dictionary(uniqueKeysWithValues: project.stillAssets.map { ($0.id, $0) })
         let inserts = Dictionary(uniqueKeysWithValues: project.stillInserts.map { ($0.id, $0) })
         let replacements = Dictionary(uniqueKeysWithValues: project.stillReplacements.map { ($0.id, $0) })
@@ -153,6 +197,7 @@ extension StillExportPlanner {
         var variableTimeline: Bool?
         func allowsShortFinalSample() throws -> Bool {
             guard ["mov", "mp4", "m4v"].contains(container) else { return false }
+            if project.stillSoundtrack != nil && effectiveFormat != nil { return true }
             if let variableTimeline { return variableTimeline }
             let cadence = indexed.values.lazy.compactMap { $0.frames.first?.duration }.first
             for media in indexed.values {
@@ -170,10 +215,11 @@ extension StillExportPlanner {
 
         for (index, window) in windows.enumerated() {
             try engine.checkCancellation()
+            let renderOutput = written[index]
             let camera = window.camera
             let media = camera.flatMap { indexed[$0.file] }
             let frames: Range<Int>?
-            if let camera, let media {
+            if let camera, let media, !held || window.placementID == nil {
                 frames = try frameRange(media, input: camera.input, segment: index + 1, placementID: window.placementID)
                 if window.placementID == nil {
                     allConversionInputs.append(ClipRequest(file: media.url, from: camera.input.from, to: camera.input.to))
@@ -182,7 +228,7 @@ extension StillExportPlanner {
                 frames = nil
             }
             let content: StillExportPicture.Content
-            if window.recordingGap {
+            if window.recordingGap && (!held || window.placementID == nil) {
                 guard mode == .encode else {
                     throw CutError(code: "recording_gap_requires_encoding",
                                    message: "The selected camera has a recording gap at output \(window.output.from)–\(window.output.to). Re-encode to fill it with black.")
@@ -191,8 +237,9 @@ extension StillExportPlanner {
                 let rate = reference.frameRate
                 let cadence = rate > .zero ? RationalTime(numerator: rate.denominator, denominator: rate.numerator) :
                     RationalTime(numerator: 1, denominator: 30)
-                let duration = try window.output.to.subtracting(window.output.from)
-                let schedule = try StillSampleSchedule(duration: duration, cadence: cadence, allowShortFinalSample: true)
+                let duration = try renderOutput.to.subtracting(renderOutput.from)
+                let schedule = try held && window.placementID != nil ? StillSampleSchedule(hold: duration, cadence: cadence) :
+                    StillSampleSchedule(duration: duration, cadence: cadence, allowShortFinalSample: true)
                 let file: URL
                 let framing: StillImageFraming
                 if let id = window.placementID, let replacement = replacements[id], let asset = assets[replacement.assetID] {
@@ -208,17 +255,26 @@ extension StillExportPlanner {
             } else if let id = window.placementID {
                 let assetID: String
                 let framing: StillImageFraming
-                let duration = try window.output.to.subtracting(window.output.from)
+                let duration = try renderOutput.to.subtracting(renderOutput.from)
                 let schedule: StillSampleSchedule
                 if let insert = inserts[id] {
                     assetID = insert.assetID
                     framing = insert.framing
-                    schedule = try .init(duration: duration, cadence: insert.cadence,
-                                         allowShortFinalSample: try allowsShortFinalSample())
-                } else if let replacement = replacements[id], let media, let frames {
+                    schedule = try held ? .init(hold: duration, cadence: insert.cadence) :
+                        .init(duration: duration, cadence: insert.cadence, allowShortFinalSample: try allowsShortFinalSample())
+                } else if let replacement = replacements[id] {
                     assetID = replacement.assetID
                     framing = replacement.framing
-                    schedule = try .init(frames: media.frames[frames], duration: duration, cancelled: cancelled)
+                    if held {
+                        let rate = reference.frameRate
+                        let cadence = rate > .zero ? RationalTime(numerator: rate.denominator, denominator: rate.numerator) :
+                            RationalTime(numerator: 1, denominator: 30)
+                        schedule = try .init(hold: duration, cadence: max(cadence, .init(numerator: 1, denominator: 240)))
+                    } else if let media, let frames {
+                        schedule = try .init(frames: media.frames[frames], duration: duration, cancelled: cancelled)
+                    } else {
+                        throw CutError(code: "invalid_still_placement", message: "Still placement \(id) has no source schedule.")
+                    }
                 } else {
                     throw CutError(code: "invalid_still_placement", message: "Still placement \(id) has no source schedule.")
                 }
@@ -229,7 +285,7 @@ extension StillExportPlanner {
                 if mode == .encode {
                     try generator.checkLossless(reference: reference, schedule: schedule)
                 } else {
-                    try generator.check(reference: reference, container: container, schedule: schedule)
+                    try generator.check(reference: reference, container: stagingContainer, schedule: schedule)
                 }
                 content = .still(file: file, framing: framing, reference: reference, schedule: schedule)
             } else if let camera, let media, let frames {
@@ -238,7 +294,17 @@ extension StillExportPlanner {
                 }
                 let edges = try cameraEdges(media, input: camera.input, frames: frames, index: index, windows: windows,
                                             mode: mode, requireCameraCopy: requireCameraCopy,
-                                            container: container, engine: engine)
+                                            container: stagingContainer, engine: engine)
+                if matroska && mode == .encode {
+                    let shift = try window.output.from.subtracting(camera.input.from)
+                    var previous = renderOutput.from
+                    for frame in frames.dropFirst() {
+                        if frame.isMultiple(of: 1_024) { try engine.checkCancellation() }
+                        let next = try StillSampleSchedule.matroskaBoundary(media.frames[frame].time.adding(shift), final: false)
+                        guard next > previous, next < renderOutput.to else { throw StillSampleSchedule.unsupported }
+                        previous = next
+                    }
+                }
                 content = .camera(media: media, input: camera.input, frames: frames, edges: edges)
             } else {
                 throw CutError(code: "uncovered_picture", message: "There is no picture at output \(window.output.from).")
@@ -254,20 +320,25 @@ extension StillExportPlanner {
                 } else {
                     exact = true
                 }
-                guard timescale > 0, timescale <= Int32.max, exact, clock % window.output.from.denominator == 0,
-                      clock % window.output.to.denominator == 0 else {
+                guard timescale > 0, timescale <= Int32.max, exact, clock % renderOutput.from.denominator == 0,
+                      clock % renderOutput.to.denominator == 0 else {
                     throw CutError(code: "unsupported_still_timing",
                                    message: "The selected MOV-family video clock cannot represent the picture at output \(window.output.from).")
                 }
             }
             pictures.append(.init(output: window.output, clock: window.clock, source: camera?.source,
-                                  sourceOccurrences: camera?.sourceOccurrences ?? [],
-                                  placementID: window.placementID, content: content))
+                                  sourceOccurrences: window.heldSources.isEmpty ? camera?.sourceOccurrences ?? [] : window.heldSources,
+                                  placementID: window.placementID, content: content,
+                                  writtenOutput: renderOutput == window.output ? nil : renderOutput))
         }
 
         var warnings: [String] = []
         if hdr.contains(where: { $0.hasContentLight || $0.hasInBandContentLight }) {
             warnings.append("Content-light statistics will be omitted because the still-bearing program has different content.")
+        }
+        if matroska {
+            let helper = try ReencodeEngine.findHelper(override: nil)
+            try StillMatroska.verifyHelper(helper, cancelled: cancelled)
         }
         if mode == .encode {
             let sourceClocks: [Int64] = try pictures.map {
@@ -276,10 +347,12 @@ extension StillExportPlanner {
                 case .still(_, _, _, let schedule): return try schedule.exactTimescale()
                 }
             }
-            let clock = Int64(conversionTimeScale(for: sourceClocks))
+            let clock = Int64(try matroska ? StillMatroska.pictureConversionClock(pictures, cancelled: cancelled) :
+                conversionTimeScale(for: sourceClocks))
             for (picture, sourceClock) in zip(pictures, sourceClocks) {
-                guard clock.isMultiple(of: picture.output.from.denominator),
-                      clock.isMultiple(of: picture.output.to.denominator) else { throw StillSampleSchedule.unsupported }
+                guard clock.isMultiple(of: picture.renderOutput.from.denominator),
+                      clock.isMultiple(of: picture.renderOutput.to.denominator) else { throw StillSampleSchedule.unsupported }
+                if matroska { continue }
                 if clock.isMultiple(of: sourceClock) { continue }
                 guard case .camera(let media, _, let frames, _) = picture.content else {
                     throw StillSampleSchedule.unsupported
@@ -294,7 +367,7 @@ extension StillExportPlanner {
                 }
             }
             let videoSettings = ReencodeSettings(codec: settings.codec, quality: settings.quality, audio: .removeAudio)
-            let conversionContainer = ExportRules.multicamMuxContainer(container)
+            let conversionContainer = stagingContainer
             guard ExportRules.reencodeContainers(videoSettings.codec).contains(conversionContainer) else {
                 throw ExportRules.reencodeContainerRefusal
             }
@@ -366,8 +439,10 @@ extension StillExportPlanner {
                     if gaps.indices.contains(gapIndex), gaps[gapIndex].contains(cursor) {
                         let upper = min(span.output.to, gaps[gapIndex].to)
                         let output = MulticamRange(from: cursor, to: upper)
+                        let offset = try group.from.subtracting(span.output.from)
+                        let authored = MulticamRange(from: try cursor.adding(offset), to: try upper.adding(offset))
                         windows.append(.init(output: output, clock: span.placementID == nil ? "assembly" : "group", placementID: span.placementID,
-                                             camera: nil, authoredClockRange: nil, recordingGap: true))
+                                             camera: nil, authoredClockRange: authored, recordingGap: true))
                         cursor = upper
                         continue
                     }
@@ -391,6 +466,28 @@ extension StillExportPlanner {
             }
         }
         return coalesceCameraWindows(windows)
+    }
+
+    private func coalesceHeldWindows(_ windows: [PictureWindow]) -> [PictureWindow] {
+        var result: [PictureWindow] = []
+        for next in windows {
+            guard let last = result.last, let placement = next.placementID,
+                  last.placementID == placement, last.output.to == next.output.from, last.clock == next.clock,
+                  last.clock == "sequence" || (last.heldEnd ?? last.authoredClockRange?.to) == next.authoredClockRange?.from else {
+                result.append(next)
+                continue
+            }
+            var sources = last.heldSources.isEmpty ? last.camera?.sourceOccurrences ?? [] : last.heldSources
+            for source in next.camera?.sourceOccurrences ?? [] where sources.last != source {
+                sources.append(source)
+            }
+            result[result.count - 1] = .init(output: .init(from: last.output.from, to: next.output.to), clock: last.clock,
+                                             placementID: placement, camera: last.camera ?? next.camera,
+                                             authoredClockRange: last.authoredClockRange,
+                                             recordingGap: last.recordingGap && next.recordingGap, heldSources: sources,
+                                             heldEnd: next.authoredClockRange?.to, heldEndSource: next.camera?.source)
+        }
+        return result
     }
 
     private func coalesceCameraWindows(_ windows: [PictureWindow]) -> [PictureWindow] {
@@ -489,10 +586,11 @@ extension StillExportPlanner {
         let proposals = try nearest.map { candidate in
             let shift = try candidate.subtracting(at)
             if let authored = adjacent.authoredClockRange {
-                let time = start ? authored.to : authored.from
+                let time = start ? adjacent.heldEnd ?? authored.to : authored.from
+                let source = start ? adjacent.heldEndSource ?? adjacent.camera?.source : adjacent.camera?.source
                 return StillBoundaryAdjustment(placementID: location, boundary: start ? .end : .start,
                                                clock: adjacent.clock,
-                                               occurrenceID: adjacent.clock == "sequence" ? adjacent.camera?.source : nil,
+                                               occurrenceID: adjacent.clock == "sequence" ? source : nil,
                                                requestedTime: time, adjustedTime: try time.adding(shift),
                                                durationChange: start ? shift : try RationalTime.zero.subtracting(shift))
             }

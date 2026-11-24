@@ -82,7 +82,7 @@ struct CommandHelp: Encodable {
               usage: ["mpcut --version [--json]"], instructions: [],
               result: "Plain output is the version string. JSON has a version field.", examples: ["mpcut --version --json"]),
         .init(name: "participants", purpose: "Scan gallery recordings, edit participant tracks and render participant shots.",
-              usage: ["mpcut participants scan --file MEDIA [--backend auto|cpu-only|gpu-required] [--sampling every-frame|sparse] [--include-scenes] [--no-sidecar] [--output SCAN.json] [--resume-file SCAN.json] [--json]",
+              usage: ["mpcut participants scan --file MEDIA [--backend auto|cpu-only|gpu-required] [--sampling adaptive|every-frame|sparse] [--feed-layout auto|COLSxROWS] [--include-scenes] [--no-sidecar] [--output SCAN.json] [--resume-file SCAN.json] [--progress none|stderr|jsonl] [--json]",
                       "mpcut participants markers build --analysis-file SCAN.json [--json]",
                       "mpcut participants project inspect --project PROJECT.cut [--json]",
                       "mpcut participants project accept --project PROJECT.cut --source-id ID --analysis-file SCAN.json (--out-project FILE | --in-place) [--json]",
@@ -90,14 +90,17 @@ struct CommandHelp: Encodable {
                       "mpcut participants render plan --project PROJECT.cut [--output MOVIE] [--json]",
                       "mpcut participants render export --project PROJECT.cut --output MOVIE [--json]",
                       "mpcut participants angles list (--stdin | --input REQUEST.json) [--json]",
+                      "mpcut participants angles take (--stdin | --input REQUEST.json) [--json]",
                       "mpcut participants angles plan (--stdin | --input REQUEST.json) [--json]",
                       "mpcut participants angles render (--stdin | --input REQUEST.json) [--json]"],
               instructions: ["Requests use project_path for a saved project and file for a recording. Project accept imports reviewed analysis into a saved source. Project apply replaces the accepted participant edit with the participants object or the object at participants_file. Choose out_project or in_place for either command.",
-                             "Save a scan of up to 1 GiB with --output to accept it or build markers later. A cancelled scan exits 130 and reports any partial analysis. Supply the partial file to --resume-file to replay the verified prefix using the saved configuration.",
+                             "For generic video feeds, set --feed-layout auto or a fixed grid such as --feed-layout 2x2 (feed_layout in JSON). Fixed grids can contain up to 64 feeds. Meeting analysis is the default.",
+                             "Save a scan of up to 1 GiB with --output to accept it or build markers later. A cancelled scan exits 130 and reports any partial analysis. An incomplete scan exits 1 and retains its coverage and backend diagnostics. Supply the partial file to --resume-file to replay the verified prefix using the saved configuration.",
                              "A minimal render request contains a project_path and a plan such as {\"canvas\":{\"width\":1280,\"height\":720},\"shots\":[{\"layout\":\"solo\",\"slots\":[{\"id\":\"guest\"}]}]}. Use layout pair with two ordered slots. Add audio mode program to keep the source program mix or iso with one participant ID to select a bound microphone.",
                              "Marker rules can be changed against a saved scan. Supply a rule in the JSON request to choose the unit, threshold, event kinds, roster and settling window.",
                              "Render plan reports the intended picture, coverage and sound before writing. Render plan and render export accept an optional plan in the JSON request. Without it they use the project’s saved render plan.",
-                             "Angle requests take source_id and an exact range with from and to. Choose participant_ids, include_original and/or presentation_ids. Both angle plan and angle render take canvas and optional audio routing. Angle render also takes output_directory. The output directory must be new."],
+                             "Angle requests take source_id and an exact range with from and to. Choose participant_ids, include_original and/or presentation_ids. Both angle plan and angle render take canvas and optional audio routing. Angle render also takes output_directory. The output directory must be new.",
+                             "Angle take takes a virtual angle object returned by angle list, an exact output_time timestamp and either out_project or in_place. It authors a timed picture decision."],
               result: "Scan returns observations and coverage. Project inspection returns the accepted participant edit. Angle export creates aligned movies and multicam.cut.",
               examples: ["mpcut participants scan --file gallery.mov --backend cpu-only --output gallery.json --json",
                          "mpcut participants markers build --analysis-file gallery.json --json",
@@ -107,6 +110,7 @@ struct CommandHelp: Encodable {
                          "mpcut participants render plan --project interview.cut --json",
                          "mpcut participants render export --project interview.cut --output interview.mov --json",
                          "mpcut participants angles list --input angles.json --json",
+                         "mpcut participants angles take --input angle-take.json --json",
                          "mpcut participants angles plan --input angle-plan.json --json",
                          "mpcut participants angles render --input angle-delivery.json --json"]),
         .init(name: "transcript", purpose: "Prepare Transcriberrr sessions and edit from attached transcripts.",
@@ -157,7 +161,10 @@ struct CommandHelp: Encodable {
               result: "Returns project_path and operation_count.", examples: ["mpcut project create --input rough-cut.json --json", "mpcut project edit --input changes.json --json"]),
         .init(name: "still", purpose: "Edit still images in saved sequence and multicam projects.",
               usage: ["mpcut timeline clips space --project FILE (--source-timing | --duration TIME | --frames COUNT --rate FPS) [--background #RRGGBB] [--rate FPS] (--out-project FILE | --in-place) [--json]",
-                      "mpcut still project create --out-project FILE (--image FILE | --gap) [--background #RRGGBB] --width N --height N --rate FPS --codec h264|hevc|prores --container mov|mp4 [--color sdr|pq|hlg] (--duration TIME | --frames COUNT) [--json]",
+                      "mpcut still project create --out-project FILE (--image FILE | --gap) [--background #RRGGBB] --width N --height N --rate FPS [--codec h264|hevc|prores|jpeg] [--container mov|mp4|m4v|mkv] [--color sdr|pq|hlg] [--soundtrack FILE [--audio-stream INDEX] [--from TIME] [--to TIME]] (--duration TIME | --frames COUNT | --fit-soundtrack) [--json]",
+                      "mpcut still soundtrack attach --project FILE --soundtrack FILE [--audio-stream INDEX] [--from TIME] [--to TIME] [--fit-soundtrack] (--out-project FILE | --in-place) [--json]",
+                      "mpcut still soundtrack fit --project FILE (--out-project FILE | --in-place) [--json]",
+                      "mpcut still soundtrack detach --project FILE (--out-project FILE | --in-place) [--json]",
                       "mpcut still picture replace --project FILE (--image FILE | --asset ID) --clock sequence|group --from TIME --to TIME (--out-project FILE | --in-place) [--json]",
                       "mpcut still placement insert --project FILE (--image FILE | --asset ID) [--background #RRGGBB] --clock sequence|assembly --at TIME (--duration TIME | --frames COUNT --rate FPS) [--rate FPS] (--out-project FILE | --in-place) [--json]",
                       "mpcut still placement list --project FILE [--placement ID] [--json]",
@@ -167,7 +174,8 @@ struct CommandHelp: Encodable {
                       "mpcut still placement update --project FILE --placement ID --fragment-index N --detach-id ID (--out-project FILE | --in-place) [--json]",
                       "mpcut still asset relink --project FILE --asset ID --image FILE (--out-project FILE | --in-place) [--json]",
                       "mpcut still placement remove --project FILE --placement ID (--out-project FILE | --in-place) [--json]"],
-              instructions: ["Replace Picture keeps the underlying sound and duration. Insert Still adds time and silence on the existing audio tracks.",
+              instructions: ["Attach places a recording at program zero in a still-only project. Supply exact source times on audio sample boundaries to use a portion. Fit stretches the single image to the selected recording's audible extent. Detach keeps the current picture timing.",
+                             "Replace Picture keeps the underlying sound and duration. Insert Still adds time and silence on the existing audio tracks.",
                              "Space Clips sets gaps between consecutive clips. --source-timing measures each gap from the preceding clip's source end to the next clip's source start. Use chronological ranges from the same file or multicam group. --duration 0 clears gaps between clips.",
                              "Add and update accept --fit fit|fill, --crop-x, --crop-y, --crop-width, --crop-height, and --background #RRGGBB. Crop coordinates are normalized. Use --color sdr|pq|hlg for an explicit program color interpretation.",
                              "Use --project - to read a project from stdin. A mutation from stdin requires a named --out-project.",
@@ -297,6 +305,19 @@ struct CommandHelp: Encodable {
               instructions: ["The default checks file identity and reindexes changed media. --deep verifies the contents even when file identity matches. Progress goes to stderr and the saved project is read-only."],
               result: "Read sources[] for each recording's refresh state, preserved analyses and references that need review.",
               examples: ["mpcut project media refresh --project edit.cut --json", "mpcut project media refresh --project edit.cut --deep --progress stderr"]),
+        .init(name: "project media", purpose: "List, locate, relink or replace files referenced by a saved project.",
+              usage: ["mpcut project media list PROJECT [--include-history] [--json]",
+                      "mpcut project media relink PROJECT (--from OLD --to NEW | --map-prefix OLD=NEW) (--out-project FILE | --in-place) [--json]",
+                      "mpcut project media locate PROJECT --folder DIR [--include-history] [--apply-matches (--out-project FILE | --in-place)] [--json]",
+                      "mpcut project media replace PROJECT --source PATH --with FILE [--use-id ID] [--conform trim|keep] [--allow-loss | --loss remove|keep-offline] [--clock source-relative|source-timecode] [--stream-map OLD=NEW ...] [--reset-crop] [--replacement-offset TIME] [--shared-time-of-day] [--transcript keep-unverified|retranscribe] [--resync timecode|waveform] [--out-project FILE | --in-place] [--json]"],
+              instructions: ["Use a stored project path or an absolute path for an existing media reference. New file and folder arguments resolve from the working directory.",
+                             "Relink changes the location across the current edit and retained history. Repeat --from and --to for multiple pairs, or repeat --map-prefix for multiple folder roots. Locate searches recursively. --apply-matches applies unique verified and matched candidates. Add --include-history to list or locate paths used only in retained undo and redo states.",
+                             "Replace previews the impact when you omit the destination. Choose --out-project FILE or --in-place to apply. For entirely out-of-range uses, --allow-loss removes them with trim or retains them offline with keep. Use --loss for an explicit choice. Read affected_use_ids and candidate_audio_streams to choose a single use or map absolute audio stream indices."],
+              result: "Read sources[] for inventory, search and mapping results. Replace returns report. A successful write supplies out_project.",
+              examples: ["mpcut project media list edit.cut --json",
+                         "mpcut project media relink edit.cut --from camera.mov --to relocated/camera.mov --out-project relinked.cut",
+                         "mpcut project media locate edit.cut --folder /Volumes/Archive --json",
+                         "mpcut project media replace edit.cut --source camera.mov --with alternate.mov --json"]),
         .init(name: "frames", purpose: "Export JPEGs and exact timestamps for source or multicam review.",
               usage: ["mpcut review frames export [--json] --output NEW_DIRECTORY [--preset review|full] [--at TIME ...] [--at-file LIST] [--] FILE",
                       "mpcut review frames export [--json] --output NEW_DIRECTORY [--select scenes|non-silent] [--sample first|midpoint] [--limit N] [--preset review|full] [--stream INDEX] [--threshold-db DB] [--min-pause-seconds SEC] [--] FILE",
@@ -307,23 +328,24 @@ struct CommandHelp: Encodable {
               examples: ["mpcut review frames export --json --select scenes --limit 12 --output overview interview.mov",
                          "mpcut review frames export --json --preset full --at 3/2 --output detail interview.mov",
                          "mpcut review frames export --json --project interview.cut --at 3/2 --at 3 --output angle-review"]),
-        .init(name: "sidecar", purpose: "Save reusable analysis beside a source or inspect the saved inventory.",
-              usage: ["mpcut analysis sidecar build [--json] [--only index,scenes,audio | --only-file LIST] [--stream INDEX] [--min-pause-seconds SEC] [--threshold-db DB] [--] FILE",
-                      "mpcut analysis sidecar inspect [--json] [--] FILE"],
+        .init(name: "sidecar", purpose: "Save reusable analysis in the configured location or inspect available caches.",
+              usage: ["mpcut analysis sidecar build [--json] [--project PROJECT] [--only index,scenes,audio | --only-file LIST] [--stream INDEX] [--min-pause-seconds SEC] [--threshold-db DB] [--] FILE",
+                      "mpcut analysis sidecar inspect [--json] [--project PROJECT] [--] FILE"],
               instructions: ["Default save merges the complete editing index, scenes when video is present, and audio analyses for every audio track. Standalone audio saves a signed overview too. --only accepts a comma-separated subset. --stream and detector options apply when saving audio. The GUI can also save displayed filmstrip tiles, labels and settings.",
-                             "The companion is FILE.cutdb. A status query is read-only. --no-sidecar disables automatic sidecar reads and writes on ordinary queries and can force fresh analysis for a save. Sidecar inspection requires sidecar access."],
-              result: "Read sidecar, status and inventory (has_index, has_scenes, waveform_streams, optional envelope_streams, silence settings and thumbnail_count). Status also includes source generations, stale reasons when available, and persisted scene attempts. saved lists sections written by a save.",
+                             "Settings → Analysis selects next to media (FILE.cutdb), the project folder, or one shared cache disk. Supply --project PROJECT for project-folder writes. Inspection searches all known locations and is read-only. --no-sidecar disables automatic sidecar reads and writes on ordinary queries and can force fresh analysis for a save. Sidecar inspection requires sidecar access."],
+              result: "Read sidecar, read_location, read_locations, write_location, status and inventory (has_index, has_scenes, waveform_streams, optional envelope_streams, silence settings and thumbnail_count). Status also includes source generations, stale reasons when available, and persisted scene attempts. saved lists sections written by a save.",
               examples: ["mpcut analysis sidecar build --json interview.mov", "mpcut analysis sidecar inspect --json interview.mov", "mpcut --no-sidecar scenes scan --json interview.mov"]),
         .init(name: "export", purpose: "Render a sequence or multicam project, join an ordered edit, remux selected tracks, convert video, or replace a soundtrack.",
               usage: ["mpcut export clips join [--json] [--dry-run] \(settings(.cliExport)) \(tracks) \(spacingUsage) --output FILE --clip FILE [--from TIME] [--to TIME] [--ranges LIST] [--clip FILE ...] [--order LIST]",
                       "mpcut export clips join --clips LIST --output FILE [--order-file LIST] \(spacingUsage) [--dry-run] [--json]",
                       "mpcut export clips join --input REQUEST.json [--dry-run] [--json]",
                       "mpcut export clips join --json --stdin [--dry-run] \(settings(.cliExport)) \(tracks) \(spacingUsage) [--order LIST]",
-                      "mpcut export project render --project FILE --output FILE [--json] [--dry-run] \(projectUsage) \(spacingUsage)",
+                      "mpcut export project render --project FILE --output FILE [--json] [--dry-run] \(projectUsage) \(spacingUsage) [--still-timing cadence|held] [--container EXT]",
                       "mpcut export project render (--input REQUEST.json [--json] | --stdin --json) [--dry-run]",
                       "mpcut export soundtrack replace [--json] [--dry-run] --clip MOVIE --replace-audio AUDIO [--replace-track INDEX] [--replacement-stream INDEX] --output FILE",
                       "mpcut export soundtrack replace (--input REQUEST.json [--json] | --stdin --json) [--dry-run]"],
               instructions: ["Run \(projectExportExample) to render the saved assembly or entire project range in a single call. Multicam defaults to \(ExportRules.displayName(mode: ExportRules.defaultMode(for: .multicam))) and uses exact boundaries. Use --dry-run to preview a plan whenever you want to check it before writing.",
+                             "For still exports, --still-timing held writes one independently decodable sample per visible hold. Use cadence for regular frame timing. Smart Trim and Re-encode support explicit --video codec and --audio alac, flac or pcm when compatible with the container. Use --container to require a destination extension. JSON requests use still_timing and container. Dry runs report the planned format and sample counts. Completed still exports also report output_bytes.",
                              "Projects with a saved participant composition default to Re-encode. Export the current assembly as balanced H.264 in MOV, or use MP4 for silent picture. Dry runs report participant privacy coverage.",
                              "--ranges accepts CSV or JSON for the preceding clip. Use time for split points or from,to for ordered keep ranges. Times are relative to the clip in-point. Headers are optional.",
                              "--from and --to belong to the preceding --clip. Omitted edges use the source edges. \(ExportRules.modeHelp(.cliExport)) Boundaries are exact unless snap says otherwise. An explicit one-based --order can omit or repeat clips. --snap nearest authorizes changing cut times for eligible copy/smart edits.",
@@ -359,7 +381,7 @@ struct CommandHelp: Encodable {
     ]
 
     static let commands: [CommandHelp] = {
-        var topics = families.filter { ["help", "--version", "multicam"].contains($0.name) }
+        var topics = families.filter { ["help", "--version", "multicam", "participants"].contains($0.name) }
         for path in CommandPath.paths.sorted() {
             let prefix = "mpcut " + path
             guard let family = families.first(where: {
@@ -397,6 +419,9 @@ struct CommandHelp: Encodable {
         "still placement remove": "--project interview.cut --placement title --out-project edited.cut",
         "still placement update": "--project interview.cut --placement title --duration 3 --out-project title.cut",
         "still project create": "--image photo.png --width 1920 --height 1080 --rate 30 --codec h264 --container mov --duration 2 --out-project still.cut",
+        "still soundtrack attach": "--project cover.cut --soundtrack recording.wav --fit-soundtrack --in-place",
+        "still soundtrack fit": "--project cover.cut --in-place",
+        "still soundtrack detach": "--project cover.cut --out-project silent.cut",
         "timeline gap insert": "--project interview.cut --clock sequence --at 1 --duration 2 --out-project gap.cut",
         "transcript attachment bind": "--project interview.cut --attachment-id session --track-id mic --source-id camera --audio-stream-index 1 --out-project bound.cut",
         "transcript attachment detach": "--project interview.cut --attachment-id session --out-project detached.cut",
@@ -417,6 +442,10 @@ struct CommandHelp: Encodable {
     ]
 
     private static let purposes = [
+        "project media list": "Report project media paths, availability and uses.",
+        "project media locate": "Search a folder recursively for missing project media.",
+        "project media relink": "Update the location of project media across current and retained edits.",
+        "project media replace": "Preview or apply a different recording or image.",
         "silence scan": "Detect quiet intervals in a file or project soundtrack.",
         "silence plan": "Calculate retained ranges and optionally preflight a proposed output.",
         "silence export": "Render retained ranges to a new media file.",
@@ -425,7 +454,7 @@ struct CommandHelp: Encodable {
         "project resolve export": "Write an editable Resolve timeline.",
         "project resolve import": "Write the timeline and import it into the current Resolve project.",
         "analysis sidecar inspect": "Read the inventory of cached analysis.",
-        "analysis sidecar build": "Compute analysis and save it beside the recording.",
+        "analysis sidecar build": "Compute analysis and save it in the configured location.",
         "export project render": "Render a saved project to media.",
         "export clips join": "Write ordered clips to a single media file.",
         "export soundtrack replace": "Write media using a replacement soundtrack."
@@ -463,7 +492,7 @@ struct CommandHelp: Encodable {
             let invocation: String
             switch command.name {
             case "version": invocation = "--version"
-            case "multicam": invocation = "help multicam"
+            case "multicam", "participants": invocation = "help " + command.name
             default: invocation = command.name
             }
             return "  \(invocation)  —  \(command.purpose)"

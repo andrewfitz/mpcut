@@ -31,7 +31,7 @@ final class AudioWaveformDisplayTests: XCTestCase {
     }
 
     @MainActor
-    func testVideoTimelineLoadsDetailOnlyAtFineZoomAndReusesTheWindow() async throws {
+    func testVideoTimelineKeepsDetailAfterPeakScanAndRefinesItOnZoom() async throws {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
         let media = try CutEngine(useSidecar: false).inspect(url, keyframes: true)
         let id = UUID(), store = AudioEnvelopeStore()
@@ -47,26 +47,35 @@ final class AudioWaveformDisplayTests: XCTestCase {
             onMove: { _, _ in }, onDrop: { _, _ in })
         let bitmap = try XCTUnwrap(surface.bitmapImageRepForCachingDisplay(in: surface.bounds))
         func draw() { surface.cacheDisplay(in: surface.bounds, to: bitmap) }
+        func waitForDetail(after revision: Int) async throws {
+            let deadline = ContinuousClock.now + .seconds(5)
+            while store.windowRevision <= revision && .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertGreaterThan(store.windowRevision, revision)
+        }
+
         draw()
-        surface.zoom = 64
+        let loadingImage = try XCTUnwrap(bitmap.tiffRepresentation)
+        try await waitForDetail(after: 0)
         draw()
-        surface.zoom = 1
+        let detailedImage = try XCTUnwrap(bitmap.tiffRepresentation)
+        XCTAssertNotEqual(detailedImage, loadingImage)
+        let revision = store.windowRevision
+        let stream = try XCTUnwrap(media.streams.first { $0.kind == "audio" })
+        surface.timeline?.waveforms[id] = try AudioAnalysis.scan(media, stream: stream.index, useSidecar: false)
+        surface.timeline?.waveformRevision += 1
         draw()
-        try await Task.sleep(for: .milliseconds(120))
-        XCTAssertEqual(store.windowRevision, 0)
+        XCTAssertEqual(bitmap.tiffRepresentation, detailedImage)
         XCTAssertTrue(store.completed(for: id, media: media).isEmpty)
 
         surface.zoom = 64
         draw()
-        let deadline = ContinuousClock.now + .seconds(5)
-        while store.windowRevision == 0 && .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
-        XCTAssertEqual(store.windowRevision, 1)
+        try await waitForDetail(after: revision)
         draw()
         XCTAssertGreaterThan(tealPixels(nearCenterOf: bitmap), 1)
         let detail = try XCTUnwrap(store.envelope(for: id, surface: .timeline(clip.id), from: 0.02, to: 0.04, pixels: 8))
         XCTAssertLessThan(detail.samples.to, media.duration.seconds / 4)
         XCTAssertTrue(detail === store.envelope(for: id, surface: .timeline(UUID()), from: 0.03, to: 0.05, pixels: 8))
-        XCTAssertEqual(store.windowRevision, 1)
+        XCTAssertEqual(store.windowRevision, revision + 1)
     }
 
     @MainActor

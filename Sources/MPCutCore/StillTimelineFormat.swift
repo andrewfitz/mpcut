@@ -18,7 +18,13 @@ public struct StillTimelineFormat: Codable, Hashable, Sendable {
     }
 
     public static func containers(for codec: ReencodeCodec) -> [String] {
-        ExportRules.reencodeContainers(codec).filter { $0 == "mov" || $0 == "mp4" }
+        ExportRules.stillMovieContainers.filter {
+            ExportRules.reencodeContainers(codec).contains(ExportRules.multicamMuxContainer($0))
+        }
+    }
+
+    var requiresExtendedStillSchema: Bool {
+        codec == .jpeg || !["mov", "mp4"].contains(container)
     }
 
     public func validate() throws {
@@ -92,7 +98,7 @@ extension StillTimelineFormat {
         try validate()
         try color.validate()
         let hdr = ["smpte2084", "arib-std-b67"].contains(color.transfer)
-        guard !hdr || codec != .h264 else {
+        guard !hdr || codec == .hevc || codec == .prores else {
             throw CutError(code: "invalid_still_format", message: "Choose HEVC or ProRes for an HDR still timeline.")
         }
         guard !hdr || (color.primaries == "bt2020" && color.matrix == "bt2020nc" && color.range == "tv") else {
@@ -100,9 +106,12 @@ extension StillTimelineFormat {
         }
     }
 
-    func targetStream(color: StillProgramColorPolicy, duration: RationalTime) throws -> StreamInfo {
+    func targetStream(color: StillProgramColorPolicy, duration: RationalTime,
+                      pictureClock: Int64? = nil) throws -> StreamInfo {
         try validate(color: color)
-        _ = try frameCount(for: duration)
+        guard duration > .zero else {
+            throw CutError(code: "invalid_still_time", message: "The still duration must be positive.")
+        }
         let hdr = ["smpte2084", "arib-std-b67"].contains(color.transfer)
         let codecTag: String
         let profile: Int
@@ -113,21 +122,23 @@ extension StillTimelineFormat {
             (codecTag, profile, pixelFormat, bitDepth) = ("avc1", 100, "yuv420p", 8)
         case .hevc:
             (codecTag, profile, pixelFormat, bitDepth) = ("hvc1", hdr ? 2 : 1, hdr ? "yuv420p10le" : "yuv420p", hdr ? 10 : 8)
+        case .jpeg:
+            (codecTag, profile, pixelFormat, bitDepth) = ("jpeg", 192, "yuvj420p", 8)
         case .prores:
             (codecTag, profile, pixelFormat, bitDepth) = ("apcn", 2, "yuv422p10le", 10)
         }
-        return StreamInfo(index: 0, trackID: 1, kind: "video", codec: codec.rawValue, codecTag: codecTag,
+        return StreamInfo(index: 0, trackID: 1, kind: "video", codec: codec == .jpeg ? "mjpeg" : codec.rawValue, codecTag: codecTag,
                           profile: profile, width: width, height: height, displayWidth: width, displayHeight: height,
                           rotation: 0, rotationOnly: true, bitDepth: bitDepth, pixelFormat: pixelFormat,
                           alphaBits: 0, hasAdditionalVideoLayers: false,
                           frameRate: .init(numerator: cadence.denominator, denominator: cadence.numerator),
                           sampleAspectRatio: .init(numerator: 1),
-                          timeBase: .init(numerator: 1, denominator: cadence.denominator),
+                          timeBase: .init(numerator: 1, denominator: pictureClock ?? cadence.denominator),
                           start: .zero, hasDeclaredStart: true, duration: duration,
                           sampleRate: 0, channels: 0, channelLayout: "", language: "und", disposition: 0,
                           isPCM: false, initialPadding: 0, trailingPadding: 0, seekPreroll: 0,
                           colorPrimaries: color.primaries, colorTransfer: color.transfer, colorMatrix: color.matrix,
-                          fieldOrder: "progressive", chromaLocation: "left", colorRange: color.range,
+                          fieldOrder: "progressive", chromaLocation: "left", colorRange: codec == .jpeg ? "pc" : color.range,
                           configuration: Data(), codecMetadata: Data(), multipleDescriptions: false,
                           complexPicture: false, reconstructedDTS: false)
     }
@@ -138,7 +149,8 @@ extension CutProject {
                                           placementID: String, duration: RationalTime,
                                           framing: StillImageFraming = .fit,
                                           colorPolicy: StillProgramColorPolicy = StillTimelineFormat.sdrColorPolicy) throws -> CutProject {
-        _ = try format.targetStream(color: colorPolicy, duration: duration)
+        _ = try format.frameCount(for: duration)
+        try format.validate(color: colorPolicy)
         let still = StillInsert(id: placementID, assetID: asset.id, duration: duration,
                                 cadence: format.cadence, framing: framing)
         let result = CutProject.stillSequence(StillSequenceProject(

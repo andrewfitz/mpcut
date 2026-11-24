@@ -34,6 +34,123 @@
     }
   },
   {
+    "name": "still_editor_soundtrack_attach",
+    "description": "Attach a recording at program zero in a still-only sequence. Optionally fit its single image to the selected audio range.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "soundtrack": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Absolute path to the recording."
+        },
+        "audio_stream": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional absolute audio stream index. Defaults to the first audio stream."
+        },
+        "from": {
+          "type": "string",
+          "description": "Optional source in-point on an audio sample boundary, as exact rational seconds."
+        },
+        "to": {
+          "type": "string",
+          "description": "Optional source out-point on an audio sample boundary, as exact rational seconds."
+        },
+        "fit_soundtrack": {
+          "type": "boolean",
+          "const": true,
+          "description": "Fit the single image to the recording’s exact audible duration in the same edit."
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id",
+        "soundtrack"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "still_editor_soundtrack_fit",
+    "description": "Fit the single image in a still-only sequence to its attached soundtrack’s exact audible duration.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "still_editor_soundtrack_detach",
+    "description": "Detach the recording from a still-only sequence and keep its picture timing.",
+    "annotations": {
+      "readOnlyHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "project_handle",
+        "expected_revision",
+        "operation_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "timeline_clips_space",
     "description": "Set the gaps between consecutive picture items in one native undo step. Use a uniform duration or restore spacing from the source time between clips. Existing leading and trailing gaps are retained.",
     "annotations": {
@@ -511,7 +628,7 @@
   },
   {
     "name": "still_editor_asset_relink",
-    "description": "Update all uses of a still asset in one native undo step.",
+    "description": "Relink a still asset to the same image at a new location. Every use and retained history follows the relink.",
     "annotations": {
       "readOnlyHint": false,
       "openWorldHint": false

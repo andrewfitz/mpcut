@@ -60,7 +60,7 @@ struct TimelineTimeControl: View {
                             .focused($focused)
                             .onSubmit {
                                 guard let time = Self.parseTime(input, initialTime: initialTime) else {
-                                    NSSound.beep()
+                                    MutedLaunch.beep()
                                     return
                                 }
                                 seek(min(max(time, 0), duration))

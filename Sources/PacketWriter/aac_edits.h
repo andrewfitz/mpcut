@@ -21,4 +21,9 @@ int mpcut_aac_empty(MPCutAAC *aac, unsigned index, int sample_rate, MPCutTime ou
                    MPCutTime out_end, char *error, size_t error_capacity);
 int mpcut_aac_finalize(MPCutAAC *aac, const char *path, char *error, size_t error_capacity);
 
+/* Give a written movie's chapter track a millisecond clock. The writer hands the MOV
+ * muxer chapter times counted in milliseconds, because the muxer's chapter samples
+ * cannot span more than about three seconds on this writer's movie clock. */
+int mpcut_mov_finish_chapters(const char *path, int movie_timescale, char *error, size_t error_capacity);
+
 #endif

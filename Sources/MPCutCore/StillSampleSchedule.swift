@@ -1,5 +1,9 @@
 import Foundation
 
+public enum StillPictureTiming: String, Codable, CaseIterable, Sendable {
+    case cadence, held
+}
+
 struct StillSampleSchedule: Encodable, Sendable {
     struct Run: Encodable, Equatable, Sendable {
         var count: Int
@@ -10,6 +14,35 @@ struct StillSampleSchedule: Encodable, Sendable {
     let count: Int
     let duration: RationalTime
     let cadence: RationalTime
+
+    init(hold duration: RationalTime, cadence: RationalTime) throws {
+        guard duration > .zero, cadence >= Self.minimumCadence,
+              cadence.numerator <= Int32.max, cadence.denominator <= Int32.max else { throw Self.unsupported }
+        self.init(runs: [.init(count: 1, duration: duration)], duration: duration, cadence: cadence)
+        _ = try exactTimescale()
+    }
+
+    static func matroskaBoundary(_ time: RationalTime, final: Bool) throws -> RationalTime {
+        let rounded = try time.roundedToSamples(1_000)
+        let point = RationalTime(numerator: rounded, denominator: 1_000)
+        if final && point < time {
+            return try point.adding(.init(numerator: 1, denominator: 1_000))
+        }
+        return point
+    }
+
+    static func pictureClock(_ denominators: [Int64]) throws -> Int64 {
+        var scale: Int64 = 1
+        for denominator in denominators {
+            var a = scale
+            var b = denominator
+            while b != 0 { (a, b) = (b, a % b) }
+            let reduced = scale / a
+            guard reduced <= Int64(Int32.max) / denominator else { throw Self.unsupported }
+            scale = reduced * denominator
+        }
+        return scale
+    }
 
     init(duration: RationalTime, cadence: RationalTime, allowShortFinalSample: @autoclosure () throws -> Bool) throws {
         guard duration > .zero, cadence >= Self.minimumCadence,
@@ -67,16 +100,7 @@ struct StillSampleSchedule: Encodable, Sendable {
     }
 
     func exactTimescale() throws -> Int64 {
-        var timescale: Int64 = 1
-        for run in runs {
-            let denominator = run.duration.denominator
-            var a = timescale
-            var b = denominator
-            while b != 0 { (a, b) = (b, a % b) }
-            let reduced = timescale / a
-            guard reduced <= Int64(Int32.max) / denominator else { throw Self.unsupported }
-            timescale = reduced * denominator
-        }
+        let timescale = try Self.pictureClock(runs.map { $0.duration.denominator })
         guard fits(timescale: timescale) else { throw Self.unsupported }
         return timescale
     }
@@ -103,6 +127,6 @@ struct StillSampleSchedule: Encodable, Sendable {
 
     private static let minimumCadence = RationalTime(numerator: 1, denominator: 240)
     static var unsupported: CutError {
-        CutError(code: "unsupported_still_timing", message: "The still sample schedule is outside the selected picture clock's limits.")
+        CutError(code: "unsupported_still_timing", message: "The still sample schedule is outside the selected picture clock’s limits. Use cadence timing or a compatible frame clock.")
     }
 }

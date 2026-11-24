@@ -4,6 +4,137 @@ import XCTest
 @testable import MPCutApp
 
 final class SidecarEditorTests: XCTestCase {
+    @MainActor
+    func testTwoEditorsSaveTheSameRecordingIntoTheirOwnProjectFoldersAfterSaveAs() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try XCTUnwrap(Bundle.module.url(forResource: "Pause-Quiet", withExtension: "mov", subdirectory: "Fixtures"))
+        let source = directory.appendingPathComponent("Interview.mov")
+        try FileManager.default.copyItem(at: fixture, to: source)
+        try await SidecarLocations.$storageDirectory.withValue(directory.appendingPathComponent("settings")) {
+            try SidecarLocations.setMode(.project)
+            let editors = [EditorModel(), EditorModel()]
+            defer { editors.forEach { $0.endSession() } }
+            let adjacent = source.appendingPathExtension("cutdb")
+            for (number, editor) in editors.enumerated() {
+                // An untitled import stays in memory. Explicit save works even with auto-save disabled.
+                editor.useAnalysisSidecars = false
+                editor.importFiles([source])
+                try await wait { !editor.isBusy && editor.canEdit }
+                XCTAssertFalse(FileManager.default.fileExists(atPath: adjacent.path))
+                let receipt = MCPAnalysisReceipt(owner: "test", revision: 0, kind: "sidecars")
+                editor.mcpSidecarReceipt = receipt
+                editor.saveAnalysisSidecars()
+                XCTAssertEqual(receipt.state, "failed")
+                XCTAssertNil(editor.mcpSidecarReceipt)
+                let folder = directory.appendingPathComponent("edit-\(number)", isDirectory: true)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+                let document = folder.appendingPathComponent("Sequence.cut")
+                try editor.writeProject(to: document)
+                let output = try XCTUnwrap(SidecarLocations(source: source, project: document).destination)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+            }
+            for editor in editors { editor.saveAnalysisSidecars() }
+            try await wait { editors.allSatisfy { !$0.isSavingSidecars } }
+            let paths = try editors.map { editor -> URL in
+                XCTAssertNil(editor.alert)
+                let project = try XCTUnwrap(editor.projectURL)
+                let path = try XCTUnwrap(SidecarLocations(source: source, project: project).destination)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: path.path))
+                XCTAssertNotNil(try SidecarLocations.$projectURL.withValue(project) { try CutEngine().cachedIndex(source) })
+                return path
+            }
+            XCTAssertNotEqual(paths[0], paths[1])
+            XCTAssertFalse(FileManager.default.fileExists(atPath: adjacent.path))
+        }
+    }
+
+    @MainActor
+    func testFirstProjectSaveFlushesDraftAnalysisEvenWhenTheWindowImmediatelyCloses() async throws {
+        let source = try scratchRecording("Pause-Quiet")
+        let directory = source.deletingLastPathComponent()
+        try await SidecarLocations.$storageDirectory.withValue(directory.appendingPathComponent("settings")) {
+            try SidecarLocations.setMode(.project)
+            let editor = EditorModel()
+            editor.importFiles([source])
+            try await wait { editor.canEdit }
+            editor.manualThresholdDB = -47
+            let single = directory.appendingPathComponent("Single.cut")
+            try editor.writeProject(to: single)
+            let singleURL = try XCTUnwrap(SidecarLocations(source: source, project: single).destination)
+            editor.endSession()
+            var completed = false
+            if editor.cancelAndWaitForExport({ completed = true }) { try await wait { completed } }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: singleURL.path))
+            try SidecarLocations.$projectURL.withValue(single) {
+                let media = try XCTUnwrap(CutEngine().cachedIndex(source))
+                let overrides = try XCTUnwrap(AnalysisSidecar(media: media).read(AnalysisSidecar.silenceThresholdOverridesKey))
+                XCTAssertEqual(try JSONDecoder().decode([Int: Double].self, from: overrides).values.first, -47)
+            }
+
+            let other = directory.appendingPathComponent("Camera.mov")
+            try FileManager.default.copyItem(at: source, to: other)
+            let model = MulticamEditorModel()
+            let media = try CutEngine(useSidecar: false).inspectMulticamSource(other)
+            model.confirmSetup(drafts: [.init(source: .init(id: "camera", file: other.path), media: media)],
+                               opening: "camera", audio: .none)
+            let multi = directory.appendingPathComponent("Multicam.cut")
+            try model.writeProject(to: multi)
+            let multiURL = try XCTUnwrap(SidecarLocations(source: other, project: multi).destination)
+            completed = false
+            let draining = model.cancelAndWait { completed = true }
+            model.reset()
+            if draining { try await wait { completed } }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: multiURL.path))
+            XCTAssertNotNil(try SidecarLocations.$projectURL.withValue(multi) { try CutEngine().cachedIndex(other) })
+            for recording in [source, other] {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: recording.appendingPathExtension("cutdb").path))
+            }
+        }
+    }
+
+    @MainActor
+    func testClearingAnOpenEditorPreservesNamedScenesAndDropsWholeSidecarMetadata() async throws {
+        let source = try scratchRecording("Pause-Quiet")
+        let settings = source.deletingLastPathComponent().appendingPathComponent("settings")
+        try await SidecarLocations.$storageDirectory.withValue(settings) {
+            let editor = EditorModel()
+            defer { editor.endSession() }
+            editor.importFiles([source])
+            try await wait { editor.canEdit }
+            editor.scanForScenes()
+            try await wait { editor.sceneProgress == nil && !editor.canScanScenes }
+            let id = try XCTUnwrap(editor.timelineClips.first?.sourceID)
+            editor.setViewName("Interview", source: id, view: 1)
+            editor.manualThresholdDB = -45
+            editor.saveAnalysisSidecars()
+            try await wait { !editor.isSavingSidecars }
+            func clear(whole: Bool) throws {
+                let entry = try XCTUnwrap(SidecarCacheCleaner.preview(sources: [source]).first {
+                    $0.source.resolvingSymlinksInPath() == source.resolvingSymlinksInPath() && $0.issue == nil
+                })
+                let result = SidecarCacheCleaner.clear([entry], wholeSidecars: whole)
+                XCTAssertEqual(result.cleared, [entry.url])
+                NotificationCenter.default.post(name: .sidecarCachesDidClear, object: Set([source]),
+                                                userInfo: ["wholeSidecars": whole])
+            }
+            try clear(whole: false)
+            XCTAssertEqual(editor.viewNamesBySource[id]?[1], "Interview")
+            XCTAssertFalse(editor.scenesBySource[id]?.isEmpty ?? true)
+            XCTAssertEqual(editor.manualThresholdDB, -45)
+            try clear(whole: true)
+            XCTAssertNil(editor.viewNamesBySource[id])
+            XCTAssertNil(editor.scenesBySource[id])
+            XCTAssertNil(editor.manualThresholdDB)
+            editor.saveAnalysisSidecars()
+            try await wait { !editor.isSavingSidecars }
+            let sidecar = try AnalysisSidecar(source: source)
+            XCTAssertNil(sidecar.read(AnalysisSidecar.silenceThresholdOverridesKey))
+            XCTAssertNil(sidecar.read(AnalysisSidecar.viewNameSectionKey))
+        }
+    }
+
     func testManualSaveRetainsFinerWaveformOverview() throws {
         let source = try scratchRecording("Pause-Quiet")
         let media = try CutEngine(useSidecar: false).inspect(source, keyframes: true)

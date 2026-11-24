@@ -99,10 +99,11 @@ final class TranscriptCodecTests: XCTestCase {
         XCTAssertEqual(document.clock, .session)
         XCTAssertEqual(document.words[0].start, RationalTime(numerator: -17, denominator: 16000))
         XCTAssertEqual(document.words[0].observations.first?.start, try origin.adding(RationalTime(numerator: 1, denominator: 16000)))
-        XCTAssertEqual(document.tracks[0].activity.first?.start, origin)
         XCTAssertEqual(document.tracks[0].words?.first?.speakerID, "local-0")
         XCTAssertEqual(document.tracks[1].coverage, .skipped)
-        XCTAssertFalse(document.tracks[1].activity.isEmpty)
+        // The provider's levels stay with the recording's analysis sidecar.
+        XCTAssertTrue(try Self.sampleSession().contains(#""activity""#))
+        XCTAssertTrue(document.tracks.allSatisfy(\.activity.isEmpty))
         XCTAssertEqual(document.words[0].observations.map(\.trackID), ["mic"])
         XCTAssertEqual(try TranscriptCodec.decode(TranscriptCodec.encode(document, format: .json), format: .json), document)
     }

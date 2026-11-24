@@ -2,9 +2,9 @@ import Darwin
 import Foundation
 
 public enum ReencodeCodec: String, CaseIterable, Codable, Sendable {
-    case h264, hevc, prores
+    case h264, hevc, prores, jpeg
 
-    var encoder: String { rawValue + "_videotoolbox" }
+    var encoder: String { self == .jpeg ? "mjpeg" : rawValue + "_videotoolbox" }
 }
 
 public enum ReencodeQuality: String, CaseIterable, Codable, Sendable {
@@ -19,9 +19,9 @@ public enum ReencodeQuality: String, CaseIterable, Codable, Sendable {
 public enum ReencodeAudio: String, CaseIterable, Codable, Sendable {
     case auto
     case copyOriginal = "copy"
-    case aac, pcm
+    case aac, pcm, alac
     case removeAudio = "remove"
-    /// Audio-only conversion targets. Movie re-encoding does not write them.
+    /// Named audio formats. FLAC also supports still-bearing movie exports.
     case mp3, flac, opus
 
     /// The actions a movie re-encode accepts.
@@ -45,7 +45,8 @@ public struct ReencodeAudioAction: Encodable, Sendable {
     public let track: Int
     public let action: ReencodeAudio
     public let reason: String?
-    /// Reported by audio-only exports: the written codec and its rate control.
+    /// The written codec and its rate control or word length. Reported for converted sound: an audio-only export,
+    /// and the AAC and PCM tracks of a movie re-encode. The movie writer encodes what is stated here.
     public var codec: String? = nil
     public var bitRate: Int? = nil
     public var quality: Int? = nil
@@ -72,11 +73,13 @@ public struct ReencodePlan: Encodable, Sendable {
     let helper: URL
     var encoding: ReencodeVideo
     let audioCopy: ResolvedEdit?
-    let timeScale: Int
+    var timeScale: Int
     let exactPCM: Set<Int>
 
     var movieTimeScale = 1_000_000
     var assemblesStillHDR = false
+    var independentStillInputs: Set<URL> = []
+    var matroskaStillTiming: [MulticamRange] = []
 
     enum CodingKeys: String, CodingKey { case edit, settings, audioActions, width, height, warnings, canvas }
 }
@@ -214,6 +217,13 @@ public struct ReencodeEngine: Sendable {
             ?? resolveAudio(reference: reference, settings: settings, clips: clips,
                             segments: segments, media: media, engine: engine,
                             container: container)
+        if mixed == nil {
+            for action in actions where action.action == .pcm {
+                if reference.audio.contains(where: { $0.stream.index == action.track && $0.stream.codec.hasPrefix("pcm_f64") }) {
+                    warnings.append("The 64-bit floating-point audio of track \(action.track) will be reduced to 32-bit float.")
+                }
+            }
+        }
         if let audioCopy {
             guard let groups = Self.audioCopyGroups(audioCopy.segments, pictures: segments) else {
                 throw CutError(code: "audio_copy_unavailable", message: "Exact audio copy could not be aligned with the picture.")
@@ -358,7 +368,9 @@ public struct ReencodeEngine: Sendable {
         guard !reference.audio.isEmpty else { return ([], nil, []) }
         var copyFailure: CutError?
         var exactPCM: Set<Int> = []
-        var effective = settings.audio
+        let effective = settings.audio
+        // True when Auto cannot copy and converts instead.
+        var automatic = false
         if effective == .auto || effective == .copyOriginal {
             for (index, track) in reference.audio.enumerated() where canPreservePCM(track.stream, container: container) {
                 if try segments.allSatisfy({ segment in
@@ -412,24 +424,53 @@ public struct ReencodeEngine: Sendable {
                         .because(issue.factor)
                 }
                 copyFailure = issue
-                effective = ExportRules.automaticAudio(codec: settings.codec, container: container, source: .movie).first ?? .aac
+                automatic = true
             }
         }
-        if let refusal = ExportRules.reencodeRefusal(audio: effective, container: container, source: .movie) { throw refusal }
-        return (try reference.audio.map { audio in
+        if !automatic, let refusal = ExportRules.reencodeRefusal(audio: effective, container: container, source: .movie) { throw refusal }
+        // Every source in order of first use. One output track decodes the track at its position in each of them.
+        var sources: [MediaInfo] = []
+        for segment in segments {
+            if let source = media[segment.file], !sources.contains(where: { $0.url == source.url }) { sources.append(source) }
+        }
+        return (try reference.audio.enumerated().map { index, audio in
             if exactPCM.contains(audio.stream.index) { return exactPCMAction(audio.stream.index) }
-            if effective != .removeAudio {
+            let tracks = sources.compactMap { $0.audio.indices.contains(index) ? $0.audio[index] : nil }
+            var action = effective
+            var note: String?
+            if automatic {
+                // Auto decides for each track. A track that is lossless in every clip is written as PCM where the container carries it.
+                let lossless = tracks.count == sources.count && tracks.allSatisfy { ExportRules.isLosslessAudio(codec: $0.stream.codec) }
+                action = ExportRules.automaticAudio(codec: settings.codec, container: container, source: .movie,
+                                                    lossless: lossless, channels: audio.stream.channels).first ?? .aac
+                note = ExportRules.automaticAudioNote(action, lossless: lossless, channels: audio.stream.channels, container: container)
+                if let refusal = ExportRules.reencodeRefusal(audio: action, container: container, source: .movie) { throw refusal }
+            }
+            if action != .removeAudio {
                 guard audio.stream.sampleRate > 0, audio.stream.channels > 0 else {
                     throw CutError(code: "unsupported_audio", message: "Audio track \(audio.stream.index) has no usable sample clock or channel layout.",
                                    track: audio.stream.index)
                 }
-                if effective == .aac, audio.stream.channels > 8 {
+                if action == .aac, audio.stream.channels > 8 {
                     throw CutError(code: "unsupported_audio", message: "AAC cannot preserve the channel layout of audio track \(audio.stream.index).",
                                    track: audio.stream.index)
                 }
             }
-            return ReencodeAudioAction(track: audio.stream.index, action: effective,
-                                       reason: copyFailure.map { "Exact audio copy could not be verified. \($0.message)" })
+            let reason = [copyFailure.map { "Exact audio copy could not be verified. \($0.message)" }, note].compactMap { $0 }
+            var written = ReencodeAudioAction(track: audio.stream.index, action: action,
+                                              reason: reason.isEmpty ? nil : reason.joined(separator: " "))
+            if action == .aac {
+                // An AAC track keeps the rate of its AAC sources. Any other source gets the default for its channels.
+                let measured = tracks.compactMap { $0.stream.codec == "aac" ? $0.averageBitRate : nil }
+                written.codec = "aac"
+                written.bitRate = AudioExportEngine.aacBitRate(matching: measured.count == sources.count ? measured.max() : nil,
+                                                               channels: audio.stream.channels)
+            } else if action == .pcm {
+                let pcm = AudioExportEngine.moviePCM(tracks.map(\.stream))
+                written.codec = pcm.codec
+                written.bitDepth = pcm.bitDepth
+            }
+            return written
         }, nil, exactPCM)
     }
 

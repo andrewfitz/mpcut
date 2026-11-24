@@ -10,7 +10,7 @@ final class VideoMonitorTests: XCTestCase {
 
     @MainActor
     func testOrdinaryMonitorSharesFramesAndClosingKeepsPlaybackRunning() async throws {
-        _ = NSApplication.shared
+        _ = WindowTestHost.application
         for (name, ext) in [("Shuttle-Chirp", "mov"), ("WebM-Opus-GOP", "webm")] {
             let session = ProjectSession(id: UUID(), preferences: EditorPreferences())
             defer { session.end() }
@@ -70,7 +70,7 @@ final class VideoMonitorTests: XCTestCase {
 
     @MainActor
     func testExistingMonitorSwitchesModesAndClearsAnUncoveredMulticamPicture() async throws {
-        _ = NSApplication.shared
+        _ = WindowTestHost.application
         let session = ProjectSession(id: UUID(), preferences: EditorPreferences())
         defer { session.end() }
         let engine = CutEngine(useSidecar: false)

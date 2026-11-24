@@ -82,6 +82,7 @@ struct SourceRangesSheet: View {
                         .monospacedDigit()
                 }
             }
+            .disabled(working)
             Group {
                 if rows.isEmpty {
                     ContentUnavailableView("No source ranges", systemImage: "list.bullet.rectangle",
@@ -124,6 +125,7 @@ struct SourceRangesSheet: View {
                     .listStyle(.inset(alternatesRowBackgrounds: true))
                 }
             }
+            .disabled(working)
             .frame(height: 236)
             .modifier(InsetPanel())
             if let error { IssueLabel(error).textSelection(.enabled) }
@@ -133,6 +135,7 @@ struct SourceRangesSheet: View {
                 if selection != nil { Text("Selected Range").tag(true) }
             }
             .fixedSize()
+            .disabled(working)
             .help("Choose where the plan goes")
             if let destination {
                 Text(destination.from == destination.to ? timelineTime(destination.from.seconds, milliseconds: true) :
@@ -143,13 +146,16 @@ struct SourceRangesSheet: View {
             }
             if working { ProgressView().controlSize(.small) }
             Spacer(minLength: 0)
-            Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+            Button("Cancel") {
+                operation?.cancel()
+                dismiss()
+            }
+            .keyboardShortcut(.cancelAction)
             Button(replace ? "Replace Selection" : "Insert at Playhead") { apply() }
                 .keyboardShortcut(.defaultAction)
-                .disabled(rows.isEmpty || (replace ? selection == nil : playhead == nil))
+                .disabled(working || rows.isEmpty || (replace ? selection == nil : playhead == nil))
         }
         .frame(width: 620)
-        .disabled(working)
         .interactiveDismissDisabled(working)
         .onDisappear { operation?.cancel() }
         .fileImporter(isPresented: $choosingFiles, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
@@ -191,7 +197,7 @@ struct SourceRangesSheet: View {
     private func save(_ row: Row) {
         run {
             let ranges = try await resolve([row])
-            let select = try NamedSourceSelect(id: row.savedID ?? UUID().uuidString, name: row.name, range: ranges[0])
+            let select = try NamedSourceSelect(id: row.savedID ?? ProjectIdentifier.make(), name: row.name, range: ranges[0])
             try checkGeneration()
             try await editor.saveSourceSelect(select, expectedRevision: revision)
             if let index = rows.firstIndex(where: { $0.id == row.id }) {
@@ -219,6 +225,7 @@ struct SourceRangesSheet: View {
             let engine = CutEngine(cancelled: { Task.isCancelled }, useSidecar: false)
             var durations: [URL: RationalTime] = [:]
             return try rows.map { row in
+                try Task.checkCancellation()
                 let from = try RationalTime(parsing: row.from.trimmingCharacters(in: .whitespacesAndNewlines))
                 let end = row.to.trimmingCharacters(in: .whitespacesAndNewlines)
                 let to: RationalTime

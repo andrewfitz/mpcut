@@ -26,7 +26,16 @@ final class TranscriptExternalCacheTests: XCTestCase {
         exec "$MPCUT_TEST_REAL_PROVIDER" "$@"
         """.utf8).write(to: wrapper)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: wrapper.path)
+        // This process, the command-line tool and the provider exchange results in one folder.
+        let claimsVariable = "MPCUT_TRANSCRIPT_CLAIMS_HOME"
+        let claimsFolder = directory.appendingPathComponent("claims", isDirectory: true)
+        let inheritedClaims = environment[claimsVariable]
+        setenv(claimsVariable, claimsFolder.path, 1)
+        defer {
+            if let inheritedClaims { setenv(claimsVariable, inheritedClaims, 1) } else { unsetenv(claimsVariable) }
+        }
         let processEnvironment = environment.merging([
+            claimsVariable: claimsFolder.path,
             "MPCUT_TRANSCRIBERRR_HELPER": wrapper.path,
             "MPCUT_TEST_PROVIDER_LOG": launchLog.path,
             "MPCUT_TEST_REAL_PROVIDER": provider,
@@ -91,6 +100,7 @@ final class TranscriptExternalCacheTests: XCTestCase {
                 let scope = TranscriptExternalCacheDescriptor.scope(for: track.file, stream: stream)
                 let id = TranscriptExternalCacheDescriptor.claimID(scope: scope, key: key)
                 try? FileManager.default.removeItem(at: cacheDirectory.appendingPathComponent(id + ".json"))
+                try? FileManager.default.removeItem(at: cacheDirectory.appendingPathComponent(id + ".mpx"))
                 try? FileManager.default.removeItem(at: cacheDirectory.appendingPathComponent(id))
             }
         }

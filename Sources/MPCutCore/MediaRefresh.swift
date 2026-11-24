@@ -52,6 +52,12 @@ public struct MediaRefreshResult: Encodable, Sendable {
 }
 
 public enum MediaRefresh {
+    package static func presence(of source: URL, identity: SourceIdentity?) -> MediaRefreshResult {
+        let available = identity != nil
+        return .init(source: source, state: available ? .unchanged : .offline, media: nil, scenesPreserved: false,
+                     preservedAudioStreams: [], reviewStreams: [], displayChanged: !available, persistenceError: nil)
+    }
+
     /// Refreshes one source and verifies all dependencies before carrying forward existing analysis.
     public static func check(_ source: URL, previous: MediaInfo? = nil,
                              verification: MediaRefreshVerification = .stamp, persist: Bool = true,
@@ -66,13 +72,12 @@ public enum MediaRefresh {
 
     package static func check(_ source: URL, identity: SourceIdentity?, previous: MediaInfo?,
                               verification: MediaRefreshVerification, persist: Bool, exclusions: Set<URL>,
+                              requiresIndex: Bool = false,
                               progress: ((Double) -> Void)?, cancelled: @escaping () -> Bool) throws -> MediaRefreshResult {
         try checkCancellation(cancelled)
         guard let identity else {
             progress?(1)
-            return MediaRefreshResult(source: source, state: .offline, media: nil, scenesPreserved: false,
-                                      preservedAudioStreams: [], reviewStreams: [], displayChanged: true,
-                                      persistenceError: nil)
+            return presence(of: source, identity: nil)
         }
         let sidecar = AnalysisSidecar(source: source, identity: identity)
         let readSidecar = persist && AnalysisSidecar.readsEnabled &&
@@ -92,7 +97,7 @@ public enum MediaRefresh {
                                       displayChanged: false, persistenceError: nil, referenceEvidence: evidence)
         }
         if verification == .stamp {
-            if snapshotMatches, previous != nil || cacheEvidence != nil {
+            if !requiresIndex, snapshotMatches, previous != nil || cacheEvidence != nil {
                 try checkCancellation(cancelled)
                 return unchanged(previous?.refreshEvidence ?? cacheEvidence)
             }
@@ -120,7 +125,7 @@ public enum MediaRefresh {
             guard media.identity.isCurrentSnapshot(at: source) else {
                 throw CutError(code: "source_changed", message: "The source changed during deep verification.")
             }
-            return unchanged(previousEvidence)
+            return unchanged(previousEvidence, rebound: requiresIndex ? media : nil)
         }
         var comparison = previousEvidence.map { evidence.compare(to: $0) }
             ?? MediaRefreshEvidence.Comparison(review: Set(previous?.streams

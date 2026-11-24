@@ -28,6 +28,7 @@ typedef struct {
     int64_t start, duration;
     int sample_rate, channels, pcm, initial_padding, trailing_padding, seek_preroll;
     char *language;
+    char name[256];
     int disposition;
     int track_id, deferred_aac_issue, complex_picture, multilayer, multiple_descriptions, reconstructed_dts;
     char audio_clock_issue[128];
@@ -54,6 +55,8 @@ typedef struct {
     MPProbeStream *streams;
     int stream_count, video_index, source_start_safe, has_unsupported_auxiliary;
     int64_t origin, end;
+    int64_t source_stamp_units;
+    int source_stamp_kind, source_stamp_stream, source_stamp_num, source_stamp_den;
 } MPProbeResult;
 
 // Writes the layout two descriptions are compared by: a layout that names no speakers ("2 channels") becomes the
@@ -103,16 +106,52 @@ size_t mp_scene_match_view(const uint8_t *feature, const uint8_t *layouts, size_
 // provisional scenes if the hardware reader must restart on the general decoder.
 typedef void (*MPSceneVisit)(void *context, int64_t pts, const uint8_t *feature);
 // Populated only when the decode pass can verify a report-only timeline.
+// If supplied, metadata runs for every decoded picture. A positive return
+// requests RGB for this picture, zero skips it, and a negative return stops
+// the scan. Damaged or untimestamped pictures never request conversion.
+typedef int (*MPParticipantFrameSelect)(void *context, int64_t pts, int64_t duration, int damaged);
 // RGB24, coded orientation. The pointer is valid only for the duration of
-// the callback. A null pointer signals a damaged or untimestamped picture.
+// the callback. Without a selector, a null pointer reports damaged pictures.
 // unplaced_damage is set when the decoder recovers from an error without
 // yielding the affected picture's timestamp.
 typedef int (*MPParticipantFrameVisit)(void *context, int64_t pts, int64_t duration,
                                       const uint8_t *rgb, int32_t width, int32_t height,
                                       int32_t stride, int32_t sar_num, int32_t sar_den);
 int mp_participant_scan(const char *path, int stream, MPProbeCancelled cancelled,
-                        MPParticipantFrameVisit frame, MPSceneVisit scene, void *context,
+                        MPParticipantFrameSelect select_frame, MPParticipantFrameVisit frame,
+                        MPSceneVisit scene, void *context,
                         int *unplaced_damage, char *error, size_t capacity);
+// A picture of the adaptive scan, with the analysis the prepare callback
+// returned for it or NULL. The visit owns that analysis. As the frame visit, a
+// nonzero return stops the scan and null pixels report a damaged picture. As
+// the coarse visit, the picture follows pictures the scan has not decoded,
+// normally the next keyframe: a positive return accepts it in their place,
+// zero asks for the pictures before it, and a negative return stops the scan.
+// A refused picture arrives again through the frame visit after the pictures
+// it follows.
+typedef int (*MPParticipantSampleVisit)(void *context, int64_t pts, int64_t duration,
+                                       const uint8_t *rgb, int32_t width, int32_t height,
+                                       int32_t stride, int32_t sar_num, int32_t sar_den, void *prepared);
+// Analyze a picture's pixels ahead of its visit. Runs on several threads at
+// once, never during a visit. Discard releases an analysis no visit received.
+typedef void *(*MPParticipantPrepare)(void *context, int64_t pts, const uint8_t *rgb, int32_t width,
+                                      int32_t height, int32_t stride, int32_t sar_num, int32_t sar_den);
+typedef void (*MPParticipantDiscard)(void *context, void *prepared);
+// Decode random access pictures first and the pictures between two of them
+// only on request. A stretch is offered for skipping when its packets cover
+// the time between both pictures without a gap and it lasts at most three
+// seconds. Every other picture reaches the frame visit in presentation order,
+// as in mp_participant_scan without a selector. With a null coarse visit every
+// picture does. Small H.264 pictures decode on frame threads in software,
+// packed as the NV12 the hardware decoder returns.
+// A positive sample limit delivers each picture as the grid of point samples
+// the analyzer reads: the longer side becomes the limit, the other scales to
+// match, and sample i of n is source pixel (2i + 1) * size / 2n. Pictures then
+// convert side by side. Zero delivers whole pictures.
+int mp_participant_scan_adaptive(const char *path, int stream, int sample_limit, MPProbeCancelled cancelled,
+                                 MPParticipantSampleVisit coarse, MPParticipantSampleVisit frame,
+                                 MPParticipantPrepare prepare, MPParticipantDiscard discard,
+                                 void *context, int *unplaced_damage, char *error, size_t capacity);
 
 typedef struct {
     int valid, tb_num, tb_den;
@@ -125,6 +164,7 @@ int mp_scene_scan(const char *path, int stream, int allow_asset_reader,
                   void *context, MPSceneTiming *timing, char *error, size_t capacity);
 
 enum { MP_SCENE_RESUME_MISMATCH = 1, MP_SCENE_SCAN_CANCELLED = 2 };
+enum { MP_PARTICIPANT_UNSUPPORTED_DISPLAY_TRANSFORM = 3 };
 // Leading scene's descriptor, emitted separately from actual scene boundaries.
 #define MP_SCENE_RANGE_LEADING_PTS (INT64_MIN + 1)
 typedef struct {

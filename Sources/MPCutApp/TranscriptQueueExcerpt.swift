@@ -6,21 +6,25 @@ struct TranscriptQueueExcerpt: Sendable {
     var name: String
     private let project: CutProject
     private let location: URL
+    private let mediaSnapshot: ProjectMediaSnapshot
     private enum CapturedAsset: Sendable {
-        case data(Data)
+        /// The bytes are held in case the file they came from is gone by the time the excerpt is saved.
+        case data(Data, from: TranscriptAsset)
         case unavailable(TranscriptAssetStatus)
     }
 
     private let assets: [String: CapturedAsset]
 
-    init(name: String, project: CutProject, location: URL) {
+    init(name: String, project: CutProject, location: URL, mediaSnapshot: ProjectMediaSnapshot = .empty) {
         self.name = name
         self.project = project
         self.location = location
+        self.mediaSnapshot = mediaSnapshot
         var assets: [String: CapturedAsset] = [:]
         for attachment in project.transcripts.attachments where assets[attachment.resultID] == nil {
             do {
-                assets[attachment.resultID] = .data(try TranscriptStore.read(attachment.asset, relativeTo: location))
+                assets[attachment.resultID] = .data(try TranscriptStore.read(attachment.asset, relativeTo: location),
+                                                    from: attachment.asset)
             } catch {
                 let missing = (error as? CutError)?.code == "missing_transcript"
                 assets[attachment.resultID] = .unavailable(missing ? .missing : .invalid)
@@ -36,7 +40,8 @@ struct TranscriptQueueExcerpt: Sendable {
         guard !FileManager.default.fileExists(atPath: destination.path) else {
             throw CutError(code: "output_exists", message: "Choose a new project destination.")
         }
-        var snapshot = try project.rebased(from: location, to: destination)
+        var paths: [String: String] = [:]
+        var snapshot = try project.rebased(from: location, to: destination, paths: &paths, makeRelative: true)
         var transcripts = snapshot.transcripts
         transcripts.documentID = nil
         for index in transcripts.attachments.indices {
@@ -45,8 +50,9 @@ struct TranscriptQueueExcerpt: Sendable {
                 throw CutError(code: "missing_transcript", message: "The queued excerpt is missing a transcript reference.")
             }
             switch captured {
-            case .data(let data):
-                transcripts.attachments[index].asset = try TranscriptStore.put(data, relativeTo: destination)
+            case .data(let data, let asset):
+                transcripts.attachments[index].asset = try TranscriptStore.put(data, readFrom: asset, in: location,
+                                                                               relativeTo: destination)
             case .unavailable(let status):
                 let store = TranscriptStore.folder(relativeTo: destination).lastPathComponent
                 transcripts.attachments[index].asset = .init(file: "\(store)/\(attachment.resultID).json",
@@ -54,7 +60,9 @@ struct TranscriptQueueExcerpt: Sendable {
             }
         }
         snapshot.transcripts = transcripts
-        try snapshot.save(to: destination, undo: [], redo: [], replacingExisting: false)
+        try snapshot.save(to: destination, undo: [], redo: [],
+                          mediaSnapshot: mediaSnapshot.rebased(from: location, to: destination, makeRelative: true),
+                          replacingExisting: false)
     }
 
     @MainActor

@@ -1,8 +1,8 @@
 import AppKit
 import Combine
 import Foundation
-import MPCutCore
 import UniformTypeIdentifiers
+import MPCutCore
 
 private struct IndexedSource: Sendable {
     let id: UUID
@@ -43,12 +43,80 @@ private struct IndexedSource: Sendable {
     var url: URL { media.url }
     var name: String { originalURL.lastPathComponent }
     var duration: RationalTime { media.duration }
+}
+
+private struct UnresolvedSource: Sendable {
+    let id: UUID
+    let url: URL
+    let originalURL: URL
+    let replacementNames: [Int: String]
+    let replacementTrack: Int?
+    let status: ProjectMediaStatus
+    let detail: String
+    let snapshot: ProjectMediaSnapshot.Entry?
+
+    var hasPicture: Bool? {
+        guard let streams = snapshot?.streams, !streams.isEmpty else { return nil }
+        return streams.contains { $0.kind == "video" }
+    }
+
+    var isAudioOnly: Bool {
+        if let streams = snapshot?.streams {
+            return streams.contains { $0.kind == "audio" } && !streams.contains { $0.kind == "video" }
+        }
+        return replacementTrack != nil
+    }
+}
+
+private enum EditorSource: Sendable {
+    case resolved(IndexedSource)
+    case unresolved(UnresolvedSource)
+
+    var indexed: IndexedSource? {
+        if case .resolved(let source) = self { return source }
+        return nil
+    }
+    var unresolved: UnresolvedSource? {
+        if case .unresolved(let source) = self { return source }
+        return nil
+    }
+    var media: MediaInfo? { indexed?.media }
+    var id: UUID {
+        switch self {
+        case .resolved(let source): return source.id
+        case .unresolved(let source): return source.id
+        }
+    }
+    var url: URL {
+        switch self {
+        case .resolved(let source): return source.url
+        case .unresolved(let source): return source.url
+        }
+    }
+    var originalURL: URL {
+        switch self {
+        case .resolved(let source): return source.originalURL
+        case .unresolved(let source): return source.originalURL
+        }
+    }
+    var replacementTrack: Int? { indexed?.replacementTrack ?? unresolved?.replacementTrack }
+    var replacementNames: [Int: String] { indexed?.replacementNames ?? unresolved?.replacementNames ?? [:] }
+    var name: String { originalURL.lastPathComponent }
     var replacementLabel: String? {
         if replacementNames.count == 1 { return replacementNames.values.first }
         if replacementNames.isEmpty { return nil }
         return replacementNames.sorted { $0.key < $1.key }
             .map { "Track \($0.key + 1): \($0.value)" }.joined(separator: " · ")
     }
+    var isAudioReplacement: Bool { replacementTrack != nil && url != originalURL }
+    var isIndexed: Bool { indexed?.isIndexed == true }
+    var frames: [RationalTime] { indexed?.frames ?? [] }
+    var frameBoundaries: [RationalTime] { indexed?.frameBoundaries ?? [] }
+    var keyframes: [RationalTime] { indexed?.keyframes ?? [] }
+    var keyframeSeconds: [Double] { indexed?.keyframeSeconds ?? [] }
+    var thumbnailSyncTimes: [Double] { indexed?.thumbnailSyncTimes ?? [] }
+
+    func audioOrdinal(preferred: Int) -> Int? { indexed?.audioOrdinal(preferred: preferred) }
 }
 
 /// Occurrences can link to the same working movie with different replacement provenance.
@@ -62,7 +130,7 @@ private struct DocumentSourceKey: Hashable {
 private struct EditorSegment: Sendable {
     let id: UUID
     let documentID: String
-    var source: IndexedSource
+    var source: EditorSource
     var start: RationalTime
     var end: RationalTime
     var displayRange: AudioSpan?
@@ -71,13 +139,19 @@ private struct EditorSegment: Sendable {
 
     init(id: UUID = UUID(), documentID: String? = nil, source: IndexedSource, start: RationalTime = .zero, end: RationalTime? = nil,
          displayRange: AudioSpan? = nil, occurrence: UUID? = nil) {
+        self.init(id: id, documentID: documentID, source: .resolved(source), start: start, end: end ?? source.duration,
+                  displayRange: displayRange, occurrence: occurrence)
+    }
+
+    init(id: UUID = UUID(), documentID: String? = nil, source: EditorSource, start: RationalTime, end: RationalTime,
+         displayRange: AudioSpan? = nil, occurrence: UUID? = nil) {
         self.id = id
-        self.documentID = documentID ?? id.uuidString
+        self.documentID = documentID ?? ProjectIdentifier.make(from: id)
         self.source = source
         self.start = start
         self.displayRange = displayRange
         self.occurrence = occurrence ?? id
-        self.end = end ?? source.duration
+        self.end = end
     }
 
     func split(at boundary: RationalTime, rightID: UUID) -> (left: Self, right: Self) {
@@ -85,31 +159,36 @@ private struct EditorSegment: Sendable {
         left.end = boundary
         left.displayRange = AudioSpan(from: min(start, displayRange?.from ?? .zero), to: boundary)
         let right = Self(id: rightID, source: source, start: boundary, end: end,
-                         displayRange: AudioSpan(from: boundary, to: max(end, displayRange?.to ?? source.duration)),
+                         displayRange: AudioSpan(from: boundary, to: max(end, displayRange?.to ?? sourceExtent)),
                          occurrence: occurrence)
         return (left, right)
     }
 
     var duration: RationalTime { end - start }
+    var sourceExtent: RationalTime { source.indexed?.duration ?? max(end, source.unresolved?.snapshot?.duration ?? .zero) }
     func sequenceSeconds(at sourceTime: RationalTime, offset: RationalTime) -> Double {
         if let exact = try? offset.adding(sourceTime.subtracting(start)) { return exact.seconds }
         return offset.seconds + (sourceTime.seconds - start.seconds)
     }
 
     var preview: PreviewRange {
-        var range = PreviewRange(media: source.media, from: start, to: end)
+        guard let media = source.media else {
+            return PreviewRange(url: source.url, exactStart: start, exactEnd: end, isAudioOnly: true, isSilentInsert: true)
+        }
+        var range = PreviewRange(media: media, from: start, to: end)
         range.audioTrack = source.replacementTrack
         return range
     }
     var request: ClipRequest { ClipRequest(file: source.url, from: start, to: end) }
     func timeline(sequenceRange: Range<Double>) -> TimelineClip {
         TimelineClip(id: id, sourceID: source.id, name: source.name, sourceStart: start.seconds, sourceEnd: end.seconds,
-                     sourceDuration: source.duration.seconds, keyframes: source.keyframeSeconds,
+                     sourceDuration: sourceExtent.seconds, keyframes: source.keyframeSeconds,
                      thumbnailSyncTimes: source.thumbnailSyncTimes, frames: source.frames,
-                     displaySize: CGSize(width: source.media.videoStream?.displayWidth ?? 0, height: source.media.videoStream?.displayHeight ?? 0),
-                     sourceOrigin: source.media.origin,
+                     displaySize: CGSize(width: source.media?.videoStream?.displayWidth ?? 0, height: source.media?.videoStream?.displayHeight ?? 0),
+                     sourceOrigin: source.media?.origin ?? source.unresolved?.snapshot?.origin ?? .zero,
                      sequenceRange: sequenceRange, isIndexed: source.isIndexed, displayRange: displayRange,
-                     isAudioOnly: !source.media.hasVideo, audioSampleRate: source.media.hasVideo ? 0 : source.media.primaryStream.sampleRate,
+                     isAudioOnly: source.media.map { !$0.hasVideo } ?? (source.unresolved?.isAudioOnly == true),
+                     audioSampleRate: source.media.flatMap { $0.hasVideo ? nil : $0.primaryStream.sampleRate } ?? 0,
                      replacementAudio: source.replacementLabel)
     }
 }
@@ -175,20 +254,31 @@ private struct PreparedEdit: Sendable {
     var firstSourceID: UUID?
     var requiresBackgroundCopyChecks = false
     var sourceMedia: [UUID: MediaInfo] = [:]
+    var unresolvedStatusByURL: [URL: ProjectMediaStatus] = [:]
+    var unavailableSourceIDs: Set<UUID> = []
+    var firstMedia: MediaInfo?
     var audioTracks: [StreamInfo] = []
     /// True when the movies differ in format, so no packet copy joins them and only Re-encode writes the timeline.
     var isMixed = false
 
     init() {}
 
-    init(segments: [EditorSegment], previous: Self, engine: CutEngine) {
-        sourceMedia = Dictionary(segments.map { ($0.source.id, $0.source.media) }, uniquingKeysWith: { first, _ in first })
-        if sourceMedia.count > 1, let first = segments.first?.source, first.media.hasVideo {
+    init(segments: [EditorSegment], previous: Self, engine: CutEngine, excluding unavailable: Set<UUID> = []) {
+        unavailableSourceIDs = unavailable
+        let indexed = segments.compactMap { $0.source.indexed }
+        // Keep indexes for history and recovery. Timeline format and track choices use available recordings.
+        sourceMedia = Dictionary(indexed.map { ($0.id, $0.media) }, uniquingKeysWith: { first, _ in first })
+        unresolvedStatusByURL = Dictionary(segments.lazy.compactMap { segment in
+            segment.source.unresolved.map { (ProjectMediaVolume.watchURL($0.url), $0.status) }
+        }, uniquingKeysWith: { first, _ in first })
+        let sources = unavailable.isEmpty ? indexed : indexed.filter { !unavailable.contains($0.id) }
+        firstMedia = sources.first?.media
+        let activeMedia = unavailable.isEmpty ? sourceMedia : sourceMedia.filter { !unavailable.contains($0.key) }
+        if activeMedia.count > 1, let first = sources.first, first.media.hasVideo {
             // Measured against the first clip, as the import and the planners do. A replacement working copy changes
             // its sound by design, so it is held to the first clip's picture and track count only.
             var seen: Set<UUID> = [first.id]
-            isMixed = segments.contains { segment in
-                let source = segment.source
+            isMixed = sources.contains { source in
                 guard seen.insert(source.id).inserted, source.media.hasVideo else { return false }
                 if source.isAudioReplacement || first.isAudioReplacement {
                     return (try? engine.checkPictureCompatibility(source.media, with: first.media)) == nil
@@ -197,14 +287,20 @@ private struct PreparedEdit: Sendable {
                 return (try? engine.checkCompatibility(source.media, with: first.media)) == nil
             }
         }
-        audioTracks = sourceMedia.values.sorted { $0.url.path < $1.url.path }
+        audioTracks = activeMedia.values.sorted { $0.url.path < $1.url.path }
             .map { $0.streams.filter { $0.kind == "audio" } }.max { $0.count < $1.count } ?? []
-        requiresBackgroundCopyChecks = sourceMedia.values.reduce(0) { $0 + $1.indexStorageBytes } >= PreparedEdit.backgroundCopyCheckBytes
-        guard let first = segments.first?.source, first.isIndexed else { return }
+        requiresBackgroundCopyChecks = activeMedia.values.reduce(0) { $0 + $1.indexStorageBytes } >= PreparedEdit.backgroundCopyCheckBytes
+        guard let first = sources.first, first.isIndexed else { return }
         firstSourceID = first.id
         container = first.id == previous.firstSourceID
             ? previous.container : engine.suggestedContainers(for: first.media).first
     }
+}
+
+private struct InlineStill {
+    var insert: StillInsert
+    var start: RationalTime
+    var end: RationalTime
 }
 
 private struct EditSnapshot {
@@ -214,6 +310,7 @@ private struct EditSnapshot {
     var stillSequence: StillSequenceProject?
     var segments: [EditorSegment] = []
     var timelineClips: [TimelineClip] = []
+    var inlineStillsByID: [UUID: InlineStill] = [:]
     var timelineThumbnailHeight = TimelineClip.minimumThumbnailHeight
     var largeThumbnailHeight = TimelineClip.minimumLargeThumbnailHeight
     var preparation = PreparedEdit()
@@ -285,6 +382,15 @@ final class SidecarPreference: @unchecked Sendable {
     private var change = EditCancellation()
     private var exclusions: Set<URL> = []
     private var cachedPermissions: [URL: Bool] = [:]
+    private var document: URL?
+    var projectURL: URL? {
+        get { lock.withLock { document } }
+        set { lock.withLock { document = newValue } }
+    }
+
+    func attachingDocument(to media: MediaInfo) -> MediaInfo {
+        media.withSidecarDocument { [self] in projectURL }
+    }
 
     func setExclusions(_ urls: Set<URL>) {
         let previous: EditCancellation? = lock.withLock {
@@ -336,6 +442,7 @@ struct QueuedRange: Identifiable, Sendable {
     let media: [URL: MediaInfo]
     var stillProject: CutProject? = nil
     var placements: ExportPlacementScope = .none
+    var pictureTiming: StillPictureTiming? = nil
     var excerpt: TranscriptQueueExcerpt? = nil
     var customName: String? = nil
     var name: String? { customName ?? excerpt?.name }
@@ -349,21 +456,47 @@ struct EditorNotice: Identifiable {
 
 @MainActor
 final class EditorModel: ObservableObject {
+    @Published var projectMediaRequest: ProjectMediaRequest?
+    let projectMediaJobs = ProjectMediaJobs()
+    private var projectMediaPicture: [(interval: MulticamRange, url: URL?)] = []
+    let projectMediaSummaryPaths = ProjectMediaSummaryPaths()
     let preferences: EditorPreferences
     let preview: SequencePreview
 
     @Published private var edit = EditSnapshot()
     @Published private(set) var projectURL: URL? {
-        didSet { if let projectURL { preferences.recentFiles.record([projectURL]) } }
+        didSet {
+            sidecarPreference.projectURL = projectURL
+            lastSidecarCandidates = []
+            if let projectURL { preferences.recentFiles.record([projectURL]) }
+        }
+    }
+    var sidecarWork: ProjectSidecarWork {
+        ProjectSidecarWork(project: sidecarPreference.projectURL)
     }
     private var projectDiskRevision: ProjectDiskRevision?
-    private(set) var openingProjectURL: URL?
+    private(set) var mediaSnapshot = ProjectMediaSnapshot() {
+        didSet { ignoredMediaPaths = mediaSnapshot.ignoredPaths }
+    }
+    private var ignoredMediaPaths: Set<String> = []
+    private var mediaSnapshotChanged = false
+    private var mediaRelinkIndexing = Set<URL>()
+    private var mediaRelinkCancellation: EditCancellation?
+    @Published private(set) var mediaRelinkProgress: Double?
+    private(set) var openingProjectURL: URL? {
+        didSet { sidecarPreference.projectURL = openingProjectURL.flatMap {
+            ProjectDraft.isManaged($0) || draft.managesDestination($0) ? nil : $0
+        } ?? projectURL }
+    }
     let draft: ProjectDraft
     private var committedBeforeImport: CutProject?
     private var savedSequence: [CutSequenceClip] = []
     private var savedStillSequence: StillSequenceProject?
+    private var soundtrackMediaByURL: [URL: MediaInfo] = [:]
+    private var soundtrackIndexes: [URL: UUID] = [:]
     private var savedParticipants = ParticipantProject()
     private var stillTimelineIDs: [String: UUID] = [:]
+    private let stillSoundtrackWaveformID = UUID()
     // A named file can still reference older history beyond this window’s retention limit.
     private var savedMediaPaths: [String: String] = [:]
     private var lastSidecarPaths: Set<String> = []
@@ -394,22 +527,35 @@ final class EditorModel: ObservableObject {
 
     func mcpOccurrence(_ id: UUID) -> (start: RationalTime, end: RationalTime, offset: RationalTime, sourceDuration: RationalTime)? {
         guard let index = segments.firstIndex(where: { $0.id == id }) else { return nil }
-        return (segments[index].start, segments[index].end, edit.offsets[index], segments[index].source.duration)
+        return (segments[index].start, segments[index].end, edit.offsets[index], segments[index].sourceExtent)
     }
 
     func mcpSceneSource(for clip: UUID) -> String? {
         segments.first { $0.id == clip }?.source.id.uuidString
     }
 
+    func mcpClipMediaIssue(_ id: UUID) -> String? {
+        segments.first { $0.id == id }.flatMap(mediaReviewIssue)
+    }
+
     var mcpCopyContainers: [String] {
         // No container carries a packet copy of clips in different formats.
-        guard let source = segments.first?.source.media, !isMixedTimeline else { return [] }
+        guard let source = edit.preparation.firstMedia, !isMixedTimeline,
+              segments.allSatisfy({ mediaReviewIssue($0) == nil }) else { return [] }
         let choices = CutEngine(tracks: source.hasVideo ? .all : .audio)
             .suggestedContainers(for: source, clips: segments.map(\.request))
         return source.hasVideo && choices.isEmpty ? [preferredCopyContainer ?? "mp4"] : choices
     }
 
     var sequenceClips: [CutSequenceClip] { edit.documentClips }
+    var interchangeIndexedMedia: [MediaInfo] {
+        let reviewedSoundtracks = soundtrackMediaByURL.values.filter {
+            let url = ProjectMediaVolume.watchURL($0.url)
+            return !incompatibleMedia.contains(url) && (refreshReviewStreams[url] ?? []).isEmpty
+        }
+        return Array(edit.preparation.sourceMedia.values) + reviewedSoundtracks
+    }
+    var interchangeCheckingVolumes: Set<String> { mediaWatcher?.checkingVolumes ?? ProjectMediaWatcher.knownCheckingVolumes }
     var transcriptProject: CutProject {
         var project = stillProject
         project.transcripts = transcriptState
@@ -421,6 +567,8 @@ final class EditorModel: ObservableObject {
         project.participants = edit.participants
         return project
     }
+
+    var participantProject: ParticipantProject { edit.participants }
 
     func replaceParticipantProject(_ next: ParticipantProject, action: String) throws {
         guard !isBusy, alert == nil else {
@@ -441,7 +589,9 @@ final class EditorModel: ObservableObject {
         saveUntitledDraft()
     }
 
-    @Published private(set) var transcriptState = ProjectTranscripts()
+    @Published private(set) var transcriptState = ProjectTranscripts() {
+        didSet { projectMediaSummaryPaths.invalidate() }
+    }
     private var savedTranscriptState = ProjectTranscripts()
 
     func transcriptAssetContext() throws -> URL {
@@ -499,11 +649,14 @@ final class EditorModel: ObservableObject {
             ? try CutProject.loadEditorDocument(from: url, limit: preferences.historyLimit) : nil
         let archive = history ?? (undo: disk?.undo ?? [], redo: disk?.redo ?? [])
         let media = archiveMedia ?? disk?.media
-        let diskPaths = media?.absoluteSources(relativeTo: url)
+        let checkingVolumes = interchangeCheckingVolumes
+        let diskPaths = ProjectMediaVolume.$checking.withValue(checkingVolumes) { media?.absoluteSources(relativeTo: url) }
         var resolvedPaths: [String: String] = [:]
         func resolve(_ file: String) -> String {
             if let cached = resolvedPaths[file] { return cached }
-            let path = CutProject.mediaURL(file, relativeTo: url).path
+            let path = ProjectMediaVolume.$checking.withValue(checkingVolumes) {
+                CutProject.mediaURL(file, relativeTo: url).path
+            }
             resolvedPaths[file] = path
             return path
         }
@@ -525,11 +678,14 @@ final class EditorModel: ObservableObject {
                     return item
                 }
                 sequence.stillAssets = sequence.stillAssets.map { asset in
+                    guard !asset.isGap else { return asset }
                     var asset = asset
                     asset.file = resolve(asset.file)
                     return asset
                 }
                 sequence.sourceSelects = sequence.sourceSelects.map { $0.mapPath(resolve) }
+                sequence.stillAudioReference = sequence.stillAudioReference.map(absolute)
+                sequence.stillSoundtrack = sequence.stillSoundtrack.map(absolute)
                 sequence.transcripts = sequence.transcripts.mapSourcePaths(resolve)
                 var copy = CutProject.stillSequence(sequence)
                 copy.participants = project.participants.mapSourcePaths(resolve)
@@ -540,7 +696,8 @@ final class EditorModel: ObservableObject {
         }
         func entries(_ states: [CutHistoryState]) throws -> [HistoryEntry] {
             try states.map { state in
-                HistoryEntry(action: state.action, origin: state.origin, contents: .document(try absoluteProject(state.project)))
+                HistoryEntry(action: state.action, origin: state.origin, contents: .document(try absoluteProject(state.project)),
+                             bindingChanges: state.bindingChanges?.map { $0.mappingPaths(resolve) } ?? [])
             }
         }
         let loadedProject: CutProject
@@ -555,12 +712,15 @@ final class EditorModel: ObservableObject {
         if diskPaths == nil {
             for (relative, path) in resolvedPaths { paths[path] = relative }
         }
+        let openedMediaSnapshot = media?.mediaSnapshot.mappingPaths(resolve) ?? .empty
         let opened = {
             self.mcpGeneration = UUID()
             self.mcpRevision = 0
             self.transcriptState = fullDocument.transcripts
             self.edit.participants = fullDocument.participants
             self.savedMediaPaths = paths
+            self.mediaSnapshot = openedMediaSnapshot
+            self.mediaSnapshotChanged = false
             self.recoveredDraft = self.draft.adopt(reservation)
             self.projectURL = self.recoveredDraft ? nil : url
             self.projectDiskRevision = self.recoveredDraft ? nil : media?.diskRevision
@@ -576,28 +736,15 @@ final class EditorModel: ObservableObject {
                 opened()
             }
         } else {
-            let files = try checkedFiles(document)
+            let files = document.map { URL(fileURLWithPath: $0.file, isDirectory: false) }
             openingProjectURL = url
             importFiles(files, projectClips: document, openingMedia: paths, allowCommit: allowCommit, installed: opened,
-                        sequenceProject: fullDocument)
-        }
-    }
-
-    private func checkedFiles(_ clips: [CutSequenceClip]) throws -> [URL] {
-        // Archive references are absolute here. A once-offline traversal may now
-        // resolve through a mounted directory or a restored symlink.
-        var files: [String: URL] = [:]
-        return try clips.map { clip in
-            if let file = files[clip.file] { return file }
-            let file = URL(fileURLWithPath: clip.file)
-            let resolved = clip.file.split(separator: "/").contains("..")
-                ? try CutProject.checkedMediaURL(clip.file, relativeTo: file) : file
-            files[clip.file] = resolved
-            return resolved
+                        sequenceProject: fullDocument, sourceSnapshot: openedMediaSnapshot)
         }
     }
 
     private func markSaved() {
+        mediaSnapshotChanged = false
         savedSequence = sequenceClips
         savedStillSequence = edit.stillSequence
         savedParticipants = edit.participants
@@ -617,9 +764,9 @@ final class EditorModel: ObservableObject {
     }
 
     @discardableResult
-    func saveProject(to url: URL) -> Bool {
+    func saveProject(to url: URL, flushDraftAnalysis: Bool = true) -> Bool {
         do {
-            try writeProject(to: url)
+            try writeProject(to: url, flushDraftAnalysis: flushDraftAnalysis)
             return true
         } catch {
             ProjectPanels.present(NSAlert(error: error), in: editorWindow)
@@ -627,7 +774,10 @@ final class EditorModel: ObservableObject {
         }
     }
 
-    func writeProject(to url: URL, replacingExisting: Bool = true) throws {
+    func writeProject(to url: URL, replacingExisting: Bool = true, flushDraftAnalysis: Bool = true) throws {
+        if interchangeCheckingVolumes.contains(ProjectMediaVolume.key(for: url)) {
+            throw CutError(code: "media_volume_checking", message: "The destination volume is still checking: \(url.path)")
+        }
         guard !isBusy else {
             throw CutError(code: "editor_busy", message: "Wait for the current operation to finish.")
         }
@@ -647,6 +797,7 @@ final class EditorModel: ObservableObject {
             }
             transcriptState = updated
         }
+        let flush = flushDraftAnalysis && projectURL == nil && useAnalysisSidecars && SidecarLocations.mode == .project
         projectURL = url
         // Keep every recording referenced by the saved file until the next explicit save.
         savedMediaPaths = documentMedia()
@@ -654,6 +805,7 @@ final class EditorModel: ObservableObject {
         recoveredDraft = false
         markSaved()
         draft.discard()
+        if flush { saveAnalysisSidecars(afterFirstProjectSave: true) }
     }
 
     private func documentMedia(including saved: [String: String] = [:]) -> [String: String] {
@@ -665,7 +817,8 @@ final class EditorModel: ObservableObject {
             }
         }
         func collectProject(_ project: CutProject, includeAttachments: Bool = false) {
-            for asset in project.stillAssets { paths[asset.file] = asset.id }
+            for asset in project.stillAssets where !asset.isGap { paths[asset.file] = asset.id }
+            collect([project.stillAudioReference, project.stillSoundtrack].compactMap { $0 })
             for select in project.sourceSelects { paths[select.range.file] = select.id }
             for (id, path) in project.participants.protectedMediaPaths { paths[path] = id }
             for record in project.transcripts.authoring {
@@ -673,9 +826,8 @@ final class EditorModel: ObservableObject {
                     if let file = anchor.binding.file { paths[file] = record.id }
                 }
             }
-            guard includeAttachments else { return }
             for attachment in project.transcripts.attachments {
-                if let context = projectURL ?? draft.url {
+                if includeAttachments, let context = projectURL ?? draft.url {
                     paths[CutProject.mediaURL(attachment.asset.file, relativeTo: context).path] = attachment.id
                     if let location = TranscriptStore.assetLocation(attachment.asset, relativeTo: context) {
                         paths[location.path] = attachment.id
@@ -698,7 +850,7 @@ final class EditorModel: ObservableObject {
         for range in queuedRanges {
             for clip in range.clips { files[clip.file.path] = clip.file.lastPathComponent }
             for asset in range.stillProject?.stillAssets ?? [] { files[asset.file] = asset.id }
-            if let reference = range.stillProject?.stillAudioReference {
+            for reference in [range.stillProject?.stillAudioReference, range.stillProject?.stillSoundtrack].compactMap({ $0 }) {
                 files[reference.file] = reference.id
                 if let original = reference.originalFile { files[original] = reference.id }
             }
@@ -707,7 +859,9 @@ final class EditorModel: ObservableObject {
     }
 
     func validateHistoryDestination(_ output: URL, includesContents: Bool = false) throws {
-        try CutProject.validateMediaDestination(output, absoluteSources: protectedMedia, includesContents: includesContents)
+        try ProjectMediaVolume.$checking.withValue(interchangeCheckingVolumes) {
+            try CutProject.validateMediaDestination(output, absoluteSources: protectedMedia, includesContents: includesContents)
+        }
     }
 
     private func refreshSidecarExclusions(adding urls: [URL] = [], openingMedia: [String: String] = [:]) {
@@ -719,7 +873,9 @@ final class EditorModel: ObservableObject {
         guard sourcePaths != lastSidecarPaths || candidates != lastSidecarCandidates else { return }
         lastSidecarPaths = sourcePaths
         lastSidecarCandidates = candidates
-        let excluded = CutProject.sidecarExclusions(absoluteSources: paths, candidates: Array(candidates))
+        let excluded = ProjectMediaVolume.$checking.withValue(interchangeCheckingVolumes) {
+            CutProject.sidecarExclusions(absoluteSources: paths, candidates: Array(candidates), projectURL: sidecarWork.project)
+        }
         guard excluded != sidecarExclusions else { return }
         sidecarExclusions = excluded
         sidecarPreference.setExclusions(excluded)
@@ -740,71 +896,81 @@ final class EditorModel: ObservableObject {
                                 coordinate: Bool = false, expected: ProjectDiskRevision? = nil)
         -> @Sendable (URL) throws -> (revision: ProjectDiskRevision, transcripts: ProjectTranscripts)? {
         func state(_ entry: HistoryEntry) -> CutHistoryState {
-            CutHistoryState(action: entry.action, origin: entry.origin, project: entry.project)
+            CutHistoryState(action: entry.action, origin: entry.origin, project: entry.project, bindingChanges: entry.bindingChanges)
         }
         let project = snapshot ?? transcriptProject
         let undo = undoStack.map(state), redo = redoStack.map(state)
         let context = projectURL ?? draft.url
+        let snapshotMedia = projectMediaSnapshotForWriting
+        let checkingVolumes = interchangeCheckingVolumes
         return { url in
-            var paths: [String: String] = [:]
-            func relative(_ file: String) -> String {
-                if let cached = paths[file] { return cached }
-                let path = CutProject.relativeMediaPath(file, to: url)
-                paths[file] = path
-                return path
-            }
-            func rebasedClip(_ clip: CutSequenceClip) -> CutSequenceClip {
-                var copy = clip
-                copy.file = relative(clip.file)
-                copy.originalFile = clip.originalFile.map(relative)
-                return copy
-            }
-            func rebasedProject(_ project: CutProject) -> CutProject {
-                switch project {
-                case .sequence(let clips):
-                    var copy = CutProject.sequence(clips.map(rebasedClip))
-                    copy.participants = project.participants.mapSourcePaths(relative)
-                    return copy
-                case .stillSequence(var sequence):
-                    sequence.items = sequence.items.map { item in
-                        guard case .source(let clip) = item else { return item }
-                        return .source(rebasedClip(clip))
-                    }
-                    sequence.stillAssets = sequence.stillAssets.map { asset in
-                        var asset = asset
-                        asset.file = relative(asset.file)
-                        return asset
-                    }
-                    sequence.sourceSelects = sequence.sourceSelects.map { $0.mapPath(relative) }
-                    sequence.transcripts = sequence.transcripts.mapSourcePaths(relative)
-                    var copy = CutProject.stillSequence(sequence)
-                    copy.participants = project.participants.mapSourcePaths(relative)
-                    return copy
-                default: return project
+            try ProjectMediaVolume.$checking.withValue(checkingVolumes) {
+                var paths: [String: String] = [:]
+                func relative(_ file: String) -> String {
+                    if let cached = paths[file] { return cached }
+                    let path = CutProject.relativeMediaPath(file, to: url)
+                    paths[file] = path
+                    return path
                 }
-            }
-            func rebased(_ state: CutHistoryState) -> CutHistoryState {
-                CutHistoryState(action: state.action, origin: state.origin, project: rebasedProject(state.project))
-            }
-            var current = rebasedProject(project)
-            if !coordinate, let context, context.deletingLastPathComponent() != url.deletingLastPathComponent() {
-                let draftDocument = url.deletingLastPathComponent().appendingPathComponent("Untitled.cut")
-                current.transcripts = try TranscriptStore.copy(in: current.transcripts, from: context, to: draftDocument, draft: true)
-            }
-            let undo = undo.map(rebased), redo = redo.map(rebased)
-            if coordinate {
-                if let context, !current.transcripts.attachments.isEmpty {
-                    let saved = try current.saveCopyRevision(to: url, copyingTranscriptsFrom: context, undo: undo, redo: redo,
+                func rebasedClip(_ clip: CutSequenceClip) -> CutSequenceClip {
+                    var copy = clip
+                    copy.file = relative(clip.file)
+                    copy.originalFile = clip.originalFile.map(relative)
+                    return copy
+                }
+                func rebasedProject(_ project: CutProject) -> CutProject {
+                    switch project {
+                    case .sequence(let clips):
+                        var copy = CutProject.sequence(clips.map(rebasedClip))
+                        copy.participants = project.participants.mapSourcePaths(relative)
+                        return copy
+                    case .stillSequence(var sequence):
+                        sequence.items = sequence.items.map { item in
+                            guard case .source(let clip) = item else { return item }
+                            return .source(rebasedClip(clip))
+                        }
+                        sequence.stillAssets = sequence.stillAssets.map { asset in
+                            guard !asset.isGap else { return asset }
+                            var asset = asset
+                            asset.file = relative(asset.file)
+                            return asset
+                        }
+                        sequence.sourceSelects = sequence.sourceSelects.map { $0.mapPath(relative) }
+                        sequence.stillAudioReference = sequence.stillAudioReference.map(rebasedClip)
+                        sequence.stillSoundtrack = sequence.stillSoundtrack.map(rebasedClip)
+                        sequence.transcripts = sequence.transcripts.mapSourcePaths(relative)
+                        var copy = CutProject.stillSequence(sequence)
+                        copy.participants = project.participants.mapSourcePaths(relative)
+                        return copy
+                    default: return project
+                    }
+                }
+                func rebased(_ state: CutHistoryState) -> CutHistoryState {
+                    CutHistoryState(action: state.action, origin: state.origin, project: rebasedProject(state.project),
+                                    bindingChanges: state.bindingChanges?.map { $0.mappingPaths(relative) })
+                }
+                var current = rebasedProject(project)
+                if !coordinate, let context, context.deletingLastPathComponent() != url.deletingLastPathComponent() {
+                    let draftDocument = url.deletingLastPathComponent().appendingPathComponent("Untitled.cut")
+                    current.transcripts = try TranscriptStore.copy(in: current.transcripts, from: context, to: draftDocument, draft: true)
+                }
+                let undo = undo.map(rebased), redo = redo.map(rebased)
+                let mediaSnapshot = snapshotMedia.mappingPaths(relative)
+                if coordinate {
+                    if let context, !current.transcripts.attachments.isEmpty {
+                        let saved = try current.saveCopyRevision(to: url, copyingTranscriptsFrom: context, undo: undo, redo: redo, mediaSnapshot: mediaSnapshot,
+                                                                replacingExisting: replacingExisting, expected: expected)
+                        return (saved.revision, saved.project.transcripts)
+                    }
+                    let revision = try current.saveRevision(to: url, undo: undo, redo: redo, mediaSnapshot: mediaSnapshot,
                                                             replacingExisting: replacingExisting, expected: expected)
-                    return (saved.revision, saved.project.transcripts)
+                    return (revision, current.transcripts)
                 }
-                let revision = try current.saveRevision(to: url, undo: undo, redo: redo,
-                                                        replacingExisting: replacingExisting, expected: expected)
-                return (revision, current.transcripts)
+                try current.saveStaged(to: url, undo: undo, redo: redo, mediaSnapshot: mediaSnapshot, replacingExisting: replacingExisting)
+                return nil
             }
-            try current.saveStaged(to: url, undo: undo, redo: redo, replacingExisting: replacingExisting)
-            return nil
         }
+
     }
 
     private func saveUntitledDraft() {
@@ -860,7 +1026,15 @@ final class EditorModel: ObservableObject {
     @Published private(set) var lastExportedURL: URL?
     @Published private(set) var isCheckingEdit = false
     @Published private var isPresentingPanel = false
-    @Published private(set) var queuedRanges: [QueuedRange] = []
+    @Published private(set) var queuedRanges: [QueuedRange] = [] {
+        didSet {
+            var targets = QueueMediaTargets()
+            for entry in queuedRanges { entry.addMediaTargets(to: &targets) }
+            queuedMediaTargets = targets
+            if mediaWatcher != nil { updateMediaWatcher() }
+        }
+    }
+    private var queuedMediaTargets = QueueMediaTargets()
     @Published var isBulkQueuePresented = false
     @Published var alert: EditorNotice?
 
@@ -877,6 +1051,7 @@ final class EditorModel: ObservableObject {
     /// Presents the question. Tests replace it. Nil shows a sheet on the editor window.
     var tierPrompt: ((TierPrompt, @escaping (TierPrompt.Choice) -> Void) -> Void)?
 
+    private var storageObservers: Set<AnyCancellable> = []
     private var preferenceObservation: AnyCancellable?
     private let sidecarPreference = SidecarPreference()
 
@@ -965,6 +1140,7 @@ final class EditorModel: ObservableObject {
         var copyContainer: String?
         var transcriptState: ProjectTranscripts = .init()
         var audioMonitoring: AudioMonitoring?
+        var bindingChanges: [TranscriptBindingChange] = []
     }
     /// Save and open panels attach to the editor, not to whichever window is main.
     weak var editorWindow: NSWindow?
@@ -1011,7 +1187,7 @@ final class EditorModel: ObservableObject {
     var refreshStaleScenes = Set<UUID>()
     private(set) var staleSceneReports: [UUID: SceneReport] = [:]
     private var refreshStaleSilence = Set<UUID>()
-    private var invalidatedQueueIDs = Set<UUID>()
+    @Published private(set) var invalidatedQueueIDs = Set<UUID>()
     private var refreshReviewStreams: [URL: Set<Int>] = [:]
     private var refreshReviewPicture = Set<URL>()
     private var offlineMedia = Set<URL>()
@@ -1050,9 +1226,12 @@ final class EditorModel: ObservableObject {
     }
 
     private(set) var sceneReports: [UUID: SceneReport] = [:]
-    var analysisSourceMedia: [UUID: MediaInfo] { edit.preparation.sourceMedia }
+    var analysisSourceMedia: [UUID: MediaInfo] {
+        edit.preparation.sourceMedia.filter { !edit.preparation.unavailableSourceIDs.contains($0.key) }
+    }
     private var snapScanRequests = Set<UUID>()
     private var sidecarSaveToken: EditCancellation?
+    private var isFlushingDraftSidecars = false
     var nativeSidecarSave: MCPNativeOperation? {
         guard let token = sidecarSaveToken, mcpSidecarReceipt == nil else { return nil }
         return MCPNativeOperation(id: token.id, kind: "sidecars", label: "Saving analysis sidecars…",
@@ -1206,7 +1385,7 @@ final class EditorModel: ObservableObject {
         }
     }
     var audioTracks: [StreamInfo] { edit.preparation.audioTracks }
-    var playheadAudioTracks: [StreamInfo] { playheadAudioSource?.media.streams.filter { $0.kind == "audio" } ?? [] }
+    var playheadAudioTracks: [StreamInfo] { playheadAudioSource?.media?.streams.filter { $0.kind == "audio" } ?? [] }
     private var hasSilenceResults: Bool {
         !activeAudioSources.isEmpty && activeAudioSources.allSatisfy { sourcePauses[$0] != nil }
     }
@@ -1250,10 +1429,19 @@ final class EditorModel: ObservableObject {
         preferenceObservation = preferences.observeChanges { [weak self] change in
             self?.applyPreference(change)
         }
+        NotificationCenter.default.publisher(for: .sidecarStorageDidChange).sink { [weak self] _ in
+            guard let self else { return }
+            self.lastSidecarCandidates = []
+            self.refreshSidecarExclusions()
+        }.store(in: &storageObservers)
+        NotificationCenter.default.publisher(for: .sidecarCachesDidClear).sink { [weak self] notification in
+            guard let self, let sources = notification.object as? Set<URL> else { return }
+            self.discardClearedAnalysis(sources, whole: notification.userInfo?["wholeSidecars"] as? Bool == true)
+        }.store(in: &storageObservers)
         audioStore.changed = { [weak self] complete in
             guard let self else { return }
             if complete { self.refreshDetectedPauses() }
-            else { self.waveformRevision += 1 }
+            if !complete || self.stillProject.stillSoundtrack != nil { self.waveformRevision += 1 }
         }
         previewTimeObservation = preview.$time.sink { [weak self] time in
             guard let self, self.trimOrigin == nil else { return }
@@ -1266,6 +1454,42 @@ final class EditorModel: ObservableObject {
                 self.skipPauseIfNeeded(at: clamped)
             }
         }
+    }
+
+    private func discardClearedAnalysis(_ sources: Set<URL>, whole: Bool) {
+        let urls = Set(sources.map { $0.standardizedFileURL.resolvingSymlinksInPath() })
+        let affected = edit.preparation.sourceMedia.filter { urls.contains($0.value.url.standardizedFileURL.resolvingSymlinksInPath()) }
+        guard !affected.isEmpty else { return }
+        sidecarSaveToken?.cancel()
+        mediaRefresh.cancel()
+        for (id, media) in affected {
+            filmstripTiles.removeSource(id)
+            pauseDetections.removeValue(forKey: id)?.cancel()
+            checkedSilenceSidecars.remove(id)
+            silenceResults[id] = nil
+            sourcePauses[id] = nil
+            audioStore.refresh(id, media: media, preserving: [])
+            invalidateSceneScan(for: id)
+            staleSceneReports[id] = nil
+            staleSceneRangeReports = staleSceneRangeReports.filter { $0.key.source != id }
+            automaticThresholds[id] = nil
+            let edits = pendingMetadata[id] ?? EditorMetadataEdits()
+            let report = edits.retainedReport(sceneReports[id], afterRemovingWholeSidecar: whole)
+            sceneReports[id] = report
+            scenesBySource[id] = report?.scenes.map { TimelineScene(start: $0.startSeconds, view: $0.view) }
+            viewNamesBySource[id] = report.map { Dictionary(uniqueKeysWithValues: $0.views.compactMap { view in
+                view.name.map { (view.view, $0) }
+            }) }
+            if whole {
+                for (track, stream) in media.streams.filter({ $0.kind == "audio" }).enumerated() {
+                    thresholdOverrides[AudioTrackKey(source: id, track: track)] = edits.thresholds[stream.index] ?? nil
+                }
+            }
+        }
+        preview.invalidateMedia(alsoFilmstrip: true)
+        waveformRevision += 1
+        sceneRevision += 1
+        rebuildPausePlan()
     }
 
     private func applyPreference(_ change: EditorPreferences.Change) {
@@ -1293,7 +1517,7 @@ final class EditorModel: ObservableObject {
                 updateStatus()
                 saveUntitledDraft()
             }
-        case .largeThumbnails:
+        case .largeThumbnails, .sourceTimeTicks:
             break
         case .minimumPause, .maxBlip:
             refreshDetectedPauses(invalidating: activeAudioSources)
@@ -1326,12 +1550,16 @@ final class EditorModel: ObservableObject {
     var windowTitle: String {
         if let projectURL { return projectURL.deletingPathExtension().lastPathComponent }
         guard let first = edit.timelineClips.first else { return "Untitled" }
-        let additional = edit.preparation.sourceMedia.count + inlineStillCount - 1
+        let additional = Set(segments.map { $0.source.id }).count + inlineStillCount - 1
         return additional > 0 ? "\(first.name) + \(additional)" : first.name
     }
     var isEmpty: Bool { segments.isEmpty && !hasInlineStills }
-    var hasPicture: Bool { hasInlineStills || segments.first?.source.media.hasVideo == true }
-    var isAudioOnly: Bool { !isEmpty && !hasPicture }
+    var hasPicture: Bool { hasInlineStills || edit.preparation.firstMedia?.hasVideo == true }
+    var isAudioOnly: Bool {
+        guard !isEmpty, !hasInlineStills else { return false }
+        if let media = edit.preparation.firstMedia { return !media.hasVideo }
+        return segments.allSatisfy { $0.source.unresolved?.isAudioOnly == true || $0.source.media?.hasVideo == false }
+    }
     /// True when the clips differ in format (`ExportRules` “Mixed timelines”): only Re-encode writes the timeline.
     var isMixedTimeline: Bool { edit.preparation.isMixed }
     var effectiveSnapTarget: TimelineSnapTarget {
@@ -1391,7 +1619,11 @@ final class EditorModel: ObservableObject {
     var canActOnRange: Bool { canEdit && selectedSpan != nil }
     var canSplitSelectedRange: Bool {
         guard canEdit, let span = selectedSpan else { return false }
-        return isInsideClip(span.from) || isInsideClip(span.to)
+        let cuts = [span.from, span.to].filter(isInsideClip)
+        return !cuts.isEmpty && cuts.allSatisfy { cut in
+            if stillInsert(at: cut.seconds) != nil { return true }
+            return locatedSegment(at: cut.seconds).map { mediaReviewIssue($0.1) == nil } ?? false
+        }
     }
     var canDelete: Bool { canActOnRange || (canEdit && !rangeTool && selectedID != nil) }
     var canClearMarks: Bool { !isBusy && (markIn != nil || markOut != nil) }
@@ -1413,17 +1645,27 @@ final class EditorModel: ObservableObject {
     }
 
     func canTrimSelected(_ edge: TimelineEdge, restore: Bool) -> Bool {
-        guard canEdit, let index = selectedClipIndex else { return false }
+        guard canEdit else { return false }
+        if let selectedID, let card = edit.inlineStillsByID[selectedID] {
+            return edge == .end && !restore && playhead > card.start.seconds && playhead < card.end.seconds
+        }
+        guard let index = selectedClipIndex else { return false }
         let clip = segments[index]
-        if restore { return edge == .start ? clip.start > .zero : clip.end < clip.source.duration }
+        guard mediaReviewIssue(clip) == nil else { return false }
+        if restore { return edge == .start ? clip.start > .zero : clip.end < clip.sourceExtent }
         let offset = edit.offsets[index].seconds
         return playhead > offset && playhead < offset + clip.duration.seconds
     }
 
     func trimSelected(_ edge: TimelineEdge, restore: Bool = false) {
-        guard canTrimSelected(edge, restore: restore), let index = selectedClipIndex else { return }
+        guard canTrimSelected(edge, restore: restore) else { return }
+        if let selectedID, let card = edit.inlineStillsByID[selectedID] {
+            _ = resizeStillEnd(card, duration: playhead - card.start.seconds, commit: true)
+            return
+        }
+        guard let index = selectedClipIndex else { return }
         let clip = segments[index]
-        let sourceTime = restore ? (edge == .start ? 0 : clip.source.duration.seconds)
+        let sourceTime = restore ? (edge == .start ? 0 : clip.sourceExtent.seconds)
             : clip.start.seconds + playhead - edit.offsets[index].seconds
         let snap = !restore && usesPointerPosition ? TimelineSnapTarget.off : effectiveSnapTarget
         if snap == .keyframes && usesBackgroundTrimValidation {
@@ -1444,7 +1686,7 @@ final class EditorModel: ObservableObject {
 
     var formatSummary: String? {
         if let format = stillProject.stillFormat { return "\(format.width) × \(format.height) · \(format.codec.rawValue.uppercased())" }
-        guard let media = segments.first?.source.media else { return nil }
+        guard let media = edit.preparation.firstMedia else { return nil }
         guard let video = media.videoStream else {
             let audio = media.primaryStream
             return "\(audio.codec.uppercased()) · \(audio.sampleRate) Hz · \(audio.channels) ch"
@@ -1501,7 +1743,7 @@ final class EditorModel: ObservableObject {
         resumePendingWork()
     }
 
-    func importFiles(_ urls: [URL], at index: Int? = nil, allowCommit: (() -> Bool)? = nil) {
+    func importFiles(_ urls: [URL], at index: Int? = nil, timelineSlot: Int? = nil, allowCommit: (() -> Bool)? = nil) {
         if allowCommit == nil {
             let images = urls.filter(StillPanels.isSupportedImage)
             if !images.isEmpty {
@@ -1510,22 +1752,38 @@ final class EditorModel: ObservableObject {
                     addDroppedStills(images, at: playhead)
                 } else {
                     pendingOpenFiles.insert(contentsOf: images, at: 0)
-                    importFiles(media, at: index, projectClips: nil, asksBeforeLoweringTier: true)
+                    importFiles(media, at: index, timelineSlot: timelineSlot, projectClips: nil, asksBeforeLoweringTier: true)
                 }
                 return
             }
         }
         // Clips added in the editor ask before lowering the tier. A remote import, which supplies `allowCommit`, does not.
-        importFiles(urls, at: index, projectClips: nil, allowCommit: allowCommit, asksBeforeLoweringTier: allowCommit == nil)
+        let mayAttachSoundtrack = allowCommit == nil && urls.count == 1 && urls[0].isFileURL &&
+            stillSoundtrackControls.map { $0.name == nil } == true
+        importFiles(urls, at: index, timelineSlot: timelineSlot, projectClips: nil, allowCommit: allowCommit,
+                    asksBeforeLoweringTier: allowCommit == nil, mayAttachSoundtrack: mayAttachSoundtrack)
     }
 
-    private func importFiles(_ urls: [URL], at index: Int? = nil, projectClips: [CutSequenceClip]?,
-                             historyAction: String? = nil, openingMedia: [String: String] = [:],
+    private static func requiredStillFragmentEnds(_ placements: [StillReplacement]) -> [String: RationalTime] {
+        var ends: [String: RationalTime] = [:]
+        for placement in placements {
+            guard case .sequence(let fragments) = placement.coverage else { continue }
+            for fragment in fragments {
+                ends[fragment.clipID] = max(ends[fragment.clipID] ?? .zero, fragment.range.to)
+            }
+        }
+        return ends
+    }
+
+    private func importFiles(_ urls: [URL], at index: Int? = nil, timelineSlot: Int? = nil, projectClips: [CutSequenceClip]?,
+                             openingMedia: [String: String] = [:],
                              beforeInstall: (() throws -> Bool)? = nil, allowCommit: (() -> Bool)? = nil,
                              requestCancellation: EditCancellation? = nil, installed: (() -> Void)? = nil,
                              restoringAudioMonitoring: AudioMonitoring? = nil,
-                             sequenceProject: CutProject? = nil,
-                             asksBeforeLoweringTier asks: Bool = false,
+                             sequenceProject: CutProject? = nil, sourceSnapshot: ProjectMediaSnapshot? = nil,
+                             asksBeforeLoweringTier asks: Bool = false, mayAttachSoundtrack: Bool = false,
+                             preserveProjectPosition: Bool = false, preindexedMedia: [URL: MediaInfo] = [:],
+                             keepUnavailableRangesAt: Set<URL> = [],
                              completion: ((Result<Void, Error>) -> Void)? = nil) {
         guard !isBusy, !urls.isEmpty else {
             completion?(.failure(CutError(code: "editor_busy", message: "The editor could not start loading the media.")))
@@ -1538,30 +1796,70 @@ final class EditorModel: ObservableObject {
         cancellation = token
         let preference = sidecarPreference
         let engine = CutEngine(cancelled: { token.isCancelled })
+        let stillFragmentEnds = Self.requiredStillFragmentEnds(sequenceProject?.stillReplacements ?? [])
         let existing = projectClips == nil ? segments : []
         let priorPreparation = edit.preparation
+        let entries = Dictionary((sourceSnapshot ?? mediaSnapshot).entries.map { ($0.path, $0) },
+                                 uniquingKeysWith: { first, _ in first })
+        var stillExtents: [String: RationalTime] = [:]
+        for replacement in sequenceProject?.stillReplacements ?? [] {
+            guard case .sequence(let fragments) = replacement.coverage else { continue }
+            for fragment in fragments {
+                stillExtents[fragment.clipID] = max(stillExtents[fragment.clipID] ?? .zero, fragment.range.to)
+            }
+        }
+        let requiredStillExtents = stillExtents
+        let checkingPaths = Set(projectClips?.compactMap { clip -> String? in
+            mediaWatcher?.status(for: URL(fileURLWithPath: clip.file, isDirectory: false)) == .checking ? clip.file : nil
+        } ?? [])
         let publishPartial = allowCommit == nil && requestCancellation == nil
         let beforeImport = snapshot()
         committedBeforeImport = beforeImport.stillSequence.map(CutProject.stillSequence) ?? .sequence(beforeImport.documentClips)
         let insertion = min(max(0, index ?? existing.count), existing.count)
+        // Stills occupy timeline slots but have no entry in the indexed source array.
+        // Build partial and final presentations from the same pre-import ordering.
+        @MainActor @Sendable func projectAfterImport(_ proposed: [EditorSegment]) -> CutProject? {
+            guard projectClips == nil, var sequence = beforeImport.stillSequence,
+                  let slot = timelineSlot ?? (index == nil ? sequence.items.count : nil) else { return sequenceProject }
+            let count = proposed.count - existing.count
+            let added = sequenceClips(for: Array(proposed[insertion..<(insertion + count)]))
+            sequence.items.insert(contentsOf: added.map(StillSequenceItem.source),
+                                  at: min(max(0, slot), sequence.items.count))
+            if sequence.stillFormat != nil {
+                sequence.stillFormat = nil
+                sequence.programColorPolicy = nil
+            }
+            sequence.participants = beforeImport.participants
+            return .stillSequence(sequence)
+        }
         let currentSession = session
+        let importRevision = mcpRevision
         let pendingWrite = lastSidecarWrite?.task
         importProgress = 0
         isImporting = true
         Task {
             // A quick Close Video and reopen must see the last accepted edits.
             await pendingWrite?.value
-            let result = await Task.detached(priority: .utility) {
+            let result = await sidecarWork.detached(priority: .utility) {
                 var additions: [EditorSegment] = []
+                var soundtrack: MediaInfo?
                 var rejected: [String] = []
                 var savedAnalysis: [UUID: SavedEditorAnalysis] = [:]
-                var indexed = Dictionary(existing.map { ($0.source.url, $0.source) }, uniquingKeysWith: { first, _ in first })
-                for clip in existing where indexed[clip.source.originalURL] == nil {
-                    indexed[clip.source.originalURL] = clip.source
+                var indexed = Dictionary(existing.compactMap { $0.source.indexed }.map { ($0.url, $0) }, uniquingKeysWith: { first, _ in first })
+                for (url, media) in preindexedMedia {
+                    let source = IndexedSource(media: preference.attachingDocument(to: media))
+                    indexed[url] = source
+                    if preference.permits(url) {
+                        savedAnalysis[source.id] = SavedEditorAnalysis(media: media, cancelled: { token.isCancelled || !preference.permits(url) })
+                    }
                 }
+                for source in existing.compactMap({ $0.source.indexed }) where indexed[source.originalURL] == nil {
+                    indexed[source.originalURL] = source
+                }
+                var unresolvedIDs: [DocumentSourceKey: UUID] = [:]
                 var documentSources: [DocumentSourceKey: IndexedSource] = [:]
-                var pictureReference = existing.first?.source.media
-                var ordinaryReference = existing.first(where: { !$0.source.isAudioReplacement })?.source.media
+                var pictureReference = existing.compactMap { $0.source.media }.first
+                var ordinaryReference = existing.lazy.filter { !$0.source.isAudioReplacement }.compactMap { $0.source.media }.first
                 var lastPublication: ContinuousClock.Instant?
                 var prior = priorPreparation
                 for (offset, file) in urls.enumerated() {
@@ -1575,11 +1873,19 @@ final class EditorModel: ObservableObject {
                         }
                     }
                     defer { if !token.isCancelled { report(1) } }
-                    let canonical = file.standardizedFileURL
                     let document = projectClips?[offset]
-                    let original = document?.originalFile.map { URL(fileURLWithPath: $0).standardizedFileURL }
+                    let canonical: URL
+                    let original = document?.originalFile.map { URL(fileURLWithPath: $0, isDirectory: false) }
                     var provisional: EditorSegment?
                     do {
+                        if let document, checkingPaths.contains(document.file) {
+                            throw CutError(code: "source_checking", message: "Waiting for the recording’s volume to respond.")
+                        }
+                        if let document, document.file.split(separator: "/").contains("..") {
+                            canonical = try CutProject.checkedMediaURL(document.file, relativeTo: file)
+                        } else {
+                            canonical = file.standardizedFileURL
+                        }
                         let source: IndexedSource
                         let cached = indexed[canonical]
                         if let cached {
@@ -1595,7 +1901,7 @@ final class EditorModel: ObservableObject {
                                                                         preferCompleted: preview)
                                         let index = try await SourceIndexLoader.shared.read(key, token: token,
                                             preference: settings.change, progress: report)
-                                        return index.ordinary
+                                        return preference.attachingDocument(to: index.ordinary)
                                     } catch is CancellationError where settings.change.isCancelled && !token.isCancelled {
                                         continue
                                     }
@@ -1605,14 +1911,15 @@ final class EditorModel: ObservableObject {
 
                             let canPublishPreview = publishPartial && projectClips == nil && existing.isEmpty && additions.isEmpty
                             let header = canPublishPreview ? try? await read(true) : nil
-                            if let preview = header, !preview.hasFullEditIndex, preview.timelineIssue == nil {
+                            if let preview = header, !preview.hasFullEditIndex, preview.timelineIssue == nil,
+                               !mayAttachSoundtrack || preview.hasVideo {
                                 let clip = EditorSegment(source: IndexedSource(media: preview))
                                 provisional = clip
                                 let prepared = PreparedEdit(segments: [clip], previous: prior, engine: engine)
                                 await MainActor.run {
                                     guard self.session == currentSession, !token.isCancelled else { return }
                                     self.apply([clip], prepared: prepared, selecting: clip.id, at: 0,
-                                               action: "Add Clip", recordHistory: false)
+                                               action: "Add Clip", recordHistory: false, sequenceProject: projectAfterImport([clip]))
                                 }
                             }
                             let media: MediaInfo
@@ -1620,6 +1927,10 @@ final class EditorModel: ObservableObject {
                                 media = header
                             } else {
                                 media = try await read(false, identity: header?.identity)
+                            }
+                            if mayAttachSoundtrack, !media.hasVideo, !media.audio.isEmpty {
+                                soundtrack = media.forRefreshAlias(media.url.resolvingSymlinksInPath())
+                                break
                             }
                             try Self.checkEditable(media)
                             source = IndexedSource(media: media, id: provisional?.source.id ?? UUID())
@@ -1646,12 +1957,16 @@ final class EditorModel: ObservableObject {
                                 if !matches { try engine.checkEncodeCombinable(source.media, with: pictureReference) }
                             }
                         }
-                        if pictureReference == nil { pictureReference = source.media }
-                        if ordinaryReference == nil && !isReplacement { ordinaryReference = source.media }
                         indexed[canonical] = source
                         if let document {
                             guard document.from >= .zero, document.from < document.to, document.to <= source.duration else {
                                 throw CutError(code: "project_clip_range", message: "The saved trim exceeds the recording duration.")
+                            }
+                            if let required = requiredStillExtents[document.id], required > source.duration {
+                                throw CutError(code: "project_clip_range", message: "A saved still replacement extends past the recording.")
+                            }
+                            if let fragmentEnd = stillFragmentEnds[document.id], fragmentEnd > source.duration {
+                                throw CutError(code: "project_clip_range", message: "A still replacement exceeds the recording duration.")
                             }
                             let original = original ?? source.url
                             let key = DocumentSourceKey(file: source.url, original: original, track: document.audioTrack,
@@ -1677,6 +1992,8 @@ final class EditorModel: ObservableObject {
                         } else {
                             additions.append(EditorSegment(id: provisional?.id ?? UUID(), source: source))
                         }
+                        if pictureReference == nil { pictureReference = source.media }
+                        if ordinaryReference == nil && !isReplacement { ordinaryReference = source.media }
                         if publishPartial, projectClips == nil, offset + 1 < urls.count, lastPublication.map({ $0.duration(to: .now) >= .milliseconds(250) }) ?? true {
                             var partial = existing
                             partial.insert(contentsOf: additions, at: insertion)
@@ -1687,7 +2004,7 @@ final class EditorModel: ObservableObject {
                                 guard self.session == currentSession, !token.isCancelled else { return }
                                 self.apply(clips, prepared: prepared, selecting: clips[insertion].id,
                                            at: self.playhead, action: "Add Clips", recordHistory: false,
-                                           preservePreview: true)
+                                           preservePreview: true, sequenceProject: projectAfterImport(clips))
                             }
                             lastPublication = .now
                         }
@@ -1703,13 +2020,36 @@ final class EditorModel: ObservableObject {
                                 self.updateStatus()
                             }
                         }
-                        rejected.append("\(file.lastPathComponent) — \(error.localizedDescription)")
+                        if let document {
+                            let original = original ?? file
+                            let key = DocumentSourceKey(file: file, original: original, track: document.audioTrack,
+                                                        names: document.replacementNames)
+                            let id = unresolvedIDs[key] ?? UUID()
+                            unresolvedIDs[key] = id
+                            let checking = checkingPaths.contains(document.file)
+                            let present = !checking && (error as? CutError)?.code != "missing_source"
+                                && FileManager.default.fileExists(atPath: file.path)
+                            let snapshot = entries[document.file]
+                            let keptOffline = (error as? CutError)?.code == "project_clip_range"
+                                && keepUnavailableRangesAt.contains(ProjectMediaVolume.watchURL(file))
+                            let status: ProjectMediaStatus = checking ? .checking
+                                : present && !keptOffline ? .needsReview : snapshot?.ignored == true ? .ignored : .offline
+                            let source = UnresolvedSource(id: id, url: file, originalURL: original,
+                                                          replacementNames: document.replacementNames,
+                                                          replacementTrack: document.audioTrack, status: status,
+                                                          detail: checking || present ? error.localizedDescription : "Recording is offline.",
+                                                          snapshot: snapshot)
+                            additions.append(EditorSegment(documentID: document.id, source: .unresolved(source),
+                                                           start: document.from, end: document.to))
+                        } else {
+                            rejected.append("\(file.lastPathComponent) — \(error.localizedDescription)")
+                        }
                     }
                 }
                 var candidate = existing
                 candidate.insert(contentsOf: additions, at: insertion)
                 let prepared = PreparedEdit(segments: candidate, previous: prior, engine: engine)
-                return (candidate, additions.count, rejected, prepared, savedAnalysis)
+                return (candidate, additions.count, rejected, prepared, savedAnalysis, soundtrack)
             }.value
 
             var outcome: Result<Void, Error> = .failure(CutError(code: "cancelled", message: "Media loading was cancelled."))
@@ -1765,11 +2105,10 @@ final class EditorModel: ObservableObject {
                 updateStatus()
                 return
             }
-            if projectClips != nil, !result.2.isEmpty {
-                let title = historyAction.map { "Couldn’t Restore “\($0)”" } ?? "Couldn’t Open Project"
-                let message = result.2.joined(separator: "\n\n")
-                outcome = .failure(CutError(code: "import_incomplete", message: message))
-                if completion == nil { alert = EditorNotice(title: title, message: message) }
+            if let soundtrack = result.5 {
+                guard mcpRevision == importRevision else { return }
+                selectStillSoundtrackTrack(soundtrack, generation: mcpGeneration, revision: importRevision)
+                outcome = .success(())
                 return
             }
             if result.1 > 0 {
@@ -1794,10 +2133,14 @@ final class EditorModel: ObservableObject {
                     }
                     sceneRevision += 1
                 }
-                let applied = apply(result.0, prepared: result.3, selecting: result.0[insertion].id, at: projectClips == nil ? playhead : 0,
+                let selectedDocumentID = preserveProjectPosition
+                    ? beforeImport.segments.first(where: { $0.id == beforeImport.selectedID })?.documentID : nil
+                let selected = result.0.first(where: { $0.documentID == selectedDocumentID })?.id ?? result.0[insertion].id
+                let applied = apply(result.0, prepared: result.3, selecting: selected,
+                      at: preserveProjectPosition ? beforeImport.playhead : (projectClips == nil ? playhead : 0),
                       action: result.1 == 1 ? "Add Clip" : "Add Clips", recordHistory: projectClips == nil, historySnapshot: beforeImport,
-                      preservePreview: true, restoringAudioMonitoring: restoringAudioMonitoring,
-                      sequenceProject: sequenceProject)
+                      preservePreview: true, preserveMarks: preserveProjectPosition, restoringAudioMonitoring: restoringAudioMonitoring,
+                      sequenceProject: projectAfterImport(result.0))
                 if applied {
                     outcome = .success(())
                     if projectClips != nil { installed?() }
@@ -1844,6 +2187,11 @@ final class EditorModel: ObservableObject {
     func scrub(_ position: Double) {
         guard position.isFinite, canNavigate else { return }
         let target = min(max(position, 0), duration)
+        if preview.hasSoundtrack {
+            preview.scrubSoundtrack(to: target)
+            usesPointerPosition = true
+            return
+        }
         guard let index = locatedSegment(at: target)?.0 ?? (target == duration ? segments.indices.last : nil) else {
             preview.seek(to: target)
             usesPointerPosition = true
@@ -1940,12 +2288,15 @@ final class EditorModel: ObservableObject {
     private func persistMetadata<Value: Codable & Sendable>(_ value: Value?, key: Int, section: String, media: MediaInfo,
                                                            seed: [Int: Value], source: UUID, edits: EditorMetadataEdits) {
         let preference = sidecarPreference
+        let media = media.pinningSidecarWrites()
         let automatic = preference.permits(media.url)
         let currentSession = session
+        let work = sidecarWork
+        pendingMetadata[source, default: EditorMetadataEdits()].record(edits)
         enqueueSidecarWrite {
             var saved = false
             if automatic && preference.permits(media.url) {
-                saved = await Task.detached(priority: .utility) {
+                saved = await work.detached(priority: .utility) {
                     do {
                         try AnalysisSidecar(media: media).save([:], updating: [section: { old in
                             let values = EditorMetadataEdits.merged(old, seed: seed, edits: [key: value])
@@ -1957,8 +2308,8 @@ final class EditorModel: ObservableObject {
                     }
                 }.value
             }
-            if self.session == currentSession {
-                self.pendingMetadata[source, default: EditorMetadataEdits()].update(edits, saved: saved)
+            if saved, self.session == currentSession {
+                self.pendingMetadata[source]?.discardSaved(edits)
             }
         }
     }
@@ -2022,7 +2373,7 @@ final class EditorModel: ObservableObject {
     }
 
     var canScanScenes: Bool {
-        canScanScenes(clipID: nil) && segments.contains { $0.source.media.hasVideo && sceneReports[$0.source.id] == nil }
+        canScanScenes(clipID: nil) && segments.contains { $0.source.media?.hasVideo == true && mediaReviewIssue($0) == nil && sceneReports[$0.source.id] == nil }
     }
 
     func canScanScenes(clipID: UUID?) -> Bool {
@@ -2031,17 +2382,18 @@ final class EditorModel: ObservableObject {
 
     private func sceneRequests(clipID: UUID?) -> [EditorSceneRequest] {
         if let clipID {
-            guard let clip = segments.first(where: { $0.id == clipID && $0.source.isIndexed && $0.source.media.hasVideo }),
-                  mediaReviewIssue(clip) == nil, clip.start < clip.end else { return [] }
-            return [EditorSceneRequest(id: clip.id.uuidString, media: clip.source.media,
+            guard let clip = segments.first(where: { $0.id == clipID && $0.source.isIndexed }),
+                  let media = clip.source.media, media.hasVideo, mediaReviewIssue(clip) == nil,
+                  clip.start < clip.end else { return [] }
+            return [EditorSceneRequest(id: clip.id.uuidString, media: media,
                                        scope: .range(start: clip.start, end: clip.end))]
         }
         var seen = Set<UUID>()
         return segments.compactMap { clip in
             let source = clip.source
-            guard source.isIndexed, source.media.hasVideo, !offlineMedia.contains(source.url),
-                  !incompatibleMedia.contains(source.url), seen.insert(source.id).inserted else { return nil }
-            return EditorSceneRequest(id: source.id.uuidString, media: source.media)
+            guard source.isIndexed, let media = source.media, media.hasVideo, mediaReviewIssue(clip) == nil,
+                  seen.insert(source.id).inserted else { return nil }
+            return EditorSceneRequest(id: source.id.uuidString, media: media)
         }
     }
 
@@ -2063,26 +2415,44 @@ final class EditorModel: ObservableObject {
 
     var canSaveAnalysisSidecars: Bool { canEdit && !isSavingSidecars }
 
-    func saveAnalysisSidecars() {
+    func saveAnalysisSidecars() { saveAnalysisSidecars(afterFirstProjectSave: false) }
+
+    private func saveAnalysisSidecars(afterFirstProjectSave: Bool) {
         guard canSaveAnalysisSidecars else { return }
+        if SidecarLocations.mode == .project, projectURL == nil {
+            if let receipt = mcpSidecarReceipt {
+                receipt.finish("failed", detail: ["error": "Save the project before saving analysis in its folder."])
+                mcpSidecarReceipt = nil
+            } else {
+                let panel = ProjectPanels.cutSavePanel(name: "Untitled.cut")
+                ProjectPanels.present(panel, in: editorWindow) { [weak self] accepted in
+                    guard let self, accepted, let url = panel.url, self.saveProject(to: url, flushDraftAnalysis: false) else { return }
+                    self.saveAnalysisSidecars()
+                }
+            }
+            return
+        }
         var seen = Set<URL>()
         let snapshots = segments.compactMap { clip -> DesktopAnalysisSnapshot? in
             let source = clip.source
+            guard let media = source.media, mediaReviewIssue(clip) == nil else { return nil }
+            if afterFirstProjectSave, !media.hasFullEditIndex || !sidecarPreference.permits(source.url) { return nil }
             guard seen.insert(source.url).inserted else { return nil }
-            let audio = source.media.streams.filter { $0.kind == "audio" }
+            let audio = media.streams.filter { $0.kind == "audio" }
             let overrides = Dictionary(uniqueKeysWithValues: audio.enumerated().compactMap { (track, stream) -> (Int, Double)? in
                 thresholdOverrides[AudioTrackKey(source: source.id, track: track)].map { (stream.index, $0) }
             })
-            return DesktopAnalysisSnapshot(sourceID: source.id, media: source.media, scenes: sceneReports[source.id],
+            return DesktopAnalysisSnapshot(sourceID: source.id, media: media.pinningSidecarWrites(), scenes: sceneReports[source.id],
                                           viewNames: viewNamesBySource[source.id] ?? [:],
                                           thresholdOverrides: overrides,
-                                          edits: EditorMetadataEdits(),
-                                          waveforms: audioStore.completedWaveforms(for: source.id, media: source.media),
-                                          envelopeOverviews: audioStore.completedEnvelope(for: source.id, media: source.media),
+                                          edits: pendingMetadata[source.id] ?? EditorMetadataEdits(),
+                                          waveforms: audioStore.completedWaveforms(for: source.id, media: media),
+                                          envelopeOverviews: audioStore.completedEnvelope(for: source.id, media: media),
                                           silence: completedSilences(for: source.id),
                                           filmstrip: filmstripTiles.snapshot(for: source.id))
         }
-        let excluded = CutProject.sidecarExclusions(absoluteSources: protectedMedia, candidates: snapshots.map { $0.media.url })
+        guard !snapshots.isEmpty else { return }
+        let excluded = CutProject.sidecarExclusions(absoluteSources: protectedMedia, candidates: snapshots.map { $0.media.url }, projectURL: projectURL)
         if let conflict = snapshots.first(where: { AnalysisSidecar.isExcluded($0.media.url, in: excluded) }) {
             alert = EditorNotice(title: "Couldn’t Save Analysis",
                                  message: "The analysis file for ‘\(conflict.media.url.lastPathComponent)’ would overwrite media referenced by this project.")
@@ -2090,6 +2460,7 @@ final class EditorModel: ObservableObject {
         }
         let token = EditCancellation()
         sidecarSaveToken = token
+        isFlushingDraftSidecars = afterFirstProjectSave
         let receipt = mcpSidecarReceipt
         let outputs = receipt.map { _ in MCPLiveOutputProgress() }
         let endWork = receipt?.cleanup.begin()
@@ -2100,48 +2471,53 @@ final class EditorModel: ObservableObject {
         statusMessage = "Saving analysis sidecars…"
         let checkpointRequests = Dictionary(grouping: sceneScan.checkpointRequests, by: { $0.media.identity })
         let sceneCache = sceneScan.cache
+        let work = sidecarWork
         enqueueSidecarWrite { [self] in
             defer { endWork?() }
-            guard sidecarSaveToken === token else { return }
+            // A close immediately after saving the draft can release the document before this queue drains.
+            guard afterFirstProjectSave || sidecarSaveToken === token else { return }
             // An earlier autosave may have committed since these snapshots were captured.
             let snapshots = snapshots.map { original in
                 var snapshot = original
-                snapshot.edits = pendingMetadata[snapshot.sourceID] ?? EditorMetadataEdits()
+                if sidecarSaveToken === token {
+                    snapshot.edits = pendingMetadata[snapshot.sourceID] ?? EditorMetadataEdits()
+                }
                 return snapshot
             }
-            let (saved, failures, checkpoints) = await Task.detached(priority: .utility) {
-                var saved: [UUID] = []
+            let (saved, failures, checkpoints) = await work.detached(priority: .utility) {
+                var saved: [UUID: URL] = [:]
                 var checkpoints: [(String, SceneScanProgress)] = []
                 var failures: [String] = []
                 for snapshot in snapshots {
                     if token.isCancelled { break }
                     do {
-                        try snapshot.save(cancelled: { token.isCancelled })
+                        let location = try snapshot.save(cancelled: { token.isCancelled })
                         for item in checkpointRequests[snapshot.media.identity] ?? [] {
                             if token.isCancelled { break }
                             if let progress = try SceneAnalysis.saveCheckpoint(for: snapshot.media, scope: item.scope, session: sceneCache) {
                                 checkpoints.append((item.id, progress))
                             }
                         }
-                        saved.append(snapshot.sourceID)
-                        outputs?.published(AnalysisSidecar.url(for: snapshot.media.url))
+                        saved[snapshot.sourceID] = location
+                        outputs?.published(location)
                         outputs?.update(Double(saved.count) / Double(snapshots.count))
                     } catch {
                         if token.isCancelled { break }
                         failures.append("\(snapshot.media.url.lastPathComponent) — \(error.localizedDescription)")
                     }
                 }
-                return (Set(saved), failures, checkpoints)
+                return (saved, failures, checkpoints)
             }.value
             guard sidecarSaveToken === token else { return }
             for (id, progress) in checkpoints { sceneScan.didSaveCheckpoint(id, progress: progress) }
             if !checkpoints.isEmpty { sceneRevision += 1 }
-            for snapshot in snapshots where saved.contains(snapshot.sourceID) {
+            for snapshot in snapshots where saved[snapshot.sourceID] != nil {
                 pendingMetadata[snapshot.sourceID]?.discardSaved(snapshot.edits)
             }
             isSavingSidecars = false
+            isFlushingDraftSidecars = false
             sidecarSaveToken = nil
-            let paths = snapshots.filter { saved.contains($0.sourceID) }.map { AnalysisSidecar.url(for: $0.media.url).path }
+            let paths = snapshots.compactMap { saved[$0.sourceID]?.path }
             receipt?.finish(token.isCancelled ? "cancelled" : (failures.isEmpty ? "succeeded" : "failed"),
                             detail: ["outputs": paths, "errors": failures])
             mcpSidecarReceipt = nil
@@ -2319,11 +2695,12 @@ final class EditorModel: ObservableObject {
             let segment = segments[i]
             let offset = edit.offsets[i]
             let local = playhead - offset.seconds + segment.start.seconds
-            if !segment.source.media.hasVideo {
+            guard let media = segment.source.media, mediaReviewIssue(segment) == nil else { continue }
+            if !media.hasVideo {
                 guard !keyframes else { return }
                 let cut: RationalTime
                 if direction > 0 && local < segment.start.seconds { cut = segment.start }
-                else { cut = segment.source.media.steppingAudioBoundary(from: min(local, segment.end.seconds), direction: direction) }
+                else { cut = media.steppingAudioBoundary(from: min(local, segment.end.seconds), direction: direction) }
                 guard cut >= segment.start, cut <= segment.end else { continue }
                 let time = segment.sequenceSeconds(at: cut, offset: offset)
                 if direction > 0 ? time <= playhead : time >= playhead { continue }
@@ -2534,10 +2911,16 @@ final class EditorModel: ObservableObject {
             else { alert = EditorNotice(title: title, message: message) }
         }
         let segment = segments[index], offset = edit.offsets[index]
+        if let issue = mediaReviewIssue(segment) {
+            if let completion { completion(.failure(CutError(code: "source_needs_review", message: issue))) }
+            else { fail(issue) }
+            return
+        }
+        guard let media = segment.source.media else { return }
         let candidates: [RationalTime]
         switch targetMode {
-        case .off: candidates = segment.source.media.hasVideo ? segment.source.frames :
-            [segment.source.media.audioEditBoundary(near: target)]
+        case .off: candidates = media.hasVideo ? segment.source.frames :
+            [media.audioEditBoundary(near: target)]
         case .keyframes: candidates = copyBoundaries(for: segment.source)?.splitPoints ?? []
         case .scenes, .silence:
             guard let boundary = analysisBoundary(in: segment, to: target, after: segment.start, before: segment.end) else {
@@ -2549,6 +2932,7 @@ final class EditorModel: ObservableObject {
         }
         let original = segments, rightID = UUID(), revision = mcpRevision
         let container = preferredCopyContainer
+        let validateJoins = edit.preparation.unavailableSourceIDs.isEmpty
         let perform: @Sendable (CutEngine) -> SplitSearch = { engine in
             var result = SplitSearch()
             for boundary in Self.nearestBoundaries(in: candidates, to: target, after: segment.start, before: segment.end) {
@@ -2556,7 +2940,7 @@ final class EditorModel: ObservableObject {
                 let halves = segment.split(at: boundary, rightID: rightID)
                 proposed[index] = halves.left
                 proposed.insert(halves.right, at: index + 1)
-                if targetMode == .keyframes, let error = Self.copyIssue(proposed, container: container, engine: engine) {
+                if targetMode == .keyframes, validateJoins, let error = Self.copyIssue(proposed, container: container, engine: engine) {
                     if error.code == "cancelled" { break }
                     if result.issue == nil {
                         result.issue = error
@@ -2573,6 +2957,11 @@ final class EditorModel: ObservableObject {
         }
         let finish: (SplitSearch) -> Void = { [self] result in
             do { try check() } catch { completion?(.failure(error)); return }
+            if let issue = mediaReviewIssue(segment) {
+                if let completion { completion(.failure(CutError(code: "source_needs_review", message: issue))) }
+                else { fail(issue) }
+                return
+            }
             if let cut = result.cut {
                 let snapped: RationalTime
                 do {
@@ -2609,7 +2998,7 @@ final class EditorModel: ObservableObject {
             cancellation = token
             isCheckingEdit = true
             Task {
-                let result = await Task.detached(priority: .userInitiated) {
+                let result = await sidecarWork.detached(priority: .userInitiated) {
                     perform(CutEngine(cancelled: { token.isCancelled }))
                 }.value
                 guard cancellation === token else {
@@ -2644,7 +3033,36 @@ final class EditorModel: ObservableObject {
     }
 
     func trim(_ id: UUID, edge: TimelineEdge, sourceTime: Double, commit: Bool) -> Double? {
-        asking(true) { trim(id, edge: edge, sourceTime: sourceTime, commit: commit, snap: effectiveSnapTarget) }
+        if let card = edit.inlineStillsByID[id] {
+            guard edge == .end else { return nil }
+            return resizeStillEnd(card, duration: sourceTime, commit: commit)
+        }
+        return asking(true) { trim(id, edge: edge, sourceTime: sourceTime, commit: commit, snap: effectiveSnapTarget) }
+    }
+
+    private func resizeStillEnd(_ card: InlineStill, duration: Double, commit: Bool) -> Double? {
+        guard canEdit, duration.isFinite else { return nil }
+        let cadence = card.insert.cadence
+        let exact: RationalTime
+        if let soundtrack = edit.stillSequence?.stillSoundtrack,
+           let remaining = try? soundtrack.to.subtracting(soundtrack.from).subtracting(card.start),
+           remaining > .zero, abs(duration - remaining.seconds) <= cadence.seconds / 2 {
+            exact = remaining
+        } else {
+            let frames = max(1, (duration / cadence.seconds).rounded())
+            guard frames <= Double(Int32.max),
+                  let rounded = try? cadence.multiplied(by: RationalTime(numerator: Int64(frames))) else { return nil }
+            exact = rounded
+        }
+        guard commit, exact != card.insert.duration else { return exact.seconds }
+        do {
+            let project = try stillProject.resizingStill(id: card.insert.id, duration: exact)
+            try applyStillProjectByHand(project, action: "Change Still Duration")
+            return exact.seconds
+        } catch {
+            showStillError(error)
+            return nil
+        }
     }
 
     /// Large native copy-boundary searches can finish after a setting changes or a window closes.
@@ -2656,6 +3074,9 @@ final class EditorModel: ObservableObject {
             if result != nil { mcpTrimPreview = preview }
             return result
         }
+        if let clip = segments.first(where: { $0.id == id }), let issue = mediaReviewIssue(clip) {
+            throw CutError(code: "source_needs_review", message: issue)
+        }
         guard usesBackgroundTrimValidation,
               let index = segments.firstIndex(where: { $0.id == id }),
               let boundaries = copyBoundaries(for: segments[index].source) else {
@@ -2664,14 +3085,15 @@ final class EditorModel: ObservableObject {
         }
         let original = segments, revision = mcpRevision, generation = mcpGeneration
         let container = preferredCopyContainer
+        let validateJoins = edit.preparation.unavailableSourceIDs.isEmpty
         let previewID = mcpTrimPreview
         let candidates = trimCandidates(at: index, edge: edge, boundaries: boundaries)
         let cached = checkingTrim?.0 == id && checkingTrim?.1 == edge ? trimChecks : [:]
         cancellation = token
         isCheckingEdit = true
-        let worker = Task.detached(priority: .userInitiated) {
+        let worker = sidecarWork.detached(priority: .userInitiated) {
             Self.searchCopyTrim(segments: original, index: index, edge: edge, target: time,
-                                options: candidates, container: container, cached: cached)
+                                options: candidates, container: container, validateJoins: validateJoins, cached: cached)
         }
         let cancelID = token.onCancel { worker.cancel() }
         let result = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
@@ -2697,6 +3119,10 @@ final class EditorModel: ObservableObject {
               let index = segments.firstIndex(where: { $0.id == id }) else { return nil }
         mcpTrimPreview = nil
         let segment = segments[index]
+        if let issue = mediaReviewIssue(segment) {
+            if commit { alert = EditorNotice(title: "Can’t Trim Clip", message: issue) }
+            return nil
+        }
         let offset = edit.offsets[index]
         let minimum = edge == .end ? segment.start : nil
         let maximum = edge == .start ? segment.end : nil
@@ -2728,7 +3154,7 @@ final class EditorModel: ObservableObject {
             let result = verified ?? Self.searchCopyTrim(
                 segments: segments, index: index, edge: edge, target: sourceTime,
                 options: trimCandidates(at: index, edge: edge, boundaries: boundaries),
-                container: preferredCopyContainer, cached: trimChecks
+                container: preferredCopyContainer, validateJoins: edit.preparation.unavailableSourceIDs.isEmpty, cached: trimChecks
             )
             trimChecks.merge(result.newChecks) { _, new in new }
             fixedTrimIssue = result.fixedIssue
@@ -2747,7 +3173,7 @@ final class EditorModel: ObservableObject {
         } else if snap == .scenes || snap == .silence {
             // Even a source with no detected markers can be restored to its original extent.
             if edge == .start && sourceTime <= 0 { cut = .zero }
-            else if edge == .end && sourceTime >= segment.source.duration.seconds { cut = segment.source.duration }
+            else if edge == .end && sourceTime >= segment.sourceExtent.seconds { cut = segment.sourceExtent }
             else if let boundary = analysisBoundary(in: segment, to: sourceTime, after: minimum, before: maximum) {
                 cut = boundary
             } else {
@@ -2770,7 +3196,7 @@ final class EditorModel: ObservableObject {
                 trimAudition = (id, edge, cut)
                 let auditionTime = edge == .end ? precedingFrame(in: segment, before: cut) : cut
                 preview.audition(monitoredPreview(segment), at: auditionTime.seconds,
-                                 sourceDuration: segment.source.duration.seconds, reverse: backwards)
+                                 sourceDuration: segment.sourceExtent.seconds, reverse: backwards)
             }
             return cut.seconds
         }
@@ -2808,7 +3234,7 @@ final class EditorModel: ObservableObject {
 
     private nonisolated static func searchCopyTrim(segments: [EditorSegment], index: Int, edge: TimelineEdge,
                                                    target: Double, options: [RationalTime], container: String?,
-                                                   cached: [RationalTime: TrimCheck]) -> TrimSearch {
+                                                   validateJoins: Bool, cached: [RationalTime: TrimCheck]) -> TrimSearch {
         let segment = segments[index]
         let candidates = nearestBoundaries(in: options, to: target, after: edge == .end ? segment.start : nil,
                                            before: edge == .start ? segment.end : nil)
@@ -2816,6 +3242,7 @@ final class EditorModel: ObservableObject {
         let engine = CutEngine(cancelled: { Task.isCancelled })
         for candidate in candidates {
             if Task.isCancelled { break }
+            if !validateJoins { result.cut = candidate; break }
             if let check = cached[candidate], check.error == nil { result.cut = candidate; break }
             var proposed = segments
             if edge == .start { proposed[index].start = candidate } else { proposed[index].end = candidate }
@@ -2840,7 +3267,7 @@ final class EditorModel: ObservableObject {
     func validateHandle(_ id: UUID, edge: TimelineEdge, target: Double, commit: Bool,
                         completion: @escaping (Double?) -> Void) {
         guard canEdit, effectiveSnapTarget == .keyframes, let index = segments.firstIndex(where: { $0.id == id }),
-              let bounds = copyBoundaries(for: segments[index].source) else {
+              mediaReviewIssue(segments[index]) == nil, let bounds = copyBoundaries(for: segments[index].source) else {
             completion(trim(id, edge: edge, sourceTime: target, commit: commit))
             return
         }
@@ -2849,17 +3276,19 @@ final class EditorModel: ObservableObject {
         let request = UUID()
         trimValidationID = request
         let original = segments, container = preferredCopyContainer
+        let validateJoins = edit.preparation.unavailableSourceIDs.isEmpty
         let options = trimCandidates(at: index, edge: edge, boundaries: bounds)
         let cached = checkingTrim?.0 == id && checkingTrim?.1 == edge ? trimChecks : [:]
         isCommittingHandle = commit
         if commit { isCheckingEdit = true }
+        let work = sidecarWork
         trimValidation = Task { [weak self] in
             // Coalesce rapid drag events while an older native planner call winds down.
             await previous?.value
             guard !Task.isCancelled else { return }
-            let worker = Task.detached(priority: .userInitiated) {
+            let worker = work.detached(priority: .userInitiated) {
                 Self.searchCopyTrim(segments: original, index: index, edge: edge, target: target,
-                                    options: options, container: container, cached: cached)
+                                    options: options, container: container, validateJoins: validateJoins, cached: cached)
             }
             let result = await withTaskCancellationHandler(operation: { await worker.value }, onCancel: { worker.cancel() })
             guard let self, self.trimValidationID == request else { return }
@@ -2945,7 +3374,7 @@ final class EditorModel: ObservableObject {
         cancellation = token
         isCheckingEdit = true
         Task {
-            let result = await Task.detached(priority: .userInitiated) {
+            let result = await sidecarWork.detached(priority: .userInitiated) {
                 Result { try ClipEditCSV.ranges(in: url, clip: scope, cancelled: { token.isCancelled }) }
             }.value
             guard session == currentSession, cancellation === token else {
@@ -2973,7 +3402,7 @@ final class EditorModel: ObservableObject {
                         newOccurrences.append(occurrence)
                     }
                     let displayFrom = range.from == scope.from ? clip.displayRange?.from ?? .zero : range.from
-                    let displayTo = range.to == scope.to ? clip.displayRange?.to ?? clip.source.duration : range.to
+                    let displayTo = range.to == scope.to ? clip.displayRange?.to ?? clip.sourceExtent : range.to
                     return EditorSegment(id: offset == 0 ? clip.id : UUID(), documentID: offset == 0 ? clip.documentID : nil,
                                          source: clip.source, start: range.from, end: range.to,
                                          displayRange: AudioSpan(from: displayFrom, to: displayTo), occurrence: occurrence)
@@ -3036,7 +3465,7 @@ final class EditorModel: ObservableObject {
     }
 
     func deleteClip(_ id: UUID) {
-        if let placementID = stillTimelineIDs.first(where: { $0.value == id })?.key {
+        if let placementID = edit.inlineStillsByID[id]?.insert.id {
             editStill(action: "Delete Still") { try stillProject.removingStill(id: placementID) }
             return
         }
@@ -3096,11 +3525,14 @@ final class EditorModel: ObservableObject {
         var to = backwards ? redoStack : undoStack
         var target = HistoryEntry(action: "", contents: .live(snapshot()),
                                   copyContainer: explicitCopyContainer, transcriptState: transcriptState, audioMonitoring: audioMonitoring)
+        var bindingChanges: [[TranscriptBindingChange]] = []
         for _ in 0..<abs(historyCursor - index) {
             let step = from.removeLast()
+            bindingChanges.append(step.bindingChanges)
             to.append(HistoryEntry(id: step.id, action: step.action, origin: step.origin, contents: target.contents,
                                    copyContainer: target.copyContainer, transcriptState: target.project.transcripts,
-                                   audioMonitoring: step.audioMonitoring == nil ? nil : target.audioMonitoring))
+                                   audioMonitoring: step.audioMonitoring == nil ? nil : target.audioMonitoring,
+                                   bindingChanges: step.bindingChanges.map(\.reversed)))
             let monitoring = step.audioMonitoring ?? target.audioMonitoring
             let container = step.clipCount == 0 ? nil : target.copyContainer ?? step.copyContainer
             target = step
@@ -3109,16 +3541,25 @@ final class EditorModel: ObservableObject {
         }
         let authoring = target.project.transcripts.authoring
         let changesAuthoring = transcriptState.authoring != authoring
+        var checkedTranscripts = transcriptState
+        func applyBindings(to transcripts: inout ProjectTranscripts) -> Bool {
+            bindingChanges.reduce(false) { changed, transitions in
+                TranscriptBindingChange.apply(transitions, to: &transcripts) || changed
+            }
+        }
+        let changesBindings = applyBindings(to: &checkedTranscripts)
         func restoreTranscripts() throws {
             // An attachment may finish while an older timeline snapshot indexes.
             var restored = transcriptState
-            guard restored.authoring != authoring else { return }
+            let changesBindings = applyBindings(to: &restored)
+            guard restored.authoring != authoring || changesBindings else { return }
+            restored.revision = transcriptState.revision
             try restored.advanceRevision()
             restored.authoring = authoring
             transcriptState = restored
             rebuildPausePlan()
         }
-        if changesAuthoring, transcriptState.revision == .max {
+        if changesAuthoring || changesBindings, transcriptState.revision == .max {
             fail(CutError(code: "invalid_transcript_state", message: "The transcript revision counter is exhausted."))
             return
         }
@@ -3138,7 +3579,7 @@ final class EditorModel: ObservableObject {
         }
         var targetTimeline = target.project
         targetTimeline.transcripts = .init()
-        if changesAuthoring, targetTimeline == stillProject, explicitCopyContainer == target.copyContainer,
+        if changesAuthoring || changesBindings, targetTimeline == stillProject, explicitCopyContainer == target.copyContainer,
            target.audioMonitoring == nil || audioMonitoring == target.audioMonitoring {
             do { try beforeRestore?() } catch { fail(error); return }
             finish()
@@ -3146,7 +3587,11 @@ final class EditorModel: ObservableObject {
             return
         }
         if case .live(let state) = target.contents,
-           state.preparation.sourceMedia.values.allSatisfy(Self.currentSource) {
+           state.segments.allSatisfy({ canReuseUnresolved($0.source) }),
+           state.preparation.sourceMedia.values.allSatisfy({ media in
+               let status = mediaStatus(for: media.url)
+               return status == .checking || status == .offline || status == .ignored || Self.currentSource(media)
+           }) {
             do { try beforeRestore?() } catch { fail(error); return }
             let sources = Set(state.preparation.sourceMedia.values.map(\.url))
             if !sources.isSubset(of: lastSidecarCandidates) { refreshSidecarExclusions(adding: Array(sources)) }
@@ -3154,7 +3599,16 @@ final class EditorModel: ObservableObject {
             explicitCopyContainer = target.copyContainer
             mcpRevision += 1
             edit = state
-            mediaClipReview = Dictionary(uniqueKeysWithValues: edit.timelineClips.compactMap { clip in
+            edit.preparation = preparedForMediaAvailability(state.segments, using: state.preparation)
+            let segmentsByID = Dictionary(uniqueKeysWithValues: state.segments.map { ($0.id, $0) })
+            var clips = state.timelineClips
+            for index in clips.indices {
+                if let segment = segmentsByID[clips[index].id] {
+                    applyMediaPresentation(segment, to: &clips[index])
+                }
+            }
+            edit.timelineClips = clips
+            mediaClipReview = Dictionary(uniqueKeysWithValues: clips.compactMap { clip in
                 clip.mediaIssue.map { (clip.id, $0) }
             })
             refreshTier()
@@ -3184,17 +3638,15 @@ final class EditorModel: ObservableObject {
                 // A retention change while indexing may have removed this transition.
                 let originalHistory = historyEntryIDs
                 let originalCursor = historyCursor
-                do {
-                    try importFiles(checkedFiles(clips), projectClips: clips, historyAction: target.action, beforeInstall: {
-                        try beforeRestore?()
-                        guard self.historyEntryIDs == originalHistory, self.historyCursor == originalCursor else {
-                            if completion == nil { return false }
-                            throw CutError(code: "stale_history", message: "The history changed while preparing this state.")
-                        }
-                        return true
-                    }, requestCancellation: requestCancellation, installed: finish,
-                    restoringAudioMonitoring: target.audioMonitoring, sequenceProject: target.project, completion: completion)
-                } catch { fail(error) }
+                importFiles(clips.map { URL(fileURLWithPath: $0.file, isDirectory: false) }, projectClips: clips, beforeInstall: {
+                    try beforeRestore?()
+                    guard self.historyEntryIDs == originalHistory, self.historyCursor == originalCursor else {
+                        if completion == nil { return false }
+                        throw CutError(code: "stale_history", message: "The history changed while preparing this state.")
+                    }
+                    return true
+                }, requestCancellation: requestCancellation, installed: finish,
+                            restoringAudioMonitoring: target.audioMonitoring, sequenceProject: target.project, completion: completion)
             }
         }
     }
@@ -3203,9 +3655,15 @@ final class EditorModel: ObservableObject {
         media.identity.isCurrentSnapshot(at: media.url)
     }
 
+    private func canReuseUnresolved(_ source: EditorSource) -> Bool {
+        guard source.unresolved != nil else { return true }
+        let status = mediaWatcher?.status(for: source.url)
+        return status == .offline || status == .checking
+    }
+
     /// Reuse the indexed media already on the timeline when walking through saved trims or rearrangements.
     private func cachedSegments(for clips: [CutSequenceClip]) -> [EditorSegment]? {
-        var sources: [DocumentSourceKey: IndexedSource] = [:]
+        var sources: [DocumentSourceKey: EditorSource] = [:]
         for segment in segments {
             let source = segment.source
             sources[DocumentSourceKey(file: source.url, original: source.originalURL, track: source.replacementTrack,
@@ -3214,11 +3672,17 @@ final class EditorModel: ObservableObject {
         var checked: Set<UUID> = []
         var restored: [EditorSegment] = []
         for clip in clips {
-            let file = URL(fileURLWithPath: clip.file)
-            let key = DocumentSourceKey(file: file, original: clip.originalFile.map(URL.init(fileURLWithPath:)) ?? file,
+            let file = URL(fileURLWithPath: clip.file, isDirectory: false)
+            let original = clip.originalFile.map { URL(fileURLWithPath: $0, isDirectory: false) } ?? file
+            let key = DocumentSourceKey(file: file, original: original,
                                         track: clip.audioTrack, names: clip.replacementNames)
-            guard let source = sources[key], clip.to <= source.duration else { return nil }
-            if checked.insert(source.id).inserted, !Self.currentSource(source.media) { return nil }
+            guard let source = sources[key], canReuseUnresolved(source) else { return nil }
+            if let indexed = source.indexed {
+                guard clip.to <= indexed.duration else { return nil }
+                let status = mediaStatus(for: source.url)
+                if status != .offline, status != .checking, status != .ignored,
+                   checked.insert(source.id).inserted, !Self.currentSource(indexed.media) { return nil }
+            }
             restored.append(EditorSegment(documentID: clip.id, source: source, start: clip.from, end: clip.to))
         }
         return restored
@@ -3253,9 +3717,17 @@ final class EditorModel: ObservableObject {
 
     private func captureMarkedQueueRange() throws -> QueuedRange {
         guard canReviseQueuedRange, let span = selectedSpan else { throw QueueEdit.noSelection }
+        return try captureQueueRange(span)
+    }
+
+    private func captureQueueRange(_ span: AudioSpan) throws -> QueuedRange {
         guard edit.participants.render == nil else { throw ParticipantProjectExport.unsupported("A queued range export") }
+        let selection = pieces(in: span)
+        if let issue = selection.lazy.compactMap({ self.mediaReviewIssue($0) }).first {
+            throw CutError(code: "source_needs_review", message: issue)
+        }
         if case .stillSequence = stillProject {
-            let project = try stillProjectForSelection()
+            let project = try stillProjectForRange(span)
             let scope = try project.exportPlacementScope()
             if scope != .none {
                 let clips = (project.sequenceClips ?? []).map {
@@ -3265,14 +3737,19 @@ final class EditorModel: ObservableObject {
                 if let reference = project.stillAudioReference {
                     files.insert(URL(fileURLWithPath: reference.file).standardizedFileURL)
                 }
-                let media = Self.tierInput(segments).media.filter { files.contains($0.key) }
+                var media = Self.tierInput(segments).media.filter { files.contains($0.key) }
+                if let soundtrack = stillProject.stillSoundtrack,
+                   (project.stillSoundtrack ?? project.stillAudioReference)?.file == soundtrack.file {
+                    let info = try indexedSoundtrack(for: soundtrack)
+                    media[info.url] = info
+                }
                 return QueuedRange(start: span.from, end: span.to, clips: clips,
-                                   media: media, stillProject: project, placements: scope)
+                                   media: media, stillProject: project, placements: scope,
+                                   pictureTiming: stillProject.stillSoundtrack == nil ? nil : .held)
             }
         }
-        let selection = pieces(in: span)
         guard !selection.isEmpty else { throw QueueEdit.noSelection }
-        let media = Dictionary(selection.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { first, _ in first })
+        let media = Self.mediaByURL(selection)
         return QueuedRange(start: span.from, end: span.to, clips: selection.map(\.request), media: media)
     }
 
@@ -3292,6 +3769,7 @@ final class EditorModel: ObservableObject {
         guard let index = queuedRanges.firstIndex(where: { $0.id == id }) else { throw QueueEdit.invalidTarget }
         let original = queuedRanges[index]
         var entry = try captureMarkedQueueRange()
+        try checkQueueDependencies(entry.mediaDependencies, status: mediaStatus)
         if extending {
             try QueueEdit.checkExtension(from: original.start, to: original.end, into: entry.start, through: entry.end)
         }
@@ -3301,6 +3779,28 @@ final class EditorModel: ObservableObject {
         invalidatedQueueIDs.remove(id)
         clearRangeMarks()
         statusMessage = "Updated the queued range."
+    }
+
+    func replanQueuedRange(_ id: UUID) throws {
+        guard !isBusyOutsideQueue else { throw QueueEdit.busy }
+        guard invalidatedQueueIDs.contains(id),
+              let index = queuedRanges.firstIndex(where: { $0.id == id }) else { throw QueueEdit.invalidTarget }
+        let original = queuedRanges[index]
+        if original.excerpt != nil {
+            guard self.canReviseQueuedRange else { throw QueueEdit.replanExcerpt }
+            try reviseQueuedRange(id, extending: false)
+            return
+        }
+        guard original.start >= .zero, original.start < original.end, original.end <= edit.duration else {
+            throw QueueEdit.replanBounds
+        }
+        var entry = try captureQueueRange(AudioSpan(from: original.start, to: original.end))
+        try checkQueueDependencies(entry.mediaDependencies, status: mediaStatus)
+        entry.id = id
+        entry.customName = original.name
+        queuedRanges[index] = entry
+        invalidatedQueueIDs.remove(id)
+        statusMessage = "Replanned the queued range."
     }
 
     func removeQueuedRange(_ id: UUID) {
@@ -3317,8 +3817,9 @@ final class EditorModel: ObservableObject {
 
     func bulkQueueDismissed() { resumePendingWork() }
 
-    func chooseBulkDestination(options: ExportSheetOptions) {
-        guard isBulkQueuePresented, !queuedRanges.isEmpty else { return }
+    func chooseBulkDestination(options: ExportSheetOptions, summary: String? = nil) {
+        guard isBulkQueuePresented, !readyQueuedRanges.isEmpty else { return }
+        let contentIDs = readyQueuedRanges.map(\.contentID)
         let panel = NSOpenPanel()
         panel.title = "Export Queued Ranges"
         panel.prompt = "Export Here"
@@ -3326,22 +3827,23 @@ final class EditorModel: ObservableObject {
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
         panel.directoryURL = exportDirectory
+        if let summary {
+            panel.accessoryView = multicamDeliveryAccessory(summary)
+            panel.isAccessoryViewDisclosed = true
+        }
         let currentSession = session
         ProjectPanels.present(panel, in: sheetWindow, fromSheet: true) { [weak self] accepted in
-            guard let self, self.session == currentSession, accepted, let directory = panel.url else { return }
+            guard let self, self.session == currentSession, accepted, let directory = panel.url,
+                  self.readyQueuedRanges.map(\.contentID) == contentIDs else { return }
             self.exportQueuedRanges(to: directory, options: options)
         }
     }
 
     func exportQueuedRanges(to directory: URL, options: ExportSheetOptions) {
-        guard isBulkQueuePresented, !queuedRanges.isEmpty else { return }
+        let ranges = readyQueuedRanges
+        guard isBulkQueuePresented, !ranges.isEmpty else { return }
         exportDirectory = directory
         isBulkQueuePresented = false
-        let ranges = queuedRanges
-        if let error = queuedMediaRefreshIssue() {
-            alert = EditorNotice(title: "Queued Media Changed", message: error.message)
-            return
-        }
         let protected = protectedMedia
         let useSidecar = useAnalysisSidecars
         runExport { token, progress in
@@ -3376,7 +3878,8 @@ final class EditorModel: ObservableObject {
     func stillReviewOccurrence(_ documentID: String) throws -> (id: UUID, source: UUID, media: MediaInfo) {
         let clip = try stillReviewSegment(documentID)
         if let issue = mediaReviewIssue(clip) { throw MCPCommandError("source_needs_review", issue) }
-        return (clip.id, clip.source.id, clip.source.media)
+        guard let media = clip.source.media else { throw MCPCommandError("source_needs_review", "Recording is offline.") }
+        return (clip.id, clip.source.id, media)
     }
 
     func refreshedSourceIssue(for clips: [CutSequenceClip]) -> String? {
@@ -3390,7 +3893,7 @@ final class EditorModel: ObservableObject {
     }
 
     var stillReviewCanvas: MediaInfo? {
-        segments.lazy.map { $0.source.media }.first(where: \.hasVideo)
+        segments.lazy.compactMap({ $0.source.media }).first(where: \.hasVideo)
     }
 
     var jpegSourceAtPlayhead: EditorJPEGSource? {
@@ -3399,11 +3902,12 @@ final class EditorModel: ObservableObject {
         let picture: RationalTime?
         if let (id, edge, cut) = trimAudition, let auditioned = segments.first(where: { $0.id == id }) {
             clip = auditioned
-            guard clip.source.media.hasVideo, mediaReviewIssue(clip) == nil else { return nil }
-            picture = try? JPEGExport.stillFrameTime(in: clip.source.media, at: cut, exclusiveEnd: edge == .end)
+            guard let media = clip.source.media, media.hasVideo, mediaReviewIssue(clip) == nil else { return nil }
+            picture = try? JPEGExport.stillFrameTime(in: media, at: cut, exclusiveEnd: edge == .end)
         } else if let (_, active, offset) = locatedSegment(at: playhead) {
             clip = active
-            let frames = clip.source.media.frames
+            guard let media = clip.source.media, media.hasVideo, mediaReviewIssue(clip) == nil else { return nil }
+            let frames = media.frames
             // Translate timestamps before comparing them to the display playhead. Rounding
             // a source-time Double after subtraction can move it across a frame boundary.
             func sequenceTime(_ sourceTime: RationalTime) -> Double {
@@ -3412,7 +3916,6 @@ final class EditorModel: ObservableObject {
                 return offset.seconds + (sourceTime.seconds - clip.start.seconds)
             }
             let index = frames.lowerBound { $0.time >= clip.end || sequenceTime($0.time) > playhead } - 1
-            guard clip.source.media.hasVideo, mediaReviewIssue(clip) == nil else { return nil }
             if frames.indices.contains(index), let frameEnd = try? frames[index].time.adding(frames[index].duration),
                playhead < sequenceTime(frameEnd) {
                 picture = max(.zero, frames[index].time)
@@ -3420,11 +3923,12 @@ final class EditorModel: ObservableObject {
                 picture = nil
             }
         } else {
-            guard playhead == duration, let last = segments.last, last.source.media.hasVideo else { return nil }
+            guard playhead == duration, let last = segments.last, let media = last.source.media,
+                  media.hasVideo, mediaReviewIssue(last) == nil else { return nil }
             clip = last
-            picture = try? JPEGExport.stillFrameTime(in: last.source.media, at: last.end, exclusiveEnd: true)
+            picture = try? JPEGExport.stillFrameTime(in: media, at: last.end, exclusiveEnd: true)
         }
-        let media = clip.source.media
+        guard let media = clip.source.media else { return nil }
         let tracks = media.streams.filter { $0.kind == "audio" }
         return EditorJPEGSource(id: clip.source.id, media: media, frame: picture, scenes: sceneReports[clip.source.id],
                                 audioStream: sourceAnalysisTracks[clip.source.id].map { tracks[$0].index },
@@ -3583,8 +4087,8 @@ final class EditorModel: ObservableObject {
     }
 
     private var replacementSource: IndexedSource? {
-        guard let index = selectedClipIndex else { return nil }
-        let source = segments[index].source
+        guard let index = selectedClipIndex, mediaReviewIssue(segments[index]) == nil,
+              let source = segments[index].source.indexed else { return nil }
         return source.media.streams.contains { $0.kind == "audio" } ? source : nil
     }
 
@@ -3596,7 +4100,8 @@ final class EditorModel: ObservableObject {
     }
 
     func chooseReplacementAudio(forClip id: UUID) {
-        guard canEdit, let source = segments.first(where: { $0.id == id })?.source else { return }
+        guard canEdit, let clip = segments.first(where: { $0.id == id }), mediaReviewIssue(clip) == nil,
+              let source = clip.source.indexed else { return }
         select(id)
         chooseReplacementAudio(for: source)
     }
@@ -3634,7 +4139,7 @@ final class EditorModel: ObservableObject {
         cancellation = token
         isCheckingEdit = true
         Task { [self] in
-            let inspection = await Task.detached(priority: .userInitiated) {
+            let inspection = await sidecarWork.detached(priority: .userInitiated) {
                 Result { try CutEngine(cancelled: { token.isCancelled }, useSidecar: useSidecar && !AnalysisSidecar.isExcluded(replacement, in: excluded)).inspectSummary(replacement) }
             }.value
             guard session == currentSession else { return }
@@ -3642,7 +4147,7 @@ final class EditorModel: ObservableObject {
             isCheckingEdit = false
             do {
                 let control = try ReplacementExportPanel(source: source.media, replacement: inspection.get(),
-                                                         sourceName: source.name, preferredTrack: monitoredAudioOrdinal(for: source) ?? 0, useSidecar: useSidecar, excludedSources: excluded)
+                                                         sourceName: source.name, preferredTrack: monitoredAudioOrdinal(for: .resolved(source)) ?? 0, useSidecar: useSidecar, excludedSources: excluded)
                 let panel = NSSavePanel()
                 panel.title = "Apply Replacement Audio"
                 panel.message = "Save a lossless copy with the new audio. Every cut of this source will use it."
@@ -3730,7 +4235,7 @@ final class EditorModel: ObservableObject {
                           completed: ((Result<Int, MCPCommandError>) -> Void)? = nil) -> EditCancellation? {
         // An analysis notice can arrive while the save panel is open.
         guard !isEmpty, !isBusy else { return nil }
-        guard let source = segments.lazy.map(\.source).first(where: {
+        guard let source = segments.lazy.compactMap({ $0.source.indexed }).first(where: {
             $0.url.standardizedFileURL == plan.source.standardizedFileURL && (sourceID == nil || $0.id == sourceID)
         }), source.media.identity == plan.sourceIdentity else {
             alert = EditorNotice(title: "Couldn’t Apply Replacement Audio",
@@ -3762,7 +4267,7 @@ final class EditorModel: ObservableObject {
         let gate = replacementTierGate(source: source, token: token)
         exportTasks[currentSession] = Task {
             defer { exportTasks.removeValue(forKey: currentSession) }
-            let exported = await Task.detached(priority: .userInitiated) {
+            let exported = await sidecarWork.detached(priority: .userInitiated) {
                 Result {
                     try AnalysisSidecar.$excludedSources.withValue(excluded) {
                         try AudioReplacementEngine(cancelled: { token.isCancelled }, useSidecar: useSidecar)
@@ -3785,7 +4290,7 @@ final class EditorModel: ObservableObject {
             case .success(let identity):
                 saved = true
                 exportProgress = 0.8
-                result = await Task.detached(priority: .userInitiated) {
+                result = await sidecarWork.detached(priority: .userInitiated) { [sidecarPreference] in
                     Result {
                         let media = try CutEngine(cancelled: { token.isCancelled }, useSidecar: useSidecar && !AnalysisSidecar.isExcluded(output, in: excluded))
                             .inspect(output, keyframes: true, expectedIdentity: identity) { _ = report(0.8 + $0 * 0.2) }
@@ -3796,7 +4301,7 @@ final class EditorModel: ObservableObject {
                         }
                         var names = source.replacementNames
                         names[plan.targetAudioOrdinal] = plan.replacement.lastPathComponent
-                        return IndexedSource(media: media, originalURL: source.originalURL,
+                        return IndexedSource(media: sidecarPreference.attachingDocument(to: media), originalURL: source.originalURL,
                                              replacementNames: names, replacementTrack: plan.targetAudioOrdinal)
                     }
                 }.value
@@ -3849,13 +4354,17 @@ final class EditorModel: ObservableObject {
         guard canEdit else { return }
         let project = transcriptProject
         let clips = segments.map(\.request)
-        let imported = Array(edit.preparation.sourceMedia.values)
+        let imported = interchangeIndexedMedia
+        let location = projectURL
         let name = clips.first?.file.deletingPathExtension().lastPathComponent ?? "Untitled"
         ResolveExportPanel.choose(name: name, in: editorWindow) { output, open in
             guard self.canExport(to: output) else { return }
+            let checkingVolumes = self.interchangeCheckingVolumes
             self.runExport { token, _ in
-                try ResolveExport.validateTimelineHandoff(project)
-                try ResolveExport.write(clips, to: output, matching: imported, cancelled: { token.isCancelled })
+                try ProjectMediaVolume.$checking.withValue(checkingVolumes) {
+                    try ResolveExport.write(project, relativeTo: location ?? output, to: output,
+                                            matching: imported, cancelled: { token.isCancelled })
+                }
                 if open { try ResolveExport.openInResolve(output, cancelled: { token.isCancelled }) }
                 return (output, "Exported \(output.lastPathComponent).")
             }
@@ -3877,6 +4386,10 @@ final class EditorModel: ObservableObject {
 
     private func chooseExport(mode: ExportMode?, candidate: [EditorSegment], selectionOnly: Bool) {
         guard canEdit else { return }
+        if let issue = candidate.compactMap(mediaReviewIssue).first {
+            alert = EditorNotice(title: "Media Needs Review", message: issue)
+            return
+        }
         if edit.participants.render != nil {
             if selectionOnly || (mode != nil && mode != .encode) {
                 let issue = selectionOnly ? ParticipantProjectExport.unsupported("A selection export")
@@ -3887,10 +4400,6 @@ final class EditorModel: ObservableObject {
             }
             return
         }
-        if let issue = candidate.compactMap(mediaReviewIssue).first {
-            alert = EditorNotice(title: "Media Needs Review", message: issue)
-            return
-        }
         if case .stillSequence = stillProject {
             do {
                 let project = selectionOnly ? try stillProjectForSelection() : stillProject
@@ -3898,17 +4407,32 @@ final class EditorModel: ObservableObject {
                 if scope != .none {
                     cancelTrim()
                     preview.pause()
-                    let source = candidate.first?.source.media ?? segments.first?.source.media
+                    let source = currentSoundtrackMedia ?? candidate.first?.source.media ?? segments.lazy.compactMap({ $0.source.media }).first
                     var options = exportOptions
                     options.placements = scope
                     options.tracks = .all
                     options.mode = mode ?? ExportRules.defaultStillMode(tracks: options.tracks, placements: scope, otherwise: defaultExportMode)
-                    if !ExportRules.stillMovieAudioActions.contains(options.audio) { options.audio = .copyOriginal }
+                    if stillProject.stillSoundtrack != nil || project.stillInserts.contains(where: \.usesExactDuration) {
+                        options.pictureTiming = options.pictureTiming ?? .held
+                    }
+                    if project.stillSoundtrack != nil || project.stillAudioReference?.audioTrack != nil {
+                        options.audio = .auto
+                    } else if !ExportRules.stillMovieAudioActions.contains(options.audio) {
+                        options.audio = .copyOriginal
+                    }
                     options.audioMode = .copy
+                    if project.stillSoundtrack != nil || project.stillAudioReference?.audioTrack != nil {
+                        options.convertAudio(to: .alac, preferred: "m4a")
+                    }
                     options.audioTrackOrdinal = nil
                     let preferred = project.stillFormat?.container ?? preferredCopyContainer
+                    options.codec = project.stillFormat?.codec ?? options.codec
                     options.copyContainer = preferred.flatMap { ExportRules.stillMovieContainers.contains($0) ? $0 : nil } ?? "mov"
                     let encode = ExportRules.stillContainers(mode: .encode, tracks: .all, codec: options.codec, audio: options.audio)
+                    if let format = project.stillFormat {
+                        options.encodeContainer = format.container
+                        options.proResContainer = format.container
+                    }
                     if !encode.contains(options.encodeContainer) { options.encodeContainer = encode.first ?? "mov" }
                     if !encode.contains(options.proResContainer) { options.proResContainer = encode.first ?? "mov" }
                     let containers = ExportContainerChoices(stillSource: source, cancelled: { false })
@@ -3918,23 +4442,26 @@ final class EditorModel: ObservableObject {
                 }
             } catch { showStillError(error); return }
         }
-        guard let first = candidate.first else { return }
+        guard let source = candidate.first?.source.media else { return }
         cancelTrim()
         preview.pause()
         let currentSession = session
         let token = EditCancellation()
         cancellation = token
         isCheckingEdit = true
-        let source = first.source.media
-        let preferred = preferredCopyContainer
+        let preferred = selectionOnly
+            ? explicitCopyContainer ?? CutEngine().suggestedContainers(for: source).first
+            : preferredCopyContainer
         let excluded = sidecarExclusions
         let useSidecar = useAnalysisSidecars
         // The whole timeline opens on the preferred mode unless its tier is lower, then on the tier's mode.
         // A selection is not the timeline, and a tier that is still being checked decides nothing.
-        let opening = openingExportMode(mode, selectionOnly: selectionOnly)
-        let media = Dictionary(candidate.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { first, _ in first })
+        let opening = selectionOnly
+            ? mode ?? ExportRules.openingMode(preferred: defaultExportMode, tier: nil, source: source.hasVideo ? .movie : .audio)
+            : openingExportMode(mode)
+        let media = Self.mediaByURL(candidate)
         Task {
-            let (choices, verified) = await Task.detached(priority: .userInitiated) {
+            let (choices, verified) = await sidecarWork.detached(priority: .userInitiated) {
                 AnalysisSidecar.$excludedSources.withValue(excluded) {
                     let clips = candidate.map(\.request)
                     let choices = ExportContainerChoices(source: source, clips: clips, preferred: preferred, cancelled: { token.isCancelled })
@@ -4020,15 +4547,25 @@ final class EditorModel: ObservableObject {
         panel.isExtensionHidden = false
         panel.directoryURL = exportDirectory
         panel.nameFieldStringValue = "\(stem) \(selectionOnly ? "Selection" : "Edit").\(options.container)"
-        var media = Dictionary(candidate.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { first, _ in first })
+        var media = Self.mediaByURL(candidate)
         if let reference = stillProject?.stillAudioReference,
-           let source = segments.first(where: { $0.source.url.path == reference.file })?.source {
+           let source = segments.lazy.compactMap({ $0.source.indexed }).first(where: { $0.url.path == reference.file }) {
             media[source.url] = source.media
         }
+        if let info = currentSoundtrackMedia,
+           (stillProject?.stillSoundtrack ?? stillProject?.stillAudioReference)?.file == info.url.path {
+            media[info.url] = info
+        }
+        let expectedSoundtrackIdentity = (stillProject?.stillSoundtrack).flatMap { try? self.expectedSoundtrackIdentity($0) }
         let currentSession = session
         let formatControl = ExportFormatControl(panel: panel, options: options, copyContainers: copyContainers,
                                                clips: candidate.map(\.request), media: media, useSidecar: useSidecar, excludedSources: sidecarExclusions,
                                                allowsApplyingReviewToTimeline: !selectionOnly, stillProject: stillProject,
+                                               expectedSoundtrackIdentity: expectedSoundtrackIdentity,
+                                               stillAudioIssue: { [weak self] tracks, audio in
+            guard let stillProject else { return nil }
+            return self?.stillSoundtrackExportIssue(in: stillProject, tracks: tracks, audio: audio)
+        },
                                                changed: { [weak self] options, explicitCopyContainer in
             guard let self, self.session == currentSession else { return }
             if stillProject == nil {
@@ -4061,7 +4598,7 @@ final class EditorModel: ObservableObject {
                     let result = saveResult ? try ExportResultFile(output: output, plan: plan.report, cutMap: plan.report.cutMap) : nil
                     try StillExportPlanner(useSidecar: useSidecar, cancelled: { token.isCancelled })
                         .write(plan, to: output, progress: progress)
-                    return (output, result?.completionMessage(for: output) ?? "Exported \(output.lastPathComponent).")
+                    return (output, ExportResultFile.stillCompletionMessage(for: output, result: result))
                 }
             } else if accepted, let output = panel.url, let plan = formatControl.selected {
                 self.exportDirectory = output.deletingLastPathComponent()
@@ -4078,7 +4615,7 @@ final class EditorModel: ObservableObject {
                   segment.source.url == range.file && segment.start == range.from && segment.end == range.to
               }) else { return }
         let proposed = zip(segments, review.revised).map { segment, range in
-            EditorSegment(id: segment.id, documentID: segment.documentID, source: segment.source, start: range.from ?? segment.start, end: range.to, displayRange: segment.displayRange, occurrence: segment.occurrence)
+            EditorSegment(id: segment.id, documentID: segment.documentID, source: segment.source, start: range.from ?? segment.start, end: range.to ?? segment.sourceExtent, displayRange: segment.displayRange, occurrence: segment.occurrence)
         }
         validate(proposed, selecting: selectedID, at: playhead, action: "Apply Reviewed Cuts")
     }
@@ -4119,6 +4656,9 @@ final class EditorModel: ObservableObject {
     }
 
     func endSession() {
+        projectMediaJobs.reset()
+        projectMediaRequest = nil
+        projectMediaPicture = []
         mediaRefresh.reset()
         mediaRefreshProgress = nil
         mediaRefreshWarnings = [:]
@@ -4145,6 +4685,12 @@ final class EditorModel: ObservableObject {
         mcpRevision = 0
         committedBeforeImport = nil
         savedMediaPaths = [:]
+        mediaSnapshot = .init()
+        mediaSnapshotChanged = false
+        mediaRelinkCancellation?.cancel()
+        mediaRelinkCancellation = nil
+        mediaRelinkProgress = nil
+        mediaRelinkIndexing.removeAll()
         lastSidecarPaths = []
         lastSidecarCandidates = []
         sidecarExclusions = []
@@ -4155,6 +4701,8 @@ final class EditorModel: ObservableObject {
         openingProjectURL = nil
         savedSequence = []
         savedStillSequence = nil
+        soundtrackMediaByURL.removeAll()
+        soundtrackIndexes.removeAll()
         savedParticipants = .init()
         stillTimelineIDs.removeAll()
         savedUndoIDs = []
@@ -4165,7 +4713,8 @@ final class EditorModel: ObservableObject {
         cancelTrim()
         usesPointerPosition = false
         filmstripTiles = FilmstripTileBuffer()
-        sidecarSaveToken?.cancel()
+        if !isFlushingDraftSidecars { sidecarSaveToken?.cancel() }
+        isFlushingDraftSidecars = false
         sidecarSaveToken = nil
         pendingMetadata.removeAll()
         isSavingSidecars = false
@@ -4237,9 +4786,8 @@ final class EditorModel: ObservableObject {
     }
 
     func thumbnail(for sourceID: UUID, at sourceTime: Double, size: CGSize) async -> CGImage? {
-        if let placementID = stillTimelineIDs.first(where: { $0.value == sourceID })?.key,
-           let card = inlineStills(in: stillProject).first(where: { $0.insert.id == placementID }),
-           let frame = try? stillProject.stillReviewFrame(placementID: placementID,
+        if let card = edit.inlineStillsByID[sourceID],
+           let frame = try? stillProject.stillReviewFrame(placementID: card.insert.id,
                                                           interval: MulticamRange(from: card.start, to: card.end),
                                                           document: projectURL, canvas: stillReviewCanvas) {
             let maximum = max(1, Int(min(max(size.width, size.height), 1_024)))
@@ -4252,6 +4800,7 @@ final class EditorModel: ObservableObject {
                 } onCancel: { work.cancel() }
             }
         }
+        guard segments.contains(where: { $0.source.id == sourceID && !mediaStatus(for: $0.source.url).hidesMedia }) else { return nil }
         if let draft = refreshFilmstrips[sourceID] {
             guard draft.media.identity.isCurrentSnapshot(at: draft.media.url),
                   sourceTime >= 0, sourceTime < draft.media.duration.seconds else { return nil }
@@ -4262,8 +4811,7 @@ final class EditorModel: ObservableObject {
                   draft.media.identity.isCurrentSnapshot(at: draft.media.url) else { return nil }
             return image
         }
-        guard let media = edit.preparation.sourceMedia[sourceID], media.hasVideo,
-              !offlineMedia.contains(media.url) else { return nil }
+        guard let media = edit.preparation.sourceMedia[sourceID], media.hasVideo else { return nil }
         let revision = refreshDisplayRevisions[sourceID]
         // The header used during provisional import can have a different presentation clock.
         let key = media.frames.isEmpty ? nil : FilmstripTileKey(time: sourceTime, size: size)
@@ -4287,8 +4835,12 @@ final class EditorModel: ObservableObject {
         let keepsLeading = marked.lowerBound > .zero
         let keepsTrailing = marked.upperBound < edit.duration
         func boundary(at index: Int, target: RationalTime, edge: TimelineEdge) -> RationalTime? {
-            if edge == .end ? pointerLower : pointerUpper { return target }
             let segment = segments[index]
+            if let issue = mediaReviewIssue(segment) {
+                alert = EditorNotice(title: "Can’t Delete Marked Range", message: issue)
+                return nil
+            }
+            if edge == .end ? pointerLower : pointerUpper { return target }
             switch effectiveSnapTarget {
             case .off: return target
             case .scenes, .silence:
@@ -4343,7 +4895,7 @@ final class EditorModel: ObservableObject {
                     // Preserve handles at the outside ends of a clip cut in two.
                     before[before.count - 1].displayRange = AudioSpan(from: min(left.start, segment.displayRange?.from ?? .zero),
                                                                       to: left.end)
-                    let rightDisplay = AudioSpan(from: cut, to: max(segment.end, segment.displayRange?.to ?? segment.source.duration))
+                    let rightDisplay = AudioSpan(from: cut, to: max(segment.end, segment.displayRange?.to ?? segment.sourceExtent))
                     after.append(EditorSegment(source: segment.source, start: cut, end: segment.end,
                                                displayRange: rightDisplay, occurrence: segment.occurrence))
                 } else {
@@ -4354,7 +4906,7 @@ final class EditorModel: ObservableObject {
             }
         }
         let proposed = before + after
-        if effectiveSnapTarget == .keyframes, !pointerLower, !pointerUpper, !proposed.isEmpty, let error = copyIssue(proposed) {
+        if effectiveSnapTarget == .keyframes, !pointerLower, !pointerUpper, !proposed.isEmpty, proposed.allSatisfy({ mediaReviewIssue($0) == nil }), let error = copyIssue(proposed) {
             alert = EditorNotice(title: "Can’t Delete Marked Range", message: copyMessage(error, in: proposed))
             return
         }
@@ -4391,8 +4943,8 @@ final class EditorModel: ObservableObject {
 
     private func isContinuousCopyRange(_ pieces: ArraySlice<EditorSegment>) -> Bool {
         if pieces.count == 1 { return true }
-        guard let first = pieces.first, let container = preferredCopyContainer,
-              CutEngine().coalescesAdjacentRanges(in: first.source.media, container: container) else { return false }
+        guard let media = pieces.first?.source.media, let container = preferredCopyContainer,
+              CutEngine().coalescesAdjacentRanges(in: media, container: container) else { return false }
         return zip(pieces, pieces.dropFirst()).allSatisfy {
             $0.source.id == $1.source.id && $0.end == $1.start
         }
@@ -4402,8 +4954,8 @@ final class EditorModel: ObservableObject {
         let segment = segments[index]
         let first = index == 0
         let last = index == segments.count - 1
-        guard let container = preferredCopyContainer,
-              CutEngine().coalescesAdjacentRanges(in: segment.source.media, container: container) else {
+        guard let media = segment.source.media, let container = preferredCopyContainer,
+              CutEngine().coalescesAdjacentRanges(in: media, container: container) else {
             return edge == .start ? boundaries.starts(first: first, last: last) : boundaries.ends(first: first, last: last)
         }
         var beginning = index
@@ -4438,7 +4990,8 @@ final class EditorModel: ObservableObject {
             return
         }
         let sources = edit.preparation.sourceMedia.filter { id, media in
-            copyBoundaryIndices[id] == nil && media.hasFullEditIndex && media.indexStorageBytes >= PreparedEdit.backgroundCopyCheckBytes
+            !edit.preparation.unavailableSourceIDs.contains(id) && copyBoundaryIndices[id] == nil
+                && media.hasFullEditIndex && media.indexStorageBytes >= PreparedEdit.backgroundCopyCheckBytes
         }
         guard !sources.isEmpty else {
             isPreparingCopyBoundaries = false
@@ -4467,20 +5020,23 @@ final class EditorModel: ObservableObject {
         }
     }
 
-    private func copyBoundaries(for source: IndexedSource) -> BoundaryIndex? {
+    private func copyBoundaries(for source: EditorSource) -> BoundaryIndex? {
+        guard let media = source.media else { return nil }
         guard let container = preferredCopyContainer else { return nil }
         if let cached = copyBoundaryIndices[source.id] { return cached }
-        if isPreparingCopyBoundaries || (isImporting && source.media.indexStorageBytes >= PreparedEdit.backgroundCopyCheckBytes) { return nil }
-        let index = try? BoundaryIndex(media: source.media, container: container, engine: CutEngine())
+        if isPreparingCopyBoundaries || (isImporting && media.indexStorageBytes >= PreparedEdit.backgroundCopyCheckBytes) { return nil }
+        let index = try? BoundaryIndex(media: media, container: container, engine: CutEngine())
         copyBoundaryIndices[source.id] = index
         return index
     }
 
     private func copyIssue(_ proposed: [EditorSegment]) -> CutError? {
-        Self.copyIssue(proposed, container: preferredCopyContainer, engine: CutEngine())
+        guard !proposed.contains(where: { edit.preparation.unavailableSourceIDs.contains($0.source.id) }) else { return nil }
+        return Self.copyIssue(proposed, container: preferredCopyContainer, engine: CutEngine())
     }
 
     private nonisolated static func copyIssue(_ proposed: [EditorSegment], container: String?, engine: CutEngine) -> CutError? {
+        if proposed.contains(where: { $0.source.unresolved != nil }) { return nil }
         guard let container else {
             return CutError(code: "unsupported_container", message: "No copy container is available for this source.")
         }
@@ -4504,13 +5060,13 @@ final class EditorModel: ObservableObject {
               let field = issue.boundary, field == "from" || field == "to" else { return false }
         let index = number - 1
         let segment = proposed[index]
+        guard let media = segment.source.media else { return true }
         let failedEdge: TimelineEdge = field == "from" ? .start : .end
         if segment.id == id && failedEdge == edge { return false }
         let neighbor = failedEdge == .start ? index - 1 : index + 1
         if proposed.indices.contains(neighbor), proposed[neighbor].id == id, edge != failedEdge,
            proposed[neighbor].source.id == segment.source.id, let container,
-           CutEngine().coalescesAdjacentRanges(in: segment.source.media, container: container) { return false }
-        let media = segment.source.media
+           CutEngine().coalescesAdjacentRanges(in: media, container: container) { return false }
         let time = failedEdge == .start ? segment.start : segment.end
         if time == .zero { return failedEdge == .start && !media.sourceStartSafe }
         if time == media.duration { return false }
@@ -4551,7 +5107,7 @@ final class EditorModel: ObservableObject {
 
     private func nearestCopyPictureBoundary(in segment: EditorSegment, to target: Double,
                                             edge: TimelineEdge) -> RationalTime? {
-        let media = segment.source.media
+        guard let media = segment.source.media else { return nil }
         var candidates: [RationalTime] = edge == .start && media.sourceStartSafe ? [.zero] : []
         candidates += media.frames.compactMap { frame in
             guard frame.time > .zero, frame.time < media.duration else { return nil }
@@ -4565,9 +5121,9 @@ final class EditorModel: ObservableObject {
 
     private func linkedAudioIssue(for segment: EditorSegment, at boundary: RationalTime, edge: TimelineEdge,
                                   first: Bool, last: Bool) -> CutError? {
-        guard let container = preferredCopyContainer,
+        guard let media = segment.source.media, let container = preferredCopyContainer,
               boundary != (edge == .start ? segment.start : segment.end) else { return nil }
-        return CutEngine().linkedAudioBoundaryIssue(in: segment.source.media, at: boundary,
+        return CutEngine().linkedAudioBoundaryIssue(in: media, at: boundary,
                                                     start: edge == .start, first: first, last: last, container: container)
     }
 
@@ -4619,7 +5175,7 @@ final class EditorModel: ObservableObject {
             return true
         }
         exportTasks[currentSession] = Task {
-            let result = await Task.detached(priority: .userInitiated) {
+            let result = await sidecarWork.detached(priority: .userInitiated) {
                 Result {
                     try AnalysisSidecar.$excludedSources.withValue(excluded) {
                         try AnalysisSidecar.$readsEnabled.withValue(useSidecar) { try work(token, reportProgress) }
@@ -4655,7 +5211,7 @@ final class EditorModel: ObservableObject {
         cancelTrim()
         preview.pause()
         let original = originalPlayhead ?? playhead
-        guard proposed.allSatisfy({ $0.start >= .zero && $0.start < $0.end && $0.end <= $0.source.duration }) else {
+        guard proposed.allSatisfy({ $0.start >= .zero && $0.start < $0.end && $0.end <= $0.sourceExtent }) else {
             restorePreview(at: original)
             alert = EditorNotice(title: "Couldn’t \(action)", message: "Keep a nonempty range within each source.")
             return false
@@ -4682,7 +5238,10 @@ final class EditorModel: ObservableObject {
 
     private nonisolated static func resolve(_ segments: [EditorSegment], engine: CutEngine,
                                            container: String? = nil) throws -> ResolvedEdit {
-        let media = Dictionary(segments.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { first, _ in first })
+        let media = Self.mediaByURL(segments)
+        if let clip = segments.first(where: { $0.source.media == nil }) {
+            throw CutError(code: "source_needs_review", message: "\(clip.source.name) — open Project Media to review this recording.")
+        }
         return try engine.resolve(segments.map(\.request), media: media, container: container)
     }
 
@@ -4692,6 +5251,7 @@ final class EditorModel: ObservableObject {
                        historySnapshot: EditSnapshot? = nil, preservePreview: Bool = false, replacementTrack: Int? = nil,
                        preserveMarks: Bool = false, restoringAudioMonitoring: AudioMonitoring? = nil,
                        sequenceProject: CutProject? = nil) -> Bool {
+        let prepared = preparedForMediaAvailability(proposed, using: prepared)
         var duration = RationalTime.zero
         var offsets: [RationalTime] = []
         offsets.reserveCapacity(proposed.count)
@@ -4709,11 +5269,12 @@ final class EditorModel: ObservableObject {
         do {
             try stillPresentation?.validate()
             if let stillPresentation, !stillPresentation.stillReplacements.isEmpty {
-                let extents = Dictionary(uniqueKeysWithValues: proposed.map { ($0.documentID, $0.source.duration) })
+                let sources = Dictionary(uniqueKeysWithValues: proposed.map { ($0.documentID, $0) })
                 for placement in stillPresentation.stillReplacements {
                     guard case .sequence(let fragments) = placement.coverage else { continue }
                     for fragment in fragments {
-                        guard let extent = extents[fragment.clipID], fragment.range.to <= extent else {
+                        guard let source = sources[fragment.clipID],
+                              source.source.unresolved != nil || fragment.range.to <= source.sourceExtent else {
                             throw CutError(code: "invalid_still_target",
                                            message: "Placement \(placement.id) extends beyond source clip \(fragment.clipID).")
                         }
@@ -4753,7 +5314,7 @@ final class EditorModel: ObservableObject {
             let segment = proposed[index]
             var clip = segment.timeline(sequenceRange: offsets[index].seconds..<end.seconds)
             clip.mediaRevision = refreshDisplayRevisions[segment.source.id] ?? 0
-            clip.mediaIssue = mediaReviewIssue(segment)
+            applyMediaPresentation(segment, to: &clip)
             return clip
         }
         mediaClipReview = Dictionary(uniqueKeysWithValues: clips.compactMap { clip in
@@ -4790,8 +5351,13 @@ final class EditorModel: ObservableObject {
 
     // MARK: Timeline tier
 
+    private nonisolated static func mediaByURL(_ segments: [EditorSegment]) -> [URL: MediaInfo] {
+        Dictionary(segments.compactMap { clip in clip.source.media.map { (clip.source.url, $0) } },
+                   uniquingKeysWith: { first, _ in first })
+    }
+
     private nonisolated static func tierInput(_ segments: [EditorSegment]) -> (clips: [ClipRequest], media: [URL: MediaInfo]) {
-        (segments.map(\.request), Dictionary(segments.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { first, _ in first }))
+        (segments.filter { $0.source.media != nil }.map(\.request), Self.mediaByURL(segments))
     }
 
     /// The source ranges of a timeline with joined ranges of one source written as one, for comparing two timelines.
@@ -4821,6 +5387,11 @@ final class EditorModel: ObservableObject {
             if tierState != nil { tierState = nil }
             return
         }
+        if let issue = segments.compactMap(mediaReviewIssue).first {
+            tierIsCurrent = true
+            tierState = .unavailable(CutError(code: "source_needs_review", message: issue))
+            return
+        }
         let input = Self.tierInput(segments)
         let evaluator = tierEvaluator
         // The badge names the container the export sheet opens on: the preferred one when the timeline verifies in it.
@@ -4838,7 +5409,7 @@ final class EditorModel: ObservableObject {
         let useSidecar = useAnalysisSidecars
         let excluded = sidecarExclusions
         Task {
-            let state = await Task.detached(priority: .utility) {
+            let state = await sidecarWork.detached(priority: .utility) {
                 if project.participants.render != nil {
                     return ParticipantProjectExport.tier(project, preferredContainer: preferred, cancelled: { token.isCancelled })
                 }
@@ -4904,7 +5475,8 @@ final class EditorModel: ObservableObject {
                              decide: @escaping ([EditorSegment]?) -> Void) {
         // A timeline that already has no tier cannot go lower.
         let hasNoTier = tierIsCurrent && tierState != nil && tierState?.tier == nil && current.map(\.id) == segments.map(\.id)
-        guard asksBeforeLoweringTier, preferences.warnBeforeLoweringExportTier, !current.isEmpty, !proposed.isEmpty, !hasNoTier else {
+        guard asksBeforeLoweringTier, preferences.warnBeforeLoweringExportTier, !current.isEmpty, !proposed.isEmpty, !hasNoTier,
+              current.allSatisfy({ mediaReviewIssue($0) == nil }), proposed.allSatisfy({ mediaReviewIssue($0) == nil }) else {
             decide(proposed)
             return
         }
@@ -4990,7 +5562,7 @@ final class EditorModel: ObservableObject {
         cancellation = token
         isCheckingEdit = true
         Task {
-            let prompt = await Task.detached(priority: .userInitiated) { work({ token.isCancelled }) }.value
+            let prompt = await sidecarWork.detached(priority: .userInitiated) { work({ token.isCancelled }) }.value
             guard session == currentSession else { abandoned?(); return }
             if cancellation === token { cancellation = previous }
             isCheckingEdit = wasChecking
@@ -5001,7 +5573,7 @@ final class EditorModel: ObservableObject {
     }
 
     private var hasUnsavedDocumentChanges: Bool {
-        recoveredDraft || transcriptState != savedTranscriptState || edit.participants != savedParticipants ||
+        recoveredDraft || mediaSnapshotChanged || transcriptState != savedTranscriptState || edit.participants != savedParticipants ||
             (committedBeforeImport.map { project in
                 var timeline = project
                 timeline.transcripts = .init()
@@ -5016,6 +5588,7 @@ final class EditorModel: ObservableObject {
     }
 
     private func updateStatus() {
+        updateMediaWatcher()
         let changed = hasUnsavedDocumentChanges
         if isProjectChanged != changed { isProjectChanged = changed }
         lastExportedURL = nil
@@ -5037,7 +5610,27 @@ final class EditorModel: ObservableObject {
         preview.pause()
         playhead = min(max(0, time), duration)
         preview.update(segments.map(monitoredPreview), at: playhead, project: stillProject,
-                       reference: segments.first(where: { $0.source.media.hasVideo })?.source.media)
+                       reference: edit.preparation.firstMedia.flatMap { $0.hasVideo ? $0 : nil },
+                       soundtrack: stillSoundtrackPreview)
+    }
+
+    private var stillSoundtrackMapping: StillSoundtrackMapping? {
+        try? stillProject.stillSoundtrackMapping(in: MulticamRange(from: .zero, to: edit.duration))
+    }
+
+    private var stillSoundtrackPreview: PreviewRange? {
+        guard let mapping = stillSoundtrackMapping, let media = currentSoundtrackMedia else { return nil }
+        var range = PreviewRange(media: media, from: mapping.source.from, to: mapping.source.to)
+        range.audioTrack = mapping.clip.audioTrack
+        range.audioOrigin = media.origin
+        range.readerRevision = media.identity.hashValue
+        return range
+    }
+
+    var stillSoundtrackWaveform: TimelineSoundtrack? {
+        guard let mapping = stillSoundtrackMapping else { return nil }
+        let fullEnd = (try? mapping.clip.to.subtracting(mapping.clip.from)) ?? mapping.output.to
+        return TimelineSoundtrack(id: stillSoundtrackWaveformID, source: mapping.source, output: mapping.output, fullProgramEnd: fullEnd)
     }
 
     private func monitoredPreview(_ segment: EditorSegment) -> PreviewRange {
@@ -5078,6 +5671,10 @@ final class EditorModel: ObservableObject {
         }
         guard let (_, segment, offset) = locatedSegment(at: time) else { return edit.duration }
         if time == offset.seconds { return offset }
+        if mediaReviewIssue(segment) != nil {
+            let end = offset + segment.duration
+            return time - offset.seconds < end.seconds - time ? offset : end
+        }
         let target = time - offset.seconds + segment.start.seconds
         let boundary: RationalTime
         switch (pointer ?? usesPointerPosition) ? .off : effectiveSnapTarget {
@@ -5085,7 +5682,7 @@ final class EditorModel: ObservableObject {
             boundary = editBoundary(in: segment.source, to: target) ?? segment.start
         case .keyframes:
             let keys = segment.source.keyframes
-            let points = (0..<(keys.count + 1)).lazy.map { $0 == keys.count ? segment.source.duration : keys[$0] }
+            let points = (0..<(keys.count + 1)).lazy.map { $0 == keys.count ? segment.sourceExtent : keys[$0] }
             guard let point = nearest(in: points, to: target, after: segment.start, before: segment.end,
                                       includingLimits: true) else {
                 alert = EditorNotice(title: "Can’t Set Mark", message: "There is no keyframe within this clip’s kept range.")
@@ -5125,6 +5722,7 @@ final class EditorModel: ObservableObject {
     /// Binary-search the ordered report directly, including during handle drags on long recordings.
     private func analysisBoundary(in clip: EditorSegment, to target: Double, after minimum: RationalTime? = nil,
                                   before maximum: RationalTime? = nil, includingLimits: Bool = false) -> RationalTime? {
+        guard mediaReviewIssue(clip) == nil else { return nil }
         let source = clip.source
         if snapTarget == .scenes {
             if let report = sceneRangeReports[ClipSceneRange(clip)] {
@@ -5133,7 +5731,7 @@ final class EditorModel: ObservableObject {
             }
             guard let report = sceneReports[source.id] else { return nil }
             let boundaries = (0..<(report.scenes.count + 1)).lazy.map { index in
-                index == report.scenes.count ? source.duration : report.scenes[index].start
+                index == report.scenes.count ? clip.sourceExtent : report.scenes[index].start
             }
             return nearest(in: boundaries, to: target, after: minimum, before: maximum, includingLimits: includingLimits)
         }
@@ -5146,14 +5744,15 @@ final class EditorModel: ObservableObject {
         return nearest(in: boundaries, to: target, after: minimum, before: maximum, includingLimits: includingLimits)
     }
 
-    private func editBoundary(in source: IndexedSource, to target: Double, after minimum: RationalTime? = nil,
+    private func editBoundary(in source: EditorSource, to target: Double, after minimum: RationalTime? = nil,
                               before maximum: RationalTime? = nil) -> RationalTime? {
-        if source.media.hasVideo {
+        guard let media = source.media else { return nil }
+        if media.hasVideo {
             return nearest(in: source.frameBoundaries, to: target, after: minimum, before: maximum)
         }
-        var cut = source.media.audioEditBoundary(near: target)
-        if let minimum, cut <= minimum { cut = source.media.steppingAudioBoundary(from: minimum.seconds, direction: 1) }
-        if let maximum, cut >= maximum { cut = source.media.steppingAudioBoundary(from: maximum.seconds, direction: -1) }
+        var cut = media.audioEditBoundary(near: target)
+        if let minimum, cut <= minimum { cut = media.steppingAudioBoundary(from: minimum.seconds, direction: 1) }
+        if let maximum, cut >= maximum { cut = media.steppingAudioBoundary(from: maximum.seconds, direction: -1) }
         guard minimum.map({ cut > $0 }) ?? true, maximum.map({ cut < $0 }) ?? true else { return nil }
         return cut
     }
@@ -5188,8 +5787,9 @@ final class EditorModel: ObservableObject {
     }
 
     private func precedingFrame(in segment: EditorSegment, before time: RationalTime) -> RationalTime {
-        if !segment.source.media.hasVideo {
-            return max(segment.start, segment.source.media.steppingAudioBoundary(from: time.seconds, direction: -1))
+        guard let media = segment.source.media, mediaReviewIssue(segment) == nil else { return segment.start }
+        if !media.hasVideo {
+            return max(segment.start, media.steppingAudioBoundary(from: time.seconds, direction: -1))
         }
         let frames = segment.source.frames
         let index = frames.lowerBound { $0 >= time } - 1
@@ -5256,7 +5856,7 @@ struct CutPreview: Identifiable {
 }
 
 extension EditorModel {
-    private func monitoredAudioOrdinal(for source: IndexedSource) -> Int? {
+    private func monitoredAudioOrdinal(for source: EditorSource) -> Int? {
         switch audioMonitoring {
         case .followSource: return source.audioOrdinal(preferred: source.replacementTrack ?? 0)
         case .track(let ordinal): return source.audioOrdinal(preferred: ordinal)
@@ -5270,7 +5870,8 @@ extension EditorModel {
         var ordinals: [UUID: Int] = [:]
         for clip in segments where clip.source.isIndexed && mediaReviewIssue(clip) == nil && sources[clip.source.id] == nil {
             let source = clip.source
-            sources[source.id] = source.media
+            guard let media = source.media else { continue }
+            sources[source.id] = media
             ordinals[source.id] = monitoredAudioOrdinal(for: source)
         }
         let changed = Set(ordinals.keys.filter { ordinals[$0] != sourceAnalysisTracks[$0] })
@@ -5282,17 +5883,23 @@ extension EditorModel {
         if nextSources != activeAudioSources { invalidateMCPSilenceReceipt() }
         activeAudioSources = nextSources
         let opening = segments.first.flatMap { clip -> (UUID, MediaInfo, Int)? in
-            guard !clip.source.isIndexed, clip.source.media.hasVideo,
+            guard !clip.source.isIndexed, let media = clip.source.media, media.hasVideo,
                   let ordinal = monitoredAudioOrdinal(for: clip.source) else { return nil }
-            return (clip.source.id, clip.source.media, ordinal)
+            return (clip.source.id, media, ordinal)
         }
-        audioStore.update(sources: silenceMedia, track: 0, sourceTracks: ordinals, useSidecar: useAnalysisSidecars,
+        var waveformSources = silenceMedia
+        if let media = currentSoundtrackMedia, let soundtrack = stillProject.stillSoundtrack {
+            waveformSources[stillSoundtrackWaveformID] = media
+            ordinals[stillSoundtrackWaveformID] = soundtrack.audioTrack ?? 0
+        }
+        audioStore.update(sources: waveformSources, track: 0, sourceTracks: ordinals, useSidecar: useAnalysisSidecars,
                           excludedSources: sidecarExclusions, opening: opening)
         refreshDetectedPauses(invalidating: invalidatingPauses ? nextSources : changed)
     }
 
-    private var playheadAudioSource: IndexedSource? {
-        locatedSegment(at: playhead)?.1.source ?? segments.last?.source
+    private var playheadAudioSource: EditorSource? {
+        guard let clip = locatedSegment(at: playhead)?.1 ?? segments.last, mediaReviewIssue(clip) == nil else { return nil }
+        return clip.source
     }
 
     var playheadAnalysisTrack: Int { playheadAudioSource.flatMap(monitoredAudioOrdinal) ?? 0 }
@@ -5413,6 +6020,7 @@ extension EditorModel {
                 continue
             }
             let persist = sidecarPreference.permits(media.url)
+            let media = persist ? media.pinningSidecarWrites() : media
             let readSaved = !rescan && persist && checkedSilenceSidecars.insert(id).inserted
             let wave = audioStore.finished.contains(id) ? audioStore.waves[id] : nil
             let calibrated = automaticThresholds[id]
@@ -5420,7 +6028,7 @@ extension EditorModel {
             guard readSaved || (wave != nil && (requested || calibrated == nil)) else { continue }
             // This job restores saved results even before the waveform has arrived.
             // Fresh detection shares the waveform decoder and runs only on request.
-            let worker = Task.detached(priority: .utility) { [sidecarPreference] () throws -> (Double?, SilenceAnalysisResult?) in
+            let worker = sidecarWork.detached(priority: .utility) { [sidecarPreference] () throws -> (Double?, SilenceAnalysisResult?) in
                 let skipSidecar = { @Sendable in Task.isCancelled || !sidecarPreference.permits(media.url) }
                 var level = calibrated
                 if readSaved {
@@ -5521,18 +6129,19 @@ extension EditorModel {
             guard let end = try? offset.adding(clip.duration) else { continue }
             guard let lower = try? clip.start.adding(max(scope.from, offset).subtracting(offset)),
                   let upper = try? clip.end.subtracting(end.subtracting(min(scope.to, end))) else { continue }
-            guard lower < upper, clip.source.isIndexed, let pauses = sourcePauses[clip.source.id] else { continue }
+            guard lower < upper, let media = clip.source.media, mediaReviewIssue(clip) == nil,
+                  clip.source.isIndexed, let pauses = sourcePauses[clip.source.id] else { continue }
             let bounds = effectiveSnapTarget == .keyframes ? copyBoundaries(for: clip.source) : nil
             let fullClip = AudioSpan(from: clip.start, to: clip.end)
             var local: [(key: TimelinePause.Key, span: AudioSpan, cut: AudioSpan?, keep: Bool, padding: Double)] = []
             let source = TimelinePause.Source(occurrence: clip.occurrence, track: sourceAnalysisTracks[clip.source.id] ?? analysisTrack)
             let protected = protectedPauses[source] ?? []
             if authoredProtections[clip.source.id] == nil {
-                let audio = clip.source.media.audio
+                let audio = media.audio
                 authoredProtections[clip.source.id] = !transcriptProtections.isEmpty && audio.indices.contains(source.track)
-                    ? transcriptProtections.sequence(file: clip.source.media.url.path, origin: clip.source.media.multicamSourceOffset,
+                    ? transcriptProtections.sequence(file: media.url.path, origin: media.multicamSourceOffset,
                                                      stream: audio[source.track].stream.index,
-                                                     sourceFingerprint: clip.source.media.identity.transcriptFingerprint)
+                                                     sourceFingerprint: media.identity.transcriptFingerprint)
                     : []
             }
             let authored = authoredProtections[clip.source.id] ?? []
@@ -5550,8 +6159,8 @@ extension EditorModel {
                 let isExterior = padding == 0 && (span.from == clip.start || span.to == clip.end)
                 var cut: AudioSpan?
                 if !keep && !(effectiveSnapTarget == .keyframes && isExterior) {
-                    if !clip.source.media.hasVideo {
-                        cut = AudioAnalysis.audioRemoval(in: span, padding: padding, media: clip.source.media, clip: fullClip)
+                    if !media.hasVideo {
+                        cut = AudioAnalysis.audioRemoval(in: span, padding: padding, media: media, clip: fullClip)
                     } else {
                         let ends = effectiveSnapTarget == .keyframes ? bounds?.interiorEnds ?? [] : clip.source.frameBoundaries
                         let starts = effectiveSnapTarget == .keyframes ? bounds?.interiorStarts ?? [] : clip.source.frameBoundaries
@@ -5862,7 +6471,7 @@ extension EditorModel {
            candidate.range.from < exact, exact < candidate.range.to {
             return insertTakeBoundary(boundary, for: id)
         }
-        guard let (_, clip, offset) = locatedSegment(at: position), clip.source.isIndexed else { return false }
+        guard let (_, clip, offset) = locatedSegment(at: position), clip.source.isIndexed, mediaReviewIssue(clip) == nil else { return false }
         let target = position - offset.seconds + clip.start.seconds
         let lower = max(offset, candidate.range.from)
         guard let minimum = try? clip.start.adding(lower.subtracting(offset)),
@@ -5870,7 +6479,7 @@ extension EditorModel {
         let boundary: RationalTime?
         if position == offset.seconds {
             boundary = clip.start
-        } else if effectiveSnapTarget == .keyframes && clip.source.media.hasVideo {
+        } else if effectiveSnapTarget == .keyframes && clip.source.media?.hasVideo == true {
             boundary = nearest(in: clip.source.keyframes, to: target, after: minimum, before: min(upper, clip.end))
         } else {
             boundary = editBoundary(in: clip.source, to: target, after: minimum, before: min(upper, clip.end))
@@ -5915,7 +6524,7 @@ extension EditorModel {
         if queueTakes {
             do {
                 let takes = try zip(ranges, clips).map { range, clips in
-                    var media = Dictionary(clips.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { first, _ in first })
+                    var media = Self.mediaByURL(clips)
                     var project: CutProject?
                     var placements: ExportPlacementScope = .none
                     if edit.stillSequence != nil {
@@ -5924,7 +6533,7 @@ extension EditorModel {
                         if placements != .none {
                             project = snapshot
                             if let reference = snapshot.stillAudioReference,
-                               let source = segments.first(where: { $0.documentID == reference.id })?.source {
+                               let source = segments.first(where: { $0.documentID == reference.id })?.source.indexed {
                                 media[source.url] = source.media
                             }
                         }
@@ -5963,6 +6572,17 @@ extension EditorModel {
 }
 
 extension EditorModel {
+    func validateMCPInterchange() throws {
+        guard !mcpHasActiveTrim else { throw MCPCommandError("busy", "Finish the pending edit before exporting.") }
+        for segment in segments where segment.source.unresolved == nil {
+            let status = mediaStatus(for: segment.source.url)
+            guard status != .checking, status != .offline, status != .ignored else { continue }
+            if let issue = mediaReviewIssue(segment) {
+                throw MCPCommandError("source_needs_review", issue)
+            }
+        }
+    }
+
     /// Capture the very same occurrence pieces and indexed sources as the native export sheet.
     func mcpExportInput(selection: Bool) throws -> (clips: [ClipRequest], media: [URL: MediaInfo], occurrenceIDs: [String?]) {
         guard canEdit, !mcpHasActiveTrim else { throw MCPCommandError("busy", "Finish the pending edit or import first.") }
@@ -5973,7 +6593,7 @@ extension EditorModel {
         } else { items = segments }
         guard !items.isEmpty else { throw MCPCommandError("empty_edit", "Add media before exporting.") }
         if let issue = items.compactMap(mediaReviewIssue).first { throw MCPCommandError("source_needs_review", issue) }
-        return (items.map(\.request), Dictionary(items.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { a, _ in a }),
+        return (items.map(\.request), Self.mediaByURL(items),
                 items.map(\.documentID))
     }
 
@@ -5995,18 +6615,27 @@ extension EditorModel {
     }
 
     func mcpReplacementSource(_ clipID: UUID) throws -> (UUID, MediaInfo) {
-        guard let source = segments.first(where: { $0.id == clipID })?.source else {
+        guard let clip = segments.first(where: { $0.id == clipID }) else {
             throw MCPCommandError("invalid_target", "Choose an existing clip occurrence.")
         }
-        return (source.id, source.media)
+        if let issue = mediaReviewIssue(clip) { throw MCPCommandError("source_needs_review", issue) }
+        guard let media = clip.source.media else { throw MCPCommandError("source_needs_review", "Recording is offline.") }
+        return (clip.source.id, media)
     }
 }
 
 extension EditorModel {
-    private struct InlineStill {
-        var insert: StillInsert
-        var start: RationalTime
-        var end: RationalTime
+    func projectMediaUseID(for id: UUID) -> String? {
+        segments.first(where: { $0.id == id })?.documentID ?? edit.inlineStillsByID[id]?.insert.id
+    }
+
+    var projectMediaPreviewURL: URL? {
+        let time = playhead >= duration ? max(0, playhead.nextDown) : playhead
+        let index = projectMediaPicture.lowerBound { $0.interval.to.seconds > time }
+        if projectMediaPicture.indices.contains(index), projectMediaPicture[index].interval.from.seconds <= time {
+            return projectMediaPicture[index].url
+        }
+        return locatedSegment(at: time)?.1.source.url
     }
 
     private func inlineStills(in project: CutProject) -> [InlineStill] {
@@ -6052,7 +6681,7 @@ extension EditorModel {
 
     var stillCadence: RationalTime? {
         if let cadence = stillProject.stillFormat?.cadence { return cadence }
-        guard let reference = segments.first(where: { $0.source.media.hasVideo })?.source.media,
+        guard let reference = segments.lazy.compactMap({ $0.source.media }).first(where: \.hasVideo),
               let rate = reference.videoStream?.frameRate, rate > .zero else { return nil }
         let cadence = RationalTime(numerator: rate.denominator, denominator: rate.numerator)
         // A nominal rate also exists on variable-rate material. Require equal
@@ -6074,15 +6703,28 @@ extension EditorModel {
         var timeline = project
         timeline.transcripts = .init()
         timeline.participants = .init()
+        projectMediaPicture = []
         guard case .stillSequence(let sequence) = timeline else {
+            edit.inlineStillsByID.removeAll()
             edit.stillSequence = nil
             return
         }
         edit.stillSequence = sequence
+        loadSoundtrackIfNeeded()
+        var cards: [UUID: InlineStill] = [:]
         var clips: [TimelineClip] = []
         var offsets: [RationalTime] = []
         let segmentsByID = Dictionary(uniqueKeysWithValues: segments.map { ($0.documentID, $0) })
         let assets = Dictionary(uniqueKeysWithValues: sequence.stillAssets.map { ($0.id, $0) })
+        if !assets.isEmpty, let plan = try? timeline.resolveStills() {
+            let ids = Dictionary(uniqueKeysWithValues:
+                sequence.stillReplacements.map { ($0.id, $0.assetID) } +
+                timeline.stillInserts.map { ($0.id, $0.assetID) })
+            projectMediaPicture = plan.spans.compactMap { span in
+                guard let placement = span.placementID, let id = ids[placement], let asset = assets[id] else { return nil }
+                return (span.output, asset.isGap ? nil : URL(fileURLWithPath: asset.file))
+            }
+        }
         var cursor = RationalTime.zero
         for item in sequence.items {
             switch item {
@@ -6091,13 +6733,14 @@ extension EditorModel {
                 offsets.append(cursor)
                 var timelineClip = source.timeline(sequenceRange: cursor.seconds..<end.seconds)
                 timelineClip.mediaRevision = refreshDisplayRevisions[source.source.id] ?? 0
-                timelineClip.mediaIssue = mediaReviewIssue(source)
+                applyMediaPresentation(source, to: &timelineClip)
                 clips.append(timelineClip)
                 cursor = end
             case .still(let card):
                 guard let end = try? cursor.adding(card.duration) else { continue }
                 let id = stillTimelineIDs[card.id] ?? UUID()
                 stillTimelineIDs[card.id] = id
+                cards[id] = InlineStill(insert: card, start: cursor, end: end)
                 let asset = assets[card.assetID]
                 var thumbnailRevision = Hasher()
                 thumbnailRevision.combine(asset)
@@ -6106,13 +6749,16 @@ extension EditorModel {
                 thumbnailRevision.combine(stillReviewCanvas?.videoStream?.displayWidth)
                 thumbnailRevision.combine(stillReviewCanvas?.videoStream?.displayHeight)
                 let name = asset?.displayName ?? "Still"
+                let mediaURL = asset.flatMap { $0.isGap ? nil : URL(fileURLWithPath: $0.file) }
                 clips.append(TimelineClip(id: id, sourceID: id, name: name, sourceStart: 0, sourceEnd: card.duration.seconds,
                                           sourceDuration: card.duration.seconds, keyframes: [], thumbnailSyncTimes: [],
                                           frames: [], sequenceRange: cursor.seconds..<end.seconds, isStill: true, isGap: asset?.isGap == true,
-                                          mediaRevision: thumbnailRevision.finalize()))
+                                          mediaRevision: thumbnailRevision.finalize(),
+                                          mediaStatus: mediaURL.map { mediaStatus(for: $0) }, mediaURL: mediaURL))
                 cursor = end
             }
         }
+        edit.inlineStillsByID = cards
         edit.offsets = offsets
         edit.duration = cursor
         edit.timelineClips = clips
@@ -6200,7 +6846,7 @@ extension EditorModel {
         cancellation = token
         isCheckingEdit = true
         Task {
-            let prompt = await Task.detached(priority: .userInitiated) {
+            let prompt = await sidecarWork.detached(priority: .userInitiated) {
                 AnalysisSidecar.$excludedSources.withValue(excluded) {
                     let planner = StillExportPlanner(useSidecar: useSidecar, cancelled: { token.isCancelled })
                     let oldState = previously ?? (((try? baseline.exportPlacementScope()) ?? .none) != .none
@@ -6244,7 +6890,7 @@ extension EditorModel {
         }
         let project: CutProject
         if candidate.programColorPolicy == nil, !candidate.stillAssets.isEmpty,
-           let stream = segments.first(where: { $0.source.media.hasVideo })?.source.media.videoStream,
+           let stream = segments.lazy.compactMap({ $0.source.media }).first(where: \.hasVideo)?.videoStream,
            let color = try? StillProgramColorPolicy.resolving(source: stream) {
             project = try candidate.settingStillColorPolicy(color)
         } else {
@@ -6254,7 +6900,7 @@ extension EditorModel {
         guard project != stillProject else { return }
         let byID = Dictionary(uniqueKeysWithValues: segments.map { ($0.documentID, $0) })
         let proposed = try clips.map { clip -> EditorSegment in
-            if var segment = byID[clip.id], segment.source.url.path == clip.file, clip.to <= segment.source.duration {
+            if var segment = byID[clip.id], segment.source.url.path == clip.file, clip.to <= segment.sourceExtent {
                 segment.start = clip.from
                 segment.end = clip.to
                 return segment
@@ -6263,7 +6909,7 @@ extension EditorModel {
                 throw CutError(code: "invalid_still_target", message: "The edit refers to an unknown sequence occurrence.")
             }
             return EditorSegment(documentID: clip.id, source: original.source, start: clip.from, end: clip.to,
-                                 displayRange: AudioSpan(from: clip.from, to: max(original.end, original.displayRange?.to ?? original.source.duration)),
+                                 displayRange: AudioSpan(from: clip.from, to: max(original.end, original.displayRange?.to ?? original.sourceExtent)),
                                  occurrence: original.occurrence)
         }
         cancelTrim()
@@ -6283,6 +6929,7 @@ extension EditorModel {
     private func stillProjectForRange(_ selection: AudioSpan) throws -> CutProject {
         guard case .stillSequence(var sequence) = stillProject else { return stillProject }
         var cursor = RationalTime.zero
+        let format = sequence.stillFormat
         sequence.items = try sequence.items.compactMap { item in
             let length: RationalTime
             switch item {
@@ -6301,8 +6948,23 @@ extension EditorModel {
                 return .source(clip)
             case .still(var insert):
                 insert.duration = try upper.subtracting(lower)
+                if let format, (try? format.frameCount(for: insert.duration)) == nil {
+                    insert.usesExactDuration = true
+                }
                 return .still(insert)
             }
+        }
+        if let mapping = try stillProject.stillSoundtrackMapping(in: .init(from: selection.from, to: selection.to)) {
+            var clip = mapping.clip
+            clip.from = mapping.source.from
+            clip.to = mapping.source.to
+            sequence.stillSoundtrack = clip
+        } else {
+            if let soundtrack = sequence.stillSoundtrack, sequence.stillFormat != nil,
+               sequence.items.allSatisfy({ $0.still != nil }) {
+                sequence.stillAudioReference = soundtrack
+            }
+            sequence.stillSoundtrack = nil
         }
         let ids = Set(sequence.items.compactMap { if case .source(let clip) = $0 { return clip.id }; return nil })
         sequence.stillReplacements = sequence.stillReplacements.compactMap { replacement in
@@ -6329,7 +6991,7 @@ extension EditorModel {
                 let references = zip(zip(sequenceClips, segments), edit.offsets).compactMap { entry, offset
                     -> (clip: CutSequenceClip, offset: RationalTime)? in
                     let (clip, segment) = entry
-                    guard segment.source.media.streams.contains(where: { $0.kind == "audio" }) else { return nil }
+                    guard segment.source.media?.streams.contains(where: { $0.kind == "audio" }) == true else { return nil }
                     return (clip, offset)
                 }
                 sequence.stillAudioReference = (references.last { $0.offset <= selection.from } ?? references.first)?.clip
@@ -6342,18 +7004,195 @@ extension EditorModel {
 }
 
 extension EditorModel {
-    var canReplacePicture: Bool { canEdit && selectedSpan != nil && segments.contains { $0.source.media.hasVideo } }
+    func cacheStillSoundtrackMedia(_ media: MediaInfo) {
+        let previous = soundtrackMediaByURL[media.url]
+        soundtrackMediaByURL[media.url] = media
+        guard stillProject.stillSoundtrack?.file == media.url.path,
+              previous?.identity != media.identity else { return }
+        objectWillChange.send()
+        syncWaveforms()
+        restorePreview(at: playhead)
+    }
+
+    var currentSoundtrackMedia: MediaInfo? {
+        guard let soundtrack = stillProject.stillSoundtrack else { return nil }
+        let url = URL(fileURLWithPath: soundtrack.file)
+        guard mediaStatus(for: url) == .online else { return nil }
+        return soundtrackMediaByURL[url]
+    }
+
+    func stillSoundtrackExportIssue(in project: CutProject, tracks: ExportTracks,
+                                    audio: ReencodeAudio? = nil) -> CutError? {
+        guard tracks != .video, audio != .removeAudio,
+              let source = project.stillSoundtrack ?? project.stillAudioReference,
+              source.file == stillProject.stillSoundtrack?.file else { return nil }
+        let url = URL(fileURLWithPath: source.file)
+        let status = mediaStatus(for: url)
+        if status != .online {
+            return CutError(code: "source_needs_review", message: "Review the soundtrack in Project Media before exporting audio.")
+        }
+        do { _ = try expectedSoundtrackIdentity(source) }
+        catch let issue as CutError { return issue }
+        catch {
+            return CutError(code: "source_needs_review", message: "Review the soundtrack in Project Media before exporting audio.")
+        }
+        return nil
+    }
+
+    private func expectedSoundtrackIdentity(_ clip: CutSequenceClip) throws -> SourceIdentity? {
+        let url = URL(fileURLWithPath: clip.file)
+        if let identity = soundtrackMediaByURL[url]?.identity {
+            guard identity.isCurrentSnapshot(at: url) else {
+                throw CutError(code: "source_changed", message: "The attached soundtrack changed. Review it in Project Media before exporting.")
+            }
+            return identity
+        }
+        return try mediaSnapshot.expectedStillSoundtrack(clip,
+            relativeTo: projectURL ?? draft.url ?? LiveProjectMediaArchive.untitledURL)
+    }
+
+    var stillSoundtrackControls: StillSoundtrackControls? {
+        let project = stillProject
+        guard !isBusy, alert == nil, project.stillFormat != nil,
+              !project.stillInserts.isEmpty || project.stillSoundtrack != nil,
+              project.sequenceClips?.isEmpty == true else { return nil }
+        return StillSoundtrackControls(name: project.stillSoundtrack.map { URL(fileURLWithPath: $0.file).lastPathComponent },
+            canFit: currentSoundtrackMedia != nil && project.stillInserts.count == 1 &&
+                project.stillAssets.contains { $0.id == project.stillInserts[0].assetID && !$0.isGap },
+            attach: chooseStillSoundtrack, fit: {
+                self.editStill(action: "Fit Image to Soundtrack") { try self.stillProject.fittingStillToSoundtrack() }
+            }, remove: {
+                self.editStill(action: "Remove Soundtrack") { try self.stillProject.attachingStillSoundtrack(nil) }
+            })
+    }
+
+    private func chooseStillSoundtrack() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Soundtrack"
+        panel.allowedContentTypes = [.audio, .movie]
+        panel.canChooseDirectories = false
+        let generation = mcpGeneration
+        let revision = mcpRevision
+        isPresentingPanel = true
+        ProjectPanels.present(panel, in: editorWindow) { [weak self] accepted in
+            guard let self, self.mcpGeneration == generation else { return }
+            self.isPresentingPanel = false
+            guard accepted, self.mcpRevision == revision, let url = panel.url else {
+                self.resumePendingWork()
+                return
+            }
+            self.inspectStillSoundtrack(url, generation: generation, revision: revision)
+        }
+    }
+
+    private func inspectStillSoundtrack(_ url: URL, generation: UUID, revision: Int) {
+        isCheckingEdit = true
+        let file = url.standardizedFileURL.resolvingSymlinksInPath()
+        let useSidecar = sidecarPreference.permits(file)
+        let helper = sidecarWork.detached(priority: .userInitiated) {
+            Result { try CutEngine(useSidecar: useSidecar).inspect(file, keyframes: true) }
+        }
+        Task {
+            let result = await helper.value
+            guard self.mcpGeneration == generation else { return }
+            self.isCheckingEdit = false
+            defer { self.resumePendingWork() }
+            guard self.mcpRevision == revision else { return }
+            do { try selectStillSoundtrackTrack(result.get(), generation: generation, revision: revision) }
+            catch { showStillError(error) }
+        }
+    }
+
+    private func selectStillSoundtrackTrack(_ media: MediaInfo, generation: UUID, revision: Int) {
+        let tracks = media.streams.filter { $0.kind == "audio" }
+        let attach: (Int?) -> Void = { [weak self = self] stream in
+            guard let self, self.mcpGeneration == generation, self.mcpRevision == revision else { return }
+            do {
+                guard media.identity.isCurrentSnapshot(at: media.url) else {
+                    throw CutError(code: "source_changed", message: "The soundtrack changed while it was being selected. Choose the file again.")
+                }
+                let reference = try StillSoundtrack.reference(media: media, stream: stream)
+                let project = try self.stillProject.attachingStillSoundtrack(reference)
+                self.cacheStillSoundtrackMedia(media)
+                try self.applyStillProjectByHand(project, action: "Attach Soundtrack")
+            } catch { self.showStillError(error) }
+        }
+        if tracks.count > 1 {
+            let picker = NSPopUpButton()
+            picker.addItems(withTitles: tracks.map(\.exportLabel))
+            self.isPresentingPanel = true
+            StillPanels.present(title: "Choose Soundtrack Track", fields: [("Audio track", picker)], in: self.editorWindow,
+                                dismissed: { [weak self = self] in
+                guard let self, self.mcpGeneration == generation else { return }
+                self.isPresentingPanel = false
+                Task { self.resumePendingWork() }
+            }) {
+                guard tracks.indices.contains(picker.indexOfSelectedItem) else { return }
+                attach(tracks[picker.indexOfSelectedItem].index)
+            }
+        } else { attach(tracks.first?.index) }
+    }
+
+    private func indexedSoundtrack(for clip: CutSequenceClip) throws -> MediaInfo {
+        let url = URL(fileURLWithPath: clip.file)
+        let status = mediaStatus(for: url)
+        guard status != .changed, status != .needsReview, status != .offline, status != .ignored else {
+            throw CutError(code: "source_needs_review", message: "Review the soundtrack in Project Media before queueing this range.")
+        }
+        if let media = soundtrackMediaByURL[url] {
+            guard media.identity.isCurrentSnapshot(at: url) else {
+                throw CutError(code: "source_changed", message: "\(url.lastPathComponent) changed after the soundtrack was opened.")
+            }
+            return media
+        }
+        try checkLiveMediaVolume(url, volumes: interchangeCheckingVolumes)
+        let expected = try expectedSoundtrackIdentity(clip)
+        let media = try CutEngine(useSidecar: useAnalysisSidecars).inspect(url, keyframes: true)
+        guard expected.map({ $0.matchesSnapshot(media.identity) }) ?? true else {
+            throw CutError(code: "source_changed", message: "The attached soundtrack changed during queue capture.")
+        }
+        return media
+    }
+
+    private func loadSoundtrackIfNeeded() {
+        guard let clip = stillProject.stillSoundtrack else { return }
+        let url = URL(fileURLWithPath: clip.file)
+        guard soundtrackMediaByURL[url] == nil, soundtrackIndexes[url] == nil,
+              mediaStatus(for: url) == .online else { return }
+        let token = UUID()
+        soundtrackIndexes[url] = token
+        let useSidecar = useAnalysisSidecars
+        let task = sidecarWork.detached(priority: .utility) {
+            try? CutEngine(useSidecar: useSidecar).inspect(url, keyframes: true)
+        }
+        Task { [weak self] in
+            let result = await task.value
+            guard let self, self.soundtrackIndexes[url] == token else { return }
+            self.soundtrackIndexes[url] = nil
+            if self.soundtrackMediaByURL[url] == nil, let result {
+                do { _ = try self.expectedSoundtrackIdentity(clip) }
+                catch {
+                    self.incompatibleMedia.insert(ProjectMediaVolume.watchURL(url))
+                }
+                self.cacheStillSoundtrackMedia(result.forRefreshAlias(url))
+            }
+        }
+    }
+
+    var canReplacePicture: Bool { canEdit && selectedSpan != nil && segments.contains { $0.source.media?.hasVideo == true && mediaReviewIssue($0) == nil } }
     var canInsertStill: Bool { !isBusy && alert == nil && (isEmpty || hasPicture) }
 
     var stillAssetSpans: [MulticamAssetSpan] {
         let project = stillProject
         guard !project.stillAssets.isEmpty, let plan = try? project.resolveStills() else { return [] }
-        let names = Dictionary(uniqueKeysWithValues: project.stillAssets.filter { !$0.isGap }.map { ($0.id, $0.displayName) })
+        let assets = Dictionary(uniqueKeysWithValues: project.stillAssets.filter { !$0.isGap }.map { ($0.id, $0) })
         let assetIDs = Dictionary(uniqueKeysWithValues:
             project.stillReplacements.map { ($0.id, $0.assetID) } + project.stillInserts.map { ($0.id, $0.assetID) })
         return plan.spans.enumerated().compactMap { index, span in
-            guard let id = span.placementID, let asset = assetIDs[id], let title = names[asset] else { return nil }
-            return MulticamAssetSpan(id: "\(id)-\(index)", title: title, interval: span.output)
+            guard let id = span.placementID, let assetID = assetIDs[id], let asset = assets[assetID] else { return nil }
+            let url = URL(fileURLWithPath: asset.file)
+            return MulticamAssetSpan(id: "\(id)-\(index)", title: asset.displayName, interval: span.output,
+                                     mediaURL: url, mediaStatus: mediaStatus(for: url))
         }
     }
 
@@ -6362,13 +7201,18 @@ extension EditorModel {
         let assets = Dictionary(uniqueKeysWithValues: stillProject.stillAssets.map { ($0.id, $0) })
         func name(_ id: String) -> String {
             guard let asset = assets[id] else { return "Missing image" }
-            return asset.isGap || FileManager.default.fileExists(atPath: asset.file) ? asset.displayName : "\(asset.displayName) (offline)"
+            return asset.displayName
+        }
+        func status(_ id: String) -> ProjectMediaStatus {
+            guard let asset = assets[id], !asset.isGap else { return .online }
+            return mediaStatus(for: URL(fileURLWithPath: asset.file))
         }
         func framing(_ frame: StillImageFraming) -> String { frame.mode == .fit ? "Fit" : "Fill" }
         var result = inlineStills(in: stillProject).map { card in
             StillPlacementRow(id: card.insert.id, title: "Insert · \(name(card.insert.assetID))",
                               details: "Sequence \(card.start)–\(card.end) s · \(card.insert.duration) s · \(framing(card.insert.framing))",
-                              isInsert: true, isGap: assets[card.insert.assetID]?.isGap == true)
+                              isInsert: true, isGap: assets[card.insert.assetID]?.isGap == true,
+                              mediaStatus: status(card.insert.assetID))
         }
         let namesByClip = Dictionary(uniqueKeysWithValues: segments.map { ($0.documentID, $0.source.name) })
         let visible = Dictionary(grouping: (try? stillProject.resolveStills().spans) ?? []) { $0.placementID }
@@ -6394,7 +7238,7 @@ extension EditorModel {
             }
             return StillPlacementRow(id: replacement.id, title: "Replace · \(name(replacement.assetID))",
                                      details: (ranges + [framing(replacement.framing)]).joined(separator: " · "), isInsert: false,
-                                     fragmentCount: fragmentCount)
+                                     fragmentCount: fragmentCount, mediaStatus: status(replacement.assetID))
         }
         return result
     }
@@ -6438,8 +7282,8 @@ extension EditorModel {
                         if let cadence, interval != cadence {
                             throw CutError(code: "invalid_still_cadence", message: "Use the sequence’s frame rate for this gap.")
                         }
-                        let asset = self.stillProject.stillAssets.first(where: \.isGap) ?? StillAsset(gapID: UUID().uuidString)
-                        let id = UUID().uuidString
+                        let asset = self.stillProject.stillAssets.first(where: \.isGap) ?? StillAsset(gapID: ProjectIdentifier.make(avoiding: self.stillProject.stillAssets.map(\.id)))
+                        let id = ProjectIdentifier.make()
                         let result: CutProject
                         if let format {
                             result = try CutProject.makeStillTimeline(format: format, asset: asset, placementID: id,
@@ -6522,7 +7366,7 @@ extension EditorModel {
         inspectImages([url]) { assets in
             let asset = assets[0]
             let project = try self.project(with: asset).replacingPicture(
-                id: UUID().uuidString, assetID: asset.id, from: range.from, to: range.to
+                id: ProjectIdentifier.make(), assetID: asset.id, from: range.from, to: range.to
             )
             try self.applyStillProjectByHand(project, action: "Replace Picture")
         }
@@ -6578,7 +7422,7 @@ extension EditorModel {
                 var project = self.stillProject
                 var cursor = time
                 for (index, asset) in assets.enumerated() {
-                    let id = UUID().uuidString
+                    let id = ProjectIdentifier.make()
                     if let format, index == 0 {
                         project = try CutProject.makeStillTimeline(format: format, asset: asset, placementID: id,
                                                                   duration: duration, colorPolicy: colorPolicy ?? StillTimelineFormat.sdrColorPolicy)
@@ -6594,7 +7438,9 @@ extension EditorModel {
     }
 
     func validateStillReplacementExtents(_ candidate: CutProject, original: StillReplacement) throws {
-        let mediaByClip = Dictionary(uniqueKeysWithValues: segments.map { ($0.documentID, $0.source.media) })
+        let mediaByClip = Dictionary(uniqueKeysWithValues: segments.compactMap { clip in
+            clip.source.media.map { (clip.documentID, $0) }
+        })
         let priorFragments: Set<StillReplacementFragment>
         if case .sequence(let fragments) = original.coverage { priorFragments = Set(fragments) }
         else { priorFragments = [] }
@@ -6627,8 +7473,8 @@ extension EditorModel {
                         if clock == "sequence" { return try self.stillBoundary(at: time.seconds) }
                         guard let fragment,
                               let clip = self.segments.first(where: { $0.documentID == fragment.clipID }),
-                              time >= .zero, time <= clip.source.media.duration,
-                              time != clip.source.media.duration else { return time }
+                              let media = clip.source.media, self.mediaReviewIssue(clip) == nil,
+                              time >= .zero, time <= media.duration, time != media.duration else { return time }
                         let target = time.seconds
                         let snapped: RationalTime?
                         switch self.effectiveSnapTarget {
@@ -6674,20 +7520,14 @@ extension EditorModel {
         case .duplicate:
             guard let card else { return }
             var copy = card.insert
-            copy.id = UUID().uuidString
+            copy.id = ProjectIdentifier.make()
             editStill(action: "Duplicate Still") { try stillProject.insertingStill(copy, at: card.end) }
         case .detach: return
         case .remove:
             editStill(action: "Delete Still") { try stillProject.removingStill(id: row.id) }
         case .relink:
-            chooseStillImage { [weak self] url in
-                self?.inspectImages([url]) { [weak self] assets in
-                    guard let self else { return }
-                    let image = assets[0]
-                    let project = try self.stillProject.relinkingStillAsset(assetID, file: image.file, fingerprint: image.fingerprint)
-                    try self.applyStillProjectByHand(project, action: "Relink Image")
-                }
-            }
+            guard let asset = stillProject.stillAssets.first(where: { $0.id == assetID && !$0.isGap }) else { return }
+            presentProjectMedia(.locate, path: asset.file)
         }
     }
 
@@ -6721,117 +7561,274 @@ extension EditorModel {
     }
 
     func dropOnTimeline(_ urls: [URL], slot: Int) {
+        let slot = max(0, slot)
         let sourceSlot = (stillProject.sequenceItems ?? []).prefix(slot).compactMap(\.source).count
-        importFiles(urls, at: sourceSlot)
+        importFiles(urls, at: sourceSlot, timelineSlot: slot)
     }
 }
 
 extension EditorModel {
     var canRefreshProjectMedia: Bool {
-        guard !isBusy, !isSavingSidecars, !mcpHasActiveTrim, alert == nil else { return false }
-        return !segments.isEmpty || queuedRanges.contains { !$0.media.isEmpty }
-            || undoStack.contains { !$0.clips.isEmpty } || redoStack.contains { !$0.clips.isEmpty }
+        guard !isBusy, !isSavingSidecars, !mcpHasActiveTrim, alert == nil, mediaRelinkIndexing.isEmpty else { return false }
+        return !segments.isEmpty || !transcriptProject.mediaPaths.isEmpty || !queuedMediaTargets.presenceOnlyByURL.isEmpty
     }
 
     func refreshProjectMedia(deep: Bool = false, receipt: MCPAnalysisReceipt? = nil) {
+        updateMediaWatcher()
         _ = refreshProjectMedia(deep: deep, verify: [], receipt: receipt)
     }
 
-    private func updateMediaWatcher() {
-        guard preferences.automaticallyRefreshMedia else {
-            mediaWatcher?.stop()
-            mediaWatcher = nil
-            return
-        }
-        if mediaWatcher == nil {
-            mediaWatcher = ProjectMediaWatcher { [weak self] verify in
-                self?.refreshProjectMedia(deep: false, verify: verify, receipt: nil) ?? false
-            }
-        }
-        mediaWatcher?.update(Set(segments.map { $0.source.url }))
+    private func currentMediaTargets() -> [URL: Bool] {
+        let location = projectURL ?? openingProjectURL ?? draft.url ?? URL(fileURLWithPath: "/Untitled.cut", isDirectory: false)
+        return transcriptProject.mediaRefreshTargets(relativeTo: location)
+            .merging(queuedMediaTargets.presenceOnlyByURL) { $0 && $1 }
     }
 
-    private func refreshProjectMedia(deep: Bool, verify: Set<URL>, receipt: MCPAnalysisReceipt?) -> Bool {
+    func mediaStatus(for url: URL) -> ProjectMediaStatus {
+        mediaStatus(for: url, includingUnresolved: true)
+    }
+
+    private func mediaStatus(for url: URL, includingUnresolved: Bool) -> ProjectMediaStatus {
+        let url = ProjectMediaVolume.watchURL(url)
+        if mediaRelinkIndexing.contains(url) { return .indexing }
+        if let status = mediaWatcher?.status(for: url), status == .checking || status == .offline || status == .changed {
+            return status == .offline && ignoredMediaPaths.contains(url.path)
+                ? .ignored : status
+        }
+        if includingUnresolved, let status = edit.preparation.unresolvedStatusByURL[url] {
+            return status == .offline && ignoredMediaPaths.contains(url.path)
+                ? .ignored : status
+        }
+        if offlineMedia.contains(url) {
+            return ignoredMediaPaths.contains(url.path) ? .ignored : .offline
+        }
+        if incompatibleMedia.contains(url) || refreshReviewPicture.contains(url) || !(refreshReviewStreams[url] ?? []).isEmpty {
+            return .needsReview
+        }
+        return mediaWatcher?.status(for: url) ?? .online
+    }
+
+    private func preparedForMediaAvailability(_ segments: [EditorSegment], using previous: PreparedEdit) -> PreparedEdit {
+        let unavailable = Set(previous.sourceMedia.compactMap { id, media in
+            let status = mediaStatus(for: media.url, includingUnresolved: false)
+            return status == .offline || status == .ignored || status == .checking ? id : nil
+        })
+        guard unavailable != previous.unavailableSourceIDs else { return previous }
+        return PreparedEdit(segments: segments, previous: previous, engine: CutEngine(), excluding: unavailable)
+    }
+
+    private func updateMediaWatcher() {
+        if mediaWatcher == nil {
+            mediaWatcher = ProjectMediaWatcher(publish: { [weak self] urls in
+                guard let self else { return }
+                self.objectWillChange.send()
+                self.invalidateQueuedMedia(at: Set(urls.filter {
+                    let status = self.mediaStatus(for: $0)
+                    return status == .offline || status == .changed || status == .ignored
+                }))
+                var touchedStills = self.refreshStillMediaPresentation(for: urls)
+                if let soundtrack = self.stillProject.stillSoundtrack,
+                   urls.contains(ProjectMediaVolume.watchURL(URL(fileURLWithPath: soundtrack.file))) {
+                    self.loadSoundtrackIfNeeded()
+                    self.syncWaveforms()
+                    touchedStills = true
+                }
+                guard self.segments.contains(where: { urls.contains(ProjectMediaVolume.watchURL($0.source.url)) }) else {
+                    if touchedStills { self.restorePreview(at: self.playhead) }
+                    return
+                }
+                let previous = self.edit.preparation
+                let prepared = self.preparedForMediaAvailability(self.segments, using: previous)
+                let availabilityChanged = previous.unavailableSourceIDs != prepared.unavailableSourceIDs
+                if availabilityChanged {
+                    self.edit.preparation = prepared
+                    if previous.container != prepared.container { self.copyBoundaryIndices.removeAll() }
+                    self.trimChecks.removeAll()
+                    self.fixedTrimIssue = nil
+                    self.prepareCopyBoundaries()
+                }
+                var clips = self.edit.timelineClips
+                var presentationChanged = false
+                var reviewChanged = false
+                let segments = Dictionary(uniqueKeysWithValues: self.segments.map { ($0.id, $0) })
+                for index in clips.indices {
+                    guard let segment = segments[clips[index].id], urls.contains(ProjectMediaVolume.watchURL(segment.source.url)) else { continue }
+                    let previousStatus = clips[index].mediaStatus
+                    let previousIssue = clips[index].mediaIssue
+                    self.applyMediaPresentation(segment, to: &clips[index])
+                    if clips[index].mediaStatus != previousStatus { presentationChanged = true }
+                    if clips[index].mediaIssue != previousIssue { reviewChanged = true }
+                }
+                if presentationChanged || reviewChanged { self.edit.timelineClips = clips }
+                if reviewChanged {
+                    self.mediaClipReview = Dictionary(uniqueKeysWithValues: clips.compactMap { clip in
+                        clip.mediaIssue.map { (clip.id, $0) }
+                    })
+                    self.syncWaveforms()
+                }
+                if reviewChanged || touchedStills { self.restorePreview(at: self.playhead) }
+                if reviewChanged || availabilityChanged { self.refreshTier() }
+            }, refresh: { [weak self] urls, verify in
+                guard let self else { return true }
+                var sources = self.segments.map { ProjectMediaVolume.watchURL($0.source.url) }
+                if let soundtrack = self.stillProject.stillSoundtrack {
+                    sources.append(ProjectMediaVolume.watchURL(URL(fileURLWithPath: soundtrack.file)))
+                }
+                let recordings = urls.intersection(sources)
+                guard !recordings.isEmpty else { return true }
+                return self.refreshProjectMedia(deep: false, verify: verify, receipt: nil, only: recordings)
+            })
+        }
+        var expected = queuedMediaTargets.indexed.mapValues(\.identity)
+        if let clip = stillProject.stillSoundtrack,
+           let media = soundtrackMediaByURL[URL(fileURLWithPath: clip.file)] {
+            expected[ProjectMediaVolume.watchURL(media.url)] = media.identity
+        }
+        for clip in segments {
+            if let media = clip.source.media { expected[ProjectMediaVolume.watchURL(media.url)] = media.identity }
+        }
+        let unresolved = Set(segments.compactMap { segment in
+            segment.source.unresolved?.status == .offline ? ProjectMediaVolume.watchURL(segment.source.url) : nil
+        })
+        mediaWatcher?.update(Set(currentMediaTargets().keys), expected: expected, assumedOffline: unresolved,
+                             perFile: preferences.automaticallyRefreshMedia)
+    }
+
+    private func refreshProjectMedia(deep: Bool, verify: Set<URL>, receipt: MCPAnalysisReceipt?, only: Set<URL>? = nil) -> Bool {
         guard canRefreshProjectMedia else {
             receipt?.finish("failed", detail: ["error": "Finish the current project operation before refreshing media."])
             return false
         }
-        let history = undoStack + redoStack
         var inputs = [URL: ProjectMediaRefreshInput]()
-        func add(_ url: URL, media: MediaInfo? = nil) {
-            let url = url.standardizedFileURL
-            inputs[url] = ProjectMediaRefreshInput(url: url, previous: inputs[url]?.previous ?? media ?? refreshBaselines[url])
+        func add(_ url: URL, media: MediaInfo? = nil, requiresIndex: Bool = false, presenceOnly: Bool = false) {
+            let url = ProjectMediaVolume.watchURL(url)
+            guard only?.contains(url) != false, mediaWatcher?.status(for: url) != .checking else { return }
+            inputs[url] = ProjectMediaRefreshInput(url: url, previous: inputs[url]?.previous ?? media ?? refreshBaselines[url] ?? queuedMediaTargets.indexed[url],
+                                                   requiresIndex: requiresIndex || inputs[url]?.requiresIndex == true,
+                                                   presenceOnly: (inputs[url]?.presenceOnly ?? true) && presenceOnly)
         }
-        for clip in segments {
-            add(clip.source.url, media: clip.source.media)
-            if clip.source.originalURL != clip.source.url { add(clip.source.originalURL) }
+        for clip in segments { add(clip.source.url, media: clip.source.media, requiresIndex: clip.source.unresolved != nil) }
+        if let soundtrack = stillProject.stillSoundtrack {
+            let url = URL(fileURLWithPath: soundtrack.file)
+            add(url, media: soundtrackMediaByURL[url], requiresIndex: true)
         }
-        for state in history {
-            if case .live(let snapshot) = state.contents {
-                for media in snapshot.preparation.sourceMedia.values { add(media.url, media: media) }
-            }
-            for clip in state.clips {
-                add(URL(fileURLWithPath: clip.file))
-                if let original = clip.originalFile { add(URL(fileURLWithPath: original)) }
-            }
-        }
-        for queued in queuedRanges {
-            for media in queued.media.values { add(media.url, media: media) }
-        }
+        for (url, presenceOnly) in currentMediaTargets() { add(url, presenceOnly: presenceOnly) }
         guard !inputs.isEmpty else {
             receipt?.finish("failed", detail: ["error": "No recordings are referenced by this project."])
             return false
         }
         mediaRefreshProgress = 0
         statusMessage = "Refreshing project media…"
-        let previewSources = Set(segments.lazy.filter { $0.source.media.hasVideo }.map { $0.source.url.standardizedFileURL })
+        let previewSources = Set(segments.lazy.filter { $0.source.media?.hasVideo == true }.map { $0.source.url.standardizedFileURL })
         mediaRefresh.start(inputs: Array(inputs.values), deep: deep, verify: verify.union(offlineMedia), persist: useAnalysisSidecars,
-                           exclusions: sidecarExclusions, receipt: receipt, previewSources: previewSources,
+                           project: projectURL, exclusions: sidecarExclusions, receipt: receipt, previewSources: previewSources,
                            preview: { [weak self] media, aliases in
             self?.previewRefreshedFilmstrip(media, aliases: aliases)
         }, progress: { [weak self] in
             self?.mediaRefreshProgress = $0
-        }, publish: { [weak self] result, aliases, _ in
+        }, publish: { [weak self] result, aliases, _, identity in
+            self?.mediaWatcher?.noteVerified(aliases, identity: identity)
+            if self?.refreshStillMediaPresentation(for: aliases) == true, let self { self.restorePreview(at: self.playhead) }
             self?.installMediaRefresh(result, aliases: aliases)
+            self?.objectWillChange.send()
         }, finished: { [weak self] message in
             guard let self else { return }
             if !self.refreshFilmstrips.isEmpty { self.refreshFilmstrips.removeAll() }
             self.mediaRefreshProgress = nil
+            if only == nil { self.mediaWatcher?.checkNow() }
             self.statusMessage = message
             self.resumePendingWork()
         })
         return true
     }
 
-    func queuedMediaRefreshIssue() -> CutError? {
-        if edit.participants.render != nil { return ParticipantProjectExport.unsupported("A queued range export") }
-        guard queuedRanges.contains(where: { invalidatedQueueIDs.contains($0.id) }) else { return nil }
-        return CutError(code: "source_changed", message: "Remove and re-add affected queued ranges to export the refreshed media.")
+    var readyQueuedRanges: [QueuedRange] {
+        queuedRanges.filter { !invalidatedQueueIDs.contains($0.id) }
+    }
+
+    func invalidateQueuedMedia(at paths: Set<URL>) {
+        guard !paths.isEmpty, !queuedRanges.isEmpty else { return }
+        let keys = Set(paths.map(ProjectMediaVolume.watchURL))
+        let affected = readyQueuedRanges.filter { entry in
+            entry.mediaDependencies.contains { keys.contains(ProjectMediaVolume.watchURL($0)) }
+        }.map(\.id)
+        if !affected.isEmpty { invalidatedQueueIDs.formUnion(affected) }
+    }
+
+    @discardableResult
+    private func refreshStillMediaPresentation(for urls: Set<URL>) -> Bool {
+        let keys = Set(urls.map(ProjectMediaVolume.watchURL))
+        let changed = edit.timelineClips.indices.filter { index in
+            let clip = edit.timelineClips[index]
+            return clip.isStill && clip.mediaURL.map { keys.contains(ProjectMediaVolume.watchURL($0)) } == true
+        }
+        for index in changed {
+            guard let url = edit.timelineClips[index].mediaURL else { continue }
+            let status = mediaStatus(for: url)
+            if edit.timelineClips[index].mediaStatus != status {
+                edit.timelineClips[index].mediaStatus = status
+                edit.timelineClips[index].mediaRevision &+= 1
+            }
+        }
+        return !changed.isEmpty || stillAssetSpans.contains {
+            $0.mediaURL.map { keys.contains(ProjectMediaVolume.watchURL($0)) } == true
+        }
+    }
+
+    private func applyMediaPresentation(_ segment: EditorSegment, to clip: inout TimelineClip) {
+        let issue = mediaReviewIssue(segment)
+        let observed = mediaStatus(for: segment.source.url, includingUnresolved: segment.source.unresolved != nil)
+        let status: ProjectMediaStatus
+        switch observed {
+        case .checking, .offline, .ignored, .indexing: status = observed
+        default: status = segment.source.unresolved?.status ?? (observed == .needsReview && issue == nil ? .online : observed)
+        }
+        clip.mediaIssue = issue
+        clip.mediaStatus = status == .online && issue != nil ? .needsReview : status
+        clip.mediaURL = segment.source.url
+    }
+
+    func unresolvedMediaStatus(for url: URL) -> ProjectMediaStatus? {
+        edit.preparation.unresolvedStatusByURL[ProjectMediaVolume.watchURL(url)]
     }
 
     private func mediaReviewIssue(_ clip: EditorSegment) -> String? {
         let source = clip.source
-        if offlineMedia.contains(source.url) { return "\(source.name) — recording is offline." }
+        let status = mediaStatus(for: source.url, includingUnresolved: source.unresolved != nil)
+        let reviewPrompt = " Open Project Media to review this recording."
+        if status == .checking { return "\(source.name) — checking the recording’s volume.\(reviewPrompt)" }
+        if let unresolved = source.unresolved { return "\(source.name) — \(unresolved.detail)\(reviewPrompt)" }
+        if status == .offline || status == .ignored { return "\(source.name) — recording is offline.\(reviewPrompt)" }
+        guard let media = source.media else { return nil }
         guard let revision = refreshSourceRevisions[source.id], revision > 0 else { return nil }
-        if clip.end > source.duration || clip.start < .zero {
-            return "\(source.name) — a saved trim extends past the refreshed recording."
+        if clip.end > media.duration || clip.start < .zero {
+            return "\(source.name) — a saved trim extends past the refreshed recording.\(reviewPrompt)"
         }
-        if incompatibleMedia.contains(source.url) { return "\(source.name) — the recording type changed." }
+        if stillProject.stillReplacements.contains(where: { replacement in
+            guard case .sequence(let fragments) = replacement.coverage else { return false }
+            return fragments.contains { $0.clipID == clip.documentID && $0.range.to > media.duration }
+        }) {
+            return "\(source.name) — a saved still replacement extends past the refreshed recording.\(reviewPrompt)"
+        }
+        if incompatibleMedia.contains(source.url) { return "\(source.name) — the recording type changed.\(reviewPrompt)" }
         if refreshReviewPicture.contains(source.url) {
-            return "\(source.name) — the picture track could not be verified."
+            return "\(source.name) — the picture track could not be verified.\(reviewPrompt)"
         }
-        let audio = source.media.streams.filter { $0.kind == "audio" }
+        let audio = media.streams.filter { $0.kind == "audio" }
+        if source.replacementNames.keys.contains(where: { !audio.indices.contains($0) }) {
+            return "\(source.name) — a named audio track is missing.\(reviewPrompt)"
+        }
         let explicitSelection = audioMonitoringTrack ?? source.replacementTrack
         let review = refreshReviewStreams[source.url] ?? []
-        let selected = explicitSelection ?? (source.media.hasVideo && audio.isEmpty && review.isEmpty ? nil : 0)
+        let selected = explicitSelection ?? (media.hasVideo && audio.isEmpty && review.isEmpty ? nil : 0)
         if let selected {
             guard audio.indices.contains(selected), !review.contains(audio[selected].index) else {
-                return "\(source.name) — the selected audio track changed or is missing."
+                return "\(source.name) — the selected audio track changed or is missing.\(reviewPrompt)"
             }
-            if (explicitSelection != nil || !source.media.hasVideo),
-               let track = source.media.audio.first(where: { $0.stream.index == audio[selected].index }),
+            if (explicitSelection != nil || !media.hasVideo),
+               let track = media.audio.first(where: { $0.stream.index == audio[selected].index }),
                clip.start < track.start || clip.end > track.end {
-                return "\(source.name) — a saved trim extends past the refreshed audio track."
+                return "\(source.name) — a saved trim extends past the refreshed audio track.\(reviewPrompt)"
             }
         }
         return nil
@@ -6840,12 +7837,12 @@ extension EditorModel {
     private func previewRefreshedFilmstrip(_ media: MediaInfo, aliases: Set<URL>) {
         guard media.timelineIssue == nil, let replacement = media.videoStream else { return }
         var drafts = refreshFilmstrips
-        for source in edit.preparation.sourceMedia where aliases.contains(source.value.url.standardizedFileURL) {
+        for source in edit.preparation.sourceMedia where aliases.contains(ProjectMediaVolume.watchURL(source.value.url)) {
             let id = source.key
             let before = source.value
             let clips = edit.timelineClips.filter { $0.sourceID == id }
             guard !clips.isEmpty, let picture = before.videoStream,
-                  media.origin == before.origin, media.identity.isCurrentSnapshot(at: before.url),
+                  media.origin == before.origin,
                   replacement.index == picture.index, replacement.trackID == picture.trackID,
                   replacement.displayWidth == picture.displayWidth, replacement.displayHeight == picture.displayHeight,
                   clips.allSatisfy({ $0.mediaIssue == nil && max($0.sourceDuration, $0.displayRange?.to.seconds ?? 0) <= media.duration.seconds }) else {
@@ -6858,13 +7855,37 @@ extension EditorModel {
     }
 
     private func installMediaRefresh(_ result: MediaRefreshResult, aliases: Set<URL>) {
-        let url = result.source.standardizedFileURL
-        func matches(_ candidate: URL) -> Bool { aliases.contains(candidate.standardizedFileURL) }
+        let url = ProjectMediaVolume.watchURL(result.source)
+        func matches(_ candidate: URL) -> Bool { aliases.contains(ProjectMediaVolume.watchURL(candidate)) }
         let history = (undoStack + redoStack).flatMap { state -> [EditorSegment] in
             if case .live(let snapshot) = state.contents { return snapshot.segments }
             return []
         }
         let sources = (segments + history).map(\.source).filter { matches($0.url) }
+        if let clip = stillProject.stillSoundtrack {
+            let soundtrack = URL(fileURLWithPath: clip.file)
+            if matches(soundtrack) {
+                if let media = result.media {
+                    soundtrackMediaByURL[soundtrack] = media.forRefreshAlias(soundtrack)
+                    incompatibleMedia.remove(ProjectMediaVolume.watchURL(soundtrack))
+                    let tracks = media.streams.filter { $0.kind == "audio" }
+                    let ordinal = clip.audioTrack ?? 0
+                    if tracks.indices.contains(ordinal) {
+                        let stream = tracks[ordinal].index
+                        let valid = (try? StillSoundtrack.reference(media: media, stream: stream, from: clip.from, to: clip.to)) != nil
+                        refreshReviewStreams[ProjectMediaVolume.watchURL(soundtrack)] =
+                            valid && !result.reviewStreams.contains(stream) ? nil : [stream]
+                    } else {
+                        incompatibleMedia.insert(ProjectMediaVolume.watchURL(soundtrack))
+                    }
+                } else if result.state == .offline {
+                    soundtrackMediaByURL[soundtrack] = nil
+                }
+                syncWaveforms()
+                restorePreview(at: playhead)
+                refreshTier()
+            }
+        }
         let sourceIDs = Set(sources.map(\.id))
         let drafts = refreshFilmstrips.filter { sourceIDs.contains($0.key) }
         if !drafts.isEmpty { refreshFilmstrips = refreshFilmstrips.filter { !sourceIDs.contains($0.key) } }
@@ -6872,21 +7893,22 @@ extension EditorModel {
             for alias in aliases {
                 let item = media.forRefreshAlias(alias)
                 refreshBaselines[alias] = item
-                SourceIndexLoader.shared.acceptRefreshedIndex(item, sidecars: sidecarPreference.permits(alias))
+                if alias == alias.standardizedFileURL {
+                    SourceIndexLoader.shared.acceptRefreshedIndex(item, sidecars: sidecarPreference.permits(alias), project: projectURL)
+                }
             }
         }
-        if result.state == .unchanged, sources.allSatisfy({ !offlineMedia.contains($0.url) }) { return }
+        if result.state == .unchanged, edit.preparation.unavailableSourceIDs.isDisjoint(with: sourceIDs),
+           sources.allSatisfy({ $0.unresolved == nil && !offlineMedia.contains($0.url) }) { return }
         if result.state == .offline {
-            offlineMedia.insert(url)
             for source in sources { offlineMedia.insert(source.url) }
         } else {
             offlineMedia.remove(url)
             for source in sources { offlineMedia.remove(source.url) }
         }
-        for range in queuedRanges where range.media.keys.contains(where: matches) {
-            invalidatedQueueIDs.insert(range.id)
-        }
-        let replacePicture = result.displayChanged || result.state == .offline
+        invalidateQueuedMedia(at: aliases.union([url]))
+        let recoveredUnresolvedSource = result.media != nil && sources.contains { $0.unresolved != nil }
+        let replacePicture = result.displayChanged || result.state == .offline || recoveredUnresolvedSource
         for id in sourceIDs {
             refreshSourceRevisions[id, default: 0] += 1
             if replacePicture {
@@ -6902,8 +7924,7 @@ extension EditorModel {
             let hadPartialScenes = sourceSceneOverlays[id] != nil || sceneOverlays.keys.contains { $0.source == id }
             invalidateSceneScan(for: id)
             let source = sources.first { $0.id == id }
-            if result.scenesPreserved, let source {
-                let media = result.media?.forRefreshAlias(source.url) ?? source.media
+            if result.scenesPreserved, let source, let media = result.media?.forRefreshAlias(source.url) ?? source.media {
                 if let old = sceneReports[id] {
                     let report = old.forRefreshedMedia(media)
                     sceneReports[id] = report
@@ -6940,7 +7961,7 @@ extension EditorModel {
             mcpSilenceWorkers.remove(id)
             if let source = sources.first(where: { $0.id == id }),
                let ordinal = sourceAnalysisTracks[id] {
-                let oldAudio = source.media.streams.filter { $0.kind == "audio" }
+                let oldAudio = source.media?.streams.filter { $0.kind == "audio" } ?? []
                 if oldAudio.indices.contains(ordinal), !savedAudio.contains(oldAudio[ordinal].index) {
                     automaticThresholds[id] = nil
                     sourcePauses[id] = nil
@@ -6953,41 +7974,61 @@ extension EditorModel {
             }
         }
         var replacements: [UUID: IndexedSource] = [:]
+        var mismatchedSources: [UUID: UnresolvedSource] = [:]
         if let media = result.media {
             let newAudio = media.streams.filter { $0.kind == "audio" }
             let unique = Dictionary(sources.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let currentIDs = Set(segments.map { $0.source.id })
+            let referenceHasPicture = segments.lazy.compactMap { clip in
+                sourceIDs.contains(clip.source.id) ? nil : clip.source.media?.hasVideo
+            }.first
             for (id, source) in unique {
                 refreshReviewStreams[source.url, default: []].formUnion(result.reviewStreams)
                 if result.pictureNeedsReview { refreshReviewPicture.insert(source.url) }
-                guard media.hasVideo == source.media.hasVideo else {
+                let expectedPicture = source.media?.hasVideo ?? source.unresolved?.hasPicture
+                    ?? (currentIDs.contains(id) ? referenceHasPicture : nil)
+                if let expectedPicture, media.hasVideo != expectedPicture {
                     incompatibleMedia.insert(source.url)
+                    if let unresolved = source.unresolved {
+                        mismatchedSources[id] = UnresolvedSource(
+                            id: id, url: source.url, originalURL: source.originalURL, replacementNames: source.replacementNames,
+                            replacementTrack: source.replacementTrack, status: .needsReview,
+                            detail: "The recording type changed.", snapshot: unresolved.snapshot
+                        )
+                    }
                     continue
                 }
                 incompatibleMedia.remove(source.url)
-                let oldAudio = source.media.streams.filter { $0.kind == "audio" }
+                let oldAudio = source.media?.streams.filter { $0.kind == "audio" } ?? []
                 for ordinal in oldAudio.indices {
                     guard newAudio.indices.contains(ordinal), newAudio[ordinal].index != oldAudio[ordinal].index else { continue }
                     refreshReviewStreams[source.url, default: []].insert(newAudio[ordinal].index)
                 }
-                replacements[id] = IndexedSource(media: media.forRefreshAlias(source.url), id: id,
+                replacements[id] = IndexedSource(media: sidecarPreference.attachingDocument(to: media.forRefreshAlias(source.url)), id: id,
                                                  originalURL: source.originalURL, replacementNames: source.replacementNames,
                                                  replacementTrack: source.replacementTrack)
             }
         }
         func refresh(_ snapshot: EditSnapshot) -> EditSnapshot {
-            guard !sourceIDs.isDisjoint(with: snapshot.preparation.sourceMedia.keys) else { return snapshot }
+            guard snapshot.segments.contains(where: { sourceIDs.contains($0.source.id) }) else { return snapshot }
             var updated = snapshot
             let timelineIndices = Dictionary(uniqueKeysWithValues: snapshot.timelineClips.enumerated().map { ($0.element.id, $0.offset) })
+            let stillFragmentEnds = Self.requiredStillFragmentEnds(snapshot.stillSequence?.stillReplacements ?? [])
             for index in updated.segments.indices where sourceIDs.contains(updated.segments[index].source.id) {
-                if let source = replacements[updated.segments[index].source.id] {
-                    updated.segments[index].source = source
+                let previous = updated.segments[index]
+                let sourceID = previous.source.id
+                let requiredEnd = max(previous.end, stillFragmentEnds[previous.documentID] ?? .zero)
+                if let source = replacements[sourceID], previous.source.unresolved == nil || requiredEnd <= source.duration {
+                    updated.segments[index].source = .resolved(source)
+                } else if let source = mismatchedSources[sourceID] {
+                    updated.segments[index].source = .unresolved(source)
                 }
                 let segment = updated.segments[index]
                 guard let timelineIndex = timelineIndices[segment.id] else { continue }
                 var clip = updated.timelineClips[timelineIndex]
                 if replacePicture { clip = segment.timeline(sequenceRange: clip.sequenceRange ?? 0..<0) }
                 clip.mediaRevision = refreshDisplayRevisions[segment.source.id] ?? 0
-                clip.mediaIssue = mediaReviewIssue(segment)
+                applyMediaPresentation(segment, to: &clip)
                 updated.timelineClips[timelineIndex] = clip
             }
             if replacePicture {
@@ -6997,6 +8038,7 @@ extension EditorModel {
             if result.media != nil {
                 updated.preparation = PreparedEdit(segments: updated.segments, previous: PreparedEdit(), engine: CutEngine())
             }
+            updated.preparation = preparedForMediaAvailability(updated.segments, using: updated.preparation)
             return updated
         }
         guard !sourceIDs.isEmpty else { return }
@@ -7011,7 +8053,7 @@ extension EditorModel {
             if case .live(let snapshot) = state.contents { state.contents = .live(refresh(snapshot)) }
             return state
         }
-        guard !sourceIDs.isDisjoint(with: edit.preparation.sourceMedia.keys) else { return }
+        guard edit.segments.contains(where: { sourceIDs.contains($0.source.id) }) else { return }
         let landing = playhead
         edit = refresh(edit)
         mediaClipReview = Dictionary(uniqueKeysWithValues: edit.timelineClips.compactMap { clip in
@@ -7041,13 +8083,15 @@ extension EditorModel {
     }
 
     var transcriptMedia: [String: MediaInfo] {
-        Dictionary(segments.map { ($0.source.url.path, $0.source.media) },
+        Dictionary(segments.compactMap { clip in clip.source.media.map { ($0.url.path, $0) } },
                    uniquingKeysWith: { first, _ in first })
     }
 
     func transcriptMediaInfo(for file: String) throws -> MediaInfo {
         let url = URL(fileURLWithPath: file).standardizedFileURL
-        return try transcriptMedia[url.path] ?? CutEngine(useSidecar: useAnalysisSidecars).inspectForPreview(url)
+        return try transcriptMedia[url.path] ?? SidecarLocations.$projectURL.withValue(projectURL) {
+            try CutEngine(useSidecar: useAnalysisSidecars).inspectForPreview(url)
+        }
     }
 
     func setTranscriptMarks(_ range: MulticamRange) throws {
@@ -7083,18 +8127,20 @@ extension EditorModel {
             let backing: EditorSegment
             let sameOccurrence = byID[clip.id].flatMap { sourceKey($0) == key ? $0 : nil }
             if let existing = sameOccurrence ?? media[key] {
-                guard existing.source.media.identity.isCurrentSnapshot(at: file) else {
+                guard existing.source.media?.identity.isCurrentSnapshot(at: file) == true else {
                     throw CutError(code: "source_changed", message: "\(file.lastPathComponent) changed after the transcript edit was reviewed.")
                 }
                 backing = existing
             } else {
-                let index = try CutEngine(useSidecar: useAnalysisSidecars).inspect(file, keyframes: true)
-                let source = IndexedSource(media: index, originalURL: original,
+                let index = try SidecarLocations.$projectURL.withValue(projectURL) {
+                    try CutEngine(useSidecar: useAnalysisSidecars).inspect(file, keyframes: true)
+                }
+                let source = IndexedSource(media: sidecarPreference.attachingDocument(to: index), originalURL: original,
                                            replacementNames: clip.replacementNames, replacementTrack: clip.audioTrack)
                 backing = EditorSegment(source: source)
                 media[key] = backing
             }
-            guard clip.to <= backing.source.duration else {
+            guard clip.to <= backing.sourceExtent else {
                 throw CutError(code: "source_unavailable", message: "The selected passage extends past \(file.lastPathComponent).")
             }
             if var existing = byID[clip.id], existing.source.id == backing.source.id {
@@ -7103,7 +8149,7 @@ extension EditorModel {
                 return existing
             }
             return EditorSegment(documentID: clip.id, source: backing.source, start: clip.from, end: clip.to,
-                                 displayRange: AudioSpan(from: .zero, to: backing.source.duration),
+                                 displayRange: AudioSpan(from: .zero, to: backing.sourceExtent),
                                  occurrence: backing.occurrence)
         }
         cancelTrim()
@@ -7157,12 +8203,19 @@ extension EditorModel {
         let generation = mcpGeneration
         let exclusions = sourceRangeSidecarExclusions([select.range])
         let useSidecars = useAnalysisSidecars
-        let media = try await Task.detached(priority: .userInitiated) {
-            try select.range.resolve(relativeTo: nil) { file in
-                let engine = CutEngine(useSidecar: useSidecars && !AnalysisSidecar.isExcluded(file, in: exclusions))
+        let work = sidecarWork.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try select.range.resolve(relativeTo: nil) { file in
+                let engine = CutEngine(cancelled: { Task.isCancelled },
+                                       useSidecar: useSidecars && !AnalysisSidecar.isExcluded(file, in: exclusions))
                 return try engine.inspectSummary(file)
             }
-        }.value
+        }
+        let media = try await withTaskCancellationHandler {
+            try await work.value
+        } onCancel: {
+            work.cancel()
+        }
         try Task.checkCancellation()
         try checkAccess()
         try checkSourceRangeEdit(expectedRevision, generation: generation)
@@ -7191,6 +8244,7 @@ extension EditorModel {
     }
 
     private func checkSourceRangeEdit(_ revision: Int, generation: UUID? = nil) throws {
+        try Task.checkCancellation()
         guard mcpRevision == revision, generation == nil || mcpGeneration == generation else {
             throw CutError(code: "stale_revision", message: "The sequence changed. Review the source ranges again.")
         }
@@ -7203,7 +8257,7 @@ extension EditorModel {
         let urls = ranges.compactMap { try? $0.fileURL(relativeTo: nil) }
         var paths = protectedMedia
         for url in urls { paths[url.path] = url.lastPathComponent }
-        return CutProject.sidecarExclusions(absoluteSources: paths, candidates: urls)
+        return CutProject.sidecarExclusions(absoluteSources: paths, candidates: urls, projectURL: projectURL)
     }
 
     func applySourceRanges(_ ranges: [SequenceSourceRange], destination: MulticamRange,
@@ -7217,8 +8271,8 @@ extension EditorModel {
         let useSidecars = useAnalysisSidecars
         let exclusions = sourceRangeSidecarExclusions(ranges)
         let engine = CutEngine(cancelled: { token.isCancelled }, useSidecar: useSidecars)
-        let work = Task.detached(priority: .userInitiated) {
-            var media = Dictionary(existing.map { ($0.source.url, $0.source.media) }, uniquingKeysWith: { first, _ in first })
+        let work = sidecarWork.detached(priority: .userInitiated) { [sidecarPreference] in
+            var media = Self.mediaByURL(existing)
             var retainedOrigins: [String: String] = [:]
             let candidate = try project.applyingSourceRanges(ranges, from: destination.from, to: destination.to,
                                                               onRetainedClip: { retainedOrigins[$0] = $1 }) { url in
@@ -7231,7 +8285,7 @@ extension EditorModel {
                 media[url] = indexed
                 return indexed
             }
-            var sources: [DocumentSourceKey: IndexedSource] = [:]
+            var sources: [DocumentSourceKey: EditorSource] = [:]
             let byID = Dictionary(uniqueKeysWithValues: existing.map { ($0.documentID, $0) })
             for segment in existing {
                 let source = segment.source
@@ -7252,20 +8306,19 @@ extension EditorModel {
                     previous.end = clip.to
                     return previous
                 }
-                let source: IndexedSource
+                let source: EditorSource
                 if let cached = sources[key] { source = cached }
                 else {
                     guard let index = media[url] else { throw sourceRangeChanged(url) }
-                    source = IndexedSource(media: index)
+                    source = .resolved(IndexedSource(media: sidecarPreference.attachingDocument(to: index)))
                     sources[key] = source
                 }
                 return EditorSegment(documentID: clip.id, source: source, start: clip.from, end: clip.to)
             }
-            if let first = proposed.first?.source.media {
-                let ordinary = proposed.first(where: { !$0.source.isAudioReplacement })?.source.media
+            if let first = proposed.compactMap({ $0.source.media }).first {
+                let ordinary = proposed.filter { !$0.source.isAudioReplacement }.compactMap { $0.source.media }.first
                 var checked = Set<UUID>()
-                for segment in proposed where checked.insert(segment.source.id).inserted {
-                    let source = segment.source
+                for source in proposed.compactMap({ $0.source.indexed }) where checked.insert(source.id).inserted {
                     if source.isAudioReplacement,
                        (try? engine.checkPictureCompatibility(source.media, with: first)) != nil,
                        source.media.audio.count == first.audio.count { continue }
@@ -7319,5 +8372,338 @@ extension EditorModel {
             preview.pause()
             seek(occurrence.from.seconds)
         }
+    }
+}
+
+extension EditorModel {
+    private var canChangeProjectMedia: Bool {
+        !isBusy && !isSavingSidecars && !mcpHasActiveTrim && alert == nil
+    }
+
+    private func updateMediaRelinkIndexing(_ paths: Set<URL>) {
+        let updated = mediaRelinkIndexing.symmetricDifference(paths)
+        guard !updated.isEmpty else { return }
+        mediaRelinkIndexing = paths
+        let byID = Dictionary(uniqueKeysWithValues: segments.map { ($0.id, $0) })
+        var clips = edit.timelineClips
+        for index in clips.indices {
+            guard let segment = byID[clips[index].id], updated.contains(ProjectMediaVolume.watchURL(segment.source.url)) else { continue }
+            applyMediaPresentation(segment, to: &clips[index])
+        }
+        edit.timelineClips = clips
+    }
+
+    func cancelProjectMediaIndexing() {
+        mediaRelinkCancellation?.cancel()
+    }
+
+    private func preindexProjectMedia(_ urls: Set<URL>, cancellation: EditCancellation) async throws -> [URL: MediaInfo] {
+        var media: [URL: MediaInfo] = [:]
+        for (index, url) in urls.sorted(by: { $0.path < $1.path }).enumerated() {
+            try Task.checkCancellation()
+            guard !url.path.split(separator: "/").contains(".."),
+                  !interchangeCheckingVolumes.contains(ProjectMediaVolume.key(for: url)) else { continue }
+            let settings = sidecarPreference.indexSettings(for: url)
+            let key = SourceIndexLoader.Key(url: url, sidecars: settings.enabled, preview: false, project: sidecarWork.project)
+            do {
+                let index = try await SourceIndexLoader.shared.read(key, token: cancellation, preference: settings.change) { [weak self] fraction in
+                    let progress = (Double(index) + fraction) / Double(urls.count)
+                    guard cancellation.shouldReport(progress) else { return }
+                    Task { @MainActor in
+                        guard let self, self.mediaRelinkCancellation === cancellation,
+                              let previous = self.mediaRelinkProgress else { return }
+                        self.mediaRelinkProgress = max(previous, progress)
+                    }
+                }
+                try Self.checkEditable(index.ordinary)
+                media[url] = index.ordinary
+            } catch {
+                try Task.checkCancellation()
+                if cancellation.isCancelled { throw CancellationError() }
+                // Revert and replacement may intentionally retain an offline source.
+                // The import path decides how the current document represents this failure.
+            }
+        }
+        return media
+    }
+
+    var projectMediaSnapshotForWriting: ProjectMediaSnapshot {
+        var indexed = interchangeIndexedMedia
+        var assets = stillProject.stillAssets
+        for entry in undoStack + redoStack {
+            if case .live(let state) = entry.contents {
+                indexed.append(contentsOf: state.preparation.sourceMedia.values)
+            }
+            assets.append(contentsOf: entry.project.stillAssets)
+        }
+        var seen = Set<String>()
+        let indexedMedia = indexed.filter { seen.insert($0.url.path).inserted }.map { ($0.url.path, $0) }
+        let stills = assets.compactMap { ProjectMediaSnapshot.Entry(path: $0.file, asset: $0) }
+            .filter { seen.insert($0.path).inserted }
+        return mediaSnapshot.merging(media: indexedMedia, stills: stills)
+    }
+
+    var projectMediaArchive: LiveProjectMediaArchive? {
+        guard !isEmpty || !stillProject.stillAssets.isEmpty || hasHistory || projectURL != nil else { return nil }
+        func state(_ entry: HistoryEntry) -> CutHistoryState {
+            .init(action: entry.action, origin: entry.origin, project: entry.project, bindingChanges: entry.bindingChanges)
+        }
+        return .init(project: transcriptProject, undo: undoStack.map(state), redo: redoStack.map(state),
+                     snapshot: projectMediaSnapshotForWriting, documentURL: projectURL ?? draft.url ?? LiveProjectMediaArchive.untitledURL,
+                     checkingVolumes: interchangeCheckingVolumes)
+    }
+
+    func relinkProjectMedia(from: String, to: URL, validateCommit: @escaping @MainActor () throws -> Void = {}) async throws -> Bool {
+        guard canChangeProjectMedia, let archive = projectMediaArchive else { throw unavailableLiveProjectMedia() }
+        let generation = mcpGeneration, revision = mcpRevision
+        let result = try await archive.relink(from, to: to)
+        return try await installProjectMedia(result.project, archive: archive, snapshot: result.snapshot,
+                                             relinkHistory: (result.undo, result.redo), affected: [archive.url(from)],
+                                             verified: result.candidate.outcome == .verified ? [archive.url(from)] : [],
+                                             generation: generation, revision: revision) {
+            try validateCommit()
+            if result.candidate.outcome.canRelink {
+                try checkLiveMediaVolume(result.candidate.url, volumes: self.interchangeCheckingVolumes)
+            }
+            try result.candidate.checkGeneration()
+        }
+    }
+
+    func relinkProjectMedia(_ mappings: [ProjectMediaMapping], validateCommit: @escaping @MainActor () throws -> Void = {}) async throws
+        -> LiveProjectMediaRelinkBatch {
+        guard canChangeProjectMedia, let archive = projectMediaArchive else { throw unavailableLiveProjectMedia() }
+        let generation = mcpGeneration, revision = mcpRevision
+        return try await archive.applyRelinks(mappings, checkingVolumes: { self.interchangeCheckingVolumes }) { result, rows, validateRows in
+            try await installProjectMedia(result.project, archive: archive, snapshot: result.snapshot,
+                                     relinkHistory: (result.undo, result.redo), affected: Set(rows.map { archive.url($0.from) }),
+                                     verified: Set(rows.filter { $0.candidate.outcome == .verified }.map { archive.url($0.from) }),
+                                     generation: generation, revision: revision) {
+                try validateCommit()
+                try validateRows()
+            }
+        }
+    }
+
+    func revertProjectMedia(_ path: String, validateCommit: @escaping @MainActor () throws -> Void = {}) async throws -> Bool {
+        guard canChangeProjectMedia, let archive = projectMediaArchive else { throw unavailableLiveProjectMedia() }
+        let generation = mcpGeneration, revision = mcpRevision
+        let result = try await archive.revert(path)
+        return try await installProjectMedia(result.project, archive: archive, snapshot: result.snapshot,
+                                             relinkHistory: (result.undo, result.redo), affected: [archive.url(path)],
+                                             verified: result.candidate.outcome == .verified ? [archive.url(path)] : [],
+                                             generation: generation, revision: revision) {
+            try validateCommit()
+            if result.candidate.outcome.canRelink {
+                try checkLiveMediaVolume(result.candidate.url, volumes: self.interchangeCheckingVolumes)
+            }
+            try result.candidate.checkGeneration()
+        }
+    }
+
+    func ignoreProjectMedia(_ path: String) throws {
+        guard canChangeProjectMedia, var archive = projectMediaArchive else { throw unavailableLiveProjectMedia() }
+        try archive.ignore(path)
+        mediaSnapshot = archive.snapshot
+        let matches = Set(segments.filter { $0.source.url == archive.url(path) }.map(\.id))
+        for index in edit.timelineClips.indices where matches.contains(edit.timelineClips[index].id) {
+            if let segment = segments.first(where: { $0.id == edit.timelineClips[index].id }) {
+                var clip = edit.timelineClips[index]
+                applyMediaPresentation(segment, to: &clip)
+                edit.timelineClips[index] = clip
+            }
+        }
+        refreshStillMediaPresentation(for: [archive.url(path)])
+        mediaSnapshotChanged = true
+        mcpRevision += 1
+        updateStatus()
+        updateMediaWatcher()
+        saveUntitledDraft()
+    }
+
+    func applyProjectMediaReplacement(_ preview: MediaReplacePreview, validateCommit: @escaping @MainActor () throws -> Void = {}) async throws -> Bool {
+        guard canChangeProjectMedia, let archive = projectMediaArchive else { throw unavailableLiveProjectMedia() }
+        try checkLiveMediaVolume(preview.candidateURL, volumes: self.interchangeCheckingVolumes)
+        let project = try preview.applying(to: archive.project)
+        return try await installProjectMedia(project, archive: archive, snapshot: preview.snapshot,
+                                             relinkHistory: nil, affected: [preview.sourceURL],
+                                             generation: mcpGeneration, revision: mcpRevision,
+                                             replacementURL: preview.candidateURL,
+                                             replacementAtSamePath: preview.replacesAtSameLocation) {
+            try validateCommit()
+            try checkLiveMediaVolume(preview.candidateURL, volumes: self.interchangeCheckingVolumes)
+            try preview.checkGeneration()
+        }
+    }
+
+    private func carryMediaAnalysis(from previous: [EditorSegment], archive: LiveProjectMediaArchive,
+                                    verified: Set<URL>, replacing: Set<URL>) {
+        let previousByID = Dictionary(uniqueKeysWithValues: previous.map { ($0.documentID, $0) })
+        let fingerprints = Dictionary(archive.snapshot.entries.compactMap { entry in
+            entry.sourceFingerprint.map { (entry.path, $0) }
+        }, uniquingKeysWith: { first, _ in first })
+        let thresholds = Dictionary(grouping: thresholdOverrides, by: { $0.key.source })
+        var carried = Set<UUID>()
+        for clip in segments {
+            guard let original = previousByID[clip.documentID], let previousMedia = original.source.media,
+                  let nextMedia = clip.source.media, clip.source.id != original.source.id,
+                  !replacing.contains(archive.url(original.source.url.path)) else { continue }
+            let sameGeneration = previousMedia.url == nextMedia.url && previousMedia.identity.matchesSnapshot(nextMedia.identity)
+            let oldPath = archive.url(original.source.url.path)
+            let provenMove = verified.contains(oldPath)
+                && fingerprints[oldPath.path] == previousMedia.identity.transcriptFingerprint
+            guard sameGeneration || provenMove else { continue }
+            let old = original.source.id, new = clip.source.id
+            if carried.insert(new).inserted {
+                let previousStamp = SceneSourceStamp(media: previousMedia)
+                let cachedScene = [sceneReports[old], staleSceneReports[old]].compactMap { $0 }.first {
+                    $0.sourceStamp == previousStamp
+                }
+                if let report = cachedScene {
+                    installSceneReport(report.forRefreshedMedia(nextMedia), for: new, replacing: true)
+                }
+                if let overlay = sourceSceneOverlays[old] { sourceSceneOverlays[new] = overlay }
+                if let results = silenceResults[old] {
+                    silenceResults[new] = results.mapValues { $0.forRefreshedMedia(nextMedia) }
+                    sourcePauses[new] = sourcePauses[old]
+                }
+                if let threshold = automaticThresholds[old] { automaticThresholds[new] = threshold }
+                if let track = sourceAnalysisTracks[old] { sourceAnalysisTracks[new] = track }
+                for (key, threshold) in thresholds[old] ?? [] {
+                    thresholdOverrides[.init(source: new, track: key.track)] = threshold
+                }
+            }
+            if clip.start == original.start, clip.end == original.end {
+                let oldRange = ClipSceneRange(original), newRange = ClipSceneRange(clip)
+                if let report = sceneRangeReports[oldRange] {
+                    sceneRangeReports[newRange] = report.forRefreshedMedia(nextMedia)
+                }
+                sceneOverlays[newRange] = sceneOverlays[oldRange]
+            }
+        }
+        if !carried.isEmpty { sceneRevision += 1 }
+    }
+
+    private func installProjectMedia(_ document: CutProject, archive: LiveProjectMediaArchive, snapshot snapshotMedia: ProjectMediaSnapshot,
+                                     relinkHistory states: (undo: [CutHistoryState], redo: [CutHistoryState])?, affected: Set<URL>,
+                                     verified: Set<URL> = [], generation: UUID, revision: Int, replacementURL: URL? = nil, replacementAtSamePath: Bool = false,
+                                     validateCommit: @escaping @MainActor () throws -> Void) async throws -> Bool {
+        func validate() throws {
+            try Task.checkCancellation()
+            try validateCommit()
+            guard canChangeProjectMedia, generation == mcpGeneration, revision == mcpRevision,
+                  (projectURL ?? draft.url ?? LiveProjectMediaArchive.untitledURL) == archive.documentURL,
+                  transcriptProject == archive.project, undoStack.count == archive.undo.count,
+                  redoStack.count == archive.redo.count else { throw staleLiveProjectMedia() }
+        }
+        guard canChangeProjectMedia, mediaRelinkIndexing.isEmpty else { throw staleLiveProjectMedia() }
+        try validate()
+        let project = document.mapMediaPaths(archive.absolutePath)
+        let media = snapshotMedia.mappingPaths(archive.absolutePath)
+        let relinkHistory = states.map { (undo: archive.absoluteHistory($0.undo), redo: archive.absoluteHistory($0.redo)) }
+        let historyChanged = relinkHistory.map { $0.undo != archive.undo || $0.redo != archive.redo } ?? false
+        guard project != archive.project || media != archive.snapshot || historyChanged else { return false }
+        let previous = snapshot()
+        let previousTranscripts = transcriptState
+        let previousContainer = explicitCopyContainer
+        var nextTranscripts = project.transcripts
+        if nextTranscripts != previousTranscripts, nextTranscripts.revision == previousTranscripts.revision {
+            try nextTranscripts.advanceRevision()
+        }
+        func installMetadata() {
+            if let relinkHistory {
+                func map(_ existing: [HistoryEntry], _ before: [CutHistoryState], _ after: [CutHistoryState]) -> [HistoryEntry] {
+                    zip(existing, zip(before, after)).map { entry, states in
+                        guard states.0 != states.1 else { return entry }
+                        var entry = entry
+                        entry.contents = .document(states.1.project)
+                        entry.bindingChanges = states.1.bindingChanges ?? []
+                        return entry
+                    }
+                }
+                undoStack = map(undoStack, archive.undo, relinkHistory.undo)
+                redoStack = map(redoStack, archive.redo, relinkHistory.redo)
+            } else {
+                undoStack.append(.init(action: "Replace Source File", contents: .live(previous),
+                                       copyContainer: previousContainer, transcriptState: previousTranscripts,
+                                       bindingChanges: TranscriptBindingChange.changes(from: nextTranscripts, to: previousTranscripts)))
+                redoStack.removeAll()
+                enforceHistoryLimit()
+            }
+            mediaSnapshot = media
+            mediaSnapshotChanged = true
+            carryMediaAnalysis(from: previous.segments, archive: archive, verified: verified,
+                               replacing: relinkHistory == nil ? affected : [])
+            transcriptState = nextTranscripts
+            rebuildPausePlan()
+            invalidateQueuedMedia(at: affected)
+            updateStatus()
+            updateMediaWatcher()
+            saveUntitledDraft()
+        }
+        let clips = project.sequenceClips ?? []
+        let timelineChanged = project.sequenceClips != archive.project.sequenceClips
+        let mustReindex = replacementAtSamePath && clips.contains { affected.contains(archive.url($0.file)) }
+        if (timelineChanged || mustReindex), !clips.isEmpty {
+            let files = clips.map { URL(fileURLWithPath: $0.file) }
+            let cancellation = EditCancellation()
+            let originalClips = Dictionary(uniqueKeysWithValues: (archive.project.sequenceClips ?? []).map { ($0.id, $0) })
+            let candidates = Set(clips.compactMap { clip -> URL? in
+                guard let original = originalClips[clip.id] else { return URL(fileURLWithPath: clip.file) }
+                return clip.file != original.file || (mustReindex && affected.contains(archive.url(clip.file)))
+                    ? URL(fileURLWithPath: clip.file) : nil
+            })
+            if !candidates.isEmpty {
+                mediaRelinkCancellation = cancellation
+                mediaRelinkProgress = 0
+                updateMediaRelinkIndexing(Set(affected.map { ProjectMediaVolume.watchURL($0) }))
+            }
+            defer {
+                if mediaRelinkCancellation === cancellation {
+                    mediaRelinkCancellation = nil
+                    mediaRelinkProgress = nil
+                    updateMediaRelinkIndexing([])
+                }
+            }
+            try await withTaskCancellationHandler {
+                let preindexed = try await preindexProjectMedia(candidates, cancellation: cancellation)
+                try validate()
+                mediaRelinkProgress = nil
+                updateMediaRelinkIndexing([])
+
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    importFiles(files, projectClips: clips, beforeInstall: {
+                        try validate()
+                        return true
+                    }, requestCancellation: cancellation, installed: installMetadata,
+                                sequenceProject: project, sourceSnapshot: media, preserveProjectPosition: true,
+                                preindexedMedia: preindexed,
+                                keepUnavailableRangesAt: Set([replacementURL].compactMap { $0 }.map { ProjectMediaVolume.watchURL($0) })) {
+                        continuation.resume(with: $0)
+                    }
+                }
+            } onCancel: {
+                cancellation.cancel()
+            }
+        } else {
+            if replacementAtSamePath, let clip = project.stillSoundtrack {
+                let url = URL(fileURLWithPath: clip.file)
+                soundtrackMediaByURL[url] = nil
+                incompatibleMedia.remove(ProjectMediaVolume.watchURL(url))
+                refreshReviewStreams[ProjectMediaVolume.watchURL(url)] = nil
+            }
+            if project != archive.project {
+                let restored = timelineChanged ? [] : segments
+                let prepared = timelineChanged ? PreparedEdit() : edit.preparation
+                guard apply(restored, prepared: prepared, selecting: selectedID, at: playhead, action: "Replace Source File",
+                            recordHistory: false, preserveMarks: true, sequenceProject: project) else {
+                    throw CutError(code: "invalid_edit", message: "The media edit could not be installed.")
+                }
+            } else {
+                loadSoundtrackIfNeeded()
+                mcpRevision += 1
+            }
+            installMetadata()
+        }
+        return true
     }
 }

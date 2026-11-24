@@ -181,6 +181,29 @@ public struct RationalTime: Hashable, Comparable, Codable, Sendable, CustomStrin
         return Self.product(before, UInt64(later.denominator)) <= Self.product(after, UInt64(earlier.denominator))
     }
 
+    /// Floor the fraction of a positive duration to a whole percent on the source clock.
+    func wholePercent(of duration: Self) -> Int {
+        guard self > .zero, duration > .zero else { return 0 }
+        guard self < duration else { return 100 }
+        let elapsed = UInt64(numerator).multipliedFullWidth(by: UInt64(duration.denominator))
+        let total = UInt64(duration.numerator).multipliedFullWidth(by: UInt64(denominator))
+        if elapsed.high == 0, total.high == 0, elapsed.low <= UInt64.max / 100 {
+            return Int(elapsed.low * 100 / total.low)
+        }
+        let scaled = Self.product(elapsed, 100)
+        var lower = 0
+        var upper = 99
+        while lower < upper {
+            let candidate = (lower + upper + 1) / 2
+            if Self.product(total, UInt64(candidate)) <= scaled {
+                lower = candidate
+            } else {
+                upper = candidate - 1
+            }
+        }
+        return lower
+    }
+
     package func roundedToSamples(_ sampleRate: Int) throws -> Int64 {
         let scaled = numerator.multipliedFullWidth(by: Int64(sampleRate))
         let magnitude = Self.magnitude(scaled)

@@ -128,4 +128,112 @@ final class QueueSnapshotTests: XCTestCase {
         XCTAssertThrowsError(try entry.snapshotItems())
     }
 
+    func testSequenceReplanKeepsEntryIdentityAndOtherQueuedRangesReady() async throws {
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let sessions = ProjectSessions(preferences: preferences)
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        let editor = session.editor
+        defer { editor.endSession() }
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov", subdirectory: "Fixtures"))
+        editor.importFiles([source])
+        let deadline = ContinuousClock.now + .seconds(15)
+        while editor.isBusy, .now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(editor.isBusy)
+
+        editor.selectRange(0, editor.mcpDuration.seconds)
+        editor.addMarkedRange()
+        let first = try XCTUnwrap(editor.queuedRanges.first)
+
+        let otherURL = URL(fileURLWithPath: "/unrelated-queue-dependency.png")
+        let other = StillAsset(id: "card", file: otherURL.path, displayName: "Card", fingerprint: String(repeating: "0", count: 64))
+        let insert = StillInsert(id: "insert", assetID: other.id, duration: .init(numerator: 1), cadence: .init(numerator: 1, denominator: 25))
+        // Queue the second source through the model, retaining its frozen project independently of the first range.
+        let clip = CutSequenceClip(id: "unrelated", file: source.path, from: .zero, to: .init(numerator: 1))
+        let secondSnapshot = CutProject.stillSequence(.init(items: [.source(clip), .still(insert)], stillAssets: [other]))
+        let excerpt = TranscriptQueueExcerpt(name: "Other", project: secondSnapshot,
+                                             location: source.deletingLastPathComponent().appendingPathComponent("Other.cut"))
+        _ = try editor.enqueueTranscriptSnapshot(secondSnapshot, excerpt: excerpt, range: .init(from: .zero, to: .init(numerator: 1)))
+        let second = try XCTUnwrap(editor.queuedRanges.last)
+
+        editor.invalidateQueuedMedia(at: [otherURL])
+        XCTAssertEqual(editor.invalidatedQueueIDs, [second.id])
+        XCTAssertEqual(editor.readyQueuedRanges.map(\.id), [first.id])
+        var options = ExportSheetOptions()
+        options.mode = .copy
+        options.copyContainer = "mov"
+        options.tracks = .all
+        let issue = await editor.checkQueuedRanges(options: options)
+        XCTAssertNil(issue)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let receipt = try await sessions.mcpOutputs(tool: "export_queue_plan", arguments: [
+            "project_handle": session.mcpHandle, "output": directory.path, "mode": "copy", "tracks": "all"
+        ], session: session, checkAccess: {})
+        let jobID = try XCTUnwrap(receipt?["job_id"] as? String)
+        let planDeadline = ContinuousClock.now + .seconds(15)
+        var state = try sessions.mcpOutputJobs.status(owner: session.mcpHandle, id: jobID, cancel: false)
+        while state["state"] as? String == "running", .now < planDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+            state = try sessions.mcpOutputJobs.status(owner: session.mcpHandle, id: jobID, cancel: false)
+        }
+        XCTAssertEqual(state["state"] as? String, "succeeded", String(describing: state))
+        let plan = try XCTUnwrap(state["result"] as? [String: Any])
+        XCTAssertEqual((plan["destinations"] as? [String])?.count, 1)
+        XCTAssertEqual(plan["skipped_needs_replan"] as? [String], [second.id.uuidString])
+
+        let args: [String: Any] = ["id": second.id.uuidString, "mode": "replace"]
+        editor.selectRange(0, editor.mcpDuration.seconds)
+        _ = try await sessions.mcpOutputs(tool: "export_queue_entry_revise", arguments: args, session: session, checkAccess: {})
+        XCTAssertTrue(editor.invalidatedQueueIDs.isEmpty)
+
+        editor.invalidateQueuedMedia(at: [source])
+        XCTAssertEqual(editor.invalidatedQueueIDs, [first.id, second.id])
+        let result = try await sessions.mcpOutputs(tool: "export_queue_entry_revise",
+                                                  arguments: ["id": first.id.uuidString, "mode": "replan"],
+                                                  session: session, checkAccess: {})
+        let entries = try XCTUnwrap(result?["ranges"] as? [[String: Any]])
+        XCTAssertEqual(entries.first?["needs_replan"] as? Bool, false)
+        XCTAssertEqual(entries.last?["needs_replan"] as? Bool, true)
+        XCTAssertEqual(editor.readyQueuedRanges.map(\.id), [first.id])
+        XCTAssertNotEqual(editor.readyQueuedRanges.first?.contentID, first.contentID)
+        editor.removeQueuedRange(second.id)
+        XCTAssertTrue(editor.invalidatedQueueIDs.isEmpty)
+    }
+
+    func testMulticamQueueMarksUsedStillsAndUnresolvedRecordingsIndividually() throws {
+        func t(_ seconds: Int64) -> RationalTime { .init(numerator: seconds) }
+        func r(_ from: Int64, _ to: Int64) -> MulticamRange { .init(from: t(from), to: t(to)) }
+
+        let wide = MulticamSource(id: "wide", file: "/queue/unavailable/../wide.mov")
+        let close = MulticamSource(id: "close", file: "/queue/close.mov")
+        let card = StillAsset(id: "card", file: "/queue/card.png", displayName: "Card", fingerprint: String(repeating: "0", count: 64))
+        let unused = StillAsset(id: "unused", file: "/queue/unused.png", displayName: "Unused", fingerprint: card.fingerprint)
+        let gap = StillAsset(gapID: "gap")
+        let insert = StillInsert(id: "insert", assetID: card.id, duration: t(1), cadence: .init(numerator: 1, denominator: 25))
+        let gapInsert = StillInsert(id: "insert-gap", assetID: gap.id, duration: t(1), cadence: .init(numerator: 1, denominator: 25))
+        let project = MulticamProject(referenceAngle: "wide", range: r(0, 4), angles: [wide, close], audio: .none,
+                                      switches: [.init(at: .zero, angle: "wide"), .init(at: t(2), angle: "close")],
+                                      assemblyItems: [.group(r(0, 2)), .still(insert), .still(gapInsert)], stillAssets: [card, unused, gap])
+        let withCard = MulticamQueuedRange(name: "Card", range: r(0, 4), project: project, media: [:], usesAssembly: true)
+        let interview = MulticamQueuedRange(name: "Interview", range: r(2, 4), project: project, media: [:])
+        let model = MulticamEditorModel()
+        model.queuedRanges = [withCard, interview]
+        let frozen = model.queuedRanges.map(\.contentID)
+
+        model.invalidateQueuedMedia(at: [URL(fileURLWithPath: unused.file)])
+        XCTAssertTrue(model.invalidatedQueueIDs.isEmpty)
+        model.invalidateQueuedMedia(at: [URL(fileURLWithPath: card.file)])
+        XCTAssertEqual(model.invalidatedQueueIDs, [withCard.id])
+        XCTAssertEqual(model.readyQueuedRanges.map(\.id), [interview.id])
+        model.clearQueueInvalidation(withCard.id)
+        model.invalidateQueuedMedia(at: [URL(fileURLWithPath: wide.file)])
+        XCTAssertEqual(model.invalidatedQueueIDs, [withCard.id])
+        XCTAssertEqual(model.queuedRanges.map(\.contentID), frozen)
+        model.removeQueuedRange(withCard.id)
+        XCTAssertTrue(model.invalidatedQueueIDs.isEmpty)
+        XCTAssertEqual(model.readyQueuedRanges.map(\.id), [interview.id])
+    }
+
 }

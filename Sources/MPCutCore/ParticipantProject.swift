@@ -102,19 +102,25 @@ public struct ParticipantSourceGeometry: Codable, Equatable, Sendable {
     public var analysisIdentity: String?
     public var sourceStamp: SceneSourceStamp?
     public var sourceInode: UInt64?
+    public var sourceContentSHA256: String?
+    public var feedLayout: ParticipantFeedLayout?
     public var appearances: [ParticipantAppearance]
     public var coverage: [ParticipantCoverage]
+    public internal(set) var unresolvedParticipantIDs: [String]
 
     public init(sourceID: String, analysisIdentity: String? = nil, sourceStamp: SceneSourceStamp? = nil,
-                sourceInode: UInt64? = nil,
+                sourceInode: UInt64? = nil, sourceContentSHA256: String? = nil, feedLayout: ParticipantFeedLayout? = nil,
                 appearances: [ParticipantAppearance] = [],
-                coverage: [ParticipantCoverage] = []) {
+                coverage: [ParticipantCoverage] = [], unresolvedParticipantIDs: [String] = []) {
         self.sourceID = sourceID
         self.analysisIdentity = analysisIdentity
         self.sourceStamp = sourceStamp
         self.sourceInode = sourceInode
+        self.sourceContentSHA256 = sourceContentSHA256
+        self.feedLayout = feedLayout == .meeting ? nil : feedLayout
         self.appearances = appearances
         self.coverage = coverage
+        self.unresolvedParticipantIDs = unresolvedParticipantIDs
     }
 
     package init(sourceID: String, media: MediaInfo, appearances: [ParticipantAppearance] = []) {
@@ -127,7 +133,10 @@ public struct ParticipantSourceGeometry: Codable, Equatable, Sendable {
         case analysisIdentity = "analysis_identity"
         case sourceStamp = "source_stamp"
         case sourceInode = "source_inode"
+        case sourceContentSHA256 = "source_content_sha256"
+        case feedLayout = "feed_layout"
         case appearances, coverage
+        case unresolvedParticipantIDs = "unresolved_participant_ids"
     }
 
     public init(from decoder: Decoder) throws {
@@ -137,8 +146,11 @@ public struct ParticipantSourceGeometry: Codable, Equatable, Sendable {
                   analysisIdentity: try values.decodeIfPresent(String.self, forKey: .analysisIdentity),
                   sourceStamp: try values.decodeIfPresent(SceneSourceStamp.self, forKey: .sourceStamp),
                   sourceInode: try values.decodeIfPresent(UInt64.self, forKey: .sourceInode),
+                  sourceContentSHA256: try values.decodeIfPresent(String.self, forKey: .sourceContentSHA256),
+                  feedLayout: try values.decodeIfPresent(ParticipantFeedLayout.self, forKey: .feedLayout),
                   appearances: try values.decodeIfPresent([ParticipantAppearance].self, forKey: .appearances) ?? [],
-                  coverage: try values.decodeIfPresent([ParticipantCoverage].self, forKey: .coverage) ?? [])
+                  coverage: try values.decodeIfPresent([ParticipantCoverage].self, forKey: .coverage) ?? [],
+                  unresolvedParticipantIDs: try values.decodeIfPresent([String].self, forKey: .unresolvedParticipantIDs) ?? [])
     }
 }
 
@@ -315,4 +327,8 @@ public struct ParticipantProject: Codable, Equatable, Sendable {
 
 func invalidParticipantProject(_ message: String) -> CutError {
     CutError(code: "invalid_participant_project", message: message)
+}
+
+func validParticipantSourceDigest(_ digest: String) -> Bool {
+    digest.utf8.count == 64 && digest.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
 }

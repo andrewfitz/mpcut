@@ -10,6 +10,8 @@ public struct CutEngine: Sendable {
     let tracks: ExportTracks
     let audioStream: Int?
     let audioTrackOrdinal: Int?
+    /// The picture is one lane of a multicam program. The later mux adds nothing from the camera file.
+    private let stagesPicture: Bool
 
     /// Select an audio track by absolute stream index, or by zero-based position among each source’s audio tracks.
     public init(cancelled: (@Sendable () -> Bool)? = nil, smartTrim: Bool = false, useSidecar: Bool = true,
@@ -20,6 +22,7 @@ public struct CutEngine: Sendable {
         self.smartTrim = smartTrim && tracks == .all
         self.useSidecar = useSidecar
         self.cancelled = cancelled
+        stagesPicture = false
     }
 
     init(multicamSmartPicture: Bool, cancelled: (@Sendable () -> Bool)?) {
@@ -29,6 +32,7 @@ public struct CutEngine: Sendable {
         smartTrim = multicamSmartPicture
         useSidecar = true
         self.cancelled = cancelled
+        stagesPicture = true
     }
 
     /// Read a complete editing index if one was saved alongside the source.
@@ -63,10 +67,9 @@ public struct CutEngine: Sendable {
     private func cachedMedia(_ file: URL, detail: SidecarIndexDetail,
                              expectedIdentity: SourceIdentity? = nil, progress: ((Double) -> Void)? = nil) throws -> MediaInfo? {
         guard useSidecar, AnalysisSidecar.readsEnabled, file.isFileURL,
-              !AnalysisSidecar.isExcluded(file, in: AnalysisSidecar.excludedSources),
-              FileManager.default.fileExists(atPath: AnalysisSidecar.url(for: file).path)
+              !AnalysisSidecar.isExcluded(file, in: AnalysisSidecar.excludedSources)
         else { return nil }
-        let sidecar = try AnalysisSidecar(source: file)
+        guard let sidecar = try? AnalysisSidecar(source: file) else { return nil }
         let identity = sidecar.identity
         if let expectedIdentity, !expectedIdentity.matchesSnapshot(identity) {
             throw CutError(code: "source_changed", message: "The source changed while opening the clip.")
@@ -392,8 +395,9 @@ public struct CutEngine: Sendable {
                                    segment: firstOccurrence[info.url])
                 }
             }
-            return try resolveSequence(clips, sequence: sequence, uniqueMedia: uniqueMedia,
-                                       container: explicit, snap: snap, boundaries: &boundaries)
+            return try deliveredPicture(resolveSequence(clips, sequence: sequence, uniqueMedia: uniqueMedia,
+                                                        container: explicit, snap: snap, boundaries: &boundaries),
+                                        source: indexed[sequence[0].url])
         }
 
         var defaultFailure: CutError?
@@ -414,16 +418,38 @@ public struct CutEngine: Sendable {
             }) {
                 continue
             }
+            let resolved: ResolvedEdit
             do {
-                return try resolveSequence(clips, sequence: sequence, uniqueMedia: uniqueMedia,
-                                           container: candidate, snap: snap, boundaries: &boundaries)
+                resolved = try resolveSequence(clips, sequence: sequence, uniqueMedia: uniqueMedia,
+                                               container: candidate, snap: snap, boundaries: &boundaries)
             } catch let error as CutError {
                 if error.code == "cancelled" || error.code == "source_changed" { throw error }
                 if defaultFailure == nil { defaultFailure = error }
+                continue
             }
+            return try deliveredPicture(resolved, source: original)
         }
         throw defaultFailure ?? CutError(code: "unsupported_container",
                                          message: "No available container can carry every clip.")
+    }
+
+    /// A picture-only export that a person asked for keeps what describes the picture: the source’s chapters, and its
+    /// MOV timecode track when the container and the ranges can hold it. Timecode that cannot be kept is left behind
+    /// with a stated reason, as it was before picture-only exports carried it at all.
+    private func deliveredPicture(_ resolved: ResolvedEdit, source: MediaInfo?) throws -> ResolvedEdit {
+        guard tracks == .video, !stagesPicture, resolved.tracks == .video else { return resolved }
+        var edit = resolved
+        edit.deliversPicture = true
+        if let track = source?.streams.first(where: { $0.kind == "data" && $0.codecTag == "tmcd" }) {
+            do {
+                try checkTimecode(edit.segments, duration: edit.duration, container: edit.container, track: track.index,
+                                  pictureOnly: true)
+                edit.keepsTimecode = true
+            } catch let issue as CutError where issue.code == "unsupported_timecode" {
+                edit.timecodeIssue = issue.message
+            }
+        }
+        return edit
     }
 
     private func resolveSequence(_ clips: [ClipRequest], sequence: [MediaInfo], uniqueMedia: [MediaInfo],
@@ -747,7 +773,7 @@ public struct CutEngine: Sendable {
         let result = try withNativeSegments(edit.segments, useAudioStreamOverride: programAudio || edit.usesPerSourceAudioStream) { buffer in
             withExtendedLifetime(bridge) {
                 let selection = programAudio ? Int32(MPCUT_TRACKS_PROGRAM_AUDIO)
-                    : audioOnly ? Int32(MPCUT_TRACKS_LINKED_AUDIO) : edit.tracks.native
+                    : audioOnly ? Int32(MPCUT_TRACKS_LINKED_AUDIO) : nativeSelection(edit)
                 return edit.stillMasteringDisplay.withUnsafeBufferPointer { mastering in
                     mpcut_write(buffer.baseAddress, buffer.count, partial.path, selection,
                                 Int32(edit.audioStream ?? -1), mastering.isEmpty ? nil : mastering.baseAddress,
@@ -779,8 +805,34 @@ public struct CutEngine: Sendable {
         }
     }
 
+    /// The selection the writer is given for a file a person keeps. A delivered picture is told apart from a staged
+    /// picture lane, which carries neither chapters nor timecode.
+    private func nativeSelection(_ edit: ResolvedEdit) -> Int32 {
+        guard edit.tracks == .video, edit.deliversPicture else { return edit.tracks.native }
+        return Int32(edit.keepsTimecode ? MPCUT_TRACKS_DELIVERED_VIDEO_TIMECODE : MPCUT_TRACKS_DELIVERED_VIDEO)
+    }
+
+    /// What a packet copy of this edit leaves behind, one sentence each: cover art or chapters that the container
+    /// cannot store, chapters that have no place on the output timeline, and timecode a picture-only copy cannot keep.
+    /// Only file headers are read. A source that cannot be opened reports nothing here; the export itself reports it.
+    public func copyOmissions(_ edit: ResolvedEdit) -> [String] {
+        var omissions: [String] = []
+        if let issue = edit.timecodeIssue {
+            omissions.append("The timecode track is not copied. \(issue)")
+        }
+        var notes = [CChar](repeating: 0, count: 2048)
+        let capacity = notes.count
+        let selection = nativeSelection(edit)
+        let status = try? withNativeSegments(edit.segments, useAudioStreamOverride: edit.usesPerSourceAudioStream) { buffer in
+            mpcut_copy_omissions(buffer.baseAddress, buffer.count, "movie.\(edit.container)", selection,
+                                 Int32(edit.audioStream ?? -1), &notes, capacity)
+        }
+        guard status == 0 else { return omissions }
+        return omissions + String(cString: notes).split(separator: "\n").map(String.init)
+    }
+
     private func checkTimecode(_ segments: [ResolvedSegment], duration: RationalTime,
-                               container: String, track: Int) throws {
+                               container: String, track: Int, pictureOnly: Bool = false) throws {
         let bridge = ExportProgress { _ in self.cancelled?() != true }
         let nativeDuration = MPCutTime(numerator: duration.numerator, denominator: duration.denominator)
         var failedSegment = 0
@@ -788,9 +840,10 @@ public struct CutEngine: Sendable {
         let capacity = diagnostic.count
         let result = try withNativeSegments(segments) { buffer in
             withExtendedLifetime(bridge) {
-                mpcut_check_timecode(buffer.baseAddress, buffer.count, nativeDuration, "movie.\(container)",
-                                     &failedSegment, ExportProgress.callback, Unmanaged.passUnretained(bridge).toOpaque(),
-                                     &diagnostic, capacity)
+                (pictureOnly ? mpcut_check_video_timecode : mpcut_check_timecode)(
+                    buffer.baseAddress, buffer.count, nativeDuration, "movie.\(container)",
+                    &failedSegment, ExportProgress.callback, Unmanaged.passUnretained(bridge).toOpaque(),
+                    &diagnostic, capacity)
             }
         }
         if result == 2 { throw cancellationError }

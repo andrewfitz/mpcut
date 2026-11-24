@@ -135,6 +135,7 @@ final class AudioEditorTests: XCTestCase {
         XCTAssertNil(model.alert, model.alert?.message ?? "")
         XCTAssertEqual(model.sequenceClips.first?.id, originalID)
         XCTAssertEqual(Set(model.sequenceClips.map(\.id)).count, 2)
+        XCTAssertEqual(model.sequenceClips.map(\.id.count), [ProjectIdentifier.length, ProjectIdentifier.length])
         let pieces = model.timelineClips
         XCTAssertEqual(pieces.count, 2)
         XCTAssertEqual(pieces[0].sourceEnd * 48_000, (pieces[0].sourceEnd * 48_000).rounded(), accuracy: 1e-8)

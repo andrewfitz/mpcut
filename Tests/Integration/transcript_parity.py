@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import wave
+from saved_project import read_project
 
 
 def run_suite(cli, directory):
@@ -144,7 +145,7 @@ def run_suite(cli, directory):
     assert corrected["text"] == "Corrected cue" and corrected["range"] == bounds(2, 3), corrected
     unchanged, = locate(segment_path, "s0-w0")
     assert unchanged["text"] == "Segment only", unchanged
-    authored = json.loads(Path(saved_as).read_text())
+    authored = read_project(Path(saved_as))
     assert len(authored["history"]["undo"]) == 1, authored["history"]
 
     edited = project("edited")
@@ -155,7 +156,7 @@ def run_suite(cli, directory):
         "action": "delete", "boundary_policy": "exact", "selections": [{"first_word_id": "s0-w1"}],
     })
     transcript("edit apply", project_path=edited, plan_file=plan_path, in_place=True)
-    edited_project = json.loads(Path(edited).read_text())
+    edited_project = read_project(Path(edited))
     kept = [bounds(clip["from"], clip["to"]) for clip in edited_project["clips"]]
     assert kept == [bounds(0, 2), bounds(3, 8)] and len(edited_project["history"]["undo"]) == 1, edited_project
     stale_plan = str(directory / "stale.json")

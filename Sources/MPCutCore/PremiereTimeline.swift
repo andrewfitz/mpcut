@@ -61,6 +61,7 @@ enum PremiereTimeline {
         case .stillSequence:
             throw issue("Premiere timeline XML has no verified mapping for MPCut stills.")
         case .sequence(let clips):
+            try InterchangeMediaPreflight.require(clips.map(\.file), relativeTo: location)
             var position = RationalTime.zero
             for clip in clips {
                 let file = try CutProject.checkedMediaURL(clip.file, relativeTo: location)
@@ -74,27 +75,39 @@ enum PremiereTimeline {
         case .multicam(let group):
             let plan = try group.plan()
             programDuration = plan.duration
-            let cameras = try group.pictureSources.map { try inspect(CutProject.checkedMediaURL($0.file, relativeTo: location)) }
+            let sources = Dictionary(uniqueKeysWithValues: group.sources.map { ($0.id, $0) })
+            let permitsNative = !flattenMulticam && (2...4).contains(group.pictureSources.count)
+                && group.angles.allSatisfy { $0.offset == .zero && $0.coverage == nil && $0.additionalRecordings.isEmpty }
+            let selectedIDs = Set(plan.intervals.compactMap(\.pictureSourceID))
+                .union(plan.intervals.compactMap { $0.audio?.source })
+            let required = permitsNative ? selectedIDs.union(group.pictureSources.map(\.id)) : selectedIDs
+            try InterchangeMediaPreflight.require(required.compactMap { sources[$0]?.file }, relativeTo: location)
+            let cameras = try permitsNative ? group.pictureSources.map {
+                try inspect(CutProject.checkedMediaURL($0.file, relativeTo: location))
+            } : []
             guard cameras.allSatisfy(\.hasVideo) else { throw issue("Each multicam camera must link to a video recording.") }
-            if let index = group.pictureSources.firstIndex(where: { $0.id == group.referenceAngle }) {
+            if let index = group.pictureSources.firstIndex(where: { $0.id == group.referenceAngle }),
+               cameras.indices.contains(index) {
                 referenceVideo = cameras[index].videoStream
             }
             let fps = cameras.first?.videoStream?.frameRate
-            let native = !flattenMulticam && (2...4).contains(cameras.count)
-                && group.angles.allSatisfy { $0.offset == .zero && $0.coverage == nil && $0.additionalRecordings.isEmpty }
-                && cameras.allSatisfy { $0.videoStream != nil && $0.videoStream?.frameRate == fps
-                    && $0.multicamSourceOffset == .zero && $0.duration >= group.range.to }
+            let native = permitsNative && cameras.allSatisfy {
+                $0.videoStream != nil && $0.videoStream?.frameRate == fps
+                    && $0.multicamSourceOffset == .zero && $0.duration >= group.range.to
+            }
             if native {
                 nativeGroup = group
                 warnings.insert("Premiere has editable native camera angles and separate microphone tracks. To import these edits back into MPCut, flatten a copy in Premiere first.")
             } else {
                 try loss("Premiere receives the selected camera and microphone edits as separate timeline clips. Alternate angles and the multicam group are omitted.")
             }
-            let sources = Dictionary(uniqueKeysWithValues: group.sources.map { ($0.id, $0) })
             func append(_ interval: MulticamInterval, sourceID: String, stream: Int?) throws {
                 guard let source = sources[sourceID] else { throw issue("Missing multicam source \(sourceID).") }
                 let url = try CutProject.checkedMediaURL(source.file, relativeTo: location)
                 let info = try inspect(url)
+                if stream == nil && !info.hasVideo {
+                    throw issue("Each selected multicam camera must link to a video recording: \(url.path)")
+                }
                 let audio = info.streams.filter { $0.kind == "audio" }
                 let ordinal = stream.flatMap { id in audio.firstIndex { $0.index == id } }
                 if stream != nil && ordinal == nil { throw issue("Missing selected microphone stream in \(url.path).") }
@@ -336,6 +349,12 @@ extension PremiereTimeline {
     }
 
     static func read(_ xml: URL, allowLoss: Bool) throws -> (CutProject, [String]) {
+        let imported = try readDocument(xml, allowLoss: allowLoss)
+        return (imported.project, imported.warnings)
+    }
+
+    static func readDocument(_ xml: URL, allowLoss: Bool) throws
+        -> (project: CutProject, warnings: [String], mediaSnapshot: ProjectMediaSnapshot) {
         let data: Data
         do { data = try ProjectFile.readBytes(from: xml) }
         catch { throw issue(error.localizedDescription) }
@@ -444,6 +463,12 @@ extension PremiereTimeline {
         let audio = sounds.flatMap { $0 }
         let engine = CutEngine(useSidecar: false)
         var metadata: [String: MediaInfo] = [:]
+        func imported(_ project: CutProject) -> (CutProject, [String], ProjectMediaSnapshot) {
+            let entries = metadata.keys.sorted().compactMap { path in
+                metadata[path].map { ProjectMediaSnapshot.Entry(path: path, media: $0) }
+            }
+            return (project, warnings.sorted(), ProjectMediaSnapshot(entries: entries))
+        }
         func inspect(_ path: String) throws -> MediaInfo {
             if let media = metadata[path] { return media }
             let url = URL(fileURLWithPath: path)
@@ -500,7 +525,7 @@ extension PremiereTimeline {
             }
             let project = CutProject.sequence(clips)
             try project.validate()
-            return (project, warnings.sorted())
+            return imported(project)
         }
         guard !pictures.isEmpty, last > .zero else { throw issue("Independent audio tracks over an audio-only interval cannot be represented in MPCut.") }
         let pictureHasGaps = pictureItems.first?.start != .zero || pictureItems.last?.end != last
@@ -587,6 +612,6 @@ extension PremiereTimeline {
         let group = MulticamProject(referenceAngle: reference.id, range: .init(from: .zero, to: last),
                                     angles: angles, audioSources: microphones, audio: .none, switches: switches)
         try group.validate()
-        return (.multicam(group), warnings.sorted())
+        return imported(.multicam(group))
     }
 }

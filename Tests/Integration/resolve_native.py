@@ -9,6 +9,13 @@ import unittest
 import xml.etree.ElementTree as ET
 
 from media_regression import ffmpeg
+from saved_project import read_project
+
+
+def media_path(project, entry):
+    """A saved project lists each media path once and an entry gives its position."""
+    file = entry["file"]
+    return project["files"][file] if isinstance(file, int) else file
 
 
 class ResolveNativeTests(unittest.TestCase):
@@ -39,10 +46,11 @@ class ResolveNativeTests(unittest.TestCase):
                     self.assertEqual(blocked["error"]["code"], "conversion_loss")
                     self.assertFalse(restored.exists())
                     self.convert(native, restored, "--allow-loss")
-                    clips = json.loads(restored.read_text())["clips"]
+                    saved = read_project(restored)
+                    clips = saved["clips"]
                     self.assertEqual([(c["from"], c["to"]) for c in clips], ranges)
                     for clip in clips:
-                        self.assertEqual((folder / clip["file"]).resolve(), media.resolve())
+                        self.assertEqual((folder / media_path(saved, clip)).resolve(), media.resolve())
 
     def test_host_timebase_and_raster_substitutions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,11 +96,11 @@ class ResolveNativeTests(unittest.TestCase):
                     self.convert(source, native)
                     restored = folder / f"multi-back-{ext}.cut"
                     self.convert(native, restored, "--allow-loss")
-                    project = json.loads(restored.read_text())
+                    project = read_project(restored)
                     close = next(angle for angle in project["angles"] if angle["name"] == "Close")
                     for entry, file, bounds in [(close, "close-first.mov", {"from": "0", "to": "1"}),
                                                  (close["additional_recordings"][0], "close-second.mov", end)]:
-                        self.assertEqual((folder / entry["file"]).resolve(), (folder / file).resolve())
+                        self.assertEqual((folder / media_path(project, entry)).resolve(), (folder / file).resolve())
                         self.assertEqual(entry["group_coverage"], bounds)
                     # Verify the reconstructed program through the normal Resolve handoff.
                     # Native interchange regenerates angle and recording IDs.

@@ -18,6 +18,7 @@ import wave
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "docs"))
 from mcp_walkthrough import Client, PROTOCOL_VERSION, timed_out
+from saved_project import read_project
 
 
 def exercise(client, folder):
@@ -72,7 +73,7 @@ def exercise(client, folder):
     job("project_file_edit", request=dict(project_path=seq, out_project=str(edited), operations=[
         dict(action="split", id="a", at="2", new_id="c"), {"action": "trim", "id": "b", "from": "1", "to": "3"},
         dict(action="move", id="c", index=0), dict(action="remove", id="a")]))
-    assert [c["id"] for c in json.loads(edited.read_bytes())["clips"]] == ["c", "b"]
+    assert [c["id"] for c in read_project(edited)["clips"]] == ["c", "b"]
     original = Path(seq).read_bytes()
     job("project_file_edit", error="output_exists", request=dict(project_path=seq, out_project=seq, operations=[]))
     invalid = folder / "invalid.cut"
@@ -116,7 +117,7 @@ def exercise(client, folder):
     job("silence_file_shorten", error="invalid_arguments", **options, out_project=str(shortened), protect_pauses=["stale"])
     assert not shortened.exists()
     job("silence_file_shorten", **options, out_project=str(shortened), protect_pauses=[report["pauses"][0]["id"]])
-    assert len(json.loads(shortened.read_bytes())["clips"]) == 3
+    assert len(read_project(shortened)["clips"]) == 3
     job("silence_file_export", **options, output=str(folder / "short.wav"))
     with wave.open(str(folder / "short.wav"), "rb") as shortened_audio:
         assert shortened_audio.getnframes() < 8 * shortened_audio.getframerate()

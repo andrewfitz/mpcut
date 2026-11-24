@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check shared sidecar creation, reuse, invalidation and concurrent saves."""
 import argparse
+import base64
 from fractions import Fraction
 import hashlib
 import json
@@ -11,11 +12,13 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
-from sidecar_payload import section_bytes
+from sidecar_payload import section_bytes, section_digest
 
 
 FIXTURES = Path(__file__).resolve().parents[1] / "MPCutAppTests" / "Fixtures"
@@ -25,6 +28,10 @@ class Sidecar(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
+        self.cache_home = Path(temp.name) / "preferences"
+        isolated = patch.dict(os.environ, {"MPCUT_SIDECAR_HOME": str(self.cache_home)})
+        isolated.start()
+        self.addCleanup(isolated.stop)
         self.source = Path(temp.name) / "Interview.mov"
         shutil.copyfile(FIXTURES / "Pause-Quiet.mov", self.source)
         self.sidecar = self.source.with_suffix(".mov.cutdb")
@@ -39,6 +46,148 @@ class Sidecar(unittest.TestCase):
 
     def save(self, *flags):
         return self.cli("analysis", "sidecar", "build", "--json", *flags, self.source)
+
+    def project_index_copy(self):
+        self.save("--only", "index")
+        (self.cache_home / "config.json").write_text(json.dumps({"mode": "project"}))
+        project = self.source.parent / "Edit.cut"
+        project.write_text(json.dumps({
+            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "clips": [{"id": "trim", "file": self.source.name, "from": "0", "to": "1"}],
+        }))
+        return Path(self.save("--project", project, "--only", "index")["write_location"])
+
+    def test_inventory_requires_a_complete_index_in_one_copy(self):
+        other = self.project_index_copy()
+        with sqlite3.connect(other) as db:
+            db.execute("DELETE FROM sections WHERE name='media_index_audio.v1'")
+        self.assertTrue(self.status()["inventory"]["has_index"])
+        with sqlite3.connect(self.sidecar) as db:
+            db.execute("DELETE FROM sections WHERE name='media_index_frames.v1'")
+        result = self.status()
+        self.assertTrue({"media_index.v1", "media_index_audio.v1", "media_index_frames.v1"} <= set(result["sections"]))
+        self.assertFalse(result["inventory"]["has_index"])
+
+    def test_inventory_rejects_conflicting_same_stamp_copies(self):
+        other = self.project_index_copy()
+        key = "media_refresh_evidence.v1"
+        with sqlite3.connect(other) as db:
+            evidence = json.loads(section_bytes(db, key))
+            stream = next(s for s in evidence["streams"] if s.get("payload"))
+            proof = bytearray(base64.b64decode(stream["payload"]))
+            proof[0] ^= 1
+            stream["payload"] = base64.b64encode(proof).decode("ascii")
+            encoded = json.dumps(evidence).encode()
+            stamp = db.execute("SELECT stamp FROM source WHERE id=1").fetchone()[0]
+            digest = hashlib.sha256(stamp.encode() + b"\0" + key.encode() + b"\0" + encoded).digest()
+            db.execute("UPDATE sections SET digest=?, value=?, logical_size=0 WHERE name=?", (digest, encoded, key))
+        result = self.status()
+        self.assertEqual(result["status"], "stale")
+        self.assertIn("evidence", result["stale_reason"])
+        self.assertFalse(result["inventory"]["has_index"])
+        self.assertEqual(result["sections"], [])
+
+    def test_project_location_save_read_and_collision_handling(self):
+        self.cache_home.mkdir()
+        (self.cache_home / "config.json").write_text(json.dumps({"mode": "project"}))
+        directory = self.source.parent / "Cut Project"
+        directory.mkdir()
+        project = directory / "Edit.cut"
+        project.write_text(json.dumps({
+            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "clips": [{"id": "trim", "file": str(self.source), "from": "0", "to": "1"}]
+        }))
+        self.assertEqual(self.status()["status"], "missing")
+        error = self.cli("analysis", "sidecar", "build", "--only", "index", self.source, "--json", success=False)
+        self.assertIn("project", error["error"]["message"].lower())
+        first = self.save("--project", project, "--only", "index")
+        cache = Path(first["write_location"])
+        self.assertTrue(cache.resolve().is_relative_to((directory / "MPCut Cache").resolve()))
+        self.assertTrue(cache.is_file())
+        self.assertFalse(self.sidecar.exists())
+        self.assertEqual(self.status()["read_locations"], [str(cache)])
+        self.cli("scenes", "scan", "--project", project, "--all-sources", "--json")
+        inventory = self.cli("analysis", "sidecar", "inspect", "--project", project, "--json", self.source)
+        self.assertEqual(inventory["read_location"], str(cache))
+        self.assertTrue(inventory["inventory"]["has_scenes"])
+        same_name = self.source.parent / "other" / self.source.name
+        same_name.parent.mkdir()
+        shutil.copyfile(self.source, same_name)
+        other = self.cli("analysis", "sidecar", "build", "--project", project, "--only", "index", "--json", same_name)
+        self.assertNotEqual(other["write_location"], str(cache))
+
+        # A later process uses the new write preference and can still find the
+        # existing project data without a project argument.
+        (self.cache_home / "config.json").write_text(json.dumps({"mode": "media"}))
+        adjacent = self.save("--only", "audio", "--stream", "1")
+        self.assertEqual(Path(adjacent["write_location"]).resolve(), self.sidecar.resolve())
+        merged = self.status()
+        self.assertEqual({Path(path).resolve() for path in merged["read_locations"]}, {cache.resolve(), self.sidecar.resolve()})
+        self.assertTrue(merged["inventory"]["has_index"])
+        self.assertTrue(merged["inventory"]["has_scenes"])
+        self.assertEqual(merged["inventory"]["waveform_streams"], [1])
+
+    def test_mixed_join_uses_each_saved_projects_folder(self):
+        self.cache_home.mkdir()
+        (self.cache_home / "config.json").write_text(json.dumps({"mode": "project"}))
+        projects = []
+        for folder in ["First", "Second"]:
+            directory = self.source.parent / folder
+            directory.mkdir()
+            shutil.copyfile(self.source, directory / "cam.mov")
+            project = directory / "edit.cut"
+            project.write_text(json.dumps({
+                "format": "mpcut", "schema_version": 3, "kind": "multicam", "reference_angle_id": "wide",
+                "group_range": {"from": "0", "to": "1"},
+                "angles": [{"id": "wide", "file": "cam.mov", "offset": "0", "audio_stream_index": 1}],
+                "audio": {"mode": "follow"}, "switches": [{"group_time": "0", "angle_id": "wide"}],
+            }))
+            projects.append(project)
+        request = self.source.parent / "join.json"
+        request.write_text(json.dumps({"clips": [{"project_path": str(p), "to": "1"} for p in projects],
+                                       "output": str(self.source.parent / "out.mov")}))
+        self.cli("export", "clips", "join", "--input", request, "--dry-run", "--json")
+        for project in projects:
+            status = self.cli("analysis", "sidecar", "inspect", "--json", project.parent / "cam.mov")
+            self.assertTrue(Path(status["read_location"]).resolve().is_relative_to((project.parent / "MPCut Cache").resolve()))
+            self.assertFalse((project.parent / "cam.mov.cutdb").exists())
+
+    def test_project_inspection_is_read_only_without_config_or_catalog(self):
+        project = self.source.parent / "Edit.cut"
+        project.write_text(json.dumps({
+            "format": "mpcut", "schema_version": 3, "kind": "sequence",
+            "clips": [{"id": "trim", "file": self.source.name, "from": "0", "to": "1"}]
+        }))
+        result = self.cli("analysis", "sidecar", "inspect", "--project", project, "--json", self.source)
+        self.assertEqual(result["status"], "missing")
+        self.assertNotIn("read_location", result)
+        self.assertFalse(self.cache_home.exists())
+        self.assertFalse((project.parent / "MPCut Cache").exists())
+        self.assertFalse(self.sidecar.exists())
+        error = self.cli("analysis", "sidecar", "inspect", "--project", "-", "--json", self.source, success=False)
+        self.assertEqual(error["error"]["code"], "invalid_arguments")
+
+    def test_inspection_preserves_a_crashed_writers_hot_journal(self):
+        self.save("--only", "index")
+        # Force dirty pages to spill to the database before simulating a crash.
+        # A read-write SQLite pager would roll this transaction back on inspect.
+        crash = """
+import os, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("PRAGMA cache_size=1")
+db.execute("BEGIN IMMEDIATE")
+db.execute("UPDATE sections SET value=randomblob(2000000)")
+os._exit(0)
+"""
+        subprocess.run([sys.executable, "-c", crash, self.sidecar], check=True)
+        journal = Path(str(self.sidecar) + "-journal")
+        before = self.sidecar.read_bytes(), journal.read_bytes()
+        self.assertEqual(before[1][:8], bytes.fromhex("d9d505f920a163d7"))
+        self.status()
+        self.assertEqual((self.sidecar.read_bytes(), journal.read_bytes()), before)
+        self.save("--only", "index")
+        self.assertFalse(journal.exists())
+        self.assertTrue(self.status()["inventory"]["has_index"])
 
     def test_complete_edition_and_analysis_round_trip(self):
         # Different room floors on two linked audio streams.
@@ -94,7 +243,7 @@ class Sidecar(unittest.TestCase):
         auto = self.save("--only", "audio")
         tracks = sum(s.startswith("waveform_peaks.v1.") for s in auto["sections"])
         self.assertGreater(tracks, 0)
-        self.assertEqual(sum(s.startswith("silence_pauses.v1.") for s in auto["sections"]), tracks + 1)
+        self.assertEqual(sum(s.startswith("silence_pauses.") for s in auto["sections"]), tracks + 1)
         self.assertIn("scenes_boundaries.v1", auto["sections"])
         before = self.source.stat()
         os.utime(self.source, ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000))
@@ -112,7 +261,7 @@ class Sidecar(unittest.TestCase):
         evidence_key = "media_refresh_evidence.v1"
         frame_key = "media_index_frames.v1"
         with sqlite3.connect(self.sidecar) as db:
-            frames = section_bytes(db, frame_key)
+            frames = section_digest(db, frame_key)
             db.execute("DELETE FROM sections WHERE name=?", (evidence_key,))
         self.assertEqual(self.save("--only", "index")["saved"], expected["saved"])
         with sqlite3.connect(self.sidecar) as db:
@@ -122,7 +271,7 @@ class Sidecar(unittest.TestCase):
             db.execute("UPDATE sections SET logical_size=0, value=?, digest=? WHERE name=?", (invalid, digest, frame_key))
         self.assertEqual(self.save("--only", "index")["saved"], expected["saved"])
         with sqlite3.connect(self.sidecar) as db:
-            self.assertEqual(section_bytes(db, frame_key), frames)
+            self.assertEqual(section_digest(db, frame_key), frames)
 
     def test_foreign_neighbor_is_a_read_miss_and_survives_save(self):
         self.sidecar.write_bytes(b"user-owned file")
@@ -155,7 +304,8 @@ class Sidecar(unittest.TestCase):
 
     def test_concurrent_repair_keeps_every_silence_profile(self):
         self.sidecar.touch()
-        thresholds = [str(i) for i in range(-52, -44)]
+        # A sidecar keeps the latest four silence settings of a stream.
+        thresholds = [str(i) for i in range(-48, -44)]
         jobs = [subprocess.Popen([CLI, "--no-sidecar", "analysis", "sidecar", "build", "--only", "audio", "--stream", "1",
                                   "--threshold-db", level, self.source], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 for level in thresholds]

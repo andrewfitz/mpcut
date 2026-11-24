@@ -39,7 +39,7 @@ struct ReencodeVideo: Sendable {
         }
         let transfer = stillColor?.transfer ?? stream.colorTransfer
         let hdr = ["smpte2084", "arib-std-b67"].contains(transfer)
-        let maximumDepth = settings.codec == .h264 ? 8 : 10
+        let maximumDepth = settings.codec == .h264 || settings.codec == .jpeg ? 8 : 10
         guard !hdr || maximumDepth >= 10 else {
             throw CutError(code: "unsupported_format", message: "The selected hardware profile cannot preserve the source’s HDR transfer function.")
         }
@@ -62,12 +62,17 @@ struct ReencodeVideo: Sendable {
         case (.h264, .smallerFile), (.hevc, .smallerFile): quality = ["-q:v", "45"]
         case (.h264, .balanced), (.hevc, .balanced): quality = ["-q:v", "60"]
         case (.h264, .highQuality), (.hevc, .highQuality): quality = ["-q:v", "75"]
+        case (.jpeg, .smallerFile): quality = ["-q:v", "5"]
+        case (.jpeg, .balanced): quality = ["-q:v", "3"]
+        case (.jpeg, .highQuality): quality = ["-q:v", "2"]
         default:
             throw CutError(code: "unsupported_quality", message: "Choose a quality available for the selected video codec.")
         }
 
         if settings.codec == .prores {
             pixelFormat = "p210le"
+        } else if settings.codec == .jpeg {
+            pixelFormat = "yuvj420p"
         } else if settings.codec == .hevc, stream.bitDepth > 8 || hdr || frame?.deep == true {
             pixelFormat = "p010le"
         } else {
@@ -75,12 +80,13 @@ struct ReencodeVideo: Sendable {
         }
         let matrix = stillColor?.matrix ?? (stream.colorMatrix == "gbr" ? "bt709" : stream.colorMatrix)
         let values = [("-color_primaries", stillColor?.primaries ?? stream.colorPrimaries), ("-color_trc", transfer),
-                      ("-colorspace", matrix), ("-color_range", stillColor?.range ?? stream.colorRange)]
+                      ("-colorspace", matrix), ("-color_range", settings.codec == .jpeg ? "pc" : stillColor?.range ?? stream.colorRange)]
         let color = values.flatMap { option, value in
             value.isEmpty || ["unknown", "unspecified", "reserved"].contains(value) ? [] : [option, value]
         }
-        arguments = ["-c:v", settings.codec.encoder, "-allow_sw", "0", "-bf", "0"]
-            + quality + color
+        let encoder = ["-c:v", settings.codec.encoder]
+        let hardware = settings.codec == .jpeg ? [] : ["-allow_sw", "0", "-bf", "0"]
+        arguments = encoder + hardware + quality + color
     }
 
     /// Chroma sampling of an FFmpeg pixel format name, ordered so that a larger value keeps more chroma.
@@ -171,12 +177,12 @@ extension ReencodeEngine {
         if let canvas {
             for (action, sound) in zip(actions, canvas.audio) where [.aac, .pcm].contains(action.action) {
                 converted.append(Sound(rate: sound.sampleRate, channels: sound.channels, layout: sound.layout, index: action.track,
-                                       options: audioOptions(action.action, sound: sound, outputIndex: converted.count)))
+                                       options: audioOptions(action, sound: sound, outputIndex: converted.count)))
             }
         } else {
             for (action, track) in zip(actions, audio) where [.aac, .pcm].contains(action.action) || exactPCM.contains(action.track) {
                 converted.append(Sound(rate: track.sampleRate, channels: track.channels, layout: try audioLayout(track), index: track.index,
-                                       options: audioOptions(action.action, track: track, outputIndex: converted.count,
+                                       options: audioOptions(action, track: track, outputIndex: converted.count,
                                                              exactPCM: exactPCM.contains(action.track))))
             }
         }

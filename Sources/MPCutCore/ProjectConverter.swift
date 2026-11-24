@@ -87,6 +87,10 @@ public enum ProjectConverter {
         case .sequence:
             result = project
         case .stillSequence(var sequence):
+            if sequence.stillSoundtrack != nil {
+                warnings.append("\(destination) omits the attached still soundtrack.")
+                sequence.stillSoundtrack = nil
+            }
             if !sequence.sourceSelects.isEmpty {
                 warnings.append("\(destination) omits MPCut named source selects.")
                 sequence.sourceSelects = []
@@ -181,12 +185,13 @@ public enum ProjectConverter {
         if source == .cut && destination == .cut {
             let document = try CutProject.loadDocument(from: input, limit: CutProject.maximumHistorySteps,
                                                        validatingDestination: output)
-            try writeCut(document.project, undo: document.undo, redo: document.redo,
+            try writeCut(document.project, undo: document.undo, redo: document.redo, mediaSnapshot: document.mediaSnapshot,
                          relativeTo: input, to: output, cancelled: cancelled)
             return []
         }
         let project: CutProject
         let warnings: [String]
+        let mediaSnapshot: ProjectMediaSnapshot
         switch source {
         case .cut:
             let document = try CutProjectMedia.load(from: input)
@@ -197,12 +202,16 @@ public enum ProjectConverter {
                 try write(document.project, relativeTo: input, to: output, allowLoss: allowLoss,
                           flattenMulticam: flattenMulticam, cancelled: cancelled)
             }
-        case .drp, .drt: (project, warnings) = try ResolveNativeInterchange.read(input, allowLoss: allowLoss, cancelled: cancelled)
-        case .prproj: (project, warnings) = try PremiereInterchange.read(input, allowLoss: allowLoss)
-        case .fcpxml, .fcpxmld: (project, warnings) = try FCPInterchange.read(input, allowLoss: allowLoss)
-        case .fcpbundle: (project, warnings) = try FCPLibraryInterchange.read(input, allowLoss: allowLoss, cancelled: cancelled)
+        case .drp, .drt:
+            (project, warnings, mediaSnapshot) = try ResolveNativeInterchange.readDocument(input, allowLoss: allowLoss, cancelled: cancelled)
+        case .prproj:
+            (project, warnings, mediaSnapshot) = try PremiereInterchange.readDocument(input, allowLoss: allowLoss)
+        case .fcpxml, .fcpxmld:
+            (project, warnings, mediaSnapshot) = try FCPInterchange.readDocument(input, allowLoss: allowLoss)
+        case .fcpbundle:
+            (project, warnings, mediaSnapshot) = try FCPLibraryInterchange.readDocument(input, allowLoss: allowLoss, cancelled: cancelled)
         }
-        let exportWarnings = try write(project, relativeTo: input, to: output, allowLoss: allowLoss,
+        let exportWarnings = try write(project, relativeTo: input, to: output, mediaSnapshot: mediaSnapshot, allowLoss: allowLoss,
                                        flattenMulticam: flattenMulticam, cancelled: cancelled)
         return warnings + exportWarnings
     }
@@ -229,7 +238,7 @@ public enum ProjectConverter {
 
     /// Export an open editor snapshot. Relative media paths use its document location.
     public static func write(_ project: CutProject, relativeTo input: URL, to output: URL,
-                             allowLoss: Bool = false, flattenMulticam: Bool = false,
+                             mediaSnapshot: ProjectMediaSnapshot = .empty, allowLoss: Bool = false, flattenMulticam: Bool = false,
                              auxiliaryOutput: ((URL) -> Void)? = nil,
                              cancelled: @escaping @Sendable () -> Bool = { false }) throws -> [String] {
         try checkCancellation(cancelled)
@@ -239,7 +248,7 @@ public enum ProjectConverter {
         switch destination {
         case .cut:
             let imported = (try? Format(url: input)).map { $0 != .cut } ?? false
-            try writeCut(project, undo: [], redo: [], relativeTo: input, to: output,
+            try writeCut(project, undo: [], redo: [], mediaSnapshot: mediaSnapshot, relativeTo: input, to: output,
                          makeRelative: imported, cancelled: cancelled)
             return []
         case .drp, .drt:
@@ -257,7 +266,7 @@ public enum ProjectConverter {
     }
 
     private static func writeCut(_ project: CutProject, undo: [CutHistoryState], redo: [CutHistoryState],
-                                 relativeTo input: URL, to output: URL, makeRelative: Bool = false,
+                                 mediaSnapshot: ProjectMediaSnapshot, relativeTo input: URL, to output: URL, makeRelative: Bool = false,
                                  cancelled: () -> Bool) throws {
         var paths: [String: String] = [:]
         func rebase(_ value: CutProject) throws -> CutProject {
@@ -265,11 +274,14 @@ public enum ProjectConverter {
             return try value.rebased(from: input, to: output, paths: &paths, makeRelative: makeRelative)
         }
         func rebaseState(_ state: CutHistoryState) throws -> CutHistoryState {
-            try CutHistoryState(action: state.action, origin: state.origin, project: rebase(state.project))
+            try checkCancellation(cancelled)
+            return try state.rebased(from: input, to: output, paths: &paths, makeRelative: makeRelative)
         }
         let document = try rebase(project)
         try document.saveNewCopy(to: output, copyingTranscriptsFrom: input, undo: undo.map(rebaseState),
-                                 redo: redo.map(rebaseState)) {
+                                 redo: redo.map(rebaseState), mediaSnapshot: mediaSnapshot.rebased(
+                                     from: input, to: output, makeRelative: makeRelative
+                                 )) {
             try checkCancellation(cancelled)
         }
     }

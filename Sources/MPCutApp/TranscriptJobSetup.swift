@@ -13,6 +13,15 @@ private struct TranscriptEngines: Decodable {
         let estimated_realtime_factor: Double?
         var id: String { name }
 
+        var title: String {
+            switch name {
+            case "qwen3": "Qwen3"
+            case "parakeet-v3": "Parakeet v3"
+            case "apple-native": "Apple Speech"
+            default: name
+            }
+        }
+
         var available: Bool {
             let version = minimum_macos.split(separator: ".").compactMap { Int($0) }
             guard let major = version.first, included, helper_present != false else { return false }
@@ -31,9 +40,30 @@ private struct TranscriptEngines: Decodable {
     let engines: [Engine]
 }
 
+struct TranscriptSetupTarget: Hashable {
+    let file: URL
+    let sourceID: String?
+    let stream: Int
+    let channel: Int?
+
+    func matches(_ track: TranscriptJobTrack) -> Bool {
+        track.streamIndex == stream && (track.file.standardizedFileURL == file.standardizedFileURL ||
+                                        sourceID.map { track.projectSourceID == $0 } == true)
+    }
+}
+
+struct TranscriptSetupRequest: Equatable {
+    let id = UUID()
+    let targets: Set<TranscriptSetupTarget>
+}
+
 struct TranscriptJobSetup: View {
     let controller: LiveTranscriptController
+    var targets: Set<TranscriptSetupTarget> = []
     let start: (TranscriptJobOptions, Bool) throws -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var showsOptions = false
+    @State private var contentHeight: CGFloat = 160
     @State private var tracks: [TranscriptJobTrack] = []
     @State private var excluded: Set<String> = []
     @State private var trackOptions: [String: TranscriptJobTrackOptions] = [:]
@@ -41,7 +71,7 @@ struct TranscriptJobSetup: View {
     @State private var engines: [TranscriptEngines.Engine] = []
     @State private var supportsPlan = false
     @State private var zoomSuggestions: [String: [TranscriptZoomParticipant]] = [:]
-    @State private var useZoom: Set<String> = []
+    @State private var zoomOverrides: [String: Bool] = [:]
     @State private var checkingZoom = true
     @State private var skipDiscovery = false
     @State private var cancelZoomQuery: (() -> Void)?
@@ -59,9 +89,14 @@ struct TranscriptJobSetup: View {
     @State private var providerError: String?
     @State private var inventoryError: String?
     private var loading: Bool { providerStatus != nil || readingTracks || (checkingZoom && !skipDiscovery) }
+    private func usesZoom(_ id: String) -> Bool {
+        guard let participants = zoomSuggestions[id] else { return false }
+        return zoomOverrides[id] ?? (Set(participants.map(\.speaker)).count > 1)
+    }
+
     private var hasMixedAudio: Bool {
         tracks.contains { track in
-            track.streamIndex != nil && !excluded.contains(track.id) && !useZoom.contains(track.id)
+            track.streamIndex != nil && !excluded.contains(track.id) && !usesZoom(track.id)
                 && (trackOptions[track.id]?.role ?? track.role) != TranscriptRole.isolatedMic.rawValue
         }
     }
@@ -74,24 +109,56 @@ struct TranscriptJobSetup: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            if let providerStatus { ProgressView(providerStatus).controlSize(.small) }
-            if readingTracks { ProgressView("Reading audio streams…").controlSize(.small) }
-            if !engines.isEmpty { settings }
-            if !tracks.isEmpty { inventory }
+        VStack(alignment: .leading, spacing: 14) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if !tracks.isEmpty { sources }
+                    if let progress = providerStatus ?? (readingTracks ? "Reading audio streams…" : nil) {
+                        ProgressView(progress).controlSize(.small)
+                    } else if checkingZoom && supportsPlan && !skipDiscovery {
+                        HStack {
+                            ProgressView("Looking for Zoom speaker tracks…").controlSize(.small)
+                            Spacer()
+                            Button("Skip search") {
+                                skipDiscovery = true
+                                cancelZoomQuery?()
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                    if !engines.isEmpty { settings }
+                }
+                .padding(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { contentHeight = $0 }
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: min(360, ceil(contentHeight)))
             if let issue = [providerError, inventoryError, error].compactMap({ $0 }).first {
-                IssueLabel(issue)
-                    .accessibilityIdentifier("transcript.setup.error")
+                IssueLabel(issue).accessibilityIdentifier("transcript.setup.error")
             }
             if !discoveryFailures.isEmpty {
                 Text("Couldn’t check for participant audio in " + discoveryFailures.joined(separator: ", ") + ".")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.callout).foregroundStyle(.secondary).lineLimit(2)
+                    .help(discoveryFailures.joined(separator: ", "))
             }
-            HStack {
+            Divider()
+            HStack(spacing: 8) {
                 if providerError != nil || inventoryError != nil || !discoveryFailures.isEmpty {
                     Button("Try Again") { loadAttempt += 1 }.disabled(loading)
+                } else if duration > 0 {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(timelineTime(duration)) of audio")
+                        if !zoomSuggestions.keys.contains(where: { usesZoom($0) && !excluded.contains($0) }),
+                           let factor = engine?.estimated_realtime_factor, factor.isFinite, factor > 0 {
+                            Text("Est. \(timelineTime(duration * factor)) to transcribe")
+                        }
+                    }
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Transcribe") { submit() }
                     .accessibilityIdentifier("transcript.start")
                     .keyboardShortcut(.defaultAction)
@@ -116,7 +183,6 @@ struct TranscriptJobSetup: View {
             await loadCapabilities()
             await inventory
             if supportsPlan && !Task.isCancelled { await discoverZoom() }
-            useZoom.formIntersection(zoomSuggestions.keys)
         }
     }
 
@@ -145,6 +211,22 @@ struct TranscriptJobSetup: View {
             let result = try await controller.tracks()
             try Task.checkCancellation()
             tracks = result
+            if !targets.isEmpty {
+                var matching: [String: [TranscriptSetupTarget]] = [:]
+                for track in result {
+                    let candidates = targets.filter { $0.matches(track) }
+                    if !candidates.isEmpty { matching[track.id] = Array(candidates) }
+                }
+                excluded = Set(result.map(\.id)).subtracting(matching.keys)
+                for track in result {
+                    guard let sources = matching[track.id],
+                          let source = sources.first, let channel = source.channel,
+                          sources.allSatisfy({ $0.channel == channel }) else { continue }
+                    trackOptions[track.id] = .init(channel: channel, role: track.role, speaker: track.speaker)
+                    channelText[track.id] = String(channel + 1)
+                }
+                if matching.isEmpty { inventoryError = "The affected audio tracks are unavailable." }
+            }
         } catch {
             if !Task.isCancelled { inventoryError = error.localizedDescription }
         }
@@ -181,148 +263,171 @@ struct TranscriptJobSetup: View {
         }
     }
 
-    private var settings: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Picker("Engine", selection: $selectedEngine) {
-                ForEach(engines) { engine in
-                    Text(engine.name + (engine.available ? "" : " (unavailable)"))
-                        .tag(engine.name)
-                        .disabled(!engine.available)
+    private var sources: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            SectionHeading("Audio sources")
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(tracks) { track in
+                    if track.id != tracks.first?.id { Divider() }
+                    if let stream = track.streamIndex {
+                        sourceRow(track, stream: stream)
+                    } else {
+                        Label("\(track.name) · Camera coverage only", systemImage: "video")
+                            .foregroundStyle(.secondary)
+                            .padding(10)
+                    }
                 }
             }
-            .accessibilityIdentifier("transcript.setup.engine")
-            .onChange(of: selectedEngine) { _, _ in
-                diarization = false
-                speakerCount = ""
-                model = ""
-            }
-            TextField("Model (default: \(engine?.default_model ?? "automatic"))", text: $model)
-            TextField("Language (default: automatic)", text: $language)
-            Toggle("Identify speakers in mixed audio", isOn: $diarization)
-                .disabled(engine?.diarization != true || !hasMixedAudio)
-            if diarization && hasMixedAudio {
-                TextField("Expected speakers (up to \(engine?.diarization_speaker_limit ?? 0))", text: $speakerCount)
-            }
-            Toggle("Download required models if missing", isOn: $download)
-                .accessibilityIdentifier("transcript.setup.download")
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary.opacity(0.35))
+            .modifier(InsetPanel())
         }
     }
 
-    private var inventory: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            SectionHeading("Audio Streams")
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 7) {
-                    ForEach(tracks) { track in
-                        if let stream = track.streamIndex {
-                            DisclosureGroup {
-                                if useZoom.contains(track.id), let participants = zoomSuggestions[track.id] {
-                                    participantSettings(track, participants)
-                                } else {
-                                    trackSettings(track)
-                                        .padding(.leading, 6).padding(.top, 4)
-                                }
-                            } label: {
-                                Toggle(isOn: Binding(
-                                    get: { !excluded.contains(track.id) },
-                                    set: { if $0 { excluded.remove(track.id) } else { excluded.insert(track.id) } }
-                                )) {
-                                    HStack {
-                                        Text("\(track.name) · Stream \(stream)")
-                                        if let lane = controller.project.transcriptLane(for: track) {
-                                            TranscriptLaneChip(label: lane.label, colorSlot: lane.colorSlot)
-                                        }
-                                    }
-                                }
-                                .accessibilityIdentifier("transcript.setup.track.\(track.id)")
-                            }
-                            if let participants = zoomSuggestions[track.id] {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Toggle("Use Zoom participant audio", isOn: Binding(
-                                        get: { useZoom.contains(track.id) && !excluded.contains(track.id) },
-                                        set: { if $0 { useZoom.insert(track.id) } else { useZoom.remove(track.id) } }
-                                    ))
-                                    .accessibilityLabel("Use Zoom participant audio for \(track.name)")
-                                    .accessibilityIdentifier("transcript.setup.zoom.\(track.id)")
-                                    Text("Speakers: " + Set(participants.map {
-                                        speakerEdits[track.id]?[$0.path] ?? $0.speaker
-                                    }).sorted().joined(separator: ", "))
-                                        .font(.caption).foregroundStyle(.secondary)
-                                    if Set(participants.map(\.speaker)).count == 1 {
-                                        Text("Only one participant has a separate recording. Choose the mix to include other voices.")
-                                            .font(.caption).foregroundStyle(.secondary)
-                                    }
-                                }
-                                .disabled(excluded.contains(track.id))
-                                .padding(.leading, 19)
-                            }
-                        } else {
-                            Label("\(track.name) · Camera coverage only", systemImage: "video")
-                                .foregroundStyle(.secondary)
+    private func sourceRow(_ track: TranscriptJobTrack, stream: Int) -> some View {
+        let included = !excluded.contains(track.id)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Toggle(isOn: Binding(
+                    get: { !excluded.contains(track.id) },
+                    set: { if $0 { excluded.remove(track.id) } else { excluded.insert(track.id) } }
+                )) {
+                    Text(track.name).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+                }
+                .accessibilityLabel("Include \(track.name), stream \(stream)")
+                .accessibilityIdentifier("transcript.setup.track.\(track.id)")
+                .help(track.file.path)
+                if let lane = controller.project.transcriptLane(for: track) {
+                    TranscriptLaneChip(label: lane.label, colorSlot: lane.colorSlot)
+                }
+                Spacer(minLength: 4)
+                Text("Stream \(stream)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            if included {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let participants = zoomSuggestions[track.id] {
+                        Toggle("Use Zoom participant audio", isOn: Binding(
+                            get: { usesZoom(track.id) },
+                            set: { zoomOverrides[track.id] = $0 }
+                        ))
+                        .accessibilityLabel("Use Zoom participant audio for \(track.name)")
+                        .accessibilityIdentifier("transcript.setup.zoom.\(track.id)")
+                        let names = Set(participants.map { speakerEdits[track.id]?[$0.path] ?? $0.speaker }).sorted()
+                        Text("Speakers: " + names.joined(separator: ", "))
+                            .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        if Set(participants.map(\.speaker)).count == 1 {
+                            Text("Only one participant has a separate recording. Use the mix to include other voices.")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                    if usesZoom(track.id), let participants = zoomSuggestions[track.id] {
+                        DisclosureGroup("Edit speaker names") {
+                            participantSettings(track, participants)
+                        }
+                    } else {
+                        DisclosureGroup("Stream settings") { trackSettings(track) }
+                    }
                 }
-                .padding(2)
+                .padding(.leading, 19)
             }
-            .frame(minHeight: 65, idealHeight: 135, maxHeight: 205)
-            if checkingZoom && supportsPlan && !skipDiscovery && !readingTracks {
-                HStack {
-                    ProgressView("Checking for Zoom participant audio…").controlSize(.small)
-                    Button("Skip remaining search") {
-                        skipDiscovery = true
-                        cancelZoomQuery?()
-                    }.controlSize(.small)
+        }
+        .padding(10)
+    }
+
+    private var settings: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            InspectorRow("Engine", labelWidth: 52) {
+                Picker("Engine", selection: $selectedEngine) {
+                    ForEach(engines) { engine in
+                        Text(engine.title + (engine.available ? "" : " (unavailable)"))
+                            .tag(engine.name)
+                            .disabled(!engine.available)
+                    }
                 }
+                .accessibilityIdentifier("transcript.setup.engine")
+                .onChange(of: selectedEngine) { _, _ in
+                    diarization = false
+                    speakerCount = ""
+                    model = ""
+                }
+                .help("Transcription engine supplied by Transcriberrr")
             }
-            Text("Selected recording duration: \(timelineTime(duration))")
-                .font(.caption).foregroundStyle(.secondary)
-            if !useZoom.subtracting(excluded).isEmpty {
-                Text("Each selected participant file is transcribed separately.").font(.caption).foregroundStyle(.secondary)
-            } else if let factor = engine?.estimated_realtime_factor, factor.isFinite, factor > 0 {
-                Text("Estimated recognition time: \(timelineTime(duration * factor))")
-                    .font(.caption).foregroundStyle(.secondary)
-            } else {
-                Text("Transcriberrr has no runtime estimate for this engine.")
-                    .font(.caption).foregroundStyle(.secondary)
+            DisclosureGroup("Recognition options", isExpanded: $showsOptions) {
+                VStack(alignment: .leading, spacing: 8) {
+                    InspectorRow("Model") {
+                        TextField("Model", text: $model, prompt: Text(engine?.default_model ?? "Default"))
+                            .accessibilityLabel("Model")
+                    }
+                    InspectorRow("Language") {
+                        TextField("Language", text: $language, prompt: Text("Automatic"))
+                            .accessibilityLabel("Language")
+                    }
+                    if engine?.diarization == true && hasMixedAudio {
+                        Toggle("Identify speakers in mixed audio", isOn: $diarization)
+                        if diarization {
+                            InspectorRow("Speakers") {
+                                TextField("Expected speakers", text: $speakerCount,
+                                          prompt: Text("Automatic · up to \(engine?.diarization_speaker_limit ?? 0)"))
+                            }
+                        }
+                    }
+                    Toggle("Download missing models", isOn: $download)
+                        .accessibilityIdentifier("transcript.setup.download")
+                }
+                .padding(.top, 6)
             }
         }
     }
 
     private func participantSettings(_ track: TranscriptJobTrack, _ participants: [TranscriptZoomParticipant]) -> some View {
-        ForEach(participants, id: \.path) { participant in
-            let filename = URL(fileURLWithPath: participant.path).lastPathComponent
-            VStack(alignment: .leading, spacing: 3) {
-                Text(filename).font(.caption).lineLimit(1).truncationMode(.middle).help(participant.path)
-                TextField("Speaker name", text: Binding(
-                    get: { speakerEdits[track.id]?[participant.path] ?? participant.speaker },
-                    set: { speakerEdits[track.id, default: [:]][participant.path] = $0 }
-                ))
-                .accessibilityLabel("Speaker for \(filename)")
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(participants, id: \.path) { participant in
+                let filename = URL(fileURLWithPath: participant.path).lastPathComponent
+                HStack(spacing: 10) {
+                    Text(filename)
+                        .font(.callout).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading).help(participant.path)
+                    TextField("Speaker name", text: Binding(
+                        get: { speakerEdits[track.id]?[participant.path] ?? participant.speaker },
+                        set: { speakerEdits[track.id, default: [:]][participant.path] = $0 }
+                    ))
+                    .accessibilityLabel("Speaker for \(filename)")
+                    .frame(maxWidth: .infinity)
+                }
             }
-            .padding(.leading, 6)
         }
+        .padding(.top, 4)
     }
 
     private func trackSettings(_ track: TranscriptJobTrack) -> some View {
         let base = TranscriptJobTrackOptions(channel: track.channel, role: track.role, speaker: track.speaker)
-        return VStack(alignment: .leading, spacing: 5) {
-            Picker("Role", selection: Binding(
-                get: { trackOptions[track.id, default: base].role },
-                set: { trackOptions[track.id, default: base].role = $0 }
-            )) {
-                Text("Unknown (default)").tag(TranscriptRole.unknown.rawValue)
-                Text("Mixed audio").tag(TranscriptRole.mixedAudio.rawValue)
-                Text("Isolated microphone").tag(TranscriptRole.isolatedMic.rawValue)
+        return VStack(alignment: .leading, spacing: 6) {
+            InspectorRow("Role") {
+                Picker("Role", selection: Binding(
+                    get: { trackOptions[track.id, default: base].role },
+                    set: { trackOptions[track.id, default: base].role = $0 }
+                )) {
+                    Text("Unknown").tag(TranscriptRole.unknown.rawValue)
+                    Text("Mixed audio").tag(TranscriptRole.mixedAudio.rawValue)
+                    Text("Isolated microphone").tag(TranscriptRole.isolatedMic.rawValue)
+                }
             }
-            TextField("Speaker hint", text: Binding(
-                get: { trackOptions[track.id, default: base].speaker ?? "" },
-                set: { trackOptions[track.id, default: base].speaker = $0.isEmpty ? nil : $0 }
-            ))
-            TextField("Channel index (zero-based, blank mixes channels to mono)", text: Binding(
-                get: { channelText[track.id] ?? base.channel.map(String.init) ?? "" },
-                set: { channelText[track.id] = $0 }
-            ))
+            InspectorRow("Speaker") {
+                TextField("Speaker hint", text: Binding(
+                    get: { trackOptions[track.id, default: base].speaker ?? "" },
+                    set: { trackOptions[track.id, default: base].speaker = $0.isEmpty ? nil : $0 }
+                ), prompt: Text("Optional"))
+            }
+            InspectorRow("Channel") {
+                TextField("Channel index", text: Binding(
+                    get: { channelText[track.id] ?? base.channel.map(String.init) ?? "" },
+                    set: { channelText[track.id] = $0 }
+                ), prompt: Text("Mix all channels to mono"))
+                .help("Enter a channel number starting at 0, or leave blank for a mono mix.")
+            }
         }
+        .padding(.top, 4)
     }
 
     private func submit() {
@@ -341,7 +446,7 @@ struct TranscriptJobSetup: View {
                 return trimmed.isEmpty ? nil : trimmed
             }
             var settings = trackOptions
-            for track in selected where !useZoom.contains(track.id) {
+            for track in selected where !usesZoom(track.id) {
                 guard let input = channelText[track.id] else { continue }
                 var option = settings[track.id] ?? .init(channel: track.channel, role: track.role, speaker: track.speaker)
                 if let text = value(input) {
@@ -355,7 +460,7 @@ struct TranscriptJobSetup: View {
                 }
                 settings[track.id] = option
             }
-            var zoom = zoomSuggestions.filter { useZoom.contains($0.key) && !excluded.contains($0.key) }
+            var zoom = zoomSuggestions.filter { usesZoom($0.key) && !excluded.contains($0.key) }
             for (id, participants) in zoom {
                 zoom[id] = try participants.map { participant in
                     var edited = participant
@@ -379,6 +484,7 @@ struct TranscriptJobSetup: View {
 }
 
 struct TranscriptRetryForm: View {
+    @Environment(\.dismiss) private var dismiss
     let message: String?
     let retry: (Bool) throws -> Void
     @State private var download = false
@@ -387,10 +493,11 @@ struct TranscriptRetryForm: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             if let message { Text(message).foregroundStyle(.secondary) }
-            Toggle("Download required models if missing", isOn: $download)
+            Toggle("Download missing models", isOn: $download)
             if let error { IssueLabel(error) }
             HStack {
                 Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Retry") {
                     do { try retry(download) } catch { self.error = error.localizedDescription }
                 }

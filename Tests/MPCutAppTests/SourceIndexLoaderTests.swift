@@ -4,6 +4,28 @@ import XCTest
 
 final class SourceIndexLoaderTests: XCTestCase {
     @MainActor
+    func testQueuedReadsRespectDocumentContextAndNeverWriteBesideAnUnsavedSource() async throws {
+        let (directory, fixture) = try fixtureDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("camera.mov")
+        try FileManager.default.copyItem(at: fixture, to: file)
+        let home = directory.appendingPathComponent("settings")
+        try await SidecarLocations.$storageDirectory.withValue(home) {
+            try SidecarLocations.setMode(.project)
+            let loader = SourceIndexLoader()
+            let unsaved = try await read(.init(url: file, sidecars: true, preview: false), using: loader)
+            XCTAssertTrue(unsaved.ordinary.hasFullEditIndex)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: file.appendingPathExtension("cutdb").path))
+            let project = directory.appendingPathComponent("edit.cut")
+            let indexed = try await read(.init(url: file, sidecars: true, preview: false, project: project), using: loader)
+            XCTAssertFalse(unsaved === indexed)
+            XCTAssertEqual(indexed.ordinary.sidecarProjectURL, project)
+            let managed = try XCTUnwrap(SidecarLocations(source: file, project: project).destination)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: managed.path))
+        }
+    }
+
+    @MainActor
     func testOpeningUsesCompleteSidecarForSequenceAndMulticam() async throws {
         let (directory, fixture) = try fixtureDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

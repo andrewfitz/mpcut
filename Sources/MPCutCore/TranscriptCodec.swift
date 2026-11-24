@@ -24,16 +24,22 @@ public enum TranscriptCodec {
         return result
     }
 
+    /// The exported form. JSON is the schema version 2 document.
     public static func encode(_ document: TranscriptDocument, format: TranscriptFormat) throws -> Data {
         try document.validate()
         switch format {
         case .json:
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-            return try encoder.encode(document)
+            return try encoder.encode(document.withoutActivity())
         case .srt, .vtt, .text:
             return try Data(TranscriptSubtitles.encode(document, format: format).utf8)
         }
+    }
+
+    /// The form a project keeps beside it. `decode` reads it back as the same document.
+    public static func encodeStored(_ document: TranscriptDocument) throws -> Data {
+        try TranscriptStoredForm.encode(document)
     }
 
     private enum JSONDocument: Decodable {
@@ -50,10 +56,14 @@ public enum TranscriptCodec {
                 self = .session(try TranscriptNativeSession(from: decoder))
             case (true, false, false):
                 let version = try keys.decode(Int.self, forKey: .schema_version)
-                guard version == TranscriptDocument.currentSchemaVersion else {
+                switch version {
+                case TranscriptDocument.currentSchemaVersion:
+                    self = .document(try TranscriptDocument(from: decoder))
+                case TranscriptStoredForm.schemaVersion:
+                    self = .document(try TranscriptStoredForm.Document(from: decoder).document())
+                default:
                     throw CutError(code: "unsupported_transcript_version", message: "Unsupported transcript schema version \(version)")
                 }
-                self = .document(try TranscriptDocument(from: decoder))
             case (false, false, false):
                 self = .recording(try TranscriptNativeRecording(from: decoder))
             default:
@@ -63,9 +73,11 @@ public enum TranscriptCodec {
     }
 
     private static func decodeJSON(_ data: Data, origin: RationalTime?) throws -> TranscriptDocument {
-        // A stored result is a document this codec wrote. Hours of words cost most of a
-        // command's time in the general decoder, so the plain form is read directly. Anything
-        // else, including every malformed input, takes the general path and its errors.
+        let data = try TranscriptStoredForm.expanded(data) ?? data
+        // An export, or a result stored before the compact form, is a document this codec
+        // wrote. Hours of words cost most of a command's time in the general decoder, so the
+        // plain form is read directly. Anything else, including the compact stored form and
+        // every malformed input, takes the general path and its errors.
         if let document = TranscriptDocumentReader.document(from: data) { return document }
         do {
             switch try JSONDecoder().decode(JSONDocument.self, from: data) {

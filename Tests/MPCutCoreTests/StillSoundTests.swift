@@ -21,6 +21,131 @@ final class StillSoundTests: XCTestCase {
         try ReencodeEngine().runHelper(helper, arguments: arguments, in: folder)
     }
 
+    func testSoundtrackEncodersRetainNativeSamplesAndRefuseUnrepresentablePrecision() throws {
+        try withDirectory { folder, helper in
+            let frames = 48_001
+            for (sourceCodec, rawFormat) in [("pcm_s24le", "s32le"), ("pcm_s32le", "s32le"), ("pcm_f64le", "f64le")] {
+                let source = folder.appendingPathComponent("\(sourceCodec).mov")
+                let rawCodec = "pcm_\(rawFormat)"
+                try run(helper, ["-f", "lavfi", "-i", "aevalsrc=0.333333333+sin(n)*0.123456789|cos(n)*0.23232323:s=48000",
+                                 "-af", "atrim=end_sample=\(frames)", "-c:a", sourceCodec, source.path], in: folder)
+                let media = try Probe.read(source)
+                let clip = try StillSoundtrack.reference(media: media)
+                let format = StillTimelineFormat(width: 96, height: 64, cadence: t(1, 30), codec: .h264, container: "mov")
+                let asset = StillAsset(id: "cover", file: "offline.png", displayName: "Cover", fingerprint: "offline")
+                let insert = StillInsert(id: "hold", assetID: asset.id, duration: t(1), cadence: t(1, 30))
+                let project = try CutProject.stillSequence(.init(items: [.still(insert)], stillAssets: [asset], stillFormat: format))
+                    .attachingStillSoundtrack(clip).fittingStillToSoundtrack()
+                let planner = StillSoundPlanner()
+                let timeline = try project.resolveStills()
+                let document = folder.appendingPathComponent("show.cut")
+                let reference = folder.appendingPathComponent("source-\(sourceCodec).raw")
+                try run(helper, ["-i", source.path, "-c:a", rawCodec, "-f", rawFormat, reference.path], in: folder)
+
+                for (container, action) in [("mov", ReencodeAudio.alac), ("mp4", .flac), ("mkv", .flac), ("mov", .pcm)] {
+                    func resolve() throws -> StillSoundPlan {
+                        try planner.resolve(project, relativeTo: document, timeline: timeline, tracks: .audio,
+                                            audioStream: nil, mode: .encode, audio: action, container: container,
+                                            independentAudio: true)
+                    }
+                    if action != .pcm && sourceCodec != "pcm_s24le" {
+                        XCTAssertThrowsError(try resolve()) {
+                            XCTAssertEqual(($0 as? CutError)?.code, "unsupported_audio")
+                            XCTAssertTrue(($0 as? CutError)?.message.contains("Choose PCM in MOV") == true)
+                        }
+                        continue
+                    }
+                    let plan = try resolve()
+                    let staging = folder.appendingPathComponent(UUID().uuidString)
+                    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+                    let written = try XCTUnwrap(planner.write(plan, in: staging).first)
+                    let output = staging.appendingPathComponent("result.raw")
+                    try run(helper, ["-i", written.path, "-c:a", rawCodec, "-f", rawFormat, output.path], in: staging)
+                    XCTAssertEqual(try Data(contentsOf: output), try Data(contentsOf: reference), "\(sourceCodec) to \(action) in \(container)")
+                }
+            }
+        }
+    }
+
+    func testDefaultMOVKeepsFloatSoundtrackSamplesWhenPictureTrimsOrExtendsAudio() throws {
+        try withDirectory { folder, helper in
+            let source = folder.appendingPathComponent("float.wav")
+            try run(helper, ["-f", "lavfi", "-i", "aevalsrc=sin(n)/31|cos(n)/7:s=48000",
+                             "-af", "atrim=end_sample=48001", "-c:a", "pcm_f32le", source.path], in: folder)
+            let reference = folder.appendingPathComponent("source.raw")
+            try run(helper, ["-i", source.path, "-c:a", "pcm_f32le", "-f", "f32le", reference.path], in: folder)
+            let sourceSamples = try Data(contentsOf: reference)
+            let clip = try StillSoundtrack.reference(media: Probe.read(source))
+            let format = StillTimelineFormat(width: 96, height: 64, cadence: t(1, 30), codec: .h264, container: "mov")
+            let planner = StillExportPlanner()
+            for (duration, frames) in [(t(1, 2), 24_000), (t(2), 96_000)] {
+                let project = try CutProject.makeStillTimeline(format: format, asset: .init(gapID: "gap"),
+                                                               placementID: "hold", duration: duration)
+                    .attachingStillSoundtrack(clip)
+                let output = folder.appendingPathComponent("result-\(frames).mov")
+                let plan = try planner.resolve(project, output: output, offerAlternatives: false)
+                XCTAssertEqual(plan.report.soundActions.map(\.codec), ["pcm_f32le"])
+                XCTAssertThrowsError(try planner.resolve(project, output: output, offerAlternatives: false, audioAction: .alac)) {
+                    XCTAssertEqual(($0 as? CutError)?.code, "unsupported_audio")
+                }
+                try planner.write(plan, to: output)
+                let raw = folder.appendingPathComponent("result-\(frames).raw")
+                try run(helper, ["-i", output.path, "-c:a", "pcm_f32le", "-f", "f32le", raw.path], in: folder)
+                let retained = sourceSamples.prefix(frames * 8)
+                let expected = retained + Data(count: frames * 8 - retained.count)
+                XCTAssertEqual(try Data(contentsOf: raw), expected)
+            }
+        }
+    }
+
+    func testDirectWAVEncodingUsesAnExactSampleClock() throws {
+        try withDirectory { folder, helper in
+            let source = folder.appendingPathComponent("source.wav")
+            try run(helper, ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo:d=2",
+                             "-c:a", "pcm_s24le", source.path], in: folder)
+            let media = try Probe.read(source)
+            let range = MulticamRange(from: .zero, to: t(2))
+            let converter = MulticamEngine()
+            let plan = try converter.resolveConvertedSound(
+                [.init(media: media, stream: media.audio.first?.stream.index, input: range, output: range)],
+                duration: range.to, container: "mov", action: .alac, preserveSamples: true) { issue, _ in issue }
+            XCTAssertTrue(plan.inputs.first?.seekablePCM == true)
+            let output = folder.appendingPathComponent("exact.mov")
+            try converter.writeConvertedSound(plan, to: output)
+            let sound = try XCTUnwrap(Probe.read(output).audio.first)
+            XCTAssertEqual(sound.packets.dropFirst(15).first?.time, t(61_440, 44_100))
+            XCTAssertEqual(sound.end, range.to)
+        }
+    }
+
+    func testFractionalCutsPreserveWholeSamplesWithoutAccumulatingDrift() throws {
+        try withDirectory { folder, helper in
+            let source = folder.appendingPathComponent("samples.wav")
+            try run(helper, ["-f", "lavfi", "-i", "aevalsrc=n/128:s=44100", "-af", "atrim=end_sample=32",
+                             "-c:a", "pcm_s24le", source.path], in: folder)
+            // Each edit is 4/3 samples. Independent duration rounding would drop the second sample
+            // from the middle edit. The middle edit's exact source start must stay fixed.
+            let clips = [(1, 5), (9, 13), (1, 5)].enumerated().map { index, edges in
+                CutSequenceClip(id: "clip-\(index)", file: source.lastPathComponent,
+                                from: t(Int64(edges.0), 132_300), to: t(Int64(edges.1), 132_300))
+            }
+            let project = CutProject.sequence(clips)
+            let planner = StillSoundPlanner()
+            let plan = try planner.resolve(project, relativeTo: folder.appendingPathComponent("show.cut"),
+                                           timeline: project.resolveStills(), tracks: .audio, audioStream: nil,
+                                           mode: .encode, audio: .alac, container: "mov", independentAudio: true)
+            guard case .convert(let conversion) = plan.treatments.first else { return XCTFail("Expected lossless conversion") }
+            XCTAssertEqual(conversion.inputs.map(\.count), [1, 2, 1])
+            XCTAssertEqual(conversion.inputs.map(\.samples), [0..<1, 3..<5, 0..<1])
+            XCTAssertTrue(plan.actions.first?.warnings.contains(where: { $0.contains("Fractional audio cuts") }) == true)
+            let output = try XCTUnwrap(planner.write(plan, in: folder).first)
+            let pcm = folder.appendingPathComponent("result.raw")
+            try run(helper, ["-i", output.path, "-c:a", "pcm_s32le", "-f", "s32le", pcm.path], in: folder)
+            let expected = [Int32(0), 3 << 24, 4 << 24, 0].map(\.littleEndian)
+            XCTAssertEqual(try Data(contentsOf: pcm), expected.withUnsafeBytes { Data($0) })
+        }
+    }
+
     func testFiveFractionalFrameSilencesAddExactlyEightThousandEightSamples() throws {
         try withDirectory { folder, helper in
             let recording = folder.appendingPathComponent("source.wav")

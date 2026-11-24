@@ -10,6 +10,7 @@ import unittest
 
 from media_regression import audio, ffmpeg, frames, probe, ratio, run, sample_hashes, timestamped_hashes
 from smart_trim import picture_ids, vcl_hashes
+from saved_project import read_project
 
 RATE = 48_000
 FPS = 25
@@ -260,8 +261,10 @@ class MulticamTests(unittest.TestCase):
         })
         self.assertEqual(self.project_path.read_bytes(), original)
         expected = json.loads(original)
-        saved = json.loads(copy.read_bytes())
-        self.assertEqual(saved["schema_version"], 4)
+        saved = read_project(copy)
+        self.assertIn(saved["schema_version"], (4, 5))
+        for step in expected["history"]["undo"]:
+            step.setdefault("origin", "unknown")
         for field in ("audio", "mix_lanes", "fixed_audio", "audio_replacements", "switches", "assembly", "history"):
             self.assertEqual(saved[field], expected[field], field)
 
@@ -473,7 +476,7 @@ class MulticamTests(unittest.TestCase):
         self.assertEqual([pts for pts, _ in timestamped_hashes(self.output)],
                          [number * step for number in range(30)])
         clips = [(20, 25), (5, 10)]
-        saved = json.loads(self.project_path.read_text())
+        saved = read_project(self.project_path)
         saved["assembly"] = [{"from": str(start * step), "to": str(end * step)} for start, end in clips]
         self.project_path.write_text(json.dumps(saved))
         self.output = self.root / "ntsc-highlights.mov"

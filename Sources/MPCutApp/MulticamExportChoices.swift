@@ -8,6 +8,11 @@ struct MulticamExportChoices: Equatable, Sendable {
     var tracks: ExportTracks = .all
     var placements: ExportPlacementScope = .none
     var requireCameraCopy = false
+    var pictureTiming: StillPictureTiming?
+    var heldStills: Bool {
+        get { pictureTiming == .held }
+        set { pictureTiming = newValue ? .held : .cadence }
+    }
     var participantAudio: ParticipantAudioMode?
     /// The mode held for picture with sound. A single-type selection is written as the rules say.
     var mode: ExportMode
@@ -103,7 +108,10 @@ struct MulticamExportChoices: Equatable, Sendable {
         let requestedAudio = alternative.argument("--audio").flatMap(ReencodeAudio.init(rawValue:))
         if let action = requestedAudio ?? alternative.audio { audio = action }
         audioOutput = alternative.argument("--audio-output").flatMap(MulticamAudioOutput.init(rawValue:)) ?? .separateTracks
-        if placements != .none { requireCameraCopy = alternative.arguments.contains("--require-camera-copy") }
+        if placements != .none {
+            requireCameraCopy = alternative.arguments.contains("--require-camera-copy")
+            pictureTiming = alternative.argument("--still-timing").flatMap(StillPictureTiming.init(rawValue:)) ?? pictureTiming
+        }
     }
 }
 

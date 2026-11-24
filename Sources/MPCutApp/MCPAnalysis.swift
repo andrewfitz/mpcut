@@ -163,6 +163,10 @@ extension ProjectSessions {
                 throw unavailable("Project media refresh is unavailable. Inspect analysis_editor_state_read.")
             }
             let receipt = try mcpAnalysisJobs.reserve(session: session, kind: "refresh")
+            receipt.completionDetail = { [weak session] in
+                guard let session, let rows = try? session.mcpMediaStatusSnapshot() else { return [:] }
+                return ["media": rows]
+            }
             let deep = args["deep"] as? Bool ?? false
             if mc {
                 multi.refreshProjectMedia(deep: deep, receipt: receipt)
@@ -347,6 +351,9 @@ extension ProjectSessions {
                         clipID = parsed
                     } else { clipID = editor.sceneClipID }
                     guard clipID != nil || camera != nil else { throw unavailable("Select an eligible clip or camera.") }
+                    if let issue = clipID.flatMap(editor.mcpClipMediaIssue) {
+                        throw MCPCommandError("source_needs_review", issue)
+                    }
                 } else if explicit != nil {
                     throw badInput("Use a target only with selected scope.")
                 }

@@ -12,30 +12,41 @@ struct BulkQueueView: View {
         self.editor = editor
         var value = ExportSheetOptions()
         value.copyContainer = ""
-        if editor.queuedRanges.contains(where: { $0.placements != .none }) {
+        value.placements = editor.readyQueuedRanges.map(\.placements).max(by: { $0.rawValue < $1.rawValue }) ?? .none
+        if editor.readyQueuedRanges.contains(where: { $0.placements != .none }) {
             value.mode = .smart
-            value.audio = .copyOriginal
+            value.audio = editor.readyQueuedRanges.contains(where: Self.hasSelectedSoundtrack) ? .auto : .copyOriginal
+            if let format = editor.readyQueuedRanges.first?.stillProject?.stillFormat {
+                value.codec = format.codec
+                value.encodeContainer = ""
+                value.proResContainer = ""
+            }
         } else {
             value.mode = editor.defaultExportMode
         }
         _options = State(initialValue: value)
     }
 
-    private var media: [MediaInfo] { editor.queuedRanges.flatMap { $0.media.values } }
+    private var media: [MediaInfo] { editor.readyQueuedRanges.flatMap { $0.media.values } }
     /// The modes, containers, audio actions and names on offer, from the export rules.
     private var choices: ExportQueueChoices {
         let selected = options.audioTrackOrdinal.flatMap { audioStreams.indices.contains($0) ? audioStreams[$0] : nil }
         return ExportQueueChoices(media: media, audioCodec: (selected ?? audioStreams.first)?.codec, placements: placements)
     }
     private var placements: ExportPlacementScope {
-        editor.queuedRanges.map(\.placements).max(by: { $0.rawValue < $1.rawValue }) ?? .none
+        editor.readyQueuedRanges.map(\.placements).max(by: { $0.rawValue < $1.rawValue }) ?? .none
     }
     private var hasVideo: Bool { choices.hasVideo }
     private var hasAudio: Bool { choices.hasAudio }
     private var tracks: ExportTracks { choices.tracks(options.tracks) }
     private var audioStreams: [StreamInfo] {
-        let layouts = editor.queuedRanges.flatMap { range -> [[StreamInfo]] in
+        let layouts = editor.readyQueuedRanges.flatMap { range -> [[StreamInfo]] in
             var sources = range.clips.map(\.file)
+            if let soundtrack = range.stillProject?.stillSoundtrack ?? range.stillProject?.stillAudioReference,
+               let ordinal = soundtrack.audioTrack {
+                let streams = range.media[URL(fileURLWithPath: soundtrack.file)]?.streams.filter { $0.kind == "audio" } ?? []
+                return streams.indices.contains(ordinal) ? [[streams[ordinal]]] : []
+            }
             if let reference = range.stillProject?.stillAudioReference {
                 sources.append(URL(fileURLWithPath: reference.file).standardizedFileURL)
             }
@@ -43,6 +54,35 @@ struct BulkQueueView: View {
         }
         guard let first = layouts.first else { return [] }
         return Array(first.prefix(layouts.map(\.count).min() ?? 0))
+    }
+    private var stillOnly: Bool {
+        !editor.readyQueuedRanges.isEmpty && editor.readyQueuedRanges.allSatisfy { $0.stillProject?.stillFormat != nil }
+    }
+    private var hasSoundtrack: Bool {
+        editor.readyQueuedRanges.contains(where: Self.hasSelectedSoundtrack)
+    }
+    private static func hasSelectedSoundtrack(_ range: QueuedRange) -> Bool {
+        range.stillProject?.stillSoundtrack != nil || range.stillProject?.stillAudioReference?.audioTrack != nil
+    }
+    private var defaultPictureTiming: StillPictureTiming {
+        let first = editor.readyQueuedRanges.first { $0.stillProject != nil }
+        return first?.pictureTiming ?? first?.stillProject.map { ExportRules.defaultStillPictureTiming(for: $0) } ?? .cadence
+    }
+    private var pictureCodecs: [ReencodeCodec] {
+        ReencodeCodec.allCases.filter { $0 != .jpeg || stillOnly }
+    }
+    private var stillCodec: Binding<ReencodeCodec> {
+        Binding(get: { options.codec }, set: {
+            options.codec = $0
+            options.stillVideoCodec = $0
+        })
+    }
+    private func audioActions(_ mode: ExportMode) -> [ReencodeAudio] {
+        let listed = choices.movieAudio(mode: mode)
+        return hasSoundtrack && !listed.contains(.auto) ? [.auto] + listed : listed
+    }
+    private var audioConversions: [ReencodeAudio] {
+        hasSoundtrack ? ExportRules.stillSoundConversions : choices.conversions
     }
     private var exportOptions: ExportSheetOptions {
         var result = options
@@ -54,9 +94,10 @@ struct BulkQueueView: View {
     private func chooseMode(_ mode: ExportMode) {
         if tracks != .audio {
             options.mode = mode
-        } else if mode == .encode, let format = choices.conversions.first {
+        } else if mode == .encode, let format = audioConversions.first {
             // Start from the source's own format, as the Export sheet does.
-            options.convertAudio(to: choices.conversions.contains(options.audioFormat) ? options.audioFormat : format)
+            options.placements = placements
+            options.convertAudio(to: audioConversions.contains(options.audioFormat) ? options.audioFormat : format)
         } else {
             options.audioMode = .copy
         }
@@ -64,15 +105,20 @@ struct BulkQueueView: View {
 
     private func export() {
         let requested = exportOptions
-        let ranges = editor.queuedRanges.map(\.contentID)
+        let ranges = editor.readyQueuedRanges.map(\.contentID)
         preflight = Task {
             // Plan every range first, so that a range that cannot be written shows the offers of the Export sheet.
-            let failure = await editor.checkQueuedRanges(options: requested)
+            let review = await editor.reviewQueuedRanges(options: requested)
             guard !Task.isCancelled else { return }
             preflight = nil
-            guard requested == exportOptions, ranges == editor.queuedRanges.map(\.contentID) else { return }
-            issue = failure
-            if failure == nil { editor.chooseBulkDestination(options: requested) }
+            guard requested == exportOptions, ranges == editor.readyQueuedRanges.map(\.contentID) else { return }
+            switch review {
+            case .failure(let failure):
+                issue = failure
+            case .success(let summary):
+                issue = nil
+                editor.chooseBulkDestination(options: requested, summary: summary)
+            }
         }
     }
 
@@ -99,7 +145,9 @@ struct BulkQueueView: View {
                                             },
                                             saveExcerpt: range.excerpt.map { excerpt in
                                                 { excerpt.presentSave(in: editor.editorWindow, canSave: editor.canSaveProjectTo) }
-                                            }) {
+                                            },
+                                            replan: editor.invalidatedQueueIDs.contains(range.id)
+                                                ? { try editor.replanQueuedRange(range.id) } : nil) {
                             editor.removeQueuedRange(range.id)
                         }
                     }
@@ -135,24 +183,31 @@ struct BulkQueueView: View {
                     if placements != .none && tracks != .audio {
                         Toggle("Require Camera Video Copy", isOn: $options.requireCameraCopy)
                             .help("Require stream copy for retained camera video")
+                        Toggle("One frame per still", isOn: Binding(
+                            get: {
+                                (options.pictureTiming ?? defaultPictureTiming) == .held
+                            },
+                            set: { options.pictureTiming = $0 ? .held : .cadence }
+                        ))
                     }
                     if exportOptions.convertsAudio {
                         Picker("Audio", selection: Binding(get: { options.audioFormat },
                                                            set: { options.convertAudio(to: $0, preferred: options.conversionContainer) })) {
-                            ForEach(choices.conversions, id: \.self) { Text($0.displayName) }
+                            ForEach(audioConversions, id: \.self) { Text($0.displayName) }
                         }
                         .help("Choose audio format")
                         Picker("Container", selection: $options.conversionContainer) {
-                            ForEach(ExportRules.conversionContainers(options.audioFormat), id: \.self) { Text(containerDisplayName($0)) }
+                            ForEach(exportOptions.conversionContainers(for: options.audioFormat), id: \.self) { Text(containerDisplayName($0)) }
                         }
                         .help("Choose file format")
                     } else if exportOptions.effectiveMode == .encode {
-                        Picker("Video", selection: $options.codec) {
-                            ForEach(ReencodeCodec.allCases, id: \.self) { Text($0.displayName) }
+                        Picker("Video", selection: placements == .none ? $options.codec : stillCodec) {
+                            ForEach(pictureCodecs, id: \.self) { Text($0.displayName) }
                         }
                         .help("Choose video codec")
                         let proRes = options.codec == .prores
                         Picker("Container", selection: proRes ? $options.proResContainer : $options.encodeContainer) {
+                            if stillOnly { Text("Project default").tag("") }
                             ForEach(placements == .none ? ExportRules.reencodeContainers(options.codec) :
                                 ExportRules.stillContainers(mode: .encode, tracks: tracks, codec: options.codec, audio: options.audio), id: \.self) { Text(containerDisplayName($0)) }
                         }
@@ -164,13 +219,18 @@ struct BulkQueueView: View {
                         if hasAudio && tracks != .video {
                             // Every audio action of the cell. One the container cannot carry is refused with its alternatives.
                             Picker("Audio", selection: $options.audio) {
-                                ForEach(choices.movieAudio(mode: .encode), id: \.self) { Text($0.displayName) }
+                                ForEach(audioActions(.encode), id: \.self) { Text($0.displayName) }
                             }
                             .help("Choose audio encoding")
                         }
                     } else {
+                        if stillOnly && tracks != .audio && exportOptions.effectiveMode == .smart {
+                            Picker("Video", selection: stillCodec) {
+                                ForEach(pictureCodecs, id: \.self) { Text($0.displayName) }
+                            }
+                        }
                         Picker("Container", selection: $options.copyContainer) {
-                            Text("Source compatible").tag("")
+                            Text(stillOnly ? "Project default" : "Source compatible").tag("")
                             let listed = tracks == .audio ? [] :
                                 placements == .none ? ExportRules.movieCopyContainers : ExportRules.stillMovieContainers
                             ForEach(listed, id: \.self) { Text(containerDisplayName($0)) }
@@ -182,14 +242,14 @@ struct BulkQueueView: View {
                         .help("Choose file format")
                         if placements != .none && tracks == .all && hasAudio && exportOptions.effectiveMode == .smart {
                             Picker("Audio", selection: $options.audio) {
-                                ForEach(choices.movieAudio(mode: .smart), id: \.self) { Text($0.displayName) }
+                                ForEach(audioActions(.smart), id: \.self) { Text($0.displayName) }
                             }
                             .help("Choose audio encoding")
                         }
                     }
                 }
                 ExportOrganizationFields(organization: $options.organization,
-                                         stem: editor.queuedRanges.first?.name ?? editor.queuedRanges.first?.clips.first?.file.deletingPathExtension().lastPathComponent ?? "Clip",
+                                         stem: editor.readyQueuedRanges.first?.name ?? editor.readyQueuedRanges.first?.clips.first?.file.deletingPathExtension().lastPathComponent ?? "Clip",
                                          container: exportOptions.container)
                 if let issue {
                     ExportOffersView(message: ExportRules.describe(issue, clips: []), alternatives: ExportQueueChoices.offers(for: issue)) {
@@ -201,12 +261,12 @@ struct BulkQueueView: View {
             Spacer()
             Button("Close") { editor.isBulkQueuePresented = false }.keyboardShortcut(.cancelAction)
                 .help("Close export queue")
-            Button(editor.queuedRanges.count == 1 ? "Export File…" : "Export \(editor.queuedRanges.count) Files…", action: export)
-                .keyboardShortcut(.defaultAction).disabled(editor.queuedRanges.isEmpty || preflight != nil)
+            Button(editor.readyQueuedRanges.count == 1 ? "Export File…" : "Export \(editor.readyQueuedRanges.count) Files…", action: export)
+                .keyboardShortcut(.defaultAction).disabled(editor.readyQueuedRanges.isEmpty || preflight != nil)
                 .help("Export queued ranges")
         }
         .onChange(of: options) { _, _ in issue = nil }
-        .onChange(of: editor.queuedRanges.map(\.contentID)) { _, _ in
+        .onChange(of: editor.readyQueuedRanges.map(\.contentID)) { _, _ in
             issue = nil
             if tracks != options.tracks { chooseTracks(tracks) }
             if let stream = options.audioTrackOrdinal, !audioStreams.indices.contains(stream) {
@@ -257,7 +317,9 @@ struct ExportQueueRangeRow: View {
     let end: RationalTime
     var details: (() -> QueueSnapshotDetails)? = nil
     var saveExcerpt: (() -> Void)? = nil
+    var replan: (() throws -> Void)? = nil
     @State private var isShowingDetails = false
+    @State private var replanIssue: String?
     let remove: () -> Void
 
     var body: some View {
@@ -266,7 +328,15 @@ struct ExportQueueRangeRow: View {
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.tertiary)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).lineLimit(1).truncationMode(.middle)
+                HStack(spacing: 5) {
+                    if replan != nil {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .accessibilityLabel("Media changed")
+                            .help("Affected by a media change. This entry is skipped until replanned.")
+                    }
+                    Text(title).lineLimit(1).truncationMode(.middle)
+                }
                 Text("\(timelineTime(start.seconds, milliseconds: true)) – \(timelineTime(end.seconds, milliseconds: true))")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
@@ -276,6 +346,15 @@ struct ExportQueueRangeRow: View {
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .accessibilityLabel("Duration")
+            if let replan {
+                Button("Replan") {
+                    do { try replan() }
+                    catch { replanIssue = error.localizedDescription }
+                }
+                .buttonStyle(.borderless)
+                .help(saveExcerpt == nil ? "Capture these bounds from the current timeline"
+                      : "Capture a newly marked range from the current timeline")
+            }
             if let details {
                 Button { isShowingDetails.toggle() } label: {
                     Image(systemName: "info.circle")
@@ -301,6 +380,13 @@ struct ExportQueueRangeRow: View {
             .help("Remove queued range")
         }
         .padding(.vertical, 2)
+        .alert("Can’t Replan Range", isPresented: Binding(
+            get: { replanIssue != nil }, set: { if !$0 { replanIssue = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(replanIssue ?? "")
+        }
     }
 }
 

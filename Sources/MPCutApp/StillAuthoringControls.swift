@@ -10,6 +10,7 @@ struct StillPlacementRow: Identifiable {
     var isInsert: Bool
     var isGap = false
     var fragmentCount = 0
+    var mediaStatus: ProjectMediaStatus = .online
 }
 
 enum StillPlacementAction: String, CaseIterable {
@@ -40,6 +41,7 @@ struct StillAuthoringControls: View {
     var spaceClips: () -> Void
     var canSpace: Bool
     var manage: (StillPlacementRow, StillPlacementAction) -> Void
+    var soundtrack: StillSoundtrackControls? = nil
 
     var body: some View {
         Menu {
@@ -49,16 +51,30 @@ struct StillAuthoringControls: View {
                 .help("Insert a still image")
             Button("Space Clips…", action: spaceClips).disabled(!canSpace)
             Button("Insert Color Gap…", action: insertGap).disabled(!canInsert)
+            if let soundtrack {
+                Divider()
+                soundtrack.menuItems
+            }
             if !rows.isEmpty {
                 Divider()
                 ForEach(rows) { row in
-                    Menu(row.title) {
+                    Menu {
                         Text(row.details)
+                        if row.mediaStatus != .online {
+                            Label(row.mediaStatus.editorLabel, systemImage: row.mediaStatus.editorIcon)
+                        }
                         ForEach(StillPlacementAction.allCases.filter { ($0 != .detach || row.fragmentCount > 1) && ($0 != .relink || !row.isGap) }, id: \.self) { action in
                             Button(action.title(for: row), role: action == .remove ? .destructive : nil) {
                                 manage(row, action)
                             }
                             .help(action.title(for: row))
+                        }
+                    } label: {
+                        if row.mediaStatus != .online && row.mediaStatus != .ignored {
+                            Label(row.title, systemImage: row.mediaStatus.editorIcon)
+                                .foregroundStyle(Color(nsColor: row.mediaStatus.editorColor))
+                        } else {
+                            Text(row.title)
                         }
                     }
                     .help("Manage this still")
@@ -70,6 +86,22 @@ struct StillAuthoringControls: View {
         .accessibilityLabel("Stills")
         .disabled(!enabled)
         .help("Manage still images")
+    }
+}
+
+struct StillSoundtrackControls {
+    var name: String?
+    var canFit: Bool
+    var attach: () -> Void
+    var fit: () -> Void
+    var remove: () -> Void
+    @ViewBuilder var menuItems: some View {
+        Button(name == nil ? "Attach Soundtrack…" : "Replace Soundtrack…", action: attach)
+        if let name {
+            Text(name)
+            Button("Fit Image to Soundtrack", action: fit).disabled(!canFit)
+            Button("Remove Soundtrack", action: remove)
+        }
     }
 }
 
@@ -109,7 +141,7 @@ enum StillPanels {
         if let asset = existing.first(where: { $0.file == path.path && $0.fingerprint == fingerprint }) {
             return asset
         }
-        return StillAsset(id: UUID().uuidString, file: path.path,
+        return StillAsset(id: ProjectIdentifier.make(avoiding: existing.map(\.id)), file: path.path,
                           displayName: url.lastPathComponent, fingerprint: fingerprint)
     }
 
@@ -283,6 +315,7 @@ enum StillPanels {
     }
 
     static func present(title: String, fields: [(String, NSControl)], in window: NSWindow?,
+                        dismissed: (() -> Void)? = nil,
                                 completion: @escaping () -> Void) {
         let alert = NSAlert()
         alert.messageText = title
@@ -297,10 +330,13 @@ enum StillPanels {
         if let first = fields.first?.1 { alert.window.initialFirstResponder = first }
         if let window, window.isVisible {
             alert.beginSheetModal(for: window) { result in
+                dismissed?()
                 if result == .alertFirstButtonReturn { completion() }
             }
-        } else if alert.runModal() == .alertFirstButtonReturn {
-            completion()
+        } else {
+            let result = alert.runModal()
+            dismissed?()
+            if result == .alertFirstButtonReturn { completion() }
         }
     }
 }

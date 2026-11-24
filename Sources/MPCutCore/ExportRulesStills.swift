@@ -1,19 +1,62 @@
 import Foundation
 
 extension ExportRules {
-    public static let stillMovieContainers = multicamMovieContainers
+    public static let stillMovieContainers = multicamMovieContainers + ["mkv"]
     public static let stillSoundCopyContainers = ["m4a", "mov", "mp4", "mkv", "mka", "wav", "caf"]
-    public static let stillSoundConversions: [ReencodeAudio] = [.pcm, .aac]
-    public static let stillMovieAudioActions = movieAudioActions.filter { $0 != .auto }
+    public static let stillSoundConversions: [ReencodeAudio] = [.pcm, .alac, .flac, .aac]
+    public static let stillMovieAudioActions = movieAudioActions.filter { $0 != .auto } + [.alac, .flac]
+
+    public static func allows(stillAudio audio: ReencodeAudio, in container: String,
+                              videoCodec: ReencodeCodec? = nil) -> Bool {
+        if let videoCodec, [.pcm, .alac, .flac].contains(audio) {
+            return stillLosslessAudioActions(codec: videoCodec, container: container).contains(audio)
+        }
+        switch audio {
+        case .auto, .copyOriginal, .removeAudio: return true
+        case .pcm: return ["mov", "mkv", "wav", "wave", "caf"].contains(container)
+        case .alac: return ["mov", "mp4", "m4v", "m4a"].contains(container)
+        case .flac: return ["mp4", "m4v", "mkv", "mka", "flac"].contains(container)
+        case .aac: return ["mov", "mp4", "m4v", "m4a"].contains(container)
+        case .mp3, .opus: return false
+        }
+    }
+
+    /// Lossless sound choices for the held-picture delivery targets.
+    public static func stillLosslessAudioActions(codec: ReencodeCodec, container: String) -> [ReencodeAudio] {
+        guard StillTimelineFormat.containers(for: codec).contains(container) else { return [] }
+        switch container {
+        case "mov": return codec == .jpeg ? [.pcm] : [.alac, .pcm]
+        case "mp4", "m4v": return [.alac, .flac]
+        case "mkv": return [.flac]
+        default: return []
+        }
+    }
+
+    public static func defaultStillLosslessAudio(codec: ReencodeCodec, container: String) -> ReencodeAudio? {
+        if let first = stillLosslessAudioActions(codec: codec, container: container).first { return first }
+        switch container {
+        case "m4a": return .alac
+        case "mka", "flac": return .flac
+        case "wav", "wave", "caf": return .pcm
+        default: return nil
+        }
+    }
 
     public static func stillContainers(mode: ExportMode, tracks: ExportTracks, codec: ReencodeCodec,
                                        audio: ReencodeAudio) -> [String] {
         if tracks == .audio {
-            return mode == .encode ? conversionContainers(audio) : stillSoundCopyContainers
+            let containers = stillSoundCopyContainers + ["flac"]
+            return containers.filter { allows(stillAudio: audio, in: $0) }
         }
+        let codecContainers = StillTimelineFormat.containers(for: codec)
         return stillMovieContainers.filter {
-            mode != .encode || reencodeContainers(codec).contains(multicamMuxContainer($0))
+            (mode == .copy || codecContainers.contains($0)) &&
+                (tracks == .video || allows(stillAudio: audio, in: $0, videoCodec: codec))
         }
+    }
+
+    public static func defaultStillPictureTiming(for project: CutProject) -> StillPictureTiming {
+        project.stillSoundtrack != nil || project.stillInserts.contains(where: \.usesExactDuration) ? .held : .cadence
     }
 
     /// A request without an explicit mode generates visible still picture with Smart Trim.
@@ -40,6 +83,20 @@ extension ExportRules {
             lines.append("| \(label) | \(answers.joined(separator: " | ")) |")
         }
         lines += ["", "Omitting the mode with visible still picture selects Smart Trim. A picture replacement alone leaves the sound-only selection on the ordinary rules. Preserve camera picture requires zero encoded camera duration. Export reports distinguish copied camera, encoded camera and generated still durations. The True Lossless tier requires every selected output packet to copy.", ""]
+        lines += ["### One frame per still", "",
+                  "| Container | Video codec | Program color | Lossless audio |",
+                  "| --- | --- | --- | --- |"]
+        for container in stillMovieContainers {
+            for codec in ReencodeCodec.allCases {
+                let audio = stillLosslessAudioActions(codec: codec, container: container)
+                guard !audio.isEmpty else { continue }
+                let color = codec == .hevc || codec == .prores ? "SDR, PQ, HLG" : "SDR"
+                let actions = audio.map { displayName(audio: $0) }.joined(separator: ", ")
+                lines.append("| .\(container) | `\(codec.rawValue)` | \(color) | \(actions) |")
+            }
+        }
+        lines += ["", "Smart Trim and Re-encode support held picture. A still-and-soundtrack project defaults to held timing. Choose cadence timing to export regular video frames instead. A saved picture format supplies the codec and container when a request omits them. An explicit container must agree with the destination extension.", "",
+                  "MOV-family picture uses exact sample timing. MKV rounds internal changes to the nearest millisecond with ties forward, and rounds the final picture end up. Preflight reports the requested and written intervals and refuses a hold that collapses to zero ticks or shifts a copied camera boundary.", ""]
         return lines
     }
 }
@@ -50,15 +107,12 @@ extension StillExportPlanner {
         if cancelled?() == true { return .checking }
         var factors: [TierFactor] = []
         var last = CutError(code: "export_failed", message: "No still export mode is available.")
-        let preferred = project.stillFormat?.container ?? preferredContainer.flatMap {
+        let preferred = preferredContainer.flatMap {
             ExportRules.stillMovieContainers.contains($0) ? $0 : nil
-        }
-        let containers: [String]
-        if let format = project.stillFormat {
-            containers = [format.container]
-        } else {
-            containers = (preferred.map { [$0] } ?? []) + ExportRules.stillMovieContainers.filter { $0 != preferred }
-        }
+        } ?? project.stillFormat?.container
+        let compatible = project.stillFormat.map { StillTimelineFormat.containers(for: $0.codec) }
+            ?? ExportRules.stillMovieContainers
+        let containers = (preferred.map { [$0] } ?? []) + compatible.filter { $0 != preferred }
         let scope: ExportPlacementScope
         do { scope = try project.exportPlacementScope() }
         catch let issue as CutError { return .unavailable(issue) }
@@ -72,7 +126,8 @@ extension StillExportPlanner {
             }
             var modeFailure: CutError?
             for container in containers {
-                for audio in [ReencodeAudio.copyOriginal, .pcm, .aac] {
+                for audio in [ReencodeAudio.copyOriginal, .alac, .flac, .pcm, .aac]
+                where ExportRules.allows(stillAudio: audio, in: container, videoCodec: project.stillFormat?.codec) {
                     if cancelled?() == true { return .checking }
                     do {
                         let plan = try resolve(project, relativeTo: location, mode: mode, container: container,
@@ -92,13 +147,15 @@ extension StillExportPlanner {
                         if issue.code == "cancelled" { return .checking }
                         if issue.code == "source_changed" { return .unavailable(issue) }
                         if modeFailure == nil { modeFailure = issue }
-                        last = issue
                     } catch {
-                        last = CutError(code: "export_failed", message: error.localizedDescription)
+                        if modeFailure == nil {
+                            modeFailure = CutError(code: "export_failed", message: error.localizedDescription)
+                        }
                     }
                 }
             }
             if let issue = modeFailure {
+                last = issue
                 let factor = TierFactor(issue, forces: mode == .copy ? .lossless : .reencode)
                 if !factors.contains(where: { $0.id == factor.id && $0.segment == factor.segment && $0.boundary == factor.boundary }) {
                     factors.append(factor)

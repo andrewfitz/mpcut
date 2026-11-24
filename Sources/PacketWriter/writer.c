@@ -97,6 +97,12 @@ typedef struct {
     size_t active_config_size;
     int64_t video_origin_pts;
     EdgePatch patches[2];
+    int delivered;      /* A file a person keeps: its chapters, and a sound-only source's cover art, travel with it. */
+    int whole_sound;    /* Every audio track was selected, so a sound-only source is copied whole. */
+    int keep_timecode;  /* A delivered picture-only movie keeps its MOV timecode track. */
+    unsigned art_streams;
+    uint8_t *art;       /* Per input stream of the first source: 1 when its cover picture is written. */
+    int mov_chapter_clock; /* Nonzero when the MOV chapter track still counts milliseconds on this clock. */
 } Writer;
 
 typedef struct {
@@ -282,9 +288,24 @@ static int track_selection(int tracks) {
         case MPCUT_TRACKS_LINKED_AUDIO:
         case MPCUT_TRACKS_PROGRAM_AUDIO:
             return MPCUT_TRACKS_AUDIO;
+        case MPCUT_TRACKS_DELIVERED_VIDEO:
+        case MPCUT_TRACKS_DELIVERED_VIDEO_TIMECODE:
+            return MPCUT_TRACKS_VIDEO;
         default:
             return -1;
     }
+}
+
+/* Record what the requested selection delivers before it is reduced to its primary tracks. */
+static void set_delivery(Writer *writer, int tracks, int audio_stream) {
+    writer->keep_timecode = tracks == MPCUT_TRACKS_DELIVERED_VIDEO_TIMECODE;
+    writer->delivered = tracks == MPCUT_TRACKS_ALL || tracks == MPCUT_TRACKS_AUDIO ||
+        tracks == MPCUT_TRACKS_DELIVERED_VIDEO || writer->keep_timecode;
+    writer->whole_sound = tracks == MPCUT_TRACKS_AUDIO && audio_stream < 0;
+}
+
+static int timecode_track(const AVStream *stream) {
+    return stream->codecpar->codec_type == AVMEDIA_TYPE_DATA && stream->codecpar->codec_tag == MPCUT_TIMECODE_TAG;
 }
 
 static int selected_stream(const Writer *writer, const AVStream *stream) {
@@ -292,7 +313,9 @@ static int selected_stream(const Writer *writer, const AVStream *stream) {
         case MPCUT_TRACKS_AUDIO:
             return stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
                 (writer->audio_stream < 0 || stream->index == writer->audio_stream);
-        case MPCUT_TRACKS_VIDEO: return primary_video(stream);
+        case MPCUT_TRACKS_VIDEO:
+            // Timecode describes the picture, so a delivered picture-only movie can keep it.
+            return primary_video(stream) || (writer->keep_timecode && timecode_track(stream));
         default: return 1;
     }
 }
@@ -601,9 +624,424 @@ static int set_still_hdr(Writer *writer, AVCodecParameters *codec)
     return 0;
 }
 
+/* --- Cover art and chapters ---
+ * A delivered copy keeps what describes the recording as a whole. Muxers store a
+ * picture in different forms, and several containers store neither. */
+
+enum { ART_NONE, ART_PICTURE_STREAM, ART_ATTACHMENT };
+
+static int art_form(const AVOutputFormat *format) {
+    // The MOV muxer writes cover atoms only into the iTunes metadata of MP4 and M4A, never into a QuickTime movie.
+    if (!strcmp(format->name, "mp4") || !strcmp(format->name, "ipod") ||
+        !strcmp(format->name, "mp3") || !strcmp(format->name, "flac"))
+        return ART_PICTURE_STREAM;
+    return strcmp(format->name, "matroska") ? ART_NONE : ART_ATTACHMENT;
+}
+
+static int attached_picture(const AVStream *stream) {
+    return stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && (stream->disposition & AV_DISPOSITION_ATTACHED_PIC);
+}
+
+static int sound_only(const AVFormatContext *input) {
+    for (unsigned i = 0; i < input->nb_streams; i++)
+        if (primary_video(input->streams[i]))
+            return 0;
+    return 1;
+}
+
+static const char *picture_mime(const AVStream *stream) {
+    const AVDictionaryEntry *named = av_dict_get(stream->metadata, "mimetype", NULL, 0);
+    if (named && named->value[0])
+        return named->value;
+    const AVCodecDescriptor *codec = avcodec_descriptor_get(stream->codecpar->codec_id);
+    return codec && codec->mime_types ? codec->mime_types[0] : NULL;
+}
+
+/* Whether the muxer has a picture type for this codec: MP4 cover atoms, ID3 and FLAC picture blocks. */
+static int art_codec(const AVOutputFormat *format, const AVStream *stream) {
+    int mp4 = !strcmp(format->name, "mp4") || !strcmp(format->name, "ipod");
+    switch (stream->codecpar->codec_id) {
+        case AV_CODEC_ID_MJPEG:
+        case AV_CODEC_ID_PNG:
+        case AV_CODEC_ID_BMP:
+            return 1;
+        case AV_CODEC_ID_GIF:
+            return !mp4 && strcmp(format->name, "flac");
+        case AV_CODEC_ID_TIFF:
+        case AV_CODEC_ID_WEBP:
+        case AV_CODEC_ID_JPEGXL:
+            return !mp4;
+        default:
+            return 0;
+    }
+}
+
+/* MOV cover atoms and ID3 pictures carry no pixel size, and these inputs are not decoded.
+ * Read it from the picture's own header. */
+static int picture_size(const AVStream *stream, int *width, int *height) {
+    const uint8_t *data = stream->attached_pic.data;
+    int size = stream->attached_pic.size;
+    *width = stream->codecpar->width;
+    *height = stream->codecpar->height;
+    if (*width > 0 && *height > 0)
+        return 1;
+    *width = *height = 0;
+    switch (stream->codecpar->codec_id) {
+        case AV_CODEC_ID_PNG:
+            if (size >= 24 && !memcmp(data, "\x89PNG\r\n\x1a\n", 8)) {
+                *width = (int)AV_RB32(data + 16);
+                *height = (int)AV_RB32(data + 20);
+            }
+            break;
+        case AV_CODEC_ID_GIF:
+            if (size >= 10 && !memcmp(data, "GIF8", 4)) {
+                *width = AV_RL16(data + 6);
+                *height = AV_RL16(data + 8);
+            }
+            break;
+        case AV_CODEC_ID_BMP:
+            if (size >= 26 && data[0] == 'B' && data[1] == 'M') {
+                int32_t rows = (int32_t)AV_RL32(data + 22);
+                *width = (int)AV_RL32(data + 18);
+                *height = rows < 0 ? -rows : rows;
+            }
+            break;
+        case AV_CODEC_ID_MJPEG:
+            for (int at = 2; at + 9 <= size;) {
+                if (data[at] != 0xff) {
+                    break;
+                }
+                uint8_t marker = data[at + 1];
+                if (marker == 0xff) {
+                    at++; // Fill byte.
+                } else if (marker == 0x01 || (marker >= 0xd0 && marker <= 0xd8)) {
+                    at += 2; // No payload.
+                } else if (marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc) {
+                    *height = AV_RB16(data + at + 5);
+                    *width = AV_RB16(data + at + 7);
+                    break;
+                } else if (marker == 0xda || marker == 0xd9) {
+                    break; // Scan data follows, with no frame header before it.
+                } else {
+                    at += 2 + AV_RB16(data + at + 2);
+                }
+            }
+            break;
+        default:
+            break;
+    }
+    return *width > 0 && *height > 0 && *width <= 65535 && *height <= 65535;
+}
+
+/* Cover art travels when a sound-only source is copied with every audio track. Marks the
+ * source pictures the output stores and returns how many it cannot store. */
+static unsigned plan_art(const Writer *writer, const AVFormatContext *input, uint8_t *keep, unsigned *kept) {
+    *kept = 0;
+    if (!writer->delivered || !writer->whole_sound || !sound_only(input))
+        return 0;
+    const AVOutputFormat *format = writer->output->oformat;
+    int form = art_form(format);
+    int flac = !strcmp(format->name, "flac");
+    unsigned dropped = 0, icons = 0;
+    for (unsigned i = 0; i < input->nb_streams; i++) {
+        const AVStream *stream = input->streams[i];
+        if (!attached_picture(stream))
+            continue;
+        int width = 0, height = 0;
+        int usable = form != ART_NONE && stream->attached_pic.size > 0 &&
+            !(stream->disposition & AV_DISPOSITION_TIMED_THUMBNAILS);
+        if (usable && form == ART_ATTACHMENT)
+            usable = picture_mime(stream) != NULL;
+        if (usable && form == ART_PICTURE_STREAM)
+            usable = art_codec(format, stream) && picture_size(stream, &width, &height);
+        if (usable && flac) {
+            // FLAC allows one of each file icon, and the standard icon is a 32x32 PNG.
+            const AVDictionaryEntry *type = av_dict_get(stream->metadata, "comment", NULL, 0);
+            unsigned icon = !type ? 0 : !av_strcasecmp(type->value, "32x32 pixels 'file icon' (PNG only)") ? 1
+                : !av_strcasecmp(type->value, "Other file icon") ? 2 : 0;
+            if ((icons & icon) || (icon == 1 && (stream->codecpar->codec_id != AV_CODEC_ID_PNG || width != 32 || height != 32)))
+                usable = 0;
+            icons |= icon;
+        }
+        if (usable) {
+            if (keep)
+                keep[i] = 1;
+            (*kept)++;
+        } else {
+            dropped++;
+        }
+    }
+    return dropped;
+}
+
+static int add_art(Writer *writer, const AVFormatContext *input) {
+    AVFormatContext *output = writer->output;
+    unsigned kept = 0;
+    writer->art = av_calloc(input->nb_streams ? input->nb_streams : 1, 1);
+    if (!writer->art)
+        return fail(writer, "Cannot allocate cover art state");
+    plan_art(writer, input, writer->art, &kept);
+    int form = art_form(output->oformat);
+    for (unsigned i = 0; i < input->nb_streams; i++) {
+        if (!writer->art[i])
+            continue;
+        const AVStream *source = input->streams[i];
+        AVStream *destination = avformat_new_stream(output, NULL);
+        if (!destination)
+            return fail(writer, "Cannot allocate a cover art track");
+        AVCodecParameters *codec = destination->codecpar;
+        int result = avcodec_parameters_copy(codec, source->codecpar);
+        if (result >= 0)
+            result = av_dict_copy(&destination->metadata, source->metadata, 0);
+        codec->codec_tag = 0;
+        destination->id = destination->index + 1;
+        destination->time_base = (AVRational){1, 90000};
+        if (result >= 0 && form == ART_ATTACHMENT) {
+            // Matroska stores a picture as an attached file. Its readers find cover art by MIME type.
+            const char *mime = picture_mime(source);
+            const char *subtype = strchr(mime, '/');
+            char name[48];
+            subtype = subtype ? subtype + 1 : "bin";
+            snprintf(name, sizeof(name), "cover.%s", !strcmp(subtype, "jpeg") ? "jpg" : !strcmp(subtype, "x-ms-bmp") ? "bmp" : subtype);
+            av_freep(&codec->extradata);
+            codec->extradata_size = 0;
+            codec->codec_type = AVMEDIA_TYPE_ATTACHMENT;
+            codec->extradata = av_mallocz((size_t)source->attached_pic.size + AV_INPUT_BUFFER_PADDING_SIZE);
+            if (!codec->extradata)
+                return fail(writer, "Cannot allocate cover art");
+            memcpy(codec->extradata, source->attached_pic.data, (size_t)source->attached_pic.size);
+            codec->extradata_size = source->attached_pic.size;
+            result = av_dict_set(&destination->metadata, "mimetype", mime, AV_DICT_DONT_OVERWRITE);
+            if (result >= 0)
+                result = av_dict_set(&destination->metadata, "filename", name, AV_DICT_DONT_OVERWRITE);
+        } else if (result >= 0) {
+            destination->disposition = AV_DISPOSITION_ATTACHED_PIC;
+            picture_size(source, &codec->width, &codec->height);
+        }
+        if (result < 0)
+            return ff_error(writer, result, "Cannot copy cover art from", input->url);
+        writer->art_streams++;
+    }
+    return 0;
+}
+
+/* Muxers that take a picture as a stream expect its one packet before the sound. */
+static int write_art(Writer *writer, const AVFormatContext *input) {
+    AVFormatContext *output = writer->output;
+    if (!writer->art_streams || art_form(output->oformat) != ART_PICTURE_STREAM)
+        return 0;
+    int index = (int)(output->nb_streams - writer->art_streams);
+    for (unsigned i = 0; i < input->nb_streams; i++) {
+        if (!writer->art[i])
+            continue;
+        AVPacket *picture = av_packet_clone(&input->streams[i]->attached_pic);
+        if (!picture)
+            return fail(writer, "Cannot allocate cover art");
+        picture->stream_index = index++;
+        picture->pts = picture->dts = 0;
+        picture->duration = 0;
+        picture->pos = -1;
+        picture->flags |= AV_PKT_FLAG_KEY;
+        int result = av_interleaved_write_frame(output, picture);
+        av_packet_free(&picture);
+        if (result < 0)
+            return ff_error(writer, result, "Cannot write cover art to", writer->output_path);
+    }
+    return 0;
+}
+
+typedef struct {
+    MPCutTime start, end; /* On the output timeline. */
+    AVDictionary *metadata;
+    int64_t id;
+    size_t source;        /* The first segment that names this chapter's file. */
+    unsigned index;       /* Its position among that file's chapters. */
+} Chapter;
+
+typedef struct {
+    Chapter *items;
+    size_t count;
+    int unplaced;         /* A range could not be placed on the output timeline. */
+} Chapters;
+
+static void free_chapters(Chapters *chapters) {
+    for (size_t i = 0; i < chapters->count; i++)
+        av_dict_free(&chapters->items[i].metadata);
+    av_freep(&chapters->items);
+    chapters->count = 0;
+}
+
+enum { CHAPTERS_NONE, CHAPTERS_PLAIN, CHAPTERS_MOV };
+
+static int chapter_form(const AVOutputFormat *format) {
+    if (!strcmp(format->name, "mov") || !strcmp(format->name, "mp4") || !strcmp(format->name, "ipod"))
+        return CHAPTERS_MOV; // A text track that the movie's other tracks reference.
+    return is_matroska(format) || !strcmp(format->name, "mp3") ? CHAPTERS_PLAIN : CHAPTERS_NONE;
+}
+
+static MPCutTime mov_audio_lead(const MPCutSegment *segment);
+
+/* Place every source chapter on the output timeline: clip it to the kept ranges, move it by
+ * each range's offset, and rejoin the pieces of one chapter that neighbouring ranges share.
+ * A chapter that lies wholly in removed material has no place and is left out. */
+static int plan_chapters(const Writer *writer, const MPCutSegment *segments, size_t count,
+                         const AVFormatContext *first, MPCutTime first_origin, int movie_clock, Chapters *plan) {
+    AVFormatContext *other = NULL;
+    MPCutTime cursor = {0, 1};
+    int result = 0;
+    for (size_t at = 0; at < count && !result && !plan->unplaced; at++) {
+        const MPCutSegment *segment = &segments[at];
+        size_t source = 0;
+        while (strcmp(segments[source].path, segment->path))
+            source++;
+        const AVFormatContext *input = first;
+        if (source) {
+            if (!other || strcmp(other->url, segment->path)) {
+                avformat_close_input(&other);
+                if (avformat_open_input(&other, segment->path, NULL, NULL) < 0) {
+                    plan->unplaced = 1;
+                    break;
+                }
+            }
+            input = other;
+        }
+        MPCutTime origin = segment->source_origin.denominator > 0 ? segment->source_origin
+            : source ? (MPCutTime){0, 0} : first_origin;
+        MPCutTime source_start = time_add(origin, segment->start, 1);
+        MPCutTime source_end = time_add(origin, segment->end, 1);
+        MPCutTime shift = time_add(cursor, source_start, -1);
+        int whole = count == 1 && segment->start.numerator == 0 && segment->reaches_end;
+        if (whole && movie_clock && is_mov(writer->output->oformat))
+            shift = time_add(shift, mov_audio_lead(segment), 1);
+        cursor = time_add(cursor, time_add(segment->end, segment->start, -1), 1);
+        if (origin.denominator <= 0 || !source_start.denominator || !source_end.denominator ||
+            !shift.denominator || !cursor.denominator) {
+            plan->unplaced = input->nb_chapters > 0;
+            continue;
+        }
+        for (unsigned index = 0; index < input->nb_chapters && !result; index++) {
+            const AVChapter *chapter = input->chapters[index];
+            MPCutTime start = time_ticks(chapter->start, chapter->time_base);
+            MPCutTime end = time_ticks(chapter->end, chapter->time_base);
+            if (!start.denominator)
+                continue;
+            if (!end.denominator || time_compare(end, start) < 0) {
+                // No stated end: the chapter runs to the next one, or to the end of the range.
+                end = (MPCutTime){0, 0};
+                for (unsigned next = 0; next < input->nb_chapters; next++) {
+                    MPCutTime later = time_ticks(input->chapters[next]->start, input->chapters[next]->time_base);
+                    if (later.denominator && time_compare(later, start) > 0 &&
+                        (!end.denominator || time_compare(later, end) < 0))
+                        end = later;
+                }
+                if (!end.denominator)
+                    end = time_compare(source_end, start) > 0 ? source_end : start;
+            }
+            if (!whole) {
+                if (time_compare(start, source_start) < 0)
+                    start = source_start;
+                if (time_compare(end, source_end) > 0)
+                    end = source_end;
+                if (time_compare(end, start) <= 0)
+                    continue;
+            }
+            start = time_add(start, shift, 1);
+            end = time_add(end, shift, 1);
+            if (!start.denominator || !end.denominator) {
+                plan->unplaced = 1;
+                break;
+            }
+            if (start.numerator < 0)
+                start = (MPCutTime){0, 1};
+            if (time_compare(end, start) < 0)
+                continue;
+            Chapter *last = plan->count ? &plan->items[plan->count - 1] : NULL;
+            if (last && last->source == source && last->index == index && time_compare(last->end, start) == 0) {
+                last->end = end;
+                continue;
+            }
+            Chapter *grown = av_realloc_array(plan->items, plan->count + 1, sizeof(*grown));
+            if (!grown) {
+                result = AVERROR(ENOMEM);
+                break;
+            }
+            plan->items = grown;
+            grown[plan->count] = (Chapter){.start = start, .end = end, .id = chapter->id, .source = source, .index = index};
+            result = av_dict_copy(&grown[plan->count].metadata, chapter->metadata, 0);
+            plan->count++;
+        }
+    }
+    avformat_close_input(&other);
+    if (plan->unplaced)
+        free_chapters(plan);
+    return result;
+}
+
+/* The MOV chapter track counts whole milliseconds and needs each chapter to start after the one before. */
+static int mov_chapter_times(const Chapter *chapter, int64_t previous_start, int64_t *start, int64_t *end) {
+    const AVRational milliseconds = {1, 1000};
+    *start = time_round(chapter->start, milliseconds);
+    *end = time_round(chapter->end, milliseconds);
+    return *start != AV_NOPTS_VALUE && *end != AV_NOPTS_VALUE && *start > previous_start &&
+        *end > *start && *end - *start < INT_MAX;
+}
+
+/* Hand the planned chapters to the muxer, or with no output only count those its container cannot hold. */
+static int store_chapters(Writer *writer, Chapters *plan, int movie_timescale, int apply, unsigned *unstored) {
+    AVFormatContext *output = writer->output;
+    int form = chapter_form(output->oformat);
+    int64_t previous = -1;
+    *unstored = 0;
+    for (size_t i = 0; i < plan->count; i++) {
+        Chapter *planned = &plan->items[i];
+        AVRational base = {1, 1000000000};
+        int64_t start = time_round(planned->start, base);
+        int64_t end = time_round(planned->end, base);
+        int usable = form != CHAPTERS_NONE && start != AV_NOPTS_VALUE && end != AV_NOPTS_VALUE;
+        if (usable && form == CHAPTERS_MOV) {
+            /* The muxer copies these numbers onto its movie clock unchanged; the finished
+             * track is then relabelled with the millisecond clock they were counted on. */
+            base = (AVRational){1, movie_timescale};
+            usable = mov_chapter_times(planned, previous, &start, &end);
+        }
+        if (!usable) {
+            (*unstored)++;
+            continue;
+        }
+        previous = start;
+        if (!apply)
+            continue;
+        AVChapter *chapter = av_mallocz(sizeof(*chapter));
+        AVChapter **list = chapter ? av_realloc_array(output->chapters, output->nb_chapters + 1, sizeof(*list)) : NULL;
+        if (!list) {
+            av_free(chapter);
+            return fail(writer, "Cannot allocate output chapters");
+        }
+        output->chapters = list;
+        list[output->nb_chapters++] = chapter;
+        chapter->id = planned->id;
+        chapter->time_base = base;
+        chapter->start = start;
+        chapter->end = end;
+        chapter->metadata = planned->metadata;
+        planned->metadata = NULL;
+        // The MOV muxer writes a text sample only for a titled chapter.
+        if (form == CHAPTERS_MOV && av_dict_set(&chapter->metadata, "title", "", AV_DICT_DONT_OVERWRITE) < 0)
+            return fail(writer, "Cannot allocate output chapters");
+    }
+    if (apply && form == CHAPTERS_MOV && output->nb_chapters) {
+        // The Nero chapter list would repeat the millisecond counts as if they were movie ticks.
+        int result = av_opt_set(output->priv_data, "movflags", "+disable_chpl", 0);
+        if (result < 0)
+            return ff_error(writer, result, "Cannot configure chapters for", writer->output_path);
+        writer->mov_chapter_clock = movie_timescale;
+    }
+    return 0;
+}
+
 static int configure_output(Writer *writer, AVFormatContext *input, int whole_file,
                             int timecode_index, const MPCutTimecode *timecode, const char *initial_timecode,
-                            const MPCutSegment *segment) {
+                            const MPCutSegment *segment, Chapters *chapters) {
     AVFormatContext *output = writer->output;
     writer->has_timecode = timecode_index >= 0;
     if (writer->has_timecode) {
@@ -718,7 +1156,16 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
 
     if (is_mov(output->oformat)) {
         /* Preserve sub-millisecond edits and allow leading decode timestamps. */
-        av_opt_set_int(output->priv_data, "movie_timescale", movie_timescale, 0);
+        int output_movie_timescale = movie_timescale;
+        if (writer->generated_stills && output_count == 1) {
+            const AVRational base = output->streams[0]->time_base;
+            // Generated-still picture lanes plan every boundary on this clock.
+            // A different movie clock can round the track header and edit list
+            // even when the video sample table describes the exact duration.
+            if (base.num == 1 && base.den > 0 && movie_timescale % base.den != 0)
+                output_movie_timescale = base.den;
+        }
+        av_opt_set_int(output->priv_data, "movie_timescale", output_movie_timescale, 0);
         av_opt_set_int(output->priv_data, "use_editlist", 1, 0);
         av_opt_set_int(output->priv_data, "use_stream_ids_as_track_ids", 1, 0);
         for (unsigned index = 0; index < output->nb_streams; index++) {
@@ -763,6 +1210,15 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
         if (result < 0)
             return ff_error(writer, result, "Cannot enable large WAV files for", writer->output_path);
     }
+    if (writer->delivered) {
+        // Cover art follows the copied tracks, so their output indices do not move.
+        unsigned unstored;
+        result = add_art(writer, input);
+        if (!result)
+            result = store_chapters(writer, chapters, movie_timescale, 1, &unstored);
+        if (result)
+            return result;
+    }
     result = avio_open(&output->pb, writer->output_path, AVIO_FLAG_WRITE);
     if (result < 0) {
         return ff_error(writer, result, "Cannot create", writer->output_path);
@@ -771,7 +1227,7 @@ static int configure_output(Writer *writer, AVFormatContext *input, int whole_fi
     if (result < 0) {
         return ff_error(writer, result, "Cannot write movie header to", writer->output_path);
     }
-    return 0;
+    return write_art(writer, input);
 }
 
 static int video_origin(Writer *writer, AVFormatContext **input, unsigned *video_index,
@@ -875,11 +1331,12 @@ static int check_timecode_range(Writer *writer, const AVFormatContext *input, in
     return code < 0 ? ff_error(writer, code, "Cannot preserve timecode at the selected start of", input->url) : 0;
 }
 
-int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime duration,
-                         const char *output_path, size_t *failed_segment,
-                         MPCutProgress progress, void *context, char *error, size_t error_capacity) {
+static int check_timecode(const MPCutSegment *segments, size_t count, MPCutTime duration, int tracks,
+                          const char *output_path, size_t *failed_segment,
+                          MPCutProgress progress, void *context, char *error, size_t error_capacity) {
     Writer writer = {.output_path = output_path, .progress = progress, .progress_context = context,
-                     .error = error, .error_capacity = error_capacity};
+                     .error = error, .error_capacity = error_capacity, .tracks = track_selection(tracks)};
+    set_delivery(&writer, tracks, -1);
     if (failed_segment)
         *failed_segment = 0;
     if (!segments || !count || !output_path)
@@ -959,6 +1416,20 @@ cleanup:
     av_packet_free(&writer.packet);
     avformat_free_context(writer.output);
     return result;
+}
+
+int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime duration,
+                         const char *output_path, size_t *failed_segment,
+                         MPCutProgress progress, void *context, char *error, size_t error_capacity) {
+    return check_timecode(segments, count, duration, MPCUT_TRACKS_ALL, output_path, failed_segment,
+                          progress, context, error, error_capacity);
+}
+
+int mpcut_check_video_timecode(const MPCutSegment *segments, size_t count, MPCutTime duration,
+                               const char *output_path, size_t *failed_segment,
+                               MPCutProgress progress, void *context, char *error, size_t error_capacity) {
+    return check_timecode(segments, count, duration, MPCUT_TRACKS_DELIVERED_VIDEO_TIMECODE, output_path, failed_segment,
+                          progress, context, error, error_capacity);
 }
 
 static int pcm_frame_size(const AVCodecParameters *codec) {
@@ -1918,7 +2389,7 @@ static int validate_layout(Writer *writer, const AVFormatContext *input, int tim
     if (has_timecode != writer->has_timecode) {
         return fail(writer, "Timecode track presence changed in %s", input->url);
     }
-    if (writer->selected_count != writer->output->nb_streams) {
+    if (writer->selected_count + writer->art_streams != writer->output->nb_streams) {
         return fail(writer, "Track count changed in %s", input->url);
     }
 
@@ -2005,10 +2476,13 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
     };
     const int program_audio = tracks == MPCUT_TRACKS_PROGRAM_AUDIO;
     const int linked_movie_clock = tracks == MPCUT_TRACKS_ALL || tracks == MPCUT_TRACKS_LINKED_AUDIO || program_audio;
+    const int movie_chapters = tracks == MPCUT_TRACKS_ALL;
+    set_delivery(&writer, tracks, audio_stream);
     tracks = track_selection(tracks);
     writer.tracks = tracks;
     writer.audio_stream = audio_stream;
     AVFormatContext *input = NULL;
+    Chapters chapters = {0};
     // Cache the last selected AAC track set, including movies with no special edit list.
     AACSourceCache aac_cache = {0};
     int result;
@@ -2030,6 +2504,8 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
                 segment->audio_stream_override - 1 > INT_MAX)) {
             return fail(&writer, "Segment %zu has invalid track timing or selection", index + 1);
         }
+        if (segment->audio_stream_override)
+            writer.whole_sound = 0; // One chosen track per source is not the whole recording.
         writer.track_video_config |= segment->multiple_descriptions;
         writer.generated_stills |= segment->generated_still;
         writer.smart_trim |= segment->head_edge.frame_count > 0 || segment->tail_edge.frame_count > 0;
@@ -2173,8 +2649,13 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
         for (unsigned i = 0; i < input->nb_streams; i++)
             if (writer.stream_map[i] < 0)
                 input->streams[i]->discard = AVDISCARD_ALL;
+        if (!index && writer.delivered && plan_chapters(&writer, segments, count, input, origin, movie_chapters, &chapters) < 0) {
+            result = fail(&writer, "Cannot allocate output chapters");
+            goto cleanup;
+        }
         result = index ? validate_layout(&writer, input, timecode_index)
-                       : configure_output(&writer, input, range.whole_file, timecode_index, &timecode, initial_timecode, segment);
+                       : configure_output(&writer, input, range.whole_file, timecode_index, &timecode, initial_timecode,
+                                          segment, &chapters);
         if (result) {
             goto cleanup;
         }
@@ -2224,6 +2705,12 @@ int mpcut_write(const MPCutSegment *segments, size_t count, const char *output_p
             goto cleanup;
         }
     }
+    if (writer.mov_chapter_clock) {
+        result = mpcut_mov_finish_chapters(output_path, writer.mov_chapter_clock, error, error_capacity);
+        if (result) {
+            goto cleanup;
+        }
+    }
     if (writer.aac_edits) {
         result = mpcut_aac_finalize(writer.aac_edits, output_path, error, error_capacity);
         if (result) {
@@ -2252,9 +2739,125 @@ cleanup:
     av_free(writer.opus_trim);
     av_free(writer.range_tracks);
     av_free(writer.stream_map);
+    av_free(writer.art);
+    free_chapters(&chapters);
     if (writer.output) {
         avio_closep(&writer.output->pb);
         avformat_free_context(writer.output);
     }
+    return result;
+}
+
+static void add_note(char *notes, size_t capacity, const char *format, ...) {
+    size_t used = strlen(notes);
+    if (used + 2 >= capacity)
+        return;
+    if (used)
+        notes[used++] = '\n';
+    va_list args;
+    va_start(args, format);
+    vsnprintf(notes + used, capacity - used, format, args);
+    va_end(args);
+}
+
+/* Pictures in a later source that the first source, whose art the copy keeps, does not also carry. */
+static unsigned unmatched_art(const AVFormatContext *first, const AVFormatContext *later) {
+    unsigned count = 0;
+    for (unsigned i = 0; i < later->nb_streams; i++) {
+        const AVStream *stream = later->streams[i];
+        if (!attached_picture(stream))
+            continue;
+        int matched = 0;
+        for (unsigned j = 0; j < first->nb_streams && !matched; j++) {
+            const AVPacket *kept = &first->streams[j]->attached_pic;
+            matched = attached_picture(first->streams[j]) && kept->size == stream->attached_pic.size &&
+                kept->size > 0 && !memcmp(kept->data, stream->attached_pic.data, (size_t)kept->size);
+        }
+        count += !matched;
+    }
+    return count;
+}
+
+int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char *output_path,
+                         int tracks, int audio_stream, char *notes, size_t capacity) {
+    if (!notes || !capacity)
+        return 1;
+    notes[0] = '\0';
+    Writer writer = {.output_path = output_path, .tracks = track_selection(tracks), .audio_stream = audio_stream};
+    if (!segments || !count || !output_path || writer.tracks < 0)
+        return 1;
+    set_delivery(&writer, tracks, audio_stream);
+    for (size_t i = 0; i < count; i++) {
+        if (!valid_segment_range(&segments[i]))
+            return 1;
+        if (segments[i].audio_stream_override)
+            writer.whole_sound = 0;
+    }
+    if (!writer.delivered)
+        return 0;
+
+    AVFormatContext *input = NULL;
+    Chapters chapters = {0};
+    int result = prepare_output(&writer) || avformat_open_input(&input, segments[0].path, NULL, NULL) < 0;
+    if (!result) {
+        char container[16] = "This format";
+        const char *extension = strrchr(output_path, '.');
+        if (extension && extension[1] && strlen(extension + 1) < sizeof(container)) {
+            size_t length = strlen(extension + 1);
+            for (size_t i = 0; i <= length; i++)
+                container[i] = (char)av_toupper(extension[1 + i]);
+        }
+
+        unsigned kept = 0;
+        unsigned dropped = plan_art(&writer, input, NULL, &kept);
+        unsigned later = 0;
+        if (writer.whole_sound && sound_only(input)) {
+            for (size_t at = 1; at < count; at++) {
+                size_t source = 0;
+                while (strcmp(segments[source].path, segments[at].path))
+                    source++;
+                if (source != at)
+                    continue; // Counted where this file first appears.
+                AVFormatContext *other = NULL;
+                if (avformat_open_input(&other, segments[at].path, NULL, NULL) < 0)
+                    continue;
+                if (sound_only(other))
+                    later += unmatched_art(input, other);
+                avformat_close_input(&other);
+            }
+        }
+        if (!kept)
+            dropped += later;
+        if (dropped && art_form(writer.output->oformat) == ART_NONE) {
+            add_note(notes, capacity, "%s cannot store cover art. %u embedded picture%s not copied.",
+                     container, dropped, dropped == 1 ? " is" : "s are");
+        } else if (dropped) {
+            add_note(notes, capacity, "%u embedded picture%s cannot be stored in %s and %s not copied.",
+                     dropped, dropped == 1 ? "" : "s", container, dropped == 1 ? "is" : "are");
+        }
+        if (kept && later) {
+            add_note(notes, capacity, "Cover art comes from the first clip. %u different picture%s in later clips %s not copied.",
+                     later, later == 1 ? "" : "s", later == 1 ? "is" : "are");
+        }
+
+        MPCutTime origin = segments[0].source_origin.denominator > 0 ? segments[0].source_origin : (MPCutTime){0, 1};
+        result = plan_chapters(&writer, segments, count, input, origin, tracks == MPCUT_TRACKS_ALL, &chapters) < 0;
+        unsigned unstored = 0;
+        if (!result && chapters.unplaced) {
+            add_note(notes, capacity, "The chapters could not be placed on the output timeline and are not copied.");
+        } else if (!result && chapters.count) {
+            store_chapters(&writer, &chapters, movie_timescale, 0, &unstored);
+            if (unstored && chapter_form(writer.output->oformat) == CHAPTERS_NONE) {
+                add_note(notes, capacity, "%s cannot store chapters. %u chapter%s not copied.",
+                         container, unstored, unstored == 1 ? " is" : "s are");
+            } else if (unstored) {
+                add_note(notes, capacity, "%u chapter%s cannot be stored in %s and %s not copied.",
+                         unstored, unstored == 1 ? "" : "s", container, unstored == 1 ? "is" : "are");
+            }
+        }
+    }
+    free_chapters(&chapters);
+    avformat_close_input(&input);
+    avformat_free_context(writer.output);
     return result;
 }

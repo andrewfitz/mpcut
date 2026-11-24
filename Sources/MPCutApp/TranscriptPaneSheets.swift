@@ -7,14 +7,16 @@ struct TranscriptPaneSheet: Identifiable {
     let id = UUID()
     let title: String
     let content: AnyView
+    let contentHasActions: Bool
     let actionTitle: String?
     let actionIdentifier: String
     let action: (() throws -> Void)?
 
     init<Content: View>(_ title: String, actionTitle: String? = nil, actionIdentifier: String = "transcript.confirm",
-                        action: (() throws -> Void)? = nil, @ViewBuilder content: () -> Content) {
+                        contentHasActions: Bool = false, action: (() throws -> Void)? = nil, @ViewBuilder content: () -> Content) {
         self.title = title
         self.content = AnyView(content())
+        self.contentHasActions = contentHasActions
         self.actionTitle = actionTitle
         self.actionIdentifier = actionIdentifier
         self.action = action
@@ -34,16 +36,18 @@ struct TranscriptPaneSheetView: View {
             if let error {
                 IssueLabel(error).accessibilityIdentifier("transcript.error")
             }
-            HStack(spacing: 10) {
-                Spacer()
-                Button(sheet.action == nil ? "Done" : "Cancel", action: dismiss)
-                    .keyboardShortcut(.cancelAction)
-                if let action = sheet.action, let title = sheet.actionTitle {
-                    Button(title) {
-                        do { try action() } catch { self.error = error.localizedDescription }
+            if !sheet.contentHasActions {
+                HStack(spacing: 10) {
+                    Spacer()
+                    Button(sheet.action == nil ? "Done" : "Cancel", action: dismiss)
+                        .keyboardShortcut(.cancelAction)
+                    if let action = sheet.action, let title = sheet.actionTitle {
+                        Button(title) {
+                            do { try action() } catch { self.error = error.localizedDescription }
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier(sheet.actionIdentifier)
                     }
-                    .keyboardShortcut(.defaultAction)
-                    .accessibilityIdentifier(sheet.actionIdentifier)
                 }
             }
         }

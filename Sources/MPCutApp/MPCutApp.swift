@@ -22,7 +22,9 @@ struct MPCutApp: App {
         .windowResizability(.contentSize)
         .defaultPosition(.center)
         Settings {
-            EditorSettings(preferences: application.sessions.preferences)
+            EditorSettings(preferences: application.sessions.preferences) {
+                SidecarClearContext(sessions: application.sessions)
+            }
         }
     }
 }
@@ -157,6 +159,17 @@ private struct ProjectFileItems: View {
         }
         .disabled(session.isMulticam ? !multicam.canRefreshProjectMedia : !editor.canRefreshProjectMedia)
         .help("Refresh changed media")
+        Button("Relink Offline Media…") {
+            if session.isMulticam { multicam.presentProjectMedia(offlineOnly: true) }
+            else { editor.presentProjectMedia(offlineOnly: true) }
+        }
+        .keyboardShortcut("l", modifiers: [.command, .shift])
+        .disabled(session.isMulticam ? multicam.project == nil : editor.isEmpty)
+        Button("Project Media…") {
+            if session.isMulticam { multicam.presentProjectMedia() }
+            else { editor.presentProjectMedia() }
+        }
+        .disabled(session.isMulticam ? multicam.project == nil : editor.isEmpty)
         Button("Deep Verify Project Media") {
             if session.isMulticam { multicam.refreshProjectMedia(deep: true) } else { editor.refreshProjectMedia(deep: true) }
         }
@@ -165,10 +178,10 @@ private struct ProjectFileItems: View {
         if session.isMulticam {
             Button("Save Analysis Sidecars", action: multicam.saveAnalysisSidecars)
                 .disabled(!multicam.canSaveSidecars)
-                .help("Save the edit index and analysis in a sidecar beside each source file.")
+                .help("Save the edit index and analysis to the sidecar location chosen in Settings.")
         } else {
             Button("Save Analysis Sidecars", action: editor.saveAnalysisSidecars)
-                .help("Save the edit index and analysis in a sidecar beside each source file.")
+                .help("Save the edit index and analysis to the sidecar location chosen in Settings.")
                 .disabled(!editor.canSaveAnalysisSidecars)
         }
     }

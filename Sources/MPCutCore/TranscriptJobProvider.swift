@@ -19,6 +19,9 @@ struct TranscriptProviderCapabilities: Decodable {
     let version: String
     let cache_revision: String?
     let session_schema_version: Int?
+    /// The newest form of a shared recognition file this helper reads. A helper that
+    /// does not say reads the first.
+    let shared_cache_exchange_version: Int?
     let engines: [Engine]
 
     static func read(_ data: Data) throws -> Self {
@@ -292,6 +295,7 @@ extension TranscriptProviderCommand {
 struct TranscriptProviderSettings {
     let providerVersion: String
     let sharedCacheRevision: String?
+    let sharedExchangeVersion: Int
     let engine: TranscriptProviderCapabilities.Engine
     let model: String
     let language: String
@@ -303,6 +307,7 @@ struct TranscriptProviderSettings {
     init(capabilities: TranscriptProviderCapabilities, options: TranscriptJobOptions) throws {
         providerVersion = capabilities.version
         sharedCacheRevision = capabilities.cache_revision
+        sharedExchangeVersion = capabilities.shared_cache_exchange_version ?? 1
         engine = try capabilities.select(options.engine)
         model = options.model ?? engine.default_model
         guard engine.model_source != "macos" || model == engine.default_model else {

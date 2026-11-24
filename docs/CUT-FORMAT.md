@@ -1,8 +1,42 @@
 # MPCut project files
 
-A `.cut` file contains one editable timeline in UTF-8 JSON. It references media by path. When moving a project, take the referenced recordings, linked images and any sibling `.cut.transcripts` directory. The SQLite analysis sidecars (`.cutdb`) are optional caches.
+A `.cut` file contains one editable timeline as a JSON document. MPCut saves that document in a compact layout and compresses it, and it also opens a document written as plain UTF-8 JSON, which is the form to author by hand. It references media by path. When moving a project, take the referenced recordings, linked images and any sibling `.cut.transcripts` directory. The SQLite analysis sidecars (`.cutdb`) are optional caches.
 
-Native saves use the [version 4 JSON Schema](schema/cut-v4.schema.json) for sequences, multicam projects, edit history, still placements and transcript attachments. MPCut also reads [version 3 documents](schema/cut-v3.schema.json). Opening a version 3 project leaves its file intact. Its next explicit save writes version 4, retaining the assembly, switch overrides, fixed soundtrack selection, attachments and edit history. Mix lanes and track replacements start empty in a version 3 project. Opening a version 1 or 2 document reports an unsupported version and preserves the file. Readers reject unknown fields, duplicate object keys and unknown versions. The maximum file size is 64 MiB. Timeline times are seconds stored as strings. Writers emit reduced fractions or integers. Readers also accept exact decimals and clock times. Reduced numerators and positive denominators must fit signed 64-bit integers. Relative paths resolve from the folder containing the document. Opening a symbolic link to a project uses the target document’s folder. A relative media path that traverses `..` requires its preceding directory to exist so MPCut can resolve symlinks to the intended recording. Spaces and `#` are literal path characters.
+Native saves follow the [version 4 JSON Schema](schema/cut-v4.schema.json) for sequences, multicam projects, edit history, still placements and transcript attachments, written in the compressed [saved layout](#saved-layout) as version 5. MPCut also reads [version 3 documents](schema/cut-v3.schema.json). Opening a version 3 project leaves its file intact. Its next explicit save writes version 4 content, retaining the assembly, switch overrides, fixed soundtrack selection, attachments and edit history. Mix lanes and track replacements start empty in a version 3 project. Opening a version 1 or 2 document reports an unsupported version and preserves the file. Readers reject unknown fields, duplicate object keys and unknown versions. The maximum file size is 64 MiB. Timeline times are seconds stored as strings. Writers emit reduced fractions or integers. Readers also accept exact decimals and clock times. Reduced numerators and positive denominators must fit signed 64-bit integers. Relative paths resolve from the folder containing the document. Opening a symbolic link to a project uses the target document’s folder. A relative media path that traverses `..` requires its preceding directory to exist so MPCut can resolve symlinks to the intended recording. Spaces and `#` are literal path characters.
+
+Still sequences use the [version 6 JSON Schema](schema/cut-v6.schema.json) if the current edit or retained history includes a soundtrack, an exact fitted duration, or a JPEG, M4V or MKV still format. Multicam projects and other sequences continue to use version 4. MPCut reads versions 3 through 7. Older builds that support versions 4 and 5 require a project whose current edit and saved history use the version 4 fields.
+
+## Media snapshot
+
+The optional root `media_snapshot` stores descriptions and content evidence for referenced paths. Version 1 uses an `entries` array. Each entry has a `path`. Snapshot timing fields use integer `numerator` and `denominator` members. Readers preserve unknown entry fields and can open a project with no snapshot. A transcript fingerprint identifies the source generation used to collect the accompanying evidence. Relink uses both values when updating a binding.
+
+The current edit and retained history take priority under the 64 MiB document limit. Writers fit up to 4 MiB of complete snapshot entries into the remaining space, starting with paths in the current edit. A missing entry means the reader has less evidence for locating that source. Compact layout preserves the snapshot as written.
+
+A Replace edit can store `transcript_bindings` on its undo or redo step. Each change identifies an existing binding by `attachment_id` and `track_id` and carries its `before` and `after` values in the direction of that step. Applying it updates only a matching binding. An attachment added after the edit survives undo.
+
+## Saved layout
+
+Expanded project documents can repeat media paths across clips, undo and redo, and transcript bindings. MPCut can store repeated values once in the compact saved layout. Version 5 expands to version 4, and version 7 expands to version 6. Both use the following substitutions. MPCut saves every project in the compact layout and then compresses it. The only exception is a document the layout could not represent exactly, which is compressed as it is.
+
+On disk a saved project begins with the eight bytes `00 4D 50 43 55 54 31 0A`, then the length of the JSON as a 64-bit little-endian integer, then the JSON as a raw DEFLATE stream. In Python, `zlib.decompress(data[16:], wbits=-15)` gives the JSON; `Tests/Integration/saved_project.py` reads a saved project and expands it to the plain document. Set `MPCUT_PROJECT_VERSION=4` to save the plain version 4 document for a build that predates this.
+
+- The root `files` list holds each media path once. Every `file` and `original_file` member is a position in that list, counting from zero.
+- Neighbouring transcript bindings that differ only in `track_id` are one entry with a `track_ids` list in its place.
+- In a transcript binding, `offset` and `sequence_clock_origin` are time text such as `"0"` or `"-1/3000"`, as is an attachment’s `import_origin`.
+- Other text of twelve characters or more that occurs more than once, such as a clip or angle ID that switches and edit history repeat, is held once in the root `strings` list. Each use is a reference such as `"~3"`, counting from zero. Text that itself begins with `~` is written with a second one, so `"~~/Movies"` stands for `~/Movies`. The `files` and `strings` lists and a `media_snapshot` hold their text as it is.
+- Inside `history`, an object or list that occurs more than once is held once in the root `shared` list, and each use is a reference such as `{"~": 3}`. An entry of `shared` may refer only to entries before it. An undo step keeps every clip or participant span it restores, and nearly all of them are the same from one step to the next. The current timeline outside `history` never uses these references.
+
+```json
+{
+  "clips": [{"file": 0, "from": "0", "id": "intro", "to": "3"}, {"file": 0, "from": "8", "id": "answer", "to": "14"}],
+  "files": ["Recordings/interview.mov"],
+  "format": "mpcut",
+  "kind": "sequence",
+  "schema_version": 5
+}
+```
+
+To expand a compact file, replace each `{"~": n}` inside `history` with entry `n` of `shared`, each text reference with its entry in `strings`, and each file position with its entry in `files`. Expand grouped transcript bindings and restore escaped text. Remove the compact tables and set the schema version to 4 for a version 5 file, or 6 for a version 7 file. Validate the expanded file against its corresponding JSON Schema. Set `MPCUT_PROJECT_VERSION=4` to save in the expanded layout. The writer uses version 6 when the project needs its extended fields.
 
 ## Sequence
 
@@ -29,6 +63,26 @@ A sequence can save named source intervals in `source_selects`, including interv
   {"id": "reaction", "name": "Reaction shot", "range": {"file": "media/reaction.mov", "from": "5/2", "to": "4"}}
 ]
 ```
+
+## Still soundtrack
+
+A still-only sequence with an explicit `still_format` can attach one recording in the optional root `still_soundtrack` field.
+
+```json
+"still_soundtrack": {
+  "id": "cover-recording",
+  "file": "Recordings/voice.wav",
+  "track_ordinal": 0,
+  "from": "0",
+  "to": "48001/48000"
+}
+```
+
+The clip ID identifies the attachment in Project Media and history. The path resolves relative to the project, and `track_ordinal` selects a zero-based audio track within that file. The half-open source interval begins at program zero. Image changes and moves preserve this mapping. Preview and export intersect the recording with the program or selected range. When picture extends beyond the recording, the remaining interval is silent. When picture ends earlier, export trims the soundtrack at the selected program end.
+
+Fitting one image to this example sets its duration to `48001/48000` seconds. Fitting or entering a duration between picture grid points in a soundtrack project sets `exact_duration: true` on the insert. Dragging the image edge uses the project's frame grid. Detaching the soundtrack keeps the authored image duration.
+
+Undo and redo store an attachment change as a `still_soundtrack` list delta. An empty list removes the attachment. Media snapshots can retain the recording's identity and technical description for relink. Timeline interchange reports the omission of an attached soundtrack when the destination cannot represent it.
 
 ## Multicam
 
@@ -120,7 +174,7 @@ A sequence or multicam document can carry a `transcripts` object. Its stream off
 
 After a Finder rename, MPCut looks for each referenced digest in the matching store beside the renamed project. It can also recover the asset from the former sibling store when the former project name is free. Saving moves verified content into the current project's store. If both project names exist, choose the intended store explicitly to recover a copy.
 
-The [Transcriberrr result schema](schema/transcript-result-v1.schema.json) describes the sample-timed JSON accepted by transcript import. MPCut normalizes those samples to rational seconds when it writes the referenced asset. The asset and transcript JSON exported by MPCut use the editor's rational clocks.
+The [Transcriberrr result schema](schema/transcript-result-v1.schema.json) describes the sample-timed JSON accepted by transcript import. MPCut normalizes those samples to rational seconds when it writes the referenced asset. The asset and transcript JSON exported by MPCut use the editor's rational clocks. The asset is the [compact stored form](schema/transcript-document-v3.schema.json), which may be compressed, and an export is the [version 2 document](schema/transcript-document-v2.schema.json). Assets written by earlier builds are version 2 documents and stay readable.
 
 The attachment revision changes when the transcript data used for editing changes. A word-based edit must also match the timeline revision and the selected result identity. Authored changes participate in native undo through the `transcript_authoring` history field. An external timeline export reports transcript metadata as a conversion loss. [Transcript and history schema](schema/cut-v4.schema.json)
 

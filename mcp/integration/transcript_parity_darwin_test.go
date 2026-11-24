@@ -16,9 +16,10 @@ import (
 var transcriptFixturePath = flag.String("transcript-fixture", "", "generated interview fixture directory for multicam transcript parity")
 
 type transcriptProjectSnapshot struct {
+	Files []string
 	Clips []struct {
 		ID   string
-		File string
+		File savedTranscriptPath
 		From string
 		To   string
 	}
@@ -31,11 +32,35 @@ type transcriptProjectSnapshot struct {
 		Attachments []struct {
 			ID    string
 			Asset struct {
-				File   string
+				File   savedTranscriptPath
 				SHA256 string
 			}
 		}
 	}
+}
+
+type savedTranscriptPath struct {
+	path  string
+	index *int
+}
+
+func (p *savedTranscriptPath) UnmarshalJSON(data []byte) error {
+	if len(data) != 0 && data[0] == '"' {
+		return json.Unmarshal(data, &p.path)
+	}
+	return json.Unmarshal(data, &p.index)
+}
+
+func (p *savedTranscriptPath) expand(t *testing.T, files []string) {
+	t.Helper()
+	if p.index == nil {
+		return
+	}
+	if *p.index < 0 || *p.index >= len(files) {
+		t.Fatalf("invalid file index %d in saved project", *p.index)
+	}
+	p.path = files[*p.index]
+	p.index = nil
 }
 
 func readTranscriptProject(t *testing.T, path string) transcriptProjectSnapshot {
@@ -47,6 +72,12 @@ func readTranscriptProject(t *testing.T, path string) transcriptProjectSnapshot 
 	var project transcriptProjectSnapshot
 	if err := json.Unmarshal(data, &project); err != nil {
 		t.Fatalf("decode saved project %s: %v", path, err)
+	}
+	for i := range project.Clips {
+		project.Clips[i].File.expand(t, project.Files)
+	}
+	for i := range project.Transcripts.Attachments {
+		project.Transcripts.Attachments[i].Asset.File.expand(t, project.Files)
 	}
 	return project
 }
@@ -152,7 +183,7 @@ func checkTranscriptEditParity(t *testing.T, ctx context.Context, contents, dir 
 	if !reflect.DeepEqual(cliSaved.Clips, liveSaved.Clips) {
 		t.Fatalf("CLI saved ranges %v differ from live MCP ranges %v", cliSaved.Clips, liveSaved.Clips)
 	}
-	if len(cliSaved.Clips) != 2 || cliSaved.Clips[0].File == "" || cliSaved.Clips[1].File != cliSaved.Clips[0].File ||
+	if len(cliSaved.Clips) != 2 || cliSaved.Clips[0].File.path == "" || cliSaved.Clips[1].File != cliSaved.Clips[0].File ||
 		cliSaved.Clips[0].From != "0" || cliSaved.Clips[0].To != "1" ||
 		cliSaved.Clips[1].From != "2" || cliSaved.Clips[1].To != "4" {
 		t.Fatalf("expected half-open retained ranges [0,1) and [2,4), got %v", cliSaved.Clips)

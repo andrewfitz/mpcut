@@ -216,24 +216,34 @@ public struct StillInsert: Codable, Hashable, Sendable, Identifiable {
     /// Duration of one generated sample.
     public var cadence: RationalTime
     public var framing: StillImageFraming
+    /// Allows a fitted image to end at an exact audio sample boundary.
+    public var usesExactDuration: Bool
 
     public init(id: String, assetID: String, duration: RationalTime, cadence: RationalTime,
-                framing: StillImageFraming = .fit) {
+                framing: StillImageFraming = .fit, usesExactDuration: Bool = false) {
         self.id = id
         self.assetID = assetID
+        self.usesExactDuration = usesExactDuration
         self.duration = duration
         self.cadence = cadence
         self.framing = framing
     }
 
-    private enum CodingKeys: String, CodingKey { case id, assetID = "asset_id", duration, cadence, framing }
+    private enum CodingKeys: String, CodingKey {
+        case id, assetID = "asset_id", duration, cadence, framing
+        case usesExactDuration = "exact_duration"
+    }
 
     public init(from decoder: Decoder) throws {
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
         let v = try decoder.container(keyedBy: CodingKeys.self)
+        let exact = v.contains(.usesExactDuration)
+        if exact, try !v.decode(Bool.self, forKey: .usesExactDuration) {
+            throw stillError("An explicit exact_duration must be true")
+        }
         try self.init(id: v.decode(String.self, forKey: .id), assetID: v.decode(String.self, forKey: .assetID),
                       duration: ProjectField.time(v, .duration), cadence: ProjectField.time(v, .cadence),
-                      framing: v.decode(StillImageFraming.self, forKey: .framing))
+                      framing: v.decode(StillImageFraming.self, forKey: .framing), usesExactDuration: exact)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -243,6 +253,7 @@ public struct StillInsert: Codable, Hashable, Sendable, Identifiable {
         try v.encode(duration.description, forKey: .duration)
         try v.encode(cadence.description, forKey: .cadence)
         try v.encode(framing, forKey: .framing)
+        if usesExactDuration { try v.encode(true, forKey: .usesExactDuration) }
     }
 
     public func frameCount() throws -> Int64 {
@@ -436,11 +447,13 @@ public struct StillSequenceProject: Equatable, Sendable {
     // A selection consisting only of inserts still has its parent program's
     // silent sound lanes. This recording supplies their layout, not samples.
     package var stillAudioReference: CutSequenceClip?
+    public var stillSoundtrack: CutSequenceClip?
 
     public init(items: [StillSequenceItem], stillAssets: [StillAsset] = [], stillReplacements: [StillReplacement] = [],
                 programColorPolicy: StillProgramColorPolicy? = nil, stillFormat: StillTimelineFormat? = nil,
                 transcripts: ProjectTranscripts = .init(), sourceSelects: [NamedSourceSelect] = [],
-                participants: ParticipantProject = .init()) {
+                participants: ParticipantProject = .init(), stillSoundtrack: CutSequenceClip? = nil) {
+        self.stillSoundtrack = stillSoundtrack
         self.items = items
         self.stillAssets = stillAssets
         self.stillReplacements = stillReplacements
@@ -453,7 +466,7 @@ public struct StillSequenceProject: Equatable, Sendable {
 
     var hasStillContent: Bool {
         !stillAssets.isEmpty || !stillReplacements.isEmpty || programColorPolicy != nil || stillFormat != nil
-            || items.contains { $0.still != nil }
+            || stillSoundtrack != nil || items.contains { $0.still != nil }
     }
 }
 
@@ -489,6 +502,9 @@ func validateStillCollections(assets: [StillAsset], inserts: [StillInsert], repl
     }
     for insert in inserts {
         try validatePlacement(id: insert.id, assetID: insert.assetID, framing: insert.framing)
+        if insert.usesExactDuration, group != nil || clipIDs?.isEmpty == false {
+            throw stillError("An exact fitted duration requires a still-only sequence")
+        }
         guard insert.duration > .zero, insert.cadence > .zero else {
             throw stillError("Still ‘\(insert.id)’ must have a positive duration and cadence")
         }

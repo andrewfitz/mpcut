@@ -12,6 +12,7 @@ import tempfile
 
 from media_regression import ffmpeg, probe, ratio, sample_hashes
 from mixed_timeline import frame_count, gray, power, samples
+from saved_project import read_project, saved_file
 
 
 SCRIPT = "Results are usually ready today."
@@ -105,7 +106,7 @@ def exercise(cli, directory):
 
     reviewed = directory / "review.json"
     edit = {"action": "assemble", "selections": [opening, ending]}
-    before = json.loads(project.read_text())
+    before = read_project(project)
     strict = call("transcript", "edit", "plan", request=target | {"output": str(reviewed),
                   "request": edit | {"boundary_policy": "exact"}})
     assert strict["previous_tier"]["mode"] == "copy" and strict["tier"]["mode"] in {"smart", "encode"}, strict
@@ -128,16 +129,16 @@ def exercise(cli, directory):
     safe_plan.write_text(json.dumps(safe))
     safe_project = directory / "safe.cut"
     call("transcript", "edit", "apply", "--project", project, "--plan-file", safe_plan, "--out-project", safe_project)
-    assert json.loads(project.read_text()) == before
+    assert read_project(project) == before
 
     result = call("transcript", "edit", "apply", "--project", project, "--plan-file", reviewed, "--in-place")
     assert result["history_action"] == strict["history_action"]
-    reopened = json.loads(project.read_text())
+    reopened = read_project(project)
     undo = reopened["history"]["undo"]
     assert len(undo) == len(before["history"]["undo"]) + 1
     assert undo[0]["action"] == result["history_action"]
     clips = reopened["clips"]
-    assert [(Path(clip["file"]).name, clip["from"], clip["to"]) for clip in clips] == [
+    assert [(Path(saved_file(reopened, clip["file"])).name, clip["from"], clip["to"]) for clip in clips] == [
         (right.name, "2/5", "4/5"), (left.name, "31/25", "9/5")]
     records = call("transcript", "attachment", "inspect", "--project", project)["authoring"]["items"]
     assert {r["change"]["named_select"]["name"] for r in records if "named_select" in r["change"]} == {

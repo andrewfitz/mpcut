@@ -373,8 +373,20 @@ final class TimelineTierGateTests: XCTestCase {
             XCTAssertEqual(asked.prompts.count, 0)
             return (model, asked)
         }
-        func leftovers() throws -> [String] {
-            try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0 != donor.lastPathComponent && !$0.hasSuffix(".cutdb") }.sorted()
+        func leftovers() async throws -> [String] {
+            let deadline = ContinuousClock.now + .seconds(3)
+            let sidecarStageNameLength = ".mpcut-XXXXXX".utf8.count
+            while true {
+                let files = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+                    .filter { $0 != donor.lastPathComponent && !$0.hasSuffix(".cutdb") }.sorted()
+                // Background analysis may still be publishing its sidecar after the edit settles.
+                // Wait for its mkstemp staging file, then assert against the full listing.
+                guard ContinuousClock.now < deadline,
+                      files.contains(where: { $0.hasPrefix(".mpcut-") && $0.utf8.count == sidecarStageNameLength }) else {
+                    return files
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
         }
 
         // Declined: nothing is saved, nothing changes, and no failure is reported.
@@ -392,7 +404,8 @@ final class TimelineTierGateTests: XCTestCase {
         XCTAssertLessThan(prompt.to.tier ?? .reencode, .trueLossless)
         XCTAssertNil(prompt.nearest, "The cuts are not moved for a soundtrack.")
         XCTAssertEqual(prompt.action, "Replace Source Audio")
-        XCTAssertEqual(try leftovers(), [], "Declining leaves neither the working copy nor its staging folder.")
+        let declinedLeftovers = try await leftovers()
+        XCTAssertEqual(declinedLeftovers, [], "Declining leaves neither the working copy nor its staging folder.")
         XCTAssertNil(model.alert)
         XCTAssertEqual(model.timelineClips.map(\.id), before)
         XCTAssertNil(model.timelineClips.first?.replacementAudio)
@@ -406,7 +419,8 @@ final class TimelineTierGateTests: XCTestCase {
         try await settle(model)
         XCTAssertEqual(asked.prompts.count, 2, "One question for the edit, none again when it is applied.")
         XCTAssertNil(model.alert)
-        XCTAssertEqual(try leftovers(), [accepted.lastPathComponent])
+        let acceptedLeftovers = try await leftovers()
+        XCTAssertEqual(acceptedLeftovers, [accepted.lastPathComponent])
         XCTAssertNotNil(model.timelineClips.first?.replacementAudio)
         XCTAssertEqual(model.tierState?.tier, asked.prompts[1].to.tier)
         XCTAssertLessThan(model.tierState?.tier ?? .reencode, .trueLossless)

@@ -16,6 +16,47 @@ final class MCPOutputTests: XCTestCase {
         throw MCPCommandError("timeout", "Timed out waiting for the output job.")
     }
 
+    func testLiveInterchangeReportsOfflineDependenciesAndCanSaveCutCopy() async throws {
+        let preferences = EditorPreferences()
+        preferences.useAnalysisSidecars = false
+        let sessions = ProjectSessions(preferences: preferences)
+        let session = ProjectSession(id: UUID(), preferences: preferences)
+        defer { session.editor.endSession() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appendingPathComponent("Offline.cut")
+        let missing = "Offline.mov"
+        let clips = [CutSequenceClip(id: "offline", file: missing, from: .zero, to: .init(numerator: 1))]
+        try CutProject.sequence(clips).save(to: input)
+        try session.editor.openProject(clips, at: input)
+        let deadline = ContinuousClock.now + .seconds(30)
+        while session.editor.isBusy && .now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+
+        func export(_ tool: String, to output: URL) async throws -> [String: Any] {
+            let receipt = try await sessions.mcpOutputs(tool: tool,
+                arguments: ["project_handle": session.mcpHandle, "output": output.path],
+                session: session, checkAccess: {})
+            return try await finished(XCTUnwrap(receipt), owner: session.mcpHandle, in: sessions.mcpOutputJobs)
+        }
+
+        for tool in ["project_editor_convert", "project_editor_resolve_export"] {
+            let output = directory.appendingPathComponent("Offline.fcpxml")
+            let status = try await export(tool, to: output)
+            XCTAssertEqual(status["state"] as? String, "failed", String(describing: status))
+            let error = try XCTUnwrap(status["error"] as? [String: Any])
+            XCTAssertEqual(error["code"] as? String, "missing_source")
+            XCTAssertTrue((error["message"] as? String)?.contains(missing) == true)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        }
+        let copy = directory.appendingPathComponent("Copy.cut")
+        let status = try await export("project_editor_convert", to: copy)
+        XCTAssertEqual(status["state"] as? String, "succeeded", String(describing: status))
+        let archived = try CutProject.load(from: copy)
+        let stored = try XCTUnwrap(archived.sequenceClips?.first?.file)
+        XCTAssertEqual(CutProject.mediaURL(stored, relativeTo: copy).path, directory.appendingPathComponent(missing).path)
+    }
+
     func testInterchangeCapturesUnsavedSplitAndDryRunDoesNotWrite() async throws {
         let preferences = EditorPreferences()
         preferences.useAnalysisSidecars = false

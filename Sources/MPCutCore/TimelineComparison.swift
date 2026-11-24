@@ -81,6 +81,7 @@ public struct TimelineComparison: Codable, Equatable, Sendable {
         if before.programColorPolicy != after.programColorPolicy { projectFields.append("program_color") }
         if before.stillFormat != after.stillFormat { projectFields.append("still_format") }
         if before.stillAudioReference != after.stillAudioReference { projectFields.append("still_audio_reference") }
+        if before.stillSoundtrack != after.stillSoundtrack { projectFields.append("still_soundtrack") }
         var groupChanges: [String] = []
         if case .multicam(let old) = before, case .multicam(let new) = after {
             if old.range != new.range { projectFields.append("group_range") }

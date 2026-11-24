@@ -140,6 +140,13 @@ public struct ResolvedEdit: Encodable, Sendable {
     public internal(set) var audioStream: Int? = nil
     var usesPerSourceAudioStream = false
     var stillMasteringDisplay: [UInt32] = []
+    /// A picture-only export a person asked for. A staged picture lane leaves this unset
+    /// and carries neither chapters nor timecode.
+    var deliversPicture = false
+    /// The delivered picture keeps the source’s MOV timecode track.
+    var keepsTimecode = false
+    /// Why a delivered picture leaves the source’s timecode track behind.
+    var timecodeIssue: String? = nil
 
     enum CodingKeys: String, CodingKey { case segments, duration, container }
 

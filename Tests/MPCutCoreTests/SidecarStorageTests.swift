@@ -79,7 +79,7 @@ final class SidecarStorageTests: XCTestCase {
         try store.save([key: irregular])
         XCTAssertEqual(try db.integer("SELECT hex(substr(value, 1, 1)) = '01' FROM sections"), 1)
         XCTAssertEqual(store.read(key), irregular)
-        try db.execute("UPDATE sections SET value = X'017F'")
+        try SidecarDatabase(store.url, writing: true).execute("UPDATE sections SET value = X'017F'")
         XCTAssertNil(store.read(key))
         try store.save([:], updating: [key: { previous in
             XCTAssertNil(previous)
@@ -118,10 +118,8 @@ final class SidecarStorageTests: XCTestCase {
         XCTAssertLessThan(try db.integer("SELECT length(value) FROM scene_markers"), 500)
     }
 
-    func testFormatThreeIsReadOnlyUntilAnAtomicWriteCompactsIt() throws {
-        let store = try makeSidecar()
-        let key = AnalysisSidecar.viewNameSectionKey
-        let value = Data(repeating: 65, count: 300_000)
+    /// Rewrites a new sidecar as format 3 stored it: one raw payload per row, with no size column.
+    private func makeFormatThree(_ store: AnalysisSidecar, key: String, value: Data) throws -> (db: SidecarDatabase, stamp: String) {
         try store.save(["small": Data([7])])
         let db = try SidecarDatabase(store.url, writing: true)
         for table in ["sections", "archived_sections", "scene_markers", "scene_attempts"] {
@@ -132,13 +130,27 @@ final class SidecarStorageTests: XCTestCase {
         let digest = Data(SHA256.hash(data: Data((stamp + "\0" + key + "\0").utf8) + value))
         try db.updateBlobs("INSERT INTO sections(name, value, digest) VALUES (?, ?, ?)", [key], blobs: [value, digest])
         try db.update("INSERT INTO archived_sections SELECT 1, name, digest, value FROM sections WHERE name = ?", [key])
+        return (db, stamp)
+    }
+
+    func testFormatThreeStaysRawWithoutAutomaticWritesUntilAnAtomicWriteCompactsIt() throws {
+        let store = try makeSidecar()
+        let key = AnalysisSidecar.viewNameSectionKey
+        let value = Data(repeating: 65, count: 300_000)
+        let (db, stamp) = try makeFormatThree(store, key: key, value: value)
         let before = try Data(contentsOf: store.url)
-        XCTAssertEqual(store.read(key), value)
+        // A session that may not save on its own account reads the file and leaves it raw.
+        AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
+            XCTAssertEqual(store.read(key), value)
+        }
+        AnalysisSidecar.waitForRawStorageRepacks()
         XCTAssertEqual(try Data(contentsOf: store.url), before)
         // Fail after the migration, before committing the caller's update.
         XCTAssertThrowsError(try store.save([:], updating: ["small": { _ in throw CancellationError() }]))
         XCTAssertEqual(try db.integer("PRAGMA user_version"), 3)
-        XCTAssertEqual(store.read(key), value)
+        AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
+            XCTAssertEqual(store.read(key), value)
+        }
 
         let lock = NSLock()
         var failures: [Error] = []
@@ -150,13 +162,84 @@ final class SidecarStorageTests: XCTestCase {
         for index in 0..<4 {
             XCTAssertEqual(store.read("writer.\(index)"), Data([UInt8(index)]))
         }
-        XCTAssertEqual(try db.integer("PRAGMA user_version"), 4)
+        XCTAssertEqual(try db.integer("PRAGMA user_version"), AnalysisSidecar.schemaVersion)
         XCTAssertEqual(store.read(key), value)
         XCTAssertEqual(store.read("small"), Data([7]))
         let reader = try XCTUnwrap(store.openReadSnapshot())
         XCTAssertEqual(try store.verifiedSection(key, in: reader, stamp: stamp, maxBytes: nil,
                                                 cancelled: { false }, generation: "1"), value)
         XCTAssertLessThan(try Data(contentsOf: store.url).count, before.count / 2)
+    }
+
+    func testAReadPacksFormatThreeInTheBackgroundAndInspectionLeavesItRaw() throws {
+        let store = try makeSidecar()
+        let key = "custom.large"
+        let value = Data(repeating: 65, count: 300_000)
+        let (db, _) = try makeFormatThree(store, key: key, value: value)
+        let raw = try Data(contentsOf: store.url)
+        // Looking at a sidecar is not a use of its analysis.
+        XCTAssertEqual(store.status(), "current")
+        XCTAssertEqual(store.keys(), [key, "small"])
+        XCTAssertTrue(store.containsSections([key]))
+        XCTAssertEqual(store.savedSectionInventory().status, "current")
+        XCTAssertEqual(AnalysisSidecar.inventorySnapshot(source: store.source).sections, [key, "small"])
+        XCTAssertEqual(store.persistedGenerations().count, 1)
+        XCTAssertEqual(store.readArchived(key, generation: 1), value)
+        _ = SidecarCacheCleaner.preview(sources: [store.source])
+        // Nor is a read in a session that must not write, or of a file it cannot write.
+        AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
+            XCTAssertEqual(store.read(key), value)
+        }
+        if geteuid() != 0 {
+            XCTAssertEqual(chmod(store.url.path, 0o444), 0)
+            XCTAssertEqual(store.read(key), value)
+            XCTAssertEqual(chmod(store.url.path, 0o644), 0)
+        }
+        AnalysisSidecar.waitForRawStorageRepacks()
+        XCTAssertEqual(try Data(contentsOf: store.url), raw)
+        XCTAssertEqual(try db.integer("PRAGMA user_version"), 3)
+
+        // The read returns the raw value. The file is packed afterwards, as a write would pack it.
+        XCTAssertEqual(store.read(key), value)
+        AnalysisSidecar.waitForRawStorageRepacks()
+        XCTAssertEqual(try db.integer("PRAGMA user_version"), AnalysisSidecar.schemaVersion)
+        let packed = try Data(contentsOf: store.url)
+        XCTAssertLessThan(packed.count, raw.count / 2)
+        XCTAssertEqual(store.read(key), value)
+        XCTAssertEqual(store.read("small"), Data([7]))
+        XCTAssertEqual(store.readArchived(key, generation: 1), value)
+        XCTAssertEqual(try store.withReadSnapshot(cancelled: { false }) { read in read(key) }, value)
+        AnalysisSidecar.waitForRawStorageRepacks()
+        XCTAssertEqual(try Data(contentsOf: store.url), packed)
+    }
+
+    func testABackgroundPackThatFailsIsNotRepeatedByLaterReads() throws {
+        let store = try makeSidecar()
+        let (db, _) = try makeFormatThree(store, key: "custom.large", value: Data(repeating: 65, count: 300_000))
+        let raw = try Data(contentsOf: store.url)
+        var info = stat()
+        XCTAssertEqual(stat(store.source.path, &info), 0)
+        let saved = [info.st_atimespec, info.st_mtimespec]
+        let earlier = [info.st_atimespec, timespec(tv_sec: info.st_mtimespec.tv_sec - 60, tv_nsec: info.st_mtimespec.tv_nsec)]
+        // Hold the background writer at the lock until the recording has changed under it.
+        try db.execute("BEGIN IMMEDIATE")
+        XCTAssertEqual(try store.withReadSnapshot(cancelled: { false }) { read in read("small") }, Data([7]))
+        XCTAssertEqual(utimensat(AT_FDCWD, store.source.path, earlier, 0), 0)
+        try db.execute("ROLLBACK")
+        AnalysisSidecar.waitForRawStorageRepacks()
+        XCTAssertEqual(try Data(contentsOf: store.url), raw)
+
+        // The exact modification time is part of the identity the sidecar was saved for.
+        XCTAssertEqual(utimensat(AT_FDCWD, store.source.path, saved, 0), 0)
+        let reopened = try AnalysisSidecar(source: store.source)
+        XCTAssertEqual(reopened.read("small"), Data([7]))
+        AnalysisSidecar.waitForRawStorageRepacks()
+        XCTAssertEqual(try Data(contentsOf: store.url), raw)
+        XCTAssertEqual(try db.integer("PRAGMA user_version"), 3)
+        // The next write still packs the file.
+        try reopened.save(["after": Data([1])])
+        XCTAssertEqual(try db.integer("PRAGMA user_version"), AnalysisSidecar.schemaVersion)
+        XCTAssertLessThan(try Data(contentsOf: store.url).count, raw.count / 2)
     }
 
     func testProjectHistoryExcludesOnlyCollidingCachesEvenWhenNoStepsAreRestored() throws {
@@ -194,6 +277,25 @@ final class SidecarStorageTests: XCTestCase {
             cache.saveAutomatically(["new": Data([3])])
         }
         XCTAssertEqual(try Data(contentsOf: cache.url), before)
+    }
+
+    func testManagedDestinationsAndJournalsRespectProjectHistory() throws {
+        let media = try makeSidecar().source
+        let folder = media.deletingLastPathComponent()
+        let project = folder.appendingPathComponent("edit.cut")
+        let home = folder.appendingPathComponent("preferences")
+        try SidecarLocations.$storageDirectory.withValue(home) {
+            SidecarLocations.mode = .project
+            let managed = try XCTUnwrap(SidecarLocations(source: media, project: project).destination)
+            for suffix in ["", "-journal", "-wal", "-shm"] {
+                let protectedPath = managed.path + suffix
+                let exclusions = CutProject.sidecarExclusions(
+                    absoluteSources: [media.path: "video", protectedPath: "offline-sound"],
+                    candidates: [media], projectURL: project)
+                XCTAssertTrue(AnalysisSidecar.isExcluded(media, in: exclusions), suffix)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: protectedPath))
+            }
+        }
     }
 
     func testSidecarExclusionsFollowCameraAliasesJournalTargetsAndHardLinks() throws {

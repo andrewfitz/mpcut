@@ -1,25 +1,63 @@
 import Foundation
 
 extension CutProject {
-    /// Accept a detector result only when it still describes this project's media.
-    public mutating func acceptParticipantAnalysis(_ scan: ParticipantScanResult, sourceID: String,
-                                                   relativeTo projectURL: URL) throws {
-        let file: String?
+    package mutating func applyParticipantEdits(_ edits: ParticipantProject, relativeTo document: URL) throws {
+        try edits.validate()
+        var edits = edits
+        let previous = Dictionary(uniqueKeysWithValues: participants.sources.map { ($0.sourceID, $0) })
+        for index in edits.sources.indices where edits.sources[index].sourceStamp == nil {
+            let id = edits.sources[index].sourceID
+            if let saved = previous[id], let stamp = saved.sourceStamp {
+                // Editing a roster or mask must not bless a replaced recording.
+                edits.sources[index].sourceStamp = stamp
+                edits.sources[index].sourceInode = saved.sourceInode
+                edits.sources[index].sourceContentSHA256 = saved.sourceContentSHA256
+            } else {
+                let identity = try SourceIdentity(participantRecording(id, relativeTo: document))
+                edits.sources[index].sourceStamp = .init(identity: identity)
+                edits.sources[index].sourceInode = identity.inode
+            }
+        }
+        participants = edits
+    }
+
+    private func participantRecording(_ id: String, relativeTo document: URL) throws -> URL {
+        let path: String?
         switch self {
         case .multicam(let project):
-            file = project.pictureSources.first { $0.id == sourceID }?.file
+            path = project.pictureSources.first { $0.id == id }?.file
         case .sequence, .stillSequence:
-            file = sequenceClips?.first { $0.file == sourceID }?.file
+            path = sequenceClips?.first { $0.file == id }?.file
         }
-        guard let file else { throw invalidParticipantProject("Unknown picture source ‘\(sourceID)’.") }
-        let url = AnalysisSidecar.canonicalSource(try Self.checkedMediaURL(file, relativeTo: projectURL))
+        guard let path else { throw invalidParticipantProject("Unknown picture source ‘\(id)’.") }
+        return try Self.checkedMediaURL(path, relativeTo: document)
+    }
+
+    /// Accept a detector result only when it still describes this project's media.
+    public mutating func acceptParticipantAnalysis(_ scan: ParticipantScanResult, sourceID: String,
+                                                   relativeTo projectURL: URL, cancelled: () -> Bool = { false }) throws {
+        try validateParticipantScanSource(scan, sourceID: sourceID, relativeTo: projectURL, cancelled: cancelled)
+        try participants.acceptAnalysis(scan, sourceID: sourceID)
+    }
+
+    func validateParticipantScanSource(_ scan: ParticipantScanResult, sourceID: String,
+                                       relativeTo projectURL: URL, cancelled: () -> Bool = { false }) throws {
+        if cancelled() { throw CancellationError() }
+        let url = AnalysisSidecar.canonicalSource(try participantRecording(sourceID, relativeTo: projectURL))
         let scanned = AnalysisSidecar.canonicalSource(URL(fileURLWithPath: scan.source.file))
         let identity = try SourceIdentity(url)
         guard url == scanned, SceneSourceStamp(identity: identity) == scan.source.stamp,
               scan.source.inode.map({ $0 == identity.inode }) ?? true else {
             throw invalidParticipantProject("The scan describes a different source or the recording has changed.")
         }
-        try participants.acceptAnalysis(scan, sourceID: sourceID)
+        if let digest = scan.source.contentSHA256 {
+            let cache = AnalysisSidecar.readsEnabled ? AnalysisSidecar(source: url, identity: identity) : nil
+            let verified = try cachedParticipantSourceDigest(identity, in: cache, cancelled: cancelled)
+                ?? participantSourceDigest(url, identity: identity, cancelled: cancelled)
+            guard verified == digest, identity.isCurrentSnapshot(at: url) else {
+                throw invalidParticipantProject("The recording content differs from the supplied participant scan.")
+            }
+        }
     }
 }
 
@@ -29,11 +67,14 @@ extension ParticipantProject {
             throw invalidParticipantProject("Complete or resume the participant scan before accepting its geometry.")
         }
         guard let analysis = scan.analysis, analysis.schemaVersion == 1, analysis.start < analysis.end,
-              analysis.sampling == scan.configuration.sampling, !analysis.observations.isEmpty else {
+              analysis.sampling == scan.configuration.sampling.detectorSampling, !analysis.observations.isEmpty else {
             throw invalidParticipantProject("The scan has no supported participant observations.")
         }
         if let accepted = sources.first(where: { $0.sourceID == sourceID }) {
-            guard accepted.analysisIdentity == scan.analysisIdentity else {
+            guard accepted.analysisIdentity == scan.analysisIdentity,
+                  (accepted.feedLayout ?? .meeting) == scan.configuration.feedLayout,
+                  accepted.sourceContentSHA256 == nil || scan.source.contentSHA256 == nil
+                    || accepted.sourceContentSHA256 == scan.source.contentSHA256 else {
                 throw invalidParticipantProject("Reconcile the new scan with this source's accepted geometry before replacing it.")
             }
             return
@@ -41,12 +82,13 @@ extension ParticipantProject {
         var knownTracks: [UInt64: String] = [:]
         var acceptedPeople: [ParticipantPerson] = []
         let sourcePrefix = UUID().uuidString.lowercased()
+        let namePrefix = scan.configuration.feedLayout == .meeting ? "Participant" : "Feed"
         for track in analysis.tracks {
             let participantID = "\(sourcePrefix)-participant-\(track.id)"
             guard knownTracks.updateValue(participantID, forKey: track.id) == nil else {
                 throw invalidParticipantProject("The scan repeats a participant track ID.")
             }
-            acceptedPeople.append(.init(id: participantID, name: "Participant \(track.id)"))
+            acceptedPeople.append(.init(id: participantID, name: "\(namePrefix) \(track.id)"))
         }
         var detectedEnds: [UInt64: RationalTime] = [:]
         for appearance in analysis.appearances {
@@ -83,7 +125,7 @@ extension ParticipantProject {
                 let height = rect.y + rect.height <= 1.0000001 ? min(rect.height, 1 - rect.y) : rect.height
                 let bounds = ParticipantBounds(x: rect.x, y: rect.y, width: width, height: height)
                 let competingMatch = region.possibleMatches.contains { $0.participantID != region.participantID }
-                let participantID = state == .presentation || competingMatch ? nil
+                let participantID = state == .presentation || competingMatch || region.identityUncertain ? nil
                     : region.participantID.flatMap { knownTracks[$0] }
                 let id = "\(sourcePrefix)-appearance-\(region.appearanceID)"
                 let appearance = ParticipantAppearance(id: id, participantID: participantID,
@@ -119,6 +161,8 @@ extension ParticipantProject {
         revised.people.append(contentsOf: acceptedPeople)
         revised.sources.append(.init(sourceID: sourceID, analysisIdentity: scan.analysisIdentity,
             sourceStamp: scan.source.stamp, sourceInode: scan.source.inode,
+            sourceContentSHA256: scan.source.contentSHA256,
+            feedLayout: scan.configuration.feedLayout,
             appearances: tracks.keys.sorted().flatMap { tracks[$0] ?? [] }, coverage: coverage))
         try revised.validate()
         self = revised

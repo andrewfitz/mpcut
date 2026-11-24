@@ -40,7 +40,7 @@ struct MulticamBulkExport: Sendable {
         var audioDeliverySummary: String {
             switch payload {
             case .multicam(let plan): plan.audioDeliverySummary
-            case .still(let plan): plan.audioDeliverySummary
+            case .still(let plan): plan.inspectorSummary
             }
         }
 
@@ -80,7 +80,8 @@ struct MulticamBulkExport: Sendable {
          mode: ExportMode? = nil, tracks: ExportTracks, settings: ReencodeSettings,
          organization: ExportOrganization = .init(), engine: MulticamEngine,
          requireCameraCopy: Bool = false, cancelled: @escaping @Sendable () -> Bool = { false },
-         audioOutput: MulticamAudioOutput = .separateTracks, audioAction: ReencodeAudio? = nil) throws {
+         audioOutput: MulticamAudioOutput = .separateTracks, audioAction: ReencodeAudio? = nil,
+         pictureTiming: StillPictureTiming? = nil, videoCodec: ReencodeCodec? = nil) throws {
         self.directory = directory
         self.organization = organization
         self.engine = engine
@@ -105,13 +106,15 @@ struct MulticamBulkExport: Sendable {
                 }
                 let document = CutProject.multicam(snapshot)
                 if try document.exportPlacementScope() != .none || typedSettings {
-                    try verifyQueuedStillSources(entry.media.values)
+                    let recordingIndexes = entry.recordingDependencies.compactMap { entry.media[$0.id] }
+                    try verifyQueuedStillSources(recordingIndexes)
                     try CutEngine(cancelled: cancelled).checkDestination(output,
                                                                          plannedSubfolder: organization.subfolder.isEmpty ? nil : folder)
                     let plan = try stillPlanner.resolve(document, tracks: tracks, mode: mode,
                                                         requireCameraCopy: requireCameraCopy, container: container,
-                                                        settings: settings, audioOutput: audioOutput, audioAction: audioAction)
-                    try verifyQueuedStillSources(entry.media.values)
+                                                        settings: settings, audioOutput: audioOutput, audioAction: audioAction,
+                                                        pictureTiming: pictureTiming, videoCodec: videoCodec)
+                    try verifyQueuedStillSources(recordingIndexes)
                     return Item(output: output, payload: .still(plan))
                 }
                 let standardMode = mode ?? ExportRules.defaultMode(for: .multicam, tracks: tracks)
@@ -157,7 +160,8 @@ extension MulticamBulkExport {
             let batch = try MulticamBulkExport(ranges: ranges, directory: scratch, container: choices.container, mode: choices.effectiveMode,
                                        tracks: choices.tracks, settings: choices.settings, organization: organization,
                                        engine: MulticamEngine(cancelled: cancelled), requireCameraCopy: choices.requireCameraCopy,
-                                       cancelled: cancelled, audioOutput: choices.audioOutput, audioAction: choices.requestedAudioAction)
+                                       cancelled: cancelled, audioOutput: choices.audioOutput, audioAction: choices.requestedAudioAction,
+                                       pictureTiming: choices.pictureTiming)
             return .success(batch.items.map {
                 "\($0.output.lastPathComponent)\n\($0.audioDeliverySummary)"
             }.joined(separator: "\n\n"))
@@ -225,6 +229,7 @@ extension MulticamEditorModel {
         guard let index = queuedRanges.firstIndex(where: { $0.id == id }) else { throw QueueEdit.invalidTarget }
         let original = queuedRanges[index]
         var entry = try captureMarkedQueueRange()
+        try checkQueueDependencies(entry.mediaDependencies, status: mediaStatus)
         if extending {
             guard original.usesAssembly == entry.usesAssembly else { throw QueueEdit.incompatibleCoordinateSpace }
             try QueueEdit.checkExtension(from: original.range.from, to: original.range.to,
@@ -282,6 +287,35 @@ extension MulticamEditorModel {
         }
     }
 
+    func replanQueuedRange(_ id: UUID) throws {
+        guard !isBusy else { throw QueueEdit.busy }
+        guard let project, invalidatedQueueIDs.contains(id),
+              let index = queuedRanges.firstIndex(where: { $0.id == id }) else { throw QueueEdit.invalidTarget }
+        let original = queuedRanges[index]
+        if original.excerpt != nil {
+            guard self.canEnqueueMarkedRange else { throw QueueEdit.replanExcerpt }
+            try reviseQueuedRange(id, extending: false)
+            return
+        }
+        let snapshot: MulticamProject
+        if original.usesAssembly {
+            snapshot = try project.assemblySelection(original.range)
+        } else {
+            _ = try project.plan(ranges: [original.range])
+            snapshot = project
+        }
+        let entry = MulticamQueuedRange(id: id, name: original.name, range: original.range, project: snapshot,
+                                        media: media, usesAssembly: original.usesAssembly)
+        if let issue = entry.recordingDependencies.lazy.compactMap({ self.sourceIssues[$0.id] }).first {
+            throw CutError(code: "source_needs_review", message: issue)
+        }
+        try checkQueueDependencies(entry.mediaDependencies, status: mediaStatus)
+        queuedRanges[index] = entry
+        clearQueueInvalidation(id)
+        reconcileSourceLoads()
+        status = "Replanned the queued range."
+    }
+
     func removeQueuedRange(_ id: UUID) {
         guard !isExporting else { return }
         queuedRanges.removeAll { $0.id == id }
@@ -296,6 +330,7 @@ extension MulticamEditorModel {
     }
 
     func resetExportQueue() {
+        for entry in queuedRanges { clearQueueInvalidation(entry.id) }
         queuedRanges.removeAll()
         isBulkQueuePresented = false
         isReplacementAudioPresented = false
@@ -310,11 +345,11 @@ extension MulticamEditorModel {
     }
 
     func reviewQueuedRanges(_ choices: MulticamExportChoices, organization: ExportOrganization) async -> Result<String, CutError> {
-        if let issue = queuedMediaRefreshIssue() { return .failure(issue) }
-        let ranges = queuedRanges
+        let ranges = readyQueuedRanges
+        guard !ranges.isEmpty else { return .failure(noReadyQueueEntries) }
         let useSidecar = useAnalysisSidecars
         let excluded = AnalysisSidecar.excludedSources.union(sidecarExclusions)
-        return await Task.detached(priority: .userInitiated) {
+        return await sidecarWork.detached(priority: .userInitiated) {
             AnalysisSidecar.$excludedSources.withValue(excluded) {
                 AnalysisSidecar.$readsEnabled.withValue(useSidecar) {
                     MulticamBulkExport.review(ranges, choices: choices, organization: organization)
@@ -324,8 +359,8 @@ extension MulticamEditorModel {
     }
 
     func chooseBulkDestination(_ choices: MulticamExportChoices, organization: ExportOrganization, summary: String) {
-        guard isBulkQueuePresented, !queuedRanges.isEmpty, !isBusy else { return }
-        let contentIDs = queuedRanges.map(\.contentID)
+        guard isBulkQueuePresented, !readyQueuedRanges.isEmpty, !isBusy else { return }
+        let contentIDs = readyQueuedRanges.map(\.contentID)
         let panel = NSOpenPanel()
         panel.title = "Export Queued Ranges"
         panel.prompt = "Export Here"
@@ -337,23 +372,22 @@ extension MulticamEditorModel {
         panel.isAccessoryViewDisclosed = true
         ProjectPanels.present(panel, in: window, fromSheet: true) { [weak self] accepted in
             guard let self, self.isBulkQueuePresented, accepted, let directory = panel.url,
-                  self.queuedRanges.map(\.contentID) == contentIDs else { return }
+                  self.readyQueuedRanges.map(\.contentID) == contentIDs else { return }
             self.exportQueuedRanges(to: directory, container: choices.container, mode: choices.effectiveMode,
                                     tracks: choices.tracks, settings: choices.settings, organization: organization,
                                     requireCameraCopy: choices.requireCameraCopy, audioOutput: choices.audioOutput,
-                                    audioAction: choices.requestedAudioAction)
+                                    audioAction: choices.requestedAudioAction, pictureTiming: choices.pictureTiming)
         }
     }
 
     func exportQueuedRanges(to directory: URL, container: String, mode: ExportMode,
                             tracks: ExportTracks, settings: ReencodeSettings = .init(), organization: ExportOrganization = .init(),
                             requireCameraCopy: Bool = false, audioOutput: MulticamAudioOutput = .separateTracks,
-                            audioAction: ReencodeAudio? = nil) {
-        guard !queuedRanges.isEmpty, !isBusy else { return }
-        if let issue = queuedMediaRefreshIssue() { fail(issue.message); return }
+                            audioAction: ReencodeAudio? = nil, pictureTiming: StillPictureTiming? = nil) {
+        let ranges = readyQueuedRanges
+        guard !ranges.isEmpty, !isBusy else { return }
         bulkExportDirectory = directory
         isBulkQueuePresented = false
-        let ranges = queuedRanges
         let protected = protectedMediaPaths
         run("Exporting queued multicam ranges…", exporting: true) { [weak self] token, useSidecar in
             try AnalysisSidecar.$readsEnabled.withValue(useSidecar) {
@@ -364,7 +398,7 @@ extension MulticamEditorModel {
                     batch = try MulticamBulkExport(ranges: ranges, directory: directory, container: container,
                                                    mode: mode, tracks: tracks, settings: settings, organization: organization, engine: engine,
                                                    requireCameraCopy: requireCameraCopy, cancelled: { token.isCancelled },
-                                                   audioOutput: audioOutput, audioAction: audioAction)
+                                                   audioOutput: audioOutput, audioAction: audioAction, pictureTiming: pictureTiming)
                 } catch let issue as CutError {
                     // The times of a queued entry belong to its snapshot. The editor's switch suggestions are for the
                     // open project, so this failure is reported without the switch or edge it names.
@@ -410,7 +444,7 @@ struct MulticamBulkQueueView: View {
     init(model: MulticamEditorModel) {
         self.model = model
         var options = MulticamExportChoices(entry: .multicamQueue, preferred: model.preferences.defaultExportMode)
-        let placements = model.queuedRanges.map(\.placements)
+        let placements = model.readyQueuedRanges.map(\.placements)
         options.placements = placements.contains(.insertion) ? .insertion : placements.contains(.replacement) ? .replacement : .none
         options.mode = ExportRules.defaultStillMode(tracks: options.tracks, placements: options.placements, otherwise: options.mode)
         options.settle()
@@ -420,14 +454,14 @@ struct MulticamBulkQueueView: View {
     private func export() {
         let requested = choices
         let layout = organization
-        let ranges = model.queuedRanges.map(\.contentID)
+        let ranges = model.readyQueuedRanges.map(\.contentID)
         isChecking = true
         Task {
             // Plan every range first, so that one that cannot be written shows the offers of the export rules.
             let review = await model.reviewQueuedRanges(requested, organization: layout)
             guard isChecking else { return }
             isChecking = false
-            guard requested == choices, layout == organization, ranges == model.queuedRanges.map(\.contentID) else { return }
+            guard requested == choices, layout == organization, ranges == model.readyQueuedRanges.map(\.contentID) else { return }
             switch review {
             case .failure(let failure):
                 issue = failure
@@ -458,22 +492,24 @@ struct MulticamBulkQueueView: View {
                                             },
                                             saveExcerpt: entry.excerpt.map { excerpt in
                                                 { excerpt.presentSave(in: model.window, canSave: model.canSaveProjectTo) }
-                                            }) {
+                                            },
+                                            replan: model.invalidatedQueueIDs.contains(entry.id)
+                                                ? { try model.replanQueuedRange(entry.id) } : nil) {
                             model.removeQueuedRange(entry.id)
                         }
                     }
                 }
                 options
-                ExportOrganizationFields(organization: $organization, stem: model.queuedRanges.first?.name ?? "Multicam", container: choices.container)
+                ExportOrganizationFields(organization: $organization, stem: model.readyQueuedRanges.first?.name ?? "Multicam", container: choices.container)
                 if let issue {
                     ExportOffersView(message: ExportRules.describe(issue, clips: []), alternatives: issue.alternatives ?? []) {
                         choices.apply($0)
                     }
                     // An unsafe edge of a queued range offers its verified times. Applying one moves that entry's edge.
                     if let edge = issue.multicam?.edge, edge.range == 1, let times = issue.nearest, !times.isEmpty,
-                       let number = issue.segment, number > 0, model.queuedRanges.indices.contains(number - 1),
-                       let contentID = issueContentID, model.queuedRanges[number - 1].contentID == contentID,
-                       !model.queuedRanges[number - 1].usesAssembly {
+                       let number = issue.segment, number > 0, model.readyQueuedRanges.indices.contains(number - 1),
+                       let contentID = issueContentID, model.readyQueuedRanges[number - 1].contentID == contentID,
+                       !model.readyQueuedRanges[number - 1].usesAssembly {
                         MulticamEdgeSuggestionsView(suggestion: MulticamEdgeSuggestion(edge: MulticamEdge(range: number, boundary: edge.boundary, at: edge.at),
                                                                                          times: times), preview: nil) {
                             model.applyQueuedEdgeSuggestion($0, for: issue, contentID: contentID)
@@ -485,8 +521,8 @@ struct MulticamBulkQueueView: View {
             Spacer()
             Button("Close") { model.isBulkQueuePresented = false }.keyboardShortcut(.cancelAction)
                 .help("Close export queue")
-            Button(model.queuedRanges.count == 1 ? "Export File…" : "Export \(model.queuedRanges.count) Files…", action: export)
-                .keyboardShortcut(.defaultAction).disabled(model.queuedRanges.isEmpty || isChecking)
+            Button(model.readyQueuedRanges.count == 1 ? "Export File…" : "Export \(model.readyQueuedRanges.count) Files…", action: export)
+                .keyboardShortcut(.defaultAction).disabled(model.readyQueuedRanges.isEmpty || isChecking)
                 .help("Export queued ranges")
         }
         .onChange(of: organization) { _, _ in issue = nil }
@@ -494,9 +530,9 @@ struct MulticamBulkQueueView: View {
             issue = nil
             choices.settle()
         }
-        .onChange(of: model.queuedRanges.map(\.contentID)) { _, _ in
+        .onChange(of: model.readyQueuedRanges.map(\.contentID)) { _, _ in
             issue = nil
-            let placements = model.queuedRanges.map(\.placements)
+            let placements = model.readyQueuedRanges.map(\.placements)
             choices.placements = placements.contains(.insertion) ? .insertion : placements.contains(.replacement) ? .replacement : .none
             choices.settle()
         }
@@ -523,10 +559,11 @@ struct MulticamBulkQueueView: View {
             if choices.placements != .none && choices.tracks != .audio {
                 Toggle("Require Camera Video Copy", isOn: $choices.requireCameraCopy)
                     .help("Require stream copy for retained camera video")
+                Toggle("One frame per still", isOn: $choices.heldStills)
             }
             if choices.effectiveMode == .encode && choices.tracks != .audio {
                 Picker("Video", selection: $choices.codec) {
-                    ForEach(ReencodeCodec.allCases, id: \.self) { Text($0.displayName) }
+                    ForEach(ReencodeCodec.allCases.filter { $0 != .jpeg }, id: \.self) { Text($0.displayName) }
                 }
                 .help("Choose video codec")
                 Picker("Quality", selection: choices.codec == .prores ? $choices.proResQuality : $choices.standardQuality) {

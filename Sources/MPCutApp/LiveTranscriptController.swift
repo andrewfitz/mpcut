@@ -15,6 +15,7 @@ final class TranscriptWorkCounter: @unchecked Sendable {
 @MainActor
 final class LiveTranscriptController: ObservableObject {
     private unowned let session: ProjectSession
+    @Published var replacementSetup: TranscriptSetupRequest?
     private struct IndexedMedia: Equatable, Sendable {
         let identity: SourceIdentity
         let changeTime: SourceIdentity.ChangeTime?
@@ -46,11 +47,15 @@ final class LiveTranscriptController: ObservableObject {
             lock.withLock { entries.first { $0.key == key }?.index }
         }
 
-        func remember(_ index: TranscriptIndex, for key: IndexKey) {
+        /// The index every reader of this revision shares. Two builds of one revision can
+        /// finish together. The first stays, so that a clock added later is added for both.
+        func remember(_ index: TranscriptIndex, for key: IndexKey) -> TranscriptIndex {
             lock.withLock {
+                if let kept = entries.first(where: { $0.key == key }) { return kept.index }
                 entries.removeAll { $0.key.attachment.id == key.attachment.id }
                 entries.append((key, index))
                 if entries.count > 16 { entries.removeFirst() }
+                return index
             }
         }
 
@@ -61,9 +66,13 @@ final class LiveTranscriptController: ObservableObject {
 
     private let indexes = IndexShelf()
     let mcpProjectIndexCache = MCPTranscriptProjectIndexCache()
-    private var indexLoads: [String: (key: IndexKey, task: Task<TranscriptIndex, Error>)] = [:]
-    /// Index builds started. Tests hold each edit to its rebuild budget with this.
+    private var indexLoads: [String: (key: IndexKey, clocks: Set<TranscriptSpace>, task: Task<TranscriptIndex, Error>)] = [:]
+    /// Index builds started: one for each index, and one each time clocks are added to it.
+    /// Tests hold each edit to its rebuild budget with this.
     let indexBuilds = TranscriptWorkCounter()
+    /// Builds a reader caused by reading a clock it had not asked for, which it waited for
+    /// where it stood. A reader that names its clocks when it asks for an index causes none.
+    let unrequestedClockBuilds = TranscriptWorkCounter()
     private var importedDocument: (asset: TranscriptAsset, context: URL, document: TranscriptDocument)?
     /// Keyed by result ID, which names the stored bytes, so an entry never goes out of date.
     private var lineages: [String: ResultOrigin] = [:]
@@ -121,42 +130,63 @@ final class LiveTranscriptController: ObservableObject {
         try TranscriptStore.decoded(attachment(id: attachmentID).asset, relativeTo: assetContext())
     }
 
-    func index(attachmentID: String? = nil) throws -> TranscriptIndex {
-        try buildIndex(for: indexKey(attachmentID: attachmentID))()
+    /// The index of the current revision with these clocks built. It builds a clock that is
+    /// missing before it returns, on the caller's thread.
+    func index(attachmentID: String? = nil,
+               clocks: Set<TranscriptSpace> = Set(TranscriptSpace.allCases)) throws -> TranscriptIndex {
+        try buildIndex(for: indexKey(attachmentID: attachmentID), spaces: clocks)()
     }
 
-    /// The index for the current revision when it is already built.
-    func cachedIndex(attachmentID: String? = nil) -> TranscriptIndex? {
-        (try? indexKey(attachmentID: attachmentID)).flatMap(indexes.index)
+    /// The index for the current revision when it is already built with these clocks.
+    func cachedIndex(attachmentID: String? = nil, clocks: Set<TranscriptSpace> = []) -> TranscriptIndex? {
+        guard let index = (try? indexKey(attachmentID: attachmentID)).flatMap(indexes.index),
+              index.holds(clocks) else { return nil }
+        return index
     }
 
-    func indexedTranscript(attachmentID: String? = nil) async throws -> TranscriptIndex {
+    /// The index of the current revision with these clocks built, away from the main thread.
+    /// A reader names the clocks it reads. An index builds any other clock the first time it
+    /// is read, but the reader then waits for it where it stands.
+    func indexedTranscript(attachmentID: String? = nil,
+                           clocks: Set<TranscriptSpace> = Set(TranscriptSpace.allCases)) async throws -> TranscriptIndex {
         let key = try indexKey(attachmentID: attachmentID)
-        if let cached = indexes.index(for: key) { return cached }
+        if let cached = indexes.index(for: key), cached.holds(clocks) { return cached }
         let id = key.attachment.id
         let load: Task<TranscriptIndex, Error>
-        if let running = indexLoads[id], running.key == key {
+        if let running = indexLoads[id], running.key == key, clocks.isSubset(of: running.clocks) {
             load = running.task
         } else {
             // A build cannot stop midway. One that an edit has superseded finishes before its
-            // successor starts, and a successor superseded while it waits never starts.
-            let superseded = indexLoads[id]?.task
-            superseded?.cancel()
-            let build = buildIndex(for: key)
+            // successor starts, and a successor superseded while it waits never starts. A build
+            // of other clocks of this revision is waited for and then added to.
+            let earlier = indexLoads[id]
+            let sameRevision = earlier?.key == key
+            if !sameRevision { earlier?.task.cancel() }
+            let preceding = earlier?.task
+            let build = buildIndex(for: key, spaces: clocks)
             load = Task.detached(priority: .userInitiated) {
-                _ = await superseded?.result
+                _ = await preceding?.result
                 return try build()
             }
-            indexLoads[id] = (key, load)
+            indexLoads[id] = (key, sameRevision ? clocks.union(earlier?.clocks ?? []) : clocks, load)
         }
         let result = await load.result
         if indexLoads[id]?.task == load { indexLoads[id] = nil }
         let index = try result.get()
+        // The load this one joined may have ended without the clocks an earlier one failed to build.
+        try await extend(index, with: clocks)
         try Task.checkCancellation()
         guard try indexKey(attachmentID: attachmentID) == key else {
             throw CutError(code: "stale_transcript", message: "The transcript changed while it was opening.")
         }
         return index
+    }
+
+    /// Builds clocks on an index a reader already holds, away from the main thread. A reader
+    /// that is about to read another clock asks here first.
+    func extend(_ index: TranscriptIndex, with clocks: Set<TranscriptSpace>) async throws {
+        guard !index.holds(clocks) else { return }
+        try await Task.detached(priority: .userInitiated) { try index.build(clocks) }.value
     }
 
     private func indexKey(attachmentID: String?) throws -> IndexKey {
@@ -232,7 +262,10 @@ final class LiveTranscriptController: ObservableObject {
         try plan.validate(to: project, revision: currentRevision(for: plan))
         try validateSources(for: plan)
         let displayRange = MulticamRange(from: range.from, to: try range.from.adding(plan.duration))
-        let excerpt = try TranscriptQueueExcerpt(name: name, project: plan.snapshot, location: assetContext())
+        let mediaSnapshot = session.isMulticam ? session.multicam.projectMediaSnapshotForWriting
+            : session.editor.projectMediaSnapshotForWriting
+        let excerpt = try TranscriptQueueExcerpt(name: name, project: plan.snapshot, location: assetContext(),
+                                                mediaSnapshot: mediaSnapshot)
         if session.isMulticam, case .multicam(let proposal) = plan.snapshot {
             return try session.multicam.enqueueTranscriptSnapshot(proposal, excerpt: excerpt, range: displayRange)
         }
@@ -257,7 +290,8 @@ final class LiveTranscriptController: ObservableObject {
         let owner = selection.firstOccurrenceID.flatMap { occurrence in
             state.attachments.first { occurrence.hasPrefix("\($0.id.count):\($0.id):") }?.id
         }
-        return try TranscriptEditPlanner.select(selection, in: index(attachmentID: selection.attachmentID ?? owner ?? attachmentID))
+        return try TranscriptEditPlanner.select(selection, in: index(attachmentID: selection.attachmentID ?? owner ?? attachmentID,
+                                                                     clocks: [selection.space]))
     }
 
     @discardableResult
@@ -283,7 +317,7 @@ final class LiveTranscriptController: ObservableObject {
         } else if result.space == .currentCut {
             try session.editor.setTranscriptMarks(result.range)
         } else {
-            let index = try index(attachmentID: selection.attachmentID ?? attachmentID)
+            let index = try index(attachmentID: selection.attachmentID ?? attachmentID, clocks: [.currentCut])
             let first = try retainedOccurrence(result.first, in: index)
             let last = try retainedOccurrence(result.last, in: index)
             guard first.clipID == last.clipID else {
@@ -321,7 +355,7 @@ final class LiveTranscriptController: ObservableObject {
             session.editor.preview.pause()
             if space == .currentCut {
                 session.editor.seek(occurrence.range.from.seconds)
-            } else if let retained = try? retainedOccurrence(occurrence, in: index(attachmentID: attachmentID)) {
+            } else if let retained = try? retainedOccurrence(occurrence, in: index(attachmentID: attachmentID, clocks: [.currentCut])) {
                 session.editor.seek(retained.range.from.seconds)
             } else {
                 throw unavailableOccurrence()
@@ -403,7 +437,7 @@ final class LiveTranscriptController: ObservableObject {
         let stamped = bindings.isEmpty && previous != nil
             ? candidates : candidates.map { $0.stamped(in: snapshot, relativeTo: context, confirmed: confirmed) }
         let asset = try store(transcript)
-        let attachment = TranscriptAttachment(id: previous?.id ?? UUID().uuidString, asset: asset, bindings: stamped,
+        let attachment = TranscriptAttachment(id: previous?.id ?? ProjectIdentifier.make(), asset: asset, bindings: stamped,
                                               importOrigin: origin ?? previous?.importOrigin, fingerprint: nil)
         var next = state
         if let index = next.attachments.firstIndex(where: { $0.id == attachment.id }) {
@@ -425,7 +459,7 @@ final class LiveTranscriptController: ObservableObject {
         let draft = session.isMulticam ? session.multicam.projectURL == nil : session.editor.projectURL == nil
         let stamped = candidates.map { $0.stamped(in: snapshot, relativeTo: context, confirmed: !bindings.isEmpty) }
         let worker = Task.detached(priority: .userInitiated) {
-            let data = try TranscriptCodec.encode(transcript, format: .json)
+            let data = try TranscriptCodec.encodeStored(transcript)
             try Task.checkCancellation()
             return try TranscriptStore.put(data, relativeTo: context, draft: draft)
         }
@@ -441,7 +475,7 @@ final class LiveTranscriptController: ObservableObject {
         guard TranscriptStore.assetStatus(asset, relativeTo: context) == .available else {
             throw CutError(code: "missing_transcript", message: "The staged transcript is unavailable. Attach it again.")
         }
-        let attachment = TranscriptAttachment(id: UUID().uuidString, asset: asset, bindings: stamped,
+        let attachment = TranscriptAttachment(id: ProjectIdentifier.make(), asset: asset, bindings: stamped,
                                               importOrigin: origin, fingerprint: nil)
         var next = state
         next.attachments.append(attachment)
@@ -533,7 +567,7 @@ final class LiveTranscriptController: ObservableObject {
     private func store(_ document: TranscriptDocument) throws -> TranscriptAsset {
         let context = try assetContext()
         let draft = session.isMulticam ? session.multicam.projectURL == nil : session.editor.projectURL == nil
-        return try TranscriptStore.put(TranscriptCodec.encode(document, format: .json), relativeTo: context, draft: draft)
+        return try TranscriptStore.put(TranscriptCodec.encodeStored(document), relativeTo: context, draft: draft)
     }
 
     private func inferredBindings(_ document: TranscriptDocument) -> [TranscriptBinding] {
@@ -694,7 +728,8 @@ extension LiveTranscriptController {
         }
         // The reader already holds this index for the current revision. Building another
         // for each correction read, hashed and projected the whole result on the main thread.
-        let sourceIndex = try index(attachmentID: attachment.id)
+        // A record is anchored to Source words, and checked against the clock it was selected in.
+        let sourceIndex = try index(attachmentID: attachment.id, clocks: Set(selections.map(\.space)).union([.source]))
         let record = try TranscriptEditorial.makeRecord(change: change, selections: selections, in: sourceIndex)
         try correct(record)
         return record
@@ -772,14 +807,17 @@ extension LiveTranscriptController {
     }
 
     private struct SidecarPolicy: Sendable {
+        let project: URL?
         let reads: Bool
         let writes: Bool
         let excluded: Set<URL>
 
         func run<T>(_ work: () throws -> T) rethrows -> T {
-            try AnalysisSidecar.$excludedSources.withValue(excluded) {
-                try AnalysisSidecar.$readsEnabled.withValue(reads) {
-                    try AnalysisSidecar.$automaticWritesEnabled.withValue(writes) { try work() }
+            try SidecarLocations.$projectURL.withValue(project) {
+                try AnalysisSidecar.$excludedSources.withValue(excluded) {
+                    try AnalysisSidecar.$readsEnabled.withValue(reads) {
+                        try AnalysisSidecar.$automaticWritesEnabled.withValue(writes, operation: work)
+                    }
                 }
             }
         }
@@ -791,10 +829,12 @@ extension LiveTranscriptController {
         let protected = session.isMulticam ? session.multicam.protectedMediaPaths : session.editor.mcpOutputProtectedMedia
         let candidates = (project.sequenceClips ?? []).flatMap { [$0.file, $0.originalFile].compactMap { $0 } }
             .map { URL(fileURLWithPath: $0) }
-        return .init(reads: reads && AnalysisSidecar.readsEnabled,
+        let projectURL = session.sidecarWork.project
+        return .init(project: projectURL,
+                     reads: reads && AnalysisSidecar.readsEnabled,
                      writes: reads && AnalysisSidecar.automaticWritesEnabled,
                      excluded: excluded.union(AnalysisSidecar.excludedSources)
-                        .union(CutProject.sidecarExclusions(absoluteSources: protected, candidates: candidates)))
+                        .union(CutProject.sidecarExclusions(absoluteSources: protected, candidates: candidates, projectURL: projectURL)))
     }
 
     func capabilities(opening: ((String) -> Void)? = nil) async throws -> Data {
@@ -1235,7 +1275,7 @@ extension LiveTranscriptController {
         let documents = accepted.map(\.transcript)
         let stored = try await Task.detached(priority: .userInitiated) {
             try documents.map {
-                try TranscriptStore.put(TranscriptCodec.encode($0, format: .json), relativeTo: destination, draft: draft)
+                try TranscriptStore.put(TranscriptCodec.encodeStored($0), relativeTo: destination, draft: draft)
             }
         }.value
         // Writing the results takes time. Everything checked before it is checked again.
@@ -1387,18 +1427,19 @@ extension LiveTranscriptController {
 }
 
 extension LiveTranscriptController {
-    func prepareIndex(attachmentID: String? = nil) throws -> @Sendable () throws -> TranscriptIndex {
-        try buildIndex(for: indexKey(attachmentID: attachmentID))
+    func prepareIndex(attachmentID: String? = nil, clocks: Set<TranscriptSpace> = Set(TranscriptSpace.allCases)) throws
+        -> @Sendable () throws -> TranscriptIndex {
+        try buildIndex(for: indexKey(attachmentID: attachmentID), spaces: clocks)
     }
 
     func prepareCoverageIndex(attachmentID: String? = nil) throws -> @Sendable () throws -> TranscriptIndex {
         let key = try indexKey(attachmentID: attachmentID)
         if let index = indexes.index(for: key) { return { index } }
-        return buildIndex(for: key, spaces: [])
+        return buildIndex(for: key, spaces: [], coverageOnly: true)
     }
 
-    private func buildIndex(for key: IndexKey, spaces: Set<TranscriptSpace> = Set(TranscriptSpace.allCases))
-        -> @Sendable () throws -> TranscriptIndex {
+    private func buildIndex(for key: IndexKey, spaces: Set<TranscriptSpace> = Set(TranscriptSpace.allCases),
+                            coverageOnly: Bool = false) -> @Sendable () throws -> TranscriptIndex {
         let sequenceMedia = session.editor.transcriptMedia
         let multicamMedia = session.multicam.media
         let records = state.authoring
@@ -1406,34 +1447,48 @@ extension LiveTranscriptController {
             $0.asset == key.attachment.asset && $0.context == key.context ? $0.document : nil
         }
         let builds = indexBuilds
+        let unrequested = unrequestedClockBuilds
         // A review sheet asks for every attachment's index each time it opens. Whoever builds
-        // one leaves it for the next reader of the same revision.
-        let shelf = spaces.count == TranscriptSpace.allCases.count ? indexes : nil
+        // one leaves it for the next reader of the same revision, and a reader of another
+        // clock adds that clock to it. An index of input coverage alone projects no words,
+        // so it has no corrected speakers to offer a later reader and is not left.
+        let shelf = coverageOnly ? nil : indexes
         return {
-            if let built = shelf?.index(for: key) { return built }
+            if let built = shelf?.index(for: key) {
+                guard !built.holds(spaces) else { return built }
+                try Task.checkCancellation()
+                try built.build(spaces)
+                try Task.checkCancellation()
+                return built
+            }
             try Task.checkCancellation()
             builds.increment()
             // The document just imported is already decoded. Its stored copy is still verified.
             let document = try TranscriptStore.decoded(key.attachment.asset, relativeTo: key.context, known: staged)
             try Task.checkCancellation()
-            let index: TranscriptIndex
-            if case .multicam = key.project {
-                // Source, Group and Current Cut each take about a third of a multicam build, so
-                // they are built side by side. A sequence spends nearly all of it on Current Cut.
-                index = try .concurrent(document: document, attachment: key.attachment,
-                                        project: key.project, projectURL: key.context,
-                                        sequenceMedia: sequenceMedia, multicamMedia: multicamMedia,
-                                        timelineRevision: key.revision.timelineRevision,
-                                        records: records, spaces: spaces)
-            } else {
-                index = try TranscriptIndex(document: document, attachment: key.attachment,
-                                            project: key.project, projectURL: key.context,
-                                            sequenceMedia: sequenceMedia, multicamMedia: multicamMedia,
-                                            timelineRevision: key.revision.timelineRevision, records: records, spaces: spaces)
+            guard let shelf else {
+                return try TranscriptIndex(document: document, attachment: key.attachment,
+                                           project: key.project, projectURL: key.context,
+                                           sequenceMedia: sequenceMedia, multicamMedia: multicamMedia,
+                                           timelineRevision: key.revision.timelineRevision, records: records, spaces: spaces)
+            }
+            // Source, Group and Current Cut each take about a third of a multicam build, so
+            // the ones asked for together are built side by side. A sequence spends nearly all
+            // of it on Current Cut.
+            let sideBySide = if case .multicam = key.project { true } else { false }
+            let index = try TranscriptIndex.onDemand(document: document, attachment: key.attachment,
+                                                     project: key.project, projectURL: key.context,
+                                                     sequenceMedia: sequenceMedia, multicamMedia: multicamMedia,
+                                                     timelineRevision: key.revision.timelineRevision,
+                                                     records: records, spaces: spaces, sideBySide: sideBySide) { late in
+                builds.increment()
+                if late { unrequested.increment() }
             }
             try Task.checkCancellation()
-            shelf?.remember(index, for: key)
-            return index
+            // Another build of this revision may have finished first. Its index is the one kept.
+            let kept = shelf.remember(index, for: key)
+            try kept.build(spaces)
+            return kept
         }
     }
 
@@ -1464,6 +1519,9 @@ extension LiveTranscriptController {
         return {
             try sidecars.run {
                 let primary = try matchingIndex ?? build()
+                // A reader hands over the index it holds, which has the clocks it shows. A plan
+                // reads them all, and they are built here before it does.
+                try primary.build(Set(TranscriptSpace.allCases))
                 let supporting = try additional.map { try $0() }
                 try Task.checkCancellation()
                 let plan = try TranscriptEditPlanner.plan(request, in: primary, project: project,
@@ -1480,7 +1538,7 @@ extension LiveTranscriptController {
 
     func prepareExport(format: TranscriptFormat, space: TranscriptSpace,
                        attachmentID: String? = nil) throws -> @Sendable () throws -> Data {
-        let build = try prepareIndex(attachmentID: attachmentID)
+        let build = try prepareIndex(attachmentID: attachmentID, clocks: [space])
         return { try TranscriptCodec.encode(build(), space: space, format: format) }
     }
 

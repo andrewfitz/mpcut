@@ -288,8 +288,95 @@ class ReencodeTests(unittest.TestCase):
         dry = self.export(output, clips, audio="auto", dry=True)
         self.assertEqual([track["action"] for track in dry["audio_actions"]], ["aac", "aac"])
         self.assertTrue(all(track.get("reason") for track in dry["audio_actions"]))
+        # MP4 cannot carry PCM here, so the lossless sources become AAC. The reason says so, and the report states the rate.
+        self.assertTrue(all("MP4 cannot carry PCM" in track["reason"] for track in dry["audio_actions"]))
+        self.assertEqual([(track["codec"], track["bit_rate"]) for track in dry["audio_actions"]],
+                         [("aac", 192_000), ("aac", 96_000)])
         report = self.export(output, clips, audio="copy", dry=True, ok=False)
         self.assertEqual(report["error"]["code"], "audio_copy_unavailable")
+
+    def ntsc_picture(self):
+        # 30000/1001 fps frames fall between 48 kHz samples, so a cut on them has no exact PCM copy.
+        picture = self.root / "ntsc.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x96:r=30000/1001:d=3", "-c:v", "libx264", "-g", "30", "-bf", "2",
+               "-threads", "1", "-pix_fmt", "yuv420p", picture)
+        return picture
+
+    @staticmethod
+    def integer_samples(path, index=0):
+        return array("i", ffmpeg("-i", path, "-map", f"0:a:{index}", "-c:a", "pcm_s32le", "-f", "s32le", "-"))
+
+    def kept_samples(self, path, start, end, index=0, channels=2, rate=48000):
+        # A cut between samples moves to the nearest one, by less than a sample.
+        first, count = round(start * rate), round((end - start) * rate)
+        return self.integer_samples(path, index)[first * channels:(first + count) * channels]
+
+    def test_auto_writes_lossless_sound_as_pcm_with_identical_samples(self):
+        picture = self.ntsc_picture()
+        noise = ["-f", "lavfi", "-i", "anoisesrc=d=3:c=pink:r=48000:a=0.5:seed=5"]
+        frames = (Fraction(7 * 1001, 30000), Fraction(61 * 1001, 30000))
+        self.assertNotEqual((frames[0] * 48000).denominator, 1)
+        # Matroska states each picture to the millisecond.
+        milliseconds = (Fraction(234, 1000), Fraction(2035, 1000))
+        sources = {}
+        for name, codec, options, source_container, cut, container, written, depth in [
+            ("s16", "pcm_s16le", [], "mov", frames, "mov", "pcm_s16le", 16),
+            ("s24", "pcm_s24le", [], "mov", frames, "mkv", "pcm_s24le", 24),
+            ("alac", "alac", ["-sample_fmt", "s32p"], "mov", frames, "mov", "pcm_s24le", 24),
+            ("flac", "flac", ["-sample_fmt", "s16"], "mkv", milliseconds, "mov", "pcm_s16le", 16),
+        ]:
+            with self.subTest(source=name):
+                source = sources[name] = self.root / f"{name}.{source_container}"
+                ffmpeg("-i", picture, *noise, "-map", "0:v", "-map", "1:a", "-ac", "2", "-c:v", "copy",
+                       "-c:a", codec, *options, source)
+                output = self.root / f"{name}-auto.{container}"
+                report = self.export(output, [(source, *cut)], audio="auto")
+                action = report["audio_actions"][0]
+                self.assertEqual((action["action"], action["codec"], action["bit_depth"]), ("pcm", written, depth))
+                self.assertIn("Exact audio copy could not be verified", action["reason"])
+                self.assertIn("The lossless source is written as PCM", action["reason"])
+                self.assertEqual(stream(output, "a:0")["codec_name"], written)
+                self.assertEqual(self.integer_samples(output), self.kept_samples(source, *cut))
+        # MP4 cannot carry PCM here. The conversion to AAC and its reason are reported.
+        action = self.export(self.root / "lossless.mp4", [(sources["s24"], *frames)], audio="auto", dry=True)["audio_actions"][0]
+        self.assertEqual((action["action"], action["codec"], action["bit_rate"]), ("aac", "aac", 192_000))
+        self.assertIn("MP4 cannot carry PCM", action["reason"])
+        # A named format is written as asked.
+        action = self.export(self.root / "named.mov", [(sources["s24"], *frames)], audio="aac", dry=True)["audio_actions"][0]
+        self.assertEqual((action["action"], action["codec"], action["bit_rate"]), ("aac", "aac", 192_000))
+        self.assertNotIn("reason", action)
+
+    def test_auto_decides_each_track_and_aac_follows_the_source_bit_rate(self):
+        picture = self.ntsc_picture()
+        noise = ["-f", "lavfi", "-i", "anoisesrc=d=3:c=pink:r=48000:a=0.5:seed=5"]
+        source = self.root / "two-tracks.mov"
+        ffmpeg("-i", picture, *noise, *noise, "-map", "0:v", "-map", "1:a", "-map", "2:a", "-ac", "2", "-c:v", "copy",
+               "-c:a:0", "pcm_s24le", "-c:a:1", "aac", "-b:a:1", "256k", source)
+        start, end = Fraction(7 * 1001, 30000), Fraction(61 * 1001, 30000)
+        for container in ("mov", "mkv"):
+            with self.subTest(container=container):
+                output = self.root / f"two-tracks-auto.{container}"
+                lossless, lossy = self.export(output, [(source, start, end)], audio="auto")["audio_actions"]
+                self.assertEqual((lossless["action"], lossless["codec"], lossless["bit_depth"]), ("pcm", "pcm_s24le", 24))
+                self.assertEqual((lossy["action"], lossy["codec"], lossy["bit_rate"]), ("aac", "aac", 256_000))
+                self.assertNotIn("lossless", lossy["reason"])
+                self.assertEqual([stream(output, f"a:{index}")["codec_name"] for index in range(2)], ["pcm_s24le", "aac"])
+                self.assertEqual(self.integer_samples(output), self.kept_samples(source, start, end))
+        # Two channels get 192 kbps without a measured AAC source. This one is written at its own rate.
+        self.assertGreater(int(stream(self.root / "two-tracks-auto.mov", "a:1")["bit_rate"]), 224_000)
+
+    def test_pcm_from_lossy_sound_is_float_and_keeps_samples_above_full_scale(self):
+        source = self.root / "hot.mp4"
+        ffmpeg("-i", self.video, "-f", "lavfi", "-i", "anoisesrc=d=5:c=white:r=48000:a=1.0:seed=3",
+               "-map", "0:v", "-map", "1:a", "-ac", "2", "-c:v", "copy", "-c:a", "aac", "-b:a", "64k", source)
+        expected = pcm(source, 48000)[2 * 48000:2 * 3 * 48000]
+        self.assertGreater(max(expected), 1.05)
+        output = self.root / "hot-pcm.mov"
+        action = self.export(output, [(source, Fraction(1), Fraction(3))], audio="pcm")["audio_actions"][0]
+        self.assertEqual((action["action"], action["codec"], action["bit_depth"]), ("pcm", "pcm_f32le", 32))
+        self.assertEqual(stream(output, "a:0")["codec_name"], "pcm_f32le")
+        # Integer PCM would stop at full scale.
+        self.assertAlmostEqual(max(pcm(output, 48000)), max(expected), places=3)
 
     def test_reencode_preserves_silent_mov_audio_edits(self):
         source = self.root / "delayed.mov"
@@ -362,6 +449,18 @@ class ReencodeTests(unittest.TestCase):
                 self.assertEqual([track["action"] for track in report["audio_actions"]], ["copy"])
                 self.assertEqual(stream(output, "a:0")["codec_name"], "pcm_s24le")
                 self.assertEqual(pcm(output, 44100), pcm(source, 44100))
+
+    def test_double_float_pcm_stays_float_and_keeps_samples_above_full_scale(self):
+        source = self.root / "double.mov"
+        ffmpeg("-i", self.stereo, "-map", "0:v", "-map", "0:a:0", "-c:v", "copy", "-af", "volume=3",
+               "-c:a", "pcm_f64le", source)
+        self.assertGreater(max(pcm(source, 44100)), 1.2)
+        output = self.root / "double-pcm.mov"
+        report = self.export(output, [(source, 0, 5)], audio="pcm")
+        self.assertEqual([track["action"] for track in report["audio_actions"]], ["pcm"])
+        self.assertTrue(any("reduced to 32-bit float" in warning for warning in report["warnings"]), report["warnings"])
+        self.assertEqual(stream(output, "a:0")["codec_name"], "pcm_f32le")
+        self.assertEqual(pcm(output, 44100), pcm(source, 44100))
 
     def test_chroma_reduction_is_reported_before_export(self):
         source = self.root / "prores-4444.mov"

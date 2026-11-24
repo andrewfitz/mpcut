@@ -53,7 +53,7 @@ struct MulticamAssemblyTimeline: View {
                                     keyframes: [], thumbnailSyncTimes: [],
                                     frames: [], sequenceRange: start.seconds..<end.seconds,
                                     displayRange: AudioSpan(from: from, to: to),
-                                    isGap: item.still.map { gaps.contains($0.assetID) } == true)
+                                    isStill: item.still != nil, isGap: item.still.map { gaps.contains($0.assetID) } == true)
             }
         }
     }
@@ -77,16 +77,25 @@ struct MulticamAssemblyTimeline: View {
 
     private func timeline(_ current: Layout) -> SequenceTimeline {
         let items = current.items
-        let clips = current.clips
+        let assetsByID = Dictionary(uniqueKeysWithValues: current.assets.filter { !$0.isGap }.map { ($0.id, $0) })
+        let clips = zip(current.clips, items).map { clip, item in
+            var clip = clip
+            if let still = item.still, let asset = assetsByID[still.assetID] {
+                let url = model.projectMediaURL(asset.file)
+                clip.mediaURL = url
+                clip.mediaStatus = model.mediaStatus(for: url)
+            }
+            return clip
+        }
         let selected = model.occurrenceIndex(at: preview.time)
         let position = model.assemblyPreview ? preview.time.seconds
             : Self.outputPosition(for: model.groupTime(at: preview.time), occurrence: selected, layout: current)
         var result = SequenceTimeline(clips: clips, playhead: position, selection: Self.id(selected),
                          markIn: model.assemblySelection?.from.seconds, markOut: model.assemblySelection?.to.seconds,
-                         thumbnailHeight: 4,
+                         thumbnailHeight: 4, showsSourceRuler: model.preferences.sourceTimeTicks,
                          snapTarget: Binding(get: { model.analysis.snapTarget }, set: { model.setAnalysisSnap($0) }),
                          zoom: $model.timelineZoom, allowsClipEdits: !model.isBusy,
-                         showsControls: false, accessibilityTitle: "Assembly timeline",
+                         allowsStillTrims: true, showsControls: false, accessibilityTitle: "Assembly timeline",
                          onSelect: { id in
                              if let index = clips.firstIndex(where: { $0.id == id }) {
                                  model.selectAssemblyOccurrence(index)
@@ -112,7 +121,15 @@ struct MulticamAssemblyTimeline: View {
         }
         result.onDropProjects = { openDroppedProjects($0) }
         result.timelinePadding = paddingSpans
-        result.assemblyAssets = current.assetSpans
+        result.assemblyAssets = current.assetSpans.map { span in
+            var span = span
+            if let url = span.mediaURL { span.mediaStatus = model.mediaStatus(for: url) }
+            return span
+        }
+        result.onProjectMedia = { action, clip in
+            guard let path = clip.mediaURL?.path else { return }
+            model.presentProjectMedia(action, path: path)
+        }
         if model.rangeTool && !model.isBusy { result.onRangeSelect = model.selectAssemblyRange }
         result.onDropStills = { urls, seconds, replace in
             guard let time = model.assemblyStillDropTime(seconds) else { return }

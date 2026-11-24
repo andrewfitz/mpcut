@@ -129,7 +129,7 @@ extension CutProject {
         }
         let clips = try ranges.map { range -> TranscriptEditSlice in
             let media = try range.resolve(relativeTo: projectURL, inspect: inspect)
-            return .sequence(CutSequenceClip(id: UUID().uuidString, file: media.url.path,
+            return .sequence(CutSequenceClip(id: ProjectIdentifier.make(), file: media.url.path,
                                              from: range.from, to: range.to))
         }
         let (before, after) = try timeline.retaining(before: from, after: to)

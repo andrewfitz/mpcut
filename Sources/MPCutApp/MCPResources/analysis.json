@@ -616,7 +616,7 @@
   },
   {
     "name": "analysis_editor_sidecars_save",
-    "description": "Save completed analysis beside the project sources using the native save operation. Poll the returned job with analysis_job_status_read.",
+    "description": "Save completed analysis to the configured sidecar location for each project source. Poll the returned job with analysis_job_status_read.",
     "inputSchema": {
       "type": "object",
       "properties": {

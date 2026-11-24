@@ -18,6 +18,7 @@ These rules apply to the app and the CLI alike. Both resolve every export throug
 | Audio action | `copy` | Copy Original. Copy the original audio packets. Stop if they can’t be copied exactly. |
 | Audio action | `aac` | AAC. Encode AAC. |
 | Audio action | `pcm` | PCM. Write PCM. |
+| Audio action | `alac` | ALAC. Encode Apple Lossless audio for a still-bearing export. |
 | Audio action | `remove` | Remove Audio. Omit the audio track. |
 | Audio action | `mp3` | MP3. Encode MP3 with LAME. |
 | Audio action | `flac` | FLAC. Encode FLAC, which is lossless. |
@@ -71,6 +72,7 @@ The multicam rows describe picture mode and the available audio actions. The exp
 | Re-encode, `h264` | `mp4`, `mov`, `mkv` |
 | Re-encode, `hevc` | `mp4`, `mov`, `mkv` |
 | Re-encode, `prores` | `mov`, `mkv` |
+| Re-encode, `jpeg` | `mov` |
 | Convert Audio, `pcm` | `wav`, `caf`, `mov` |
 | Convert Audio, `aac` | `m4a`, `mp4`, `mov` |
 | Convert Audio, `mp3` | `mp3` |
@@ -80,6 +82,7 @@ The multicam rows describe picture mode and the available audio actions. The exp
 | Multicam re-encode, `h264` | `mov`, `mp4`, `m4v`, `mkv` |
 | Multicam re-encode, `hevc` | `mov`, `mp4`, `m4v`, `mkv` |
 | Multicam re-encode, `prores` | `mov`, `mkv` |
+| Multicam re-encode, `jpeg` | `mov` |
 | Multicam picture only, listed by the app | `mov`, `mp4`, `m4v`, `mkv`, `webm` |
 | Multicam sound only, listed by the app | `mov`, `mp4`, `m4v`, `mkv`, `wav`, `caf`, `m4a` |
 | Replace Source Audio, movie (after the source's own) | `mov`, `mp4`, `mkv`, `webm` |
@@ -91,9 +94,9 @@ The multicam rows describe picture mode and the available audio actions. The exp
 
 An audio action its container cannot carry is refused with `unsupported_audio` and offers the containers that carry it, then `auto` for a movie. No front end substitutes another action. A multicam `m4v` is written as MP4. Multicam AAC needs a movie edit list for gapless timing, so it is not written into Matroska.
 
-PCM bit depth is chosen by the engine that writes it: a sound-only conversion keeps the source depth (16, 24 or 32-bit, or 32-bit float), while a movie or multicam re-encode writes 32-bit, or 32-bit float for a float source, so that no source depth is reduced.
+PCM bit depth is chosen by the engine that writes it. A sound-only conversion keeps the source depth (16, 24 or 32-bit, or 32-bit float). A movie re-encode keeps the depth of integer sources too, the longest among the clips of a track (16, 24 or 32-bit), and writes 32-bit float for float PCM and for decoded lossy sound, which can exceed full scale. A track of a mixed timeline that is resampled or mixed to stereo is written as 32-bit, or as 32-bit float under the same rule. A multicam re-encode writes 32-bit, or 32-bit float for a float source. A movie track made only of integer sources of up to 32 bits, neither resampled nor mixed, keeps every bit.
 
-When `auto` cannot copy the sound of a movie re-encode exactly it converts to AAC, or PCM for ProRes outside MP4. A multicam export uses `separate_tracks` by default, with one selectable track per lane in project order. Copy preserves source formats and refuses a lane that needs rendering. Explicit `auto` tries copy for each lane and may render the affected lanes or insert silence while retaining eligible PCM samples. `downmix_mono` and `downmix_stereo` always render one track. For picture with sound, MOV renders PCM or AAC, MP4 and M4V render AAC, and MKV renders PCM. WebM offers audio copy. For sound-only output, WAV, WAVE and CAF render PCM, and M4A renders AAC.
+When `auto` cannot copy the sound of a movie re-encode exactly it decides for each track. A track that is lossless in every clip (PCM, FLAC, ALAC, TrueHD or MLP) is written as PCM where the container carries it, so that no lossy encoding is added: in MOV, and in MKV for mono and stereo. MP4 cannot carry PCM here, and MKV states no speaker positions for wider PCM, so there the track is converted to AAC and its reason says so. Any other track is converted to AAC, or for ProRes to PCM under the same container limits. Converted AAC follows the bit rate of an AAC source, at the customary step nearest its measured average and at least 32 kbps for each channel. Any other source gets 96 kbps for each channel, up to 512 kbps. `audio_actions` reports the codec of each converted track with its bit rate or bit depth. A multicam export uses `separate_tracks` by default, with one selectable track per lane in project order. Copy preserves source formats and refuses a lane that needs rendering. Explicit `auto` tries copy for each lane and may render the affected lanes or insert silence while retaining eligible PCM samples. `downmix_mono` and `downmix_stereo` always render one track. For picture with sound, MOV renders PCM or AAC, MP4 and M4V render AAC, and MKV renders PCM. WebM offers audio copy. For sound-only output, WAV, WAVE and CAF render PCM, and M4A renders AAC.
 
 ## Defaults
 
@@ -143,14 +146,14 @@ The tier of a mixed timeline is Re-encode with the factor `join_stream_mismatch`
 - Pixel format: the chosen encoder's (8-bit 4:2:0 for H.264, 4:2:2 10-bit for ProRes, 4:2:0 for HEVC with ten bits when any clip has more than eight).
 - Colour: tagged like the first clip. A clip with another matrix or range is converted to it. Primaries and transfer function are not converted, so an HDR clip is never joined to an SDR one.
 - Frame rate: not converted. Every picture keeps its own time, so clips with different frame rates give a variable frame rate.
-- Sound: one output track per track position, as many as the clip with the most. A position keeps its sample rate and channel layout when the clips agree; otherwise it is resampled to 48 kHz or mixed to stereo. A clip without that track is written as silence. The sound is always converted: AAC, or PCM where the rules choose it for the codec and container.
+- Sound: one output track per track position, as many as the clip with the most. A position keeps its sample rate and channel layout when the clips agree; otherwise it is resampled to 48 kHz or mixed to stereo. A clip without that track is written as silence. The sound is always converted: AAC, or PCM where the rules choose it for the sources, codec and container.
 - There is no project setting for the canvas. Put the clip whose picture should be kept first.
 
 ### Audio actions on a mixed timeline
 
 | Action | Result |
 | --- | --- |
-| `auto` | Converted: AAC, or PCM for ProRes outside MP4. |
+| `auto` | Converted: PCM for a track that is lossless in every clip that has it, in MOV, and in MKV for mono and stereo. Otherwise AAC, or for ProRes PCM under the same container limits. |
 | `copy` | Refused: `incompatible_clip`. Offers the re-encode with `auto`. |
 | `aac` | Converted to AAC in the canvas format. |
 | `pcm` | Converted to PCM in the canvas format. |
@@ -192,6 +195,26 @@ These rows apply to both sequence and multicam projects. The planner verifies th
 | Sound only with an insert | Refused (`placement_silence`) | Refused (`placement_silence`) | Convert Audio |
 
 Omitting the mode with visible still picture selects Smart Trim. A picture replacement alone leaves the sound-only selection on the ordinary rules. Preserve camera picture requires zero encoded camera duration. Export reports distinguish copied camera, encoded camera and generated still durations. The True Lossless tier requires every selected output packet to copy.
+
+### One frame per still
+
+| Container | Video codec | Program color | Lossless audio |
+| --- | --- | --- | --- |
+| .mov | `h264` | SDR | ALAC, PCM |
+| .mov | `hevc` | SDR, PQ, HLG | ALAC, PCM |
+| .mov | `prores` | SDR, PQ, HLG | ALAC, PCM |
+| .mov | `jpeg` | SDR | PCM |
+| .mp4 | `h264` | SDR | ALAC, FLAC |
+| .mp4 | `hevc` | SDR, PQ, HLG | ALAC, FLAC |
+| .m4v | `h264` | SDR | ALAC, FLAC |
+| .m4v | `hevc` | SDR, PQ, HLG | ALAC, FLAC |
+| .mkv | `h264` | SDR | FLAC |
+| .mkv | `hevc` | SDR, PQ, HLG | FLAC |
+| .mkv | `prores` | SDR, PQ, HLG | FLAC |
+
+Smart Trim and Re-encode support held picture. A still-and-soundtrack project defaults to held timing. Choose cadence timing to export regular video frames instead. A saved picture format supplies the codec and container when a request omits them. An explicit container must agree with the destination extension.
+
+MOV-family picture uses exact sample timing. MKV rounds internal changes to the nearest millisecond with ties forward, and rounds the final picture end up. Preflight reports the requested and written intervals and refuses a hold that collapses to zero ticks or shifts a copied camera boundary.
 
 
 ## Timeline tier

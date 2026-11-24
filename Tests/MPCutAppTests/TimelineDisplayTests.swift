@@ -26,6 +26,31 @@ final class TimelineDisplayTests: XCTestCase {
                      displaySize: size)
     }
 
+    func testSourceRulerFollowsTheOriginalTrimWhenMovedAndPanned() {
+        for left: CGFloat in [20, 700] {
+            let ruler = TimelineSourceRuler(source: 750.125...765.125, pixels: left..<(left + 1_500), scale: 100)
+            XCTAssertEqual(ruler.time(at: left + 1_500), 765.125)
+            var labels: [Double] = []
+            ruler.ticks(in: (left + 300)..<(left + 530)) { x, time, major in
+                XCTAssertEqual(x, left + (time - 750.125) * 100, accuracy: 0.0001)
+                if major { labels.append(time) }
+            }
+            XCTAssertEqual(labels, [754, 755])
+        }
+    }
+
+    func testSourceRulerUsesAuthoredEdgesAtMillisecondRoundingBoundaries() {
+        let scale = 183.3
+        let left = 8012.1
+        let end = 3.1255
+        let pixels = CGFloat(left)..<CGFloat(left + (end - 2) * scale)
+        let ruler = TimelineSourceRuler(source: 2...end, pixels: pixels, scale: scale)
+        XCTAssertEqual(ruler.time(at: pixels.upperBound), end)
+        XCTAssertEqual(TimelineSourceRuler.edgeLabel(end), "00:03.126")
+        XCTAssertEqual(TimelineSourceRuler.edgeLabel(1.0005), "00:01.001")
+        XCTAssertEqual(TimelineSourceRuler.edgeLabel(1.9998), "00:02")
+    }
+
     func testSharedFilmstripLayoutDividesCoverageEvenly() {
         let strip = TimelineFilmstrip(width: 400, targetWidth: 92)
         XCTAssertEqual(strip.count, 5)
@@ -33,6 +58,20 @@ final class TimelineDisplayTests: XCTestCase {
         XCTAssertEqual(strip.visibleTiles(origin: 31, visible: 111..<191), 1..<2)
         XCTAssertEqual(strip.visibleTiles(origin: 31, visible: 429..<500), 4..<5)
         XCTAssertTrue(strip.visibleTiles(origin: 31, visible: 500..<600).isEmpty)
+    }
+
+    @MainActor
+    func testContinuousAudioAtViewportEdgeKeepsItsSourceClockAcrossCameraSwitches() {
+        let mic = MulticamAudioSelection(source: "mic", stream: 0)
+        let other = MulticamAudioSelection(source: "other", stream: 0)
+        let intervals = [mic, mic, mic, other].enumerated().map { i, audio in
+            let group = MulticamRange(from: .init(numerator: Int64(i * 5)), to: .init(numerator: Int64((i + 1) * 5)))
+            return MulticamInterval(group: group, output: group, angle: "camera-\(i)", audio: audio, assemblyIndex: 0)
+        }
+        let spans = MulticamTimeline.audioSpans(in: intervals, visibleIndices: 1..<3)
+        XCTAssertEqual(spans.map(\.range), [0..<15, 15..<20])
+        XCTAssertEqual(spans.map(\.audio), [mic, other])
+        XCTAssertTrue(MulticamTimeline.audioSpans(in: intervals, visibleIndices: 4..<4).isEmpty)
     }
 
     @MainActor
@@ -328,6 +367,30 @@ final class TimelineDisplayTests: XCTestCase {
     }
 
     @MainActor
+    func testSourceRulerShowsTrimmedTimeBesideSequenceTime() throws {
+        let first = clip(size: .zero)
+        let trim = TimelineClip(id: UUID(), sourceID: first.sourceID, name: "Trimmed clip",
+                                sourceStart: 750.125, sourceEnd: 765.125, sourceDuration: 900,
+                                keyframes: [], thumbnailSyncTimes: [], frames: [])
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 1032, height: 155))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = 1032
+        surface.hidesCutSections = true
+        var state = timeline([first, trim])
+        surface.timeline = state
+        func clipElement() throws -> NSAccessibilityElement {
+            try XCTUnwrap(surface.accessibilityChildren()?.last as? NSAccessibilityElement)
+        }
+        XCTAssertNil(try clipElement().accessibilityHelp())
+        state.showsSourceRuler = true
+        surface.timeline = state
+        let element = try clipElement()
+        XCTAssertEqual(element.accessibilityValue() as? String, "00:10.000–00:25.000")
+        XCTAssertEqual(element.accessibilityHelp(), "Source time 12:30.125 to 12:45.125")
+    }
+
+    @MainActor
     func testSubmittingUnchangedTimePreservesAnExactNTSCFrame() {
         let frame = 1001.0 / 30_000
         XCTAssertEqual(SequenceTimeline.parseTime("00:00.033", initialTime: frame), frame)
@@ -390,6 +453,69 @@ final class TimelineDisplayTests: XCTestCase {
         XCTAssertEqual(points.count, 2)
         if points.count == 2 { XCTAssertGreaterThan(points[0], points[1]) }
         XCTAssertEqual(stops, 1)
+    }
+
+    @MainActor
+    func testSourceRulerDragScrubsVideoAndAssemblyStillEdgeStillTrims() throws {
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 632, height: 150))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = 632
+        let video = clip(size: .zero)
+        var still = clip(size: .zero)
+        still.isStill = true
+        var trims: [Double] = []
+        var scrubs: [Double] = []
+        var state = SequenceTimeline(clips: [video, still], playhead: 0, selection: video.id,
+                                     thumbnailHeight: 4, showsSourceRuler: true, allowsStillTrims: true,
+                                     onSelect: { _ in }, onSeek: { _ in }, onTrim: { id, _, time, commit in
+                                         XCTAssertEqual(id, still.id)
+                                         if commit { trims.append(time) }
+                                         return time
+                                     }, onMove: { _, _ in XCTFail("A ruler or trim drag moved the clip") }, onDrop: { _, _ in })
+        state.onScrub = { scrubs.append($0) }
+        surface.timeline = state
+        func event(_ type: NSEvent.EventType, _ x: CGFloat, _ y: CGFloat) throws -> NSEvent {
+            let point = surface.convert(NSPoint(x: x, y: y), to: nil)
+            return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+        }
+        // Start just inside the selected clip's right edge, in the source ruler below the trim grip.
+        surface.mouseDown(with: try event(.leftMouseDown, 312, 62))
+        surface.mouseDragged(with: try event(.leftMouseDragged, 166, 62))
+        surface.mouseUp(with: try event(.leftMouseUp, 166, 62))
+        XCTAssertEqual(scrubs, [5])
+        for enabled in [false, true] {
+            state.showsSourceRuler = enabled
+            surface.timeline = state
+            surface.mouseDown(with: try event(.leftMouseDown, 615, 44))
+            surface.mouseDragged(with: try event(.leftMouseDragged, 585, 44))
+            surface.mouseUp(with: try event(.leftMouseUp, 585, 44))
+        }
+        XCTAssertEqual(trims, [9, 9])
+        let element = try XCTUnwrap(surface.accessibilityChildren()?.last as? NSAccessibilityElement)
+        XCTAssertNil(element.accessibilityHelp())
+    }
+
+    @MainActor
+    func testUnselectedStillDurationGripIncludesJoinAndExcludesSoundtrack() {
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 632, height: 150))
+        surface.viewportWidth = 632
+        var still = clip(size: .zero)
+        still.isStill = true
+        var next = clip(size: .zero)
+        next.isStill = true
+        var state = timeline([still, next])
+        state.showsWaveform = true
+        state.allowsStillEndResize = true
+        surface.timeline = state
+        func hint(_ x: CGFloat, _ y: CGFloat) -> String {
+            surface.view(surface, stringForToolTip: 0, point: NSPoint(x: x, y: y), userData: nil)
+        }
+        XCTAssertEqual(hint(316, 42), "Drag to change still duration")
+        XCTAssertEqual(hint(320, 42), "Drag to change still duration")
+        XCTAssertEqual(hint(335, 42), "Select or drag to reorder")
+        XCTAssertEqual(hint(316, 112), "Scrub timeline")
     }
 
     @MainActor
@@ -497,6 +623,114 @@ final class TimelineDisplayTests: XCTestCase {
         XCTAssertTrue(surface.performKeyEquivalent(with: try escapeKey(window: window)))
         surface.mouseUp(with: try event(.leftMouseUp, 1300, 55))
         XCTAssertEqual(ranges, [0...5, 2...2])
+    }
+
+    @MainActor
+    func testHideCutSectionsFillsTrackAndMapsClicksToSequenceTime() throws {
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 632, height: 119))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = surface.bounds.width
+        let source = UUID()
+        let clips = [(2.0, 4.0), (5.0, 9.0)].map { start, end in
+            TimelineClip(id: UUID(), sourceID: source, name: "Take", sourceStart: start, sourceEnd: end,
+                         sourceDuration: 10, keyframes: [], thumbnailSyncTimes: [], frames: [])
+        }
+        var state = timeline(clips)
+        var seeks: [Double] = []
+        state.onPointerSeek = { seeks.append($0) }
+        surface.timeline = state
+
+        func clipFrames() throws -> [NSRect] {
+            let elements = try XCTUnwrap(surface.accessibilityChildren() as? [NSAccessibilityElement])
+            return elements.dropFirst().map { $0.accessibilityFrameInParentSpace() }
+        }
+        let expanded = try clipFrames()
+        XCTAssertEqual(expanded.map(\.width), [60, 120])
+        surface.hidesCutSections = true
+        let compact = try clipFrames()
+        XCTAssertEqual(compact.map(\.minX), [16, 216])
+        XCTAssertEqual(compact.map(\.width), [200, 400])
+
+        func clickRuler() throws {
+            let point = surface.convert(NSPoint(x: 316, y: 10), to: nil)
+            func event(_ type: NSEvent.EventType) throws -> NSEvent {
+                try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+                                                 windowNumber: window.windowNumber, context: nil, eventNumber: 1,
+                                                 clickCount: 1, pressure: 1))
+            }
+            surface.mouseDown(with: try event(.leftMouseDown))
+            surface.mouseUp(with: try event(.leftMouseUp))
+        }
+        try clickRuler()
+        surface.hidesCutSections = false
+        XCTAssertEqual(try clipFrames(), expanded)
+        try clickRuler()
+        XCTAssertEqual(seeks, [3, 2])
+    }
+
+    @MainActor
+    func testCompactTrimPreviewTracksBothHandlesAndKeepsClipsTogether() throws {
+        let surface = TimelineSurface(frame: NSRect(x: 0, y: 0, width: 632, height: 119))
+        let window = NSWindow(contentRect: surface.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = surface
+        surface.viewportWidth = 632
+        let clips = (0..<3).map { _ in
+            TimelineClip(id: UUID(), sourceID: UUID(), name: "Take", sourceStart: 2, sourceEnd: 4,
+                         sourceDuration: 10, keyframes: [], thumbnailSyncTimes: [], frames: [])
+        }
+        var committed: [Double] = []
+        surface.timeline = SequenceTimeline(clips: clips, playhead: 0, selection: clips[1].id,
+            onSelect: { _ in }, onSeek: { _ in }, onTrim: { id, _, target, commit in
+                XCTAssertEqual(id, clips[1].id)
+                if commit { committed.append(target) }
+                return target
+            }, onMove: { _, _ in }, onDrop: { _, _ in })
+        surface.hidesCutSections = true
+        func mouse(_ type: NSEvent.EventType, _ x: CGFloat) throws -> NSEvent {
+            let point = surface.convert(NSPoint(x: x, y: 45), to: nil)
+            return try XCTUnwrap(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+        }
+        for startEdge in [true, false] {
+            let down: CGFloat = startEdge ? 218 : 414
+            surface.mouseDown(with: try mouse(.leftMouseDown, down))
+            for delta: CGFloat in [-50, 50] {
+                surface.mouseDragged(with: try mouse(.leftMouseDragged, down + delta))
+                let elements = try XCTUnwrap(surface.accessibilityChildren() as? [NSAccessibilityElement])
+                let rects = elements.dropFirst().map { $0.accessibilityFrameInParentSpace() }
+                XCTAssertEqual(rects[1].minX, startEdge ? 216 + delta : 216, accuracy: 0.01)
+                XCTAssertEqual(rects[1].maxX, startEdge ? 416 : 416 + delta, accuracy: 0.01)
+                XCTAssertEqual(rects[0].maxX, rects[1].minX, accuracy: 0.01)
+                XCTAssertEqual(rects[1].maxX, rects[2].minX, accuracy: 0.01)
+            }
+            if startEdge { surface.cancelOperation(nil) }
+            else { surface.mouseUp(with: try mouse(.leftMouseUp, down + 50)) }
+        }
+        XCTAssertEqual(committed, [4.5])
+    }
+
+    @MainActor
+    func testShowingCutsKeepsZoomedPlayheadAtFractionalJoin() throws {
+        let scroll = TimelineScrollView(frame: NSRect(x: 0, y: 0, width: 632, height: 119))
+        let window = NSWindow(contentRect: scroll.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = scroll
+        scroll.documentView = scroll.surface
+        let clips = [(0.0, 0.96), (4.0, 5.5)].map { start, end in
+            TimelineClip(id: UUID(), sourceID: UUID(), name: "Take", sourceStart: start, sourceEnd: end,
+                         sourceDuration: 10, keyframes: [], thumbnailSyncTimes: [], frames: [])
+        }
+        scroll.surface.timeline = timeline(clips, at: clips[0].duration)
+        scroll.surface.hidesCutSections = true
+        scroll.surface.zoom = 4
+        scroll.resizeDocument()
+        scroll.scrollHorizontally(to: 700)
+        let playhead = try XCTUnwrap(scroll.subviews.first { !$0.isHidden && $0.frame.width == 20 })
+        let original = playhead.frame.midX
+        scroll.surface.hidesCutSections = false
+        scroll.resizeDocument()
+        XCTAssertFalse(playhead.isHidden)
+        XCTAssertEqual(playhead.frame.midX, original, accuracy: 1)
     }
 
     @MainActor

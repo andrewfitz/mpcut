@@ -364,6 +364,9 @@ func TestLiveBundle(t *testing.T) {
 	t.Run("StillAuthoring", func(t *testing.T) {
 		checkStillAuthoring(t, toolCaller, rawCall, runGUIProbe, dir)
 	})
+	t.Run("HeldSoundtrack", func(t *testing.T) {
+		checkHeldSoundtrack(t, toolCaller(t), dir)
+	})
 	t.Run("ClipSpacing", func(t *testing.T) {
 		checkClipSpacing(t, toolCaller(t), dir)
 	})

@@ -5,11 +5,11 @@ import MPCutCore
 struct ParticipantCLI {
     fileprivate static let maximumScanBytes = 1024 * 1024 * 1024
     enum Operation {
-        case scan, markers, inspect, accept, apply, plan, render, angles, planAngles, renderAngles
+        case scan, markers, inspect, accept, apply, plan, render, angles, takeAngle, planAngles, renderAngles
 
         var allowed: Set<String> {
             switch self {
-            case .scan: ["file", "backend", "sampling", "include_scenes", "no_sidecar", "progress", "output", "resume_file"]
+            case .scan: ["file", "backend", "sampling", "feed_layout", "include_scenes", "no_sidecar", "progress", "output", "resume_file"]
             case .markers: ["analysis_file", "rule"]
             case .inspect: ["project_path"]
             case .accept: ["project_path", "source_id", "analysis_file", "out_project", "in_place"]
@@ -17,6 +17,7 @@ struct ParticipantCLI {
             case .plan: ["project_path", "plan", "output"]
             case .render: ["project_path", "plan", "output", "progress"]
             case .angles: ["project_path", "source_id", "participant_ids", "range", "include_original", "presentation_ids"]
+            case .takeAngle: ["project_path", "angle", "output_time", "out_project", "in_place"]
             case .planAngles:
                 Operation.angles.allowed.union(["canvas", "audio"])
             case .renderAngles:
@@ -45,7 +46,8 @@ struct ParticipantCLI {
         requestFile = nil
         let switches: Set<String> = ["include_scenes", "in_place", "include_original"]
         let strings: Set<String> = ["file", "project_path", "source_id", "analysis_file", "out_project",
-                                    "output", "output_directory", "backend", "sampling", "progress", "resume_file", "participants_file"]
+                                    "output", "output_directory", "backend", "sampling", "feed_layout", "progress",
+                                    "resume_file", "participants_file"]
         var values: [String: Any] = [:]
         var iterator = options.makeIterator()
         while let token = iterator.next() {
@@ -81,10 +83,20 @@ struct ParticipantCLI {
             }
             let sampling: ParticipantSampling
             switch try request.value("sampling", as: String.self) {
-            case nil: sampling = resume?.configuration.sampling ?? .everyFrame
+            case nil: sampling = resume?.configuration.sampling ?? .adaptive
+            case "adaptive": sampling = .adaptive
             case "every-frame": sampling = .everyFrame
             case "sparse": sampling = .sparse
-            default: throw CLIError("invalid_arguments", "Choose sampling every-frame or sparse.")
+            default: throw CLIError("invalid_arguments", "Choose sampling adaptive, every-frame or sparse.")
+            }
+            let feedLayout: ParticipantFeedLayout
+            if let value = try request.value("feed_layout", as: String.self) {
+                guard let layout = ParticipantFeedLayout(feedLayout: value) else {
+                    throw CLIError("invalid_arguments", "Choose feed layout auto or COLSxROWS with one to 64 feeds.")
+                }
+                feedLayout = layout
+            } else {
+                feedLayout = resume?.configuration.feedLayout ?? .meeting
             }
             let source = try request.url("file")
             let destination = try request.value("output", as: String.self).map { try fileURL($0, label: "Output") }
@@ -98,30 +110,42 @@ struct ParticipantCLI {
                 }
             }
             let progress = try request.progress()
-            var lastUpdate = -Double.infinity
-            let result = try ParticipantAnalysis.scan(source, options: .init(
+            let options = try ParticipantScanOptions(
                 backend: backend, sampling: sampling,
                 includeScenes: request.value("include_scenes", as: Bool.self) ?? resume?.configuration.includeScenes ?? false,
-                useSidecar: useSidecar && !(request.value("no_sidecar", as: Bool.self) ?? false)),
-                resuming: resume, cancelled: cancelled, progress: progress == .none ? nil : { time in
-                    let now = ProcessInfo.processInfo.systemUptime
-                    guard now - lastUpdate >= 0.2 else { return }
-                    lastUpdate = now
-                    emitProgress(progress, time: time)
-                })
-            if result.state == .completed || result.state == .upToDate {
-                emitProgress(progress, time: result.source.duration, fraction: 1)
+                useSidecar: useSidecar && !(request.value("no_sidecar", as: Bool.self) ?? false), feedLayout: feedLayout)
+            let result: ParticipantScanResult
+            var last: ParticipantScanProgress?
+            do {
+                if progress == .none {
+                    result = try ParticipantAnalysis.scan(source, options: options, resuming: resume, cancelled: cancelled)
+                } else {
+                    result = try ParticipantAnalysis.scanWithStatus(source, options: options, resuming: resume, cancelled: cancelled) { update in
+                        last = update
+                        switch update.phase {
+                        case .preparing, .checkingCache, .scanning, .finalizing:
+                            emitScanProgress(progress, phase: update.phase.rawValue, percent: update.percent, time: update.time)
+                        case .completed, .upToDate, .paused, .incomplete, .failed:
+                            break
+                        }
+                    }
+                }
+                if let last {
+                    // A completed scan or paused checkpoint still needs to be delivered.
+                    emitScanProgress(progress, phase: "writing_result", percent: min(99, last.percent), time: last.time)
+                }
+                try outputScan(result, to: destination, pretty: destination == nil && !json, interruption: interruption)
+            } catch {
+                if let last {
+                    let wasCancelled = error is CancellationError || (error as? CLIError)?.code == "cancelled"
+                        || (error as? CutError)?.code == "cancelled"
+                    let phase = wasCancelled ? "paused" : "failed"
+                    emitScanProgress(progress, phase: phase, percent: min(99, last.percent), time: last.time)
+                }
+                throw error
             }
-            if let destination {
-                let encoder = JSONEncoder()
-                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-                var data = try encoder.encode(result)
-                data.append(0x0A)
-                try publishAnalysis(data, paused: result.state == .paused, to: destination, interruption: interruption)
-                try interruption.beginResponse(checkCancellation: false)
-                try writeOutput(data)
-            } else {
-                try writeJSON(result, pretty: !json, checkCancellation: false)
+            if let last {
+                emitScanProgress(progress, phase: last.phase.rawValue, percent: last.percent, time: last.time)
             }
             if result.state == .paused { exit(130) }
             if result.state == .incomplete { exit(1) }
@@ -137,6 +161,13 @@ struct ParticipantCLI {
         }
 
         let document = try request.url("project_path")
+        try SidecarLocations.$projectURL.withValue(document) {
+            try runProject(request, document: document, json: json, interruption: interruption, cancelled: cancelled)
+        }
+    }
+
+    private func runProject(_ request: ParticipantRequest, document: URL, json: Bool,
+                            interruption: Interruption, cancelled: @escaping @Sendable () -> Bool) throws {
         let loaded = try CutProject.loadEditorDocument(from: document, limit: CutProject.maximumHistorySteps)
         let project = loaded.project
         switch operation {
@@ -144,7 +175,7 @@ struct ParticipantCLI {
             return
         case .inspect:
             try writeJSON(project.participants, pretty: !json)
-        case .apply, .accept:
+        case .apply, .accept, .takeAngle:
             let inPlace = try request.value("in_place", as: Bool.self) ?? false
             let outProject = try request.value("out_project", as: String.self)
             guard inPlace != (outProject != nil) else {
@@ -157,29 +188,37 @@ struct ParticipantCLI {
             try loaded.media.validateDestination(destination, relativeTo: document)
             var updated = project
             if operation == .apply {
+                let edits: ParticipantProject
                 if request.fields["participants_file"] != nil {
                     guard request.fields["participants"] == nil else {
                         throw CLIError("invalid_arguments", "Choose participants or participants_file.")
                     }
-                    updated.participants = try request.readJSONFile("participants_file", as: ParticipantProject.self,
-                                                                    label: "Participant edit", cancelled: cancelled)
+                    edits = try request.readJSONFile("participants_file", as: ParticipantProject.self,
+                                                      label: "Participant edit", cancelled: cancelled)
                 } else {
-                    updated.participants = try request.required("participants", as: ParticipantProject.self)
+                    edits = try request.required("participants", as: ParticipantProject.self)
                 }
-            } else {
+                try updated.applyParticipantEdits(edits, relativeTo: document)
+            } else if operation == .accept {
                 let sourceID = try request.required("source_id", as: String.self)
                 let scan = try request.analysis(cancelled: cancelled)
                 try updated.acceptParticipantAnalysis(scan, sourceID: sourceID, relativeTo: document)
+            } else {
+                let angle = try request.required("angle", as: ParticipantVirtualAngle.self)
+                let time = try RationalTime(parsing: request.required("output_time", as: String.self))
+                updated = try ParticipantMulticam.taking(angle, at: time, in: project, document: document)
             }
+            let action = operation == .takeAngle ? "Take Participant Angle" : "Edit Participants"
             try updated.validate()
             if inPlace, project != updated {
-                let history = loaded.undo + [.init(action: "Edit Participants", project: project)]
+                let history = loaded.undo + [.init(action: action, project: project)]
                 try updated.saveCopy(to: destination, copyingTranscriptsFrom: document,
-                                     undo: history, redo: [], replacingExisting: true,
+                                     undo: history, redo: [], mediaSnapshot: loaded.media.mediaSnapshot, replacingExisting: true,
                                      expected: loaded.media.diskRevision, check: interruption.check)
             } else if !inPlace {
-                try saveEditedProject(updated, source: document, destination: destination, action: "Edit Participants",
-                                      original: project, undo: loaded.undo, redo: loaded.redo, interruption: interruption)
+                try saveEditedProject(updated, source: document, destination: destination, action: action,
+                                      original: project, undo: loaded.undo, redo: loaded.redo,
+                                      mediaSnapshot: loaded.media.mediaSnapshot, interruption: interruption)
             }
             try writeJSON(ProjectMutationReceipt(projectPath: destination.path, operationCount: project == updated ? 0 : 1),
                           pretty: !json, checkCancellation: false)
@@ -238,24 +277,39 @@ struct ParticipantCLI {
         }
     }
 
-    private func publishAnalysis(_ data: Data, paused: Bool, to destination: URL,
-                                 interruption: Interruption) throws {
-        guard data.count <= Self.maximumScanBytes else {
-            throw CutError(code: "participant_analysis_too_large",
-                           message: "The scan report exceeds 1 GiB. Scan a shorter recording to save an importable report.")
+    private func outputScan(_ result: ParticipantScanResult, to destination: URL?, pretty: Bool,
+                            interruption: Interruption) throws {
+        let directory = destination?.deletingLastPathComponent() ?? FileManager.default.temporaryDirectory
+        let staging = directory.appendingPathComponent(".mpcut-participants-\(UUID().uuidString)")
+        let fd = open(staging.path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, destination == nil ? 0o600 : 0o666)
+        guard fd >= 0 else { throw CutError(code: "participant_analysis_write_failed", message: String(cString: strerror(errno))) }
+        let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? file.close() }
+        defer { if destination != nil { try? FileManager.default.removeItem(at: staging) } }
+        // Keep stdout transactional on an encoding error. An anonymous spool
+        // is also reclaimed if the process exits while writing to a closed pipe.
+        if destination == nil { try FileManager.default.removeItem(at: staging) }
+        var count = 0
+        func write(_ bytes: Data) throws {
+            if result.state != .paused { try interruption.check() }
+            if destination != nil && bytes.count > Self.maximumScanBytes - count {
+                throw CutError(code: "participant_analysis_too_large",
+                               message: "The scan report exceeds 1 GiB. Scan a shorter recording to save an importable report.")
+            }
+            try file.write(contentsOf: bytes)
+            count += bytes.count
         }
-        if !paused { try interruption.check() }
-        let staging = destination.deletingLastPathComponent().appendingPathComponent(".mpcut-participants-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: staging) }
-        try data.write(to: staging, options: [.withoutOverwriting])
-        if !paused { try interruption.check() }
-        let code = publishExclusively(from: staging, to: destination)
-        if code == EEXIST {
-            throw CutError(code: "output_exists", message: "Choose a new analysis destination.")
+        try result.writeJSON(pretty: pretty, write: write)
+        try write(Data([10]))
+        try file.seek(toOffset: 0)
+        if let destination {
+            if result.state != .paused { try interruption.check() }
+            let code = publishExclusively(from: staging, to: destination)
+            if code == EEXIST { throw CutError(code: "output_exists", message: "Choose a new analysis destination.") }
+            if code != 0 { throw CutError(code: "participant_analysis_write_failed", message: String(cString: strerror(code))) }
         }
-        if code != 0 {
-            throw CutError(code: "participant_analysis_write_failed", message: String(cString: strerror(code)))
-        }
+        try interruption.beginResponse(checkCancellation: false)
+        while let bytes = try file.read(upToCount: 1 << 20), !bytes.isEmpty { try writeOutput(bytes) }
     }
 
     private func read(_ interruption: Interruption) throws -> ParticipantRequest {
@@ -327,19 +381,30 @@ private struct ParticipantRequest {
     }
 }
 
-private func emitProgress(_ output: MediaProgressOutput, time: RationalTime? = nil, fraction: Double? = nil) {
+private func emitScanProgress(_ output: MediaProgressOutput, phase: String, percent: Int, time: RationalTime) {
+    emitProgress(output, time: time, fraction: Double(percent) / 100, phase: phase, percent: percent)
+}
+
+private func emitProgress(_ output: MediaProgressOutput, time: RationalTime? = nil, fraction: Double? = nil,
+                          phase: String? = nil, percent: Int? = nil) {
     switch output {
     case .none: break
     case .stderr:
+        if let phase, let percent {
+            progressOutput("\(phase) \(percent)%")
+            return
+        }
         if let time { progressOutput(String(format: "%.2f s media scanned", time.seconds)) }
         if let fraction { progressOutput(String(format: "%.1f%%", 100 * fraction)) }
     case .jsonl:
         struct Event: Encodable {
             let event = "progress"
+            let phase: String?
+            let percent: Int?
             let time: RationalTime?
             let fraction: Double?
         }
-        if let data = try? JSONEncoder().encode(Event(time: time, fraction: fraction)) {
+        if let data = try? JSONEncoder().encode(Event(phase: phase, percent: percent, time: time, fraction: fraction)) {
             progressOutput(String(decoding: data, as: UTF8.self))
         }
     }

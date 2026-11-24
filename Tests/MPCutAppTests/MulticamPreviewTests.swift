@@ -55,7 +55,7 @@ final class MulticamPreviewTests: XCTestCase {
     }
 
     @MainActor
-    func testRelinkingReplacedRecordingAtSamePathRefreshesIndexAndDisplayedPicture() async throws {
+    func testReplacingRecordingAtSamePathRefreshesIndexAndDisplayedPicture() async throws {
         let original = try indexed("SmartTrim-GOP", "mp4")
         let replacement = try indexed("VFR-PTS", "mp4")
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -86,14 +86,18 @@ final class MulticamPreviewTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
         model.notice = nil
 
-        model.relink("wide", to: file)
+        let mediaArchive = try XCTUnwrap(model.projectMediaArchive)
+        let preview = try ProjectMediaReplace.preview(mediaArchive.project, snapshot: mediaArchive.snapshot,
+                                                      relativeTo: mediaArchive.documentURL, source: file.path, candidate: file)
+        let changed = try await model.applyProjectMediaReplacement(preview)
+        XCTAssertTrue(changed)
         try await waitForIndex(model)
         XCTAssertNil(model.notice)
         let refreshed = try XCTUnwrap(model.media["wide"])
         XCTAssertNotEqual(refreshed.identity, oldIdentity)
         XCTAssertEqual(refreshed.frames.map(\.time), replacement.frames.map(\.time))
         XCTAssertEqual(model.project?.range, project.range)
-        XCTAssertFalse(model.isChanged)
+        XCTAssertTrue(model.isChanged)
         try await waitForPicture(model.preview, source: "wide", frame: replacement.frames[0].time)
         XCTAssertEqual(model.preview.picture?.identity, refreshed.identity)
     }

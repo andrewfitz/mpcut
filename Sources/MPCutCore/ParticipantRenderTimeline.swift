@@ -76,20 +76,24 @@ struct ParticipantRenderTimeline {
         }
         let omitted = Set(plan.redactions.filter { $0.treatment == .omit }.map(\.participantID))
         let defaultShot = plan.shots.first { $0.range == nil }!
-        let outputShots = plan.shots.filter { $0.range != nil && $0.clock == .output }
-        let groupShots = plan.shots.filter { $0.range != nil && $0.clock == .group }
+        let shotIndex = ParticipantTimedShot.index(plan.shots)
+        let outputShots = shotIndex[.init(clock: .output)] ?? []
+        let groupShots = shotIndex[.init(clock: .group)] ?? []
         // Only participating layers are opened or evaluated for privacy.
         func emit(_ output: MulticamRange, group: MulticamRange?, occurrence: Int,
                   base: () throws -> ParticipantRenderRoute?,
                   camera: (String, RationalTime) throws -> ParticipantRenderRoute?,
                   cameraBoundaries: [RationalTime] = [], into windows: inout [ParticipantRenderWindow]) throws {
             var controlPoints = Set([output.from, output.to])
-            let outputCandidates = outputShots.filter { $0.occurrence == nil || $0.occurrence == occurrence }
-            for shot in outputCandidates {
-                for point in [shot.range!.from, shot.range!.to] where output.contains(point) { controlPoints.insert(point) }
+            let occurrenceShots = shotIndex[.init(clock: .output, occurrence: occurrence)] ?? []
+            for candidates in [occurrenceShots.overlapping(output), outputShots.overlapping(output)] {
+                for shot in candidates {
+                    for point in [shot.range.from, shot.range.to] where output.contains(point) { controlPoints.insert(point) }
+                }
             }
             if let group {
-                for point in groupShots.flatMap({ [$0.range!.from, $0.range!.to] }) + cameraBoundaries where group.contains(point) {
+                let shotBoundaries = groupShots.overlapping(group).flatMap { [$0.range.from, $0.range.to] }
+                for point in shotBoundaries + cameraBoundaries where group.contains(point) {
                     controlPoints.insert(try output.from.adding(point.subtracting(group.from)))
                 }
             }
@@ -97,9 +101,9 @@ struct ParticipantRenderTimeline {
             for (from, to) in zip(points, points.dropFirst()) {
                 try checkCancellation()
                 let groupTime = try group.map { try $0.from.adding(from.subtracting(output.from)) }
-                let shot = outputCandidates.first { $0.occurrence != nil && $0.range!.contains(from) }
-                    ?? outputCandidates.first { $0.occurrence == nil && $0.range!.contains(from) }
-                    ?? groupTime.flatMap { time in groupShots.first { $0.range!.contains(time) } }
+                let shot = occurrenceShots.shot(at: from)
+                    ?? outputShots.shot(at: from)
+                    ?? groupTime.flatMap { groupShots.shot(at: $0) }
                     ?? defaultShot
                 let slots = shot.slots.filter { $0.target != .participant || !omitted.contains($0.id) }
                 let base = shot.layout == .original || slots.contains(where: { $0.target != .camera }) ? try base() : nil

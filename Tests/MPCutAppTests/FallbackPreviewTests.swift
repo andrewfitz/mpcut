@@ -3,6 +3,67 @@ import MPCutCore
 import XCTest
 @testable import MPCutApp
 
+final class ParticipantDisplayedPictureTests: XCTestCase {
+    func testReviewIndexMatchesProjectOrderWhenPlayingAndSeekingBackward() throws {
+        func time(_ value: Int64) -> RationalTime { .init(numerator: value) }
+        let bounds = ParticipantBounds(x: 0, y: 0, width: 1, height: 1)
+        let ranges: [(Int64, Int64)] = [(3, 9), (0, 12), (1, 3), (3, 5), (7, 8)]
+        let appearances = ranges.enumerated().map { id, range in
+            ParticipantAppearance(id: String(id), participantID: nil, range: .init(from: time(range.0), to: time(range.1)), bounds: bounds)
+        }
+        let index = ParticipantAppearanceIndex(appearances)
+        for instant: Int64 in [4, 5, 5, 10, 8, 7, 6, 3, 2, 0, 19, 1] {
+            XCTAssertEqual(index.at(time(instant)), appearances.filter { $0.range.contains(time(instant)) })
+        }
+    }
+
+    func testReflowReviewUsesIndexedPicturesOnBothSidesOfBoundary() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "Multicam-Delayed-ProRes", withExtension: "mov",
+                                                  subdirectory: "Fixtures"))
+        let media = try CutEngine().inspectMulticamSource(url)
+        let position = ParticipantMonitorPosition(sourceID: "gallery", media: media, time: .zero)
+        let current = try media.frames[1].time.subtracting(media.multicamClockOffset)
+        XCTAssertGreaterThan(media.multicamClockOffset, .zero)
+        XCTAssertEqual(position.frameRange(atReflow: current, before: true)?.from, .zero)
+        XCTAssertEqual(position.frameRange(atReflow: current, before: false)?.from, current)
+        XCTAssertNil(position.frameRange(atReflow: .zero, before: true))
+    }
+
+    @MainActor
+    func testPendingSeekKeepsTheDisplayedSourcePicture() async throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
+                                                  subdirectory: "Fixtures"))
+        let preview = SequencePreview()
+        defer { preview.pause() }
+        preview.update([PreviewRange(url: url, exactStart: .zero, exactEnd: .init(numerator: 2))], at: 0)
+        func wait(for expected: RationalTime) async throws {
+            let deadline = ContinuousClock.now + .seconds(8)
+            while preview.sourcePicture.value?.time != expected, .now < deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertEqual(preview.sourcePicture.value?.time, expected)
+            XCTAssertEqual(preview.sourcePicture.value?.url, url)
+        }
+        try await wait(for: .zero)
+        preview.seek(to: 1)
+        XCTAssertEqual(preview.time, 1)
+        XCTAssertEqual(preview.sourcePicture.value?.time, .zero)
+        try await wait(for: .init(numerator: 1))
+    }
+
+    func testFallbackPlaybackRetainsSourcePTSWhenPrerollGetsAnOutputTimestamp() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",
+                                                  subdirectory: "Fixtures"))
+        let reader = FFPreviewReader(videoOnly: true)
+        try reader.seek(url: url, to: 1.01)
+        let batch = try reader.batch(from: 1.01, end: 1.5, timelineOffset: -1.01, first: true) { false }
+        let first = try XCTUnwrap(batch.video.first)
+        XCTAssertEqual(first.time.seconds, 0, accuracy: 1e-8)
+        XCTAssertEqual(first.sourcePicture?.url, url)
+        XCTAssertEqual(first.sourcePicture?.time, RationalTime(numerator: 1))
+    }
+}
+
 final class FallbackPreviewTests: XCTestCase {
     func testNegativeFractionalOriginSeeksBeforeNextKeyframe() throws {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "SmartTrim-GOP", withExtension: "mp4",

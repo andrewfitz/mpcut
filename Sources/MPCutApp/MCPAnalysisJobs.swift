@@ -41,6 +41,8 @@ final class MCPAnalysisReceipt {
     var nativeProgress: (() -> Double?)?
     var nativeDetail: (() -> [String: Any])?
     var cancelledDetail: (() -> [String: Any])?
+    var completionDetail: (() -> [String: Any])?
+    var mediaLocateRows: [ProjectMediaSearchRow]?
     var sceneRequest: MCPSceneRequest?
     var sceneCoverage: (() -> [String: SceneScanProgress])?
     fileprivate var sceneWorkerOrigin: String?
@@ -59,6 +61,7 @@ final class MCPAnalysisReceipt {
         guard self.state == "running" else { return }
         self.state = state
         self.detail = runningDetail()
+        self.detail.merge(completionDetail?() ?? [:]) { _, new in new }
         if state == "cancelled" {
             self.detail.merge(cancelledDetail?() ?? [:]) { _, new in new }
         }
@@ -67,6 +70,7 @@ final class MCPAnalysisReceipt {
         nativeProgress = nil
         nativeDetail = nil
         cancelledDetail = nil
+        completionDetail = nil
         sceneSubscribers?.finish(state, detail: self.detail)
         sceneSubscribers = nil
         sceneCoverage = nil

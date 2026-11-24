@@ -16,12 +16,16 @@ struct MulticamTimeline: View {
     let deleteSwitch: (RationalTime) -> Void
     let selectSwitch: (RationalTime) -> Void
     var onPreviewSwitch: ((RationalTime) -> Void)? = nil
+    var sourceMediaStatus: ((MulticamSource) -> ProjectMediaStatus)?
+    var onProjectMedia: ((ProjectMediaAction, MulticamSource) -> Void)?
     var useAnalysisSidecars = true
     let thumbnailService: MulticamThumbnailService
     var selectedSwitch: RationalTime? = nil
     var scrubEnded: () -> Void = {}
     var zoom: Binding<Double> = .constant(0)
     var largeThumbnails: Binding<Bool> = .constant(false)
+    var showsSourceRuler = false
+    private var sourceRulerHeight: CGFloat { showsSourceRuler ? TimelineSourceRuler.height : 0 }
     var timeEntryRequest = 0
     var groupPadding: [AudioSpan] = []
     var analysis: MulticamAnalysisStore? = nil
@@ -75,14 +79,14 @@ struct MulticamTimeline: View {
         project.angles.map { angle in
             let video = media[angle.id]?.videoStream
             let size = CGSize(width: video?.displayWidth ?? 0, height: video?.displayHeight ?? 0)
-            return TimelineFilmstrip.height(displaySize: size, large: largeThumbnails.wrappedValue)
+            return TimelineFilmstrip.height(displaySize: size, large: largeThumbnails.wrappedValue) + sourceRulerHeight
         }
     }
 
     private var groupAssetHeight: CGFloat { showGroupAssets ? 30 : 0 }
     private var assemblyAssetHeight: CGFloat { assembly?.hasAssets == true ? 24 : 0 }
 
-    private var audioHeight: CGFloat { largeThumbnails.wrappedValue ? 64 : Self.audioHeight }
+    private var audioHeight: CGFloat { (largeThumbnails.wrappedValue ? 64 : Self.audioHeight) + sourceRulerHeight }
     private var audioRowsHeight: CGFloat {
         audioHeight * CGFloat(project.audio == .mix ? project.mixLanes.count : 1)
     }
@@ -102,7 +106,7 @@ struct MulticamTimeline: View {
         let viewportHeight = contentHeight + scrollBarHeight
         let idealHeight = Self.rulerHeight + Self.markerHeight + heights.prefix(4).reduce(0, +)
             + (heights.count <= 4 ? audioRowsHeight + groupAssetHeight : 0) + scrollBarHeight
-            + (assembly == nil ? 0 : 70 + assemblyAssetHeight)
+            + (assembly == nil ? 0 : 70 + sourceRulerHeight + assemblyAssetHeight)
 
         VStack(spacing: 0) {
             TimelineControlBar {
@@ -142,7 +146,7 @@ struct MulticamTimeline: View {
                         if let assembly {
                             HStack(spacing: 0) {
                                 VStack(spacing: 0) {
-                                    laneTitle("Assembly", height: 69)
+                                    laneTitle("Assembly", height: 69 + sourceRulerHeight)
                                     if assembly.hasAssets { laneTitle("Assets", height: 24) }
                                 }
                                 .frame(width: labelWidth + Self.trackDividerWidth)
@@ -273,6 +277,12 @@ struct MulticamTimeline: View {
             laneTitle("Switches", height: Self.markerHeight)
             ForEach(Array(project.angles.enumerated()), id: \.element.id) { index, angle in
                 HStack(spacing: 5) {
+                    let state = sourceMediaStatus?(angle) ?? .online
+                    if state != .online && state != .ignored {
+                        Image(systemName: state.editorIcon)
+                            .foregroundStyle(Color(nsColor: state.editorColor))
+                            .accessibilityLabel(state.editorLabel)
+                    }
                     Text(sourceName(angle))
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -289,6 +299,7 @@ struct MulticamTimeline: View {
                 .padding(.horizontal, 7)
                 .frame(height: heights[index])
                 .overlay(alignment: .bottom) { Divider() }
+                .contextMenu { mediaActions(angle) }
             }
             if project.audio == .mix {
                 ForEach(project.mixLanes, id: \.id) { lane in
@@ -324,17 +335,22 @@ struct MulticamTimeline: View {
                 let left = x(still.interval.from.seconds, scale: scale)
                 let width = max(1, x(still.interval.to.seconds, scale: scale) - left)
                 HStack(spacing: 4) {
-                    if let frame = still.frame, width > 36 {
+                    if still.mediaStatus.hidesMedia {
+                        Image(systemName: still.mediaStatus.editorIcon)
+                            .foregroundStyle(Color(nsColor: still.mediaStatus.editorColor))
+                    } else if let frame = still.frame, width > 36 {
                         StillThumbnail(frame: frame).frame(width: 32, height: 20).clipped()
                     }
                     Text(still.title).font(.caption).lineLimit(1)
                 }
                 .padding(.horizontal, 4)
                 .frame(width: width, height: 24, alignment: .leading)
-                .background(.purple.opacity(0.25), in: RoundedRectangle(cornerRadius: 4))
+                .background(still.mediaStatus.hidesMedia ? Color(nsColor: still.mediaStatus.editorColor).opacity(0.25) : .purple.opacity(0.25),
+                            in: RoundedRectangle(cornerRadius: 4))
                 .clipped()
                 .offset(x: left)
-                .help(still.title)
+                .help(still.mediaURL?.path ?? still.title)
+                .accessibilityLabel(still.mediaStatus == .online ? still.title : "\(still.mediaStatus.editorLabel): \(still.title)")
             }
         }
     }
@@ -393,7 +409,8 @@ struct MulticamTimeline: View {
                             .overlay(alignment: .bottom) { Divider() }
                             .contentShape(Rectangle())
                             .gesture(scrubGesture(scale: scale))
-                            .help("Scrub camera lane")
+                            .contextMenu { mediaActions(project.pictureSource(for: angle.id, at: currentPlayhead) ?? angle) }
+                            .help(angle.file)
                             .accessibilityLabel("\(sourceName(angle)) filmstrip")
                             .accessibilityValue(cameraStatus(angle, active: current?.angle == angle.id))
                     } else {
@@ -429,7 +446,7 @@ struct MulticamTimeline: View {
                         if let lane = routedAudio[MulticamPlan.programAudioLaneID] {
                             routedAudioLane(lane, laneID: nil, color: .teal, pauses: pauses, scale: scale, visible: visible)
                         } else {
-                            audioLane(intervals: visibleIntervals, pauses: pauses, scale: scale, visible: visible)
+                            audioLane(intervals: intervals, visibleIndices: first..<end, pauses: pauses, scale: scale, visible: visible)
                                 .onDisappear { analysis?.waveformDetail.setVisibleTimelineSurfaces([]) }
                         }
                     } else {
@@ -589,6 +606,9 @@ struct MulticamTimeline: View {
                     .contextMenu {
                         Button("Select Switch") { choose(marker.at) }
                             .help("Select camera switch")
+                        if let camera = project.pictureSource(for: marker.angle, at: marker.at) {
+                            mediaActions(camera)
+                        }
                         if !opening {
                             if let onPreviewSwitch {
                                 Button("Preview Join at Switch") { onPreviewSwitch(marker.at) }
@@ -626,7 +646,7 @@ struct MulticamTimeline: View {
         let intervalsByRecording = Dictionary(grouping: laneIntervals, by: \.pictureSourceID)
         let groupExtent = extent
         let visibleRecordings = recordings.compactMap { recording -> VisibleRecording? in
-            let info = media[recording.id]
+            let info = sourceMediaStatus?(recording).hidesMedia == true ? nil : media[recording.id]
             let coverage = info.flatMap { videoCoverage(recording, media: $0, extent: groupExtent) }
             let pixels = coverage.map { pixelRange($0.group, scale: scale) }
             let covered = pixels.flatMap { intersection($0, visible) }
@@ -659,6 +679,16 @@ struct MulticamTimeline: View {
         }
     }
 
+    @ViewBuilder
+    private func mediaActions(_ source: MulticamSource) -> some View {
+        if let onProjectMedia {
+            ForEach([ProjectMediaAction.locate, .replace, .reveal, .show], id: \.rawValue) { action in
+                Button(action.title) { onProjectMedia(action, source) }
+                    .disabled(action == .reveal && sourceMediaStatus?(source).hidesMedia == true)
+            }
+        }
+    }
+
     private struct VisibleRecording: Identifiable {
         let source: MulticamSource
         let media: MediaInfo?
@@ -672,7 +702,9 @@ struct MulticamTimeline: View {
     private func recordingLane(_ recording: VisibleRecording, height: CGFloat,
                                laneIntervals: [MulticamInterval], scale: CGFloat,
                                visible: Range<CGFloat>, spansFiles: Bool) -> some View {
+        let pictureHeight = height - sourceRulerHeight
         let angle = recording.source
+        let mediaState = sourceMediaStatus?(angle) ?? .online
         let mediaInfo = recording.media
         let covered = recording.covered
         let gaps = covered == nil ? [] : mediaInfo.map { thumbnailService.pictureGaps(in: $0) } ?? []
@@ -688,17 +720,32 @@ struct MulticamTimeline: View {
                     let range = layout.tileRange(index, origin: coveragePixels.lowerBound, displayScale: displayScale)
                     let times = MulticamFilmstrip.tileTimeRange(index, count: layout.count, coverage: coverage)
                     if let sourceTime = MulticamFilmstrip.thumbnailTime(in: mediaInfo, from: times.lowerBound, to: times.upperBound) {
-                        let size = CGSize(width: targetWidth * displayScale, height: height * displayScale)
+                        let size = CGSize(width: targetWidth * displayScale, height: pictureHeight * displayScale)
                         MulticamThumbnail(service: thumbnailService, media: mediaInfo, time: sourceTime, size: size,
                                           useAnalysisSidecars: useAnalysisSidecars)
-                            .frame(width: range.upperBound - range.lowerBound, height: height)
+                            .frame(width: range.upperBound - range.lowerBound, height: pictureHeight)
                             .offset(x: range.lowerBound)
                     }
                 }
             }
 
             visibleCanvas(visible) { context, size in
-                let height = size.height
+                let height = size.height - sourceRulerHeight
+                if mediaState.hidesMedia {
+                    if spansFiles {
+                        for interval in recording.selected {
+                            let pixels = pixelRange(interval.group.from.seconds..<interval.group.to.seconds, scale: scale)
+                            if let area = intersection(pixels, visible) { mediaPlaceholder(context, range: area, height: height, state: mediaState) }
+                        }
+                    } else {
+                        mediaPlaceholder(context, range: visible, height: height, state: mediaState)
+                    }
+                    return
+                }
+                if mediaState == .changed || mediaState == .needsReview {
+                    line(context, range: covered ?? visible, y: 2, color: Color(nsColor: mediaState.editorColor))
+                    label(context, mediaState.editorLabel, range: covered ?? visible, y: 23, background: .black.opacity(0.8))
+                }
                 if !spansFiles {
                     if let covered {
                         hatch(context, range: visible.lowerBound..<covered.lowerBound, height: height)
@@ -744,6 +791,9 @@ struct MulticamTimeline: View {
                     }
                 }
                 if let covered {
+                    if let coverage = recording.sourceCoverage, let pixels = recording.pixels {
+                        drawSourceRuler(context, source: coverage.lowerBound...coverage.upperBound, pixels: pixels, visible: covered, top: height, scale: scale)
+                    }
                     let cuts = boundaryTicks(scenes, offset: angle.offset.seconds, scale: scale,
                                              visible: covered, top: 0, bottom: height - 2)
                     context.stroke(cuts, with: .color(.yellow), style: StrokeStyle(lineWidth: 1, dash: [3, 2]))
@@ -751,6 +801,7 @@ struct MulticamTimeline: View {
             }
             .accessibilityHidden(true)
         }
+        .help([angle.file, mediaState == .online ? nil : mediaState.editorLabel].compactMap { $0 }.joined(separator: "\n"))
     }
 
     private func routedTimelineLanes() -> [String: MulticamPlannedAudioLane] {
@@ -771,6 +822,7 @@ struct MulticamTimeline: View {
                                  pauses: [AudioSpan], scale: CGFloat, visible: Range<CGFloat>) -> some View {
         Color.clear.overlay(alignment: .leading) {
             MulticamAudioCanvas(store: analysis?.waveformDetail, laneID: laneID, visible: visible) { context, size in
+                let height = size.height - sourceRulerHeight
                 var visibleWaveforms = Set<WaveformSurface>()
                 defer { analysis?.waveformDetail.setVisibleTimelineSurfaces(visibleWaveforms, laneID: laneID) }
                 guard let lane else { return }
@@ -781,12 +833,18 @@ struct MulticamTimeline: View {
                     let bounds = pixelRange((origin + span.output.from.seconds)..<(origin + span.output.to.seconds), scale: scale)
                     guard bounds.lowerBound < visible.upperBound else { break }
                     guard let area = intersection(bounds, visible) else { continue }
-                    guard let stream = span.stream, let info = media[span.source],
-                          info.audio.contains(where: { $0.stream.index == stream }) else {
-                        unavailable(context, range: area, height: size.height, text: "Track index unavailable")
+                    if let source = project.sources.first(where: { $0.id == span.source }),
+                       let state = sourceMediaStatus?(source), state.hidesMedia {
+                        mediaPlaceholder(context, range: area, height: height, state: state)
                         continue
                     }
-                    shadeAudio(context, area: area, height: size.height, color: color, pauses: pauses, scale: scale)
+                    guard let stream = span.stream, let info = media[span.source],
+                          info.audio.contains(where: { $0.stream.index == stream }) else {
+                        unavailable(context, range: area, height: height, text: "Track index unavailable")
+                        continue
+                    }
+                    drawSourceRuler(context, source: span.input.from.seconds...span.input.to.seconds, pixels: bounds, visible: area, top: height, scale: scale)
+                    shadeAudio(context, area: area, height: height, color: color, pauses: pauses, scale: scale)
                     let track = try? MulticamAnalysisAudioSpan(
                         laneID: laneID, selection: .init(source: span.source, stream: stream),
                         group: .init(from: groupOrigin.adding(span.output.from), to: groupOrigin.adding(span.output.to)),
@@ -795,75 +853,105 @@ struct MulticamTimeline: View {
                         waveform: analysis?.waveform(sourceID: span.source, stream: stream)
                     )
                     if let track {
-                        drawWaveform(track, context: context, visible: area, scale: scale, height: size.height,
+                        drawWaveform(track, context: context, visible: area, scale: scale, height: height,
                                      color: color, visibleWaveforms: &visibleWaveforms)
                     }
                     label(context, "\(name(for: span.source)) · Stream \(stream)", range: area,
-                          y: size.height / 2, background: .black.opacity(0.8))
+                          y: height / 2, background: .black.opacity(0.8))
                 }
                 let firstGap = lane.gaps.lowerBound { x(origin + $0.to.seconds, scale: scale) > visible.lowerBound }
                 for gap in lane.gaps.dropFirst(firstGap) {
                     let bounds = pixelRange((origin + gap.from.seconds)..<(origin + gap.to.seconds), scale: scale)
                     guard bounds.lowerBound < visible.upperBound else { break }
                     guard let area = intersection(bounds, visible) else { continue }
-                    unavailable(context, range: area, height: size.height, text: "Missing audio")
+                    unavailable(context, range: area, height: height, text: "Missing audio")
                 }
             }
         }
         .onDisappear { analysis?.waveformDetail.setVisibleTimelineSurfaces([], laneID: laneID) }
     }
 
-    private func audioLane(intervals: ArraySlice<MulticamInterval>, pauses: [AudioSpan],
+    static func audioSpans(in intervals: [MulticamInterval], visibleIndices: Range<Int>)
+        -> [(range: Range<Double>, audio: MulticamAudioSelection?)] {
+        guard !visibleIndices.isEmpty else { return [] }
+        var spans: [(range: Range<Double>, audio: MulticamAudioSelection?)] = []
+        // At a camera switch on the viewport boundary, the same recording can
+        // continue offscreen. Include its neighbor before labeling a trim edge.
+        let nearby = max(0, visibleIndices.lowerBound - 1)..<min(intervals.count, visibleIndices.upperBound + 1)
+        for interval in intervals[nearby] {
+            let range = interval.group.from.seconds..<interval.group.to.seconds
+            if let last = spans.last, last.range.upperBound == range.lowerBound, last.audio == interval.audio {
+                spans[spans.count - 1].range = last.range.lowerBound..<range.upperBound
+            } else {
+                spans.append((range, interval.audio))
+            }
+        }
+        return spans
+    }
+
+    private func audioLane(intervals: [MulticamInterval], visibleIndices: Range<Int>, pauses: [AudioSpan],
                            scale: CGFloat, visible: Range<CGFloat>) -> some View {
         let tracks: [MulticamAnalysisAudioSpan]
-        if let first = intervals.first, let last = intervals.last, let analysis {
+        let visibleIntervals = intervals[visibleIndices]
+        if let first = visibleIntervals.first, let last = visibleIntervals.last, let analysis {
             tracks = analysis.soundtrack(in: .init(from: first.group.from, to: last.group.to))
         } else {
             tracks = []
         }
+        let spans = Self.audioSpans(in: intervals, visibleIndices: visibleIndices)
         return ZStack(alignment: .topLeading) {
             Color.clear
             MulticamAudioCanvas(store: analysis?.waveformDetail, visible: visible) { context, size in
+                let height = size.height - sourceRulerHeight
                 var visibleWaveforms = Set<WaveformSurface>()
                 defer { analysis?.waveformDetail.setVisibleTimelineSurfaces(visibleWaveforms) }
-                var spans: [(range: Range<Double>, audio: MulticamAudioSelection?)] = []
-                for interval in intervals {
-                    let range = interval.group.from.seconds..<interval.group.to.seconds
-                    if let last = spans.last, last.range.upperBound == range.lowerBound, last.audio == interval.audio {
-                        spans[spans.count - 1].range = last.range.lowerBound..<range.upperBound
-                    } else {
-                        spans.append((range, interval.audio))
-                    }
-                }
                 for span in spans {
                     guard let selected = intersection(pixelRange(span.range, scale: scale), visible) else { continue }
                     guard let audio = span.audio else {
                         let videoOnly = project.audio == .none
-                        if !videoOnly { hatch(context, range: selected, height: size.height, warning: true) }
+                        if !videoOnly { hatch(context, range: selected, height: height, warning: true) }
                         label(context, videoOnly ? "Video only" : "Missing audio",
-                              range: selected, y: size.height / 2, background: .black.opacity(0.8))
+                              range: selected, y: height / 2, background: .black.opacity(0.8))
                         continue
                     }
-                    let audioRange = audioCoverage(audio).flatMap { intersection(pixelRange($0, scale: scale), selected) }
-                    if let audioRange {
-                        shadeAudio(context, area: audioRange, height: size.height, color: .teal, pauses: pauses, scale: scale)
+                    if let source = project.sources.first(where: { $0.id == audio.source }),
+                       let state = sourceMediaStatus?(source), state.hidesMedia {
+                        mediaPlaceholder(context, range: selected, height: height, state: state)
+                        continue
+                    }
+                    let coverage = audioCoverage(audio).map { $0.clamped(to: span.range) }
+                    if let coverage, !coverage.isEmpty, let audioRange = intersection(pixelRange(coverage, scale: scale), selected) {
+                        if showsSourceRuler, let source = project.sources.first(where: { $0.id == audio.source }) {
+                            let offset = source.offset.seconds
+                            drawSourceRuler(context, source: (coverage.lowerBound - offset)...(coverage.upperBound - offset), pixels: pixelRange(coverage, scale: scale),
+                                            visible: audioRange, top: height, scale: scale)
+                        }
+                        shadeAudio(context, area: audioRange, height: height, color: .teal, pauses: pauses, scale: scale)
                         let firstTrack = tracks.lowerBound { x($0.group.to.seconds, scale: scale) > audioRange.lowerBound }
                         for track in tracks.dropFirst(firstTrack) {
                             guard x(track.group.from.seconds, scale: scale) < audioRange.upperBound else { break }
-                            drawWaveform(track, context: context, visible: audioRange, scale: scale, height: size.height,
+                            drawWaveform(track, context: context, visible: audioRange, scale: scale, height: height,
                                          color: .teal, visibleWaveforms: &visibleWaveforms)
                         }
-                        unavailable(context, range: selected.lowerBound..<audioRange.lowerBound, height: size.height, text: "Missing audio")
-                        unavailable(context, range: audioRange.upperBound..<selected.upperBound, height: size.height, text: "Missing audio")
+                        unavailable(context, range: selected.lowerBound..<audioRange.lowerBound, height: height, text: "Missing audio")
+                        unavailable(context, range: audioRange.upperBound..<selected.upperBound, height: height, text: "Missing audio")
                         label(context, "\(name(for: audio.source)) · Stream \(audio.stream)", range: audioRange,
-                              y: size.height / 2, background: .black.opacity(0.8))
+                              y: height / 2, background: .black.opacity(0.8))
                     } else {
-                        hatch(context, range: selected, height: size.height, warning: true)
+                        hatch(context, range: selected, height: height, warning: true)
                         label(context, "\(name(for: audio.source)) · Unavailable", range: selected,
-                              y: size.height / 2, background: .black.opacity(0.8))
+                              y: height / 2, background: .black.opacity(0.8))
                     }
                 }
             }
+        }
+    }
+
+    private func drawSourceRuler(_ context: GraphicsContext, source: ClosedRange<Double>, pixels: Range<CGFloat>,
+                                 visible: Range<CGFloat>, top: CGFloat, scale: CGFloat) {
+        guard showsSourceRuler else { return }
+        context.withCGContext { cg in
+            TimelineSourceRuler(source: source, pixels: pixels, scale: scale).draw(in: cg, top: top, visible: visible)
         }
     }
 
@@ -1040,8 +1128,12 @@ struct MulticamTimeline: View {
 
     private func cameraStatus(_ angle: MulticamSource, active: Bool) -> String {
         let time = currentPlayhead
+        if let recording = project.pictureSource(for: angle.id, at: time, exclusiveEnd: time == project.range.to),
+           let state = sourceMediaStatus?(recording), state != .online {
+            return "\(state.editorLabel): \(recording.displayName)"
+        }
         guard let recording = project.pictureSource(for: angle.id, at: time, exclusiveEnd: time == project.range.to),
-              let info = media[recording.id], let local = try? time.subtracting(recording.offset),
+              let info = sourceMediaStatus?(recording).hidesMedia == true ? nil : media[recording.id], let local = try? time.subtracting(recording.offset),
               MulticamPicturePosition.at(local, source: angle.id, media: info, spanIndex: -1, exclusiveEnd: exclusiveEnd) != nil else {
             return active ? "Selected, no picture" : "No picture"
         }
@@ -1052,6 +1144,10 @@ struct MulticamTimeline: View {
         guard let interval else { return "Outside the group" }
         guard let selection = interval.audio else { return project.audio == .none ? "Video only" : "Missing audio" }
         let label = "\(name(for: selection.source)), stream \(selection.stream)"
+        if let source = project.sources.first(where: { $0.id == selection.source }),
+           let state = sourceMediaStatus?(source), state != .online {
+            return "\(state.editorLabel): \(label)"
+        }
         let covered = audioCoverage(selection).map {
             exclusiveEnd ? $0.lowerBound < playhead.seconds && playhead.seconds <= $0.upperBound : $0.contains(playhead.seconds)
         } ?? false
@@ -1068,18 +1164,28 @@ struct MulticamTimeline: View {
         label(context, text, range: range, y: height / 2, background: .black.opacity(0.8))
     }
 
-    private func hatch(_ context: GraphicsContext, range: Range<CGFloat>, height: CGFloat, warning: Bool = false) {
+    private func mediaPlaceholder(_ context: GraphicsContext, range: Range<CGFloat>, height: CGFloat, state: ProjectMediaStatus) {
+        let color = Color(nsColor: state.editorColor)
+        shade(context, range: range, height: height, color: .black.opacity(0.85))
+        hatch(context, range: range, height: height, color: color)
+        if state != .ignored {
+            label(context, state.editorLabel, range: range, y: height / 2, background: .black.opacity(0.8))
+        }
+    }
+
+    private func hatch(_ context: GraphicsContext, range: Range<CGFloat>, height: CGFloat,
+                       warning: Bool = false, color: Color? = nil) {
         guard !range.isEmpty else { return }
         let bounds = CGRect(x: range.lowerBound, y: 0, width: range.upperBound - range.lowerBound, height: height)
         var clipped = context
         clipped.clip(to: Path(bounds))
-        shade(clipped, range: range, height: height, color: warning ? .orange.opacity(0.18) : .secondary.opacity(0.1))
+        shade(clipped, range: range, height: height, color: color?.opacity(0.16) ?? (warning ? .orange.opacity(0.18) : .secondary.opacity(0.1)))
         var marks = Path()
         for start in stride(from: (range.lowerBound / 7).rounded(.down) * 7 - height, to: range.upperBound, by: 7) {
             marks.move(to: CGPoint(x: start, y: height))
             marks.addLine(to: CGPoint(x: start + height, y: 0))
         }
-        clipped.stroke(marks, with: .color(warning ? .orange.opacity(0.62) : .secondary.opacity(0.38)), lineWidth: 1)
+        clipped.stroke(marks, with: .color(color?.opacity(0.56) ?? (warning ? .orange.opacity(0.62) : .secondary.opacity(0.38))), lineWidth: 1)
     }
 
     private func line(_ context: GraphicsContext, range: Range<CGFloat>, y: CGFloat, color: Color) {

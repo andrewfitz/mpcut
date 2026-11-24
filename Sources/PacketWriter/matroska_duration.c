@@ -139,3 +139,94 @@ int mpcut_set_matroska_durations(const char *path, const int64_t *ends, size_t c
     if (close(fd) != 0) result = -1;
     return result;
 }
+
+static int match_block(Element block, Element duration, uint64_t video, int64_t cluster_tick,
+                       uint64_t default_duration, const MPCutMatroskaBlock *expected,
+                       size_t count, uint8_t *seen) {
+    if (!block.size || !block.data[0]) return -1;
+    unsigned length = 1;
+    while (!(block.data[0] & (0x80 >> (length - 1)))) length++;
+    if (block.size < length + 3) return -1;
+    uint64_t track = block.data[0] & (0xff >> length);
+    for (unsigned i = 1; i < length; i++) track = (track << 8) | block.data[i];
+    if (track != video) return 0;
+    if (block.data[length + 2] & 0x06) return -1; // Video lacing is not produced by this mux.
+    int relative = AV_RB16(block.data + length);
+    if (relative >= 32768) relative -= 65536;
+    if (cluster_tick > INT64_MAX - 32767) return -1;
+    int64_t pts = cluster_tick + relative;
+    size_t first = 0, last = count;
+    while (first < last) {
+        size_t middle = first + (last - first) / 2;
+        if (expected[middle].pts < pts) first = middle + 1;
+        else last = middle;
+    }
+    if (first == count || expected[first].pts != pts || seen[first]) return -1;
+    if (expected[first].duration > 0) {
+        uint64_t required = (uint64_t)expected[first].duration;
+        if (duration.data ? integer(duration) != required :
+            default_duration % 1000000 || default_duration / 1000000 != required)
+            return -1;
+    }
+    seen[first] = 1;
+    return 1;
+}
+
+static int verify_video(Element segment, const MPCutMatroskaBlock *expected, size_t count,
+                        uint8_t *seen) {
+    Element info = child(segment, 0x1549a966);
+    if (integer(child(info, 0x2ad7b1)) != 1000000) return -1;
+    Element tracks = child(segment, 0x1654ae6b), entry;
+    uint64_t video = 0, default_duration = 0;
+    while (next(&tracks, &entry)) {
+        if (entry.id != 0xae || integer(child(entry, 0x83)) != 1) continue;
+        if (video) return -1;
+        video = integer(child(entry, 0xd7));
+        default_duration = integer(child(entry, 0x23e383));
+    }
+    if (!video) return -1;
+
+    size_t matched = 0;
+    Element cluster;
+    while (next(&segment, &cluster)) {
+        if (cluster.id != 0x1f43b675) continue;
+        Element timestamp = child(cluster, 0xe7);
+        uint64_t tick = integer(timestamp);
+        if (!timestamp.size || timestamp.size > 8 || tick > INT64_MAX) return -1;
+        Element block;
+        while (next(&cluster, &block)) {
+            Element duration = {0};
+            if (block.id == 0xa0) {
+                duration = child(block, 0x9b);
+                block = child(block, 0xa1);
+            } else if (block.id != 0xa3) {
+                continue;
+            }
+            int result = match_block(block, duration, video, (int64_t)tick,
+                                     default_duration, expected, count, seen);
+            if (result < 0) return -1;
+            matched += result;
+        }
+    }
+    return matched == count ? 0 : -1;
+}
+
+int mpcut_verify_matroska_video(const char *path, const MPCutMatroskaBlock *expected, size_t count) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    int result = -1;
+    if (count && !fstat(fd, &st) && st.st_size > 0 && (uint64_t)st.st_size <= SIZE_MAX) {
+        size_t size = (size_t)st.st_size;
+        uint8_t *seen = calloc(count, sizeof(*seen));
+        uint8_t *data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (data != MAP_FAILED) {
+            Element segment = child((Element){0, data, size}, 0x18538067);
+            if (segment.data && seen) result = verify_video(segment, expected, count, seen);
+            if (munmap(data, size) != 0) result = -1;
+        }
+        free(seen);
+    }
+    if (close(fd) != 0) result = -1;
+    return result;
+}

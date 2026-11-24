@@ -6,6 +6,8 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class ProjectSession: ObservableObject {
+    var sidecarWork: ProjectSidecarWork { isMulticam ? multicam.sidecarWork : editor.sidecarWork }
+
     static let windowID = "project"
     let id: UUID
     let editor: EditorModel
@@ -13,7 +15,24 @@ final class ProjectSession: ObservableObject {
     let presentation = EditorPresentation()
     let transcriptBasket = TranscriptPaneBasket()
     let transcriptPaneMemory = TranscriptPaneMemory()
+    private var participantGeometryRevision: ParticipantSpeakerIndexKey?
+    private var participantGeometryIndexes: [String: ParticipantMonitorGeometry] = [:]
+
+    func participantGeometry(for sourceID: String) -> ParticipantMonitorGeometry? {
+        let revision = ParticipantSpeakerIndexKey(session: self)
+        if revision != participantGeometryRevision {
+            participantGeometryIndexes.removeAll()
+            participantGeometryRevision = revision
+        }
+        if let index = participantGeometryIndexes[sourceID] { return index }
+        guard let source = participantProject.sources.first(where: { $0.sourceID == sourceID }) else { return nil }
+        let index = ParticipantMonitorGeometry(source)
+        participantGeometryIndexes[sourceID] = index
+        return index
+    }
+
     lazy var transcript = LiveTranscriptController(session: self)
+    var mcpMediaPreview: MCPProjectMediaPreview?
     private(set) var mcpModeGeneration = UUID()
     @Published var isMulticam = false {
         didSet { if oldValue != isMulticam { mcpModeGeneration = UUID() } }
@@ -778,6 +797,7 @@ private struct ProjectWorkspace: View {
             } else {
                 EditorView(editor: editor, multicam: multicam, presentation: session.presentation, addMulticam: { sessions.chooseMulticamSources(in: session) })
                     .frame(minWidth: 730, minHeight: max(510, 385 + editor.timelineThumbnailHeight +
+                        (editor.preferences.sourceTimeTicks ? TimelineSourceRuler.height : 0) +
                         (editor.isAudioOnly || editor.audioTracks.isEmpty ? 0 : (editor.largeThumbnails ? 64 : 32))))
             }
         }
@@ -935,6 +955,7 @@ final class EditorApplication: NSObject, NSApplicationDelegate {
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
+        MutedLaunch.activate()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

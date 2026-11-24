@@ -292,8 +292,8 @@ final class MCPFileJobs {
            }).first {
             result["progress_event"] = event
             if let fraction = event["fraction"] as? Double, fraction.isFinite {
-                let percent = Int(100 * min(1, max(0, fraction)))
-                result["progress_percent"] = min(job.ended == nil ? 99 : 100, percent)
+                let percent = event["percent"] as? Int ?? Int(100 * min(1, max(0, fraction)))
+                result["progress_percent"] = min(job.state == "succeeded" ? 100 : 99, max(0, percent))
             }
         } else if let percent = lines.lazy.compactMap({ line -> Int? in
             guard line.hasPrefix("Export "), line.hasSuffix("%") else { return nil }
@@ -302,6 +302,10 @@ final class MCPFileJobs {
             result["progress_percent"] = percent
         }
         if job.ended != nil {
+            if job.tool == "participants_file_scan", job.state == "succeeded" {
+                // Advisory diagnostics may be dropped. A zero exit confirms the scan report was delivered.
+                result["progress_percent"] = 100
+            }
             result["exit_code"] = Int(job.process.terminationStatus)
             let size = try resultBytes(job)
             result["result_bytes"] = size

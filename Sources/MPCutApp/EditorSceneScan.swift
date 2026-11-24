@@ -125,7 +125,9 @@ final class EditorSceneScan {
         let endWork = receipt?.cleanup.begin()
         let groups = Dictionary(grouping: requests, by: SceneRecording.init)
         var seen = Set<SceneRecording>()
-        let recordings = requests.filter { seen.insert(SceneRecording($0)).inserted }
+        let recordings = requests.filter { seen.insert(SceneRecording($0)).inserted }.map {
+            EditorSceneRequest(id: $0.id, media: $0.media.pinningSidecarWrites(), scope: $0.scope)
+        }
         let duration = recordings.reduce(0) { $0 + $1.duration }
         let cachedDuration = recordings.reduce(0.0) { $0 + $1.duration * (coverage[$1.id]?.fraction ?? 0) }
         if duration > 0 { progress = min(0.999, cachedDuration / duration) }

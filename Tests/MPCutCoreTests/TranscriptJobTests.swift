@@ -279,6 +279,31 @@ final class TranscriptJobTests: XCTestCase {
         }
     }
 
+    func testRetryByIDUsesReboundSidecarProject() throws {
+        try inTemporaryFolder { folder in
+            let source = folder.appendingPathComponent("mic.wav")
+            try wave(click: 20_000).write(to: source)
+            let project = folder.appendingPathComponent("edit.cut")
+            let moved = folder.appendingPathComponent("moved/edit.cut")
+            try FileManager.default.createDirectory(at: moved.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let store = TranscriptJobStore(directory: folder.appendingPathComponent("jobs"))
+            let id = UUID()
+            try SidecarLocations.$storageDirectory.withValue(folder.appendingPathComponent("preferences")) {
+                SidecarLocations.mode = .project
+                try SidecarLocations.$projectURL.withValue(project) {
+                    XCTAssertThrowsError(try store.prepare(media: source, documentID: project.path,
+                                                           operationID: id, cancelled: { true }))
+                }
+                try store.rebindDocument(from: project.path, to: moved.path)
+                let resumed = try store.retry(id)
+                XCTAssertEqual(resumed.sidecarProjectURL?.path, moved.path)
+                let destination = try XCTUnwrap(SidecarLocations(source: source, project: moved).destination)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: source.appendingPathExtension("cutdb").path))
+            }
+        }
+    }
+
     func testInterruptedDiscoveryCanResumeAfterRebindingDocument() throws {
         try inTemporaryFolder { folder in
             let source = folder.appendingPathComponent("capture.wav")
@@ -577,6 +602,349 @@ final class TranscriptJobTests: XCTestCase {
         }
     }
 
+    /// Copies the provider that recognizes by rule. `outcomes` holds what each launch reports, in order.
+    private func lifecycleProvider(in folder: URL, outcomes: [String]) throws -> URL {
+        let provider = folder.appendingPathComponent("provider.py")
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("MPCutAppTests/Fixtures/TranscriptLifecycleProvider.py")
+        try FileManager.default.copyItem(at: fixture, to: provider)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: provider.path)
+        for (index, outcome) in outcomes.enumerated() {
+            try Data(outcome.utf8).write(to: folder.appendingPathComponent("release-\(index + 1)"))
+        }
+        return provider
+    }
+
+    private func exists(_ file: URL?) -> Bool {
+        file.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+    }
+
+    func testAttachedJobGivesUpItsSessionOutputAndStillReconciles() throws {
+        try inTemporaryFolder { folder in
+            let first = folder.appendingPathComponent("wide.wav")
+            let second = folder.appendingPathComponent("close.wav")
+            try wave(click: 16_000).write(to: first)
+            try wave(click: 20_000).write(to: second)
+            let provider = try lifecycleProvider(in: folder, outcomes: ["completed", "completed", "completed"])
+            var group = multicam(wide: first, close: second)
+            var editor = TranscriptJobStore(directory: folder.appendingPathComponent("jobs"))
+            editor.stagesAudioForStandaloneProvider = false
+            let prepared = try editor.prepare(project: .multicam(group), documentID: "edit",
+                                              options: .init(engine: "lifecycle-fixture"))
+            let finished = try editor.run(prepared.id, helper: provider)
+            XCTAssertEqual(finished.state, .completed)
+            let output = finished.sessions[0].output
+            let original = try XCTUnwrap(editor.verifiedDocuments(finished.id, project: .multicam(group)).first)
+            XCTAssertFalse(original.document.words.isEmpty)
+            XCTAssertTrue(exists(output))
+
+            let attached = try editor.markAttached(finished.id, expectedPreparationID: finished.preparationID)
+            XCTAssertTrue(attached.attached)
+            XCTAssertFalse(exists(output))
+            // The manifest and each track's result and levels are what a retry reads.
+            XCTAssertTrue(exists(attached.sessions[0].manifest))
+            for track in attached.sessions[0].tracks {
+                XCTAssertTrue(exists(track.result), track.name)
+                XCTAssertTrue(exists(track.activity), track.name)
+            }
+            let status = try editor.status(finished.id)
+            XCTAssertEqual(status.state, .completed)
+            XCTAssertTrue(status.attached)
+            XCTAssertEqual(status.updatedAt, attached.updatedAt)
+            XCTAssertEqual(try editor.status(finished.id), status)
+            XCTAssertEqual(try editor.list(documentID: "edit"), [status])
+            XCTAssertNoThrow(try editor.markAttached(finished.id, expectedPreparationID: finished.preparationID))
+
+            // A second import says what happened and leaves the job as it was.
+            XCTAssertThrowsError(try editor.verifiedDocuments(finished.id, project: .multicam(group))) {
+                XCTAssertEqual(($0 as? CutError)?.code, "transcript_output_removed")
+                XCTAssertTrue(($0 as? CutError)?.message.contains("Retry") == true)
+            }
+            let refused = try editor.status(finished.id)
+            XCTAssertEqual(refused.state, .completed)
+            XCTAssertTrue(refused.attached)
+            // The retry it asks for builds the same result from the track results, and decodes no audio.
+            let again = try editor.retry(finished.id, project: .multicam(group))
+            XCTAssertEqual(again.state, .prepared)
+            XCTAssertFalse(again.attached)
+            XCTAssertEqual(again.sessions[0].tracks.map { exists($0.audio) }, [false, false])
+            let rebuilt = try editor.run(again.id, helper: provider)
+            XCTAssertEqual(rebuilt.state, .completed)
+            let replay = try XCTUnwrap(editor.verifiedDocuments(rebuilt.id, project: .multicam(group)).first)
+            XCTAssertEqual(replay.document.words, original.document.words)
+            XCTAssertEqual(replay.document.fingerprint, original.document.fingerprint)
+            // A job acknowledged by a version that kept the output gives it up to the next prune.
+            try editor.update(rebuilt.id) { $0.attached = true }
+            XCTAssertTrue(exists(rebuilt.sessions[0].output))
+            XCTAssertEqual(try editor.prune(olderThan: 30 * 86_400), [])
+            XCTAssertFalse(exists(rebuilt.sessions[0].output))
+            XCTAssertEqual(try editor.status(rebuilt.id).state, .completed)
+
+            // Reconcile after a camera moves: placement changes and the recognitions still answer.
+            group.angles[1].offset = .init(numerator: 1, denominator: 2)
+            let retried = try editor.retry(rebuilt.id, project: .multicam(group))
+            XCTAssertEqual(retried.state, .prepared)
+            XCTAssertEqual(retried.sessions[0].tracks.map { exists($0.audio) }, [false, false])
+            let reconciled = try editor.run(retried.id, helper: provider)
+            XCTAssertEqual(reconciled.state, .completed)
+            XCTAssertEqual(reconciled.sessions[0].tracks.map(\.state), [.recognized, .recognized])
+            let moved = try XCTUnwrap(editor.verifiedDocuments(reconciled.id, project: .multicam(group)).first)
+            XCTAssertEqual(moved.document.words.map(\.text), original.document.words.map(\.text))
+            XCTAssertNotEqual(moved.document.fingerprint, original.document.fingerprint)
+            XCTAssertTrue(exists(reconciled.sessions[0].output))
+        }
+    }
+
+    func testAcknowledgedSessionLeavesItsSiblingToTheProviderStillToRun() throws {
+        try inTemporaryFolder { folder in
+            let files = [folder.appendingPathComponent("first.wav"), folder.appendingPathComponent("second.wav")]
+            for file in files { try wave(click: 16_000).write(to: file) }
+            let project = CutProject.sequence(files.map {
+                CutSequenceClip(id: $0.lastPathComponent, file: $0.path, from: .zero, to: .init(numerator: 2))
+            })
+            // A provider run on its own writes each session output, with or without a result for each track.
+            for trackResults in [false, true] {
+                let store = TranscriptJobStore(directory: folder.appendingPathComponent("jobs-\(trackResults)"))
+                let prepared = try store.prepare(project: project, documentID: "edit")
+                let (done, waiting) = (prepared.sessions[0], prepared.sessions[1])
+                func provide(_ session: TranscriptJobSession) throws {
+                    try writeResult(session: session, jobID: prepared.id)
+                    if trackResults { try writeTrackResults(session: session) }
+                }
+                try provide(done)
+                XCTAssertEqual(try store.verifiedDocuments(prepared.id, project: project).map(\.url), [done.output])
+                XCTAssertEqual(try store.status(prepared.id).state, .partial)
+                // The manifest still to run names this recording.
+                XCTAssertTrue(exists(waiting.tracks[0].audio))
+
+                // Without track results the output is the job's only copy of the recognition.
+                _ = try store.markAttached(prepared.id, expectedPreparationID: prepared.preparationID)
+                XCTAssertEqual(exists(done.output), !trackResults)
+                try provide(waiting)
+                XCTAssertEqual(try store.prune(olderThan: 30 * 86_400), [])
+                XCTAssertEqual(exists(done.output), !trackResults)
+                XCTAssertTrue(exists(waiting.output))
+                XCTAssertEqual(try store.verifiedDocuments(prepared.id, project: project).map(\.url),
+                               trackResults ? [waiting.output] : [done.output, waiting.output])
+                let completed = try store.status(prepared.id)
+                XCTAssertEqual(completed.state, .completed)
+                XCTAssertEqual(completed.sessions.flatMap(\.tracks).map { exists($0.audio) }, [false, false])
+
+                _ = try store.markAttached(prepared.id, expectedPreparationID: prepared.preparationID)
+                XCTAssertEqual(try store.prune(olderThan: 30 * 86_400), [])
+                XCTAssertEqual([done, waiting].map { exists($0.output) }, [!trackResults, !trackResults])
+                if trackResults {
+                    XCTAssertThrowsError(try store.verifiedDocuments(prepared.id, project: project)) {
+                        XCTAssertEqual(($0 as? CutError)?.code, "transcript_output_removed")
+                    }
+                } else {
+                    // A second import reads the same outputs and leaves the job as it was.
+                    XCTAssertEqual(try store.verifiedDocuments(prepared.id, project: project).map(\.url),
+                                   [done.output, waiting.output])
+                    XCTAssertTrue(try store.status(prepared.id).attached)
+                }
+                XCTAssertEqual(try store.status(prepared.id).state, .completed)
+            }
+        }
+    }
+
+    func testAttachedOutputStaysUntilTrackResultsRepeatIt() throws {
+        try inTemporaryFolder { folder in
+            let source = folder.appendingPathComponent("capture.wav")
+            try wave(click: 20_000).write(to: source)
+            let store = TranscriptJobStore(directory: folder.appendingPathComponent("jobs"))
+            let prepared = try store.prepare(media: source, documentID: "capture")
+            let session = try XCTUnwrap(prepared.sessions.first)
+            let result = try XCTUnwrap(session.tracks.first?.result)
+            try writeResult(session: session, jobID: prepared.id)
+            XCTAssertEqual(try store.verifiedOutputs(prepared.id, media: source), [session.output])
+            XCTAssertEqual(try store.status(prepared.id).state, .completed)
+
+            // Only the session output holds the recognition. Neither an acknowledgement nor a
+            // prune of a job acknowledged earlier removes it, and it can be imported again.
+            try store.update(prepared.id) { $0.attached = true }
+            XCTAssertEqual(try store.prune(olderThan: 30 * 86_400), [])
+            XCTAssertTrue(exists(session.output))
+            _ = try store.markAttached(prepared.id, expectedPreparationID: prepared.preparationID)
+            XCTAssertTrue(exists(session.output))
+            XCTAssertEqual(try store.verifiedOutputs(prepared.id, media: source), [session.output])
+
+            // With a result for the recognized track, the output is a copy, and prune removes it.
+            try writeTrackResults(session: session)
+            XCTAssertEqual(try store.prune(olderThan: 30 * 86_400), [])
+            XCTAssertFalse(exists(session.output))
+            XCTAssertThrowsError(try store.verifiedOutputs(prepared.id, media: source)) {
+                XCTAssertEqual(($0 as? CutError)?.code, "transcript_output_removed")
+            }
+            XCTAssertEqual(try store.status(prepared.id).state, .completed)
+
+            // An output written since the record is still to be imported, so prune leaves it.
+            // The acknowledgement that follows its import removes it.
+            try writeResult(session: session, jobID: prepared.id)
+            XCTAssertEqual(try store.prune(olderThan: 30 * 86_400), [])
+            XCTAssertTrue(exists(session.output))
+            XCTAssertEqual(try store.verifiedOutputs(prepared.id, media: source), [session.output])
+            _ = try store.markAttached(prepared.id, expectedPreparationID: prepared.preparationID)
+            XCTAssertFalse(exists(session.output))
+
+            // Losing the track result makes a new output the only copy again.
+            try FileManager.default.removeItem(at: result)
+            try writeResult(session: session, jobID: prepared.id)
+            _ = try store.markAttached(prepared.id, expectedPreparationID: prepared.preparationID)
+            XCTAssertEqual(try store.prune(olderThan: 30 * 86_400), [])
+            XCTAssertTrue(exists(session.output))
+            XCTAssertEqual(try store.verifiedOutputs(prepared.id, media: source), [session.output])
+        }
+    }
+
+    func testPartialRunKeepsOnlyTheAudioItsRetryReads() throws {
+        try inTemporaryFolder { folder in
+            let first = folder.appendingPathComponent("wide.wav")
+            let second = folder.appendingPathComponent("close.wav")
+            try wave(click: 16_000).write(to: first)
+            try wave(click: 20_000).write(to: second)
+            let provider = try lifecycleProvider(in: folder, outcomes: ["partial", "completed"])
+            let group = multicam(wide: first, close: second)
+            func staged(_ record: TranscriptJobRecord) -> [Bool] {
+                record.sessions[0].tracks.map { exists($0.audio) }
+            }
+            var editor = TranscriptJobStore(directory: folder.appendingPathComponent("jobs"))
+            editor.stagesAudioForStandaloneProvider = false
+            let prepared = try editor.prepare(project: .multicam(group), documentID: "edit",
+                                              options: .init(engine: "lifecycle-fixture"))
+            XCTAssertEqual(staged(prepared), [true, true])
+            let partial = try editor.run(prepared.id, helper: provider)
+            XCTAssertEqual(partial.state, .partial, partial.message ?? "")
+            XCTAssertEqual(partial.sessions[0].tracks.map(\.state), [.recognized, .failed])
+            XCTAssertEqual(staged(partial), [false, true])
+            // Attaching the partial result reads no audio and removes none that the retry needs.
+            XCTAssertEqual(try editor.verifiedDocuments(partial.id, project: .multicam(group)).count, 1)
+            _ = try editor.markAttached(partial.id, expectedPreparationID: partial.preparationID)
+            XCTAssertEqual(staged(partial), [false, true])
+            // The failed track has no result to wait for: the output repeats the one that was recognized.
+            XCTAssertFalse(exists(partial.sessions[0].output))
+            XCTAssertTrue(exists(partial.sessions[0].tracks[0].result))
+            XCTAssertFalse(exists(partial.sessions[0].tracks[1].result))
+
+            let failedAudio = try XCTUnwrap(partial.sessions[0].tracks[1].audio)
+            let stagedOnce = try SourceIdentity(failedAudio)
+            let retried = try editor.retry(partial.id, project: .multicam(group))
+            XCTAssertEqual(retried.state, .prepared)
+            XCTAssertEqual(staged(retried), [false, true])
+            XCTAssertEqual(try SourceIdentity(failedAudio), stagedOnce)
+            let completed = try editor.run(retried.id, helper: provider)
+            XCTAssertEqual(completed.state, .completed, completed.message ?? "")
+            XCTAssertEqual(completed.sessions[0].tracks.map(\.state), [.recognized, .recognized])
+            XCTAssertEqual(staged(completed), [false, false])
+            XCTAssertNoThrow(try editor.verifiedOutputs(completed.id, project: .multicam(group)))
+        }
+    }
+
+    func testTrackThatIsOnlyMeasuredKeepsNoStagedAudio() throws {
+        try inTemporaryFolder { folder in
+            let first = folder.appendingPathComponent("wide.wav")
+            let second = folder.appendingPathComponent("close.wav")
+            try wave(click: 16_000).write(to: first)
+            try wave(click: 20_000).write(to: second)
+            // Recognizes what it is asked to, and for any other track accepts levels in place of audio.
+            let provider = folder.appendingPathComponent("provider.py")
+            try Data(#"""
+            #!/usr/bin/python3
+            import json, sys, wave
+            from pathlib import Path
+            if sys.argv[1:] == ["capabilities"]:
+                print(json.dumps({"version": "measured-fixture", "session_schema_version": 1, "engines": [{
+                    "name": "lifecycle-fixture", "aliases": [], "included": True, "default_model": "fixture",
+                    "diarization": False, "minimum_macos": "14.0", "model_source": "macos"}]}))
+                sys.exit()
+            manifest = json.load(sys.stdin)
+            def event(name, state, **extra):
+                print(json.dumps({"schema_version": 1, "job_id": manifest["job_id"],
+                                  "fingerprint": manifest["fingerprint"], "event": name, "status": state, **extra}), flush=True)
+            tracks = []
+            for track in manifest["tracks"]:
+                output = {"id": track["track_id"], "source_id": track["source_id"], "name": track["name"],
+                          "stream_evidence": track["stream_evidence"], "role": track["role"],
+                          "channel": track.get("channel"), **track["binding"]}
+                if track["recognize"]:
+                    with wave.open(track["audio"]) as wav:
+                        duration = wav.getnframes()
+                    levels = {"version": 1, "sample_rate": 16000, "stream_evidence": track["stream_evidence"],
+                              "duration_samples": duration,
+                              "activity": [{"start_sample": start, "end_sample": min(start + 320, duration), "level": 0.25}
+                                           for start in range(0, duration, 320)]}
+                    Path(track["activity"]).write_text(json.dumps(levels))
+                    Path(track["result"]).write_text(json.dumps({**levels, "recognition_key": track.get("recognition_key"), "words": []}))
+                    output["coverage"] = "recognized"
+                else:
+                    if track.get("audio") is not None:
+                        Path("handed-audio").write_text(track["audio"])
+                    assert json.loads(Path(track["activity"]).read_text())["stream_evidence"] == track["stream_evidence"]
+                    output["coverage"] = "skipped"
+                tracks.append(output)
+                event("track_finished", output["coverage"], track_id=output["id"])
+            Path(manifest["output"]).write_text(json.dumps({
+                "version": 1, "sample_rate": 16000, "clock": "session", "tracks": tracks, "speakers": [], "words": [],
+                "job_id": manifest["job_id"], "fingerprint": manifest["fingerprint"]}))
+            event("session_finished", "completed")
+            """#.utf8).write(to: provider)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: provider.path)
+
+            let project = CutProject.multicam(multicam(wide: first, close: second))
+            let inventory = try XCTUnwrap(TranscriptJobPlan.inventory(project: project).first)
+            let chosen = try XCTUnwrap(inventory.tracks.first { $0.sourceID == "wide" })
+            let options = TranscriptJobOptions(engine: "lifecycle-fixture", selectedTracks: [chosen.id])
+            func staged(_ record: TranscriptJobRecord) -> [Bool] {
+                ["wide", "close"].map { source in exists(record.sessions[0].tracks.first { $0.sourceID == source }?.audio) }
+            }
+
+            var editor = TranscriptJobStore(directory: folder.appendingPathComponent("editor-jobs"))
+            editor.stagesAudioForStandaloneProvider = false
+            let prepared = try editor.prepare(project: project, documentID: "edit", options: options)
+            let measured = try XCTUnwrap(prepared.sessions[0].tracks.first { $0.sourceID == "close" })
+            XCTAssertFalse(measured.recognize)
+            XCTAssertEqual(staged(prepared), [true, false])
+            XCTAssertTrue(exists(measured.activity))
+            let finished = try editor.run(prepared.id, helper: provider)
+            XCTAssertEqual(finished.state, .completed, finished.message ?? "")
+            XCTAssertEqual(finished.sessions[0].tracks.first { $0.id == measured.id }?.state, .skipped)
+            XCTAssertFalse(exists(finished.workingDirectory.appendingPathComponent("handed-audio")))
+            XCTAssertNoThrow(try editor.verifiedOutputs(finished.id, project: project))
+            // A retry measures nothing again.
+            XCTAssertEqual(staged(try editor.retry(finished.id, project: project)), [false, false])
+
+            // A restart measures from the audio again, and a standalone provider is handed every recording.
+            let restarted = try editor.prepare(project: project, documentID: "edit", options: options,
+                                               operationID: prepared.id, policy: .restart)
+            XCTAssertEqual(staged(restarted), [true, true])
+            let standalone = TranscriptJobStore(directory: folder.appendingPathComponent("standalone-jobs"))
+            XCTAssertEqual(staged(try standalone.prepare(project: project, documentID: "edit", options: options)), [true, true])
+        }
+    }
+
+    func testPartialRunForAStandaloneStoreStagesItsRetryFromTheMedia() throws {
+        try inTemporaryFolder { folder in
+            let first = folder.appendingPathComponent("wide.wav")
+            let second = folder.appendingPathComponent("close.wav")
+            try wave(click: 16_000).write(to: first)
+            try wave(click: 20_000).write(to: second)
+            let provider = try lifecycleProvider(in: folder, outcomes: ["partial", "completed"])
+            let group = multicam(wide: first, close: second)
+            let store = TranscriptJobStore(directory: folder.appendingPathComponent("jobs"))
+            let prepared = try store.prepare(project: .multicam(group), documentID: "edit",
+                                             options: .init(engine: "lifecycle-fixture"))
+            let partial = try store.run(prepared.id, helper: provider)
+            XCTAssertEqual(partial.state, .partial, partial.message ?? "")
+            XCTAssertEqual(partial.sessions[0].tracks.map { exists($0.audio) }, [false, true])
+            // A standalone provider is handed every recording, so the retry extracts the removed one again.
+            let retried = try store.retry(partial.id, project: .multicam(group))
+            XCTAssertEqual(retried.sessions[0].tracks.map { exists($0.audio) }, [true, true])
+            let completed = try store.run(retried.id, helper: provider)
+            XCTAssertEqual(completed.state, .completed, completed.message ?? "")
+            XCTAssertNoThrow(try store.verifiedOutputs(completed.id, project: .multicam(group)))
+        }
+    }
+
     private func multicam(wide: URL, close: URL) -> MulticamProject {
         MulticamProject(referenceAngle: "wide", range: .init(from: .zero, to: .init(numerator: 2)),
                         angles: [.init(id: "wide", file: wide.path), .init(id: "close", file: close.path)],
@@ -604,6 +972,18 @@ final class TranscriptJobTests: XCTestCase {
             "fingerprint": session.fingerprint, "tracks": tracks, "speakers": [], "words": [],
         ]
         try JSONSerialization.data(withJSONObject: output).write(to: session.output, options: .atomic)
+    }
+
+    /// The result a provider leaves for each track it recognizes, beside the session output.
+    private func writeTrackResults(session: TranscriptJobSession) throws {
+        for track in session.tracks where track.recognize && track.unavailable == nil {
+            let samples = try track.duration.roundedToSamples(16_000)
+            let result: [String: Any] = [
+                "version": 1, "sample_rate": 16_000, "stream_evidence": track.evidence, "duration_samples": samples,
+                "activity": [[String: Any]](), "words": [[String: Any]](),
+            ]
+            try JSONSerialization.data(withJSONObject: result).write(to: XCTUnwrap(track.result), options: .atomic)
+        }
     }
 
     private func inTemporaryFolder(_ work: (URL) throws -> Void) throws {

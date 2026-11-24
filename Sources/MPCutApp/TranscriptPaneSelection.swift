@@ -30,29 +30,23 @@ struct MulticamTranscriptPlaybackPosition: Equatable {
 }
 
 extension TranscriptIndex {
-    func sourcePanePosition(at time: RationalTime, playbackSpace: TranscriptSpace,
-                            scoped: TranscriptPaneWordList?) -> Int? {
-        func sourcePosition(for occurrence: TranscriptOccurrence) -> Int? {
-            guard let word = locate(wordID: occurrence.wordID, space: .source).first(where: {
-                $0.attachmentID == occurrence.attachmentID && $0.trackID == occurrence.trackID
-                    && $0.originalSourceRange == occurrence.originalSourceRange
-            }) else { return nil }
-            if let scoped { return scoped.position(of: word.id) }
-            return position(of: word.id, space: .source)
+    func activePanePositions(at time: RationalTime, playbackSpace: TranscriptSpace,
+                             readerSpace: TranscriptSpace, scoped: TranscriptPaneWordList?) -> [Int] {
+        guard readerSpace == playbackSpace || readerSpace == .source else { return [] }
+        return activeWords(at: time, space: playbackSpace).compactMap { occurrence in
+            let id: String
+            if readerSpace == playbackSpace {
+                id = occurrence.id
+            } else {
+                guard let source = locate(wordID: occurrence.wordID, space: .source).first(where: {
+                    $0.attachmentID == occurrence.attachmentID && $0.trackID == occurrence.trackID
+                        && $0.originalSourceRange == occurrence.originalSourceRange
+                }) else { return nil }
+                id = source.id
+            }
+            if let scoped { return scoped.position(of: id) }
+            return position(of: id, space: readerSpace)
         }
-
-        if let active = position(at: time, space: playbackSpace),
-           let occurrence = read(space: playbackSpace, offset: active, limit: 1).items.first,
-           let position = sourcePosition(for: occurrence) {
-            return position
-        }
-        guard scoped != nil,
-              let end = try? time.adding(.init(numerator: 1, denominator: 1_000_000_000)) else { return nil }
-        for occurrence in overlapping(.init(from: time, to: end), space: playbackSpace).reversed()
-            where occurrence.range.contains(time) {
-            if let position = sourcePosition(for: occurrence) { return position }
-        }
-        return nil
     }
 
     /// A cut through a clip gives the part after it a new clip ID. `acrossClips` accepts a
@@ -130,7 +124,7 @@ struct TranscriptReaderPlace {
     let query: String
     let followPlayback: Bool
     let anchor: TranscriptOccurrence?
-    /// The anchor's position within its page.
+    /// The visible word’s position in the current reader filter.
     let anchorIndex: Int
     let selectionStart: TranscriptOccurrence?
     let selectionEnd: TranscriptOccurrence?
@@ -148,16 +142,10 @@ final class TranscriptPaneMemory {
 struct TranscriptPaneWordList {
     let words: [TranscriptOccurrence]
     private let positions: [String: Int]
-    private let endTimes: [RationalTime]
 
     init(_ words: [TranscriptOccurrence]) {
         self.words = words
         self.positions = Dictionary(uniqueKeysWithValues: words.enumerated().map { ($0.element.id, $0.offset) })
-        var furthest = words.first?.range.from ?? .zero
-        self.endTimes = words.map {
-            furthest = max(furthest, $0.range.to)
-            return furthest
-        }
     }
 
     func position(of id: String) -> Int? { positions[id] }
@@ -173,21 +161,6 @@ struct TranscriptPaneWordList {
         return max(0, lower - 1)
     }
 
-    func position(at time: RationalTime) -> Int? {
-        var lower = 0
-        var upper = words.count
-        while lower < upper {
-            let middle = lower + (upper - lower) / 2
-            if words[middle].range.from <= time { lower = middle + 1 }
-            else { upper = middle }
-        }
-        var index = lower - 1
-        while index >= 0 && endTimes[index] > time {
-            if words[index].range.to > time { return index }
-            index -= 1
-        }
-        return nil
-    }
 }
 
 @MainActor

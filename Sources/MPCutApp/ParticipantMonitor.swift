@@ -19,14 +19,86 @@ struct ParticipantDrawnBounds: Equatable {
     let bounds: ParticipantBounds
 }
 
+/// Each lane contains disjoint ranges so a point lookup can binary search it.
+struct ParticipantAppearanceIndex {
+    private let appearances: [ParticipantAppearance]
+    private let lanes: [[Int]]
+
+    init(_ appearances: [ParticipantAppearance]) {
+        self.appearances = appearances
+        let starts = appearances.indices.sorted { appearances[$0].range.from < appearances[$1].range.from }
+        let ends = appearances.indices.sorted { appearances[$0].range.to < appearances[$1].range.to }
+        var lanes: [[Int]] = []
+        var available: [Int] = []
+        var assigned = Array(repeating: 0, count: appearances.count)
+        var nextEnd = 0
+        for index in starts {
+            let from = appearances[index].range.from
+            while nextEnd < ends.count, appearances[ends[nextEnd]].range.to <= from {
+                available.append(assigned[ends[nextEnd]])
+                nextEnd += 1
+            }
+            let lane = available.popLast() ?? lanes.count
+            if lane == lanes.count { lanes.append([]) }
+            assigned[index] = lane
+            lanes[lane].append(index)
+        }
+        self.lanes = lanes
+    }
+
+    func at(_ time: RationalTime) -> [ParticipantAppearance] {
+        let visible = lanes.compactMap { lane -> Int? in
+            let i = lane.lowerBound { appearances[$0].range.to > time }
+            guard lane.indices.contains(i), appearances[lane[i]].range.from <= time else { return nil }
+            return lane[i]
+        }
+        return visible.sorted().map { appearances[$0] }
+    }
+}
+
+@MainActor
+final class ParticipantMonitorGeometry {
+    private let index: ParticipantAppearanceIndex
+    private let intervals: [ParticipantCoverage]
+    let hasUncertainAppearance: Bool
+
+    init(_ source: ParticipantSourceGeometry) {
+        index = ParticipantAppearanceIndex(source.appearances)
+        intervals = source.coverage.sorted { $0.range.from < $1.range.from }
+        hasUncertainAppearance = source.appearances.contains { $0.participantID == nil && $0.state != .presentation }
+    }
+
+    func appearances(at time: RationalTime) -> [ParticipantAppearance] { index.at(time) }
+
+    func coverage(at time: RationalTime) -> ParticipantCoverageState {
+        let i = intervals.lowerBound { $0.range.to > time }
+        return intervals.indices.contains(i) && intervals[i].range.contains(time) ? intervals[i].state : .unknown
+    }
+}
+
 struct ParticipantMonitorPosition {
     let sourceID: String
     let media: MediaInfo
     let time: RationalTime
+    var duration: RationalTime {
+        (try? media.duration.subtracting(media.multicamClockOffset)) ?? media.duration
+    }
+
     // Preview video uses display dimensions, including rotation and pixel aspect.
     var aspect: CGFloat {
         guard let stream = media.videoStream, stream.displayWidth > 0, stream.displayHeight > 0 else { return 1 }
         return CGFloat(stream.displayWidth) / CGFloat(stream.displayHeight)
+    }
+
+    func frameRange(atReflow boundary: RationalTime, before: Bool) -> MulticamRange? {
+        let frames = media.frames
+        guard let clock = try? boundary.adding(media.multicamClockOffset) else { return nil }
+        let index = frames.lowerBound { $0.time >= clock } - (before ? 1 : 0)
+        guard frames.indices.contains(index),
+              let start = try? frames[index].time.subtracting(media.multicamClockOffset),
+              let end = try? start.adding(frames[index].duration) else { return nil }
+        let range = MulticamRange(from: max(.zero, start), to: min(duration, end))
+        return range.from < range.to ? range : nil
     }
 
     func needsReconciliation(in project: ParticipantProject) -> Bool {
@@ -35,14 +107,24 @@ struct ParticipantMonitorPosition {
 }
 
 extension ProjectSession {
+    var participantProject: ParticipantProject {
+        isMulticam ? (multicam.project?.participants ?? .init()) : editor.participantProject
+    }
+
     var participantPosition: ParticipantMonitorPosition? {
+        participantPosition(displaying: multicam.preview.picture, sequence: editor.preview.sourcePicture.value)
+    }
+
+    func participantPosition(displaying picture: MulticamPicturePosition?,
+                             sequence: SequenceSourcePicture?) -> ParticipantMonitorPosition? {
         if isMulticam {
-            guard let picture = multicam.preview.picture, picture.spanIndex >= 0,
-                  let media = multicam.media[picture.source], media.identity == picture.identity else { return nil }
-            return .init(sourceID: picture.source, media: media, time: picture.frameTime)
+            guard let picture, picture.spanIndex >= 0,
+                  let media = multicam.media[picture.source], media.identity == picture.identity,
+                  let sourceTime = try? picture.frameTime.subtracting(picture.multicamClockOffset) else { return nil }
+            return .init(sourceID: picture.source, media: media, time: sourceTime)
         }
-        guard let source = editor.jpegSourceAtPlayhead, let frame = source.frame else { return nil }
-        return .init(sourceID: source.media.url.path, media: source.media, time: frame)
+        guard let sequence, let source = editor.jpegSourceAtPlayhead, source.media.url == sequence.url else { return nil }
+        return .init(sourceID: source.media.url.path, media: source.media, time: sequence.time)
     }
 
     var participantTimelineTime: RationalTime {
@@ -82,6 +164,7 @@ struct ParticipantMonitorOverlay: View {
     @ObservedObject private var presentation: EditorPresentation
     @State private var time: RationalTime = .zero
     @State private var displayedPicture: MulticamPicturePosition?
+    @State private var sequencePicture: SequenceSourcePicture?
     @State private var indexes: [TranscriptIndex] = []
     @State private var drawing: CGRect?
 
@@ -92,12 +175,13 @@ struct ParticipantMonitorOverlay: View {
     }
 
     var body: some View {
-        let project = session.transcript.project.participants
+        let project = session.participantProject
         let speakers = speakingParticipantIDs(project)
         GeometryReader { geometry in
-            if let source = session.participantPosition, !source.needsReconciliation(in: project) {
+            if let source = session.participantPosition(displaying: displayedPicture, sequence: sequencePicture),
+               !source.needsReconciliation(in: project) {
                 let picture = Self.pictureRect(in: geometry.size, aspect: source.aspect)
-                let appearances = project.appearances(sourceID: source.sourceID, at: source.time)
+                let appearances = session.participantGeometry(for: source.sourceID)?.appearances(at: source.time) ?? []
                 ZStack(alignment: .topLeading) {
                     ForEach(appearances) { appearance in
                         let active = appearance.participantID.map(speakers.contains) ?? false
@@ -106,12 +190,20 @@ struct ParticipantMonitorOverlay: View {
                             tile(appearance, sourceID: source.sourceID, picture: picture, project: project, active: active, pinned: pinned)
                         }
                     }
+                    if interactive && appearances.isEmpty && !presentation.participantDrawMode {
+                        ForEach(scanPreviewRegions(for: source), id: \.appearanceID) { region in
+                            let rect = CGRect(x: region.rect.x, y: region.rect.y,
+                                              width: region.rect.width, height: region.rect.height)
+                            outline(Self.position(rect, in: picture), color: .orange)
+                                .allowsHitTesting(false)
+                                .accessibilityHidden(true)
+                        }
+                    }
                     if interactive && presentation.participantDrawMode {
                         Rectangle()
                             .fill(.clear)
                             .contentShape(Rectangle())
                             .frame(width: picture.width, height: picture.height)
-                            .position(x: picture.midX, y: picture.midY)
                             .gesture(DragGesture(minimumDistance: 4).onChanged { value in
                                 drawing = Self.normalizedRect(from: value.startLocation, to: value.location, size: picture.size)
                             }.onEnded { value in
@@ -123,6 +215,7 @@ struct ParticipantMonitorOverlay: View {
                                     bounds: .init(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height))
                                 presentation.participantDrawMode = false
                             })
+                            .position(x: picture.midX, y: picture.midY)
                         if let drawing {
                             outline(Self.position(drawing, in: picture), color: .accentColor)
                                 .allowsHitTesting(false)
@@ -142,6 +235,9 @@ struct ParticipantMonitorOverlay: View {
         .onReceive(session.multicam.preview.$picture.receive(on: DispatchQueue.main)) { picture in
             if session.isMulticam, displayedPicture != picture { displayedPicture = picture }
         }
+        .onReceive(session.editor.preview.sourcePicture) { picture in
+            if !session.isMulticam, sequencePicture != picture { sequencePicture = picture }
+        }
         .onChange(of: speakers, initial: true) { _, value in
             presentation.speakingParticipants = value
         }
@@ -156,6 +252,15 @@ struct ParticipantMonitorOverlay: View {
             }
             if !Task.isCancelled { indexes = loaded }
         }
+    }
+
+    private func scanPreviewRegions(for position: ParticipantMonitorPosition) -> [ParticipantRegion] {
+        guard let preview = presentation.participantScanPreview, preview.sourceID == position.sourceID,
+              preview.stamp == SceneSourceStamp(media: position.media),
+              preview.analysis.start <= position.time, position.time < preview.analysis.end else { return [] }
+        let observations = preview.analysis.observations
+        let after = observations.lowerBound { $0.time > position.time }
+        return after > 0 ? observations[after - 1].regions : []
     }
 
     private func tile(_ appearance: ParticipantAppearance, sourceID: String, picture: CGRect,
@@ -226,7 +331,7 @@ struct ParticipantSpeakerIndexKey: Equatable {
     let transcriptRevision: UInt64
 
     @MainActor init(session: ProjectSession) {
-        generation = session.mcpModeGeneration
+        generation = session.isMulticam ? session.multicam.mcpGeneration : session.editor.mcpGeneration
         revision = session.transcript.timelineRevision
         transcriptRevision = session.transcript.state.revision
     }

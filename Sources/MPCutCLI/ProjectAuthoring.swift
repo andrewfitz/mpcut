@@ -57,6 +57,7 @@ private func requireNewProject(_ destination: URL) throws {
 /// Rebase timeline history and copy its shared transcript attachments once.
 func saveEditedProject(_ candidate: CutProject, source: URL, destination: URL, action: String,
                        original: CutProject?, undo: [CutHistoryState], redo: [CutHistoryState],
+                       mediaSnapshot: ProjectMediaSnapshot,
                        interruption: Interruption, validateSources: () throws -> Void = {}) throws {
     var paths: [String: String] = [:]
     func rebase(_ project: CutProject) throws -> CutProject {
@@ -64,7 +65,8 @@ func saveEditedProject(_ candidate: CutProject, source: URL, destination: URL, a
         return try project.rebased(from: source, to: destination, paths: &paths)
     }
     func copyState(_ state: CutHistoryState) throws -> CutHistoryState {
-        try .init(action: state.action, origin: state.origin, project: rebase(state.project))
+        try interruption.check()
+        return try state.rebased(from: source, to: destination, paths: &paths)
     }
     try requireNewProject(destination)
     let project = try rebase(candidate)
@@ -77,6 +79,7 @@ func saveEditedProject(_ candidate: CutProject, source: URL, destination: URL, a
     do {
         try project.saveNewCopy(to: destination, copyingTranscriptsFrom: source,
                                 undo: old.map(copyState), redo: next.map(copyState),
+                                mediaSnapshot: mediaSnapshot.rebased(from: source, to: destination),
                                 beforePublish: validateSources, check: interruption.check)
     } catch let error as CutError where error.code == "destination_exists" {
         throw CutError(code: "output_exists", message: "Choose a new project destination.")
@@ -102,15 +105,18 @@ func authorProject(data: Data, creating: Bool, interruption: Interruption) throw
     var original: CutProject?
     var undo: [CutHistoryState] = [], redo: [CutHistoryState] = []
     var project: CutProject
+    var mediaSnapshot = ProjectMediaSnapshot.empty
     // Authoring publishes only the project. Avoid analysis writes beside referenced media.
     let engine = CutEngine(cancelled: { !interruption.isActive }, useSidecar: false)
     var summaries: [URL: MediaInfo] = [:]
+    var inspected: [URL: MediaInfo] = [:]
     var snapshots: [URL: SourceIdentity] = [:]
     func remember(_ media: MediaInfo, at url: URL) throws -> MediaInfo {
         if let first = snapshots[url], !first.matchesSnapshot(media.identity) {
             throw CutError(code: "source_changed", message: "The source changed during project authoring: " + url.path)
         }
         snapshots[url] = media.identity
+        inspected[url] = media
         return media
     }
     func inspect(_ url: URL) throws -> MediaInfo {
@@ -160,6 +166,7 @@ func authorProject(data: Data, creating: Bool, interruption: Interruption) throw
         project = loaded.project
         undo = loaded.undo
         redo = loaded.redo
+        mediaSnapshot = loaded.media.mediaSnapshot
     }
     try project.validate()
     var index = operations.startIndex
@@ -190,8 +197,13 @@ func authorProject(data: Data, creating: Bool, interruption: Interruption) throw
         }
         index += 1
     }
+    let editedPaths = Set(([project] + [original].compactMap { $0 }).flatMap { $0.mediaPaths.map(\.1) })
+    let newEntries = editedPaths.compactMap { path in
+        inspected[CutProject.mediaURL(path, relativeTo: location)].map { (path: path, media: $0) }
+    }
     try saveEditedProject(project, source: location, destination: destination, action: "Edit Timeline", original: original,
-                          undo: undo, redo: redo, interruption: interruption) {
+                          undo: undo, redo: redo, mediaSnapshot: mediaSnapshot.merging(media: newEntries),
+                          interruption: interruption) {
         for (url, snapshot) in snapshots {
             try interruption.check()
             guard snapshot.isCurrentSnapshot(at: url) else {
@@ -390,7 +402,7 @@ private func editMulticam(_ project: inout MulticamProject, action: String, edit
         let path = try fileURL(edit.string("path"), label: "Camera recording")
         let first = try primary.coverage == nil
             ? inspect(CutProject.checkedMediaURL(primary.file, relativeTo: location)) : nil
-        try project.addRecording(id: UUID().uuidString, media: inspect(path), to: angle,
+        try project.addRecording(id: ProjectIdentifier.make(avoiding: project.sources.map(\.id)), media: inspect(path), to: angle,
                                  at: edit.time("group_start"), primaryMedia: first)
         return
     }
@@ -490,20 +502,22 @@ func multicamSwitchCoverage(data: Data, useSidecar: Bool, interruption: Interrup
     var media: [String: MediaInfo] = [:]
     var inspected: [URL: MediaInfo] = [:]
     var unavailable = Set<URL>()
-    let protected = AnalysisSidecar.excludedSources.union(document.sidecarExclusions(relativeTo: location))
-    try AnalysisSidecar.$excludedSources.withValue(protected) {
-        try AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
-            for source in project.sources where needed.contains(source.id) {
-                try interruption.check()
-                guard let url = try? CutProject.checkedMediaURL(source.file, relativeTo: location) else { continue }
-                if let info = inspected[url] {
-                    media[source.id] = info
-                } else if !unavailable.contains(url) {
-                    if let info = try? engine.inspectMulticamSource(url) {
-                        inspected[url] = info
+    try SidecarLocations.$projectURL.withValue(location) {
+        let protected = AnalysisSidecar.excludedSources.union(document.sidecarExclusions(relativeTo: location))
+        try AnalysisSidecar.$excludedSources.withValue(protected) {
+            try AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
+                for source in project.sources where needed.contains(source.id) {
+                    try interruption.check()
+                    guard let url = try? CutProject.checkedMediaURL(source.file, relativeTo: location) else { continue }
+                    if let info = inspected[url] {
                         media[source.id] = info
-                    } else {
-                        unavailable.insert(url)
+                    } else if !unavailable.contains(url) {
+                        if let info = try? engine.inspectMulticamSource(url) {
+                            inspected[url] = info
+                            media[source.id] = info
+                        } else {
+                            unavailable.insert(url)
+                        }
                     }
                 }
             }

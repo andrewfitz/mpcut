@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from saved_project import read_project
 
 FRAME = Fraction(1001, 30000)
 RATE = 48000
@@ -1008,7 +1009,7 @@ class MediaRegression(unittest.TestCase):
         self.assertEqual(ratio(report["encoded_video_duration"]), 0)
         self.assertEqual(sample_hashes(output), sample_hashes(source))
 
-        edit = json.loads(project.read_text())
+        edit = read_project(project)
         edit["assembly"] = [{"from": "7/25", "to": "2"}]
         project.write_text(json.dumps(edit))
         cut = self.cli(*command, "--mode", "smart", "--output", "program.webm", ok=False)

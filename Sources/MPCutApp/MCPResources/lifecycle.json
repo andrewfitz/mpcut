@@ -31,6 +31,7 @@
             "export_movie_default_mode",
             "timeline_snap_target",
             "timeline_large_previews_enabled",
+            "timeline_source_time_ticks_enabled",
             "silence_min_pause_seconds",
             "silence_max_blip_seconds",
             "silence_padding_per_side_seconds",
@@ -143,6 +144,7 @@
                   "export_tier_downgrade_warning_enabled",
                   "analysis_sidecar_reuse_enabled",
                   "timeline_large_previews_enabled",
+                  "timeline_source_time_ticks_enabled",
                   "playback_preview_muted",
                   "playback_scrub_audio_enabled"
                 ]

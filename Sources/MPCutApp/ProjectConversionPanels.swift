@@ -101,14 +101,18 @@ extension ProjectSessions {
                 return
             }
             let exclusions = session.isMulticam ? session.multicam.sidecarExclusions : session.editor.sidecarExclusions
+            let checkingVolumes = session.isMulticam ? session.multicam.interchangeCheckingVolumes : session.editor.interchangeCheckingVolumes
             let allowLoss = loss.state == .on
             let flattenMulticam = allowLoss && flatten?.state == .on
             // Unsaved desktop projects already retain absolute paths for all working media.
             let input = (session.isMulticam ? session.multicam.projectURL : session.editor.projectURL) ?? output
+            let mediaSnapshot = session.isMulticam ? session.multicam.projectMediaSnapshotForWriting : session.editor.projectMediaSnapshotForWriting
             self.convert(in: session, output: output, imported: false) { token in
                 try AnalysisSidecar.$excludedSources.withValue(exclusions) {
-                    try ProjectConverter.write(snapshot, relativeTo: input, to: output, allowLoss: allowLoss,
-                                               flattenMulticam: flattenMulticam, cancelled: { token.isCancelled })
+                    try ProjectMediaVolume.$checking.withValue(checkingVolumes) {
+                        try ProjectConverter.write(snapshot, relativeTo: input, to: output, mediaSnapshot: mediaSnapshot, allowLoss: allowLoss,
+                                                   flattenMulticam: flattenMulticam, cancelled: { token.isCancelled })
+                    }
                 }
             }
         }
@@ -134,10 +138,11 @@ extension ProjectSessions {
         let token = EditCancellation()
         conversionOwner = session?.mcpHandle
         projectConversion = token
+        let sidecarWork = session?.sidecarWork ?? ProjectSidecarWork(project: nil)
         Task {
             defer { finishProjectConversion() }
             do {
-                let warnings = try await Task.detached(priority: .userInitiated) { try operation(token) }.value
+                let warnings = try await sidecarWork.detached(priority: .userInitiated) { try operation(token) }.value
                 guard conversionDidFinish == nil else { return }
                 let target = session.flatMap { sessions[$0.id] === $0 ? $0 : nil }
                 if imported { openFiles([output], in: target) }

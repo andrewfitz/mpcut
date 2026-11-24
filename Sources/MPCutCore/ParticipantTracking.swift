@@ -9,6 +9,68 @@ public enum ParticipantBackendMode: String, Codable, Sendable {
 public enum ParticipantSampling: String, Codable, Sendable {
     case everyFrame = "every_frame"
     case sparse
+    /// Decode keyframes first and the frames between two of them only where
+    /// the later keyframe differs. An unchanged stretch of up to three seconds
+    /// is reported as inferred coverage; decoded stretches are observed frame
+    /// by frame. Use every-frame analysis to verify a redaction.
+    case adaptive
+
+    // TileTrail records coarse adaptive steps as inferred intervals within its every-frame mode.
+    var detectorSampling: Self {
+        switch self {
+        case .everyFrame, .adaptive: .everyFrame
+        case .sparse: .sparse
+        }
+    }
+}
+
+public enum ParticipantFeedLayout: Equatable, Codable, Sendable {
+    case meeting
+    case automatic
+    case fixed(columns: UInt32, rows: UInt32)
+
+    public init?(feedLayout: String) {
+        if feedLayout == "auto" {
+            self = .automatic
+            return
+        }
+        let dimensions = feedLayout.split(separator: "x", omittingEmptySubsequences: false)
+        guard dimensions.count == 2,
+              dimensions.allSatisfy({ !$0.isEmpty && $0.utf8.allSatisfy { (48...57).contains($0) } }),
+              let columns = UInt32(dimensions[0]), let rows = UInt32(dimensions[1]) else { return nil }
+        self = .fixed(columns: columns, rows: rows)
+        guard isValid else { return nil }
+    }
+
+    public var isValid: Bool {
+        guard case .fixed(let columns, let rows) = self else { return true }
+        return columns > 0 && rows > 0 && UInt64(columns) * UInt64(rows) <= 64
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(String.self)
+        if value == "meeting" {
+            self = .meeting
+        } else if let layout = Self(feedLayout: value) {
+            self = layout
+        } else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid participant feed layout.")
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        guard isValid else {
+            throw EncodingError.invalidValue(self, .init(codingPath: encoder.codingPath,
+                                                        debugDescription: "Invalid participant feed layout."))
+        }
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .meeting: try container.encode("meeting")
+        case .automatic: try container.encode("auto")
+        case .fixed(let columns, let rows): try container.encode("\(columns)x\(rows)")
+        }
+    }
 }
 
 public struct ParticipantScanOptions: Sendable {
@@ -16,13 +78,15 @@ public struct ParticipantScanOptions: Sendable {
     public let sampling: ParticipantSampling
     public let includeScenes: Bool
     public let useSidecar: Bool
+    public let feedLayout: ParticipantFeedLayout
 
-    public init(backend: ParticipantBackendMode = .automatic, sampling: ParticipantSampling = .everyFrame,
-                includeScenes: Bool = false, useSidecar: Bool = true) {
+    public init(backend: ParticipantBackendMode = .automatic, sampling: ParticipantSampling = .adaptive,
+                includeScenes: Bool = false, useSidecar: Bool = true, feedLayout: ParticipantFeedLayout = .meeting) {
         self.backend = backend
         self.sampling = sampling
         self.includeScenes = includeScenes
         self.useSidecar = useSidecar
+        self.feedLayout = feedLayout
     }
 }
 
@@ -30,20 +94,30 @@ public struct ParticipantScanConfiguration: Codable, Equatable, Sendable {
     public let backend: ParticipantBackendMode
     public let sampling: ParticipantSampling
     public let includeScenes: Bool
+    private let savedFeedLayout: ParticipantFeedLayout?
+    public var feedLayout: ParticipantFeedLayout { savedFeedLayout ?? .meeting }
 
     init(_ options: ParticipantScanOptions) {
         backend = options.backend
         sampling = options.sampling
         includeScenes = options.includeScenes
+        savedFeedLayout = options.feedLayout == .meeting ? nil : options.feedLayout
     }
 
     public func options(useSidecar: Bool = true) -> ParticipantScanOptions {
-        ParticipantScanOptions(backend: backend, sampling: sampling, includeScenes: includeScenes, useSidecar: useSidecar)
+        ParticipantScanOptions(backend: backend, sampling: sampling, includeScenes: includeScenes,
+                               useSidecar: useSidecar, feedLayout: feedLayout)
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.backend == rhs.backend && lhs.sampling == rhs.sampling
+            && lhs.includeScenes == rhs.includeScenes && lhs.feedLayout == rhs.feedLayout
     }
 
     enum CodingKeys: String, CodingKey {
         case backend, sampling
         case includeScenes = "include_scenes"
+        case savedFeedLayout = "feed_layout"
     }
 }
 
@@ -76,14 +150,22 @@ public struct ParticipantScanSource: Codable, Sendable {
     public let file: String
     public let stamp: SceneSourceStamp
     public let inode: UInt64?
+    public internal(set) var contentSHA256: String? = nil
     public let stream: Int
     public let origin: RationalTime
     public let timeBase: RationalTime
     public let duration: RationalTime
     public let transform: ParticipantDisplayTransform
 
+    package func matches(_ media: MediaInfo) -> Bool {
+        guard stamp == SceneSourceStamp(media: media), stream == media.videoStream?.index else { return false }
+        if let inode { return inode == media.identity.inode }
+        return AnalysisSidecar.canonicalSource(media.url).path == file
+    }
+
     enum CodingKeys: String, CodingKey {
         case file, stamp, inode, stream, origin, duration, transform
+        case contentSHA256 = "content_sha256"
         case timeBase = "time_base"
     }
 }
@@ -128,6 +210,75 @@ public struct ParticipantTrackingResult: Codable, Sendable {
     }
 }
 
+extension ParticipantScanResult {
+    /// Encode the same Codable document as JSONEncoder, limiting the temporary
+    /// Foundation tree to one batch of detector rows. The ordinary encoder
+    /// supplies the envelope, keys, number formatting and escaping.
+    package func writeJSON(pretty: Bool, write: (Data) throws -> Void) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        if pretty { encoder.outputFormatting.insert(.prettyPrinted) }
+        let batchSize = 32
+        guard let a = analysis, [a.appearances.count, a.coverage.count, a.diagnostics.count, a.events.count,
+                                 a.observations.count, a.tracks.count].contains(where: { $0 > batchSize }) else {
+            try write(encoder.encode(self))
+            return
+        }
+
+        let empty = ParticipantTrackingResult(schemaVersion: a.schemaVersion, start: a.start, end: a.end,
+            sampling: a.sampling, observations: [], tracks: [], appearances: [], events: [],
+            coverage: [], diagnostics: [], resumeAt: a.resumeAt)
+        let envelope = try encoder.encode(ParticipantScanResult(state: state, source: source, configuration: configuration,
+            analysis: empty, sceneReport: sceneReport, analysisIdentity: analysisIdentity))
+        var position = envelope.startIndex
+
+        func rows<T: Encodable>(_ key: ParticipantTrackingResult.CodingKeys, _ values: [T]) throws {
+            guard !values.isEmpty else { return }
+            let field = Data(("\"" + key.rawValue + (pretty ? "\" : [" : "\":[")).utf8)
+            guard let start = envelope.range(of: field, in: position..<envelope.endIndex)?.upperBound,
+                  let end = envelope[start...].firstIndex(of: 0x5d) else {
+                throw CutError(code: "participant_result_invalid", message: "The scan report has an invalid array field.")
+            }
+            try write(envelope[position..<start])
+            let lineStart = envelope[..<start].lastIndex(of: 10).map { $0 + 1 } ?? 0
+            let indent = pretty ? Data(envelope[lineStart...].prefix(while: { $0 == 32 })) : Data()
+            for first in stride(from: 0, to: values.count, by: batchSize) {
+                let batch = Array(values[first..<min(values.count, first + batchSize)])
+                let bytes = try encoder.encode(batch)
+                if first > 0 { try write(Data([44])) }
+                if pretty {
+                    // The root array's rows already have one indentation level.
+                    // Add the envelope's margin to nonempty lines, retaining the
+                    // blank line Foundation emits inside an empty array.
+                    var nested = Data()
+                    for line in bytes.dropFirst(2).dropLast(2).split(separator: 10, omittingEmptySubsequences: false) {
+                        nested.append(10)
+                        if !line.isEmpty {
+                            nested.append(indent)
+                            nested.append(contentsOf: line)
+                        }
+                    }
+                    try write(nested)
+                } else {
+                    try write(bytes.dropFirst().dropLast())
+                }
+            }
+            if pretty { try write(Data([10]) + indent) }
+            position = end
+        }
+
+        // Walk the same sorted keys as the envelope. Empty fields already
+        // have their final bytes in the encoded document.
+        try rows(.appearances, a.appearances)
+        try rows(.coverage, a.coverage)
+        try rows(.diagnostics, a.diagnostics)
+        try rows(.events, a.events)
+        try rows(.observations, a.observations)
+        try rows(.tracks, a.tracks)
+        try write(envelope[position...])
+    }
+}
+
 public struct ParticipantObservation: Codable, Equatable, Sendable {
     @ParticipantSourceTime public var time: RationalTime
     public let display: ParticipantDisplayTransform
@@ -168,6 +319,29 @@ public struct ParticipantRegion: Codable, Equatable, Sendable {
         case identityConfidence = "identity_confidence"
         case identityUncertain = "identity_uncertain"
         case possibleMatches = "possible_matches"
+    }
+}
+
+extension ParticipantRegion {
+    public init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        appearanceID = try fields.decode(UInt64.self, forKey: .appearanceID)
+        let participant = try fields.decodeIfPresent(UInt64.self, forKey: .participantID)
+        participantID = participant
+        rect = try fields.decode(ParticipantObservationRect.self, forKey: .rect)
+        kind = try fields.decode(Kind.self, forKey: .kind)
+        role = try fields.decode(Role.self, forKey: .role)
+        confidence = try fields.decode(Double.self, forKey: .confidence)
+        identityConfidence = try fields.decodeIfPresent(Double.self, forKey: .identityConfidence)
+        possibleMatches = try fields.decode([ParticipantIdentityMatch].self, forKey: .possibleMatches)
+        if fields.contains(.identityUncertain) {
+            identityUncertain = try fields.decode(Bool.self, forKey: .identityUncertain)
+        } else {
+            // Early v1 reports represented unresolved assignments by a missing
+            // identity or an alternative participant in possible_matches.
+            identityUncertain = (participant == nil && kind != .screenShare)
+                || possibleMatches.contains { $0.participantID != participant }
+        }
     }
 }
 

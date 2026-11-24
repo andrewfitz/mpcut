@@ -2,7 +2,7 @@ import Foundation
 import MPCutCore
 
 enum QueueEdit: LocalizedError {
-    case noSelection, busy, invalidTarget, invalidName, invalidExtension, incompatibleCoordinateSpace
+    case noSelection, busy, invalidTarget, invalidName, invalidExtension, incompatibleCoordinateSpace, replanBounds, replanExcerpt
 
     var code: String {
         switch self {
@@ -11,6 +11,8 @@ enum QueueEdit: LocalizedError {
         case .invalidTarget: "invalid_target"
         case .invalidName: "invalid_name"
         case .invalidExtension, .incompatibleCoordinateSpace: "invalid_extension"
+        case .replanBounds: "invalid_range"
+        case .replanExcerpt: "no_selection"
         }
     }
 
@@ -22,6 +24,8 @@ enum QueueEdit: LocalizedError {
         case .invalidName: "Enter a single filename stem without path separators or control characters."
         case .invalidExtension: "The marked range must contain the original bounds and extend at least one edge."
         case .incompatibleCoordinateSpace: "Mark the extension in the same timeline as the original range."
+        case .replanBounds: "The original bounds are outside the current timeline. Mark a new range to revise this entry."
+        case .replanExcerpt: "Mark a range in the editor to recapture this transcript excerpt."
         }
     }
 
@@ -101,6 +105,15 @@ extension QueuedRange {
                 }
             }
             items.append(contentsOf: try CutProject.stillSequence(project).queueReplacementItems(assets: project.stillAssets))
+            let snapshot = CutProject.stillSequence(project)
+            if project.stillSoundtrack != nil,
+               let mapping = try snapshot.stillSoundtrackMapping(in: .init(from: .zero, to: try snapshot.resolveStills().duration)) {
+                let streams = media[URL(fileURLWithPath: mapping.clip.file)]?.streams.filter { $0.kind == "audio" } ?? []
+                let ordinal = mapping.clip.audioTrack ?? 0
+                items.append(.init(kind: "audio", file: mapping.clip.file, from: mapping.source.from,
+                                   to: mapping.source.to, output: mapping.output,
+                                   stream: streams.indices.contains(ordinal) ? streams[ordinal].index : nil))
+            }
             return items
         }
         return clips.map { .init(kind: "clip", file: $0.file.path, from: $0.from, to: $0.to) }
@@ -153,5 +166,116 @@ extension MulticamQueuedRange {
             items.append(contentsOf: laneItems)
         }
         return items
+    }
+}
+
+private extension CutProject {
+    var queuedStillImages: Set<URL> {
+        guard !stillAssets.isEmpty else { return [] }
+        let placements = stillInserts.map { ($0.id, $0.assetID) } + stillReplacements.map { ($0.id, $0.assetID) }
+        let byPlacement = Dictionary(placements, uniquingKeysWith: { first, _ in first })
+        let used = (try? resolveStills()).map { plan in
+            Set(plan.spans.compactMap { $0.placementID.flatMap { byPlacement[$0] } })
+        } ?? Set(byPlacement.values)
+        return Set(stillAssets.compactMap { asset in
+            guard !asset.isGap, used.contains(asset.id) else { return nil }
+            return ProjectMediaVolume.watchURL(URL(fileURLWithPath: asset.file))
+        })
+    }
+}
+
+struct QueueMediaTargets {
+    private(set) var presenceOnlyByURL: [URL: Bool] = [:]
+    private(set) var indexed: [URL: MediaInfo] = [:]
+
+    mutating func include(recordings: Set<URL>, stills: Set<URL>, media: some Sequence<MediaInfo>) {
+        for url in stills where presenceOnlyByURL[url] == nil { presenceOnlyByURL[url] = true }
+        for url in recordings { presenceOnlyByURL[url] = false }
+        for info in media {
+            let url = ProjectMediaVolume.watchURL(info.url)
+            if recordings.contains(url) { indexed[url] = info }
+        }
+    }
+}
+
+extension QueuedRange {
+    private var recordingURLs: Set<URL> {
+        var urls = Set(clips.map(\.file))
+        for reference in [stillProject?.stillAudioReference, stillProject?.stillSoundtrack].compactMap({ $0 }) {
+            urls.insert(URL(fileURLWithPath: reference.file))
+        }
+        return Set(urls.map(ProjectMediaVolume.watchURL))
+    }
+
+    var mediaDependencies: Set<URL> {
+        recordingURLs.union(stillProject?.queuedStillImages ?? [])
+    }
+
+    func addMediaTargets(to targets: inout QueueMediaTargets) {
+        targets.include(recordings: recordingURLs, stills: stillProject?.queuedStillImages ?? [], media: media.values)
+    }
+}
+
+extension MulticamQueuedRange {
+    var recordingDependencies: [MulticamSource] {
+        let snapshot = snapshot
+        guard let plan = try? snapshot.plan() else { return snapshot.sources }
+        var used = Set(plan.picture.map(\.source))
+        if plan.picture.isEmpty {
+            if let reference = plan.intervals.first?.angle { used.insert(reference) }
+            // A still-only assembly uses the reference angle to choose its output format.
+            if snapshot.assemblyItems?.contains(where: { $0.still != nil }) == true {
+                used.insert(snapshot.referenceAngle)
+            }
+        }
+        if !snapshot.stillReplacements.isEmpty, let stillPlan = try? CutProject.multicam(snapshot).resolveStills() {
+            for span in stillPlan.spans where span.placementID != nil {
+                guard case .group(_, let group) = span.origin,
+                      let source = snapshot.pictureSource(for: snapshot.referenceAngle, at: group.from),
+                      source.coverage.map({ group.to <= $0.to }) ?? true else { continue }
+                used.insert(source.id)
+            }
+        }
+        let bindings = Dictionary(uniqueKeysWithValues: snapshot.audioReplacements.map { ($0.original, $0) })
+        for lane in plan.audioLanes {
+            if lane.spans.isEmpty, let selection = snapshot.configuredSelection(for: lane) {
+                used.insert(selection.source)
+            }
+            for span in lane.spans {
+                let selection = span.stream.map { MulticamAudioSelection(source: span.source, stream: $0) }
+                if let binding = selection.flatMap({ bindings[$0] }) {
+                    used.insert(binding.replacement.source)
+                    // Replacement coverage may require scratch audio as a fallback.
+                    if binding.uncovered == .keepOriginal { used.insert(span.source) }
+                } else {
+                    used.insert(span.source)
+                }
+            }
+        }
+        return snapshot.sources.filter { used.contains($0.id) }
+    }
+
+    private var recordingURLs: Set<URL> {
+        Set(recordingDependencies.map { ProjectMediaVolume.watchURL(URL(fileURLWithPath: $0.file)) })
+    }
+
+    var mediaDependencies: Set<URL> {
+        recordingURLs.union(CutProject.multicam(snapshot).queuedStillImages)
+    }
+
+    func addMediaTargets(to targets: inout QueueMediaTargets) {
+        targets.include(recordings: recordingURLs, stills: CutProject.multicam(snapshot).queuedStillImages, media: media.values)
+    }
+}
+
+let noReadyQueueEntries = CutError(code: "no_ready_queue_entries", message: "Replan an affected range or add a new range to export.")
+
+@MainActor
+func checkQueueDependencies(_ urls: Set<URL>, status: (URL) -> ProjectMediaStatus) throws {
+    if let blocked = urls.sorted(by: { $0.path < $1.path }).first(where: {
+        [.offline, .ignored, .changed, .needsReview, .checking].contains(status($0))
+    }) {
+        throw CutError(code: "source_needs_review",
+                       message: "Review \(blocked.lastPathComponent) in Project Media before replanning this entry.")
     }
 }

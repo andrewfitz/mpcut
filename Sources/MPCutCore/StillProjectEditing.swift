@@ -106,7 +106,7 @@ extension CutProject {
         let framing = StillImageFraming(mode: .fit, background: background)
         try framing.validate()
         let gapIDs = Set(stillAssets.filter(\.isGap).map(\.id))
-        let asset = stillAssets.first(where: \.isGap) ?? StillAsset(gapID: UUID().uuidString)
+        let asset = stillAssets.first(where: \.isGap) ?? StillAsset(gapID: ProjectIdentifier.make(avoiding: stillAssets.map(\.id)))
         let previousAssets = Set(stillInserts.map(\.assetID))
         var addedGap = false
         func spaced<Item>(_ items: [Item], insert: KeyPath<Item, StillInsert?>, make: (StillInsert) -> Item,
@@ -123,7 +123,7 @@ extension CutProject {
                 let duration = try spacing(items[left], items[right])
                 if duration > .zero {
                     let existing = items[(left + 1)..<right].first?[keyPath: insert]
-                    result.append(make(StillInsert(id: existing?.id ?? UUID().uuidString, assetID: existing?.assetID ?? asset.id,
+                    result.append(make(StillInsert(id: existing?.id ?? ProjectIdentifier.make(), assetID: existing?.assetID ?? asset.id,
                                                    duration: duration, cadence: cadence, framing: framing)))
                     addedGap = true
                 }
@@ -207,16 +207,25 @@ extension CutProject {
     public func resizingStill(id: String, duration: RationalTime, cadence: RationalTime? = nil) throws -> CutProject {
         try editingInsert(id: id) { insert in
             var changed = insert
+            if changed.duration != duration || cadence.map({ $0 != changed.cadence }) == true {
+                if stillSoundtrack != nil, let format = stillFormat {
+                    let rate = RationalTime(numerator: format.cadence.denominator, denominator: format.cadence.numerator)
+                    changed.usesExactDuration = try duration.multiplied(by: rate).denominator != 1
+                } else {
+                    changed.usesExactDuration = false
+                }
+            }
             changed.duration = duration
             if let cadence { changed.cadence = cadence }
             return [changed]
         }
     }
 
-    public func splittingStill(id: String, at offset: RationalTime, newID: String = UUID().uuidString) throws -> CutProject {
+    public func splittingStill(id: String, at offset: RationalTime, newID: String = ProjectIdentifier.make()) throws -> CutProject {
         try editingInsert(id: id) { insert in
             var left = insert
             left.duration = offset
+            left.usesExactDuration = false
             var right = insert
             right.duration = try insert.duration.subtracting(offset)
             right.id = newID
@@ -267,7 +276,7 @@ extension CutProject {
                 if position < end {
                     guard let clip = item.source else { throw insertConflict(item.still!.id) }
                     let split = try clip.from.adding(position.subtracting(start))
-                    try project.splitClip(at: index, time: split, rightID: UUID().uuidString)
+                    try project.splitClip(at: index, time: split, rightID: ProjectIdentifier.make())
                     project.items.insert(.still(insert), at: index + 1)
                     return
                 }
@@ -306,7 +315,7 @@ extension CutProject {
         return try addingStillReplacement(.init(id: id, assetID: assetID, framing: framing, coverage: .sequence(fragments)))
     }
 
-    public func splittingSequenceClip(id: String, at time: RationalTime, newID: String = UUID().uuidString) throws -> CutProject {
+    public func splittingSequenceClip(id: String, at time: RationalTime, newID: String = ProjectIdentifier.make()) throws -> CutProject {
         try editSequenceClip(id: id) { try $0.splitClip(at: $1, time: time, rightID: newID) }
     }
 
@@ -345,7 +354,7 @@ extension CutProject {
                 let retained = AudioAnalysis.retained(in: .init(from: original.from, to: original.to), removing: cuts)
                 let pieces = retained.map { span -> CutSequenceClip in
                     var clip = original
-                    if span.from != original.from { clip.id = UUID().uuidString }
+                    if span.from != original.from { clip.id = ProjectIdentifier.make() }
                     clip.from = span.from
                     clip.to = span.to
                     return clip
@@ -382,7 +391,7 @@ extension CutProject {
         }, multicam: { _ in throw stillError("Sequence pause removal requires a sequence") })
     }
 
-    public func duplicatingSequenceClip(id: String, newID: String = UUID().uuidString) throws -> CutProject {
+    public func duplicatingSequenceClip(id: String, newID: String = ProjectIdentifier.make()) throws -> CutProject {
         try editSequenceClip(id: id) { project, index in
             guard var clip = project.items[index].source else { throw unknownStill(id) }
             clip.id = newID
@@ -391,7 +400,7 @@ extension CutProject {
                 guard case .sequence(let fragments) = replacement.coverage else { return nil }
                 let added = fragments.filter { $0.clipID == id }.map { StillReplacementFragment(clipID: newID, range: $0.range) }
                 guard !added.isEmpty else { return nil }
-                return .init(id: UUID().uuidString, assetID: replacement.assetID, framing: replacement.framing,
+                return .init(id: ProjectIdentifier.make(), assetID: replacement.assetID, framing: replacement.framing,
                              coverage: .sequence(added))
             }
             project.stillReplacements.append(contentsOf: copies)

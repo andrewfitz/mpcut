@@ -32,6 +32,9 @@
         "history": {
           "$ref": "#/$defs/sequenceHistory"
         },
+        "media_snapshot": {
+          "$ref": "#/$defs/mediaSnapshot"
+        },
         "still_assets": {
           "type": "array",
           "items": {
@@ -229,6 +232,9 @@
         },
         "history": {
           "$ref": "#/$defs/multicamHistory"
+        },
+        "media_snapshot": {
+          "$ref": "#/$defs/mediaSnapshot"
         },
         "still_assets": {
           "type": "array",
@@ -667,6 +673,12 @@
             ]
           }
         },
+        "transcript_bindings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/transcriptBindingChange"
+          }
+        },
         "source_selects": {
           "type": "array",
           "maxItems": 1000000,
@@ -839,6 +851,12 @@
                 "$ref": "#/$defs/transcriptAuthoredRecord"
               }
             ]
+          }
+        },
+        "transcript_bindings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/transcriptBindingChange"
           }
         },
         "mix_lanes": {
@@ -1919,9 +1937,7 @@
       "required": [
         "id",
         "range",
-        "bounds",
-        "role",
-        "state"
+        "bounds"
       ]
     },
     "participantSourceGeometry": {
@@ -1933,10 +1949,19 @@
         "analysis_identity": {
           "$ref": "#/$defs/stillID"
         },
+        "feed_layout": {
+          "type": "string",
+          "pattern": "^(meeting|auto|[1-9][0-9]*x[1-9][0-9]*)$",
+          "description": "Omitted for a meeting scan. Automatic feed detection uses auto. Fixed grids use columns x rows, with up to 64 cells."
+        },
         "source_inode": {
           "type": "integer",
           "minimum": 0,
           "maximum": 18446744073709551615
+        },
+        "source_content_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         },
         "source_stamp": {
           "type": "object",
@@ -1962,6 +1987,13 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/participantAppearance"
+          }
+        },
+        "unresolved_participant_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stillID"
           }
         },
         "coverage": {
@@ -1990,9 +2022,7 @@
       },
       "additionalProperties": false,
       "required": [
-        "source_id",
-        "appearances",
-        "coverage"
+        "source_id"
       ]
     },
     "participantPerson": {
@@ -2055,8 +2085,7 @@
       "additionalProperties": false,
       "required": [
         "id",
-        "name",
-        "speakers"
+        "name"
       ]
     },
     "participantSlot": {
@@ -2172,7 +2201,7 @@
               "maximum": 16777215
             },
             "frame_rate": {
-              "$ref": "#/$defs/time"
+              "$ref": "#/$defs/transcriptTime"
             }
           },
           "additionalProperties": false
@@ -2287,12 +2316,223 @@
           "$ref": "#/$defs/participantRender"
         }
       },
-      "additionalProperties": false,
+      "additionalProperties": false
+    },
+    "mediaSnapshot": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "integer"
+        }
+      },
       "required": [
-        "people",
-        "sources",
-        "appearance_overrides"
-      ]
+        "version"
+      ],
+      "if": {
+        "properties": {
+          "version": {
+            "const": 1
+          }
+        }
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "const": 1
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/mediaSnapshotEntry"
+            }
+          }
+        },
+        "required": [
+          "version",
+          "entries"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "mediaSnapshotEntry": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/file"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "modified_seconds": {
+          "type": "integer"
+        },
+        "modified_nanoseconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 999999999
+        },
+        "duration": {
+          "$ref": "#/$defs/transcriptTime"
+        },
+        "origin": {
+          "$ref": "#/$defs/transcriptTime"
+        },
+        "frame_rate": {
+          "$ref": "#/$defs/transcriptTime"
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "streams": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string"
+              },
+              "codec": {
+                "type": "string"
+              },
+              "channels": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "language": {
+                "type": "string"
+              },
+              "channel_layout": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "index",
+              "kind",
+              "codec",
+              "channels",
+              "language"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "source_clock": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "enum": [
+                "timecode",
+                "broadcast_wave"
+              ]
+            },
+            "start": {
+              "$ref": "#/$defs/transcriptTime"
+            }
+          },
+          "required": [
+            "kind",
+            "start"
+          ],
+          "additionalProperties": false
+        },
+        "source_fingerprint": {
+          "$ref": "#/$defs/transcriptDigest"
+        },
+        "still_sha256": {
+          "$ref": "#/$defs/transcriptDigest"
+        },
+        "evidence": {
+          "type": "object",
+          "properties": {
+            "format": {
+              "type": "string"
+            },
+            "origin": {
+              "$ref": "#/$defs/transcriptTime"
+            },
+            "duration": {
+              "$ref": "#/$defs/transcriptTime"
+            },
+            "video_index": {
+              "type": "integer"
+            },
+            "index_issues": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "streams": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          },
+          "required": [
+            "format",
+            "origin",
+            "duration",
+            "video_index",
+            "index_issues",
+            "streams"
+          ],
+          "additionalProperties": false
+        },
+        "previous_path": {
+          "$ref": "#/$defs/file"
+        },
+        "relink_uses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ignored": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": true
+    },
+    "transcriptBindingChange": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {
+          "$ref": "#/$defs/stillID"
+        },
+        "track_id": {
+          "$ref": "#/$defs/stillID"
+        },
+        "before": {
+          "$ref": "#/$defs/transcriptBinding"
+        },
+        "after": {
+          "$ref": "#/$defs/transcriptBinding"
+        }
+      },
+      "required": [
+        "attachment_id",
+        "track_id",
+        "before",
+        "after"
+      ],
+      "additionalProperties": false
     }
   }
 }

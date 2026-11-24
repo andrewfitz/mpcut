@@ -334,7 +334,7 @@ struct MulticamTrackReplacementView: View {
         }
         guard project.sources.contains(where: { $0.id == draft.id }) else { return draft }
         var source = draft.source
-        source.id = UUID().uuidString
+        source.id = ProjectIdentifier.make(avoiding: project.sources.map(\.id))
         source.offset = .zero
         source.coverage = nil
         source.additionalRecordings = []

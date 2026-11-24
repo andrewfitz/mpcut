@@ -16,17 +16,20 @@ enum CommandPath {
         "participants scan": .scan, "participants markers build": .markers, "participants project inspect": .inspect,
         "participants project accept": .accept, "participants project apply": .apply, "participants render plan": .plan,
         "participants render export": .render, "participants angles list": .angles,
-        "participants angles plan": .planAngles, "participants angles render": .renderAngles
+        "participants angles take": .takeAngle, "participants angles plan": .planAngles, "participants angles render": .renderAngles
     ]
     static let stills: [String: StillOptions.Operation] = [
         "timeline gap insert": .add, "still picture replace": .add, "still placement insert": .add,
         "still placement list": .list, "still placement update": .update, "still placement remove": .remove,
-        "still asset relink": .relink, "timeline clips space": .space
+        "still asset relink": .relink, "timeline clips space": .space,
+        "still soundtrack attach": .attachSoundtrack, "still soundtrack fit": .fitSoundtrack,
+        "still soundtrack detach": .detachSoundtrack
     ]
     static let paths = Set([
         "project create", "project edit", "multicam switch coverage", "project convert", "project resolve import", "project resolve export", "analysis sidecar inspect",
         "analysis sidecar build", "still project create", "silence shorten", "silence scan", "silence plan", "silence export",
-        "scenes scan", "scenes export", "project media refresh", "multicam sync suggest", "waveform envelope read", "review frames export",
+        "scenes scan", "scenes export", "project media refresh", "project media list", "project media relink", "project media locate", "project media replace",
+        "multicam sync suggest", "waveform envelope read", "review frames export",
         "timeline range map", "history compare", "media inspect", "project inspect", "export ranges separate", "export project render",
         "export clips join", "export soundtrack replace", "export ranges join"
     ]).union(transcript.keys).union(stills.keys).union(participants.keys)

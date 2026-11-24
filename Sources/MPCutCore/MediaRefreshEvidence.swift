@@ -173,13 +173,35 @@ struct MediaRefreshEvidence: Codable, Sendable {
         return try encoder.encode(self)
     }
 
-    var hasCompleteProof: Bool {
-        streams.filter { $0.kind == "audio" || $0.kind == "video" }.allSatisfy { $0.payload != nil }
+    struct Content: Codable, Equatable, Sendable {
+        private enum CodingKeys: String, CodingKey {
+            case format, origin, duration, streams
+            case videoIndex = "video_index"
+            case indexIssues = "index_issues"
+        }
+
+        let format: String
+        let origin: RationalTime
+        let duration: RationalTime
+        let videoIndex: Int
+        let indexIssues: [String]
+        let streams: [Stream]
+
+        var hasCompleteProof: Bool {
+            let playable = streams.filter { $0.kind == "audio" || $0.kind == "video" }
+            return !playable.isEmpty && playable.allSatisfy { $0.payload != nil && $0.timing != nil && $0.packetLayout != nil }
+        }
     }
 
+    var content: Content {
+        Content(format: format, origin: origin, duration: duration, videoIndex: videoIndex,
+                indexIssues: indexIssues, streams: streams)
+    }
+
+    var hasCompleteProof: Bool { content.hasCompleteProof }
+
     func hasSameObservedInputs(as old: Self) -> Bool {
-        duration == old.duration && origin == old.origin && videoIndex == old.videoIndex &&
-            format == old.format && indexIssues == old.indexIssues && streams == old.streams
+        content == old.content
     }
 
     func verifiesSameFileContents(as old: Self) -> Bool {

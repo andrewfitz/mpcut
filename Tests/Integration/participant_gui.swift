@@ -8,10 +8,10 @@ struct Failure: LocalizedError {
     var errorDescription: String? { message }
 }
 
-func wait<T>(_ description: String, timeout: TimeInterval = 12, _ inspect: () -> T?) throws -> T {
+func wait<T>(_ description: String, timeout: TimeInterval = 12, _ inspect: () throws -> T?) throws -> T {
     let end = Date().addingTimeInterval(timeout)
     repeat {
-        if let result = inspect() { return result }
+        if let result = try inspect() { return result }
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
     } while Date() < end
     throw Failure("Timed out waiting for " + description)
@@ -72,12 +72,24 @@ struct Editor {
     }
 
     func choose(_ name: String, from menu: String) throws {
-        let button = try control(menu)
-        try press(button, description: menu)
-        let option = try wait(name) {
-            controls(name, role: "AXMenuItem", in: button).first ?? controls(name, role: "AXMenuItem").first
+        func menuButton() -> AXUIElement? {
+            controls(menu).first { node in
+                ["AXMenuButton", "AXPopUpButton"].contains(value(node, "AXRole") as String? ?? "")
+                    && value(node, "AXEnabled") as Bool? != false
+            }
         }
-        try press(option, description: name)
+        for _ in 0..<3 {
+            let button = try wait(menu + " menu", menuButton)
+            try press(button, description: menu)
+            if let item = try? wait(name, timeout: 3, {
+                controls(name, role: "AXMenuItem", in: menuButton()).first
+                    ?? controls(name, role: "AXMenuItem").first
+            }) {
+                try press(item, description: name)
+                return
+            }
+        }
+        throw Failure("Could not find \(name) in \(menu)")
     }
 
     func inspector(_ name: String) throws {
@@ -90,31 +102,23 @@ struct Editor {
         }
     }
 
-    func key(_ code: CGKeyCode, flags: CGEventFlags = [], text: String? = nil) throws {
-        for down in [true, false] {
-            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) else {
-                throw Failure("Could not construct keyboard input")
-            }
-            event.flags = flags
-            if let text {
-                let units = Array(text.utf16)
-                event.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
-            }
-            event.postToPid(pid)
-        }
-        RunLoop.current.run(until: Date().addingTimeInterval(0.12))
-    }
-
     func seek(_ seconds: String, displayed: String) throws {
         try press("Timeline position", role: "AXButton")
-        _ = try wait("focused timeline position") {
+        let field = try wait("focused timeline position") {
             controls("Enter playhead time", role: "AXTextField").first {
                 value($0, "AXFocused") as Bool? == true
             }
         }
-        try key(0, flags: .maskCommand)
-        try key(0, text: seconds)
-        try key(36)
+        let previous: String = value(field, "AXValue") ?? ""
+        var range = CFRange(location: 0, length: previous.utf16.count)
+        guard let selected = AXValueCreate(.cfRange, &range),
+              AXUIElementSetAttributeValue(field, kAXSelectedTextRangeAttribute as CFString, selected) == .success,
+              AXUIElementSetAttributeValue(field, kAXSelectedTextAttribute as CFString, seconds as CFString) == .success else {
+            throw Failure("Could not enter timeline position " + seconds)
+        }
+        guard AXUIElementPerformAction(field, kAXConfirmAction as CFString) == .success else {
+            throw Failure("Could not submit timeline position " + seconds)
+        }
         _ = try wait("timeline at " + displayed) {
             controls("Timeline position", role: "AXButton").first {
                 value($0, "AXValue") as String? == displayed
@@ -142,9 +146,16 @@ struct Editor {
         }
         try press(row, description: name + " roster row")
         _ = try wait(name + " pinned") {
-            controls("Participant name", role: "AXTextField").first {
+            controls(name, role: "AXTextField").first {
                 value($0, "AXValue") as String? == name
             }
+        }
+    }
+
+    func bindSpeaker(_ name: String) throws {
+        try choose(name, from: "Bind Transcript Speakers")
+        _ = try wait(name + " binding to enable Filter Transcript") {
+            controls("Filter Transcript", role: "AXButton").first { value($0, "AXEnabled") as Bool? != false }
         }
     }
 
@@ -161,25 +172,126 @@ struct Editor {
 
     func save(_ project: URL) throws {
         let data = try Data(contentsOf: project)
-        try key(1, flags: .maskCommand)
+        try press("Save Project", role: "AXButton")
         _ = try wait("project file to be saved") {
             guard let updated = try? Data(contentsOf: project), updated != data else { return nil as Data? }
             return updated
         }
     }
 
+    func verifySpeakerBindings(in project: URL) throws {
+        let json = try JSONSerialization.jsonObject(with: Data(contentsOf: project)) as? [String: Any]
+        let participants = json?["participants"] as? [String: Any]
+        let people = participants?["people"] as? [[String: Any]] ?? []
+        for (personID, speakerID) in [("host", "speaker-0"), ("guest", "speaker-1")] {
+            let person = people.first { $0["id"] as? String == personID }
+            let speakers = person?["speakers"] as? [[String: String]] ?? []
+            guard speakers == [["attachment_id": "overlap", "speaker_id": speakerID]] else {
+                throw Failure("Saved \(personID) speaker bindings differ: \(speakers)")
+            }
+        }
+    }
+
+    func reviewScan(evidence: URL?) throws {
+        try press("Scan Participants", role: "AXButton")
+        _ = try wait("participant scan review", timeout: 60) {
+            nodes().first {
+                labels($0).contains { $0.hasSuffix(" detected appearances") && !$0.hasPrefix("0 ") }
+            }
+        }
+        try capture("participant-scan-review", evidence: evidence)
+        print("Verified native participant scan review")
+
+        try press("Layout Change Markers", role: "AXDisclosureTriangle")
+        try press("Review Marker Candidates", role: "AXButton")
+        let candidate = try wait("layout change marker candidates") {
+            nodes().first { node in
+                value(node, "AXRole") as String? == "AXButton"
+                    && labels(node).contains { $0.hasPrefix("1 s · ") && $0.contains("participants changed") }
+            }
+        }
+        try press(candidate, description: "one-second layout change marker")
+        _ = try wait("marker jump to one second") {
+            controls("Timeline position", role: "AXButton").first {
+                value($0, "AXValue") as String? == "00:01.000"
+            }
+        }
+        try capture("participant-layout-markers", evidence: evidence)
+        print("Verified layout change marker review and timeline jump")
+
+        try press("Review Reconciliation…", role: "AXButton")
+        _ = try control("Reconcile Participant Geometry")
+        _ = try control("Replace Geometry", role: "AXButton")
+        try capture("participant-reconciliation-review", evidence: evidence)
+        try press("Cancel", role: "AXButton")
+        print("Verified reconciliation review and cancel")
+
+    }
+
+    func acceptAutomaticFeeds(in project: URL, evidence: URL?) throws {
+        for (current, layout) in [("Meeting", "Fixed Feed Grid"), ("Fixed Feed Grid", "Automatic Feeds")] {
+            try choose(layout, from: controls("Scan Layout", role: "AXPopUpButton").isEmpty ? current : "Scan Layout")
+            let button = try wait(layout + " selection") {
+                guard !controls(layout, role: "AXPopUpButton").isEmpty,
+                      controls("Accept Geometry", role: "AXButton").isEmpty else { return nil as AXUIElement? }
+                return controls("Scan Feeds", role: "AXButton").first { value($0, "AXEnabled") as Bool? == true }
+            }
+            try press(button, description: "scan with " + layout)
+            if layout == "Automatic Feeds" {
+                let percent = try wait("live feed scan percentage") { () -> Int? in
+                    for node in nodes() where value(node, "AXRole") as String? == "AXProgressIndicator" {
+                        guard labels(node).contains("Scanning feeds") else { continue }
+                        if let fraction: Double = value(node, "AXValue"), fraction > 0 && fraction < 1 {
+                            return Int((100 * fraction).rounded())
+                        }
+                        for label in labels(node) where label.hasSuffix("%") {
+                            if let percent = Int(label.dropLast()), (1..<100).contains(percent) { return percent }
+                        }
+                    }
+                    return nil
+                }
+                print("Observed live scan bar at \(percent)%")
+                try capture("feed-scan-progress", evidence: evidence)
+            }
+            _ = try wait(layout + " review", timeout: 90) {
+                controls("Accept Geometry", role: "AXButton").first { value($0, "AXEnabled") as Bool? == true }
+            }
+            _ = try wait(layout + " scan progress at 100%") {
+                nodes().first { node in
+                    value(node, "AXRole") as String? == "AXProgressIndicator"
+                        && (labels(node).contains("100%") || value(node, "AXValue") as Double? == 1)
+                }
+            }
+            _ = try control("100%", role: "AXStaticText")
+            if layout == "Fixed Feed Grid" {
+                try seek("2.25", displayed: "00:02.250")
+                _ = try control("Four-second grid.mov", role: "AXStaticText")
+                _ = try wait("alternate source ready for its first scan") {
+                    guard controls("100%", role: "AXStaticText").isEmpty,
+                          controls("Accept Geometry", role: "AXButton").isEmpty else { return nil as AXUIElement? }
+                    return controls("Scan Participants", role: "AXButton").first { value($0, "AXEnabled") as Bool? == true }
+                }
+                try seek("0", displayed: "00:00.000")
+                _ = try control("Camera feeds.mov", role: "AXStaticText")
+                _ = try control("100%", role: "AXStaticText")
+                _ = try control("Accept Geometry", role: "AXButton")
+                print("Verified the scan review follows the selected recording across camera switches")
+            }
+        }
+        try capture("automatic-feed-scan", evidence: evidence)
+        try press("Accept Geometry", role: "AXButton")
+        _ = try wait("accepted feed geometry") {
+            controls("Accept Geometry", role: "AXButton").isEmpty ? true : nil
+        }
+        try save(project)
+    }
+
     func capture(_ name: String, evidence: URL?) throws {
         guard let evidence else { return }
-        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-            as? [[String: Any]]
-        guard let entry = windows?.first(where: {
-            $0[kCGWindowOwnerPID as String] as? Int32 == pid && $0[kCGWindowLayer as String] as? Int == 0
-        }), let id = entry[kCGWindowNumber as String] as? Int else {
-            throw Failure("Could not find the test window for " + name)
-        }
         let capture = Process()
-        capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        capture.arguments = ["-x", "-o", "-l", String(id), evidence.appendingPathComponent(name + ".png").path]
+        capture.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        capture.arguments = ["backstage", "screenshot", "--pid", String(pid), "-o",
+                             evidence.appendingPathComponent(name + ".png").path]
         try capture.run()
         capture.waitUntilExit()
         guard capture.terminationStatus == 0 else { throw Failure("Could not capture " + name) }
@@ -197,68 +309,40 @@ func run() throws {
     guard (3...4).contains(CommandLine.arguments.count) else {
         throw Failure("Usage: participant_gui.swift APP PROJECT [EVIDENCE_DIRECTORY]")
     }
-    guard AXIsProcessTrusted(), CGPreflightPostEventAccess() else {
+    guard AXIsProcessTrusted() else {
         throw Failure("The terminal needs Accessibility access")
     }
     let bundle = URL(fileURLWithPath: CommandLine.arguments[1]).standardizedFileURL
     let project = URL(fileURLWithPath: CommandLine.arguments[2]).standardizedFileURL
     let evidence = CommandLine.arguments.dropFirst(3).first.map { URL(fileURLWithPath: $0) }
-    let home = project.deletingLastPathComponent().appendingPathComponent("home/Library/Preferences")
-    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
-    let instance = "mpcut-test-" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
-    defer {
-        let cleanup = Process()
-        cleanup.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
-        cleanup.arguments = ["delete", "com.mpcut.test-preferences." + instance]
-        cleanup.standardError = FileHandle.nullDevice
-        if (try? cleanup.run()) != nil { cleanup.waitUntilExit() }
-    }
-    let config = NSWorkspace.OpenConfiguration()
-    config.createsNewApplicationInstance = true
-    config.activates = true
-    config.addsToRecentItems = false
-    config.arguments = [
-        "-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO",
-        "-AppleLanguages", "(en)", "-automation_local_mcp_enabled", "NO",
-        "-analysis_sidecar_reuse_enabled", "NO",
-    ]
-    config.environment = [
-        "MPCUT_TEST_SOCKET_DIRECTORY": instance,
-        "CFFIXED_USER_HOME": home.deletingLastPathComponent().deletingLastPathComponent().path,
-    ]
-    let existing = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
-    let previousFrontmost = NSWorkspace.shared.frontmostApplication
-    var launched: Result<NSRunningApplication, Error>?
-    NSWorkspace.shared.open([project], withApplicationAt: bundle, configuration: config) { app, error in
-        if let app { launched = .success(app) }
-        else { launched = .failure(error ?? Failure("Could not launch test editor")) }
-    }
-    let app = try wait("isolated test launch", timeout: 30) { launched }.get()
-    guard !existing.contains(app.processIdentifier),
+    guard let rawPID = ProcessInfo.processInfo.environment["MPCUT_TEST_EDITOR_PID"],
+          let pid = Int32(rawPID), let app = NSRunningApplication(processIdentifier: pid),
           app.bundleURL?.resolvingSymlinksInPath() == bundle.resolvingSymlinksInPath() else {
-        throw Failure("Launch Services did not open a new instance of the test bundle")
-    }
-    defer {
-        let restoreFocus = NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
-        if !app.isTerminated { app.forceTerminate() }
-        _ = try? wait("isolated editor to exit") { app.isTerminated ? true : nil }
-        if restoreFocus { previousFrontmost?.activate(options: []) }
+        throw Failure("Run participant_gui.py to launch the test editor on Backstage")
     }
     let editor = Editor(app: app)
     AXUIElementSetMessagingTimeout(editor.root, 3)
 
     do {
         _ = try wait("synthetic project window", timeout: 35) {
-            editor.windows.first {
+            if app.isTerminated { throw Failure("Test editor exited before opening the synthetic project (PID \(editor.pid))") }
+            return editor.windows.first {
                 (value($0, "AXTitle") as String?)?.hasPrefix(project.deletingPathExtension().lastPathComponent) == true
             }
         }
-        try editor.inspector("Participants")
+        try editor.inspector("Feeds")
+        if ProcessInfo.processInfo.environment["MPCUT_GUI_FEEDS_ONLY"] == "1" {
+            try editor.acceptAutomaticFeeds(in: project, evidence: evidence)
+            return
+        }
         try editor.pin("Host")
-        try editor.choose("Host Voice · overlap", from: "Bind Transcript Speakers")
+        try editor.bindSpeaker("Host Voice · overlap")
         try editor.pin("Guest")
         try editor.choose("recorder.mov · Stream 1", from: "Bind Audio")
-        try editor.choose("Guest Voice · overlap", from: "Bind Transcript Speakers")
+        _ = try editor.control("Audio · recorder.mov, stream 1", role: "AXMenuButton")
+        try editor.bindSpeaker("Guest Voice · overlap")
+        try editor.save(project)
+        try editor.verifySpeakerBindings(in: project)
         try editor.seek("2.25", displayed: "00:02.250")
         try editor.speaker("Host", offscreen: false)
         try editor.speaker("Guest", offscreen: false)
@@ -270,6 +354,12 @@ func run() throws {
             throw Failure("Could not distinguish the stage from the guest thumbnail")
         }
         try editor.press(stage, description: "guest stage appearance")
+        _ = try wait("guest stage source range") {
+            let start = editor.controls("Source start time", role: "AXTextField").first
+            let end = editor.controls("Source end time", role: "AXTextField").first
+            guard let start, let end else { return nil as Bool? }
+            return value(start, "AXValue") as String? == "2" && value(end, "AXValue") as String? == "3" ? true : nil
+        }
         try editor.press("Use This Appearance", role: "AXButton")
         try editor.capture("overlapping-speakers", evidence: evidence)
         try editor.seek("3.25", displayed: "00:03.250")
@@ -281,23 +371,45 @@ func run() throws {
         try editor.capture("offscreen-speaker", evidence: evidence)
         try editor.press("Filter Transcript", role: "AXButton")
         _ = try editor.control("transcript.import")
-        _ = try editor.control("guestword")
-        guard editor.controls("hostword").isEmpty else {
+        let dialogue = try editor.control("transcript.dialogue")
+        func showsWord(_ word: String) -> Bool {
+            editor.nodes(in: dialogue).contains { node in
+                labels(node).contains { $0.split(whereSeparator: { $0.isWhitespace }).contains(Substring(word)) }
+            }
+        }
+        _ = try wait("filtered guest dialogue") { showsWord("guestword") ? true : nil }
+        guard !showsWord("hostword") else {
             throw Failure("Transcript filter still shows the other participant")
         }
-        try editor.inspector("Participants")
+        try editor.inspector("Feeds")
         try editor.press("Composition and Export…", role: "AXButton")
         _ = try editor.control("Participant Composition")
-        try editor.choose("Pair", from: "Layout")
+        let layoutID = "participant.composition.layout"
+        try editor.choose("Pair", from: editor.controls(layoutID).isEmpty ? "Original" : layoutID)
+        _ = try editor.control("Pair", role: "AXPopUpButton")
         try editor.choose("Host", from: "Add Slot")
+        _ = try editor.control("Host", role: "AXDisclosureTriangle")
         try editor.choose("Guest", from: "Add Slot")
+        _ = try editor.control("Guest", role: "AXDisclosureTriangle")
         try editor.press("Preview", role: "AXButton")
-        _ = try editor.control("Rendered composition")
+        let previewID = "participant.composition.preview"
+        if !editor.controls(previewID).isEmpty {
+            _ = try wait("rendered pair preview") {
+                editor.controls(previewID).first { value($0, "AXValue") as String? == "Rendered" }
+                    ?? editor.controls("Source", role: "AXImage").first
+            }
+        }
+        _ = try wait("preview to finish") {
+            editor.controls("Preview", role: "AXButton").first { value($0, "AXEnabled") as Bool? != false }
+        }
         try editor.capture("pair-layout-offscreen", evidence: evidence)
         try editor.press("Check Export", role: "AXButton")
-        _ = try wait("publishable export report") {
+        _ = try wait("export preflight for a five-second pair layout") {
             editor.nodes().first {
-                labels($0).contains { $0.contains("\"publishable\" : true") }
+                labels($0).contains {
+                    $0.contains("1920 × 1080 at 30 fps") && $0.contains("5 s · 150 frames")
+                        && $0.contains("Audio · Silence") && !$0.contains("Export blocked")
+                }
             }
         }
         try editor.press("Save Composition", role: "AXButton")
@@ -306,6 +418,11 @@ func run() throws {
         try editor.save(project)
         print("Verified overlapping speakers, appearance selection and override, offscreen roster, and participant transcript filter")
         print("Verified pair composition preview, preflight action and project save")
+        let scan = editor.controls("Scan Participants", role: "AXButton").first
+        let requireScan = ProcessInfo.processInfo.environment["MPCUT_GUI_REQUIRE_SCAN"] == "1"
+        if requireScan || scan.map({ value($0, "AXEnabled") as Bool? == true }) == true {
+            try editor.reviewScan(evidence: evidence)
+        }
     } catch {
         editor.dump()
         throw error

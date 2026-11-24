@@ -59,7 +59,7 @@ final class MCPLiveOutputJobs {
 
     var hasRunningJobs: Bool { jobs.contains { $0.task != nil } }
 
-    func start(owner: String, revision: Int, nativeCancellation: EditCancellation? = nil,
+    func start(owner: String, revision: Int, project: URL? = nil, nativeCancellation: EditCancellation? = nil,
                finished: @escaping @MainActor () -> Void = {}, work: @escaping Work) throws -> [String: Any] {
         guard shutdownWaiters.isEmpty else { throw MCPCommandError("busy", "Output jobs are shutting down.") }
         guard jobs.filter({ $0.task != nil }).count < 4 else {
@@ -68,7 +68,7 @@ final class MCPLiveOutputJobs {
         if jobs.count >= 32, let i = jobs.firstIndex(where: { $0.task == nil }) { jobs.remove(at: i) }
         let job = Job(owner: owner, revision: revision, nativeCancellation: nativeCancellation)
         let progress = job.progress
-        let task = Task.detached(priority: .userInitiated) { () -> Outcome in
+        let task = ProjectSidecarWork(project: project).detached(priority: .userInitiated) { () -> Outcome in
             do {
                 try Task.checkCancellation()
                 return .success(try work(progress))

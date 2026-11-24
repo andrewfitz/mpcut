@@ -23,6 +23,8 @@ struct ParticipantCompositionSheet: View {
     @State private var renderedProject: URL?
     @State private var anglePersonIDs = Set<String>()
     @State private var angleMix = true
+    @State private var includeOriginalAngle = false
+    @State private var presentationAngleIDs = Set<String>()
     @State private var angleISOs = false
     @State private var angleFrom = "0"
     @State private var angleTo = ""
@@ -86,6 +88,10 @@ struct ParticipantCompositionSheet: View {
                                 Image(decorative: preview, scale: 1).resizable().scaledToFit()
                             }
                         }
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Composition Preview")
+                        .accessibilityValue(preview == nil ? "Pending" : "Rendered")
+                        .accessibilityIdentifier("participant.composition.preview")
                     }
                     if let report {
                         ScrollView { Text(report).font(.callout).frame(maxWidth: .infinity, alignment: .leading) }
@@ -121,7 +127,7 @@ struct ParticipantCompositionSheet: View {
             } else {
                 rangeStart = session.participantTimelineTime.description
             }
-            if let position = session.participantPosition { angleTo = position.media.duration.description }
+            if let position = session.participantPosition { angleTo = position.duration.description }
         }
         .onDisappear { progress?.cancel() }
         .onChange(of: shotClock) { _, clock in
@@ -201,9 +207,9 @@ struct ParticipantCompositionSheet: View {
                         Text("Group").tag(ParticipantShotClock.group)
                         Text("Edited Output").tag(ParticipantShotClock.output)
                     }
-                    if shotClock == .output && session.multicam.assemblyPreview {
-                        Toggle("Current occurrence only", isOn: $occurrenceOnly)
-                    }
+                }
+                if shotClock == .output, currentOccurrence != nil {
+                    Toggle("Current occurrence only", isOn: $occurrenceOnly)
                 }
                 HStack {
                     TextField("From seconds", text: $rangeStart)
@@ -228,6 +234,7 @@ struct ParticipantCompositionSheet: View {
                     Text(layout == .grid ? "Fixed 2 × 2" : layout.rawValue.capitalized).tag(layout)
                 }
             }
+            .accessibilityIdentifier("participant.composition.layout")
             if shot.layout.wrappedValue == .flow {
                 Toggle("Compact on confirmed absence", isOn: shot.compact)
             }
@@ -293,8 +300,7 @@ struct ParticipantCompositionSheet: View {
             let from = try RationalTime(parsing: rangeStart)
             let to = try RationalTime(parsing: rangeEnd)
             guard from < to else { throw CutError(code: "invalid_participant_range", message: "Choose a nonempty shot range.") }
-            let occurrence = shotClock == .output && occurrenceOnly && session.multicam.assemblyPreview
-                ? session.multicam.activeOccurrenceIndex : nil
+            let occurrence = shotClock == .output && occurrenceOnly ? currentOccurrence : nil
             var shot = plan.shots[shotIndex]
             shot.clock = shotClock
             shot.range = .init(from: from, to: to)
@@ -377,21 +383,85 @@ struct ParticipantCompositionSheet: View {
                     angles = []
                 }))
             }
+            Toggle("Include Original Gallery", isOn: $includeOriginalAngle)
+                .onChange(of: includeOriginalAngle) { _, _ in angles = [] }
+            ForEach(presentationAngles, id: \.self) { id in
+                Toggle("Presentation \((presentationAngles.firstIndex(of: id) ?? 0) + 1)",
+                       isOn: Binding(get: { presentationAngleIDs.contains(id) }, set: { enabled in
+                    if enabled { presentationAngleIDs.insert(id) }
+                    else { presentationAngleIDs.remove(id) }
+                    angles = []
+                }))
+            }
             HStack {
                 TextField("Source From", text: $angleFrom)
                 TextField("Source To", text: $angleTo)
             }
+            .onChange(of: angleFrom) { _, _ in angles = [] }
+            .onChange(of: angleTo) { _, _ in angles = [] }
             Toggle("Meeting mix on one program lane", isOn: $angleMix)
             Toggle("Include bound participant ISOs", isOn: $angleISOs)
             HStack {
                 Button("Review Virtual Angles", action: virtualAngles)
                 Button("Render Angle Media…", action: renderAngles)
             }
-            .disabled(anglePersonIDs.isEmpty || session.participantPosition == nil)
+            .disabled((anglePersonIDs.isEmpty && presentationAngleIDs.isEmpty && !includeOriginalAngle) ||
+                      session.participantPosition == nil)
             ForEach(angles) { angle in
-                Text("\(angle.name) · \(angle.range.from.description)–\(angle.range.to.description) s").font(.caption)
+                HStack {
+                    Text("\(angle.name) · \(angle.range.from.description)–\(angle.range.to.description) s").font(.caption)
+                    Spacer()
+                    Button("Take at Playhead") { take(angle) }
+                        .accessibilityLabel("Take \(angle.name) at Playhead")
+                        .disabled(compositionPlayhead == nil)
+                }
+            }
+            ParticipantDialogueReview(session: session, project: dialogueDraft, document: document, angles: angles,
+                                      preview: previewDialogue, commit: commitDialogue)
+        }
+    }
+
+    private var dialogueDraft: CutProject {
+        var draft = project
+        draft.participants.render = plan
+        return draft
+    }
+
+    private func commitDialogue(_ expected: CutProject, _ updated: CutProject, _ proposal: ParticipantDialogueProposal) throws {
+        guard dialogueDraft == expected else {
+            throw CutError(code: "stale_participant_dialogue", message: "The composition changed. Review suggestions again.")
+        }
+        try session.commitParticipants(updated.participants, action: "Take \(proposal.angle.name) on Dialogue")
+        if let saved = updated.participants.render {
+            plan = saved
+            shotIndex = saved.shots.count - 1
+        }
+    }
+
+    private func previewDialogue(_ proposal: ParticipantDialogueProposal) {
+        perform {
+            let draft = try documentForRender()
+            let source = document
+            let rate = plan.canvas.frameRate
+            run { token in
+                let adjusted = try ParticipantDialogue.accepting(proposal, in: draft, document: source)
+                let frames = try proposal.at.multiplied(by: rate)
+                let tick = frames.numerator / frames.denominator + (frames.numerator % frames.denominator == 0 ? 0 : 1)
+                let cadence = RationalTime(numerator: rate.denominator, denominator: rate.numerator)
+                let sampleTime = try cadence.multiplied(by: .init(numerator: tick))
+                return try ParticipantRenderer(cancelled: { token.isCancelled })
+                    .frame(adjusted, document: source, at: sampleTime)
+            } onSuccess: {
+                preview = $0
+                sourcePreview = nil
             }
         }
+    }
+
+    private var presentationAngles: [String] {
+        guard let source = session.participantPosition,
+              let geometry = participants.sources.first(where: { $0.sourceID == source.sourceID }) else { return [] }
+        return Set(geometry.appearances.filter { $0.state == .presentation }.map(\.id)).sorted()
     }
 
     private func anglePlan() throws -> [ParticipantVirtualAngle] {
@@ -400,12 +470,13 @@ struct ParticipantCompositionSheet: View {
         }
         let from = try RationalTime(parsing: angleFrom)
         let to = try RationalTime(parsing: angleTo)
-        guard to <= source.media.duration else {
+        guard to <= source.duration else {
             throw CutError(code: "invalid_participant_range", message: "Choose a range within the selected recording.")
         }
-        return try ParticipantMulticam.virtualAngles(participants, sourceID: source.sourceID,
+        return try ParticipantMulticam.virtualAngles(project, sourceID: source.sourceID,
                                                      participantIDs: participants.people.map(\.id).filter(anglePersonIDs.contains),
-                                                     range: .init(from: from, to: to))
+                                                     range: .init(from: from, to: to), includeOriginal: includeOriginalAngle,
+                                                     presentationIDs: presentationAngles.filter(presentationAngleIDs.contains))
     }
 
     private func virtualAngles() {
@@ -417,9 +488,35 @@ struct ParticipantCompositionSheet: View {
             let canvas = plan.canvas
             let audio = ParticipantMulticamAudioRouting(meetingMix: angleMix, includeISOs: angleISOs)
             run { token in
-                try Self.formatted(ParticipantMulticam.report(requestedAngles, project: project, document: source,
-                                                               canvas: canvas, audio: audio, cancelled: { token.isCancelled }))
-            } onSuccess: { report = $0 }
+                try ParticipantMulticam.report(requestedAngles, project: project, document: source,
+                                               canvas: canvas, audio: audio, cancelled: { token.isCancelled })
+            } onSuccess: { report = Self.angleSummary($0) }
+        }
+    }
+
+    private func take(_ angle: ParticipantVirtualAngle) {
+        guard let time = compositionPlayhead else {
+            error = "Choose an Assembly occurrence before taking an angle."
+            return
+        }
+        do {
+            let draft = try documentForRender()
+            let source = document
+            let take: @Sendable (EditCancellation) throws -> CutProject = { _ in
+                try ParticipantMulticam.taking(angle, at: time, in: draft, document: source)
+            }
+            run(take) { updated in
+                perform {
+                    try session.commitParticipants(updated.participants, action: "Take \(angle.name)")
+                    if let saved = updated.participants.render {
+                        plan = saved
+                        shotIndex = saved.shots.count - 1
+                    }
+                    refreshPreview()
+                }
+            }
+        } catch {
+            self.error = error.localizedDescription
         }
     }
 
@@ -430,18 +527,30 @@ struct ParticipantCompositionSheet: View {
             let source = document
             let canvas = plan.canvas
             let audio = ParticipantMulticamAudioRouting(meetingMix: angleMix, includeISOs: angleISOs)
-            let panel = NSSavePanel()
-            panel.title = "Create Multicam Angle Folder"
-            panel.nameFieldStringValue = "Participant Angles"
-            ProjectPanels.present(panel, in: session.window, fromSheet: true) { accepted in
-                guard accepted, let destination = panel.url else { return }
-                run { token in
-                    _ = try ParticipantMulticam.materialize(angles, project: project, document: source, canvas: canvas,
-                                                             audio: audio, to: destination, cancelled: { token.isCancelled })
-                    return destination.appendingPathComponent("multicam.cut")
-                } onSuccess: { url in
-                    renderedProject = url
-                    report = "Rendered \(angles.count) synchronized angles in \(destination.lastPathComponent)."
+            run { token in
+                try ParticipantMulticam.report(angles, project: project, document: source,
+                                               canvas: canvas, audio: audio, cancelled: { token.isCancelled })
+            } onSuccess: { checked in
+                report = Self.angleSummary(checked)
+                guard checked.angles.allSatisfy({ $0.render.publishable }) else { return }
+                let panel = NSSavePanel()
+                panel.title = "Create Multicam Angle Folder"
+                panel.message = "The folder will contain synchronized angle movies and an MPCut project."
+                panel.nameFieldStringValue = "Participant Angles"
+                ProjectPanels.present(panel, in: session.window, fromSheet: true) { accepted in
+                    guard accepted, let destination = panel.url else { return }
+                    perform {
+                        if session.isMulticam { try session.multicam.validateHistoryDestination(destination, includesContents: true) }
+                        else { try session.editor.validateHistoryDestination(destination, includesContents: true) }
+                        run { token in
+                            _ = try ParticipantMulticam.materialize(angles, project: project, document: source, canvas: canvas,
+                                                                     audio: audio, to: destination, cancelled: { token.isCancelled })
+                            return destination.appendingPathComponent("multicam.cut")
+                        } onSuccess: { url in
+                            renderedProject = url
+                            report = "Rendered \(angles.count) synchronized angles in \(destination.lastPathComponent)."
+                        }
+                    }
                 }
             }
         }
@@ -454,6 +563,14 @@ struct ParticipantCompositionSheet: View {
             try session.commitParticipants(next, action: "Save Participant Composition")
             report = "Composition saved to the project."
         }
+    }
+
+    private var currentOccurrence: Int? {
+        if session.isMulticam {
+            return session.multicam.assemblyPreview ? session.multicam.activeOccurrenceIndex : nil
+        }
+        let time = session.participantTimelineTime
+        return (try? project.resolveStills())?.spans.firstIndex { $0.output.contains(time) }
     }
 
     private var compositionPlayhead: RationalTime? {
@@ -478,8 +595,8 @@ struct ParticipantCompositionSheet: View {
             run { token in
                 let picture = try ParticipantRenderer(cancelled: { token.isCancelled }).frame(project, document: source, at: time)
                 let sourceData = monitor.flatMap { media, time in
-                    let index = media.hasFullEditIndex ? media
-                        : (try? CutEngine(cancelled: { token.isCancelled }).inspectForPreview(media.url))
+                    let index = media.hasFullEditIndex && media.multicamClockOffset == .zero ? media
+                        : (try? CutEngine(cancelled: { token.isCancelled }).inspect(media.url, keyframes: true))
                     return index.flatMap { try? JPEGExport.reviewFrame($0, at: time, exclusiveEnd: false,
                                                                        cancelled: { token.isCancelled }).0 }
                 }
@@ -531,8 +648,7 @@ struct ParticipantCompositionSheet: View {
     }
 
     private func documentForRender() throws -> CutProject {
-        var next = project
-        next.participants.render = plan
+        let next = dialogueDraft
         try next.validate()
         return next
     }
@@ -543,7 +659,7 @@ struct ParticipantCompositionSheet: View {
         let token = EditCancellation()
         progress = token
         Task {
-            let result = await Task.detached(priority: .userInitiated) { Result { try work(token) } }.value
+            let result = await session.sidecarWork.detached(priority: .userInitiated) { Result { try work(token) } }.value
             guard progress === token else { return }
             progress = nil
             guard !token.isCancelled else { return }
@@ -560,12 +676,16 @@ struct ParticipantCompositionSheet: View {
     }
 
     private static func summary(_ checked: ParticipantRenderReport) -> String {
-        var lines = ["\(checked.canvas.width) × \(checked.canvas.height) at \(checked.canvas.frameRate.description) fps",
+        var lines = [checked.publishable ? "Ready to Export" : "Export Blocked",
+                     "\(checked.canvas.width) × \(checked.canvas.height) at \(checked.canvas.frameRate.description) fps",
                      "\(checked.duration.description) s · \(checked.frameCount) frames",
                      "Audio · \(checked.audioActions.isEmpty ? "Silence" : checked.audio.mode.rawValue.capitalized)"]
         for action in checked.audioActions {
             let streams = action.sources.map { "\($0.file.lastPathComponent), stream \($0.stream)" }
             lines.append(action.label ?? Set(streams).sorted().joined(separator: " · "))
+        }
+        if !checked.staleSourceIDs.isEmpty {
+            lines.append("Geometry needs review for \(checked.staleSourceIDs.joined(separator: ", ")).")
         }
         if !checked.privacyIssues.isEmpty {
             lines.append(checked.publishable ? "Full-frame cover for unresolved intervals" : "Export blocked by unresolved coverage")
@@ -577,10 +697,10 @@ struct ParticipantCompositionSheet: View {
         return lines.joined(separator: "\n")
     }
 
-    private nonisolated static func formatted(_ value: some Encodable) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        return String(decoding: try encoder.encode(value), as: UTF8.self)
+    private static func angleSummary(_ checked: ParticipantMulticamReport) -> String {
+        var lines = checked.angles.map { $0.angle.name + "\n" + summary($0.render) }
+        if !checked.meetingMix.isEmpty { lines.append("Meeting mix on one program lane") }
+        return lines.joined(separator: "\n\n")
     }
 
     private func colorBinding(_ value: Binding<UInt32>) -> Binding<Color> {

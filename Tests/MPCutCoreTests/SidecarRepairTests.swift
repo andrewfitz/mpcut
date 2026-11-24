@@ -149,6 +149,24 @@ final class SidecarRepairTests: XCTestCase {
         }
     }
 
+    func testWriterRetriesAnIncompleteJournalWithoutModifyingIt() throws {
+        let store = try makeSidecar()
+        try store.save(["before": Data([1])])
+        let path = URL(fileURLWithPath: store.url.path + "-journal")
+        let incomplete = Data(repeating: 0, count: 12)
+        try incomplete.write(to: path)
+        let released = expectation(description: "simulated writer unlinks its partial journal")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) {
+            defer { released.fulfill() }
+            XCTAssertEqual(try? Data(contentsOf: path), incomplete)
+            try? FileManager.default.removeItem(at: path)
+        }
+        try store.save(["after": Data([2])])
+        wait(for: [released], timeout: 1)
+        XCTAssertEqual(store.read("before"), Data([1]))
+        XCTAssertEqual(store.read("after"), Data([2]))
+    }
+
     func testStatusLeavesForeignDatabaseAndHotJournalIntact() throws {
         let store = try makeSidecar()
         let donor = store.url.deletingLastPathComponent().appendingPathComponent("other.sqlite")

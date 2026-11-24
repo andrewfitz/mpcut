@@ -264,23 +264,26 @@ private struct TranscriptCLIProject {
     let undo: [CutHistoryState]
     let redo: [CutHistoryState]
     let media: CutProjectMedia
+    let mediaSnapshot: ProjectMediaSnapshot
 
     init(url: URL) throws {
         self.url = url
         let loaded = try CutProject.loadEditorDocument(from: url, limit: CutProject.maximumHistorySteps)
         (project, undo, redo, media) = (loaded.project, loaded.undo, loaded.redo, loaded.media)
+        mediaSnapshot = loaded.media.mediaSnapshot
     }
 
-    init(mediaFile: URL, duration: RationalTime, destination: URL) throws {
-        guard duration > .zero else {
+    init(indexed: MediaInfo, destination: URL) throws {
+        guard indexed.duration > .zero else {
             throw CutError(code: "transcript_source_empty", message: "The recording has no editable duration.")
         }
         url = destination
-        project = .sequence([.init(id: "recording", file: CutProject.relativeMediaPath(mediaFile.path, to: destination),
-                                  from: .zero, to: duration)])
+        let path = CutProject.relativeMediaPath(indexed.url.path, to: destination)
+        project = .sequence([.init(id: "recording", file: path, from: .zero, to: indexed.duration)])
         undo = []
         redo = []
         media = try CutProjectMedia.decode(transcriptJSON(project))
+        mediaSnapshot = .init(entries: [.init(path: path, media: indexed)])
     }
 
     func attachment(_ id: String?) throws -> TranscriptAttachment {
@@ -337,14 +340,16 @@ private struct TranscriptCLIProject {
         if destination.inPlace, updated == project,
            assetData.keys.allSatisfy({ (try? TranscriptStore.read($0, relativeTo: url)) != nil }) { return }
         try interruption.check()
+        var paths: [String: String] = [:]
         func rebase(_ state: CutHistoryState) throws -> CutHistoryState {
-            .init(action: state.action, origin: state.origin, project: try state.project.rebased(from: url, to: destination.url))
+            try state.rebased(from: url, to: destination.url, paths: &paths)
         }
-        var saved = try updated.rebased(from: url, to: destination.url)
+        var saved = try updated.rebased(from: url, to: destination.url, paths: &paths)
         if snapshot { saved.transcripts.documentID = nil }
         let past = snapshot ? [] : try (undo + (change.map { [$0] } ?? [])).map(rebase)
         let future = snapshot || change != nil ? [] : try redo.map(rebase)
         try saved.saveCopy(to: destination.url, copyingTranscriptsFrom: url, undo: past, redo: future,
+                           mediaSnapshot: mediaSnapshot.rebased(from: url, to: destination.url),
                            replacingExisting: destination.inPlace, expected: destination.inPlace ? media.diskRevision : nil,
                            assetData: assetData, beforePublish: beforePublish, check: interruption.check)
     }
@@ -783,7 +788,10 @@ extension TranscriptCLI {
         let writeSidecar = useSidecar && [.runJob, .prepareSession, .retry, .import].contains(operation)
         try AnalysisSidecar.$automaticWritesEnabled.withValue(writeSidecar) {
             try AnalysisSidecar.$readsEnabled.withValue(useSidecar) {
-                try run(request(interruption: interruption), json: json, interruption: interruption)
+                let input = try request(interruption: interruption)
+                try SidecarLocations.$projectURL.withValue(try input.url("project_path")) {
+                    try run(input, json: json, interruption: interruption)
+                }
             }
         }
     }
@@ -1076,7 +1084,7 @@ extension TranscriptCLI {
                     selections = []
                 }
                 record = try TranscriptEditorial.makeRecord(change: change, selections: selections, in: index,
-                                                            id: recordID ?? UUID().uuidString)
+                                                            id: recordID ?? ProjectIdentifier.make())
             }
             try record.validate()
             guard record.attachmentID == attachment.id else {
@@ -1339,7 +1347,7 @@ private extension TranscriptCLI {
             let engine = CutEngine(cancelled: { !interruption.isActive })
             let indexed = try engine.inspect(media, keyframes: true)
             bareMedia = indexed
-            loaded = try bareProject.map { try TranscriptCLIProject(mediaFile: media, duration: indexed.duration, destination: $0) }
+            loaded = try bareProject.map { try TranscriptCLIProject(indexed: indexed, destination: $0) }
         } else {
             guard output == nil else {
                 throw CLIError("invalid_arguments", "Use --out-project FILE or --in-place when importing into a project.")
@@ -1402,7 +1410,7 @@ private extension TranscriptCLI {
             var attachmentIDs: [String] = []
             var newAssets: [TranscriptAsset: Data] = [:]
             for (document, session) in results {
-                let id = requestedID ?? session?.id ?? UUID().uuidString
+                let id = requestedID ?? session?.id ?? ProjectIdentifier.make(avoiding: updated.transcripts.attachments.map(\.id))
                 let previous = updated.transcripts.attachments.first { $0.id == id }
                 if let session, session.tracks.contains(where: { !$0.sourceIsCurrent }) {
                     throw CutError(code: "stale_transcript_job", message: "A recording changed before its prepared result could be saved.")
@@ -1410,7 +1418,7 @@ private extension TranscriptCLI {
                 let verified = session?.bindings
                 let bindings = try loaded.bindings(bindingRequest, document: document, original: verified ?? previous?.bindings ?? [],
                                                    interruption: interruption)
-                let bytes = try TranscriptCodec.encode(document, format: .json)
+                let bytes = try TranscriptCodec.encodeStored(document)
                 let file = TranscriptStore.reference(for: bytes, relativeTo: target.url)
                 newAssets[file] = bytes
                 let attachment = TranscriptAttachment(id: id, asset: file, bindings: bindings,

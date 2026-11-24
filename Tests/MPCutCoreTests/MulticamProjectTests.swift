@@ -276,15 +276,17 @@ final class MulticamProjectTests: XCTestCase {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let overhead = try encoder.encode(edit).count
         edit.angles[0].name = String(repeating: "x", count: MulticamProject.maximumFileSize - overhead)
+        // The limit is on the document. The file holds it compressed.
         try edit.save(to: url)
-        XCTAssertEqual(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize, MulticamProject.maximumFileSize)
+        let saved = try Data(contentsOf: url)
+        XCTAssertEqual(try CutProject.documentJSON(saved: saved).count, MulticamProject.maximumFileSize)
         XCTAssertEqual(try MulticamProject.load(from: url), edit)
 
         edit.angles[0].name!.append("x")
         XCTAssertThrowsError(try edit.save(to: url)) {
             XCTAssertEqual(($0 as? CutError)?.code, "invalid_multicam_project")
         }
-        XCTAssertEqual(try url.resourceValues(forKeys: [.fileSizeKey]).fileSize, MulticamProject.maximumFileSize)
+        XCTAssertEqual(try Data(contentsOf: url), saved)
     }
 
     func testSavingOverSourceOrLinkLeavesMediaIntact() throws {

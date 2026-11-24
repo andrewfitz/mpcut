@@ -18,6 +18,7 @@ import tempfile
 import unittest
 
 from media_regression import ffmpeg, frames, packets, probe, ratio, run, sample_hashes, timestamped_hashes
+from saved_project import read_project
 
 CLI = None
 FPS = 24
@@ -225,14 +226,14 @@ class StillTimelineAcceptance(unittest.TestCase):
         target = base.with_stem(base.stem + "-replaced")
         self.cli("still", "picture", "replace", "--project", base, "--image", image or self.sdr_card, "--clock", "sequence" if kind == "sequence" else "group", "--from", start,
                  "--to", end, "--out-project", target)
-        self.assertEqual(json.loads(target.read_text())["schema_version"], 4)
+        self.assertIn(read_project(target)["schema_version"], (4, 5))
         return target
 
     def insert(self, base, kind, at, *, image=None, count=24, rate=FPS):
         target = base.with_stem(base.stem + "-inserted")
         self.cli("still", "placement", "insert", "--project", base, "--image", image or self.sdr_card, "--clock", "sequence" if kind == "sequence" else "assembly", "--at", at,
                  "--frames", count, "--rate", rate, "--out-project", target)
-        self.assertEqual(json.loads(target.read_text())["schema_version"], 4)
+        self.assertIn(read_project(target)["schema_version"], (4, 5))
         return target
 
     def export(self, project, output, *args, **options):
@@ -247,7 +248,7 @@ class StillTimelineAcceptance(unittest.TestCase):
                     target = base.with_stem(base.stem + "-spaced")
                     self.cli("timeline", "clips", "space", "--project", base, "--duration", 2, "--background", "#000000",
                              "--out-project", target)
-                    saved = json.loads(target.read_text())
+                    saved = read_project(target)
                     self.assertEqual(len(saved["still_assets"]), 1)
                     self.assertEqual(set(saved["still_assets"][0]), {"kind", "id"})
                     def spacing():
@@ -331,7 +332,7 @@ class StillTimelineAcceptance(unittest.TestCase):
     def test_nested_replacement_uses_the_reference_recording_covering_its_range(self):
         row = next(row for row in ROWS if row.name == "prores")
         base = self.project(row, "multicam")
-        document = json.loads(base.read_bytes())
+        document = read_project(base)
         primary = document["angles"][0]
         primary["additional_recordings"] = [{"id": "second", "file": primary["file"], "offset": "4",
                                             "group_coverage": {"from": "4", "to": "6"}}]
@@ -553,7 +554,8 @@ class StillTimelineAcceptance(unittest.TestCase):
         copied = LENGTH - generated if operation == "replace" else LENGTH
         for report in (planned, written):
             self.assert_report(report, copied, generated)
-        self.assertEqual({**planned, "dry_run": False}, written)
+        self.assertNotIn("output_bytes", planned)
+        self.assertEqual({**planned, "dry_run": False, "output_bytes": output.stat().st_size}, written)
         self.assert_picture(output, row, reference, parts)
         self.assert_card(output, row, at + Fraction(1, 2), hdr=row.hdr and operation != "replace")
         if video_only:
@@ -768,7 +770,7 @@ class StillTimelineAcceptance(unittest.TestCase):
             with self.subTest(source=label):
                 base = self.project(row, "sequence", sources=(source, source), label=label)
                 if source == replacement:
-                    document = json.loads(base.read_text())
+                    document = read_project(base)
                     document["clips"][0].update(original_file=str(two_tracks), track_ordinal=1,
                                                 replacement_names={"1": "Close microphone"})
                     base.write_text(json.dumps(document))
@@ -800,7 +802,7 @@ class StillTimelineAcceptance(unittest.TestCase):
     def test_multicam_audio_angle_switch_continues_under_replacement(self):
         row = ROWS[1]
         base = self.project(row, "multicam")
-        document = json.loads(base.read_text())
+        document = read_project(base)
         document["audio"] = {"mode": "follow"}
         base.write_text(json.dumps(document))
         covered = self.replace(base, "multicam", 2, 4)
@@ -822,7 +824,7 @@ class StillTimelineAcceptance(unittest.TestCase):
         self.export(base, reference, "--tracks", "video")
         self.export(covered, output, "--require-camera-copy", "--tracks", "video")
         self.assert_picture(output, row, reference, [(0, 8), (None, 2), (10, 2)])
-        document = json.loads(covered.read_text())
+        document = read_project(covered)
         document["clips"].reverse()
         # Drop history after moving the entries by hand. Their openable state and
         # occurrence IDs remain identical to those saved by the authoring command.
@@ -899,7 +901,7 @@ class StillTimelineAcceptance(unittest.TestCase):
         row = ROWS[1]
         base = self.project(row, "sequence")
         project = self.replace(base, "sequence", 4, 5)
-        document = json.loads(project.read_text())
+        document = read_project(project)
         # Retain the exact authored placement and occurrence ID while changing its
         # current trim, as a sequence editor does.
         document.pop("history", None)

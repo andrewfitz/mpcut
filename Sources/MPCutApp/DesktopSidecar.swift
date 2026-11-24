@@ -43,14 +43,26 @@ struct EditorMetadataEdits: Sendable {
         return values
     }
 
+    /// Named views need their original report. A whole-file removal retains only
+    /// names the user has edited in this window and has not yet saved.
+    func retainedReport(_ candidate: SceneReport?, afterRemovingWholeSidecar whole: Bool) -> SceneReport? {
+        guard var report = candidate else { return nil }
+        if !whole, report.views.contains(where: { $0.name != nil }) { return report }
+        guard !names.isEmpty else { return nil }
+        if whole {
+            for view in report.views { report.setViewName(names[view.view] ?? nil, for: view.view) }
+        }
+        return report
+    }
+
     mutating func discardSaved(_ edits: Self) {
         for (key, value) in edits.names where names[key] == .some(value) { names.removeValue(forKey: key) }
         for (key, value) in edits.thresholds where thresholds[key] == .some(value) { thresholds.removeValue(forKey: key) }
     }
 
-    mutating func update(_ edits: Self, saved: Bool) {
-        for (key, value) in edits.names { names[key] = saved ? nil : .some(value) }
-        for (key, value) in edits.thresholds { thresholds[key] = saved ? nil : .some(value) }
+    mutating func record(_ edits: Self) {
+        names.merge(edits.names) { _, new in new }
+        thresholds.merge(edits.thresholds) { _, new in new }
     }
 }
 
@@ -66,7 +78,8 @@ struct DesktopAnalysisSnapshot: Sendable {
     let silence: [SilenceAnalysisResult]
     let filmstrip: [FilmstripTile]
 
-    func save(cancelled: () -> Bool) throws {
+    @discardableResult
+    func save(cancelled: () -> Bool) throws -> URL {
         var sections = try AnalysisSidecar.indexSections(for: media, cancelled: cancelled)
         let analysis = try AnalysisSidecar.sections(media: media, scenes: scenes, waveforms: waveforms,
                                                     envelopeOverviews: envelopeOverviews, silence: silence, cancelled: cancelled)
@@ -92,6 +105,8 @@ struct DesktopAnalysisSnapshot: Sendable {
             }
         }
         let retention = filmstrip.isEmpty ? [:] : [FilmstripTileKey.sectionPrefix: FilmstripTileBuffer.countLimit]
-        try AnalysisSidecar(media: media).saveAnalysisSections(sections, updating: updates, retainingLatest: retention, cancelled: cancelled)
+        let sidecar = AnalysisSidecar(media: media)
+        try sidecar.saveAnalysisSections(sections, updating: updates, retainingLatest: retention, cancelled: cancelled)
+        return sidecar.url
     }
 }

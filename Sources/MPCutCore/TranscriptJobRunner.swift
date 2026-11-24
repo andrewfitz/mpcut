@@ -8,8 +8,18 @@ extension TranscriptJobStore {
                     interrupted: @escaping @Sendable () -> Bool = { false },
                     progress: @escaping (TranscriptJobRecord) -> Void = { _ in }) throws -> TranscriptJobRecord {
         let token = UUID()
-        var record = try claimRun(id, token: token)
+        let record = try claimRun(id, token: token)
         guard record.ownerToken == token else { return record }
+        return try SidecarLocations.$projectURL.withValue(SidecarLocations.projectURL ?? record.sidecarProjectURL) {
+            try runClaimed(record, token: token, helper: helper, download: download, interrupted: interrupted, progress: progress)
+        }
+    }
+
+    private func runClaimed(_ initial: TranscriptJobRecord, token: UUID, helper: URL?, download: Bool,
+                            interrupted: @escaping @Sendable () -> Bool,
+                            progress: @escaping (TranscriptJobRecord) -> Void) throws -> TranscriptJobRecord {
+        var record = initial
+        let id = record.id
         progress(record)
 
         let poll = TranscriptJobPoll(record: recordURL(id))
@@ -71,7 +81,8 @@ extension TranscriptJobStore {
                        let stream = track.streamIndex, let stamp = stamps[track.file] {
                         let sidecar = AnalysisSidecar(source: track.file, identity: stamp)
                         if !sidecar.isExcluded {
-                            caches[track.id] = .init(sidecar: sidecar, key: key, evidence: track.evidence, stream: stream, channel: track.stagedChannel)
+                            caches[track.id] = .init(sidecar: sidecar, key: key, evidence: track.evidence, stream: stream, channel: track.stagedChannel,
+                                                     providerExchangeVersion: settings.sharedExchangeVersion)
                         }
                     }
                 }
@@ -89,6 +100,8 @@ extension TranscriptJobStore {
                 try change { $0.warnings.append(error.localizedDescription) }
             }
 
+            // The provider reads a reused result and its levels at the paths the manifest names.
+            try restoreArtifacts(record)
             var allValid = true
             var failures = false
             var outputCount = 0
@@ -130,7 +143,7 @@ extension TranscriptJobStore {
                     let scope = settings.settingsKey(for: track)
                     let candidate = key ?? (scope != nil && scope == track.recognitionSettingsKey ? track.recognitionKey : nil)
                     if policy != .restart, let candidate,
-                       let prior = TranscriptRecognitionCache.Artifacts(result: result, activity: track.activity),
+                       let prior = TranscriptRecognitionCache.Artifacts(job: result, activity: track.activity),
                        prior.matches(key: candidate, evidence: track.evidence, needsActivity: track.activity != nil) {
                         track.recognitionKey = candidate
                         track.recognitionSettingsKey = scope
@@ -159,6 +172,7 @@ extension TranscriptJobStore {
                         if FileManager.default.fileExists(atPath: result.path) {
                             try FileManager.default.removeItem(at: result)
                         }
+                        try? FileManager.default.removeItem(at: TranscriptJobArtifact.packedURL(result))
                         do {
                             try ensureStagedAudio(&track, stream: stream, stamp: stamp, cancelled: cancelled)
                         } catch {
@@ -245,7 +259,7 @@ extension TranscriptJobStore {
                         let affected = Set(pending.map(\.id))
                         for index in session.tracks.indices where affected.contains(session.tracks[index].id) {
                             let track = session.tracks[index]
-                            if let result = track.result { try? FileManager.default.removeItem(at: result) }
+                            if let result = track.result { TranscriptJobArtifact.remove(result) }
                             session.tracks[index].recognitionKey = nil
                             session.tracks[index].recognitionSettingsKey = nil
                             session.tracks[index].state = .failed
@@ -350,7 +364,8 @@ extension TranscriptJobStore {
                 $0.state = state
                 if let message { $0.message = message }
             }
-            if [.completed, .cancelled].contains($0.state) { removeStagedAudio($0) }
+            // Any other outcome can be retried, and keeps the audio that retry would read.
+            if [.completed, .cancelled].contains($0.state) { removeStagedAudio($0) } else { removeFinishedAudio($0) }
             $0.ownerToken = nil
             $0.ownerPID = nil
             $0.helperPID = nil
@@ -380,7 +395,7 @@ extension TranscriptJobStore {
     private func cacheTrack(_ track: TranscriptJobTrack, cache: TranscriptRecognitionCache?,
                             cancelled: @escaping @Sendable () -> Bool, warnings: inout [String]) {
         guard !cancelled(), AnalysisSidecar.automaticWritesEnabled, let cache, let result = track.result,
-              let artifacts = TranscriptRecognitionCache.Artifacts(result: result, activity: track.activity),
+              let artifacts = TranscriptRecognitionCache.Artifacts(job: result, activity: track.activity),
               artifacts.matches(key: cache.key, evidence: cache.evidence, needsActivity: track.activity != nil) else { return }
         do {
             if cache.read(cancelled: cancelled) == nil {
@@ -397,9 +412,10 @@ extension TranscriptJobStore {
     private func prepareActivity(_ track: TranscriptJobTrack, stream: Int, stamp: SourceIdentity, reuse: Bool,
                                  cancelled: () -> Bool) throws -> Bool {
         guard let activity = track.activity else { return false }
-        if reuse, let existing = try? Data(contentsOf: activity, options: .mappedIfSafe),
+        if reuse, let existing = TranscriptJobArtifact.read(activity),
            TranscriptRecognitionCache.Artifacts.matchesActivity(existing, evidence: track.evidence) { return true }
         if FileManager.default.fileExists(atPath: activity.path) { try FileManager.default.removeItem(at: activity) }
+        try? FileManager.default.removeItem(at: TranscriptJobArtifact.packedURL(activity))
         guard reuse, track.hasReusableEvidence else { return false }
         let sidecar = AnalysisSidecar(source: track.file, identity: stamp)
         let key = TranscriptActivityKey(stream: stream, channel: track.stagedChannel)
@@ -415,7 +431,7 @@ extension TranscriptJobStore {
                                cancelled: @escaping @Sendable () -> Bool, warnings: inout [String]) {
         guard AnalysisSidecar.readsEnabled, AnalysisSidecar.automaticWritesEnabled,
               track.hasReusableEvidence, let stamp, let stream = track.streamIndex, let activity = track.activity,
-              let data = try? Data(contentsOf: activity, options: .mappedIfSafe),
+              let data = TranscriptJobArtifact.read(activity),
               TranscriptRecognitionCache.Artifacts.matchesActivity(data, evidence: track.evidence) else { return }
         let key = TranscriptActivityKey(stream: stream, channel: track.stagedChannel)
         let sidecar = AnalysisSidecar(source: track.file, identity: stamp)

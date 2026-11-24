@@ -18,6 +18,7 @@ import time
 import unittest
 
 from media_regression import ffmpeg, probe, run, sample_hashes
+from saved_project import read_project
 
 CLI = None
 CANVAS = (320, 180)
@@ -217,7 +218,10 @@ class MixedTimelineTests(unittest.TestCase):
         self.assertEqual((video["codec_name"], video["width"], video["height"], video["pix_fmt"]), ("h264", *CANVAS, "yuv420p"))
         self.assertEqual(video.get("sample_aspect_ratio", "1:1"), "1:1")
         self.assertFalse(any("rotation" in item for item in video.get("side_data_list", [])))
-        self.assertEqual((audio["codec_name"], int(audio["sample_rate"]), audio["channels"]), ("pcm_s32le", 48000, 2))
+        # Some clips are AAC. Decoded lossy sound is written as float PCM, which does not clip above full scale.
+        self.assertEqual((audio["codec_name"], int(audio["sample_rate"]), audio["channels"]), ("pcm_f32le", 48000, 2))
+        self.assertEqual([(item["action"], item["codec"], item["bit_depth"]) for item in written["audio_actions"]],
+                         [("pcm", "pcm_f32le", 32)])
         # Duration is exact for picture and sound, and no picture is dropped or repeated.
         self.assertEqual(Fraction(written["duration"]["numerator"], written["duration"]["denominator"]), 12)
         self.assertEqual(Fraction(video["duration"]), 12)
@@ -295,7 +299,8 @@ class MixedTimelineTests(unittest.TestCase):
 
     def test_other_codecs_and_containers(self):
         clips = [(self.portrait, "0", "1"), (self.wide, "0", "1"), (self.prores, "0", "1")]
-        for codec, extension, pixel_format, sound in [("hevc", "mkv", "yuv420p10le", "aac"), ("prores", "mov", "yuv422p10le", "pcm_s32le"),
+        # One clip is AAC, so the track is not lossless: Auto writes AAC, or PCM for ProRes, as float for the decoded AAC.
+        for codec, extension, pixel_format, sound in [("hevc", "mkv", "yuv420p10le", "aac"), ("prores", "mov", "yuv422p10le", "pcm_f32le"),
                                                       ("h264", "mkv", "yuv420p", "aac")]:
             with self.subTest(codec=codec):
                 output = self.root / f"{codec}.{extension}"
@@ -311,6 +316,24 @@ class MixedTimelineTests(unittest.TestCase):
                 duration = Fraction(probe(output, "-show_entries", "format=duration")["format"]["duration"])
                 self.assertLess(abs(duration - 3), Fraction(1, 20))
                 self.assert_clean()
+
+    def test_auto_writes_a_track_that_is_lossless_in_every_clip_as_pcm(self):
+        # Both clips carry PCM, at other rates and layouts. Auto keeps the track lossless where the container carries PCM.
+        clips = [(self.portrait, "0", "1"), (self.prores, "0", "1")]
+        for extension, action, codec in [("mov", "pcm", "pcm_s32le"), ("mkv", "pcm", "pcm_s32le"), ("mp4", "aac", "aac")]:
+            with self.subTest(container=extension):
+                output = self.root / f"lossless.{extension}"
+                report = self.export(output, clips)
+                planned = report["audio_actions"][0]
+                self.assertEqual((planned["action"], planned["codec"], planned["track"]), (action, codec, 1))
+                self.assertIn("The clips differ, so their sound is converted to one format.", planned["reason"])
+                self.assertIn("The lossless source is written as PCM" if action == "pcm" else "MP4 cannot carry PCM", planned["reason"])
+                self.assertEqual(streams(output)[1]["codec_name"], codec)
+        # A clip with AAC at the same position makes the track lossy, and Auto converts it as before.
+        report = self.export(self.root / "lossy.mov", [(self.portrait, "0", "1"), (self.wide, "0", "1")], dry=True)
+        planned = report["audio_actions"][0]
+        self.assertEqual((planned["action"], planned["codec"], planned["bit_rate"]), ("aac", "aac", 192_000))
+        self.assertNotIn("lossless", planned["reason"])
 
     def test_colour_matrix_is_converted_to_the_canvas(self):
         output = self.root / "colour.mp4"
@@ -539,7 +562,7 @@ class MixedTimelineTests(unittest.TestCase):
                                   ("portrait.mov", ("96", "160", "1/30s"), "1", "2s", "0s", "1s")])
         restored = self.root / "restored.cut"
         self.assertEqual(self.cli("project", "convert", output, "--output", restored, "--json")["warnings"], [])
-        back = json.loads(restored.read_text())["clips"]
+        back = read_project(restored)["clips"]
         self.assertEqual([(Path(clip["file"]).name, clip["from"], clip["to"]) for clip in back],
                          [(Path(clip["file"]).name, clip["from"], clip["to"]) for clip in clips])
 

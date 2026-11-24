@@ -187,7 +187,7 @@ src/configure \
     --disable-network --disable-encoders --enable-zlib --enable-bzlib \
     --enable-videotoolbox --enable-libsvtav1 --enable-libmp3lame --pkg-config-flags=--static \
     --enable-libopus --disable-decoder=libopus \
-    --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox,libsvtav1,aac,libmp3lame,flac,libopus,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,wrapped_avframe,rawvideo
+    --enable-encoder=h264_videotoolbox,hevc_videotoolbox,prores_videotoolbox,libsvtav1,mjpeg,aac,alac,libmp3lame,flac,libopus,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le,wrapped_avframe,rawvideo
 make -j "$jobs" DESTDIR="$stage" install
 cd "$build_dir"
 install -m 644 "$stage/$source_name"/{COPYING.LGPLv2.1,LICENSE.md} "$stage$prefix/"

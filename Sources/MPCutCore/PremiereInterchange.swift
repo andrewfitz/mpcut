@@ -5,6 +5,12 @@ public enum PremiereInterchange {
     private static let protocolVersion = 3
 
     public static func read(_ url: URL, allowLoss: Bool) throws -> (CutProject, [String]) {
+        let imported = try readDocument(url, allowLoss: allowLoss)
+        return (imported.project, imported.warnings)
+    }
+
+    package static func readDocument(_ url: URL, allowLoss: Bool) throws
+        -> (project: CutProject, warnings: [String], mediaSnapshot: ProjectMediaSnapshot) {
         let source = url.resolvingSymlinksInPath()
         guard url.pathExtension.lowercased() == "prproj",
               (try? source.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
@@ -25,7 +31,7 @@ public enum PremiereInterchange {
             }
             defer { try? FileManager.default.removeItem(at: copy) }
             let warnings = try request("read", project: copy, xml: xml, mailbox: mailbox, allowLoss: allowLoss)
-            let (project, losses) = try PremiereTimeline.read(xml, allowLoss: allowLoss)
+            let imported = try PremiereTimeline.readDocument(xml, allowLoss: allowLoss)
             var translations: [String] = []
             for log in try FileManager.default.contentsOfDirectory(at: stage, includingPropertiesForKeys: [.fileSizeKey])
                 where log.pathExtension.lowercased() == "txt" {
@@ -40,7 +46,7 @@ public enum PremiereInterchange {
                     translations.append("Premiere reported additional translation issues. Export the sequence XML in Premiere to see its complete translation log.")
                 }
             }
-            return (project, [nativeWarning] + warnings + losses + translations)
+            return (imported.project, [nativeWarning] + warnings + imported.warnings + translations, imported.mediaSnapshot)
         }
     }
 

@@ -10,6 +10,8 @@ import tempfile
 import unittest
 import zlib
 
+from saved_project import read_project, saved_file
+
 
 CLI = None
 
@@ -68,8 +70,8 @@ class StillProjectCLI(unittest.TestCase):
         self.assertEqual(ranges(cover["placements"][0]), [(8, 10)])
         self.assertEqual(cover["placements"][0]["authored_fragments"][0]["clip_id"], "second")
         self.assertEqual(cover["assets"][0]["file"], "../photo.png")
-        saved = json.loads(destination.read_text())
-        self.assertEqual(saved["schema_version"], 4)
+        saved = read_project(destination)
+        self.assertIn(saved["schema_version"], (4, 5))
         self.assertEqual([entry["id"] for entry in saved["clips"]], ["first", "second"])
         before = destination.read_bytes()
         issue = self.run_json("still", "picture", "replace", "--project", destination, "--asset", cover["asset_id"],
@@ -88,15 +90,16 @@ class StillProjectCLI(unittest.TestCase):
                          (Fraction(271001, 30000), Fraction(301001, 30000))])
         self.assertEqual(ranges(placements[insert_id]), [(9, Fraction(271001, 30000))])
 
-        self.image.unlink()
+        repaired = self.root / "renamed.png"
+        self.image.rename(repaired)
         offline = self.run_json("still", "placement", "list", "--project", destination)
         self.assertTrue(offline["assets"][0]["offline"])
-        repaired = self.root / "renamed.png"
-        repaired.write_bytes(png((0, 170, 67)))
         relinked = self.run_json("still", "asset", "relink", "--project", destination, "--asset", cover["asset_id"],
                                  "--image", repaired, "--in-place")
         self.assertFalse(relinked["assets"][0]["offline"])
         self.assertEqual(relinked["assets"][0]["id"], cover["asset_id"])
+        self.assertEqual(relinked["assets"][0]["file"], "../renamed.png")
+        self.assertEqual(relinked["assets"][0]["fingerprint"], cover["assets"][0]["fingerprint"])
         self.assertEqual(len(relinked["placements"]), 2)
 
         reframed = self.run_json("still", "placement", "update", "--project", destination, "--placement",
@@ -106,6 +109,18 @@ class StillProjectCLI(unittest.TestCase):
         self.assertEqual(cover_row["framing"]["mode"], "fill")
         self.assertEqual(read_time(cover_row["framing"]["crop"]["x"]), Fraction(1, 2))
         self.assertEqual(read_time(cover_row["framing"]["crop"]["y"]), Fraction(3, 10))
+
+        replacement = self.root / "replacement.png"
+        replacement.write_bytes(png((0, 170, 67)))
+        report = self.run_json("project", "media", "replace", destination, "--source", repaired,
+                               "--with", replacement, "--in-place")["report"]
+        self.assertTrue(report["can_apply"])
+        replaced = self.run_json("still", "placement", "list", "--project", destination)
+        self.assertFalse(replaced["assets"][0]["offline"])
+        self.assertEqual(replaced["assets"][0]["id"], cover["asset_id"])
+        self.assertEqual(replaced["assets"][0]["file"], "../replacement.png")
+        self.assertNotEqual(replaced["assets"][0]["fingerprint"], cover["assets"][0]["fingerprint"])
+        self.assertEqual(replaced["placements"], reframed["placements"])
 
         deleted = self.run_json("still", "placement", "remove", "--project", destination, "--placement", insert_id, "--in-place")
         self.assertEqual(read_time(deleted["duration"]), 12)
@@ -132,7 +147,9 @@ class StillProjectCLI(unittest.TestCase):
         copy = self.root / "gap.cut"
         report = self.run_json(*insert, copy)
         asset = report["timeline"]["transcripts"]["attachments"][0]["asset"]
-        self.assertEqual(asset, json.loads(copy.read_bytes())["transcripts"]["attachments"][0]["asset"])
+        saved = read_project(copy)
+        saved_asset = saved["transcripts"]["attachments"][0]["asset"]
+        self.assertEqual(asset, {**saved_asset, "file": saved_file(saved, saved_asset["file"])})
         self.assertEqual((self.root / asset["file"]).parent.name, copy.name + ".transcripts")
         self.assertTrue((self.root / asset["file"]).is_file())
         self.assertEqual(self.project.read_bytes(), original)
@@ -167,7 +184,7 @@ class StillProjectCLI(unittest.TestCase):
                                "--clock", "assembly", "--at", "1/100", "--frames", "1",
                                "--rate", "30", "--in-place", success=False)
         self.assertEqual(result["error"]["code"], "invalid_still_boundary", result)
-        self.assertEqual(json.loads(self.project.read_bytes()), project)
+        self.assertEqual(read_project(self.project), project)
 
     def test_offline_replacement_preserves_audio_and_stdin_parity(self):
         fixtures = Path(__file__).resolve().parents[1] / "MPCutAppTests" / "Fixtures"

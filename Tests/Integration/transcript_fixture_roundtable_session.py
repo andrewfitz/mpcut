@@ -200,12 +200,13 @@ def main():
     timing["sessionWall"] = round(time.monotonic() - t0, 3)
     timing["sessionCPU"] = round(c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime, 3)
     timing["sessionExit"] = 0
+    # The import removes the session output once the result is attached.
+    result = json.loads(Path(job["sessions"][0]["output"]).read_text())
     t0 = time.monotonic()
     attached = cli(args.cli, env, "attachment import", "--project", project, "--job-id", job["id"],
                    "--job-directory", out / "jobs", "--out-project", out / "attached.cut")
     timing["importWall"] = round(time.monotonic() - t0, 3)
     (out / "attached.json").write_text(json.dumps(attached, indent=1))
-    result = json.loads(Path(job["sessions"][0]["output"]).read_text())
     (out / "result.json").write_text(json.dumps(result))
     if args.no_score:
         print(json.dumps(timing)); return

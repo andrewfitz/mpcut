@@ -380,3 +380,16 @@ extension CutEngine {
                        segment: segment, boundary: field, nearest: neighbors).because(.cutAudioPacket)
     }
 }
+
+extension ExportPlan {
+    /// What a packet copy leaves behind, one sentence each. A copy writes no warnings of its own: it keeps every
+    /// selected sample, so the only losses are a source’s cover art, chapters or timecode that the chosen container
+    /// or track selection cannot hold. An encode reports its own warnings.
+    public var copyOmissions: [String] {
+        switch self {
+        case .packets(let edit, _, _): return CutEngine().copyOmissions(edit)
+        case .audio(let plan): return plan.isCopy ? CutEngine().copyOmissions(plan.edit) : []
+        case .conversion: return []
+        }
+    }
+}

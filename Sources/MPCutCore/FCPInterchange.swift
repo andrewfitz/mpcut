@@ -4,11 +4,30 @@ import Foundation
 /// Final Cut's published XML timeline interchange. A package contains Info.fcpxml.
 public enum FCPInterchange {
     public static func read(_ url: URL, allowLoss: Bool = false) throws -> (CutProject, [String]) {
+        let imported = try readDocument(url, allowLoss: allowLoss)
+        return (imported.project, imported.warnings)
+    }
+
+    package static func readDocument(_ url: URL, allowLoss: Bool = false) throws
+        -> (project: CutProject, warnings: [String], mediaSnapshot: ProjectMediaSnapshot) {
         let xml = url.pathExtension.lowercased() == "fcpxmld" ? url.appendingPathComponent("Info.fcpxml") : url
         let reader = FCPReader(location: xml, allowLoss: allowLoss)
         let project = try reader.read()
         try project.validate()
-        return (project, reader.warnings)
+        let usedPaths = Set(project.mediaPaths.map(\.1))
+        let entries = reader.media.compactMap { url, media in
+            usedPaths.contains(url.path) ? ProjectMediaSnapshot.Entry(path: url.path, media: media) : nil
+        }
+        let stills = project.stillAssets.compactMap { asset -> ProjectMediaSnapshot.Entry? in
+            guard let generation = reader.fingerprintedStills[asset.file],
+                  var entry = ProjectMediaSnapshot.Entry(path: asset.file, asset: asset) else { return nil }
+            entry.size = generation.size
+            entry.modifiedSeconds = generation.modifiedSeconds
+            entry.modifiedNanoseconds = generation.modifiedNanoseconds
+            return entry
+        }
+        let snapshot = ProjectMediaSnapshot.empty.merging(.init(entries: entries + stills))
+        return (project, reader.warnings, snapshot)
     }
 
     static func loadDocument(_ location: URL) throws -> XMLDocument {
@@ -89,6 +108,7 @@ private final class FCPReader {
     private var assetURLs = [String: URL]()
     let engine = CutEngine(useSidecar: false)
     var media = [URL: MediaInfo]()
+    var fingerprintedStills = [String: SourceIdentity]()
 
     init(location: URL, allowLoss: Bool) {
         self.location = location
@@ -224,10 +244,11 @@ private final class FCPReader {
                 let fingerprint: String
                 if let stored = metadata?.fingerprint {
                     fingerprint = stored
-                } else if (try? SourceIdentity(url)) == nil {
-                    fingerprint = "unverified-fcpxml-\(ref)"
+                } else if let generation = try? SourceIdentity(url) {
+                    fingerprint = try StillImage.fingerprint(url, expectedIdentity: generation)
+                    fingerprintedStills[url.path] = generation
                 } else {
-                    fingerprint = try StillImage.fingerprint(url)
+                    fingerprint = "unverified-fcpxml-\(ref)"
                 }
                 let asset = StillAsset(id: assetID, file: url.path, displayName: resource.attr("name") ?? url.lastPathComponent,
                                        fingerprint: fingerprint)

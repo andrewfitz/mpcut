@@ -85,6 +85,34 @@ final class MediaRefreshTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: project), savedProject)
     }
 
+    func testProjectRefreshChecksStillPresenceAndSkipsHistoryOnlyMedia() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let audio = folder.appendingPathComponent("recording.wav")
+        let keptStill = folder.appendingPathComponent("current.png")
+        let projectURL = folder.appendingPathComponent("edit.cut")
+        try wave(samples: 16_000, amplitude: 100).write(to: audio)
+        try Data([1]).write(to: keptStill)
+        let duration = RationalTime(numerator: 1)
+        let current = CutProject.stillSequence(.init(
+            items: [.source(.init(id: "clip", file: audio.lastPathComponent, from: .zero, to: duration))],
+            stillAssets: [
+                .init(id: "kept", file: keptStill.lastPathComponent, displayName: "Current", fingerprint: String(repeating: "a", count: 64)),
+                .init(id: "offline", file: "offline.png", displayName: "Absent", fingerprint: String(repeating: "b", count: 64)),
+                .init(gapID: "gap")
+            ]
+        ))
+        let prior = CutProject.sequence([.init(id: "prior", file: "history.wav", from: .zero, to: duration)])
+        try current.saveStaged(to: projectURL, undo: [.init(action: "Edit", project: prior)], redo: [],
+                               mediaSnapshot: .init())
+        let results = try MediaRefresh.project(at: projectURL, persist: false)
+        let names = Dictionary(uniqueKeysWithValues: results.map { ($0.source.lastPathComponent, $0) })
+        XCTAssertEqual(Set(names.keys), ["recording.wav", "current.png", "offline.png"])
+        XCTAssertEqual(names["current.png"]?.state, .unchanged)
+        XCTAssertNil(names["current.png"]?.media)
+        XCTAssertEqual(names["offline.png"]?.referenceIssues, [.init(id: "offline", reason: .offline)])
+    }
+
     func testProjectRefreshFlagsParticipantGeometryForAChangedRecording() throws {
         let folder = try temporaryFolder()
         defer { try? FileManager.default.removeItem(at: folder) }

@@ -68,7 +68,7 @@ struct InputEdit: Decodable {
     var options = ExportOptions()
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case output, clips, file, project = "project_path", order, mode, video, quality, audio, audioOutput = "audio_output", snap, tracks, audioStream = "audio_stream", replaceAudio = "replace_audio", replaceTrack = "replace_track", replacementStream = "replacement_stream", requireCameraCopy = "require_camera_copy", spaceClips = "space_clips"
+        case output, clips, file, project = "project_path", order, mode, video, quality, audio, audioOutput = "audio_output", snap, tracks, audioStream = "audio_stream", replaceAudio = "replace_audio", replaceTrack = "replace_track", replacementStream = "replacement_stream", requireCameraCopy = "require_camera_copy", spaceClips = "space_clips", stillTiming = "still_timing", container
     }
 
     init(output: String, clips: [InputClip]) {
@@ -87,6 +87,10 @@ struct InputEdit: Decodable {
                 throw CLIError("invalid_json", "A saved project export takes project_path and output. Clip selection and ordering belong to export clips join.")
             }
             clips = []
+        }
+        options.container = try fields.decodeIfPresent(String.self, forKey: .container)
+        if let value = try fields.decodeIfPresent(String.self, forKey: .stillTiming) {
+            try options.set("still-timing", to: value, code: "invalid_json")
         }
         options.requireCameraCopy = try fields.decodeIfPresent(Bool.self, forKey: .requireCameraCopy)
         if let value = try fields.inputTime(.spaceClips, in: "Export request") {
@@ -144,6 +148,8 @@ struct ExportOptions {
     var baseName: String?
     var requireCameraCopy: Bool?
     var spaceClips: ClipSpacing?
+    var stillTiming: StillPictureTiming?
+    var container: String?
 
     var organization: ExportOrganization { .init(subfolder: subfolder ?? "", baseName: baseName ?? "") }
 
@@ -169,6 +175,8 @@ struct ExportOptions {
         case "snap": snap = try checked(SnapMode.self)
         case "audio": audio = try checked(ReencodeAudio.self)
         case "audio-output": audioOutput = try checked(MulticamAudioOutput.self)
+        case "still-timing": stillTiming = try checked(StillPictureTiming.self)
+        case "container": container = value
         case "space-clips":
             if value == "source" {
                 spaceClips = .source
@@ -215,7 +223,9 @@ struct ExportOptions {
             subfolder: resolve("subfolder", subfolder, request.subfolder),
             baseName: resolve("base-name", baseName, request.baseName, jsonKey: "base_name"),
             requireCameraCopy: resolve("require-camera-copy", requireCameraCopy, request.requireCameraCopy, jsonKey: "require_camera_copy"),
-            spaceClips: resolve("space-clips", spaceClips, request.spaceClips, jsonKey: "space_clips")
+            spaceClips: resolve("space-clips", spaceClips, request.spaceClips, jsonKey: "space_clips"),
+            stillTiming: resolve("still-timing", stillTiming, request.stillTiming, jsonKey: "still_timing"),
+            container: resolve("container", container, request.container)
         )
     }
 }
@@ -260,6 +270,7 @@ enum CLICommand {
     case scenes(SceneScanOptions)
     case sceneExport(file: String?, options: SceneExportOptions)
     case refresh(RefreshOptions)
+    case projectMedia(ProjectMediaOptions)
     case inspect(file: String, keyframes: Bool, allFrames: Bool, audioPackets: Bool, packetStream: Int?, from: RationalTime?, to: RationalTime?, tracks: ExportTracks, audioStream: Int?)
     case convert(input: String, output: String, allowLoss: Bool, flattenMulticam: Bool)
     case resolve(project: String, output: String, open: Bool)
@@ -350,6 +361,9 @@ struct Arguments {
     }
 
     private static func parseCommand(_ path: String, options: [String], json: Bool) throws -> Arguments {
+        if path.hasPrefix("project media "), let operation = ProjectMediaOptions.Operation(rawValue: String(path.dropFirst("project media ".count))) {
+            return Arguments(command: .projectMedia(try ProjectMediaOptions(operation, arguments: options)), json: json)
+        }
         if let operation = CommandPath.participants[path] {
             return Arguments(command: .participants(try ParticipantCLI(operation: operation, arguments: options)), json: json)
         }
@@ -802,6 +816,11 @@ struct Arguments {
                     throw CLIError("invalid_arguments", "--space-clips may be specified only once.")
                 }
                 try exportOptions.set("space-clips", to: value(for: argument))
+            case "--still-timing", "--container":
+                guard !forResolve, !forBulk, suppliedSettings.insert(argument).inserted else {
+                    throw CLIError("invalid_arguments", "Use \(argument) once when rendering a still project.")
+                }
+                try exportOptions.set(String(argument.dropFirst(2)), to: value(for: argument))
             case "--mode", "--video", "--quality", "--audio", "--audio-output", "--snap", "--tracks", "--audio-stream", "--replace-audio", "--replace-track", "--replacement-stream":
                 guard suppliedSettings.insert(argument).inserted else {
                     throw CLIError("invalid_arguments", "\(argument) may be specified only once.")

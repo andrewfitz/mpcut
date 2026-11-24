@@ -1,6 +1,26 @@
 import Foundation
 
 extension ParticipantProject {
+    package mutating func setAppearanceOverride(_ pin: ParticipantAppearanceOverride) {
+        appearanceOverrides = appearanceOverrides.flatMap { previous -> [ParticipantAppearanceOverride] in
+            guard previous.participantID == pin.participantID, previous.sourceID == pin.sourceID,
+                  previous.range.overlapsParticipantRange(pin.range) else { return [previous] }
+            var retained: [ParticipantAppearanceOverride] = []
+            if previous.range.from < pin.range.from {
+                var before = previous
+                before.range.to = pin.range.from
+                retained.append(before)
+            }
+            if pin.range.to < previous.range.to {
+                var after = previous
+                after.range.from = pin.range.to
+                retained.append(after)
+            }
+            return retained
+        }
+        appearanceOverrides.append(pin)
+    }
+
     public mutating func linkAppearance(sourceID: String, appearanceID: String, participantID: String?,
                                         range: MulticamRange) throws {
         guard participantID == nil || people.contains(where: { $0.id == participantID }) else {
@@ -135,8 +155,14 @@ extension ParticipantProject {
         }
         var sourceIDs = Set<String>()
         for source in sources {
+            guard source.feedLayout?.isValid ?? true else {
+                throw invalidParticipantProject("Invalid feed layout on source ‘\(source.sourceID)’.")
+            }
             guard validStillID(source.sourceID), sourceIDs.insert(source.sourceID).inserted,
-                  source.analysisIdentity.map(validStillID) ?? true else {
+                  source.analysisIdentity.map(validStillID) ?? true,
+                  source.sourceContentSHA256.map(validParticipantSourceDigest) ?? true,
+                  Set(source.unresolvedParticipantIDs).count == source.unresolvedParticipantIDs.count,
+                  source.unresolvedParticipantIDs.allSatisfy(roster.contains) else {
                 throw invalidParticipantProject("Participant geometry needs unique source IDs.")
             }
             for appearance in source.appearances {
@@ -190,7 +216,7 @@ extension MulticamRange {
 
 extension ParticipantProject {
     var historyRecordCount: Int {
-        let sourceRecords = sources.reduce(0) { $0 + 1 + $1.appearances.count + $1.coverage.count }
+        let sourceRecords = sources.reduce(0) { $0 + 1 + $1.appearances.count + $1.coverage.count + $1.unresolvedParticipantIDs.count }
         let rosterRecords = people.reduce(0) { $0 + 1 + $1.speakers.count + ($1.audio == nil ? 0 : 1) }
         let shotRecords = render?.shots.reduce(0) { $0 + 1 + $1.slots.count } ?? 0
         return sourceRecords + rosterRecords + appearanceOverrides.count + shotRecords + (render?.redactions.count ?? 0)

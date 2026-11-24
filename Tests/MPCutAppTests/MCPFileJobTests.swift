@@ -5,6 +5,34 @@ import XCTest
 @testable import MPCutApp
 
 final class MCPFileJobTests: XCTestCase {
+    func testProjectMediaRoutingRequiresConfirmationAndDistinctMappingModes() throws {
+        func request(_ command: String, _ fields: [String: Any]) throws -> MCPFileRequest {
+            let base: [String: Any] = ["operation_id": UUID().uuidString, "project_path": "/tmp/project.cut"]
+            return try MCPFileRequest(tool: "project_file_media_" + command,
+                                      fields: base.merging(fields) { _, new in new })
+        }
+        let list = try request("list", [:])
+        XCTAssertEqual(list.arguments, ["project", "media", "list", "--json", "/tmp/project.cut"])
+        let locate = try request("locate", ["folder": "/tmp/moved"])
+        XCTAssertEqual(locate.arguments.suffix(2), ["--folder", "/tmp/moved"])
+
+        let mapping = ["from": "old.wav", "to": "/tmp/moved/copy.wav"]
+        let relink = try request("relink", ["mappings": [mapping], "in_place": true])
+        XCTAssertEqual(relink.arguments.suffix(5), ["--from", "old.wav", "--to", "/tmp/moved/copy.wav", "--in-place"])
+        let prefix = try request("relink", ["from_prefix": "/old", "to_prefix": "/new", "in_place": true])
+        XCTAssertEqual(prefix.arguments.suffix(3), ["--map-prefix", "/old=/new", "--in-place"])
+        XCTAssertThrowsError(try request("relink", ["mappings": [mapping], "from": "old.wav", "in_place": true]))
+        XCTAssertThrowsError(try request("relink", ["mappings": [mapping]]))
+
+        let source: [String: Any] = ["source": "old.wav", "with": "/tmp/different.wav"]
+        let preview = try request("replace", source)
+        XCTAssertFalse(preview.arguments.contains("--in-place"))
+        XCTAssertThrowsError(try request("replace", source.merging(["in_place": true]) { _, new in new }))
+        XCTAssertThrowsError(try request("replace", source.merging(["confirm": true]) { _, new in new }))
+        let apply = try request("replace", source.merging(["confirm": true, "in_place": true]) { _, new in new })
+        XCTAssertTrue(apply.arguments.contains("--in-place"))
+    }
+
     func testFileSilenceForwardsBlipDurationOnlyForNewScans() throws {
         let schema = try MCPSchemas.loaded.get()
         func request(_ fields: [String: Any]) throws -> MCPFileRequest {
@@ -246,12 +274,22 @@ final class MCPFileJobTests: XCTestCase {
         XCTAssertThrowsError(try request(["project_path": "/tmp/Selects.cut", "space_clips": "-1"]))
     }
 
+    func testSidecarToolsForwardBothProjectAndRecording() throws {
+        let schemas = try MCPSchemas.loaded.get()
+        for action in ["build", "inspect"] {
+            let tool = "analysis_file_sidecar_" + action
+            let fields: [String: Any] = ["operation_id": UUID().uuidString, "project_path": "/tmp/A.cut", "file": "/tmp/B.mov"]
+            let request = try MCPFileRequest(tool: tool, fields: schemas.validate(tool: tool, arguments: fields))
+            XCTAssertEqual(request.arguments, ["analysis", "sidecar", action, "--json", "--project", "/tmp/A.cut", "--", "/tmp/B.mov"])
+        }
+    }
+
     func testSceneAndRefreshRequestsForwardNativeScopeAndPolicy() throws {
         let schemas = try MCPSchemas.loaded.get()
         let id = UUID()
         let file = "/tmp/Interview.mov"
         let project = "/tmp/Assembly.cut"
-        let clip = UUID().uuidString
+        let clip = ProjectIdentifier.make()
         func request(_ tool: String, _ args: [String: Any]) throws -> [String] {
             var input = args
             input["operation_id"] = id.uuidString.lowercased()
@@ -318,6 +356,47 @@ final class MCPFileJobTests: XCTestCase {
         XCTAssertEqual(status["state"] as? String, "failed")
         let report = try XCTUnwrap(status["result"] as? [String: Any])
         XCTAssertNotNil((report["error"] as? [String: Any])?["code"])
+    }
+
+    @MainActor
+    func testParticipantScanFileJobPreservesIntegerProgressAndReservesCompletionForSuccess() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let mock = folder.appendingPathComponent("scan-cli")
+        try """
+        #!/bin/sh
+        cd "$(dirname "$0")" || exit 2
+        echo '{"event":"progress","phase":"scanning","fraction":0.29,"percent":29}' >&2
+        while [ ! -f release ]; do sleep 0.02; done
+        if [ -f fail ]; then
+            echo '{"event":"progress","fraction":1}' >&2
+            exit 1
+        fi
+        """.write(to: mock, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: mock.path)
+        let jobs = MCPFileJobs(executable: mock)
+        defer { jobs.disable() }
+        let file = folder.appendingPathComponent("grid.mov").path
+        let id = UUID()
+        _ = try jobs.start(tool: "participants_file_scan", arguments: ["operation_id": id.uuidString, "file": file])
+        let deadline = ContinuousClock.now + .seconds(10)
+        var live = try jobs.status(id: id)
+        while live["progress_event"] == nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+            live = try jobs.status(id: id)
+        }
+        XCTAssertEqual(live["progress_percent"] as? Int, 29)
+        try Data().write(to: folder.appendingPathComponent("release"))
+        let succeeded = try await wait(jobs, id: id)
+        XCTAssertEqual(succeeded["state"] as? String, "succeeded")
+        XCTAssertEqual(succeeded["progress_percent"] as? Int, 100)
+        try Data().write(to: folder.appendingPathComponent("fail"))
+        let failedID = UUID()
+        _ = try jobs.start(tool: "participants_file_scan", arguments: ["operation_id": failedID.uuidString, "file": file])
+        let failed = try await wait(jobs, id: failedID)
+        XCTAssertEqual(failed["state"] as? String, "failed")
+        XCTAssertEqual(failed["progress_percent"] as? Int, 99)
     }
 
     @MainActor

@@ -19,7 +19,8 @@
 | Edit an interview by ear or by word | [Audition and shorten pauses](docs/USAGE.md#find-and-shorten-pauses), [find another reading, assemble quotes or export captions](docs/TRANSCRIPTS.md). |
 | Switch cameras and route sound | [Align cameras, mix microphone tracks, sync replacement audio and build a multicam assembly](docs/USAGE.md#edit-a-multicam-project). |
 | Add artwork or leave space between clips | [Cover picture while sound continues, insert a silent card or add timed gaps](docs/STILL-IMAGES.md). |
-| Edit a recorded video call | [Track participants, extract a guest or compose a two-up interview](docs/PARTICIPANTS.md). |
+| Edit a camera multiview or recorded call | [Detect feed boxes, extract a camera or compose a two-up interview](docs/PARTICIPANTS.md). |
+| Recover missing or moved recordings | [Relink offline media, search a folder or replace a source file with a preview of the changes](docs/USAGE.md#missing-and-moved-media). |
 | Find shots or compare angles | [Detect scene changes and recurring views](docs/USAGE.md#detect-scenes-and-recurring-views) or [export review JPEGs](docs/USAGE.md#review-a-recording-with-jpegs). |
 | Edit or replace a soundtrack | [Trim audio on the waveform, extract individual tracks, convert a recording or return a processed mix](docs/USAGE.md#edit-audio-and-export-tracks). |
 | Deliver media or an editable project | [Choose a copy or encoding mode](docs/EXPORT-MODES.md), [exchange timelines with another editor](#convert-projects), or [automate exports from the CLI](docs/CLI.md). |
@@ -58,13 +59,13 @@ mpcut project convert Interview.cut --to fcp --output Interview.fcpxml
 
 | Extension | What opens it | Conversion requirements |
 | --- | --- | --- |
-| `.cut` | MPCut | Versioned JSON containing an ordered sequence or multicam project. [Project format and both schemas](docs/CUT-FORMAT.md). Media files are referenced by path. |
+| `.cut` | MPCut | A versioned JSON document containing an ordered sequence or multicam project, saved in a compact, compressed layout. MPCut also opens plain JSON written by hand. [Project format and schemas](docs/CUT-FORMAT.md). Media files are referenced by path. |
 | `.drp`, `.drt` | DaVinci Resolve | Resolve writes and reads its native project or timeline through its local scripting API. |
 | `.prproj` | Adobe Premiere Pro | Adobe Premiere Pro and the MPCut Premiere bridge handle the native project. [Install the panel](docs/PREMIERE.md#install-the-panel). |
 | `.fcpxml`, `.fcpxmld` | Final Cut Pro and compatible editors | MPCut reads and writes timeline interchange XML directly. |
 | `.fcpbundle` | Final Cut Pro | Native library conversion requires Final Cut Pro and an interactive host step. |
 
-Conversion handles one edit at a time. Resolve can retain editable multicam angles. Premiere can retain switchable angles for two to four aligned cameras at a common frame rate that cover the full group. To bring that edit back through Premiere’s sequence XML, flatten a copy in Premiere or choose `--flatten-multicam --allow-loss` when exporting from MPCut. The flattened sequence retains the assembled picture cuts and selected microphone tracks. Reading a Resolve archive requires loss approval because its timeline exchange can omit host-specific effects, grades and project settings. Final Cut library import asks you to export the chosen project as XML in Final Cut. Review reported limitations before retrying a conversion with `--allow-loss`. Keep referenced recordings and generated audio files alongside your projects. For an editable XML handoff to an existing Resolve project, see the workflow below.
+Conversion handles one edit at a time and requires every referenced recording to be online. Relink missing media in **File → Project Media…** or with `mpcut project media` first. Resolve can retain editable multicam angles. Premiere can retain switchable angles for two to four aligned cameras at a common frame rate that cover the full group. To bring that edit back through Premiere’s sequence XML, flatten a copy in Premiere or choose `--flatten-multicam --allow-loss` when exporting from MPCut. The flattened sequence retains the assembled picture cuts and selected microphone tracks. Reading a Resolve archive requires loss approval because its timeline exchange can omit host-specific effects, grades and project settings. Final Cut library import asks you to export the chosen project as XML in Final Cut. Review reported limitations before retrying a conversion with `--allow-loss`. Keep referenced recordings and generated audio files alongside your projects. For an editable XML handoff to an existing Resolve project, see the workflow below.
 
 ## Export a project to DaVinci Resolve
 
@@ -144,9 +145,11 @@ open dist/MPCut.app
 
 Use `./scripts/build-app.sh /Applications` to install the source build there for the CLI examples above.
 
-To enable participant analysis, extract the Apple Silicon macOS TileTrail **0.1.0** C ABI v1 release and set `MPCUT_TILETRAIL_PREFIX` to the extracted directory when running `swift build`, `swift test`, or `scripts/build-app.sh`. The directory contains `include/tiletrail.h`, `lib/libtiletrail.a`, and `LICENSE`. The app and CLI link the analyzer statically. Standard builds run from a standalone MPCut checkout with participant analysis disabled.
+To enable automatic feed detection, fixed multiview grids and meeting analysis, use the Apple Silicon macOS TileTrail **0.4.0** C ABI v1 build and set `MPCUT_TILETRAIL_PREFIX` to the extracted directory when running `swift build`, `swift build --build-tests`, or `scripts/build-app.sh`. Run the resulting macOS test host through Backstage as described in AGENTS.md. The directory contains `include/tiletrail.h`, `lib/libtiletrail.a`, and `LICENSE`. The app and CLI link the analyzer statically. The 0.1.0 library supports the meeting profile. Adaptive scans skip unchanged stretches only with a TileTrail build that supports coarse pushes; otherwise they analyze every frame. Standard builds run from a standalone MPCut checkout with analysis disabled. See the [feed and participant editing guide](docs/PARTICIPANTS.md).
 
 For development, install Homebrew FFmpeg and pkg-config, then run `swift test`. The integration suites also use Python 3 and the FFmpeg CLI tools. [Test commands and qualification limits](AUDIT.md#reproduce-the-release-checks)
+
+To launch MPCut without sound, for example when an agent or test drives it, set `MPCUT_MUTED=1` in its environment. A muted MPCut plays no preview, scrub or reverse audio and none of its own alert sounds, while playback still advances as usual. The preview's saved volume and mute settings are unchanged. MPCutAppTests runs muted.
 
 ## Verified on Apple Silicon
 

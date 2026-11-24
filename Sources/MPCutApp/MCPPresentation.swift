@@ -9,7 +9,13 @@ final class EditorPresentation: ObservableObject {
     enum Inspector: String, CaseIterable {
         case switches, sources, assembly, export, transcript, participants
 
-        var label: String { self == .switches ? "Switch" : rawValue.capitalized }
+        var label: String {
+            switch self {
+            case .switches: "Switch"
+            case .participants: "Feeds"
+            default: rawValue.capitalized
+            }
+        }
     }
     @Published var inspector: Inspector = .switches
     @Published var inspectorVisible = true
@@ -18,6 +24,7 @@ final class EditorPresentation: ObservableObject {
     @Published var pinnedParticipant: String?
     @Published var pickedParticipantAppearance: ParticipantPickedAppearance?
     @Published var participantDrawMode = false
+    @Published var participantScanPreview: (sourceID: String, stamp: SceneSourceStamp, analysis: ParticipantTrackingResult)?
     @Published var participantDrawnBounds: ParticipantDrawnBounds?
     @Published var participantTranscriptFilter: ParticipantSpeakerBinding?
     @Published var selectedTranscriptSpeaker: ParticipantTranscriptSelection?

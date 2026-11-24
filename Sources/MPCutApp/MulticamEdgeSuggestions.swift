@@ -48,15 +48,16 @@ extension MulticamEditorModel {
     @discardableResult
     func applyQueuedEdgeSuggestion(_ time: RationalTime, for issue: CutError, contentID: UUID? = nil) -> Bool {
         guard !isBusy, let edge = issue.multicam?.edge, edge.range == 1, let number = issue.segment, number > 0,
-              queuedRanges.indices.contains(number - 1) else { return false }
-        var entry = queuedRanges[number - 1]
+              let target = readyQueuedRanges.dropFirst(number - 1).first,
+              let index = queuedRanges.firstIndex(where: { $0.id == target.id }) else { return false }
+        var entry = queuedRanges[index]
         guard contentID == nil || entry.contentID == contentID,
               !entry.usesAssembly,
               let moved = MulticamEdgeSuggestion(edge: edge, times: issue.nearest ?? []).moving(entry.range, to: time),
               (try? entry.project.plan(ranges: [moved])) != nil else { return false }
         entry.range = moved
         entry.contentID = UUID()
-        queuedRanges[number - 1] = entry
+        queuedRanges[index] = entry
         return true
     }
 }

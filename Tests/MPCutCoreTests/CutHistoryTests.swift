@@ -43,7 +43,7 @@ final class CutHistoryTests: XCTestCase {
         let namedDone = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
             defer { stageDone.signal() }
-            do { try snapshot.saveStaged(to: stage, undo: [], redo: []) }
+            do { try snapshot.saveStaged(to: stage, undo: [], redo: [], mediaSnapshot: .empty) }
             catch { XCTFail(error.localizedDescription) }
         }
         DispatchQueue.global().async {
@@ -82,7 +82,7 @@ final class CutHistoryTests: XCTestCase {
         XCTAssertEqual(document.undo, undo)
         XCTAssertEqual(document.redo, redo)
         XCTAssertEqual(try CutProject.load(from: url), .sequence(current))
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectFile.documentJSON(Data(contentsOf: url))) as? [String: Any])
         let history = try XCTUnwrap(object["history"])
         XCTAssertLessThan(try JSONSerialization.data(withJSONObject: history).count, 400)
         let limited = try CutProject.loadHistory(from: url, limit: 2)
@@ -154,7 +154,7 @@ final class CutHistoryTests: XCTestCase {
         XCTAssertEqual(CutProject.historyCounts(undo: 10, redo: 12, limit: 3).undo, 2)
         XCTAssertEqual(CutProject.historyCounts(undo: 0, redo: 12, limit: 3).redo, 3)
         try edit.save(to: url, undo: [], redo: [])
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectFile.documentJSON(Data(contentsOf: url))) as? [String: Any])
         XCTAssertNil(object["history"])
     }
 
@@ -258,9 +258,13 @@ final class CutHistoryTests: XCTestCase {
         let present = CutProject.sequence([clip(0)])
         try present.save(to: url)
         let original = try Data(contentsOf: url)
-        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: original) as? [String: Any])
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: ProjectFile.documentJSON(original)) as? [String: Any])
+        let id = clip(0).id
         for bad: [String: Any] in [
             ["action": "Undo", "clips": [[0, 1], [0, 1]]],
+            ["action": "Undo", "clips": [[0, 1], ["id": id, "file": "a.mov", "from": "0", "to": "1"]]],
+            ["action": "Undo", "clips": [[0, 1], ["id": "new", "file": "a/", "from": "0", "to": "1"]]],
+            ["action": "Undo", "clips": [[0, 1], ["id": "new", "file": "a.mov", "from": "0", "to": String(Int64.max)]]],
             ["action": "Undo", "clips": [[1, Int.max]]],
             ["action": "Undo", "clips": [[0, 2_000_000]]],
             ["action": "Undo", "clips": [[0, -1]]],

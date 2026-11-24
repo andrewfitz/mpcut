@@ -2,7 +2,7 @@ import Foundation
 import MPCutCore
 
 struct StillOptions {
-    enum Operation: String { case add, list, update, relink, remove, space }
+    enum Operation: String { case add, list, update, relink, remove, space, attachSoundtrack, fitSoundtrack, detachSoundtrack }
     enum Clock: String { case sequence, group, assembly, source }
     enum Fit: String { case fit, fill }
 
@@ -32,6 +32,8 @@ struct StillOptions {
     let cropHeight: RationalTime?
     let background: String?
     let color: StillTimelineFormat.Color?
+    let soundtrack: StillSoundtrackOptions?
+    let fitSoundtrack: Bool
 
     init(operation: Operation, arguments: [String], gap: Bool, replace: Bool) throws {
         var arguments = arguments.filter { $0 != "--json" }.makeIterator()
@@ -55,6 +57,10 @@ struct StillOptions {
             allowed = destinations.union(["--asset", "--image"])
         case .remove:
             allowed = destinations.union(["--placement"])
+        case .attachSoundtrack:
+            allowed = destinations.union(["--soundtrack", "--audio-stream", "--from", "--to", "--fit-soundtrack"])
+        case .fitSoundtrack, .detachSoundtrack:
+            allowed = destinations
         }
         var values: [String: String] = [:]
         var seen = Set<String>()
@@ -63,7 +69,7 @@ struct StillOptions {
                 throw CLIError("invalid_arguments", "Unknown still \(operation.rawValue) option '\(flag)'.")
             }
             guard seen.insert(flag).inserted else { throw CLIError("invalid_arguments", "Duplicate \(flag).") }
-            if ["--in-place", "--source-timing"].contains(flag) { continue }
+            if ["--in-place", "--source-timing", "--fit-soundtrack"].contains(flag) { continue }
             guard let value = arguments.next(), !value.isEmpty, !value.hasPrefix("--") else {
                 throw CLIError("invalid_arguments", "Missing value for \(flag).")
             }
@@ -111,6 +117,10 @@ struct StillOptions {
         }
         from = try time("--from")
         to = try time("--to")
+        fitSoundtrack = seen.contains("--fit-soundtrack")
+        soundtrack = try operation == .attachSoundtrack
+            ? StillSoundtrackOptions(path: values["--soundtrack"], stream: values["--audio-stream"], from: from, to: to)
+            : nil
         at = try time("--at")
         if let raw = values["--fragment-index"] {
             guard let index = Int(raw), index >= 0 else {
@@ -223,6 +233,7 @@ struct StillInspection: Encodable {
     let assets: [Asset]
     let placements: [Placement]
     let colorPolicy: StillProgramColorPolicy?
+    let soundtrack: CutSequenceClip?
     var timeline: CutProject
     var placementID: String?
     var assetID: String?
@@ -238,6 +249,7 @@ struct StillInspection: Encodable {
         let plan = try timeline.resolveStills()
         duration = plan.duration
         colorPolicy = timeline.programColorPolicy
+        soundtrack = timeline.stillSoundtrack
         assets = timeline.stillAssets.map { Asset($0, relativeTo: location) }
         let offlineAssets = Set(assets.filter(\.offline).map(\.id))
         let byPlacement = Dictionary(grouping: plan.spans.filter { $0.placementID != nil }, by: \.placementID)
@@ -291,7 +303,7 @@ extension StillOptions {
         return framing
     }
 
-    func sourceAsset(at location: URL, id: String = UUID().uuidString, cancelled: @escaping () -> Bool) throws -> StillAsset {
+    func sourceAsset(at location: URL, id: String = ProjectIdentifier.make(), cancelled: @escaping () -> Bool) throws -> StillAsset {
         guard let image else { throw CLIError("invalid_arguments", "Specify --image FILE.") }
         let url = try fileURL(image, label: "Image")
         let fingerprint = try StillImage.inspectAndFingerprint(url, cancelled: cancelled).fingerprint
@@ -302,11 +314,12 @@ extension StillOptions {
 
 struct StillCLIExportReport: Encodable {
     private enum CodingKeys: String, CodingKey {
-        case ok, dryRun, output, copiedDuration, encodedDuration, audioActions, audioStream, tier, cutMap
+        case ok, dryRun, output, outputBytes, copiedDuration, encodedDuration, audioActions, audioStream, tier, cutMap
     }
 
     let dryRun: Bool
     let output: String
+    let outputBytes: Int64?
     let report: StillExportReport
     let audioStream: Int?
 
@@ -316,6 +329,7 @@ struct StillCLIExportReport: Encodable {
         try fields.encode(true, forKey: .ok)
         try fields.encode(dryRun, forKey: .dryRun)
         try fields.encode(output, forKey: .output)
+        try fields.encodeIfPresent(outputBytes, forKey: .outputBytes)
         try fields.encodeIfPresent(audioStream, forKey: .audioStream)
         try fields.encode(report.cutMap, forKey: .cutMap)
         try fields.encode(report.selectedTier, forKey: .tier)
@@ -337,6 +351,7 @@ extension StillOptions {
         let placementID: String?
         let assetID: String?
         let action: String
+        var soundtrackMedia: MediaInfo? = nil
     }
 
     func edit(_ project: CutProject, relativeTo location: URL,
@@ -344,6 +359,18 @@ extension StillOptions {
         let timing = StillAuthoringTiming(project: project, location: location,
                                          engine: CutEngine(cancelled: cancelled))
         switch operation {
+        case .attachSoundtrack:
+            guard let soundtrack else { throw CLIError("invalid_arguments", "Specify --soundtrack FILE.") }
+            let (clip, media) = try soundtrack.load(relativeTo: location, cancelled: cancelled)
+            let attached = try project.attachingStillSoundtrack(clip)
+            let result = try fitSoundtrack ? attached.fittingStillToSoundtrack() : attached
+            return Edit(project: result, placementID: nil, assetID: nil, action: "Attach Soundtrack", soundtrackMedia: media)
+        case .fitSoundtrack:
+            return Edit(project: try project.fittingStillToSoundtrack(), placementID: nil, assetID: nil,
+                        action: "Fit Image to Soundtrack")
+        case .detachSoundtrack:
+            return Edit(project: try project.attachingStillSoundtrack(nil), placementID: nil, assetID: nil,
+                        action: "Detach Soundtrack")
         case .list:
             throw CLIError("invalid_arguments", "Listing stills does not edit the project.")
         case .space:
@@ -426,10 +453,7 @@ extension StillOptions {
             if let color { updated = try updated.settingStillColorPolicy(color.policy) }
             return Edit(project: updated, placementID: resultID, assetID: asset ?? insert?.assetID ?? replacement?.assetID, action: action)
         case .relink:
-            guard let asset else { throw CLIError("invalid_arguments", "Specify --asset ID.") }
-            let replacement = try sourceAsset(at: location, id: asset, cancelled: cancelled)
-            let updated = try project.relinkingStillAsset(asset, file: replacement.file, fingerprint: replacement.fingerprint)
-            return Edit(project: updated, placementID: nil, assetID: asset, action: "Relink Still")
+            throw CLIError("invalid_arguments", "Relink a saved project through its media paths.")
         case .remove:
             guard let placement else { throw CLIError("invalid_arguments", "Specify --placement ID.") }
             let updated = try project.removingStill(id: placement)
@@ -446,12 +470,12 @@ extension StillOptions {
         guard clock == expected else {
             throw CLIError("invalid_arguments", "Use --clock \(expected.rawValue) for this operation.")
         }
-        let placement = UUID().uuidString
+        let placement = ProjectIdentifier.make()
         let framing = try checkedFraming()
         var updated = project
         let assetID: String
         if gap {
-            let source = project.stillAssets.first(where: \.isGap) ?? StillAsset(gapID: UUID().uuidString)
+            let source = project.stillAssets.first(where: \.isGap) ?? StillAsset(gapID: ProjectIdentifier.make(avoiding: project.stillAssets.map(\.id)))
             updated = try updated.addingStillAsset(source)
             assetID = source.id
         } else if let asset {

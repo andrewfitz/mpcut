@@ -228,12 +228,10 @@ public struct ParticipantRenderPlan: Codable, Equatable, Sendable {
                 guard !slot.id.isEmpty, (0...1).contains(slot.anchorX), (0...1).contains(slot.anchorY),
                       slot.background.map({ $0 <= 0xFFFFFF }) ?? true else { throw invalid("A shot slot has invalid geometry or color.") }
             }
-            if let range = shot.range {
-                let overlapping = shots.filter { other in
-                    guard other.clock == shot.clock, other.occurrence == shot.occurrence, let otherRange = other.range else { return false }
-                    return otherRange.from < range.to && otherRange.to > range.from
-                }
-                guard overlapping.count == 1 else { throw invalid("Timed shots on the same clock must not overlap.") }
+        }
+        for timedShots in ParticipantTimedShot.index(shots).values {
+            for (previous, next) in zip(timedShots, timedShots.dropFirst()) where previous.range.to > next.range.from {
+                throw invalid("Timed shots on the same clock must not overlap.")
             }
         }
         guard Set(audio.ids).count == audio.ids.count, audio.ids.allSatisfy({ !$0.isEmpty }),
@@ -262,4 +260,34 @@ public struct ParticipantRenderPlan: Codable, Equatable, Sendable {
     }
 
     private func invalid(_ message: String) -> CutError { .init(code: "invalid_participant_plan", message: message) }
+}
+
+struct ParticipantTimedShot {
+    struct Scope: Hashable {
+        let clock: ParticipantShotClock
+        var occurrence: Int? = nil
+    }
+
+    let shot: ParticipantShot
+    let range: MulticamRange
+
+    static func index(_ shots: [ParticipantShot]) -> [Scope: [Self]] {
+        let timed = shots.compactMap { shot in shot.range.map { Self(shot: shot, range: $0) } }
+        return Dictionary(grouping: timed) { Scope(clock: $0.shot.clock, occurrence: $0.shot.occurrence) }
+            .mapValues { $0.sorted { $0.range.from < $1.range.from } }
+    }
+}
+
+extension Array where Element == ParticipantTimedShot {
+    func shot(at time: RationalTime) -> ParticipantShot? {
+        let index = lowerBound { $0.range.to > time }
+        guard indices.contains(index), self[index].range.contains(time) else { return nil }
+        return self[index].shot
+    }
+
+    func overlapping(_ range: MulticamRange) -> ArraySlice<Element> {
+        let first = lowerBound { $0.range.to > range.from }
+        let end = lowerBound { $0.range.from >= range.to }
+        return self[first..<end]
+    }
 }

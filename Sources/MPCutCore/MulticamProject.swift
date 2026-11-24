@@ -210,7 +210,7 @@ public struct MulticamSwitch: Codable, Hashable, Sendable {
 }
 
 public struct MulticamProject: Codable, Equatable, Sendable {
-    public static let schemaVersion = CutProject.schemaVersion
+    public static let schemaVersion = 4
     public var referenceAngle: String
     public var range: MulticamRange
     public var angles: [MulticamSource]
@@ -326,6 +326,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
         case angles
         case audioSources = "audio_sources"
         case audio, switches, assembly, history
+        case mediaSnapshot = "media_snapshot"
         case fixedAudio = "fixed_audio"
         case mixLanes = "mix_lanes"
         case audioReplacements = "audio_replacements"
@@ -341,7 +342,7 @@ public struct MulticamProject: Codable, Equatable, Sendable {
             throw Self.invalid("Expected an MPCut project document")
         }
         guard let version = try values.decodeIfPresent(Int.self, forKey: .schemaVersion),
-              CutProject.readableSchemaVersions.contains(version) else {
+              [3, Self.schemaVersion].contains(version) else {
             throw CutError(code: "unsupported_multicam_version", message: "Expected MPCut project schema_version 3 or \(Self.schemaVersion)")
         }
         try ProjectField.rejectUnknown(CodingKeys.self, in: decoder)
@@ -416,17 +417,22 @@ public struct MulticamProject: Codable, Equatable, Sendable {
     }
 
     public static func decode(_ data: Data) throws -> Self {
-        try CutProject.decodeMulticamDocument(data)
+        try CutProject.decodeMulticamDocument(data).project
     }
 
-    public func save(to url: URL) throws {
+    public static func loadDocument(from url: URL) throws -> (project: Self, mediaSnapshot: ProjectMediaSnapshot) {
+        try CutProject.decodeMulticamDocument(ProjectFile.readBytes(from: url, multicam: true))
+    }
+
+    public func save(to url: URL, mediaSnapshot: ProjectMediaSnapshot = .empty) throws {
+        let (data, sources) = try CutProject.multicam(self).encodedArchive(
+            undo: [], redo: [], mediaSnapshot: mediaSnapshot, byteLimit: Self.maximumFileSize
+        )
         if transcripts.isEmpty, !TranscriptStore.hasStore(relativeTo: url) {
-            try ProjectFile.write(self, to: url, sources: CutProject.multicam(self).mediaPaths, multicam: true)
+            try ProjectFile.write(data, to: url, sources: sources, prefix: "multicam")
         } else {
-            let data = try ProjectFile.encoded(self, compact: false)
-            _ = try ProjectFile.writeRevision(data, to: url, sources: CutProject.multicam(self).mediaPaths, prefix: "multicam",
-                                              replacingExisting: true, expected: nil,
-                                              transcriptAssets: transcripts.attachments.map(\.asset),
+            _ = try ProjectFile.writeRevision(data, to: url, sources: sources, prefix: "multicam", replacingExisting: true,
+                                              expected: nil, transcriptAssets: transcripts.attachments.map(\.asset),
                                               hasTranscriptMetadata: !transcripts.isEmpty)
         }
     }
@@ -884,60 +890,74 @@ private struct JSONInputContainer {
 package func jsonInputIssue(_ data: Data, integerNumbersOnly: Bool = false,
                             allowsFraction: (([JSONInputLocation]) -> Bool)? = nil,
                             inspectDecimal: (([JSONInputLocation], ArraySlice<UInt8>) -> Void)? = nil) -> String? {
-    let bytes = [UInt8](data)
-    var containers = [JSONInputContainer]()
-    var index = 0
-    var previous: UInt8?
-    while index < bytes.count {
-        let byte = bytes[index]
-        switch byte {
-        case UInt8(ascii: "-"), UInt8(ascii: "0")...UInt8(ascii: "9"):
-            if integerNumbersOnly || inspectDecimal != nil {
-                let start = index
-                while index + 1 < bytes.count,
-                      ![9, 10, 13, 32, 44, 93, 125].contains(bytes[index + 1]) { index += 1 }
-                let token = bytes[start...index]
-                if token.contains(UInt8(ascii: ".")) || token.contains(UInt8(ascii: "e")) || token.contains(UInt8(ascii: "E")) {
-                    let locations = containers.compactMap(\.location)
-                    if integerNumbersOnly, allowsFraction?(locations) != true, integralJSONParts(token) == nil {
-                        return "contains a non-integer JSON number"
+    data.withUnsafeBytes { raw in
+        let bytes = raw.bindMemory(to: UInt8.self)
+        var containers = [JSONInputContainer]()
+        var index = 0
+        var previous: UInt8?
+        while index < bytes.count {
+            let byte = bytes[index]
+            switch byte {
+            case UInt8(ascii: "-"), UInt8(ascii: "0")...UInt8(ascii: "9"):
+                if integerNumbersOnly || inspectDecimal != nil {
+                    let start = index
+                    while index + 1 < bytes.count,
+                          ![9, 10, 13, 32, 44, 93, 125].contains(bytes[index + 1]) { index += 1 }
+                    let spelling = bytes[start...index]
+                    if spelling.contains(UInt8(ascii: ".")) || spelling.contains(UInt8(ascii: "e")) || spelling.contains(UInt8(ascii: "E")) {
+                        let token = Array(spelling)[...]
+                        let locations = containers.compactMap(\.location)
+                        if integerNumbersOnly, allowsFraction?(locations) != true, integralJSONParts(token) == nil {
+                            return "contains a non-integer JSON number"
+                        }
+                        inspectDecimal?(locations, token)
                     }
-                    inspectDecimal?(locations, token)
                 }
+            case UInt8(ascii: "{"): containers.append(JSONInputContainer(object: true))
+            case UInt8(ascii: "["): containers.append(JSONInputContainer(object: false))
+            case UInt8(ascii: "}"), UInt8(ascii: "]"):
+                if previous == UInt8(ascii: ",") {
+                    return "contains a trailing comma"
+                }
+                _ = containers.popLast()
+            case UInt8(ascii: ","):
+                if let last = containers.indices.last {
+                    if containers[last].keys != nil { containers[last].expectsKey = true }
+                    else if case let .index(item) = containers[last].location { containers[last].location = .index(item + 1) }
+                }
+            case UInt8(ascii: "\""):
+                let start = index
+                index += 1
+                var escaped = false
+                while index < bytes.count, bytes[index] != UInt8(ascii: "\"") {
+                    if bytes[index] == UInt8(ascii: "\\") {
+                        escaped = true
+                        index += 2
+                    } else {
+                        index += 1
+                    }
+                }
+                guard index < bytes.count else { return nil }
+                if let last = containers.indices.last, containers[last].expectsKey {
+                    let key: String
+                    if escaped {
+                        key = (try? JSONDecoder().decode(String.self, from: Data(bytes[start...index]))) ?? ""
+                    } else {
+                        key = String(decoding: bytes[(start + 1)..<index], as: UTF8.self)
+                    }
+                    if containers[last].keys?.insert(key).inserted == false {
+                        return "repeats the field '\(key)'"
+                    }
+                    containers[last].expectsKey = false
+                    containers[last].location = .key(key)
+                }
+            default: break
             }
-        case UInt8(ascii: "{"): containers.append(JSONInputContainer(object: true))
-        case UInt8(ascii: "["): containers.append(JSONInputContainer(object: false))
-        case UInt8(ascii: "}"), UInt8(ascii: "]"):
-            if previous == UInt8(ascii: ",") {
-                return "contains a trailing comma"
-            }
-            _ = containers.popLast()
-        case UInt8(ascii: ","):
-            if let last = containers.indices.last {
-                if containers[last].keys != nil { containers[last].expectsKey = true }
-                else if case let .index(item) = containers[last].location { containers[last].location = .index(item + 1) }
-            }
-        case UInt8(ascii: "\""):
-            let start = index
+            if byte != 0x20 && byte != 0x09 && byte != 0x0A && byte != 0x0D { previous = byte }
             index += 1
-            while index < bytes.count, bytes[index] != UInt8(ascii: "\"") {
-                index += bytes[index] == UInt8(ascii: "\\") ? 2 : 1
-            }
-            guard index < bytes.count else { return nil }
-            if let last = containers.indices.last, containers[last].expectsKey {
-                let key = (try? JSONDecoder().decode(String.self, from: Data(bytes[start...index]))) ?? ""
-                if containers[last].keys?.insert(key).inserted == false {
-                    return "repeats the field '\(key)'"
-                }
-                containers[last].expectsKey = false
-                containers[last].location = .key(key)
-            }
-        default: break
         }
-        if byte != 0x20 && byte != 0x09 && byte != 0x0A && byte != 0x0D { previous = byte }
-        index += 1
+        return nil
     }
-    return nil
 }
 
 /// Return the exact integer represented by a previously validated JSON number token.

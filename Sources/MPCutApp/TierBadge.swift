@@ -5,10 +5,12 @@ import SwiftUI
 struct TierBadge<Details: View>: View {
     let state: TierState
     let help: String
+    var tintOverride: Color?
     @ViewBuilder let details: (_ dismiss: @escaping () -> Void) -> Details
     @State private var showsDetails = false
 
     var body: some View {
+        let tint = tintOverride ?? TimelineTierBadge.tint(state)
         Button { showsDetails = true } label: {
             HStack(spacing: 4) {
                 Image(systemName: TimelineTierBadge.symbol(state)).imageScale(.small)
@@ -17,9 +19,9 @@ struct TierBadge<Details: View>: View {
             .font(.caption.weight(.medium))
             .padding(.horizontal, 7)
             .padding(.vertical, 2)
-            .foregroundStyle(TimelineTierBadge.tint(state))
-            .background(Capsule().fill(TimelineTierBadge.tint(state).opacity(0.14)))
-            .overlay(Capsule().strokeBorder(TimelineTierBadge.tint(state).opacity(0.35), lineWidth: 0.5))
+            .foregroundStyle(tint)
+            .background(Capsule().fill(tint.opacity(0.14)))
+            .overlay(Capsule().strokeBorder(tint.opacity(0.35), lineWidth: 0.5))
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)

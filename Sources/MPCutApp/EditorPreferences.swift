@@ -9,6 +9,7 @@ final class EditorPreferences: ObservableObject {
         case mediaAutoRefreshEnabled = "media_auto_refresh_enabled"
         case analysisSidecarReuseEnabled = "analysis_sidecar_reuse_enabled"
         case historyMaxSteps = "history_max_steps"
+        case timelineSourceTimeTicksEnabled = "timeline_source_time_ticks_enabled"
         case timelineSnapTarget = "timeline_snap_target"
         case timelineLargePreviewsEnabled = "timeline_large_previews_enabled"
         case playbackPreviewVolumeFraction = "playback_preview_volume_fraction"
@@ -24,7 +25,7 @@ final class EditorPreferences: ObservableObject {
 
     enum Change {
         case automaticallyRefreshMedia, localMCPEnabled, useAnalysisSidecars, defaultExportMode, snapTarget, largeThumbnails
-        case maxBlip, minimumPause, padding, volume, isMuted, scrubSoundEnabled, jpegPreset, historyLimit
+        case sourceTimeTicks, maxBlip, minimumPause, padding, volume, isMuted, scrubSoundEnabled, jpegPreset, historyLimit
     }
 
     let recentFiles: RecentFiles
@@ -85,6 +86,9 @@ final class EditorPreferences: ObservableObject {
             save(snapTarget, replacing: oldValue, key: .timelineSnapTarget, stored: snapTarget.rawValue, change: .snapTarget)
         }
     }
+    @Published var sourceTimeTicks = false {
+        didSet { save(sourceTimeTicks, replacing: oldValue, key: .timelineSourceTimeTicksEnabled, change: .sourceTimeTicks) }
+    }
     @Published var largeThumbnails = false {
         didSet { save(largeThumbnails, replacing: oldValue, key: .timelineLargePreviewsEnabled, change: .largeThumbnails) }
     }
@@ -130,6 +134,7 @@ final class EditorPreferences: ObservableObject {
         automaticallyRefreshMedia = Self.flag(defaults.object(forKey: Key.mediaAutoRefreshEnabled.rawValue)) ?? false
         useAnalysisSidecars = Self.flag(defaults.object(forKey: Key.analysisSidecarReuseEnabled.rawValue)) ?? true
         warnBeforeLoweringExportTier = Self.flag(defaults.object(forKey: Key.exportTierDowngradeWarningEnabled.rawValue)) ?? true
+        sourceTimeTicks = Self.flag(defaults.object(forKey: Key.timelineSourceTimeTicksEnabled.rawValue)) ?? false
         largeThumbnails = Self.flag(defaults.object(forKey: Key.timelineLargePreviewsEnabled.rawValue)) ?? false
         snapTarget = defaults.string(forKey: Key.timelineSnapTarget.rawValue).flatMap(TimelineSnapTarget.init(rawValue:))
             ?? .off

@@ -31,6 +31,29 @@ struct MulticamEditorView: View {
                                 showsTimeline: false, showsStatus: showsStatus)
             }
         }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if let url = model.projectURL {
+                ProjectMediaBanner(count: model.projectMediaSummary.offline) {
+                    model.presentProjectMedia(offlineOnly: true)
+                }
+                .id(url)
+            }
+        }
+        .sheet(item: $model.projectMediaRequest, onDismiss: openReplacementTranscription) { request in
+            ProjectMediaSheet(jobs: model.projectMediaJobs, request: request, archive: { model.projectMediaArchive },
+                              revision: { .init(generation: model.mcpGeneration, edit: model.mcpRevision) }, isMulticam: true,
+                              status: model.mediaStatus(for:),
+                              relinkBatch: { try await model.relinkProjectMedia($0) },
+                              revert: { try await model.revertProjectMedia($0) },
+                              ignore: model.ignoreProjectMedia,
+                              replace: { try await model.applyProjectMediaReplacement($0) },
+                              showUse: model.showProjectMediaUse)
+        }
+        .onReceive(model.projectMediaJobs.$transcriptSetup) { request in
+            if request != nil, model.projectMediaRequest == nil {
+                Task { @MainActor in openReplacementTranscription() }
+            }
+        }
         .background(EditorKeyboardMonitor(handle: handleKey))
         .modifier(MulticamPausePlayback(model: model))
         .navigationTitle(windowTitle)
@@ -131,15 +154,22 @@ struct MulticamEditorView: View {
         .modifier(EditorMediaDrop(enabled: model.canChooseSources, importFiles: { model.importSources($0) }))
     }
 
+    private func openReplacementTranscription() {
+        guard let transcriptSession, let request = model.projectMediaJobs.takeTranscription() else { return }
+        presentation.setTranscriptVisible(true, multicam: true)
+        transcriptSession.transcript.replacementSetup = request
+    }
+
     private func editor(_ project: MulticamProject) -> some View {
         EditorWorkspace(
             viewer: MulticamProgramViewer(preview: model.preview)
                 .overlay {
                     let editing = presentation.inspectorVisible && presentation.inspector == .participants
-                    if let transcriptSession, editing || !CutProject.multicam(project).participants.isEmpty {
+                    if let transcriptSession, editing || !project.participants.isEmpty {
                         ParticipantMonitorOverlay(session: transcriptSession, interactive: editing)
                     }
                 }
+                .overlay { MulticamMediaSlate(model: model, preview: model.preview) }
                 .modifier(EditorMediaDrop(enabled: model.canChooseSources, importFiles: { model.dropMulticamMedia($0) })),
             transport: MulticamTransport(model: model, preview: model.preview, project: project),
             timeline: MulticamTimelineHost(model: model, preview: model.preview, project: project,
@@ -164,7 +194,7 @@ struct MulticamEditorView: View {
                 case .assembly: "Inspect assembly ranges"
                 case .export: "Configure multicam export"
                 case .transcript: "Read and edit the transcript"
-                case .participants: "Review and edit recording participants"
+                case .participants: "Review camera feeds and meeting participants"
                 }
                 Text(inspector.label).help(toolTip).tag(inspector)
             }
@@ -391,6 +421,7 @@ struct MulticamEditorView: View {
             HStack {
                 SectionHeading("Sources")
                 Spacer()
+                Button("Project Media…") { model.presentProjectMedia() }
                 Button("Suggest Sync…") { showingSyncSuggestions = true }
                     .disabled(directAudioSources(project).count < 2 || model.isBusy)
             }
@@ -448,8 +479,14 @@ struct MulticamEditorView: View {
                             .fixedSize()
                         }
                         Spacer()
-                        Button("Relink…") { model.relink(source.id) }
-                            .help("Locate missing source")
+                        Menu("Media") {
+                            ForEach([ProjectMediaAction.locate, .replace, .reveal, .show], id: \.rawValue) { action in
+                                Button(action.title) {
+                                    model.presentProjectMedia(action, path: model.projectMediaURL(source.file).path)
+                                }
+                                .disabled(action == .reveal && model.mediaStatus(for: model.projectMediaURL(source.file)).hidesMedia)
+                            }
+                        }
                     }
                     if let progress = model.sourceIndexProgress[source.id] {
                         ProgressView("Indexing \(source.displayName)", value: progress)
@@ -692,8 +729,13 @@ struct MulticamEditorView: View {
                     // The tier of the saved program, as the editor's status bar shows it for a file timeline.
                     MulticamTierBadge(model: model)
                 }
-                if let issue = model.mediaRefreshIssues.values.sorted().first {
-                    Label("Media refresh", systemImage: "exclamationmark.triangle").help(issue)
+                ProjectMediaJobStatus(jobs: model.projectMediaJobs) { model.presentProjectMedia() }
+                let mediaSummary = model.projectMediaSummary
+                if let title = mediaSummary.title {
+                    let state: ProjectMediaStatus = mediaSummary.offline > 0 ? .offline : .needsReview
+                    BarButton(title, symbol: state.editorIcon) { model.presentProjectMedia() }
+                        .foregroundStyle(Color(nsColor: state.editorColor))
+                        .help("Open Project Media")
                 }
                 if let analysis = model.analysis.status {
                     Text(analysis).lineLimit(1).help(analysis)
@@ -832,6 +874,22 @@ private struct MulticamSceneStatus: View {
     }
 }
 
+private struct MulticamMediaSlate: View {
+    @ObservedObject var model: MulticamEditorModel
+    @ObservedObject var preview: MulticamPreview
+
+    var body: some View {
+        if let url = model.projectMediaPreviewURL(at: preview.time) {
+            let status = model.mediaStatus(for: url)
+            if status.hidesMedia {
+                ProjectMediaSlate(url: url, status: status) {
+                    model.presentProjectMedia(.locate, path: url.path)
+                }
+            }
+        }
+    }
+}
+
 private struct MulticamProgramViewer: View {
     let preview: MulticamPreview
     @State private var issue: String?
@@ -877,7 +935,7 @@ private struct MulticamTimelineHost: View {
                          zoom: $model.timelineZoom, largeThumbnails: Binding(
                             get: { model.preferences.largeThumbnails },
                             set: { model.preferences.largeThumbnails = $0 }
-                         ), timeEntryRequest: model.timeEntryRequest, analysis: model.analysis,
+                         ), showsSourceRuler: model.preferences.sourceTimeTicks, timeEntryRequest: model.timeEntryRequest, analysis: model.analysis,
                          snapTarget: Binding(get: { model.analysis.snapTarget }, set: model.setAnalysisSnap),
                          jump: { model.preview.pause(); model.seekGroup($0) },
                          markIn: model.markIn, markOut: model.markOut, assemblySelection: model.assemblySelection,
@@ -889,6 +947,10 @@ private struct MulticamTimelineHost: View {
                          },
                          assembly: model.assemblyPreview || inspectingAssembly
                             ? MulticamAssemblyTimeline(model: model, preview: preview, paddingSpans: model.paddingSpans(assembly: true)) : nil)
+        timeline.sourceMediaStatus = { model.mediaStatus(for: model.projectMediaURL($0.file)) }
+        timeline.onProjectMedia = { action, source in
+            model.presentProjectMedia(action, path: model.projectMediaURL(source.file).path, useID: source.id)
+        }
         if !model.isBusy { timeline.onPreviewSwitch = { _ = model.previewMulticamSwitch(at: $0) } }
         timeline.groupPadding = model.paddingSpans(assembly: false)
         if model.rangeTool && !model.isBusy { timeline.selectRange = model.selectGroupRange }
@@ -1309,11 +1371,14 @@ private struct MulticamExportControls: View {
                 Toggle("Require Camera Video Copy", isOn: $choices.requireCameraCopy)
                     .help("Require stream copy for retained camera video")
             }
+            InspectorRow("Stills") {
+                Toggle("One frame per still", isOn: $choices.heldStills)
+            }
         }
         if choices.participantAudio == nil && effectiveMode == .encode && tracks != .audio {
             InspectorRow("Video") {
                 Picker("Video", selection: $choices.codec) {
-                    ForEach(ReencodeCodec.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                    ForEach(ReencodeCodec.allCases.filter { $0 != .jpeg }, id: \.self) { Text($0.displayName).tag($0) }
                 }
                 .help("Choose video codec")
             }
@@ -1433,7 +1498,7 @@ private struct MulticamExportControls: View {
         model.export(output: checkDestination, mode: effectiveMode, tracks: tracks, dryRun: true, wholeGroup: wholeGroup,
                      settings: choices.settings, selection: selectionRanges,
                      requireCameraCopy: choices.placements != .none && choices.requireCameraCopy,
-                     audioOutput: choices.audioOutput, audioAction: choices.requestedAudioAction)
+                     audioOutput: choices.audioOutput, audioAction: choices.requestedAudioAction, pictureTiming: choices.pictureTiming)
     }
 
     private func chooseDestination() {
@@ -1441,7 +1506,7 @@ private struct MulticamExportControls: View {
         model.export(output: checkDestination, mode: effectiveMode, tracks: tracks, dryRun: true,
                      wholeGroup: wholeGroup, settings: choices.settings, selection: selectionRanges,
                      requireCameraCopy: choices.placements != .none && choices.requireCameraCopy,
-                     audioOutput: choices.audioOutput, audioAction: choices.requestedAudioAction,
+                     audioOutput: choices.audioOutput, audioAction: choices.requestedAudioAction, pictureTiming: choices.pictureTiming,
                      reviewed: { summary in
             guard requested == review, requested.project == model.project else { return }
             presentDestination(requested, summary: summary)
@@ -1461,7 +1526,8 @@ private struct MulticamExportControls: View {
             model.export(output: output, mode: chosen.effectiveMode, tracks: chosen.tracks, dryRun: false,
                          wholeGroup: request.wholeGroup, settings: chosen.settings, selection: request.selection,
                          requireCameraCopy: chosen.placements != .none && chosen.requireCameraCopy,
-                         saveResult: saveResult.state == .on, audioOutput: chosen.audioOutput, audioAction: chosen.requestedAudioAction)
+                         saveResult: saveResult.state == .on, audioOutput: chosen.audioOutput, audioAction: chosen.requestedAudioAction,
+                         pictureTiming: chosen.pictureTiming)
         }
     }
 

@@ -178,7 +178,27 @@ codesign --force --sign - --timestamp=none "$app"
 codesign --verify --deep --strict "$app"
 plutil -lint "$contents/Info.plist"
 env -i PATH=/usr/bin:/bin "$contents/Helpers/mpcut" --help >/dev/null
-env -i PATH=/usr/bin:/bin "$contents/Helpers/ffmpeg" -version >/dev/null
+# Exercise the shipped encoder libraries after signing and relocating the bundle.
+# One video sample spans the generated audio in both MOV fixtures.
+for codecs in 'h264_videotoolbox alac' 'mjpeg pcm_s16le'; do
+    read -r picture_codec sound_codec <<< "$codecs"
+    env -i PATH=/usr/bin:/bin "$contents/Helpers/ffmpeg" -nostdin -v error -xerror \
+        -f lavfi -i 'color=s=320x180:r=1:d=1' -f lavfi -i 'sine=r=48000:d=1' \
+        -c:v "$picture_codec" -c:a "$sound_codec" -f mov "$staging/$picture_codec.mov"
+    env -i PATH=/usr/bin:/bin "$contents/Helpers/mpcut" media inspect --no-sidecar --frames --json \
+        "$staging/$picture_codec.mov" | python3 -c '
+import json, sys
+media = json.load(sys.stdin)["media"]
+frames = media["frames"]
+codecs = {stream["kind"]: stream["codec"] for stream in media["streams"]}
+if codecs != {"video": sys.argv[1], "audio": sys.argv[2]} or len(frames) != 1:
+    sys.exit(f"Unexpected smoke export streams or frame count: {codecs}, {len(frames)}")
+frame = frames[0]
+if not (frame["keyframe"] and frame["time"]["numerator"] == 0 and
+        frame["duration"]["numerator"] == frame["duration"]["denominator"]):
+    sys.exit(f"Unexpected one-second hold: {frame}")
+' "${picture_codec%_videotoolbox}" "$sound_codec"
+done
 python3 "$root/scripts/mcp-reference.py" --check
 # The bundle check uses assertions, which PYTHONOPTIMIZE would otherwise disable.
 env -u PYTHONOPTIMIZE python3 "$root/Tests/Integration/mcp_bundle.py" "$app"

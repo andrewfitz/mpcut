@@ -32,6 +32,9 @@ extension ProjectSessions {
         if let result = try await mcpTranscript(tool: tool, arguments: arguments, session: session, checkAccess: checkAccess) {
             return result
         }
+        if let result = try await mcpProjectMedia(tool: tool, arguments: arguments, session: session, checkAccess: checkAccess) {
+            return result
+        }
         if let result = try await mcpStills(tool: tool, arguments: arguments, session: session, checkAccess: checkAccess) {
             return result
         }

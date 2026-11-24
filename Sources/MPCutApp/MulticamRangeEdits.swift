@@ -256,7 +256,7 @@ extension MulticamEditorModel {
                 let slice = try project.assemblySelection(piece)
                 for item in slice.assemblyItems ?? [] {
                     if var insert = item.still, !used.insert(insert.id).inserted {
-                        insert.id = UUID().uuidString
+                        insert.id = ProjectIdentifier.make()
                         items.append(.still(insert))
                     } else {
                         items.append(item)

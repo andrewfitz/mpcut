@@ -3,6 +3,7 @@ import SwiftUI
 
 struct EditorSettings: View {
     @ObservedObject var preferences: EditorPreferences
+    let cacheContext: @MainActor () -> SidecarClearContext
 
     fileprivate static let finishEditing = Notification.Name("MPCutFinishEditingSettings")
     @MainActor static func commitPendingEdits() {
@@ -21,11 +22,13 @@ struct EditorSettings: View {
                     SettingsFootnote("Programs running under your Mac account can read and edit projects and process media files.")
                 }
                 Section("Media") {
-                    Toggle("Automatically refresh changed recordings", isOn: $preferences.automaticallyRefreshMedia)
+                    Toggle("Watch recordings for changes while editing", isOn: $preferences.automaticallyRefreshMedia)
                         .help("Refresh project media when a recording changes")
                 }
                 Section("Timeline") {
                     SnapTargetPicker(selection: $preferences.snapTarget)
+                    Toggle("Show source time ticks inside clips", isOn: $preferences.sourceTimeTicks)
+                        .help("Show the original recording time inside each clip.")
                     Toggle("Enlarge thumbnails and waveforms", isOn: $preferences.largeThumbnails)
                         .help("Enlarge timeline previews")
                 }
@@ -61,14 +64,7 @@ struct EditorSettings: View {
             .tabItem { Label("General", systemImage: "gearshape").help("Show general settings") }
 
             Form {
-                Section {
-                    Toggle("Save and reuse analysis beside recordings", isOn: $preferences.useAnalysisSidecars)
-                        .help("Reuse saved media analysis")
-                } header: {
-                    Text("Analysis sidecars")
-                } footer: {
-                    SettingsFootnote("MPCut and the CLI can reuse edit indexes and analysis saved in sidecar files.")
-                }
+                SidecarStorageSettings(preferences: preferences, cacheContext: cacheContext)
                 Section("Silence") {
                     PauseSetting(label: "Minimum pause", unit: "s", value: $preferences.minimumPause,
                                  minimum: 1.0 / Double(AudioWaveform.rate), step: 0.1)

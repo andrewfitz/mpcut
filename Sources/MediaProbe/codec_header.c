@@ -6,7 +6,8 @@
 #include <stdio.h>
 
 /* MOV H.26x samples are length-prefixed. Transport streams use Annex B. */
-bool mp_h26x_random_access(const AVPacket *packet, const AVCodecParameters *params, bool source_start, int *multilayer)
+static bool h26x_random_access(const AVPacket *packet, const AVCodecParameters *params,
+                               bool source_start, bool require_no_leading, int *multilayer)
 {
     bool hevc = params->codec_id == AV_CODEC_ID_HEVC;
     int length_size = 0;
@@ -47,6 +48,9 @@ bool mp_h26x_random_access(const AVPacket *packet, const AVCodecParameters *para
         if (hevc && mp_hevc_multilayer_unit(bytes + i, unit_end - i))
             *multilayer = 1;
         if (hevc && type <= 31) {
+            // BLA_N_LP and IDR_N_LP exclude pictures that decode later but present earlier.
+            if (require_no_leading && type != 18 && type != 20)
+                return false;
             if (type < 16 || type > (source_start ? 21 : 20))
                 return false;
             random_access = true;
@@ -58,6 +62,17 @@ bool mp_h26x_random_access(const AVPacket *packet, const AVCodecParameters *para
         i = unit_end;
     }
     return random_access;
+}
+
+bool mp_h26x_random_access(const AVPacket *packet, const AVCodecParameters *params, bool source_start, int *multilayer)
+{
+    return h26x_random_access(packet, params, source_start, false, multilayer);
+}
+
+bool mp_h26x_no_leading_random_access(const AVPacket *packet, const AVCodecParameters *params)
+{
+    int multilayer = 0;
+    return h26x_random_access(packet, params, false, true, &multilayer) && !multilayer;
 }
 
 typedef struct {

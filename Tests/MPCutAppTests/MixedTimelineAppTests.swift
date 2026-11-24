@@ -356,7 +356,7 @@ final class MixedTimelineAppTests: XCTestCase {
     /// sample rates and channel counts scrub and play through their joins.
     @MainActor
     func testPreviewScrubsAndPlaysAcrossClipsInDifferentFormats() async throws {
-        _ = NSApplication.shared
+        _ = WindowTestHost.application
         let session = ProjectSession(id: UUID(), preferences: EditorPreferences())
         defer { session.end() }
         let preview = session.editor.preview

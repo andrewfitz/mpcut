@@ -467,7 +467,7 @@ extension ProjectSessions {
                 })
             case "evidence", "candidates":
                 let id = try a.string("word_id")
-                let projection = try await controller.indexedTranscript(attachmentID: attachment?.id)
+                let projection = try await controller.indexedTranscript(attachmentID: attachment?.id, clocks: [.source])
                 try checkAccess()
                 guard controller.timelineRevision == clockRevision, controller.state.revision == state.revision else {
                     throw MCPCommandError("stale_transcript_plan", "The timeline or attached transcripts changed during the read.")
@@ -514,11 +514,11 @@ extension ProjectSessions {
             let trackLimit = a.fields["track_limit"] as? Int ?? limit
             let bytes = try await prepareTranscriptMCP {
                 let indexes = try builders.map { try $0() }
-                let project = TranscriptProjectIndex(indexes: indexes, space: space)
                 let args = MCPTranscriptArguments(fields: ["limit": max(limit, trackLimit)])
                 let page = try args.boundedPage { cap in
-                    let coverage = try project.inputCoverage(filter: filter, offset: offset, limit: min(limit, cap),
-                                                             trackOffset: trackOffset, trackLimit: min(trackLimit, cap))
+                    let coverage = try TranscriptProjectIndex.inputCoverage(
+                        of: indexes, space: space, filter: filter, offset: offset, limit: min(limit, cap),
+                        trackOffset: trackOffset, trackLimit: min(trackLimit, cap))
                     var value = try transcriptMCPObject(coverage.gaps)
                     value["tracks"] = try transcriptMCPJSON(coverage.tracks)
                     return value
@@ -533,9 +533,14 @@ extension ProjectSessions {
             result.merge(page, uniquingKeysWith: { old, _ in old })
             return result
         }
+        // A read names the clock it reads. Speaker lanes come from Source words, and seeking to
+        // a word of another clock in a sequence finds it in Current Cut.
+        var clocks: Set<TranscriptSpace> = [space]
+        if a.action == "speakers" { clocks.insert(.source) }
+        if a.action == "seek" { clocks.insert(.currentCut) }
         var fetched: [TranscriptIndex] = []
         for entry in selected {
-            fetched.append(try await controller.indexedTranscript(attachmentID: entry.id))
+            fetched.append(try await controller.indexedTranscript(attachmentID: entry.id, clocks: clocks))
         }
         let indexes = fetched
         let cache = controller.mcpProjectIndexCache
@@ -750,7 +755,7 @@ extension ProjectSessions {
             let aggregate = a.attachmentID == nil && a.fields["result_id"] == nil && controller.state.attachments.count > 1
             let filter = a.filter
             let selected = aggregate ? controller.state.attachments : try [controller.attachment(id: attachment?.id)]
-            let builders = try selected.map { try controller.prepareIndex(attachmentID: $0.id) }
+            let builders = try selected.map { try controller.prepareIndex(attachmentID: $0.id, clocks: [space]) }
             let render: @Sendable () throws -> Data = {
                 let indexes = try builders.map { try $0() }
                 if let index = indexes.first, indexes.count == 1 {
@@ -758,7 +763,7 @@ extension ProjectSessions {
                 }
                 return try TranscriptCodec.encode(indexes, space: space, format: format, filter: filter)
             }
-            return try mcpOutputJobs.start(owner: session.mcpHandle, revision: controller.timelineRevision) { progress in
+            return try mcpOutputJobs.start(owner: session.mcpHandle, revision: controller.timelineRevision, project: session.sidecarWork.project) { progress in
                 let data = try render()
                 let staged = output.deletingLastPathComponent().appendingPathComponent(".mpcut-transcript-" + UUID().uuidString)
                 defer { try? FileManager.default.removeItem(at: staged) }
@@ -861,7 +866,7 @@ extension ProjectSessions {
             let output = try a.path("path")
             let save = try controller.prepareExcerptSave(id, to: output)
             try checkAccess()
-            return try mcpOutputJobs.start(owner: owner, revision: controller.timelineRevision) { progress in
+            return try mcpOutputJobs.start(owner: owner, revision: controller.timelineRevision, project: session.sidecarWork.project) { progress in
                 try Task.checkCancellation()
                 try save()
                 progress.published(output)

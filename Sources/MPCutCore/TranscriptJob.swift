@@ -205,6 +205,12 @@ public struct TranscriptJobSession: Codable, Equatable, Sendable, Identifiable {
     public var recognitionDurationSeconds: Double {
         tracks.reduce(0) { $0 + ($1.recognize ? $1.duration.seconds : 0) }
     }
+
+    /// Whether a run or an import has taken this session's result, so that each track holds its
+    /// outcome. A recognition track still waiting for its provider is pending or staged.
+    var isResolved: Bool {
+        !tracks.contains { [.pending, .staged].contains($0.state) }
+    }
 }
 
 public struct TranscriptJobOutput: Sendable {
@@ -222,6 +228,7 @@ public struct TranscriptJobRecord: Codable, Equatable, Sendable, Identifiable {
         case documentID = "document_id"
         case documentIdentity = "document_identity"
         case documentDiskFingerprint = "document_disk_fingerprint"
+        case sidecarProjectURL = "sidecar_project_url"
         case options
         case policy
         case requestedPolicy = "requested_policy"
@@ -245,6 +252,7 @@ public struct TranscriptJobRecord: Codable, Equatable, Sendable, Identifiable {
     public var documentID: String
     public var documentIdentity: UUID?
     public var documentDiskFingerprint: String?
+    var sidecarProjectURL: URL?
     public var options: TranscriptJobOptions
     public var policy: TranscriptJobPolicy
     public var requestedPolicy: TranscriptJobPolicy?
@@ -647,17 +655,32 @@ public enum TranscriptJobPlan {
         return result.reusable ? result.digest : nil
     }
 
+    /// Refresh evidence stores the ordinary editing clock. Recognition runs on the
+    /// presentation clock, including any leading empty movie edit.
+    static func streamEvidence(_ evidence: MediaRefreshEvidence, streamIndex: Int) throws -> String? {
+        guard evidence.streams.indices.contains(streamIndex) else { return nil }
+        let record = evidence.streams[streamIndex]
+        guard record.kind == "audio" else { return nil }
+        let offset = MediaInfo.multicamSourceOffset(origin: evidence.origin, format: evidence.format)
+        let duration = try max(evidence.duration, record.audioEnd ?? .zero).adding(offset)
+        return try streamDigest(record, duration: duration, origin: offset > .zero ? .zero : evidence.origin)
+    }
+
+    private static func streamDigest(_ record: MediaRefreshEvidence.Stream, duration: RationalTime,
+                                     origin: RationalTime) throws -> String? {
+        guard let payload = record.payload, let timing = record.timing else { return nil }
+        return digest(try encodeJob(StreamClockEvidence(
+            payload: payload, timing: timing, configuration: record.configuration, duration: duration,
+            origin: origin, start: record.start, initialPadding: record.initialPadding,
+            trailingPadding: record.trailingPadding, seekPreroll: record.seekPreroll, channelLayout: record.channelLayout,
+            sampleRate: record.sampleRate, channels: record.channels, presentationEdits: record.insertedPresentationEdits
+        )))
+    }
+
     private static func evidence(media: MediaInfo, stream: StreamInfo?, duration: RationalTime) throws -> (digest: String, reusable: Bool) {
-        if let stream, let evidence = media.refreshEvidence, evidence.streams.indices.contains(stream.index) {
-            let record = evidence.streams[stream.index]
-            if let payload = record.payload, let timing = record.timing {
-                return (digest(try encodeJob(StreamClockEvidence(
-                    payload: payload, timing: timing, configuration: record.configuration, duration: duration,
-                    origin: media.origin, start: record.start, initialPadding: record.initialPadding,
-                    trailingPadding: record.trailingPadding, seekPreroll: record.seekPreroll, channelLayout: record.channelLayout,
-                    sampleRate: record.sampleRate, channels: record.channels, presentationEdits: record.insertedPresentationEdits
-                ))), true)
-            }
+        if let stream, let evidence = media.refreshEvidence, evidence.streams.indices.contains(stream.index),
+           let proof = try streamDigest(evidence.streams[stream.index], duration: duration, origin: media.origin) {
+            return (proof, true)
         }
         return (digest(try encodeJob(media.identity) + Data(":v1:\(stream?.index ?? -1):\(media.origin):\(duration)".utf8)), false)
     }
@@ -972,8 +995,12 @@ public struct TranscriptJobStore: Sendable {
     /// A job stays while a process owns it or holds its lock, while any of its files is newer
     /// than the cutoff, and while it holds a finished result whose document still exists: an
     /// unattached result is not stored anywhere else, and an attached one is reconciled from
-    /// this record. Everything a pruned job held can be staged or recognized again from the
+    /// this record. An attached result goes once the document has attached others in place of
+    /// all of it. Everything a pruned job held can be staged or recognized again from the
     /// media and its sidecar.
+    ///
+    /// A job that stays gives up the attached session outputs that only repeat its track
+    /// results, whatever its age, and keeps each finished track's result and levels packed.
     @discardableResult
     public func prune(olderThan age: TimeInterval, now: Date = Date()) throws -> [UUID] {
         let manager = FileManager.default
@@ -998,6 +1025,15 @@ public struct TranscriptJobStore: Sendable {
             guard ["", "json", "lock"].contains(entry.pathExtension) else { return nil }
             return UUID(uuidString: entry.pathExtension.isEmpty ? name : entry.deletingPathExtension().lastPathComponent)
         })
+        /// The transcripts each document holds on disk, read once however many jobs it has.
+        /// Nil for a path that is not a project this version can read.
+        var documents: [String: ProjectTranscripts?] = [:]
+        func transcripts(of document: String) -> ProjectTranscripts? {
+            if let known = documents[document] { return known }
+            let saved = try? CutProject.load(from: URL(fileURLWithPath: document)).transcripts
+            documents.updateValue(saved, forKey: document)
+            return saved
+        }
         var removed: [UUID] = []
         for id in ids.sorted(by: { $0.uuidString < $1.uuidString }) where isIdle(id) {
             guard let fd = try? lock(id, wait: false) else { continue }
@@ -1010,8 +1046,10 @@ public struct TranscriptJobStore: Sendable {
                     guard let owner = record.ownerPID, Self.ownerIsGone(owner, lastSeen: record.updatedAt) else { continue }
                 }
                 // An attached result is what Reconcile reads after a sync change, however old.
-                if [.completed, .partial].contains(record.state),
-                   manager.fileExists(atPath: record.documentID) { continue }
+                if [.completed, .partial].contains(record.state), manager.fileExists(atPath: record.documentID) {
+                    guard record.attached, let current = transcripts(of: record.documentID),
+                          isSuperseded(record, by: current) else { continue }
+                }
             }
             do {
                 // A lock file can outlive its job. Removing one alone is not a pruned job.
@@ -1024,7 +1062,72 @@ public struct TranscriptJobStore: Sendable {
                 // A file that cannot be removed leaves the job in place for the next pass.
             }
         }
+        // Removing an output changes its folder, which would make a job look recently used
+        // to the pass above.
+        for id in ids.subtracting(removed) {
+            // Taking the lock creates its file, so look for something to remove first.
+            func outputs() -> [URL] {
+                guard let record = try? read(id) else { return [] }
+                return attachedOutputs(record).filter { output in
+                    // An output written after the record has not been imported yet.
+                    modified(output).map { $0 < record.updatedAt } ?? false
+                }
+            }
+            guard !outputs().isEmpty, let fd = try? lock(id, wait: false) else { continue }
+            defer { close(fd) }
+            for output in outputs() { try? manager.removeItem(at: output) }
+        }
+        // A job finished by a version that kept each track's files as written, or one whose
+        // result was never read.
+        for id in ids.subtracting(removed) { packArtifacts(id, wait: false) }
         return removed
+    }
+
+    /// The session outputs an attached job can give up. The project that attached a result
+    /// stores it, and a retry discards the output before its provider writes a new one, so
+    /// only a second import of the same job reads these files.
+    private func attachedOutputs(_ record: TranscriptJobRecord) -> [URL] {
+        guard record.attached, record.ownerToken == nil, [.completed, .partial].contains(record.state) else { return [] }
+        // Look for the output first: the other question reads each track's result.
+        return record.sessions.filter { FileManager.default.fileExists(atPath: $0.output.path) && holdsOutputAsCopy($0) }
+            .map(\.output)
+    }
+
+    /// Whether a session's output repeats what the job holds elsewhere: the session has been
+    /// read, and every track it recognized has its own result, plain or packed, that can be
+    /// read. That is what a provider builds the output from again without recognizing.
+    /// A provider run on its own may write the output and no track results. That output is
+    /// the job's only copy of the recognition, which a second import could otherwise get
+    /// back only by recognizing again, so it stays.
+    /// A track that failed has nothing in either place. A session still to be recognized
+    /// keeps the place where its provider writes.
+    private func holdsOutputAsCopy(_ session: TranscriptJobSession) -> Bool {
+        session.isResolved && session.tracks.allSatisfy { track in
+            guard [.recognized, .cached].contains(track.state) else { return true }
+            return track.result.flatMap(TranscriptJobArtifact.read) != nil
+        }
+    }
+
+    /// Whether the document of an attached job has since attached other results in place of
+    /// every session of this one. Reconcile starts from the job an attached transcript names,
+    /// and none of the document's transcripts came from this job, so nothing reads it again.
+    /// A job whose result was never attached holds the only copy and is not superseded.
+    /// A transcript that cannot be read, or a document that belongs to another project,
+    /// leaves the job in place.
+    private func isSuperseded(_ record: TranscriptJobRecord, by transcripts: ProjectTranscripts) -> Bool {
+        guard record.attached, record.ownerToken == nil else { return false }
+        if let owner = record.documentIdentity, transcripts.documentID != owner { return false }
+        let fingerprints = Set(record.sessions.map(\.fingerprint))
+        if transcripts.attachments.contains(where: { $0.fingerprint.map(fingerprints.contains) ?? false }) { return false }
+        // A stored transcript names its job. That outlives a retry, which gives the job's
+        // sessions new fingerprints, and it is all an older transcript carries.
+        let document = URL(fileURLWithPath: record.documentID)
+        for attachment in transcripts.attachments {
+            guard let bytes = try? TranscriptStore.read(attachment.asset, relativeTo: document),
+                  let transcript = try? TranscriptCodec.decode(bytes, format: .json) else { return false }
+            if transcript.jobID.flatMap(UUID.init(uuidString:)) == record.id { return false }
+        }
+        return true
     }
 
     /// The folder where MPCut and a standalone Transcriberrr exchange recognition results.
@@ -1047,16 +1150,23 @@ public struct TranscriptJobStore: Sendable {
         return pruneSharedRecognition(in: directory, olderThan: age, now: now)
     }
 
+    /// Records that the project has stored this job's result, and removes the session outputs
+    /// that only repeat its track results. The record is written first, so a job that still
+    /// has to attach never finds its output gone.
     @discardableResult
     public func markAttached(_ id: UUID, expectedPreparationID: UUID? = nil) throws -> TranscriptJobRecord {
-        try update(id) {
-            if let expectedPreparationID, $0.preparationID != expectedPreparationID {
+        try withLock(id) {
+            var record = try read(id)
+            if let expectedPreparationID, record.preparationID != expectedPreparationID {
                 throw jobError("stale_transcript_job", "The job was retried before the attachment was written.")
             }
-            guard [.completed, .partial].contains($0.state) else {
+            guard [.completed, .partial].contains(record.state) else {
                 throw jobError("transcript_job_unavailable", "Only a finished transcript job can be acknowledged.")
             }
-            $0.attached = true
+            record.attached = true
+            try write(record: &record)
+            for output in attachedOutputs(record) { try? FileManager.default.removeItem(at: output) }
+            return record
         }
     }
 
@@ -1066,7 +1176,13 @@ public struct TranscriptJobStore: Sendable {
             $0.documentID == from && (documentIdentity == nil || $0.documentIdentity == documentIdentity)
         }
         for record in try list(where: matches) {
-            try update(record.id) { if matches($0) { $0.documentID = to } }
+            try update(record.id) { record in
+                guard matches(record) else { return }
+                if record.sidecarProjectURL?.resolvingSymlinksInPath().path == URL(fileURLWithPath: from).resolvingSymlinksInPath().path {
+                    record.sidecarProjectURL = URL(fileURLWithPath: to)
+                }
+                record.documentID = to
+            }
         }
     }
 
@@ -1112,6 +1228,7 @@ public struct TranscriptJobStore: Sendable {
                                              documentDiskFingerprint: documentDiskFingerprint, options: options, policy: policy,
                                              requestedPolicy: policy, requestedDownload: download, state: .preparing, sessions: [], workingDirectory: workURL(id))
             }
+            if let project = SidecarLocations.projectURL { record.sidecarProjectURL = project }
             record.policy = policy
             record.inputs = inputs
             record.preparationID = token
@@ -1168,6 +1285,9 @@ public struct TranscriptJobStore: Sendable {
             try FileManager.default.removeItem(at: initial.workingDirectory)
         }
         let id = initial.id
+        // A provider reads each artifact at its own path, and the steps below link and compare
+        // the files themselves.
+        try restoreArtifacts(initial)
         // Reuse staged audio only when its complete extraction inputs match.
         let old = Dictionary(uniqueKeysWithValues: initial.sessions.flatMap(\.tracks).map { ($0.id, $0) })
         var prepared = plan.sessions
@@ -1241,9 +1361,11 @@ public struct TranscriptJobStore: Sendable {
                       let media = plan.media[track.file] else { continue }
                 let prior = old[track.id]
                 if initial.policy == .restart || prior?.evidence != track.evidence || prior?.channel != track.channel {
-                    for artifact in [track.audio, track.result, track.activity,
-                                     track.result?.appendingPathExtension("provenance")].compactMap({ $0 }) {
+                    for artifact in [track.audio, track.result?.appendingPathExtension("provenance")].compactMap({ $0 }) {
                         try? FileManager.default.removeItem(at: artifact)
+                    }
+                    for artifact in [track.result, track.activity].compactMap({ $0 }) {
+                        TranscriptJobArtifact.remove(artifact)
                     }
                 }
                 let finished = !stagesAudioForStandaloneProvider && initial.policy != .restart
@@ -1292,6 +1414,14 @@ public struct TranscriptJobStore: Sendable {
                     do {
                         if let warning = try prepareActivity(track, media: media, audio: audio, measured: measured,
                                                              cancelled: cancelled) { notes.append(warning) }
+                        // A track that is not recognized is staged only to be measured, and its
+                        // levels are now saved: the run hands the provider those and no audio.
+                        // A standalone provider is handed every recording, and a restart
+                        // measures again from the audio.
+                        if measured != nil, !track.recognize, !stagesAudioForStandaloneProvider, initial.policy != .restart {
+                            try? FileManager.default.removeItem(at: audio)
+                            track.stagedAudioSnapshot = nil
+                        }
                     } catch {
                         if cancelled() { throw CancellationError() }
                         notes.append("Could not save audio levels for \(track.name). \(error.localizedDescription)")
@@ -1329,14 +1459,46 @@ public struct TranscriptJobStore: Sendable {
     /// neither recognition nor level measurement would read its audio again.
     private func hasFinishedArtifacts(_ track: TranscriptJobTrack, recognitionKey: String?) -> Bool {
         guard let levels = track.activity, let duration = try? track.duration.roundedToSamples(16_000),
-              let data = try? Data(contentsOf: levels, options: .mappedIfSafe),
+              let data = TranscriptJobArtifact.read(levels),
               TranscriptRecognitionCache.Artifacts.matchesActivity(data, evidence: track.evidence, duration: duration) else {
             return false
         }
         guard track.recognize else { return true }
-        guard let recognitionKey, let result = track.result,
-              let artifacts = TranscriptRecognitionCache.Artifacts(result: result, activity: levels) else { return false }
-        return artifacts.matches(key: recognitionKey, evidence: track.evidence, needsActivity: true)
+        guard let recognitionKey, let result = track.result.flatMap(TranscriptJobArtifact.read) else { return false }
+        return TranscriptRecognitionCache.Artifacts(result: result, activity: data)
+            .matches(key: recognitionKey, evidence: track.evidence, needsActivity: true)
+    }
+
+    /// Writes every artifact a track holds packed back at the path its manifest names.
+    func restoreArtifacts(_ record: TranscriptJobRecord) throws {
+        for track in record.sessions.flatMap(\.tracks) {
+            for artifact in [track.result, track.activity].compactMap({ $0 }) { try TranscriptJobArtifact.restore(artifact) }
+        }
+    }
+
+    /// The artifacts of a finished job that are still plain files. A track that was recognized,
+    /// answered from the cache or only measured has what a retry reads, and nothing reads it
+    /// until then. A session still waiting for a provider run on its own keeps its files as
+    /// that provider expects them, and a failed track is the one a retry works on.
+    private func packableArtifacts(_ record: TranscriptJobRecord) -> [(url: URL, kind: TranscriptJobArtifact.Kind)] {
+        guard record.ownerToken == nil, [.completed, .partial].contains(record.state) else { return [] }
+        return record.sessions.filter(\.isResolved).flatMap(\.tracks)
+            .filter { [.recognized, .cached, .skipped].contains($0.state) }
+            .flatMap { [($0.result, TranscriptJobArtifact.Kind.result), ($0.activity, .levels)] }
+            .compactMap { artifact in artifact.0.map { (url: $0, kind: artifact.1) } }
+            .filter { TranscriptJobArtifact.isPackable($0.url) }
+    }
+
+    /// Packs what a finished job keeps for each track. The job's lock is held for it, so no
+    /// retry or run starts on files that are changing form. Without `wait`, a job that
+    /// another process holds is left for a later pass.
+    func packArtifacts(_ id: UUID, wait: Bool) {
+        // Taking the lock creates its file, so look for something to pack first.
+        guard let record = try? read(id), !packableArtifacts(record).isEmpty,
+              let fd = try? lock(id, wait: wait) else { return }
+        defer { close(fd) }
+        guard let current = try? read(id) else { return }
+        for artifact in packableArtifacts(current) { TranscriptJobArtifact.pack(artifact.url, as: artifact.kind) }
     }
 
     /// `measured` holds the levels of PCM this preparation extracted. They describe the staged
@@ -1358,7 +1520,7 @@ public struct TranscriptJobStore: Sendable {
         if let measured, let fresh = try? transcriptActivityDocument(levels: measured, duration: duration,
                                                                      evidence: track.evidence, cancelled: cancelled) {
             data = fresh
-            if (try? Data(contentsOf: levels, options: .mappedIfSafe)) != data {
+            if TranscriptJobArtifact.read(levels) != data {
                 try data.write(to: levels, options: .atomic)
             }
             guard canShare && AnalysisSidecar.automaticWritesEnabled,
@@ -1366,7 +1528,7 @@ public struct TranscriptJobStore: Sendable {
             replacing = true
         } else {
             if cancelled() { throw CancellationError() }
-            if let data = try? Data(contentsOf: levels, options: .mappedIfSafe), matches(data) { return nil }
+            if let data = TranscriptJobArtifact.read(levels), matches(data) { return nil }
             if canShare, let data = sidecar.readTranscriptActivity(key, cancelled: cancelled), matches(data) {
                 try data.write(to: levels, options: .atomic)
                 return nil
@@ -1446,10 +1608,25 @@ public struct TranscriptJobStore: Sendable {
         }
     }
 
+    /// Removes the staged audio of each track whose result and levels are in place. A job that
+    /// did not complete can be retried, and its retry reads neither again for such a track.
+    /// A track that failed, or that was never reached, keeps its audio for that retry, which
+    /// would otherwise decode the recording a second time. `sessions` limits this to the
+    /// sessions whose provider has finished.
+    func removeFinishedAudio(_ record: TranscriptJobRecord, sessions: Set<String>? = nil) {
+        for session in record.sessions where sessions?.contains(session.id) ?? true {
+            for track in session.tracks where [.recognized, .cached, .skipped].contains(track.state) {
+                guard let audio = track.audio, FileManager.default.fileExists(atPath: audio.path),
+                      hasFinishedArtifacts(track, recognitionKey: track.recognitionKey) else { continue }
+                try? FileManager.default.removeItem(at: audio)
+            }
+        }
+    }
+
     private func removeAbandonedScratch(in folder: URL) {
         guard let files = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
         else { return }
-        for file in files where file.pathExtension == "wav" && file.lastPathComponent.hasPrefix(".") {
+        for file in files where ["wav", "artifact"].contains(file.pathExtension) && file.lastPathComponent.hasPrefix(".") {
             let filename = file.deletingPathExtension().lastPathComponent.dropFirst()
             if UUID(uuidString: String(filename)) != nil { try? FileManager.default.removeItem(at: file) }
         }
@@ -1461,8 +1638,10 @@ public struct TranscriptJobStore: Sendable {
         guard let inputs = record.inputs else {
             throw jobError("transcript_inputs_required", "Prepare this job again from its original media or project.")
         }
-        return try prepare(inputs: inputs, documentID: record.documentID, options: record.options,
-                           operationID: id, policy: .resume, cancelled: cancelled, progress: progress)
+        return try SidecarLocations.$projectURL.withValue(SidecarLocations.projectURL ?? record.sidecarProjectURL) {
+            try prepare(inputs: inputs, documentID: record.documentID, options: record.options,
+                        operationID: id, policy: .resume, cancelled: cancelled, progress: progress)
+        }
     }
 
     public func retry(_ id: UUID, project: CutProject, relativeTo location: URL? = nil,
@@ -1546,12 +1725,22 @@ public struct TranscriptJobStore: Sendable {
         -> (record: TranscriptJobRecord, outputs: [TranscriptJobOutput]) {
         var records: [String: TranscriptTrack] = [:]
         var outputs: [TranscriptJobOutput] = []
+        // Sessions whose result the project already holds, and whose output was removed as a
+        // copy of their track results. Their tracks keep the outcome read then.
+        var attached: [TranscriptJobSession] = []
+        var resolved = Set<String>()
         let requested = record.sessions.flatMap(\.tracks).contains(where: \.recognize)
         let currentFingerprints = Set(current.map(\.fingerprint))
         for session in record.sessions where currentFingerprints.contains(session.fingerprint) {
             guard let data = try? Data(contentsOf: session.output) else {
-                if allowMissing || [.prepared, .partial].contains(record.state),
-                   !FileManager.default.fileExists(atPath: session.output.path) { continue }
+                if !FileManager.default.fileExists(atPath: session.output.path) {
+                    if record.attached, holdsOutputAsCopy(session) {
+                        attached.append(session)
+                        resolved.insert(session.id)
+                        continue
+                    }
+                    if allowMissing || [.prepared, .partial].contains(record.state) { continue }
+                }
                 throw jobError("transcript_job_unavailable", "Session output is missing. Run the prepared manifest with Transcriberrr.")
             }
             let result = try TranscriptCodec.decode(data, format: .json)
@@ -1571,9 +1760,17 @@ public struct TranscriptJobStore: Sendable {
                 records[track.id] = track
             }
             outputs.append(.init(url: session.output, document: result, preparationID: record.preparationID))
+            resolved.insert(session.id)
         }
-        guard !outputs.isEmpty, records.values.contains(where: { $0.coverage != .failed }),
-              !requested || records.values.contains(where: { $0.coverage == .recognized }) else {
+        if outputs.isEmpty, !attached.isEmpty {
+            throw jobError("transcript_output_removed", "The transcript from this job is already attached, and the session "
+                           + "output it was read from has been removed. Retry the job to produce the output again.")
+        }
+        let earlier = attached.flatMap(\.tracks)
+        guard !outputs.isEmpty,
+              records.values.contains(where: { $0.coverage != .failed }) || earlier.contains(where: { $0.state != .failed }),
+              !requested || records.values.contains(where: { $0.coverage == .recognized })
+                || earlier.contains(where: { [.recognized, .cached].contains($0.state) }) else {
             throw jobError("transcript_job_unavailable", "No transcript session completed successfully.")
         }
         let currentStamps = Dictionary(uniqueKeysWithValues: current.flatMap(\.tracks).compactMap { track in track.sourceStamp.map { (track.id, $0) } })
@@ -1587,7 +1784,8 @@ public struct TranscriptJobStore: Sendable {
             guard $0.ownerToken == nil else {
                 throw jobError("transcript_job_running", "Wait for the transcript job to finish before attaching it.")
             }
-            $0.state = outputs.count < record.sessions.count || records.values.contains { $0.coverage == .failed }
+            $0.state = outputs.count + attached.count < record.sessions.count
+                || records.values.contains { $0.coverage == .failed } || earlier.contains { $0.state == .failed }
                 ? .partial : .completed
             if allowMissing {
                 let warning = "Some independent sessions could not be attached because their recordings changed or became unavailable."
@@ -1615,10 +1813,13 @@ public struct TranscriptJobStore: Sendable {
                     $0.sessions[session].tracks[index] = track
                 }
             }
-            if $0.state == .completed { removeStagedAudio($0) }
+            // A session not yet recognized keeps every recording its manifest names.
+            if $0.state == .completed { removeStagedAudio($0) } else { removeFinishedAudio($0, sessions: resolved) }
         }
         let recognizedIDs = Set(records.values.filter { $0.coverage == .recognized }.map(\.id))
         TranscriptRecognitionCache.promoteExternal(in: finished, stamps: currentStamps, recognizedIDs: recognizedIDs)
+        // Nothing reads a finished track's files again before a retry, which restores them.
+        packArtifacts(record.id, wait: true)
         return (finished, outputs)
     }
 }

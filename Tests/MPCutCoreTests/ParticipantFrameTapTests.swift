@@ -19,6 +19,18 @@ final class ParticipantFrameTapTests: XCTestCase {
         }
     }
 
+    func testContainerPixelAspectOverridesCodedFrameAspect() throws {
+        let coded = try fixture(extension: "mp4", arguments: [
+            "-f", "lavfi", "-i", "color=s=128x96:r=5:d=1", "-vf", "setsar=1", "-c:v", "libx264"
+        ])
+        let display = try fixture(extension: "mp4", arguments: [
+            "-i", coded.path, "-c", "copy", "-aspect", "2:1"
+        ])
+        let samples = try scan(display)
+        XCTAssertEqual(samples.count, 5)
+        XCTAssertTrue(samples.allSatisfy { $0.sarNum == 3 && $0.sarDen == 2 })
+    }
+
     func testPackedRGBTapPreservesComponents() throws {
         let path = try fixture(extension: "nut", arguments: [
             "-f", "lavfi", "-i", "nullsrc=s=128x96:r=25:d=0.2,format=gbrp,geq=r=23:g=97:b=201",
@@ -30,6 +42,10 @@ final class ParticipantFrameTapTests: XCTestCase {
         for sample in samples {
             XCTAssertEqual([sample.red, sample.green, sample.blue], [23, 97, 201])
         }
+        let selected = try scan(path, selecting: { _, pts, _, damaged in pts == 0 && damaged == 0 ? 1 : 0 })
+        XCTAssertEqual(selected.map(\.pts), [0])
+        XCTAssertEqual(selected.first?.duration, samples.first?.duration)
+        XCTAssertEqual(selected.map { [$0.red, $0.green, $0.blue] }, [[23, 97, 201]])
     }
 
     private struct Sample {
@@ -38,19 +54,22 @@ final class ParticipantFrameTapTests: XCTestCase {
         let red: Int
         let green: Int
         let blue: Int
+        let sarNum: Int32
+        let sarDen: Int32
     }
 
-    private func scan(_ file: URL) throws -> [Sample] {
+    private func scan(_ file: URL, selecting: MPParticipantFrameSelect? = nil) throws -> [Sample] {
         var samples: [Sample] = []
         var damage: Int32 = 0
         var message = [CChar](repeating: 0, count: 256)
         let status = withUnsafeMutablePointer(to: &samples) { context in
             file.withUnsafeFileSystemRepresentation { path in
-                mp_participant_scan(path, 0, { _ in 0 }, { context, pts, duration, rgb, width, height, stride, _, _ in
+                mp_participant_scan(path, 0, { _ in 0 }, selecting, { context, pts, duration, rgb, width, height, stride, sarNum, sarDen in
                     guard let context, let rgb else { return 1 }
                     let pixel = rgb.advanced(by: (Int(height) / 2) * Int(stride) + (Int(width) / 2) * 3)
                     context.assumingMemoryBound(to: [Sample].self).pointee.append(
-                        Sample(pts: pts, duration: duration, red: Int(pixel[0]), green: Int(pixel[1]), blue: Int(pixel[2])))
+                        Sample(pts: pts, duration: duration, red: Int(pixel[0]), green: Int(pixel[1]), blue: Int(pixel[2]),
+                               sarNum: sarNum, sarDen: sarDen))
                     return 0
                 }, nil, UnsafeMutableRawPointer(context), &damage, &message, message.count)
             }

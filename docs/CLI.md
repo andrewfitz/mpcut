@@ -223,12 +223,33 @@ Frame manifests use `schema_version` 2. Read `frame_time`, `frame_pts` (when ava
 ```sh
 mpcut analysis sidecar build --only index,audio --json interview.mov
 mpcut analysis sidecar inspect --json interview.mov
+mpcut analysis sidecar build --project Edit.cut --only audio interview.mov
 mpcut project media refresh --project interview.cut --deep --progress stderr --json
 ```
 
-The companion file is `FILE.cutdb`. Bare `analysis sidecar build FILE` saves the editing index, available scene analysis, and audio analyses. `--only` or `--only-file` chooses sections. `analysis sidecar inspect` reads the inventory and reports source generations, stale reasons and persisted scene attempts when available. Use `--no-sidecar` to bypass automatic cache reads and writes during analysis. For a manual save, it can force fresh analysis.
+MPCut and the CLI share the storage choice in **Settings → Analysis**. The default is `FILE.cutdb` beside the media. Supply `--project Edit.cut` to build in project-folder mode or to include that project in a lookup. A configured cache disk serves every project. Inspection searches every available location. Its `read_location` identifies the primary inventory, `read_locations` lists all copies contributing to it, and `write_location` names the selected destination when available. Bare `analysis sidecar build FILE` saves the editing index, available scene analysis, and audio analyses. `--only` or `--only-file` chooses sections. `analysis sidecar inspect` reads the inventory and reports source generations, stale reasons and persisted scene attempts when available. Use `--no-sidecar` to bypass automatic cache reads and writes during analysis. For a manual save, it can force fresh analysis.
 
-`refresh` checks referenced source identity and reindexes changed files. `--deep` verifies contents even when file identity matches. Check the per-source report for preserved analysis and references that need review. Refresh reads the saved project and updates analysis.
+`refresh` checks referenced source identity and reindexes changed files. `--deep` verifies contents even when file identity matches. The `sources` report includes preserved analysis and references that need review. The `media` report lists project references and their current availability. Refresh reads the saved project and updates analysis.
+
+## Find and relink project media
+
+```sh
+mpcut project media list interview.cut --json
+mpcut project media locate interview.cut --folder /Volumes/Archive --json
+mpcut project media locate interview.cut --folder /Volumes/Archive --apply-matches --out-project found.cut
+mpcut project media relink interview.cut --from camera.mov --to relocated/camera.mov --in-place
+mpcut project media relink interview.cut --map-prefix /Volumes/Shoot=/Volumes/Archive --out-project moved.cut
+mpcut project media replace interview.cut --source camera.mov --with alternate.mov --conform trim --json
+mpcut project media replace interview.cut --source camera.mov --with alternate.mov --conform trim --allow-loss --out-project edited.cut
+```
+
+List and Locate show paths used by the current edit. Add `--include-history` to include paths used only in retained undo and redo states. Use a listed path or the absolute location of the old file in `--from` or `--source`. Candidates and prefix folders resolve from the working directory. Repeat `--from` and `--to` to pair several paths by their order, or repeat `--map-prefix` for several roots. Relink changes the path in the current edit and retained history. `still asset relink` uses the same operation and identifies the old image path by asset ID.
+
+Locate searches the selected folder and its subfolders. With `--apply-matches`, it applies unique verified or matched candidates. Review ambiguous, different and pending candidates in the result. For a batch, `sources` reports the outcome of each mapping and `out_project` names the file when a write succeeds.
+
+Replace previews the ripple report when you omit a destination. To apply, choose `--in-place` or a new `--out-project` path. The default conform mode `trim` trims uses that overrun the candidate. Use `--conform keep` to preserve their timeline timing. When a use is entirely out of range, `--allow-loss` removes it in trim mode or retains it offline in keep mode. Use `--loss remove` or `--loss keep-offline` to select that behavior explicitly.
+
+Use `--use-id ID` to replace one use from `affected_use_ids`. Repeat `--stream-map OLD=NEW` to map selected audio streams by absolute index. The report includes candidate streams and unresolved mappings. Use `--clock source-timecode` to preserve source timecode when available and `--shared-time-of-day` to confirm an inferred common clock. Multicam replacement accepts `--replacement-offset TIME` or `--resync timecode|waveform`. Still replacement accepts `--reset-crop`. Existing transcript bindings are kept for review by default. Use `--transcript retranscribe` to remove affected bindings before transcribing the replacement.
 
 ## Work with multicam projects
 
@@ -253,6 +274,20 @@ Direct project export uses the saved assembly in playback order, or the entire g
 
 When a multicam boundary fails, read `error.multicam` and `error.nearest`. If `multicam.switch_group_time` identifies a switch, use the suggested time for that switch. For `multicam.edge`, use the one-based `range_number`, its `boundary` (from or to), and `group_time`. The diagnostic includes `source_id` and the affected `source_range`, `group_range`, and `assembly_range`. In a mixed edit list, `range_number` identifies the input clip. The group clock of an ordinary file clip is its source clock. Recheck the edit after changes because earlier adjustments can affect later output timing.
 
+## Edit camera feeds and recorded calls
+
+Participant commands require a TileTrail-enabled build. `mpcut help participants --json` lists the request fields.
+
+```sh
+mpcut participants scan --file gallery.mov --output gallery-scan.json --progress stderr --json
+mpcut participants scan --file switcher.mov --feed-layout 2x2 --sampling every-frame --output angles.json --json
+mpcut participants project accept --project interview.cut --source-id gallery --analysis-file gallery-scan.json --out-project reviewed.cut
+mpcut participants render export --project reviewed.cut --output interview-two-up.mov --json
+mpcut participants angles take --input angle-take.json --json
+```
+
+A scan uses the meeting profile unless `--feed-layout auto` or a grid such as `2x2` selects feeds. Sampling defaults to `adaptive`. Choose `every-frame` to verify every frame before a redaction, or `sparse` for exploratory review. `participants angles list` returns the virtual angles for a project. `angles take` switches to one at an output time, and `angles plan` and `angles render` write aligned angle media with a multicam project. [Feed and participant guide](PARTICIPANTS.md)
+
 ## Work with still images
 
 ```sh
@@ -265,21 +300,24 @@ mpcut still placement insert --project edit.cut --image title.png --clock assemb
 mpcut still placement list --project titled.cut --json
 ```
 
-- `still project create` makes a still-only project from an image or `--gap`. Supply dimensions, frame rate, codec, container and a duration or frame count.
+- `still project create` makes a still-only project from an image or `--gap`. Supply dimensions, frame rate and a duration or frame count. The default codec and container are H.264 and MOV. `--codec` also accepts `hevc`, `prores` or `jpeg`, and `--container` accepts `mp4`, `m4v` or `mkv`. To fit one image to a recording, pass `--soundtrack FILE --fit-soundtrack` in place of a duration.
+- `still soundtrack attach` adds a recording to a still-only project. Use `still soundtrack fit` to fit the single image to the recording’s exact audible duration. Use `still soundtrack detach` to keep the picture timing and remove the soundtrack.
 - `still placement insert` and `still picture replace` accept a new `--image` or an existing `--asset ID`. A replacement preserves underlying audio and duration on the sequence or group clock. An insert adds time and silence on the sequence or assembly clock. Use `timeline gap insert` for an empty interval. Use `--fit`, normalized crop fields, `--background '#RRGGBB'`, and `--color sdr|pq|hlg` where applicable.
 - `still placement list` reports assets, placements, and visible fragments. `still placement update` changes placement timing, framing, or the referenced asset. It can duplicate placements or detach a selected fragment with `--fragment-index N --detach-id ID`. Fragment indices are zero-based.
-- `still asset relink` points an existing asset at a new image. `still placement remove` deletes a placement. `timeline clips space` adds gaps between consecutive clips using source timing, a fixed duration, or a fixed frame count. Use duration zero to clear spacing.
+- `still asset relink` locates the same image at a different path. Use `project media replace` to preview a different image. `still placement remove` deletes a placement. `timeline clips space` adds gaps between consecutive clips using source timing, a fixed duration, or a fixed frame count. Use duration zero to clear spacing.
 - Write changes with `--out-project FILE` or explicit `--in-place`. With `--project -`, save mutations to a named output. [Still-image workflows](STILL-IMAGES.md)
 
 ```sh
 mpcut timeline clips space --project sequence.cut --source-timing --out-project spaced.cut --json
-mpcut still asset relink --project titled.cut --asset ASSET_ID --image revised.png \
+mpcut still asset relink --project titled.cut --asset ASSET_ID --image archive/title.png \
   --out-project relinked.cut --json
 mpcut still placement remove --project relinked.cut --placement PLACEMENT_ID \
   --out-project clean.cut --json
 ```
 
 Replace `ASSET_ID` and `PLACEMENT_ID` with IDs from `still placement list`. For timing and fragment edits, see `mpcut still placement update --help`.
+
+For a still render, `--still-timing held` writes one independently decodable sample per visible hold. Use `--still-timing cadence` for the authored frame schedule. In Smart Trim or Re-encode, set the delivery codec with `--video`. An explicit `--container` must agree with the output extension. Compatible lossless audio choices are `--audio alac`, `--audio flac` and `--audio pcm`. The JSON request fields are `still_timing`, `video`, `container`, and `audio`. [Still image guide](STILL-IMAGES.md#export-the-program)
 
 ## Work with transcripts
 

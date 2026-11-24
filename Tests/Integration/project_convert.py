@@ -12,6 +12,7 @@ import unittest
 import xml.etree.ElementTree as ET
 
 from media_regression import ffmpeg, frames
+from saved_project import read_project, saved_file
 
 
 class ProjectConversion(unittest.TestCase):
@@ -177,9 +178,9 @@ class ProjectConversion(unittest.TestCase):
         child.mkdir()
         output = child / "new.cut"
         self.assertEqual(self.cli("project", "convert", self.project, "--to", "cut", "--output", output)["warnings"], [])
-        saved = json.loads(output.read_text())
+        saved = read_project(output)
         for actual, expected in zip(saved["clips"], self.document["clips"], strict=True):
-            self.assertEqual((child / actual.pop("file")).resolve(), self.camera)
+            self.assertEqual((child / saved_file(saved, actual.pop("file"))).resolve(), self.camera)
             self.assertEqual(actual, {k: v for k, v in expected.items() if k != "file"})
         before = output.read_bytes()
         self.assertFalse(self.cli("project", "convert", self.project, "--output", output, status=1)["ok"])
@@ -227,7 +228,7 @@ class ProjectConversion(unittest.TestCase):
         self.cli("project", "convert", self.project, "--to", "fcp", "--output", output)
         restored = self.folder / "roundtrip.cut"
         self.cli("project", "convert", output, "--output", restored)
-        self.assertEqual([(c["from"], c["to"]) for c in json.loads(restored.read_text())["clips"]],
+        self.assertEqual([(c["from"], c["to"]) for c in read_project(restored)["clips"]],
                          [(c["from"], c["to"]) for c in self.document["clips"]])
         tree = ET.parse(output)
         ET.SubElement(tree.find(".//spine/asset-clip"), "marker", start="1s", value="Comment")

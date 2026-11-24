@@ -79,11 +79,16 @@ int mpcut_restore_copied_aac(const char *source_path, int source_track_id, int s
 /* Return a nonzero value from progress to cancel. Fraction is in [0, 1]. */
 typedef int (*MPCutProgress)(void *context, double fraction);
 
-/* Selected primary tracks. Linked copies also preserve supported MOV timecode. */
+/* Selected primary tracks. Linked copies also preserve supported MOV timecode.
+ * ALL, AUDIO and the two DELIVERED selections write a file a person keeps: its chapters travel
+ * with it, and a sound-only source copied with every audio track keeps its cover art.
+ * VIDEO, LINKED_AUDIO and PROGRAM_AUDIO stage a lane for a later mux and carry neither. */
 enum {
     MPCUT_TRACKS_ALL = 0, MPCUT_TRACKS_AUDIO = 1, MPCUT_TRACKS_VIDEO = 2,
     MPCUT_TRACKS_LINKED_AUDIO = 3, /* A temporary soundtrack aligned to the linked movie's clock. */
-    MPCUT_TRACKS_PROGRAM_AUDIO = 4 /* An independent soundtrack bounded by its planned ranges. */
+    MPCUT_TRACKS_PROGRAM_AUDIO = 4, /* An independent soundtrack bounded by its planned ranges. */
+    MPCUT_TRACKS_DELIVERED_VIDEO = 5, /* A picture-only movie a person asked for. */
+    MPCUT_TRACKS_DELIVERED_VIDEO_TIMECODE = 6 /* The same, keeping the source's MOV timecode track. */
 };
 
 /* Validate one standalone MP3 crop on its absolute decoded-sample clock. */
@@ -102,11 +107,38 @@ void mpcut_check_muxes(const char *input_path, const char *const *output_paths, 
 /* Write presentation end times (nanoseconds) into a staged WebM or MKV. */
 int mpcut_set_matroska_durations(const char *path, const int64_t *ends, size_t count);
 
+typedef struct {
+    int64_t pts;
+    int64_t duration;
+} MPCutMatroskaBlock;
+
+/* Verify video presentation timestamps and declared block durations (milliseconds).
+ * A zero expected duration checks the timestamp only. */
+int mpcut_verify_matroska_video(const char *path, const MPCutMatroskaBlock *expected, size_t count);
+
+/* Restage a video-only MOV with in-band parameter sets at random access points.
+ * This carries changes in MOV sample descriptions into a single Matroska stream. */
+int mpcut_stage_matroska_picture(const char *input_path, const char *output_path,
+                                MPCutProgress progress, void *context, char *error, size_t error_capacity);
+
 /* Validates an edit's timecode continuity and the first retained timecode sample.
  * On a segment-specific failure, failed_segment receives its one-based index. */
 int mpcut_check_timecode(const MPCutSegment *segments, size_t count, MPCutTime duration,
                          const char *output_path, size_t *failed_segment,
                          MPCutProgress progress, void *context, char *error, size_t error_capacity);
+
+/* The same check for a picture-only copy that would keep the timecode track
+ * (MPCUT_TRACKS_DELIVERED_VIDEO_TIMECODE). Audio tracks do not affect it. */
+int mpcut_check_video_timecode(const MPCutSegment *segments, size_t count, MPCutTime duration,
+                               const char *output_path, size_t *failed_segment,
+                               MPCutProgress progress, void *context, char *error, size_t error_capacity);
+
+/* List what mpcut_write would leave out with these arguments: cover art or chapters the
+ * output container cannot store, and chapters that cannot be placed on the output timeline.
+ * Writes one sentence per line into notes, or an empty string. Only file headers are read.
+ * Returns nonzero when a source or the output container cannot be examined. */
+int mpcut_copy_omissions(const MPCutSegment *segments, size_t count, const char *output_path,
+                         int tracks, int audio_stream, char *notes, size_t capacity);
 
 /*
  * Ranges are prevalidated and relative to source_origin. audio_stream is an

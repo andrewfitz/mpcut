@@ -205,7 +205,7 @@ public struct TranscriptAuthoredRecord: Codable, Hashable, Sendable, Identifiabl
                   speakerReference: try fields.decodeIfPresent(TranscriptAnchor.self, forKey: .speakerReference))
     }
 
-    public init(id: String = UUID().uuidString, attachmentID: String, change: TranscriptAuthoredChange, anchors: [TranscriptAnchor],
+    public init(id: String = ProjectIdentifier.make(), attachmentID: String, change: TranscriptAuthoredChange, anchors: [TranscriptAnchor],
                 speakerReference: TranscriptAnchor? = nil) {
         self.id = id
         self.attachmentID = attachmentID
@@ -430,10 +430,14 @@ extension TranscriptEditorial {
     }
 
     public static func makeRecord(change: TranscriptAuthoredChange, selections: [TranscriptWordSelection],
-                                  in index: TranscriptIndex, id: String = UUID().uuidString) throws -> TranscriptAuthoredRecord {
+                                  in index: TranscriptIndex, id: String = ProjectIdentifier.make()) throws -> TranscriptAuthoredRecord {
         guard let attachmentID = index.attachment?.id else {
             throw CutError(code: "missing_transcript_attachment", message: "Attach this transcript before saving corrections.")
         }
+        // A record is anchored to Source words and checked against the clock each selection
+        // was made in. An index that builds clocks on demand builds them here, where a clock
+        // that cannot be built is an error and not an empty list.
+        try index.build(Set(selections.map(\.space)).union([.source]))
         let source = index.readAll(space: .source)
         // Only a change that names a speaker looks one up, and the check of the finished
         // record below needs the same index.

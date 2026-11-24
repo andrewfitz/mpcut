@@ -6,7 +6,8 @@ final class SidecarManifestTests: XCTestCase {
     func testUnsupportedVersionsPreserveAuthoredDataAndRejectWrites() throws {
         try withStore { store in
             try store.save([AnalysisSidecar.viewNameSectionKey: Data(#"{"1":"Wide shot"}"#.utf8)])
-            for version in [1, 2, 100] {
+            // Formats 1 and 2 are replaced on write; SidecarLegacyFormatTests covers them.
+            for version in [100] {
                 do {
                     let db = try SidecarDatabase(store.url, writing: true)
                     try db.execute("PRAGMA user_version = \(version)")

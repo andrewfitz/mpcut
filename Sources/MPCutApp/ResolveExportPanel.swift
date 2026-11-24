@@ -28,9 +28,12 @@ extension MulticamEditorModel {
         ResolveExportPanel.choose(name: projectName ?? "Untitled Multicam", in: window) { output, open in
             do { try self.validateHistoryDestination(output) }
             catch { self.fail(error.localizedDescription); return }
+            let checkingVolumes = self.interchangeCheckingVolumes
             self.run("Exporting Resolve timeline…", exporting: true) { token, useSidecar in
-                try ResolveExport.write(project, relativeTo: location, to: output, useSidecar: useSidecar, matching: imported,
-                                        cancelled: { token.isCancelled })
+                try ProjectMediaVolume.$checking.withValue(checkingVolumes) {
+                    try ResolveExport.write(project, relativeTo: location, to: output, useSidecar: useSidecar, matching: imported,
+                                            cancelled: { token.isCancelled })
+                }
                 if open { try ResolveExport.openInResolve(output, cancelled: { token.isCancelled }) }
             } onSuccess: { self.status = "Exported \(output.lastPathComponent)." }
         }

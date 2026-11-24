@@ -67,7 +67,7 @@ final class TranscriptProjectionTests: XCTestCase {
         let bob = TranscriptTrack(id: "bob", name: "Bob", streamIndex: 0, role: .isolatedMic)
         let tracks = [mix, alice, bob]
         let word = TranscriptWord(id: "one", text: "Hello", start: t(1), end: t(2), observations: [
-            .init(trackID: bob.id, start: t(1), end: t(2), evidence: .inferred),
+            .init(trackID: bob.id, start: t(1), end: t(2), evidence: .inferred, basis: "alignment"),
             .init(trackID: alice.id, start: t(1), end: t(2), evidence: .recognized)
         ])
         let document = TranscriptDocument(clock: .session, tracks: tracks, words: [word])

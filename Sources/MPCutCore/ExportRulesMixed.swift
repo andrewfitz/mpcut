@@ -75,7 +75,7 @@ extension ExportRules {
         "Pixel format: the chosen encoder's (8-bit 4:2:0 for H.264, 4:2:2 10-bit for ProRes, 4:2:0 for HEVC with ten bits when any clip has more than eight).",
         "Colour: tagged like the first clip. A clip with another matrix or range is converted to it. Primaries and transfer function are not converted, so an HDR clip is never joined to an SDR one.",
         "Frame rate: not converted. Every picture keeps its own time, so clips with different frame rates give a variable frame rate.",
-        "Sound: one output track per track position, as many as the clip with the most. A position keeps its sample rate and channel layout when the clips agree; otherwise it is resampled to 48 kHz or mixed to stereo. A clip without that track is written as silence. The sound is always converted: AAC, or PCM where the rules choose it for the codec and container.",
+        "Sound: one output track per track position, as many as the clip with the most. A position keeps its sample rate and channel layout when the clips agree; otherwise it is resampled to 48 kHz or mixed to stereo. A clip without that track is written as silence. The sound is always converted: AAC, or PCM where the rules choose it for the sources, codec and container.",
         "There is no project setting for the canvas. Put the clip whose picture should be kept first.",
     ]
 
@@ -166,7 +166,7 @@ extension ExportRules {
         for action in movieAudioActions {
             let result: String
             switch action {
-            case .auto: result = "Converted: AAC, or PCM for ProRes outside MP4."
+            case .auto: result = "Converted: PCM for a track that is lossless in every clip that has it, in MOV, and in MKV for mono and stereo. Otherwise AAC, or for ProRes PCM under the same container limits."
             case .copyOriginal: result = "Refused: `incompatible_clip`. Offers the re-encode with `auto`."
             case .removeAudio: result = "No sound is written."
             default: result = "Converted to \(displayName(audio: action)) in the canvas format."

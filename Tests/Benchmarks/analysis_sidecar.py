@@ -41,7 +41,7 @@ def benchmark(cli, file, directory, runs):
     source = directory / file.name
     shutil.copy2(file, source)
     first, build = report(cli, source, "analysis", "sidecar", "build")
-    cache = source.with_name(source.name + ".cutdb")
+    cache = Path(first["sidecar"])
     initial_size = cache.stat().st_size
     save_times = []
     inspect_times = []

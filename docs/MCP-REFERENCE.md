@@ -2,13 +2,13 @@
 
 This reference describes the inputs advertised by the bundled stdio helper. The connected host can retrieve the complete JSON Schemas through `tools/list`. Live tool calls use the running app and its local-control setting. The `--files-only` helper exposes saved-file tools through a private CLI worker. Results bound to a live project carry the `project_handle` and the current or applied revision. Starting a saved-file job returns a receipt with a `job_id`. Inspect `isError` first. MPCut domain errors carry a code and message in `structuredContent`. Invalid requests can also return an MCP protocol or SDK validation error. [Setup, clocks, history and recovery](MCP-AGENT-GUIDE.md)
 
-**217 tools.**
+**232 tools.**
 
 ## Live analysis
 
 ### `analysis_editor_sidecars_save`
 
-Save completed analysis beside the project sources using the native save operation. Poll the returned job with analysis_job_status_read.
+Save completed analysis to the configured sidecar location for each project source. Poll the returned job with analysis_job_status_read.
 
 Returns an analysis job receipt. Poll `analysis_job_status_read` for terminal status and outputs. Use `analysis_file_sidecar_inspect` to inspect persisted sections.
 
@@ -69,7 +69,7 @@ Returns applied status and the current revision. Inspect `analysis_editor_state_
 
 Check indexed project recordings and refresh changed sources using the native editor. Poll analysis_job_status_read for updated sources and review issues.
 
-Returns an analysis job receipt. Poll `analysis_job_status_read` for per-source refresh results, preserved analysis, review issues and any persistence errors.
+Returns an analysis job receipt. Poll `analysis_job_status_read` for per-source refresh results, preserved analysis, review issues and any persistence errors. The receipt includes `media` rows with the shared project media status and current uses.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -347,7 +347,7 @@ Returns source ID, stream, `source_from_seconds`, `source_to_seconds`, source cl
 
 ### `analysis_file_sidecar_build`
 
-Build selected analysis sections beside a recording. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.
+Build selected analysis sections in the configured sidecar location. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.
 
 Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
 
@@ -355,6 +355,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 | --- | --- | --- | --- |
 | `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
+| `project_path` | optional | string, pattern `^/` | Optional absolute path to a saved project for project-folder cache lookup and storage. |
 | `file` | required | string, pattern `^/` | Absolute path to the source file. |
 | `only` | optional | array of `index` / `scenes` / `audio`, minimum items `1` |  |
 | `silence_audio_stream_index` | optional | integer, minimum `0` | Zero-based absolute stream index of the audio to analyze. |
@@ -365,7 +366,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 
 ### `analysis_file_sidecar_inspect`
 
-Inspect the analysis sections saved beside a recording. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.
+Inspect the analysis sections available for a recording. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.
 
 Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
 
@@ -373,6 +374,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 | --- | --- | --- | --- |
 | `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
 | `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
+| `project_path` | optional | string, pattern `^/` | Optional absolute path to a saved project for project-folder cache lookup and storage. |
 | `file` | required | string, pattern `^/` | Absolute path to the source file. |
 | `no_sidecar` | optional | boolean |  |
 
@@ -499,13 +501,15 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 | `tracks` | optional | `all` / `video` / `audio` |  |
 | `audio_stream_index` | optional | integer, minimum `0` | Zero-based absolute stream index for the requested audio track. |
 | `mode` | optional | `copy` / `smart` / `encode` |  |
-| `video` | optional | `h264` / `hevc` / `prores` |  |
+| `video` | optional | `h264` / `hevc` / `prores` / `jpeg` |  |
 | `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` |  |
-| `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` |  |
+| `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` / `alac` |  |
 | `snap` | optional | `exact` / `nearest` |  |
 | `dry_run` | optional | boolean |  |
 | `no_sidecar` | optional | boolean |  |
 | `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. |
+| `still_timing` | optional | `cadence` / `held` | Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule. |
+| `container` | optional | `mov` / `mp4` / `m4v` / `mkv` / `m4a` / `mka` / `wav` / `wave` / `caf` / `flac` | Explicit container for a still project export. Match the destination filename extension and selected tracks. |
 
 Additional schema rules
 
@@ -954,7 +958,7 @@ Additional schema rules
 
 Check recordings referenced by a saved project and refresh eligible analysis sidecars. The project file stays untouched. Returns a job_id. Poll file_job_status_read for the CLI result and reuse the operation_id for an identical retry.
 
-Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CLI result. Use `file_job_result_read` for large payloads. See the bundled CLI help for this command’s JSON output.
+Returns a file job receipt. The completed result includes `media` rows with the shared project media status and current uses, plus refresh results for recording sidecars.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -1286,7 +1290,7 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 | `no_sidecar` | optional | boolean |  |
 | `project_path` | optional | string, pattern `^/` | Absolute path to a saved project. Unsaved GUI changes are excluded. |
 | `source_to` | optional | string | Exclusive end in source time. |
-| `clip_id` | optional | string, format `uuid` | Stable sequence occurrence ID in the saved project. |
+| `clip_id` | optional | string, minimum length `1` | Stable sequence occurrence ID in the saved project. |
 | `camera_id` | optional | string, minimum length `1` | Stable camera ID in the saved multicam project. |
 | `all_sources` | optional | boolean | Scan all referenced video sources in the saved project. This is the default project scope. |
 | `policy` | optional | `reuse` / `resume` / `restart` | Reuse returns current results or resumes unfinished analysis. Resume prefers a saved replacement attempt. Restart begins a replacement identified by operation_id. |
@@ -1616,7 +1620,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 ### `still_file_asset_relink`
 
-Run still asset relink on a saved project. See cli_help_read for timing and destination options.
+Relink a still asset to the same image at a new location in a saved project. This is an asset-ID alias for project_file_media_relink.
 
 Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
 
@@ -1905,7 +1909,7 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 
 ### `still_file_project_create`
 
-Run still project create on a saved project. See cli_help_read for timing and destination options.
+Create a new still-only project, optionally with a recording at program zero. See cli_help_read for timeline and destination options.
 
 Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
 
@@ -1918,13 +1922,18 @@ Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page l
 | `gap` | optional | `true` |  |
 | `width` | required | integer, minimum `1` |  |
 | `height` | required | integer, minimum `1` |  |
-| `codec` | required | `h264` / `hevc` / `prores` |  |
-| `container` | required | `mp4` / `mov` |  |
+| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` |  |
+| `container` | optional | `mov` / `mp4` / `m4v` / `mkv` |  |
 | `background` | optional | string |  |
 | `color` | optional | `sdr` / `pq` / `hlg` |  |
 | `duration` | optional | string |  |
 | `frames` | optional | integer, minimum `1` |  |
 | `rate` | required | string |  |
+| `soundtrack` | optional | string, pattern `^/` | Absolute path to the recording. |
+| `audio_stream` | optional | integer, minimum `0` | Optional absolute audio stream index. Defaults to the first audio stream. |
+| `from` | optional | string | Optional source in-point on an audio sample boundary, as exact rational seconds. |
+| `to` | optional | string | Optional source out-point on an audio sample boundary, as exact rational seconds. |
+| `fit_soundtrack` | optional | `true` | Fit the single image to the recording’s exact audible duration in the same edit. |
 
 Additional schema rules
 
@@ -1956,7 +1965,129 @@ Additional schema rules
           "required": [
             "frames"
           ]
+        },
+        {
+          "required": [
+            "fit_soundtrack",
+            "image",
+            "soundtrack"
+          ]
         }
+      ]
+    }
+  ],
+  "dependentRequired": {
+    "audio_stream": [
+      "soundtrack"
+    ],
+    "from": [
+      "soundtrack"
+    ],
+    "to": [
+      "soundtrack"
+    ]
+  }
+}
+```
+
+### `still_file_soundtrack_attach`
+
+Attach a recording at program zero in a still-only sequence. Optionally fit its single image to the selected audio range. Returns a file job receipt.
+
+Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
+| `out_project` | optional | string |  |
+| `project_path` | required | string, pattern `^/` |  |
+| `in_place` | optional | `true` |  |
+| `soundtrack` | required | string, pattern `^/` | Absolute path to the recording. |
+| `audio_stream` | optional | integer, minimum `0` | Optional absolute audio stream index. Defaults to the first audio stream. |
+| `from` | optional | string | Optional source in-point on an audio sample boundary, as exact rational seconds. |
+| `to` | optional | string | Optional source out-point on an audio sample boundary, as exact rational seconds. |
+| `fit_soundtrack` | optional | `true` | Fit the single image to the recording’s exact audible duration in the same edit. |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "required": [
+        "out_project"
+      ]
+    },
+    {
+      "required": [
+        "in_place"
+      ]
+    }
+  ]
+}
+```
+
+### `still_file_soundtrack_detach`
+
+Detach the recording from a still-only sequence and keep its picture timing. Returns a file job receipt.
+
+Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
+| `out_project` | optional | string |  |
+| `project_path` | required | string, pattern `^/` |  |
+| `in_place` | optional | `true` |  |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "required": [
+        "out_project"
+      ]
+    },
+    {
+      "required": [
+        "in_place"
+      ]
+    }
+  ]
+}
+```
+
+### `still_file_soundtrack_fit`
+
+Fit the single image in a still-only sequence to its attached soundtrack’s exact audible duration. Returns a file job receipt.
+
+Returns a file job receipt. Poll `file_job_status_read` using `job_id` or page large payloads with `file_job_result_read`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct job. Identical requests can reuse it while running and for ten minutes after completion while the same desktop local-control session or standalone file worker is active. |
+| `working_directory` | optional | string, pattern `^/` | Existing base directory for relative paths embedded in reports or project documents. |
+| `out_project` | optional | string |  |
+| `project_path` | required | string, pattern `^/` |  |
+| `in_place` | optional | `true` |  |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "required": [
+        "out_project"
+      ]
+    },
+    {
+      "required": [
+        "in_place"
       ]
     }
   ]
@@ -2101,6 +2232,282 @@ Returns a file job receipt. Poll `file_job_status_read` with `job_id` for the CL
 | `source_to` | optional | string, minimum length `1` | Exclusive end in source time. |
 | `columns` | optional | integer, minimum `1`, maximum `65536` |  |
 | `no_sidecar` | optional | boolean |  |
+
+## Saved project media
+
+### `project_file_media_list`
+
+List current project media references, their statuses and uses. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. Poll `file_job_status_read` for `sources` containing paths, statuses and uses. Read large results with `file_job_result_read`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_path` | required | string, pattern `^/` | Absolute path to a saved project. |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry an identical request. |
+| `working_directory` | optional | string, pattern `^/` | Existing working directory for the CLI job. |
+
+### `project_file_media_locate`
+
+Search a folder for relink candidates. Use project_file_media_relink to apply your choices. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. Poll `file_job_status_read` for `sources` containing candidate rows. Use `project_file_media_relink` to apply selected mappings.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_path` | required | string, pattern `^/` | Absolute path to a saved project. |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry an identical request. |
+| `working_directory` | optional | string, pattern `^/` | Existing working directory for the CLI job. |
+| `folder` | required | string, pattern `^/` | Absolute path to the folder to search, including its subdirectories. |
+
+### `project_file_media_relink`
+
+Relink one or more paths to the same media, including references in retained undo and redo history. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. Poll `file_job_status_read` for `sources` containing the candidate outcome for each requested mapping, `applied_count` and the published `out_project` when applicable.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_path` | required | string, pattern `^/` | Absolute path to a saved project. |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry an identical request. |
+| `working_directory` | optional | string, pattern `^/` | Existing working directory for the CLI job. |
+| `from` | optional | string, minimum length `1` | Path returned by the project media list, or an absolute source path. |
+| `to` | optional | string, pattern `^/` | Absolute path to the candidate media file. |
+| `mappings` | optional | array of object, minimum items `1`, maximum items `256` | Explicit old-to-new path mappings. |
+| `mappings[].from` | required | string, minimum length `1` | Path returned by the project media list, or an absolute source path. |
+| `mappings[].to` | required | string, pattern `^/` | Absolute path to the candidate media file. |
+| `from_prefix` | optional | string, pattern `^/` | Previous folder root. |
+| `to_prefix` | optional | string, pattern `^/` | New folder root. |
+| `out_project` | optional | string, pattern `^/` | Write a new project at this path. |
+| `in_place` | optional | boolean | Update the input project. |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "required": [
+        "from",
+        "to"
+      ],
+      "not": {
+        "required": [
+          "mappings"
+        ]
+      },
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "from_prefix"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "to_prefix"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "required": [
+        "mappings"
+      ],
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "from"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "to"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "from_prefix"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "to_prefix"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "required": [
+        "from_prefix",
+        "to_prefix"
+      ],
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "from"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "to"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "mappings"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "required": [
+            "out_project"
+          ]
+        },
+        {
+          "required": [
+            "in_place"
+          ],
+          "properties": {
+            "in_place": {
+              "const": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `project_file_media_replace`
+
+Preview the consequences of replacing a source. Set confirm to true and specify an output to apply the replacement. Poll file_job_status_read with the returned job_id.
+
+Returns a file job receipt. Poll `file_job_status_read` for the ripple `report`. A confirmed replacement also reports the published `out_project`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_path` | required | string, pattern `^/` | Absolute path to a saved project. |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for a distinct file job. Reuse it to retry an identical request. |
+| `working_directory` | optional | string, pattern `^/` | Existing working directory for the CLI job. |
+| `source` | required | string, minimum length `1` | Path returned by the project media list, or an absolute source path. |
+| `with` | required | string, pattern `^/` | Absolute path to the candidate media file. |
+| `conform` | optional | `trim` / `keep` | Trim overlapping ranges to the new end, or keep affected ranges offline. Defaults to trim. |
+| `allow_loss` | optional | boolean | Approve the selected handling of ranges beyond the new end. |
+| `confirm` | optional | boolean | Apply the replacement. Omit or set false to preview. |
+| `out_project` | optional | string, pattern `^/` | Write a new project at this path. |
+| `in_place` | optional | boolean | Update the input project. |
+| `use_id` | optional | string, minimum length `1` | Apply to one use ID from project_editor_media_list. Omit to replace all uses. |
+| `loss` | optional | `remove` / `keep_offline` | Explicit treatment of uses starting beyond the new source extent. |
+| `clock` | optional | `source_relative` / `source_timecode` | Preserve relative times or map cuts through comparable source clocks. |
+| `stream_mapping` | optional | array of object, maximum items `256` | Map selected old audio streams to candidate audio streams. |
+| `stream_mapping[].from` | required | integer, minimum `0` |  |
+| `stream_mapping[].to` | required | integer, minimum `0` |  |
+| `reset_crop` | optional | boolean | Reset authored still crop to fit the new image. |
+| `replacement_offset` | optional | string, minimum length `1` | Exact multicam source offset in seconds or as a rational. |
+| `shared_time_of_day` | optional | boolean | Confirm that comparable mixed clock kinds share a time of day. |
+| `transcript` | optional | `keep_unverified` / `retranscribe` | Keep the transcript unverified or remove the affected binding for retranscription. |
+| `resync` | optional | `timecode` / `waveform` | Recompute multicam alignment using the selected method. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "confirm"
+        ],
+        "properties": {
+          "confirm": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "oneOf": [
+          {
+            "required": [
+              "out_project"
+            ]
+          },
+          {
+            "required": [
+              "in_place"
+            ],
+            "properties": {
+              "in_place": {
+                "const": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "required": [
+            "confirm"
+          ],
+          "properties": {
+            "confirm": {
+              "const": true
+            }
+          }
+        }
+      },
+      "then": {
+        "allOf": [
+          {
+            "not": {
+              "required": [
+                "out_project"
+              ]
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "in_place"
+              ],
+              "properties": {
+                "in_place": {
+                  "const": true
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
 
 ## Saved timeline review and multicam analysis
 
@@ -2332,7 +2739,7 @@ Returns current preference values. Changes apply app-wide. Lowering the history 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
 | `operation_id` | required | string, minimum length `1`, maximum length `128` | Unique operation ID for identical retries. |
-| `key` | required | `history_max_steps` / `analysis_sidecar_reuse_enabled` / `media_auto_refresh_enabled` / `export_tier_downgrade_warning_enabled` / `export_movie_default_mode` / `timeline_snap_target` / `timeline_large_previews_enabled` / `silence_min_pause_seconds` / `silence_max_blip_seconds` / `silence_padding_per_side_seconds` / `playback_preview_volume_fraction` / `playback_preview_muted` / `playback_scrub_audio_enabled` / `export_jpeg_default_preset` |  |
+| `key` | required | `history_max_steps` / `analysis_sidecar_reuse_enabled` / `media_auto_refresh_enabled` / `export_tier_downgrade_warning_enabled` / `export_movie_default_mode` / `timeline_snap_target` / `timeline_large_previews_enabled` / `timeline_source_time_ticks_enabled` / `silence_min_pause_seconds` / `silence_max_blip_seconds` / `silence_padding_per_side_seconds` / `playback_preview_volume_fraction` / `playback_preview_muted` / `playback_scrub_audio_enabled` / `export_jpeg_default_preset` |  |
 | `value` | required | boolean or string or number | history_max_steps 0–500, playback_preview_volume_fraction 0–1, silence_max_blip_seconds 0–1 second, pause durations in seconds. Enum values match preferences_read. |
 
 Additional schema rules
@@ -2422,6 +2829,7 @@ Additional schema rules
               "export_tier_downgrade_warning_enabled",
               "analysis_sidecar_reuse_enabled",
               "timeline_large_previews_enabled",
+              "timeline_source_time_ticks_enabled",
               "playback_preview_muted",
               "playback_scrub_audio_enabled"
             ]
@@ -2627,6 +3035,216 @@ Returns `project_handle`, `revision`, `kind`, `dirty`, `project_path`, `setup_pe
 | --- | --- | --- | --- |
 | `message` | required | string, minimum length `1` |  |
 | `project_handle` | required | string, minimum length `1` |  |
+
+## Live project media
+
+### `project_editor_media_list`
+
+List current project media references, their statuses and uses.
+
+Returns paged `items`, `offset` and `total`. Each row reports the path, status and current uses.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | Opaque handle from project_windows_list. |
+| `offset` | optional | integer, minimum `0` | Zero-based page offset. |
+| `limit` | optional | integer, minimum `1`, maximum `256` | Maximum number of media rows to return. |
+| `expected_revision` | optional | integer, minimum `0` | Pin pagination to the revision from the previous page. |
+
+### `project_editor_media_locate`
+
+Search a folder for relink candidates. Poll analysis_job_status_read for candidate rows and use project_editor_media_relink to apply your choices.
+
+Returns an analysis receipt for `analysis_job_status_read`. The completed receipt contains `candidates` and `input_revision`. Pass approved mappings and `locate_job_id` to `project_editor_media_relink` at that revision to check the reviewed file generations.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | Opaque handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | Revision from the editor state or the candidate receipt. |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for this request. Reuse it to retry an identical request. |
+| `folder` | required | string, pattern `^/` | Absolute path to the folder to search, including its subdirectories. |
+
+### `project_editor_media_relink`
+
+Relink one or more paths to the same media, including references in retained undo and redo history.
+
+Returns `applied` old paths, `failures` keyed by old path and whether the project changed. Relink updates every retained state in place.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | Opaque handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | Revision from the editor state or the candidate receipt. |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for this request. Reuse it to retry an identical request. |
+| `from` | optional | string, minimum length `1` | Path returned by the project media list, or an absolute source path. |
+| `to` | optional | string, pattern `^/` | Absolute path to the candidate media file. |
+| `mappings` | optional | array of object, minimum items `1`, maximum items `256` | Explicit old-to-new path mappings. |
+| `mappings[].from` | required | string, minimum length `1` | Path returned by the project media list, or an absolute source path. |
+| `mappings[].to` | required | string, pattern `^/` | Absolute path to the candidate media file. |
+| `from_prefix` | optional | string, pattern `^/` | Previous folder root. |
+| `to_prefix` | optional | string, pattern `^/` | New folder root. |
+| `locate_job_id` | optional | string, format `uuid` | Use candidate generations from this completed locate job. Supply exact from and to paths from its candidate rows. |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "required": [
+        "from",
+        "to"
+      ],
+      "not": {
+        "required": [
+          "mappings"
+        ]
+      },
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "from_prefix"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "to_prefix"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "required": [
+        "mappings"
+      ],
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "from"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "to"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "from_prefix"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "to_prefix"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "required": [
+        "from_prefix",
+        "to_prefix"
+      ],
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "from"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "to"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "mappings"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "locate_job_id"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### `project_editor_media_replace`
+
+Preview the consequences of replacing a source. Set confirm to true to apply the replacement.
+
+Returns the ripple `report` with warnings, blockers, affected uses and before and after duration. A preview returns `preview_id`. Repeat the reviewed request with `confirm: true` and `preview_id` to apply the reviewed file generation at that revision. Read `changed` to see whether an edit was committed.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` | Opaque handle from project_windows_list. |
+| `expected_revision` | required | integer, minimum `0` | Revision from the editor state or the candidate receipt. |
+| `operation_id` | required | string, format `uuid` | Fresh UUID for this request. Reuse it to retry an identical request. |
+| `source` | required | string, minimum length `1` | Path returned by the project media list, or an absolute source path. |
+| `with` | required | string, pattern `^/` | Absolute path to the candidate media file. |
+| `conform` | optional | `trim` / `keep` | Trim overlapping ranges to the new end, or keep affected ranges offline. Defaults to trim. |
+| `allow_loss` | optional | boolean | Approve the selected handling of ranges beyond the new end. |
+| `confirm` | optional | boolean | Apply the replacement. Omit or set false to preview. |
+| `use_id` | optional | string, minimum length `1` | Apply to one use ID from project_editor_media_list. Omit to replace all uses. |
+| `loss` | optional | `remove` / `keep_offline` | Explicit treatment of uses starting beyond the new source extent. |
+| `clock` | optional | `source_relative` / `source_timecode` | Preserve relative times or map cuts through comparable source clocks. |
+| `stream_mapping` | optional | array of object, maximum items `256` | Map selected old audio streams to candidate audio streams. |
+| `stream_mapping[].from` | required | integer, minimum `0` |  |
+| `stream_mapping[].to` | required | integer, minimum `0` |  |
+| `reset_crop` | optional | boolean | Reset authored still crop to fit the new image. |
+| `replacement_offset` | optional | string, minimum length `1` | Exact multicam source offset in seconds or as a rational. |
+| `shared_time_of_day` | optional | boolean | Confirm that comparable mixed clock kinds share a time of day. |
+| `transcript` | optional | `keep_unverified` / `retranscribe` | Keep the transcript unverified or remove the affected binding for retranscription. |
+| `resync` | optional | `timecode` / `waveform` | Recompute multicam alignment using the selected method. |
+| `preview_id` | optional | string, format `uuid` | Apply the exact reviewed preview. Repeat the same source, candidate and options with confirm true. |
+
+Additional schema rules
+
+```json
+{
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "preview_id"
+        ]
+      },
+      "then": {
+        "required": [
+          "confirm"
+        ],
+        "properties": {
+          "confirm": {
+            "const": true
+          }
+        }
+      }
+    }
+  ]
+}
+```
 
 ## Multicam
 
@@ -3042,7 +3660,7 @@ Reports selection and current preview position. Assembly selection uses the occu
 
 ### `multicam_source_edit`
 
-Edit a camera or recorder. rename requires name; offset requires offset; nudge/move require direction; nudge also accepts a group time; microphone sets stream (omit to clear); relink requires an absolute path; add_recording requires angle_id, an absolute path and group_start.
+Edit a camera or recorder. rename requires name; offset requires offset; nudge/move require direction; nudge also accepts a group time; microphone sets stream (omit to clear); relink uses project_editor_media_relink and requires the same recording at an absolute path; add_recording requires angle_id, an absolute path and group_start.
 
 Reports `revision`, `changed` and `history_retained`. Nudge reports `group_time` and the new `offset`. Relink identifies the source. `add_recording` places an additional file on the specified angle at `group_start`. A committed edit reports its native action and can carry a draft-write warning.
 
@@ -3421,7 +4039,7 @@ Returns `state`, `progress`, `input_revision` and published `outputs`. After can
 
 Plan the open project export and report eligible ranges, review findings and the occurrence-level cut map when available.
 
-Starts a live job. Poll `export_editor_job_status_read` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposed_ranges`, `alternatives` or `fallback`. An eligible plan or render can include `cut_map.occurrences[]` in playback order, with individual requested, resolved and output ranges and render segment references. Still plans report copied and encoded camera duration, generated still duration, placement ranges and sound actions. Confirm published paths in the job’s `outputs`.
+Starts a live job. Poll `export_editor_job_status_read` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposed_ranges`, `alternatives` or `fallback`. An eligible plan or render can include `cut_map.occurrences[]` in playback order, with individual requested, resolved and output ranges and render segment references. Still plans report copied and encoded camera duration, generated still duration and sample count, placement ranges, effective output codec and sound actions. Confirm published paths in the job’s `outputs`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3433,18 +4051,20 @@ Starts a live job. Poll `export_editor_job_status_read` for its result. A succes
 | `tracks` | optional | `all` / `video` / `audio` |  |
 | `require_camera_copy` | optional | boolean | Require zero encoded camera duration when generating stills. |
 | `mode` | optional | `smart` / `copy` / `encode` | Defaults to Smart Trim for visible still picture. Other outputs use the native defaults. |
-| `codec` | optional | `h264` / `hevc` / `prores` |  |
-| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` | Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. Requires movie encode mode. |
-| `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` |  |
+| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` |  |
+| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` | Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim. |
+| `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` / `alac` |  |
 | `audio_track_ordinal` | optional | integer, minimum `0` | Zero-based track within the ordinary source audio tracks. |
 | `use_reviewed_cuts` | optional | boolean | Use the native verified copy-boundary proposal for this ordinary export only. The timeline and its history stay intact. |
 | `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. |
+| `still_timing` | optional | `cadence` / `held` | Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule. |
+| `container` | optional | `mov` / `mp4` / `m4v` / `mkv` / `m4a` / `mka` / `wav` / `wave` / `caf` / `flac` | Explicit container for a still project export. Match the destination filename extension and selected tracks. |
 
 ### `export_editor_project_render`
 
 Render the open project to the output path and report its occurrence-level cut map when available.
 
-Starts a live job. Poll `export_editor_job_status_read` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposed_ranges`, `alternatives` or `fallback`. An eligible plan or render can include `cut_map.occurrences[]` in playback order, with individual requested, resolved and output ranges and render segment references. Still plans report copied and encoded camera duration, generated still duration, placement ranges and sound actions. Confirm published paths in the job’s `outputs`.
+Starts a live job. Poll `export_editor_job_status_read` for its result. A successful dry run can report `eligible: false` with `reason` and any available structured `issue`, `proposed_ranges`, `alternatives` or `fallback`. An eligible plan or render can include `cut_map.occurrences[]` in playback order, with individual requested, resolved and output ranges and render segment references. Still plans report copied and encoded camera duration, generated still duration and sample count, placement ranges, effective output codec and sound actions. Confirm published paths in the job’s `outputs`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3456,18 +4076,20 @@ Starts a live job. Poll `export_editor_job_status_read` for its result. A succes
 | `tracks` | optional | `all` / `video` / `audio` |  |
 | `require_camera_copy` | optional | boolean | Require zero encoded camera duration when generating stills. |
 | `mode` | optional | `smart` / `copy` / `encode` | Defaults to Smart Trim for visible still picture. Other outputs use the native defaults. |
-| `codec` | optional | `h264` / `hevc` / `prores` |  |
-| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` | Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. Requires movie encode mode. |
-| `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` |  |
+| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` |  |
+| `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` | Use smaller, balanced or high for H.264 and HEVC. Use 422-lt, 422 or 422-hq for ProRes. For ordinary movie export, requires Re-encode. Still picture also supports these settings in Smart Trim. |
+| `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` / `alac` |  |
 | `audio_track_ordinal` | optional | integer, minimum `0` | Zero-based track within the ordinary source audio tracks. |
 | `use_reviewed_cuts` | optional | boolean | Use the native verified copy-boundary proposal for this ordinary export only. The timeline and its history stay intact. |
 | `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. |
+| `still_timing` | optional | `cadence` / `held` | Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule. |
+| `container` | optional | `mov` / `mp4` / `m4v` / `mkv` / `m4a` / `mka` / `wav` / `wave` / `caf` / `flac` | Explicit container for a still project export. Match the destination filename extension and selected tracks. |
 
 ### `export_queue_entry_remove`
 
 Remove one entry from this project’s native export queue.
 
-Returns the default `coordinate_space` and current `ranges[]` with IDs, names when set, boundaries and captured `items[]`. A multicam entry reports its own group or assembly clock. Items identify the file, source `from` and `to`, and the kind (`clip`, `still`, `angle`, `audio`, `gap` or `replacement`). Multicam items report output bounds, audio items can identify a stream, and generated spans can omit source bounds. Rename preserves the captured contents. Revise recaptures the current marked edit under the same entry ID and name. Extend requires an enclosing interval on the same clock.
+Returns the default `coordinate_space` and current `ranges[]` with IDs, names when set, boundaries and captured `items[]`. A multicam entry reports its own group or assembly clock. Items identify the file, source `from` and `to`, and the kind (`clip`, `still`, `angle`, `audio`, `gap` or `replacement`). Multicam items report output bounds, audio items can identify a stream, and generated spans can omit source bounds. Still entries with a captured timing choice report `still_timing`. Rename preserves the captured contents. Revise recaptures the current marked edit under the same entry ID and name. Extend requires an enclosing interval on the same clock. An entry with `needs_replan: true` can be removed or replanned. Replan uses the original bounds, or newly marked bounds for a transcript excerpt.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3480,7 +4102,7 @@ Returns the default `coordinate_space` and current `ranges[]` with IDs, names wh
 
 Rename a native queue entry while keeping its captured media and bounds.
 
-Returns the default `coordinate_space` and current `ranges[]` with IDs, names when set, boundaries and captured `items[]`. A multicam entry reports its own group or assembly clock. Items identify the file, source `from` and `to`, and the kind (`clip`, `still`, `angle`, `audio`, `gap` or `replacement`). Multicam items report output bounds, audio items can identify a stream, and generated spans can omit source bounds. Rename preserves the captured contents. Revise recaptures the current marked edit under the same entry ID and name. Extend requires an enclosing interval on the same clock.
+Returns the default `coordinate_space` and current `ranges[]` with IDs, names when set, boundaries and captured `items[]`. A multicam entry reports its own group or assembly clock. Items identify the file, source `from` and `to`, and the kind (`clip`, `still`, `angle`, `audio`, `gap` or `replacement`). Multicam items report output bounds, audio items can identify a stream, and generated spans can omit source bounds. Still entries with a captured timing choice report `still_timing`. Rename preserves the captured contents. Revise recaptures the current marked edit under the same entry ID and name. Extend requires an enclosing interval on the same clock. An entry with `needs_replan: true` can be removed or replanned. Replan uses the original bounds, or newly marked bounds for a transcript excerpt.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3492,9 +4114,9 @@ Returns the default `coordinate_space` and current `ranges[]` with IDs, names wh
 
 ### `export_queue_entry_revise`
 
-Recapture the current marked range for an existing queue entry. Extend requires a strict superset in the same coordinate space. Both modes capture the live edit.
+Recapture the live edit for an existing queue entry. Replace uses the current marks. Extend requires a strict superset in the same coordinate space. Replan applies an affected entry’s original bounds to the current timeline. For an affected transcript excerpt, mark the range to recapture.
 
-Returns the default `coordinate_space` and current `ranges[]` with IDs, names when set, boundaries and captured `items[]`. A multicam entry reports its own group or assembly clock. Items identify the file, source `from` and `to`, and the kind (`clip`, `still`, `angle`, `audio`, `gap` or `replacement`). Multicam items report output bounds, audio items can identify a stream, and generated spans can omit source bounds. Rename preserves the captured contents. Revise recaptures the current marked edit under the same entry ID and name. Extend requires an enclosing interval on the same clock.
+Returns the default `coordinate_space` and current `ranges[]` with IDs, names when set, boundaries and captured `items[]`. A multicam entry reports its own group or assembly clock. Items identify the file, source `from` and `to`, and the kind (`clip`, `still`, `angle`, `audio`, `gap` or `replacement`). Multicam items report output bounds, audio items can identify a stream, and generated spans can omit source bounds. Still entries with a captured timing choice report `still_timing`. Rename preserves the captured contents. Revise recaptures the current marked edit under the same entry ID and name. Extend requires an enclosing interval on the same clock. An entry with `needs_replan: true` can be removed or replanned. Replan uses the original bounds, or newly marked bounds for a transcript excerpt.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3502,13 +4124,13 @@ Returns the default `coordinate_space` and current `ranges[]` with IDs, names wh
 | `expected_revision` | required | integer, minimum `0` |  |
 | `operation_id` | required | string, minimum length `1` | Unique operation identifier; repeat the exact request after a lost reply. |
 | `id` | required | string, minimum length `1` |  |
-| `mode` | required | `replace` / `extend` |  |
+| `mode` | required | `replace` / `extend` / `replan` |  |
 
 ### `export_queue_list`
 
-Read the native export queue and its captured contents. Each entry includes its identifier, exact marked range, and ordered source trims. Mix audio rows include lane_id, lane_label and lane_color_slot. Uncovered audio intervals have kind audio_gap.
+Read the native export queue and its captured contents. Each entry includes its identifier, exact marked range, ordered source trims, and whether a media change requires replanning. Mix audio rows include lane_id, lane_label and lane_color_slot. Uncovered audio intervals have kind audio_gap.
 
-Returns the default `coordinate_space` and current `ranges[]` with IDs, names when set, boundaries and captured `items[]`. A multicam entry reports its own group or assembly clock. Items identify the file, source `from` and `to`, and the kind (`clip`, `still`, `angle`, `audio`, `gap` or `replacement`). Multicam items report output bounds, audio items can identify a stream, and generated spans can omit source bounds. Rename preserves the captured contents. Revise recaptures the current marked edit under the same entry ID and name. Extend requires an enclosing interval on the same clock.
+Returns the default `coordinate_space` and current `ranges[]` with IDs, names when set, boundaries and captured `items[]`. A multicam entry reports its own group or assembly clock. Items identify the file, source `from` and `to`, and the kind (`clip`, `still`, `angle`, `audio`, `gap` or `replacement`). Multicam items report output bounds, audio items can identify a stream, and generated spans can omit source bounds. Still entries with a captured timing choice report `still_timing`. Rename preserves the captured contents. Revise recaptures the current marked edit under the same entry ID and name. Extend requires an enclosing interval on the same clock. An entry with `needs_replan: true` can be removed or replanned. Replan uses the original bounds, or newly marked bounds for a transcript excerpt.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3518,7 +4140,7 @@ Returns the default `coordinate_space` and current `ranges[]` with IDs, names wh
 
 Plan exports of queued entries using their captured ranges.
 
-Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` and published `outputs`. Poll `export_editor_job_status_read` with the same project. The terminal result reports planned `destinations` and still plans for applicable queue entries.
+Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` and published `outputs`. Poll `export_editor_job_status_read` with the same project. The terminal result reports planned `destinations` and still plans for applicable queue entries. Affected entries are skipped and their IDs appear in `skipped_needs_replan`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3530,19 +4152,20 @@ Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` 
 | `tracks` | optional | `all` / `video` / `audio` |  |
 | `require_camera_copy` | optional | boolean | Require zero encoded camera duration when generating stills. |
 | `mode` | optional | `smart` / `copy` / `encode` |  |
-| `codec` | optional | `h264` / `hevc` / `prores` |  |
+| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` |  |
 | `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` |  |
-| `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` |  |
+| `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` / `alac` |  |
 | `audio_track_ordinal` | optional | integer, minimum `0` | Zero-based track within the ordinary source audio tracks. |
 | `subfolder` | optional | string, minimum length `1` | Optional output subfolder. |
 | `base_name` | optional | string, minimum length `1` | Optional filename prefix. |
 | `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. |
+| `still_timing` | optional | `cadence` / `held` | Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule. |
 
 ### `export_queue_range_add`
 
 Add the current marked range to the native queue, preserving the captured edit and media.
 
-Returns the default `coordinate_space` and current `ranges[]` with IDs, names when set, boundaries and captured `items[]`. A multicam entry reports its own group or assembly clock. Items identify the file, source `from` and `to`, and the kind (`clip`, `still`, `angle`, `audio`, `gap` or `replacement`). Multicam items report output bounds, audio items can identify a stream, and generated spans can omit source bounds. Rename preserves the captured contents. Revise recaptures the current marked edit under the same entry ID and name. Extend requires an enclosing interval on the same clock.
+Returns the default `coordinate_space` and current `ranges[]` with IDs, names when set, boundaries and captured `items[]`. A multicam entry reports its own group or assembly clock. Items identify the file, source `from` and `to`, and the kind (`clip`, `still`, `angle`, `audio`, `gap` or `replacement`). Multicam items report output bounds, audio items can identify a stream, and generated spans can omit source bounds. Still entries with a captured timing choice report `still_timing`. Rename preserves the captured contents. Revise recaptures the current marked edit under the same entry ID and name. Extend requires an enclosing interval on the same clock. An entry with `needs_replan: true` can be removed or replanned. Replan uses the original bounds, or newly marked bounds for a transcript excerpt.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3554,7 +4177,7 @@ Returns the default `coordinate_space` and current `ranges[]` with IDs, names wh
 
 Render the queued entries to the output directory.
 
-Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` and published `outputs`. Poll `export_editor_job_status_read` with the same project. The terminal result reports planned `destinations` and still plans for applicable queue entries.
+Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` and published `outputs`. Poll `export_editor_job_status_read` with the same project. The terminal result reports planned `destinations` and still plans for applicable queue entries. Affected entries are skipped and their IDs appear in `skipped_needs_replan`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -3566,13 +4189,14 @@ Returns a live job receipt with `job_id`, `input_revision`, `state`, `progress` 
 | `tracks` | optional | `all` / `video` / `audio` |  |
 | `require_camera_copy` | optional | boolean | Require zero encoded camera duration when generating stills. |
 | `mode` | optional | `smart` / `copy` / `encode` |  |
-| `codec` | optional | `h264` / `hevc` / `prores` |  |
+| `codec` | optional | `h264` / `hevc` / `prores` / `jpeg` |  |
 | `quality` | optional | `smaller` / `balanced` / `high` / `422-lt` / `422` / `422-hq` |  |
-| `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` |  |
+| `audio` | optional | `auto` / `copy` / `aac` / `pcm` / `remove` / `mp3` / `flac` / `opus` / `alac` |  |
 | `audio_track_ordinal` | optional | integer, minimum `0` | Zero-based track within the ordinary source audio tracks. |
 | `subfolder` | optional | string, minimum length `1` | Optional output subfolder. |
 | `base_name` | optional | string, minimum length `1` | Optional filename prefix. |
 | `audio_output` | optional | `separate_tracks` / `downmix_mono` / `downmix_stereo` | Multicam audio delivery. Separate tracks preserve lane order. Downmix renders the lanes into one mono or stereo track. |
+| `still_timing` | optional | `cadence` / `held` | Still picture timing. Held writes one independently decodable sample per visible hold. Cadence uses the authored frame schedule. |
 
 ### `project_editor_convert`
 
@@ -3910,6 +4534,40 @@ Additional schema rules
 }
 ```
 
+### `participants_file_angles_take`
+
+Take a virtual angle at an exact output timestamp and save the resulting timed picture decision.
+
+Returns a file job receipt. The completed result supplies the project path and change count.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session. |
+| `project_path` | required | string, pattern `^/` | Absolute path to an existing .cut project. |
+| `angle` | required | object | A virtual angle from participants_file_angles_list. |
+| `output_time` | required | string, minimum length `1` | Exact timestamp on the edited output clock. |
+| `out_project` | optional | string, pattern `^/` | Absolute path for a new .cut project. |
+| `in_place` | optional | `true` | Replace the project using its current disk revision. |
+
+Additional schema rules
+
+```json
+{
+  "oneOf": [
+    {
+      "required": [
+        "out_project"
+      ]
+    },
+    {
+      "required": [
+        "in_place"
+      ]
+    }
+  ]
+}
+```
+
 ### `participants_file_markers_build`
 
 Generate participant scene candidates from saved scan events without rescanning media. Poll file_job_status_read and fetch the JSON with file_job_result_read.
@@ -4054,8 +4712,9 @@ Returns a file job receipt. The completed result includes analysis identity, sou
 | `operation_id` | required | string, format `uuid` | A fresh UUID for each distinct file job. Reuse it when retrying the same request in this session. |
 | `file` | required | string, pattern `^/` | Absolute input recording path. |
 | `backend` | optional | `auto` / `cpu-only` / `gpu-required` |  |
-| `sampling` | optional | `every-frame` / `sparse` |  |
+| `sampling` | optional | `adaptive` / `every-frame` / `sparse` |  |
 | `include_scenes` | optional | boolean |  |
+| `feed_layout` | optional | string, pattern `^(auto\|[0-9]+x[0-9]+)$` | Use auto or enter COLSxROWS for a fixed grid of up to 64 feeds. Omit for meeting analysis or to reuse a saved scan configuration. |
 | `no_sidecar` | optional | boolean |  |
 | `output` | optional | string, pattern `^/` | Optional absolute path for a new scan JSON file. Pass this file to participant project accept or marker building. |
 | `resume_file` | optional | string, pattern `^/` | Optional absolute path to a compatible saved partial scan to resume. |
@@ -4475,9 +5134,9 @@ Returns `revision` and `source_selects[]` with each select’s ID, name and sour
 
 ### `still_editor_asset_relink`
 
-Update all uses of a still asset in one native undo step.
+Relink a still asset to the same image at a new location. Every use and retained history follows the relink.
 
-Returns the affected `placement` or `asset`, native action, revision, changed and history_retained. Read still_editor_placements_list or the refreshed timeline after structural edits.
+Returns the affected `asset`, `revision` and `changed`. Every use and retained history follows the relink.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -4600,7 +5259,7 @@ Additional schema rules
 
 Read a page of image placements, including authored and visible ranges and asset availability.
 
-Page `items` using `offset` and `total`. Each row supplies stable `placement` and `asset` IDs, operation, framing, authored coordinates and visible program ranges, duration and offline status. Generated gaps have `kind: gap` and `offline: false`. Hidden replacements have zero visible duration.
+Page `items` using `offset` and `total`. Each row supplies stable `placement` and `asset` IDs, operation, framing, authored coordinates and visible program ranges, duration and offline status. Generated gaps have `kind: gap` and `offline: false`. Hidden replacements have zero visible duration. A linked recording appears under `soundtrack`.
 
 | Argument | Presence | Values | Meaning |
 | --- | --- | --- | --- |
@@ -4608,6 +5267,47 @@ Page `items` using `offset` and `total`. Each row supplies stable `placement` an
 | `expected_revision` | optional | integer, minimum `0` |  |
 | `offset` | optional | integer, minimum `0` |  |
 | `limit` | optional | integer, minimum `1`, maximum `200` |  |
+
+### `still_editor_soundtrack_attach`
+
+Attach a recording at program zero in a still-only sequence. Optionally fit its single image to the selected audio range.
+
+Returns the native action, revision, changed and history_retained. An attached recording appears under `soundtrack`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` |  |
+| `expected_revision` | required | integer, minimum `0` |  |
+| `operation_id` | required | string, minimum length `1` |  |
+| `soundtrack` | required | string, pattern `^/` | Absolute path to the recording. |
+| `audio_stream` | optional | integer, minimum `0` | Optional absolute audio stream index. Defaults to the first audio stream. |
+| `from` | optional | string | Optional source in-point on an audio sample boundary, as exact rational seconds. |
+| `to` | optional | string | Optional source out-point on an audio sample boundary, as exact rational seconds. |
+| `fit_soundtrack` | optional | `true` | Fit the single image to the recording’s exact audible duration in the same edit. |
+
+### `still_editor_soundtrack_detach`
+
+Detach the recording from a still-only sequence and keep its picture timing.
+
+Returns the native action, revision, changed and history_retained. An attached recording appears under `soundtrack`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` |  |
+| `expected_revision` | required | integer, minimum `0` |  |
+| `operation_id` | required | string, minimum length `1` |  |
+
+### `still_editor_soundtrack_fit`
+
+Fit the single image in a still-only sequence to its attached soundtrack’s exact audible duration.
+
+Returns the native action, revision, changed and history_retained. An attached recording appears under `soundtrack`.
+
+| Argument | Presence | Values | Meaning |
+| --- | --- | --- | --- |
+| `project_handle` | required | string, minimum length `1` |  |
+| `expected_revision` | required | integer, minimum `0` |  |
+| `operation_id` | required | string, minimum length `1` |  |
 
 ### `timeline_clips_space`
 

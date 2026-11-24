@@ -6,6 +6,7 @@ public struct StillSoundAction: Codable, Sendable {
         public let stream: Int
         public let input: MulticamRange
         public let output: MulticamRange
+        public var codec: String? = nil
     }
 
     public let ordinal: Int
@@ -16,6 +17,7 @@ public struct StillSoundAction: Codable, Sendable {
     public var codec: String? = nil
     public var sampleRate: Int? = nil
     public var channelLayout: String? = nil
+    public var bitDepth: Int? = nil
     public var treatment: String? = nil
     public let audio: ReencodeAudio
     public let originalStreams: [Int]
@@ -71,18 +73,20 @@ private struct StillRoutedSound {
     static func sources(in spans: [ConvertedSoundSpan]) -> [StillSoundAction.Source] {
         spans.compactMap { span in
             guard let media = span.media, let stream = span.stream else { return nil }
-            return .init(file: media.url, stream: stream, input: span.input, output: span.output)
+            return .init(file: media.url, stream: stream, input: span.input, output: span.output,
+                         codec: media.audio.first(where: { $0.stream.index == stream })?.stream.codec)
         }
     }
 }
 
 struct StillSoundPlanner {
     var cancelled: (@Sendable () -> Bool)?
+    var expectedSoundtrackIdentity: SourceIdentity? = nil
 
     func resolve(_ project: CutProject, relativeTo location: URL?, timeline: StillTimelinePlan,
                  tracks: ExportTracks, audioStream: Int?, audioTrackOrdinal: Int? = nil, mode: ExportMode, audio: ReencodeAudio,
                  container: String, audioOutput: MulticamAudioOutput = .separateTracks,
-                 independentAudio: Bool = false) throws -> StillSoundPlan {
+                 independentAudio: Bool = false, defaultSoundtrackPCM: Bool = false) throws -> StillSoundPlan {
         let muxer = ExportRules.multicamMuxContainer(container)
         if tracks == .video || audio == .removeAudio {
             return StillSoundPlan(actions: [], treatments: [], container: muxer)
@@ -99,11 +103,15 @@ struct StillSoundPlanner {
                                       needsSilenceFormat: audio != .copyOriginal && audioOutput == .separateTracks)
         case .sequence, .stillSequence:
             followsMulticamRouting = false
-            if case .stillSequence(let sequence) = project, let template = sequence.stillAudioReference,
+            if let soundtrack = project.stillSoundtrack {
+                lanes = [try soundtrackLane(project, clip: soundtrack, relativeTo: location, duration: timeline.duration,
+                                           audioStream: audioStream, audioTrackOrdinal: audioTrackOrdinal)]
+            } else if case .stillSequence(let sequence) = project, let template = sequence.stillAudioReference,
                timeline.spans.allSatisfy({ $0.origin == .insert }) {
                 let file = try ProjectFile.checkedSourceURL(file: template.file, in: projectDirectory(location))
-                let media = try CutEngine(cancelled: cancelled).inspect(file)
-                let streams = try selectedAudioStreams(media, stream: audioStream, ordinal: audioTrackOrdinal)
+                let media = try CutEngine(cancelled: cancelled).inspect(file, keyframes: false,
+                                                                        expectedIdentity: expectedSoundtrackIdentity)
+                let streams = try selectedAudioStreams(media, stream: audioStream, ordinal: audioTrackOrdinal ?? template.audioTrack)
                 let inserts = timeline.spans.map { silence($0.output) }
                 lanes = try streams.map { stream in
                     guard let audio = media.audio.first(where: { $0.stream.index == stream }) else {
@@ -135,10 +143,25 @@ struct StillSoundPlanner {
         for (ordinal, lane) in lanes.enumerated() {
             let spans = try coalesce(lane.spans, duration: timeline.duration)
             let sources = StillRoutedSound.sources(in: spans)
+            var soundtrackWarnings: [String] = []
+            if let soundtrack = project.stillSoundtrack {
+                let recordingDuration = try soundtrack.to.subtracting(soundtrack.from)
+                if timeline.duration < recordingDuration, let source = sources.last {
+                    soundtrackWarnings.append("The recording is trimmed to source time \(source.input.from)–\(source.input.to).")
+                } else if timeline.duration > recordingDuration {
+                    soundtrackWarnings.append("Generated silence follows the recording from \(recordingDuration) to \(timeline.duration).")
+                }
+            }
             let streams = (spans.compactMap(\.stream) + [lane.format?.audio.stream.index].compactMap { $0 }).reduce(into: [Int]()) { list, stream in
                 if !list.contains(stream) { list.append(stream) }
             }
-            let explicitConversion = audio == .aac || audio == .pcm
+            let explicitLossless = audio == .alac || audio == .flac
+            let explicitConversion = explicitLossless || audio == .aac || audio == .pcm
+            let hasSoundtrackSelection = project.stillSoundtrack != nil || project.stillAudioReference?.audioTrack != nil
+            let soundtrackDefault = hasSoundtrackSelection && mode != .copy && audio == .auto
+            let matchingLossless = explicitLossless && conversionAllowed(audio, container: muxer) && spans.allSatisfy { span in
+                span.media?.audio.first(where: { $0.stream.index == span.stream })?.stream.codec == audio.rawValue
+            }
             let allowsAutomaticConversion = (independentAudio || mode == .encode) && audio == .auto
             let prefersRetainedPCM = (independentAudio || mode == .smart) && audio == .auto
             let copySpans: [ConvertedSoundSpan]
@@ -148,23 +171,25 @@ struct StillSoundPlanner {
                 copySpans = spans
             }
             func append(_ treatment: StillSoundPlan.Treatment, audio: ReencodeAudio, codec: String?,
-                        rate: Int?, layout: String?, silence: [MulticamRange] = [], warnings: [String] = [],
+                        rate: Int?, layout: String?, bitDepth: Int? = nil, silence: [MulticamRange] = [], warnings: [String] = [],
                         description: String? = nil) {
                 treatments.append(treatment)
                 actions.append(StillSoundAction(ordinal: ordinal, laneID: lane.id, label: lane.label,
                                                 colorSlot: lane.colorSlot, sourceLaneIDs: lane.id.map { [$0] }, codec: codec,
-                                                sampleRate: rate, channelLayout: layout, treatment: description,
-                                                audio: audio, originalStreams: streams, sources: sources, warnings: warnings,
+                                                sampleRate: rate, channelLayout: layout, bitDepth: bitDepth, treatment: description,
+                                                audio: audio, originalStreams: streams, sources: sources, warnings: soundtrackWarnings + warnings,
                                                 generatedSilence: silence))
             }
             var copyFailure: CutError?
-            if !explicitConversion || (!independentAudio && mode != .encode) {
+            if !explicitConversion || matchingLossless || (mode == .copy && !independentAudio)
+                || (!explicitLossless && !independentAudio && mode != .encode) {
                 do {
                     let copy = try resolveCopy(copySpans, duration: timeline.duration, container: muxer,
                                                allowsSourceExtent: !followsMulticamRouting)
                     let stream = format(of: spans)?.audio.stream ?? lane.format?.audio.stream
                     append(copy, audio: .copyOriginal, codec: stream?.codec, rate: stream?.sampleRate,
-                           layout: stream?.canonicalChannelLayout)
+                           layout: stream?.canonicalChannelLayout, bitDepth: stream.flatMap(AudioExportEngine.integerDepth),
+                           description: "copied packets")
                     continue
                 } catch let issue as CutError where issue.code != "cancelled" && issue.code != "source_changed" {
                     copyFailure = trackIssue(issue, ordinal: ordinal, lane: lane, spans: copySpans)
@@ -179,22 +204,46 @@ struct StillSoundPlanner {
             } else {
                 retained = nil
             }
-            if let copyFailure, retained == nil, !allowsAutomaticConversion,
+            if let copyFailure, retained == nil, !allowsAutomaticConversion, !soundtrackDefault,
                !explicitConversion || (!independentAudio && mode == .copy) {
                 throw copyFailure
             }
-            let candidates: [ReencodeAudio] = allowsAutomaticConversion ? [.aac, .pcm] : [audio]
+            let candidates: [ReencodeAudio]
+            if soundtrackDefault {
+                switch muxer {
+                case "mov": candidates = project.stillFormat?.codec == .jpeg ? [.pcm] : [.alac, .pcm]
+                case "mp4": candidates = [.alac, .flac]
+                case "mkv": candidates = [.flac]
+                default: candidates = [.pcm, .aac]
+                }
+            } else if defaultSoundtrackPCM {
+                candidates = [audio, .pcm]
+            } else if allowsAutomaticConversion {
+                // As in a movie re-encode: a lane whose every source is lossless is written as PCM where the container carries it.
+                let lossless = !sources.isEmpty && sources.allSatisfy { $0.codec.map(ExportRules.isLosslessAudio(codec:)) ?? false }
+                candidates = lossless ? [.pcm, .aac] : [.aac, .pcm]
+            } else {
+                candidates = [audio]
+            }
             var sound = try retained ?? resolveConversion(conversionLane, duration: timeline.duration, container: muxer,
                                                           candidates: candidates, ordinal: ordinal, lane: lane,
-                                                          format: conversionFormat)
+                                                          format: conversionFormat, preservePCM: independentAudio || hasSoundtrackSelection)
             configureMuxer(&sound, container: muxer)
             let warnings = retained == nil ? (copyFailure.map { [$0.message] } ?? []) :
                 ["Retained PCM samples are preserved. Uncovered intervals receive digital silence."]
-            let codec = sound.encoderArguments?.last ?? (sound.action == .aac ? "aac" :
+            let codec = sound.exactEncoding?.codec ?? sound.encoderArguments?.last ?? (sound.action == .aac ? "aac" :
                 sound.floatingPoint ? "pcm_f32le" : "pcm_s32le")
+            let description: String?
+            if sound.inputs.allSatisfy(\.silence) {
+                description = "generated digital silence"
+            } else if retained != nil {
+                description = "retained PCM samples + generated silence"
+            } else {
+                description = sound.exactEncoding.map { $0.warnings.isEmpty ? "losslessly encoded PCM samples" : "decoded source audio" }
+            }
             append(.convert(sound), audio: sound.action, codec: codec, rate: sound.sampleRate, layout: sound.layout,
-                   silence: conversionLane.filter { $0.media == nil }.map(\.output), warnings: warnings + sound.warnings,
-                   description: retained == nil ? nil : "retained PCM samples + generated silence")
+                   bitDepth: sound.exactEncoding?.bitDepth, silence: conversionLane.filter { $0.media == nil }.map(\.output),
+                   warnings: warnings + sound.warnings, description: description)
         }
         let plan = StillSoundPlan(actions: actions, treatments: treatments, container: muxer)
         try plan.verifySources()
@@ -260,14 +309,16 @@ struct StillSoundPlanner {
 
     private func resolveConversion(_ spans: [ConvertedSoundSpan], duration: RationalTime, container: String,
                                    candidates: [ReencodeAudio], ordinal: Int, lane: StillRoutedSound,
-                                   format: ConvertedSoundFormat?) throws -> MulticamAudioConversionPlan {
+                                   format: ConvertedSoundFormat?, preservePCM: Bool) throws -> MulticamAudioConversionPlan {
         var failure = CutError(code: "unsupported_container",
                                message: "\(container.uppercased()) cannot carry the selected sample-exact audio conversion.")
         let converter = MulticamEngine(cancelled: cancelled)
         for action in candidates where conversionAllowed(action, container: container) {
             do {
                 return try converter.resolveConvertedSound(spans, duration: duration, container: container,
-                                                           action: action, allowsSilence: true, silenceFormat: format) { issue, index in
+                                                           action: action, allowsSilence: true, silenceFormat: format,
+                                                           preserveSamples: action == .alac || action == .flac ||
+                                                               (preservePCM && action == .pcm && container == "mov")) { issue, index in
                     trackIssue(issue, ordinal: ordinal, laneID: lane.id, label: lane.label, output: spans[index].output)
                 }
             } catch let issue as CutError where issue.code != "cancelled" && issue.code != "source_changed" {
@@ -326,7 +377,7 @@ struct StillSoundPlanner {
 
     private func resolveDownmix(_ lanes: [StillRoutedSound], duration: RationalTime, container: String,
                                 audio: ReencodeAudio, audioOutput: MulticamAudioOutput) throws -> StillSoundPlan {
-        guard audio != .copyOriginal else {
+        guard ![.copyOriginal, .alac, .flac].contains(audio) else {
             throw CutError(code: "unsupported_audio", message: "Choose Auto, AAC, or PCM to render a downmix.")
         }
         let multicam = MulticamEngine(cancelled: cancelled)
@@ -346,12 +397,13 @@ struct StillSoundPlanner {
                                     boundary: issue.boundary, track: issue.track, laneID: laneIDs[lane])
                 }
                 let sources = lanes.flatMap(\.sources)
-                let report = StillSoundAction(ordinal: 0, laneID: audioOutput.rawValue,
+                var report = StillSoundAction(ordinal: 0, laneID: audioOutput.rawValue,
                                               label: channels == 1 ? "Mono downmix" : "Stereo downmix",
                                               sourceLaneIDs: laneIDs.compactMap { $0 }, codec: action == .aac ? "aac" : "pcm_f32le",
                                               sampleRate: plan.sampleRate, channelLayout: plan.layout, audio: action,
                                               originalStreams: Set(sources.map(\.stream)).sorted(), sources: sources,
                                               warnings: plan.warnings, generatedSilence: commonSilence(spans))
+                report.treatment = "downmix"
                 let result = StillSoundPlan(actions: [report], treatments: [.downmix(plan)], container: container)
                 try result.verifySources()
                 return result
@@ -376,7 +428,35 @@ struct StillSoundPlanner {
     }
 
     private func conversionAllowed(_ action: ReencodeAudio, container: String) -> Bool {
-        ExportRules.multicamRenderedAudioActions(container: container).contains(action)
+        ExportRules.allows(stillAudio: action, in: container)
+    }
+
+    private func soundtrackLane(_ project: CutProject, clip: CutSequenceClip, relativeTo location: URL?,
+                                duration: RationalTime, audioStream: Int?, audioTrackOrdinal: Int?) throws -> StillRoutedSound {
+        let file = try ProjectFile.checkedSourceURL(file: clip.file, in: projectDirectory(location))
+        let media = try CutEngine(cancelled: cancelled).inspect(file, keyframes: false, expectedIdentity: expectedSoundtrackIdentity)
+        let ordinal = clip.audioTrack ?? 0
+        let streams = media.streams.filter { $0.kind == "audio" }
+        guard streams.indices.contains(ordinal),
+              let sound = media.audio.first(where: { $0.stream.index == streams[ordinal].index }) else {
+            throw CutError(code: "missing_audio", message: "The attached recording's selected audio track is unavailable.")
+        }
+        guard clip.from >= sound.start, clip.to <= sound.end else {
+            throw CutError(code: "uncovered_audio", message: "The attached recording no longer covers its saved soundtrack range.",
+                           track: sound.stream.index)
+        }
+        guard (audioTrackOrdinal.map { $0 == ordinal } ?? true),
+              (audioStream.map { $0 == sound.stream.index } ?? true) else {
+            throw CutError(code: "missing_audio", message: "Choose the track selected for the attached recording.")
+        }
+        let output = MulticamRange(from: .zero, to: duration)
+        let format = ConvertedSoundFormat(media: media, audio: sound)
+        guard let mapping = try project.stillSoundtrackMapping(in: output) else {
+            return StillRoutedSound(spans: [silence(output)], format: format)
+        }
+        var spans = [ConvertedSoundSpan(media: media, stream: sound.stream.index, input: mapping.source, output: mapping.output)]
+        if mapping.output.to < duration { spans.append(silence(.init(from: mapping.output.to, to: duration))) }
+        return StillRoutedSound(spans: spans, format: format)
     }
 
     private func compatiblePCM(in spans: [ConvertedSoundSpan], format: ConvertedSoundFormat?) -> StreamInfo? {

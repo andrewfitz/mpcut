@@ -118,7 +118,7 @@ class MulticamCLITests(unittest.TestCase):
             "assembly empty": lambda d: d.update(assembly=[{"from": "3", "to": "3"}]),
             "repeated id": lambda d: d["audio_sources"][0].update(id="wide"),
             "blank id": lambda d: d["angles"][1].update(id=" "),
-            "future version": lambda d: d.update(schema_version=5),
+            "future version": lambda d: d.update(schema_version=8),
             "wrong kind": lambda d: d.update(kind="edit"),
             "unknown field": lambda d: d.update(extra=True),
             "video stream as sound": lambda d: d.update(audio={"mode": "fixed", "source_id": "wide", "audio_stream_index": 0}),

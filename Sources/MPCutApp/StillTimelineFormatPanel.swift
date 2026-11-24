@@ -1,6 +1,21 @@
 import AppKit
 import MPCutCore
 
+private final class StillContainerPicker: NSPopUpButton {
+    @objc func updateFormats(_ codecPicker: NSPopUpButton) {
+        guard let codec = codecPicker.titleOfSelectedItem.flatMap(ReencodeCodec.init(rawValue:)) else { return }
+        let previous = titleOfSelectedItem
+        let choices = StillTimelineFormat.containers(for: codec)
+        removeAllItems()
+        addItems(withTitles: choices)
+        if let previous, choices.contains(previous) {
+            selectItem(withTitle: previous)
+        } else if choices.contains("mov") {
+            selectItem(withTitle: "mov")
+        }
+    }
+}
+
 @MainActor
 extension StillPanels {
     static func format(in window: NSWindow?, completion: @escaping (StillTimelineFormat, StillProgramColorPolicy) -> Void) {
@@ -14,9 +29,11 @@ extension StillPanels {
         let codec = NSPopUpButton()
         codec.toolTip = "Choose video codec"
         codec.addItems(withTitles: codecs)
-        let container = NSPopUpButton()
+        let container = StillContainerPicker()
         container.toolTip = "Choose file format"
-        container.addItems(withTitles: ["mp4", "mov"])
+        codec.target = container
+        codec.action = #selector(StillContainerPicker.updateFormats(_:))
+        container.updateFormats(codec)
         let color = NSPopUpButton()
         color.toolTip = "Choose program color"
         color.addItems(withTitles: StillTimelineFormat.Color.allCases.map { $0.rawValue.uppercased() })

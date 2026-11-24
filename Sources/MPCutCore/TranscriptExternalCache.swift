@@ -38,6 +38,8 @@ struct TranscriptExternalCacheDescriptor: Encodable {
             scope = Self.scope(for: track.file, stream: stream)
             self.directory = directory.path
             write = AnalysisSidecar.automaticWritesEnabled
+            // The provider publishes the exchange version that this folder says MPCut reads.
+            TranscriptRecognitionExchange.declareReader(in: directory)
         } else {
             scope = nil
             directory = nil

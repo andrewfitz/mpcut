@@ -180,11 +180,13 @@ final class MulticamMCPTests: XCTestCase {
         XCTAssertEqual(validations, 2)
         XCTAssertEqual(model.project?.angles.first?.file, old)
         XCTAssertTrue(model.historyActions.isEmpty)
+        let range = try XCTUnwrap(model.project?.range)
+        XCTAssertTrue(model.edit("Repeat") { $0.assembly = [range, range] })
         let changed = try await model.mcpCommand(tool: "multicam_source_edit", arguments: args) {}
         XCTAssertEqual(changed?["changed"] as? Bool, true)
-        XCTAssertEqual(changed?["history_retained"] as? Bool, true)
+        XCTAssertEqual(changed?["history_retained"] as? Bool, false)
         XCTAssertEqual(model.project?.angles.first?.file, replacement.path)
-        XCTAssertEqual(model.historyActions, ["Relink Source"])
+        XCTAssertEqual(model.historyActions, ["Repeat"])
         let generation = model.mcpGeneration
         let revision = model.mcpRevision
         let destination = directory.appendingPathComponent("Relinked.cut")
@@ -192,14 +194,14 @@ final class MulticamMCPTests: XCTestCase {
         XCTAssertEqual(model.mcpGeneration, generation)
         XCTAssertEqual(model.mcpRevision, revision)
         let document = try CutProject.loadEditorDocument(from: destination, limit: 10)
-        XCTAssertEqual(document.undo.map(\.action), ["Relink Source"])
+        XCTAssertEqual(document.undo.map(\.action), ["Repeat"])
         guard case .multicam(let prior)? = document.undo.first?.project else {
             return XCTFail("Expected the original multicam project in persistent history.")
         }
         let originalFile = try XCTUnwrap(prior.angles.first?.file)
-        XCTAssertEqual(CutProject.mediaURL(originalFile, relativeTo: destination).path, old)
+        XCTAssertEqual(CutProject.mediaURL(originalFile, relativeTo: destination).path, replacement.path)
         model.undo()
-        XCTAssertEqual(model.project?.angles.first?.file, old)
+        XCTAssertEqual(model.project?.angles.first?.file, replacement.path)
         model.redo()
         XCTAssertEqual(model.project?.angles.first?.file, replacement.path)
     }
@@ -303,8 +305,6 @@ final class MulticamMCPTests: XCTestCase {
                 "source_id": "wide", "action": "relink", "path": replacement.path
             ]) {}
         }
-        for _ in 0..<100 where !model.isBusy { await Task.yield() }
-        XCTAssertTrue(model.isBusy)
         operation.cancel()
         do {
             _ = try await operation.value

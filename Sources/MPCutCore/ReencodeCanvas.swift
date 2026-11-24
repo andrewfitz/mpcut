@@ -202,10 +202,8 @@ extension ReencodeEngine {
         var soundWarnings: [String] = []
         let trackCount = settings.audio == .removeAudio ? 0 : sources.map { $0.media.audio.count }.max() ?? 0
         if trackCount > 0 {
-            let action = settings.audio == .auto
-                ? ExportRules.automaticAudio(codec: settings.codec, container: container, source: .movie).first ?? .aac
-                : settings.audio
-            if let refusal = ExportRules.reencodeRefusal(audio: action, container: container, source: .movie) { throw refusal }
+            if settings.audio != .auto,
+               let refusal = ExportRules.reencodeRefusal(audio: settings.audio, container: container, source: .movie) { throw refusal }
             let aacRates = [7_350, 8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000]
             for position in 0..<trackCount {
                 let present = sources.filter { $0.media.audio.count > position }
@@ -227,8 +225,16 @@ extension ReencodeEngine {
                 // The multicam sound conversion set the precedent: keep what the clips share, else 48 kHz stereo.
                 let commonLayout = zip(streams, layouts).allSatisfy { $0.channels == first.channels && $1 == layouts[0] }
                 let commonRate = streams.allSatisfy { $0.sampleRate == first.sampleRate }
-                let keepsRate = commonRate && (action != .aac || aacRates.contains(first.sampleRate))
                 let channels = commonLayout ? first.channels : 2
+                // Auto decides for each track position. A position that is lossless in every clip that has it is written as PCM
+                // where the container carries it. A clip without the track adds silence, which loses nothing.
+                let lossless = streams.allSatisfy { ExportRules.isLosslessAudio(codec: $0.codec) }
+                let action = settings.audio == .auto
+                    ? ExportRules.automaticAudio(codec: settings.codec, container: container, source: .movie,
+                                                 lossless: lossless, channels: channels).first ?? .aac
+                    : settings.audio
+                if let refusal = ExportRules.reencodeRefusal(audio: action, container: container, source: .movie) { throw refusal }
+                let keepsRate = commonRate && (action != .aac || aacRates.contains(first.sampleRate))
                 guard action != .aac || channels <= 8 else {
                     throw CutError(code: "unsupported_audio",
                                    message: "AAC cannot preserve the channel layout of audio track \(position + 1). Choose PCM.",
@@ -237,9 +243,33 @@ extension ReencodeEngine {
                 let sound = ReencodeCanvas.Sound(sampleRate: keepsRate ? first.sampleRate : 48_000, channels: channels,
                                                  layout: commonLayout ? layouts[0] : "stereo", language: first.language,
                                                  disposition: first.disposition,
-                                                 floatingPoint: streams.contains { $0.codec.hasPrefix("pcm_f") })
+                                                 // Float PCM and decoded lossy sound can exceed full scale, where integer PCM would clip.
+                                                 floatingPoint: streams.contains { AudioExportEngine.moviePCM([$0]).codec == "pcm_f32le" })
                 sounds.append(sound)
-                actions.append(ReencodeAudioAction(track: position + 1, action: action, reason: ExportRules.mixedAudioReason))
+                let note = settings.audio == .auto
+                    ? ExportRules.automaticAudioNote(action, lossless: lossless, channels: channels, container: container) : nil
+                var written = ReencodeAudioAction(track: position + 1, action: action,
+                                                  reason: [ExportRules.mixedAudioReason, note].compactMap { $0 }.joined(separator: " "))
+                if action == .aac {
+                    // An AAC position keeps the rate of its AAC sources when their channels are kept too.
+                    let measured = present.compactMap { source -> Int? in
+                        let audio = source.media.audio[position]
+                        return audio.stream.codec == "aac" ? audio.averageBitRate : nil
+                    }
+                    written.codec = "aac"
+                    written.bitRate = AudioExportEngine.aacBitRate(
+                        matching: commonLayout && measured.count == present.count ? measured.max() : nil, channels: channels)
+                } else if action == .pcm {
+                    // Sound that is neither resampled nor mixed keeps the word length of its integer sources.
+                    let pcm = keepsRate && commonLayout ? AudioExportEngine.moviePCM(streams)
+                        : (sound.floatingPoint ? "pcm_f32le" : "pcm_s32le", 32)
+                    written.codec = pcm.0
+                    written.bitDepth = pcm.1
+                }
+                actions.append(written)
+                if action == .pcm, streams.contains(where: { $0.codec.hasPrefix("pcm_f64") }) {
+                    soundWarnings.append("The 64-bit floating-point audio of track \(position + 1) will be reduced to 32-bit float.")
+                }
                 if !keepsRate { soundWarnings.append(ExportRules.mixedResampleWarning(track: position + 1, rate: sound.sampleRate)) }
                 if !commonLayout { soundWarnings.append(ExportRules.mixedLayoutWarning(track: position + 1)) }
                 let silent = sources.filter { $0.media.audio.count <= position }.map(\.clip)
@@ -272,12 +302,16 @@ extension ReencodeEngine {
 }
 
 /// The encoder options of one converted sound track of a mixed timeline.
-func audioOptions(_ action: ReencodeAudio, sound: ReencodeCanvas.Sound, outputIndex: Int) -> [String] {
+func audioOptions(_ planned: ReencodeAudioAction, sound: ReencodeCanvas.Sound, outputIndex: Int) -> [String] {
+    let action = planned.action
     let specifier = "a:\(outputIndex)"
-    let codec = action == .aac ? "aac" : sound.floatingPoint ? "pcm_f32le" : "pcm_s32le"
+    // The plan states the codec and bit rate it chose from every clip of the position.
+    let codec = action == .aac ? "aac" : planned.codec ?? (sound.floatingPoint ? "pcm_f32le" : "pcm_s32le")
     var args = ["-c:\(specifier)", codec, "-metadata:s:\(specifier)", "language=\(sound.language)",
                 "-disposition:\(specifier)", "\(sound.disposition)"]
-    if action == .aac { args += ["-b:\(specifier)", "\(max(96, min(512, sound.channels * 96)))k"] }
+    if action == .aac {
+        args += ["-b:\(specifier)", "\(planned.bitRate ?? AudioExportEngine.aacBitRate(matching: nil, channels: sound.channels))"]
+    }
     args += ["-ar:\(specifier)", "\(sound.sampleRate)"]
     return args
 }

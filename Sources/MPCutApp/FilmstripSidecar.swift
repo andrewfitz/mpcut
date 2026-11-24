@@ -7,7 +7,8 @@ import UniformTypeIdentifiers
 /// The clock and requested backing-pixel size are serialized exactly. A tile from another
 /// zoom level or display scale can have the same timestamp and different geometry.
 struct FilmstripTileKey: Equatable, Sendable {
-    static let sectionPrefix = "timeline_filmstrip.v1."
+    // The sidecar caps the bytes saved under this prefix, in addition to the count kept here.
+    static let sectionPrefix = AnalysisSidecar.filmstripSectionPrefix
     let time: Double
     let size: CGSize
 
@@ -160,7 +161,7 @@ final class FilmstripTileWriter: @unchecked Sendable {
             }
             // Commit promptly and cap the time a burst can hold the SQLite write lock.
             let batch = pending.prefix(8).prefix {
-                $0.sidecar.source == first.sidecar.source &&
+                $0.sidecar.source == first.sidecar.source && $0.sidecar.url == first.sidecar.url &&
                     $0.sidecar.identity == first.sidecar.identity &&
                     $0.sidecar.identity.changeTime == first.sidecar.identity.changeTime
             }

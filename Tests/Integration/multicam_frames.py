@@ -12,6 +12,7 @@ import unittest
 
 from frames import ratio, rgb, run
 from media_regression import audio
+from saved_project import read_project
 
 
 class MulticamFrames(unittest.TestCase):
@@ -55,7 +56,7 @@ class MulticamFrames(unittest.TestCase):
         run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=blue:s=160x96:r=4:d=1",
              "-c:v", "ffv1", restart])
         project = self.root / (name + ".cut")
-        document = json.loads(self.project.read_text())
+        document = read_project(self.project)
         document["angles"] = [document["angles"][0]]
         document["angles"][0].update({
             "group_coverage": {"from": "0", "to": "1"},
@@ -106,7 +107,7 @@ class MulticamFrames(unittest.TestCase):
         run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=blue:s=160x96:r=4:d=1",
              "-c:v", "ffv1", restart])
         original = self.root / "authoring.cut"
-        document = json.loads(self.project.read_text())
+        document = read_project(self.project)
         document["angles"] = document["angles"][:1]
         document["switches"] = document["switches"][:1]
         original.write_text(json.dumps(document))
@@ -118,7 +119,7 @@ class MulticamFrames(unittest.TestCase):
                             "path": str(restart), "group_start": "4"}],
         }))
         run([CLI, "project", "edit", "--input", request, "--json"])
-        authored = json.loads(project.read_text())
+        authored = read_project(project)
         self.assertEqual([angle["id"] for angle in authored["angles"]], ["wide"])
         self.assertEqual(authored["switches"], document["switches"])
         self.assertEqual(authored["group_range"]["to"], "5")

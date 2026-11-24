@@ -34,6 +34,15 @@ private struct ReencodeInput {
     let from: RationalTime
     var to: RationalTime
     let outputStart: RationalTime
+    var matroskaStillTiming: MulticamRange? = nil
+
+    func renderStart() throws -> RationalTime {
+        try matroskaStillTiming.map { try StillSampleSchedule.matroskaBoundary($0.from, final: false) } ?? outputStart
+    }
+
+    func renderEnd() throws -> RationalTime {
+        try matroskaStillTiming?.to ?? outputStart.adding(to.subtracting(from))
+    }
 }
 
 extension ReencodeEngine {
@@ -178,9 +187,9 @@ extension ReencodeEngine {
             let work = staging.appendingPathComponent("render-\(index)", isDirectory: true)
             try FileManager.default.createDirectory(at: work, withIntermediateDirectories: false)
             defer { try? FileManager.default.removeItem(at: work) }
-            let start = batch[0].outputStart
+            let start = try batch[0].renderStart()
             let last = batch[batch.count - 1]
-            let end = try last.outputStart.adding(last.to.subtracting(last.from))
+            let end = try last.renderEnd()
             let weight = try end.subtracting(start).seconds
             try render(plan, inputs: batch, in: work, to: part, intermediate: true, copiedAudio: []) { fraction in
                 progress?(0.9 * (start.seconds + weight * fraction) / plan.edit.duration.seconds)
@@ -211,7 +220,7 @@ extension ReencodeEngine {
         for (index, pair) in zip(plan.audioActions, plan.canvas?.audio ?? []).enumerated() {
             // Every part carries the canvas sound, whichever clips it holds.
             args += ["-map", "0:a:\(index)", "-filter:a:\(index)", "asetpts=N/SR/TB"]
-            args += audioOptions(pair.0.action, sound: pair.1, outputIndex: index)
+            args += audioOptions(pair.0, sound: pair.1, outputIndex: index)
         }
         for (index, pair) in zip(plan.audioActions, plan.canvas == nil ? source.audio : []).enumerated() {
             let (action, audio) = pair
@@ -222,7 +231,7 @@ extension ReencodeEngine {
             } else {
                 args += ["-map", "1:a:\(index)"]
             }
-            args += audioOptions(action.action, track: audio.stream, outputIndex: index,
+            args += audioOptions(action, track: audio.stream, outputIndex: index,
                                  exactPCM: plan.exactPCM.contains(action.track))
         }
         if plan.edit.container != "mkv" {
@@ -302,7 +311,8 @@ extension ReencodeEngine {
                             intermediate: Bool, copiedAudio: [String], again: Bool,
                             progress: ((Double) -> Void)?) throws {
         let firstInput = inputs[0]
-        let base = try firstInput.outputStart.roundedToSamples(plan.timeScale)
+        let firstTime = try firstInput.renderStart()
+        let base = try firstTime.roundedToSamples(plan.timeScale)
         var decoders: [DecoderInput] = []
         var decoderIndexes: [DecoderInput: Int] = [:]
         for input in inputs {
@@ -326,9 +336,12 @@ extension ReencodeEngine {
         let last = inputs[inputs.count - 1]
         let upper = last.media.frames.lowerBound { $0.time >= last.to }
         let lastFrame = last.media.frames[upper - 1].time
-        let end = try last.outputStart.adding(last.to.subtracting(last.from))
-        let duration = try end.subtracting(firstInput.outputStart)
-        let lastTicks = try last.outputStart.adding(lastFrame.subtracting(last.from)).roundedToSamples(plan.timeScale) - base
+        let end = try last.renderEnd()
+        let duration = try end.subtracting(firstTime)
+        let lastTime = try (last.matroskaStillTiming?.from ?? last.outputStart).adding(lastFrame.subtracting(last.from))
+        let writtenLastTime = try last.matroskaStillTiming == nil ? lastTime :
+            StillSampleSchedule.matroskaBoundary(lastTime, final: false)
+        let lastTicks = try writtenLastTime.roundedToSamples(plan.timeScale) - base
         let endTicks = try end.roundedToSamples(plan.timeScale) - base
         var bitstreamFilters = "setts=duration='if(eq(PTS,\(lastTicks)),\(endTicks - lastTicks),DURATION)'"
         if plan.assemblesStillHDR && plan.settings.codec == .hevc {
@@ -337,7 +350,24 @@ extension ReencodeEngine {
         }
         args += ["-bsf:v", bitstreamFilters]
         args += plan.encoding.arguments
+        if !plan.independentStillInputs.isEmpty && plan.settings.codec != .jpeg && plan.settings.codec != .prores {
+            var frameOffset = 0
+            var keyframes: [String] = []
+            for input in inputs {
+                let frames = input.media.frames
+                let from = frames.lowerBound { $0.time >= input.from }
+                let to = frames.lowerBound { $0.time >= input.to }
+                if plan.independentStillInputs.contains(input.media.url) {
+                    keyframes.append("eq(n,\(frameOffset))")
+                }
+                frameOffset += to - from
+            }
+            if !keyframes.isEmpty {
+                args += ["-force_key_frames", "expr:" + keyframes.joined(separator: "+")]
+            }
+        }
         if plan.settings.codec == .hevc, container != "mkv" { args += ["-tag:v", "hvc1"] }
+        if plan.settings.codec == .jpeg { args += ["-tag:v", "jpeg"] }
         if container != "mkv" {
             // Only the published movie needs its metadata at the front. The
             // concat demuxer reads local batch files and can seek to the trailer.
@@ -355,7 +385,7 @@ extension ReencodeEngine {
             args += ["-map", "[sound\(index)]"]
             // As below: AAC is encoded once, across the assembled recording.
             args += intermediate && pair.0.action == .aac ? ["-c:a:\(index)", "pcm_f32le"]
-                : audioOptions(pair.0.action, sound: pair.1, outputIndex: index)
+                : audioOptions(pair.0, sound: pair.1, outputIndex: index)
         }
         for (index, pair) in zip(plan.audioActions, plan.canvas == nil ? reference.audio : []).enumerated() {
             let (action, audio) = pair
@@ -369,7 +399,7 @@ extension ReencodeEngine {
                 // across the assembled recording, with one priming interval.
                 args += ["-c:a:\(outputTrack)", "pcm_f32le"]
             } else {
-                args += audioOptions(action.action, track: audio.stream, outputIndex: outputTrack,
+                args += audioOptions(action, track: audio.stream, outputIndex: outputTrack,
                                      exactPCM: plan.exactPCM.contains(action.track))
             }
             outputTrack += 1
@@ -497,7 +527,8 @@ extension ReencodeEngine {
             }
             // Consecutive ranges from the same source can share one decoder
             // when their clock fits in the output clock without rounding.
-            if let previous = inputs.last, previous.file == segment.file, previous.to == segment.from,
+            if plan.matroskaStillTiming.isEmpty,
+               let previous = inputs.last, previous.file == segment.file, previous.to == segment.from,
                Int64(plan.timeScale) % media.video.timeBase.denominator == 0 {
                 inputs[inputs.count - 1].to = segment.to
             } else {
@@ -505,7 +536,8 @@ extension ReencodeEngine {
                 let decoder = DecoderInput(file: segment.file,
                                            seek: try seekAnchor(segment.from, media: media, preroll: preroll))
                 inputs.append(ReencodeInput(decoder: decoder, segment: index + 1, media: media, from: segment.from,
-                                            to: segment.to, outputStart: segment.outputStart))
+                                            to: segment.to, outputStart: segment.outputStart,
+                                            matroskaStillTiming: plan.matroskaStillTiming.isEmpty ? nil : plan.matroskaStillTiming[index]))
             }
         }
         return inputs
@@ -541,7 +573,8 @@ extension ReencodeEngine {
             let absoluteEnd = try media.origin.adding(segment.to)
             let start = try absoluteStart.roundedToSamples(scale)
             let end = try absoluteEnd.roundedToSamples(scale)
-            let offset = try segment.outputStart.roundedToSamples(scale) - base
+            let outputStart = segment.matroskaStillTiming?.from ?? segment.outputStart
+            let offset = try outputStart.roundedToSamples(scale) - base
             let decoder = decoders[segment.decoder]!
             let soundDecoder = decoders[segment.sound ?? segment.decoder]!
             let videoInput = "[\(decoder):\(media.video.index)]"
@@ -552,7 +585,11 @@ extension ReencodeEngine {
             let metadata = plan.assemblesStillHDR
                 ? ",sidedata=mode=delete:type=CONTENT_LIGHT_LEVEL,sidedata=mode=delete:type=MASTERING_DISPLAY_METADATA"
                 : ""
-            filters.append("\(videoInput)\(range),setpts=PTS-(\(start))+\(offset)\(fit)\(metadata)\(pictureOutput)")
+            let pts = "PTS-(\(start))+\(offset)"
+            let ticksPerMillisecond = scale / 1_000
+            let outputPTS = segment.matroskaStillTiming == nil ? pts :
+                "floor((\(pts))/\(ticksPerMillisecond)+0.5)*\(ticksPerMillisecond)"
+            filters.append("\(videoInput)\(range),setpts=\(outputPTS)\(fit)\(metadata)\(pictureOutput)")
 
             for (position, sound) in (plan.canvas?.audio ?? []).enumerated() {
                 // Sample counts are differences of cumulative output positions in the canvas rate, so no drift builds up.
@@ -669,19 +706,25 @@ func audioLayout(_ track: StreamInfo) throws -> String {
                    track: track.index)
 }
 
-func audioOptions(_ action: ReencodeAudio, track: StreamInfo, outputIndex: Int, exactPCM: Bool) -> [String] {
+/// The encoder options of one sound track. The plan states the codec and bit rate it chose from every clip of the
+/// track; `track` is the first clip's stream and supplies them for an action that states none.
+func audioOptions(_ planned: ReencodeAudioAction, track: StreamInfo, outputIndex: Int, exactPCM: Bool) -> [String] {
+    let action = planned.action
     let specifier = "a:\(outputIndex)"
     let codec: String
     switch action {
     // The bundled FFmpeg has only little-endian PCM encoders. MOV stores either byte order, and the samples are identical.
     case .copyOriginal: codec = exactPCM ? track.codec.replacingOccurrences(of: "be", with: "le", options: [.anchored, .backwards]) : "copy"
     case .aac: codec = "aac"
-    case .pcm: codec = track.codec.contains("f32") ? "pcm_f32le" : "pcm_s32le"
+    // Integer sources keep their word length. Float and decoded lossy sound stay float: integer PCM would clip samples above full scale.
+    case .pcm: codec = planned.codec ?? AudioExportEngine.moviePCM([track]).codec
     default: return []
     }
     var args = ["-c:\(specifier)", codec, "-metadata:s:\(specifier)", "language=\(track.language)",
                 "-disposition:\(specifier)", "\(track.disposition)"]
-    if action == .aac { args += ["-b:\(specifier)", "\(max(96, min(512, track.channels * 96)))k"] }
+    if action == .aac {
+        args += ["-b:\(specifier)", "\(planned.bitRate ?? AudioExportEngine.aacBitRate(matching: nil, channels: track.channels))"]
+    }
     if action != .copyOriginal { args += ["-ar:\(specifier)", "\(track.sampleRate)"] }
     return args
 }

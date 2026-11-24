@@ -25,10 +25,10 @@ struct SidecarInventory: Encodable {
     let sceneAttempts: [AnalysisSidecar.PersistedSceneAttempt]?
     let sceneStaleReason: String?
 
-    init(sections: [String], sceneAttempts: [AnalysisSidecar.PersistedSceneAttempt]?, sceneStaleReason: String?) {
+    init(sections: [String], hasIndex: Bool, sceneAttempts: [AnalysisSidecar.PersistedSceneAttempt]?, sceneStaleReason: String?) {
         self.sceneAttempts = sceneAttempts
         self.sceneStaleReason = sceneStaleReason
-        hasIndex = AnalysisSidecar.indexKeys.isSubset(of: Set(sections))
+        self.hasIndex = hasIndex
         hasScenes = sections.contains(AnalysisSidecar.sceneSectionKey)
         waveformStreams = sections.compactMap(AnalysisSidecar.savedWaveformStream(forKey:)).sorted()
         let envelopes = sections.compactMap(AnalysisSidecar.savedEnvelopeStream(forKey:)).sorted()
@@ -48,7 +48,10 @@ struct SidecarInventory: Encodable {
 struct SidecarResult: Encodable {
     let ok = true
     let file: String
-    let sidecar: String
+    let sidecar: String?
+    let readLocation: String?
+    let readLocations: [String]
+    let writeLocation: String?
     let status: String
     let sections: [String]
     let saved: [String]?
@@ -56,29 +59,32 @@ struct SidecarResult: Encodable {
     let generations: [AnalysisSidecar.PersistedGeneration]?
     let staleReason: String?
 
-    init(file: String, sidecar: String, status: String, sections: [String], saved: [String]?,
-         generations: [AnalysisSidecar.PersistedGeneration]? = nil,
-         sceneAttempts: [AnalysisSidecar.PersistedSceneAttempt]? = nil) {
-        self.file = file
-        self.sidecar = sidecar
-        self.status = status
-        self.sections = sections
+    init(file: URL, snapshot: AnalysisSidecar.InventorySnapshot, writeLocation: URL?, saved: [String]? = nil) {
+        self.file = file.path
+        self.sidecar = (saved == nil ? snapshot.location ?? writeLocation : writeLocation)?.path
+        self.readLocations = snapshot.locations.map(\.path)
+        self.readLocation = readLocations.first
+        self.writeLocation = writeLocation?.path
+        status = snapshot.status
+        sections = snapshot.sections
         self.saved = saved
-        self.generations = generations
+        let sceneAttempts = saved == nil ? snapshot.attempts : nil
+        generations = saved == nil ? snapshot.generations : nil
         switch status {
-        case "stale": staleReason = "Source identity differs from the saved analysis."
+        case "stale": staleReason = snapshot.staleReason ?? "Source identity differs from the saved analysis."
         case "offline": staleReason = "The source recording is unavailable."
         default: staleReason = nil
         }
         let generationChange = generations?.first.flatMap { latest in
             sceneAttempts?.contains(where: { !$0.current && $0.generation < latest.id }) == true ? latest.reason : nil
         }
-        let sceneStaleReason = staleReason ?? generationChange
-        inventory = SidecarInventory(sections: sections, sceneAttempts: sceneAttempts, sceneStaleReason: sceneStaleReason)
+        inventory = SidecarInventory(sections: sections, hasIndex: snapshot.hasCompleteIndex, sceneAttempts: sceneAttempts,
+                                     sceneStaleReason: staleReason ?? generationChange)
     }
 }
 
 struct SidecarOptions {
+    let project: String?
     let file: String
     let statusOnly: Bool
     let contents: Set<SidecarContent>
@@ -94,6 +100,7 @@ struct SidecarOptions {
         var threshold: Double?
         var stream: Int?
         var source: String?
+        var project: String?
         var positional = false
         var iterator = arguments.makeIterator()
         func invalid(_ reason: String) -> CLIError { CLIError("invalid_arguments", reason) }
@@ -113,6 +120,7 @@ struct SidecarOptions {
             switch word {
             case "--": positional = true
             case "--json": break
+            case "--project": project = try value()
             case "--only", "--only-file":
                 guard !flags.isSuperset(of: ["--only", "--only-file"]) else { throw invalid("Choose one section list.") }
                 let raw = try value()
@@ -149,6 +157,7 @@ struct SidecarOptions {
         if !selected.contains(.audio), !flags.isDisjoint(with: ["--min-pause-seconds", "--threshold-db", "--stream"]) {
             throw invalid("Silence settings require the audio section.")
         }
+        self.project = project
         self.file = source
         self.statusOnly = statusOnly
         self.contents = selected
@@ -159,25 +168,16 @@ struct SidecarOptions {
     }
 
     func run(source: URL, cancelled: @escaping @Sendable () -> Bool) async throws -> SidecarResult {
+        let destination = SidecarLocations(source: source).destination
         if statusOnly {
-            var location = source
-            var snapshot = AnalysisSidecar.inventorySnapshot(source: location)
-            // A scene scan can store an alias's result beside the recording it resolves to.
-            if snapshot.status == "missing" {
-                let resolved = source.resolvingSymlinksInPath()
-                if resolved != source {
-                    let alternate = AnalysisSidecar.inventorySnapshot(source: resolved)
-                    if alternate.status != "missing" {
-                        location = resolved
-                        snapshot = alternate
-                    }
-                }
-            }
-            return SidecarResult(file: source.path, sidecar: AnalysisSidecar.url(for: location).path,
-                                 status: snapshot.status, sections: snapshot.sections, saved: nil,
-                                 generations: snapshot.generations, sceneAttempts: snapshot.attempts)
+            let snapshot = AnalysisSidecar.inventorySnapshot(source: source)
+            return SidecarResult(file: source, snapshot: snapshot, writeLocation: destination)
         }
         let store = try AnalysisSidecar(source: source)
+        if destination == nil {
+            // Report an unavailable disk or missing project before performing a full scan.
+            _ = try SidecarLocations(source: source).prepareDestination()
+        }
         let sections: [String: Data]
         if contents == [.scenes] {
             sections = try AnalysisSidecar.sceneSections(for: SceneAnalysis.scan(source, cancelled: cancelled))
@@ -189,8 +189,7 @@ struct SidecarOptions {
         }
         try store.saveAnalysisSections(sections, cancelled: cancelled)
         let inventory = AnalysisSidecar.$readsEnabled.withValue(true) { store.savedSectionInventory() }
-        return SidecarResult(file: source.path, sidecar: store.url.path,
-                             status: inventory.status, sections: inventory.sections, saved: sections.keys.sorted())
+        return SidecarResult(file: source, snapshot: inventory, writeLocation: store.url, saved: sections.keys.sorted())
     }
 
     private func indexedSections(source: URL, store: AnalysisSidecar, cancelled: @escaping @Sendable () -> Bool) async throws -> [String: Data] {

@@ -1,4 +1,4 @@
-import MPCutCore
+@testable import MPCutCore
 import XCTest
 @testable import MPCutApp
 
@@ -29,7 +29,7 @@ final class CutSequenceDocumentTests: XCTestCase {
         var updatedStill = still
         updatedStill.duration = .init(numerator: 2)
         let updatedRedo = redo(with: updatedStill)
-        _ = try project.saveRevision(to: url, undo: [], redo: updatedRedo, expected: initial)
+        _ = try project.saveRevision(to: url, undo: [], redo: updatedRedo, mediaSnapshot: .empty, expected: initial)
         let published = try Data(contentsOf: url)
         XCTAssertEqual(try CutProject.loadDocument(from: url, limit: 10).redo, updatedRedo)
 
@@ -89,7 +89,7 @@ final class CutSequenceDocumentTests: XCTestCase {
     }
 
     @MainActor
-    func testFailedSequenceLoadDoesNotInstallPartialTimeline() async throws {
+    func testSequenceLoadKeepsEveryOccurrenceWhenOneSourceIsMissing() async throws {
         let file = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov", subdirectory: "Fixtures"))
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".cut")
         let clips = [file.path, url.appendingPathExtension("missing").path].enumerated().map {
@@ -99,11 +99,35 @@ final class CutSequenceDocumentTests: XCTestCase {
         defer { model.endSession() }
         try model.openProject(clips, at: url)
         try await waitForImport(model)
+        XCTAssertEqual(model.sequenceClips.map(\.id), clips.map(\.id))
+        XCTAssertEqual(model.timelineClips.map(\.mediaStatus), [.online, .offline])
+        XCTAssertEqual(model.projectURL, url)
+        XCTAssertNil(model.openingProjectURL)
+        XCTAssertFalse(model.isProjectChanged)
+        XCTAssertNil(model.alert)
+    }
+
+    @MainActor
+    func testFailedSequenceLoadDoesNotInstallPartialTimeline() throws {
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "ProRes-2997", withExtension: "mov", subdirectory: "Fixtures"))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".cut")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let first = CutSequenceClip(id: "first", file: source.path, from: .zero, to: RationalTime(numerator: 1, denominator: 10))
+        let second = CutSequenceClip(id: "second", file: source.path, from: .zero, to: RationalTime(numerator: 1, denominator: 5))
+        let data = try JSONEncoder().encode(CutProject.sequence([first, second]))
+        var document = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        var clips = try XCTUnwrap(document["clips"] as? [[String: Any]])
+        clips[1]["to"] = try XCTUnwrap(clips[1]["from"])
+        document["clips"] = clips
+        try JSONSerialization.data(withJSONObject: document).write(to: url)
+
+        let model = EditorModel(preferences: EditorPreferences())
+        defer { model.endSession() }
+        XCTAssertThrowsError(try model.openProject([first, second], at: url))
         XCTAssertTrue(model.isEmpty)
         XCTAssertNil(model.projectURL)
         XCTAssertNil(model.openingProjectURL)
         XCTAssertFalse(model.isProjectChanged)
-        XCTAssertNotNil(model.alert)
     }
 
     @MainActor
@@ -232,11 +256,12 @@ final class CutSequenceDocumentTests: XCTestCase {
         prefs.historyLimit = 0
         XCTAssertFalse(reopened.hasHistory)
         XCTAssertTrue(reopened.saveProject(to: url))
-        XCTAssertFalse(try String(contentsOf: url, encoding: .utf8).contains("\"history\""))
+        let fields = try ProjectFile.decode([String: TranscriptJSONValue].self, data: Data(contentsOf: url))
+        XCTAssertNil(fields["history"])
     }
 
     @MainActor
-    func testReopenEmptySequenceRetainsOfflineUndoAndCanRetryAfterRelinkingMedia() async throws {
+    func testReopenEmptySequenceRestoresOfflineUndoAndRechecksMediaWhenItReturns() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -252,16 +277,18 @@ final class CutSequenceDocumentTests: XCTestCase {
         XCTAssertTrue(model.canUndo)
         model.undo()
         try await waitForImport(model)
-        XCTAssertNotNil(model.alert)
-        XCTAssertEqual(model.historyCursor, 1)
+        XCTAssertNil(model.alert)
+        XCTAssertEqual(model.historyCursor, 0)
+        XCTAssertEqual(model.timelineClips.first?.mediaStatus, .offline)
+        XCTAssertTrue(model.isProjectChanged)
+        model.redo()
         XCTAssertTrue(model.isEmpty)
-        XCTAssertFalse(model.isProjectChanged)
         let source = try XCTUnwrap(Bundle.module.url(forResource: "Standalone-Multitrack", withExtension: "mka", subdirectory: "Fixtures"))
         try FileManager.default.copyItem(at: source, to: file)
-        model.dismissNotice()
         model.undo()
         try await waitForImport(model)
         XCTAssertNil(model.alert)
+        XCTAssertEqual(model.timelineClips.first?.mediaStatus, .online)
         XCTAssertEqual(model.sequenceClips.map(\.id), ["deleted"])
         XCTAssertEqual(model.historyCursor, 0)
         XCTAssertEqual(model.redoTitle, "Redo Delete Clip")
@@ -310,7 +337,7 @@ final class CutSequenceDocumentTests: XCTestCase {
         }
         let draftURL: URL = try {
             let interrupted = ProjectDraft()
-            try interrupted.write { try CutProject.sequence(clips).saveStaged(to: $0, undo: undo, redo: []) }
+            try interrupted.write { try CutProject.sequence(clips).saveStaged(to: $0, undo: undo, redo: [], mediaSnapshot: .empty) }
             return try XCTUnwrap(interrupted.url)
         }()
         let prefs = EditorPreferences()
@@ -336,14 +363,14 @@ final class CutSequenceDocumentTests: XCTestCase {
     }
 
     @MainActor
-    func testArchivedAndLiveUndoRefuseOfflineMediaAndRetryWithFreshIndexes() async throws {
+    func testArchivedAndLiveUndoRestoreOfflineMediaWithoutBlockingHistory() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let source = try XCTUnwrap(Bundle.module.url(forResource: "Standalone-Multitrack", withExtension: "mka", subdirectory: "Fixtures"))
         let file = directory.appendingPathComponent("working.mka")
         try FileManager.default.copyItem(at: source, to: file)
-        var current = CutSequenceClip(id: "a", file: "working.mka", from: .zero, to: RationalTime(numerator: 1, denominator: 5), audioTrack: 1)
+        let current = CutSequenceClip(id: "a", file: "working.mka", from: .zero, to: RationalTime(numerator: 1, denominator: 5), audioTrack: 1)
         let project = directory.appendingPathComponent("edit.cut")
         let old = CutSequenceClip(id: current.id, file: current.file, from: .zero, to: RationalTime(numerator: 1, denominator: 10), audioTrack: 1)
         try CutProject.sequence([current]).save(to: project, undo: [.init(action: "Trim Clip", project: .sequence([old]))], redo: [])
@@ -353,34 +380,25 @@ final class CutSequenceDocumentTests: XCTestCase {
         defer { editor.endSession() }
         try editor.openProject([current], at: project)
         try await waitForImport(editor)
+        editor.selectRange(0, 0.18)
+        XCTAssertNotNil(editor.markOut)
         try FileManager.default.removeItem(at: file)
         editor.undo()
         try await waitForImport(editor)
-        XCTAssertNotNil(editor.alert)
-        XCTAssertEqual(editor.historyCursor, 1)
-        XCTAssertFalse(editor.isProjectChanged)
-        editor.dismissNotice()
-        try FileManager.default.copyItem(at: source, to: file)
-        editor.selectRange(0, 0.18)
-        XCTAssertNotNil(editor.markOut)
-        editor.undo()
-        try await waitForImport(editor)
         XCTAssertNil(editor.alert)
+        XCTAssertEqual(editor.historyCursor, 0)
+        XCTAssertTrue(editor.isProjectChanged)
+        XCTAssertEqual(editor.timelineClips.first?.mediaStatus, .offline)
         XCTAssertEqual(editor.sequenceClips.map(\.to), [old.to])
         XCTAssertNil(editor.markOut, "A mark beyond the restored edit must not survive.")
         editor.deleteSelection()
         XCTAssertTrue(editor.isEmpty)
-        try FileManager.default.removeItem(at: file)
         editor.undo()
         try await waitForImport(editor)
-        XCTAssertNotNil(editor.alert)
-        XCTAssertTrue(editor.isEmpty)
-        editor.dismissNotice()
-        try FileManager.default.copyItem(at: source, to: file)
-        editor.undo()
-        try await waitForImport(editor)
-        current.to = old.to
-        XCTAssertEqual(editor.sequenceClips.map(\.to), [current.to])
+        XCTAssertNil(editor.alert)
+        XCTAssertFalse(editor.isEmpty)
+        XCTAssertEqual(editor.timelineClips.first?.mediaStatus, .offline)
+        XCTAssertEqual(editor.sequenceClips.map(\.to), [old.to])
     }
 
     @MainActor
@@ -401,8 +419,10 @@ final class CutSequenceDocumentTests: XCTestCase {
         try editor.openProject([], at: project)
         editor.undo()
         try await waitForImport(editor)
-        XCTAssertNotNil(editor.alert)
-        editor.dismissNotice()
+        XCTAssertNil(editor.alert)
+        XCTAssertEqual(editor.timelineClips.first?.mediaStatus, .offline)
+        editor.redo()
+        XCTAssertTrue(editor.isEmpty)
         try FileManager.default.createSymbolicLink(at: directory.appendingPathComponent("reader"), withDestinationURL: mount)
         editor.undo()
         try await waitForImport(editor)

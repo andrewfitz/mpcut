@@ -225,8 +225,8 @@ final class WaveformEnvelopeStore<Source: Hashable & Sendable>: ObservableObject
     private func loadOverview(_ id: Source, input: Input) {
         let token = EditCancellation()
         overviewJobs[id] = token
+        let media = input.readSidecars ? input.media.pinningSidecarWrites() : input.media
         EditorAnalysisQueues.waveformDetail.addOperation { [weak self] in
-            let media = input.media
             let columns = Self.overviewColumns(media)
             guard !token.isCancelled else { return }
             let data = try? AudioAnalysis.envelope(media, stream: input.stream, from: 0, to: media.duration.seconds,
@@ -356,9 +356,10 @@ final class WaveformEnvelopeStore<Source: Hashable & Sendable>: ObservableObject
         let job = Job(request, for: key)
         let token = job.token
         registerJob(job, for: key)
+        let media = input.readSidecars ? input.media.pinningSidecarWrites() : input.media
         let operation = BlockOperation { [weak self] in
             guard !token.isCancelled else { return }
-            let data = try? AudioAnalysis.envelope(input.media, stream: input.stream, from: lower, to: upper,
+            let data = try? AudioAnalysis.envelope(media, stream: input.stream, from: lower, to: upper,
                                                    columns: columns, useSidecar: input.readSidecars, cancelled: { token.isCancelled })
             guard !token.isCancelled else { return }
             let result = data.map(DisplayEnvelope.init)

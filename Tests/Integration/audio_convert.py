@@ -387,6 +387,32 @@ class AudioConversionTests(unittest.TestCase):
         _, report = self.export(self.flac, "join.mka", cuts=[("0", "12")])
         self.assertEqual((report["mode"], report["audio_actions"][0]["action"]), ("copy", "copy"))
 
+    def test_lossless_sound_in_a_movie_container_keeps_its_word_length(self):
+        # MOV, Matroska and CAF state the word length of ALAC and FLAC only in the codec header.
+        tones = TONES.format(rate=RATE, length=12)
+        cases = [("alac16.m4a", ("alac", "-sample_fmt", "s16p"), 16), ("alac16.caf", ("alac", "-sample_fmt", "s16p"), 16),
+                 ("alac24.mov", ("alac", "-sample_fmt", "s32p"), 24),
+                 ("flac16.mka", ("flac", "-sample_fmt", "s16"), 16), ("flac16.mp4", ("flac", "-sample_fmt", "s16"), 16),
+                 ("flac24.mka", ("flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24"), 24)]
+        for name, codec, depth in cases:
+            with self.subTest(source=name):
+                source = self.root / name
+                ffmpeg("-f", "lavfi", "-i", tones, "-c:a", *codec, source)
+                result, report = self.export(source, name + ".wav", "--audio", "pcm")
+                action = report["audio_actions"][0]
+                self.assertEqual((action["codec"], action["bit_depth"]), (f"pcm_s{depth}le", depth))
+                self.assertEqual(pcm32(result), kept(pcm32(source), CUTS))
+
+    def test_float_pcm_to_flac_warns_that_it_clips(self):
+        source = self.root / "float.wav"
+        ffmpeg("-f", "lavfi", "-i", TONES.format(rate=RATE, length=12), "-c:a", "pcm_f32le", source)
+        _, report = self.export(source, "float.flac", "--audio", "flac", dry_run=True)
+        self.assertEqual(report["audio_actions"][0]["bit_depth"], 24)
+        self.assertTrue(any("above full scale will clip" in warning for warning in report["warnings"]), report["warnings"])
+        # PCM keeps the float samples and has nothing to warn about.
+        _, report = self.export(source, "float-kept.wav", "--audio", "pcm", dry_run=True)
+        self.assertEqual((report["audio_actions"][0]["codec"], report["warnings"]), ("pcm_f32le", []))
+
     def test_auto_copies_when_copy_is_exact(self):
         # AAC in M4A carries sample-aligned joins through its edit list.
         result, report = self.export(self.m4a, "copied.m4a", cuts=[("1", "5.1"), ("9", "11.5")])
@@ -835,12 +861,22 @@ class AudioConversionTests(unittest.TestCase):
         self.index_header(surround, earlier)
         self.assertEqual(self.layout(surround), (6, "5.1"))
         renewed = self.index_header(surround)
-        self.assertEqual((renewed["probe_revision"], renewed["streams"][0]["info"]["channel_layout"]), (7, "5.1"))
+        self.assertEqual((renewed["probe_revision"], renewed["streams"][0]["info"]["channel_layout"]), (8, "5.1"))
         self.assertGreater(renewed["audio"][0]["coded_bytes"], 0)
         # Every retired probe revision is rebuilt, including ordinary AAC movies.
         self.index_header(aac, earlier)
         self.assertEqual(rate(aac, "aac"), 96_000)
-        self.assertEqual(self.index_header(aac)["probe_revision"], 7)
+        self.assertEqual(self.index_header(aac)["probe_revision"], 8)
+
+        # Revision 8 adds decoded packet counts to lossless tracks. Only
+        # affected revision-7 indexes need another source scan.
+        flac = folder / "soundtrack.flac"
+        ffmpeg("-i", aac, "-map", "0:a:0", "-c:a", "flac", flac)
+        self.layout(flac)
+        for source, expected in [(aac, 7), (flac, 8)]:
+            self.index_header(source, lambda header: header.update(probe_revision=7))
+            self.layout(source)
+            self.assertEqual(self.index_header(source)["probe_revision"], expected)
 
     def test_wrong_extension_and_settings_are_structured_errors(self):
         for options, name, code, words in [

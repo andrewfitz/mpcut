@@ -14,18 +14,25 @@ struct ParticipantFrameGeometry {
 }
 
 struct ParticipantGeometryIndex {
+    let usesScannedGeometry: Bool
     private let points: [RationalTime]
     private let frames: [ParticipantFrameGeometry]
-    private let selections: [[Selection: ParticipantAppearance]]
+    private let selections: [Selection: [Change]]
 
     private struct Selection: Hashable {
         let id: String
         let includeCameraOff: Bool
     }
 
+    private struct Change {
+        let time: RationalTime
+        let appearanceID: String?
+    }
+
     init(_ project: ParticipantProject, sourceID: String, slots: Set<String>,
          checkCancellation: () throws -> Void) throws {
         let geometry = project.sources.first { $0.sourceID == sourceID }
+        usesScannedGeometry = geometry?.analysisIdentity != nil
         let appearances = geometry?.appearances ?? []
         let coverage = (geometry?.coverage ?? []).sorted { $0.range.from < $1.range.from }
         let overrides = project.appearanceOverrides.filter { $0.sourceID == sourceID && slots.contains($0.participantID) }
@@ -34,8 +41,7 @@ struct ParticipantGeometryIndex {
             + overrides.flatMap { [$0.range.from, $0.range.to] }
         let points = Set(changes).sorted()
         var indexed: [ParticipantFrameGeometry] = []
-        var chosen: [[Selection: ParticipantAppearance]] = []
-        var holding: [Selection: String] = [:]
+        var chosen: [Selection: [Change]] = [:]
         let ordered = appearances.sorted { $0.range.from < $1.range.from }
         var next = 0
         var active: [ParticipantAppearance] = []
@@ -52,24 +58,23 @@ struct ParticipantGeometryIndex {
             let index = coverage.lowerBound { $0.range.to > time }
             let verified = coverage.indices.contains(index) && coverage[index].range.contains(time) && coverage[index].state == .verified
             indexed.append(.init(appearances: active, verified: verified))
-            var selections: [Selection: ParticipantAppearance] = [:]
-            let byParticipant = Dictionary(grouping: active.compactMap { appearance in
-                appearance.participantID.map { ($0, appearance) }
-            }, by: { $0.0 })
+            guard !slots.isEmpty else { continue }
+            let byParticipant = Dictionary(grouping: active, by: \.participantID)
             for id in slots {
                 let scoped = pins[id] ?? []
                 let index = scoped.lowerBound { $0.range.to > time }
                 let override = scoped.indices.contains(index) && scoped[index].range.contains(time) ? scoped[index] : nil
-                let available = (byParticipant[id] ?? []).map(\.1)
+                let available = byParticipant[id] ?? []
                 for includeCameraOff in [true, false] {
                     let key = Selection(id: id, includeCameraOff: includeCameraOff)
+                    let held = chosen[key]?.last?.appearanceID
                     let choice = ParticipantProject.chooseAppearance(available, override: override?.appearanceID,
-                        holding: holding[key], includeCameraOff: includeCameraOff)
-                    selections[key] = choice
-                    holding[key] = choice?.id
+                        holding: held, includeCameraOff: includeCameraOff)
+                    if choice?.id != held {
+                        chosen[key, default: []].append(.init(time: time, appearanceID: choice?.id))
+                    }
                 }
             }
-            chosen.append(selections)
         }
         self.points = points
         self.frames = indexed
@@ -85,9 +90,10 @@ struct ParticipantGeometryIndex {
         if slot.target == .presentation {
             return at(time).appearances.first { $0.id == slot.id && $0.role == .presentation && $0.state == .presentation }
         }
-        let index = points.lowerBound { $0 > time } - 1
-        guard selections.indices.contains(index) else { return nil }
-        return selections[index][.init(id: slot.id, includeCameraOff: slot.includeCameraOff)]
+        guard let changes = selections[.init(id: slot.id, includeCameraOff: slot.includeCameraOff)] else { return nil }
+        let index = changes.lowerBound { $0.time > time } - 1
+        guard index >= 0, let id = changes[index].appearanceID else { return nil }
+        return at(time).appearances.first { $0.id == id }
     }
 }
 
@@ -95,16 +101,30 @@ final class ParticipantPictureReader {
     private let media: MediaInfo
     private let renderer: JPEGRenderer
     private let seekPoints: [Int]
-    private var last: (Int, CIImage)?
+    private let scanOrientation: CGAffineTransform
+    private var last: (index: Int, image: CIImage, orientation: CGAffineTransform)?
 
     init(_ media: MediaInfo, control: JPEGControl) throws {
         self.media = media
         renderer = try JPEGRenderer(media: media, control: control)
         seekPoints = media.frames.indices.filter { media.frames[$0].canStart && media.frames[$0].dts != nil }
+        switch (media.video.rotation % 360 + 360) % 360 {
+        case 90: scanOrientation = .init(a: 0, b: 1, c: -1, d: 0, tx: 0, ty: 0)
+        case 180: scanOrientation = .init(scaleX: -1, y: -1)
+        case 270: scanOrientation = .init(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: 0)
+        default: scanOrientation = .identity
+        }
     }
 
-    func picture(at index: Int) throws -> CIImage {
-        if let last, last.0 == index { return last.1 }
+    func picture(at index: Int, usingScannedGeometry: Bool) throws -> CIImage {
+        func checked(_ image: CIImage, orientation: CGAffineTransform) throws -> CIImage {
+            guard !usingScannedGeometry || orientation == scanOrientation else {
+                throw CutError(code: "participant_display_transform_changed",
+                               message: "The decoded display rotation differs from the participant scan for ‘\(media.url.lastPathComponent)’. Review the source before rendering.")
+            }
+            return image
+        }
+        if let last, last.index == index { return try checked(last.image, orientation: last.orientation) }
         let frame = media.frames[index]
         let inverse = RationalTime(numerator: media.video.timeBase.denominator, denominator: media.video.timeBase.numerator)
         func ticks(_ time: RationalTime) throws -> Int64 {
@@ -114,8 +134,8 @@ final class ParticipantPictureReader {
             }
             return value.numerator
         }
-        let backwards = last.map { index < $0.0 } ?? false
-        let previous = last.map { media.frames[$0.0].time } ?? .zero
+        let backwards = last.map { index < $0.index } ?? false
+        let previous = last.map { media.frames[$0.index].time } ?? .zero
         let ahead = frame.time.seconds - previous.seconds > 2
         var seek = Int64.min
         if backwards || ahead {
@@ -128,8 +148,9 @@ final class ParticipantPictureReader {
             }
         }
         let image = try renderer.picture(at: ticks(frame.time), seekDTS: seek, preset: .full)
-        last = (index, image)
-        return image
+        let orientation = renderer.displayTransform
+        last = (index, image, orientation)
+        return try checked(image, orientation: orientation)
     }
 }
 

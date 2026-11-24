@@ -197,7 +197,7 @@ public struct TranscriptWord: Codable, Equatable, Sendable {
         case observations
         case candidateTrackIDs = "candidate_track_ids"
         case confidence
-        case projection
+        case storedProjection = "projection"
     }
     public var id: String
     public var text: String
@@ -209,7 +209,34 @@ public struct TranscriptWord: Codable, Equatable, Sendable {
     public var observations: [TranscriptObservation]
     public var candidateTrackIDs: [String]?
     public var confidence: Double?
-    public var projection: TranscriptWordProjection?
+    public var projection: TranscriptWordProjection? {
+        get { storedProjection?.value }
+        set { storedProjection = newValue.map(StoredProjection.init) }
+    }
+
+    /// Only a word imported from an exported group or cut has a projection, and one is larger
+    /// than the rest of the word. Hours of recognized words would each set that room aside,
+    /// in the document and in every table built from it, so a word holds a reference instead.
+    /// The reference is never written through. A change stores a new one, which leaves a
+    /// copy of the word with the projection it was copied with.
+    private var storedProjection: StoredProjection?
+
+    private final class StoredProjection: Encodable, Equatable, Sendable {
+        let value: TranscriptWordProjection
+
+        init(_ value: TranscriptWordProjection) {
+            self.value = value
+        }
+
+        static func == (first: StoredProjection, second: StoredProjection) -> Bool {
+            first === second || first.value == second.value
+        }
+
+        /// Writes the projection itself, so a word encodes as it does with the projection inline.
+        func encode(to encoder: Encoder) throws {
+            try value.encode(to: encoder)
+        }
+    }
 
     public init(id: String, text: String, start: RationalTime, end: RationalTime, utteranceID: String? = nil,
                 speakerID: String? = nil, precision: TranscriptPrecision = .word, observations: [TranscriptObservation] = [],
@@ -224,7 +251,7 @@ public struct TranscriptWord: Codable, Equatable, Sendable {
         self.observations = observations
         self.candidateTrackIDs = candidateTrackIDs
         self.confidence = confidence
-        self.projection = projection
+        self.storedProjection = projection.map(StoredProjection.init)
     }
 }
 
@@ -242,7 +269,8 @@ extension TranscriptWord {
         self.observations = try fields.decode([TranscriptObservation].self, forKey: .observations)
         self.candidateTrackIDs = try fields.decodeIfPresent([String].self, forKey: .candidateTrackIDs)
         self.confidence = try fields.decodeIfPresent(Double.self, forKey: .confidence)
-        self.projection = try fields.decodeIfPresent(TranscriptWordProjection.self, forKey: .projection)
+        self.storedProjection = try fields.decodeIfPresent(TranscriptWordProjection.self, forKey: .storedProjection)
+            .map(StoredProjection.init)
     }
 }
 
@@ -442,6 +470,16 @@ public struct TranscriptDocument: Codable, Equatable, Sendable {
 
     static func invalid(_ message: String) -> CutError {
         CutError(code: "invalid_transcript", message: message)
+    }
+
+    /// The document as MPCut writes it. Audio levels are measured into the recording's analysis
+    /// sidecar. A transcript made before that carried a level frame for every 20 ms of every
+    /// track, which came to most of its size.
+    func withoutActivity() -> TranscriptDocument {
+        guard tracks.contains(where: { !$0.activity.isEmpty }) else { return self }
+        var document = self
+        for index in document.tracks.indices { document.tracks[index].activity = [] }
+        return document
     }
 }
 

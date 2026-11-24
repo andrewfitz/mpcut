@@ -82,6 +82,23 @@ class PublicContractTests(unittest.TestCase):
                 declared = self.tools[name]["inputSchema"]["properties"].keys()
                 self.assertEqual(sorted(kw.arg for kw in call.keywords if kw.arg and kw.arg not in declared), [])
 
+    def test_project_media_tool_parity(self):
+        for operation in ("list", "locate", "relink", "replace"):
+            schemas = {
+                surface: self.tools[f"project_{surface}_media_{operation}"]["inputSchema"]
+                for surface in ("editor", "file")
+            }
+            live, file = schemas["editor"], schemas["file"]
+            self.assertIn("project_handle", live["required"])
+            self.assertIn("project_path", file["required"])
+            self.assertIn("operation_id", file["required"])
+            if operation == "replace":
+                self.assertEqual(live["properties"]["confirm"]["type"], "boolean")
+                self.assertEqual(file["properties"]["confirm"]["type"], "boolean")
+            if operation == "relink":
+                self.assertEqual(len(live["oneOf"]), 3)
+                self.assertEqual(len(file["oneOf"]), 3)
+
     def test_documented_tool_links_resolve(self):
         headings = re.findall(r"^### `([a-z][a-z0-9_]+)`$", (ROOT / "docs/MCP-REFERENCE.md").read_text(), re.M)
         self.assertCountEqual(headings, self.tools.keys())

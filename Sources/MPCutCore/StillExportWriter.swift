@@ -31,16 +31,18 @@ extension StillExportPlanner {
         }
         defer { try? FileManager.default.removeItem(at: staging) }
 
+        let heldMatroska = plan.container == "mkv" && plan.report.pictureTiming == .held && !plan.pictures.isEmpty
         let picture: URL?
         if plan.pictures.isEmpty {
             picture = nil
         } else {
-            let pictureContainer = ExportRules.multicamMuxContainer(plan.container)
+            let pictureContainer = heldMatroska ? "mov" : ExportRules.multicamMuxContainer(plan.container)
             let staged = staging.appendingPathComponent("picture.\(pictureContainer)")
             try writePicture(plan, to: staged, in: staging, engine: engine, cancelled: isCancelled) {
                 do { try update($0 * 0.80); return true } catch { return false }
             }
-            picture = staged
+            picture = heldMatroska ? try StillMatroska.stagePictureIfNeeded(plan, movie: staged, in: staging,
+                                                                           cancelled: isCancelled) : staged
         }
 
         let sounds = try plan.sound.map {
@@ -51,9 +53,9 @@ extension StillExportPlanner {
         try update(0.92)
         let partial: URL
         let lanes = [picture].compactMap { $0 } + sounds
-        if lanes.count == 1, let lane = lanes.first {
+        if lanes.count == 1, let lane = lanes.first, !heldMatroska {
             partial = lane
-        } else if lanes.count > 1 {
+        } else if !lanes.isEmpty {
             partial = staging.appendingPathComponent("program.\(plan.container)")
             if ["mov", "mp4", "m4v", "m4a"].contains(plan.container) {
                 try MulticamMOV.combine(picture: picture, sounds: sounds, output: partial) {
@@ -67,20 +69,25 @@ extension StillExportPlanner {
                 let maps = (picture == nil ? [] : ["-map", "0:v:0"]) +
                     sounds.indices.flatMap { ["-map", "\(firstSound + $0):a:0"] }
                 let dispositions = sounds.indices.flatMap { ["-disposition:a:\($0)", $0 == 0 ? "default" : "0"] }
-                try ReencodeEngine(cancelled: isCancelled).runHelper(helper, arguments:
-                    ["-xerror", "-copyts"] + inputs + maps + dispositions +
-                    ["-c", "copy", "-avoid_negative_ts", "disabled", "-f", muxer, "-n", partial.path],
-                    in: staging, duration: plan.duration)
+                var arguments = ["-xerror", "-copyts"] + inputs + maps + dispositions
+                arguments += ["-c", "copy", "-avoid_negative_ts", "disabled"]
+                if heldMatroska { arguments += StillMatroska.heldMuxArguments }
+                arguments += ["-f", muxer, "-n", partial.path]
+                try ReencodeEngine(cancelled: isCancelled).runHelper(helper, arguments: arguments,
+                                                                     in: staging, duration: plan.duration)
             }
         } else {
             throw CutError(code: "no_output_tracks", message: "The program has no selected output tracks.")
         }
 
+        if heldMatroska {
+            try StillMatroska.verifyPicture(plan, file: partial, cancelled: isCancelled)
+        }
         if picture != nil {
-            try verifyPicture(plan, file: partial, cancelled: isCancelled)
+            try verifyPicture(plan, file: partial, sounds: sounds, cancelled: isCancelled)
         } else {
             let audio = try Probe.read(partial, keyframes: false, cancelled: isCancelled)
-            try verifyTrackSelection(plan, media: audio)
+            try verifyTrackSelection(plan, media: audio, staged: sounds, cancelled: isCancelled)
         }
         try update(1)
         try plan.verifySources(using: engine)
@@ -108,6 +115,9 @@ extension StillExportPlanner {
                                                 return false
                                             })
         let transcode = plan.report.mode == .encode
+        let held = plan.report.pictureTiming == .held
+        let container = output.pathExtension
+        let pictureDuration = plan.pictures.last?.renderOutput.to ?? plan.duration
         var requests: [ClipRequest] = []
         var indexed: [URL: MediaInfo] = [:]
         var generatedInputs: Set<URL> = []
@@ -131,14 +141,14 @@ extension StillExportPlanner {
                 guard let identity = plan.identities[file] else {
                     throw CutError(code: "source_changed", message: "The still has no verified preflight identity.")
                 }
-                let suffix = transcode ? "mov" : plan.container
+                let suffix = transcode ? "mov" : container
                 let staged = staging.appendingPathComponent("still-\(index).\(suffix)")
                 if transcode {
                     media = try generator.generateLossless(asset: file, identity: identity, framing: framing, reference: reference,
                                                            schedule: schedule, output: staged)
                 } else {
                     media = try generator.generate(asset: file, identity: identity, framing: framing, reference: reference,
-                                                   container: plan.container, schedule: schedule,
+                                                   container: container, schedule: schedule,
                                                    output: staged)
                 }
                 input = .init(from: .zero, to: schedule.duration)
@@ -155,13 +165,13 @@ extension StillExportPlanner {
                 guard let last = kept.last, dts.count == kept.count else {
                     throw CutError(code: "unsafe_still_timing", message: "Picture span \(index + 1) has incomplete packet timestamps.")
                 }
-                let shift = try picture.output.from.subtracting(input.from)
+                let shift = try picture.renderOutput.from.subtracting(input.from)
                 let times = try kept.map { try $0.time.adding(shift) }
                 for (frame, decode) in zip(kept, dts) {
                     lead = max(lead, try frame.time.subtracting(decode))
                 }
                 segments.append(ResolvedSegment(file: media.url, from: input.from, to: input.to,
-                                                outputStart: picture.output.from, tracks: [], sourceOrigin: media.origin,
+                                                outputStart: picture.renderOutput.from, tracks: [], sourceOrigin: media.origin,
                                                 lastVideoFrame: last.time, reachesEnd: input.to == media.duration,
                                                 multipleDescriptions: media.video.multipleDescriptions,
                                                 generatedStill: generated, videoDecodeTimes: times,
@@ -176,9 +186,11 @@ extension StillExportPlanner {
             let settings = ReencodeSettings(codec: plan.settings.codec, quality: plan.settings.quality, audio: .removeAudio)
             let tick = StillExportProgress(progress)
             let processor = ReencodeEngine(cancelled: cancelled)
-            let container = ExportRules.multicamMuxContainer(plan.container)
             var conversion = try processor.resolveStillPictures(requests, output: output, media: indexed,
                                                                  generated: generatedInputs, container: container, settings: settings)
+            if held && plan.container == "mkv" {
+                conversion.timeScale = try StillMatroska.pictureConversionClock(plan.pictures, cancelled: cancelled)
+            }
             if let color = plan.report.colorPolicy, let first = requests.first, let source = conversion.media[first.file]?.video {
                 let width = conversion.width + conversion.width % 2
                 let height = conversion.height + conversion.height % 2
@@ -186,7 +198,7 @@ extension StillExportPlanner {
                 conversion.encoding = try ReencodeVideo(source, settings: settings, frame: frame, stillColor: color)
                 conversion.canvas = ReencodeCanvas(width: width, height: height, pixelFormat: conversion.encoding.pixelFormat,
                                                     colorPrimaries: color.primaries, colorTransfer: color.transfer,
-                                                    colorMatrix: color.matrix, colorRange: color.range, audio: [],
+                                                    colorMatrix: color.matrix, colorRange: settings.codec == .jpeg ? "pc" : color.range, audio: [],
                                                     normalizesPicture: true, usesStillColor: true)
             }
             // The native sound lanes use the packet writer's movie clock. Use
@@ -195,12 +207,24 @@ extension StillExportPlanner {
             conversion.movieTimeScale = sharedMovieClock % conversion.timeScale == 0 ?
                 sharedMovieClock : conversion.timeScale
             conversion.assemblesStillHDR = ["smpte2084", "arib-std-b67"].contains(plan.report.colorPolicy?.transfer)
-            let needsHDRMux = plan.hdrMetadata != nil
-            let encoded = needsHDRMux ? staging.appendingPathComponent("picture-encoded.\(container)") : output
-            try processor.write(conversion, to: encoded) { fraction in
-                tick.update(0.30 + fraction * (needsHDRMux ? 0.60 : 0.70))
+            if held { conversion.independentStillInputs = generatedInputs }
+            if held && plan.container == "mkv" {
+                conversion.matroskaStillTiming = plan.pictures.map { picture in
+                    let from: RationalTime
+                    switch picture.content {
+                    case .camera: from = picture.output.from
+                    case .still: from = picture.renderOutput.from
+                    }
+                    return .init(from: from, to: picture.renderOutput.to)
+                }
             }
-            if needsHDRMux {
+            let writesJPEG = settings.codec == .jpeg
+            let needsColorMux = plan.hdrMetadata != nil || writesJPEG
+            let encoded = needsColorMux ? staging.appendingPathComponent("picture-encoded.\(container)") : output
+            try processor.write(conversion, to: encoded) { fraction in
+                tick.update(0.30 + fraction * (needsColorMux ? 0.60 : 0.70))
+            }
+            if needsColorMux {
                 var args = ["-xerror", "-copyts"]
                 if let mastering = plan.hdrMetadata?.masteringOption {
                     args += ["-mastering_display:v:0", mastering]
@@ -209,8 +233,12 @@ extension StillExportPlanner {
                 args += ["-movflags", "+write_colr", "-video_track_timescale", "\(conversion.timeScale)",
                          "-movie_timescale", "\(conversion.movieTimeScale)"]
                 if settings.codec == .hevc { args += ["-tag:v", "hvc1"] }
+                if writesJPEG, let color = plan.report.colorPolicy {
+                    args += ["-color_range", "pc", "-color_primaries", color.primaries,
+                             "-color_trc", color.transfer, "-colorspace", color.matrix]
+                }
                 try processor.runHelper(conversion.helper, arguments: args + ["-n", output.path],
-                                        in: staging, duration: plan.duration) { fraction in
+                                        in: staging, duration: pictureDuration) { fraction in
                     tick.update(0.90 + fraction * 0.10)
                 }
             }
@@ -219,8 +247,8 @@ extension StillExportPlanner {
                 try engine.checkCancellation()
                 segments[index].videoDecodeTimes = try segments[index].videoDecodeTimes.map { try $0.subtracting(lead) }
             }
-            let edit = ResolvedEdit(segments: segments, duration: plan.duration,
-                                    container: ExportRules.multicamMuxContainer(plan.container),
+            let edit = ResolvedEdit(segments: segments, duration: pictureDuration,
+                                    container: container,
                                     identities: indexed.mapValues(\.identity), tracks: .video,
                                     stillMasteringDisplay: plan.hdrMetadata?.mastering ?? [])
             try engine.export(edit, to: output) { progress(0.30 + $0 * 0.70) }
@@ -236,13 +264,22 @@ extension StillExportPlanner {
             video.colorRange == policy.range
     }
 
-    private func verifyPicture(_ plan: StillExportPlan, file: URL,
+    private func verifyPicture(_ plan: StillExportPlan, file: URL, sounds: [URL],
                                cancelled: @escaping @Sendable () -> Bool) throws {
         let engine = CutEngine(cancelled: cancelled, useSidecar: false, tracks: .video)
         let result = try engine.inspect(file, keyframes: true)
-        try verifyTrackSelection(plan, media: result)
-        guard result.hasVideo, result.video.duration == plan.duration else {
-            throw CutError(code: "write_failed", message: "The staged picture did not retain its planned duration.")
+        try verifyTrackSelection(plan, media: result, staged: sounds, cancelled: cancelled)
+        let pictureDuration = plan.pictures.last?.renderOutput.to ?? plan.duration
+        let duration = plan.container == "mkv" ? result.duration : result.video.duration
+        guard result.hasVideo, result.video.codec == plan.report.videoCodec,
+              duration == pictureDuration else {
+            throw CutError(code: "write_failed", message: "The staged picture did not retain its planned codec or duration.")
+        }
+        if result.video.codec == "mjpeg", let color = plan.report.colorPolicy {
+            guard result.video.colorRange == color.range, result.video.colorMatrix == color.matrix,
+                  result.video.colorTransfer == color.transfer, result.video.colorPrimaries == color.primaries else {
+                throw CutError(code: "write_failed", message: "The staged JPEG picture did not retain its planned color description.")
+            }
         }
         if DynamicRange(result.video) != .sdr || result.video.complexPicture ||
             plan.hdrMetadata != nil || ["smpte2084", "arib-std-b67"].contains(plan.report.colorPolicy?.transfer) {
@@ -255,6 +292,7 @@ extension StillExportPlanner {
             }
         }
         let encoded = plan.report.mode == .encode
+        let held = plan.report.pictureTiming == .held
         var index = 0
         func verify(_ pts: RationalTime, _ duration: RationalTime, independent: Bool) throws {
             if index.isMultiple(of: 1_024) { try engine.checkCancellation() }
@@ -262,7 +300,7 @@ extension StillExportPlanner {
                 throw CutError(code: "write_failed", message: "The staged picture ended before the planned sample at \(pts).")
             }
             let frame = result.frames[index]
-            guard frame.time == pts, frame.duration == duration, encoded || !independent || frame.canStart else {
+            guard frame.time == pts, frame.duration == duration, !independent || frame.canStart else {
                 throw CutError(code: "write_failed", message: "The staged sample at \(pts) differs from its planned timing or independence.")
             }
             index += 1
@@ -273,13 +311,21 @@ extension StillExportPlanner {
                 let shift = try picture.output.from.subtracting(input.from)
                 for frameIndex in frames {
                     let frame = media.frames[frameIndex]
-                    try verify(frame.time.adding(shift), frame.duration, independent: frameIndex == frames.lowerBound)
+                    var pts = try frame.time.adding(shift)
+                    var duration = frame.duration
+                    if held && plan.container == "mkv" {
+                        let end = try frameIndex == frames.upperBound - 1 ? picture.renderOutput.to :
+                            StillSampleSchedule.matroskaBoundary(pts.adding(duration), final: false)
+                        pts = try StillSampleSchedule.matroskaBoundary(pts, final: false)
+                        duration = try end.subtracting(pts)
+                    }
+                    try verify(pts, duration, independent: !encoded && frameIndex == frames.lowerBound)
                 }
             case .still(_, _, _, let schedule):
-                var cursor = picture.output.from
+                var cursor = picture.renderOutput.from
                 for run in schedule.runs {
                     for _ in 0..<run.count {
-                        try verify(cursor, run.duration, independent: cursor == picture.output.from)
+                        try verify(cursor, run.duration, independent: (held || !encoded) && cursor == picture.renderOutput.from)
                         cursor = try cursor.adding(run.duration)
                     }
                 }
@@ -290,23 +336,54 @@ extension StillExportPlanner {
         }
     }
 
-    private func verifyTrackSelection(_ plan: StillExportPlan, media: MediaInfo) throws {
-        let expectedSoundTracks = plan.report.soundActions.count
-        let soundTracks = media.streams.filter { $0.kind == "audio" }
-        guard media.hasVideo == !plan.pictures.isEmpty, soundTracks.count == expectedSoundTracks else {
+    private func verifyTrackSelection(_ plan: StillExportPlan, media: MediaInfo, staged: [URL],
+                                      cancelled: @escaping @Sendable () -> Bool) throws {
+        let actions = plan.report.soundActions
+        let soundTracks = media.audio
+        guard media.hasVideo == !plan.pictures.isEmpty, soundTracks.count == actions.count,
+              soundTracks.count == staged.count else {
             throw CutError(code: "write_failed", message: "The staged program did not retain the selected picture and sound tracks.")
         }
-        if soundTracks.count > 1 {
-            for (stream, action) in zip(soundTracks, plan.report.soundActions) {
-                guard action.codec.map({ $0 == stream.codec }) ?? true,
-                      action.sampleRate.map({ $0 == stream.sampleRate }) ?? true else {
-                    throw CutError(code: "write_failed", message: "The staged track differs from its planned format or order.",
-                                   track: stream.index, laneID: action.laneID)
-                }
+        for (ordinal, sound) in soundTracks.enumerated() {
+            let action = actions[ordinal]
+            let stream = sound.stream
+            func failure() -> CutError {
+                CutError(code: "write_failed", message: "The final sound track changed its codec, precision, channel order, or audible range.",
+                         track: stream.index, laneID: action.laneID)
             }
-            if soundTracks.map({ $0.disposition & 1 }) != [1] + Array(repeating: 0, count: soundTracks.count - 1) {
-                throw CutError(code: "write_failed", message: "The staged program did not retain the planned default soundtrack.")
+            guard action.codec.map({ $0 == stream.codec }) ?? true,
+                  action.sampleRate.map({ $0 == stream.sampleRate }) ?? true,
+                  // FLAC and ALAC state their word length in the codec header where the container states none.
+                  AudioExportEngine.declaredDepth(stream).flatMap({ depth in action.bitDepth.map { $0 == depth } }) ?? true else {
+                throw failure()
             }
+            if case .convert(let conversion) = plan.sound?.treatments[ordinal], conversion.exactEncoding != nil {
+                try conversion.verifyExactSound(sound, origin: media.origin)
+                continue
+            }
+            guard staged[ordinal] != media.url else { continue }
+            let lane = try Probe.read(staged[ordinal], keyframes: false, cancelled: cancelled)
+            let depths = (AudioExportEngine.declaredDepth(lane.audio.first?.stream ?? stream), AudioExportEngine.declaredDepth(stream))
+            guard let original = lane.audio.first, original.stream.channels == stream.channels,
+                  original.stream.canonicalChannelLayout == stream.canonicalChannelLayout,
+                  original.stream.bitDepth == stream.bitDepth,
+                  depths.0 == nil || depths.1 == nil || depths.0 == depths.1 else {
+                throw failure()
+            }
+            let start = try media.origin.adding(sound.start)
+            let end = try media.origin.adding(sound.end)
+            let plannedStart = try lane.origin.adding(original.start)
+            let plannedEnd = try lane.origin.adding(original.end)
+            // MKV can report inherited PCM on its millisecond packet clock.
+            let tolerance = plan.container == "mkv" && stream.isPCM ? stream.timeBase : .zero
+            guard try start >= plannedStart.subtracting(tolerance), try start <= plannedStart.adding(tolerance),
+                  try end >= plannedEnd.subtracting(tolerance), try end <= plannedEnd.adding(tolerance) else {
+                throw failure()
+            }
+        }
+        if soundTracks.count > 1,
+           soundTracks.map({ $0.stream.disposition & 1 }) != [1] + Array(repeating: 0, count: soundTracks.count - 1) {
+            throw CutError(code: "write_failed", message: "The staged program did not retain the planned default soundtrack.")
         }
     }
 }

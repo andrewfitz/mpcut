@@ -44,7 +44,7 @@ extension MulticamEditorModel {
                 project.audioSources.append(source)
             }
             let index = project.audioReplacements.firstIndex { $0.original == original }
-            let id = index.map { project.audioReplacements[$0].id } ?? UUID().uuidString
+            let id = index.map { project.audioReplacements[$0].id } ?? ProjectIdentifier.make(avoiding: project.audioReplacements.map(\.id))
             let binding = MulticamAudioReplacement(id: id, original: original, replacement: selection,
                                                    relativeOffset: relativeOffset, uncovered: uncovered)
             if let index { project.audioReplacements[index] = binding }
@@ -124,7 +124,7 @@ extension MulticamEditorModel {
             else { self.fail(message) }
         } onSuccess: { info, ordinary, stream in
             var source = self.project?.sources.first(where: { $0.file == info.url.path })
-                ?? MulticamSource(id: UUID().uuidString, file: info.url.path)
+                ?? MulticamSource(id: ProjectIdentifier.make(avoiding: self.project?.sources.map(\.id) ?? []), file: info.url.path)
             source.audioStream = source.audioStream.flatMap { index in
                 info.audio.contains(where: { $0.stream.index == index }) ? index : nil
             } ?? stream

@@ -1,6 +1,6 @@
 import Foundation
 
-public struct ParticipantMarkerRule: Codable, Sendable {
+public struct ParticipantMarkerRule: Codable, Equatable, Sendable {
     public enum Unit: String, Codable, Sendable {
         case participants, slots
     }

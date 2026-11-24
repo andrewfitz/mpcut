@@ -944,7 +944,7 @@ final class ExportRulesParityTests: XCTestCase {
             let report = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any], String(decoding: data, as: UTF8.self))
             let clips = try XCTUnwrap(report["clips"] as? [[String: Any]])
             XCTAssertFalse(clips.isEmpty)
-            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: saved.file)) as? [String: Any])
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: CutProject.documentJSON(saved: Data(contentsOf: saved.file))) as? [String: Any])
             object["assembly"] = try clips.map { clip -> [String: String] in
                 let group = try XCTUnwrap(clip["group"] as? [String: Any])
                 func text(_ key: String) throws -> String {
@@ -1061,7 +1061,7 @@ final class ExportRulesParityTests: XCTestCase {
         process.waitUntilExit()
         let help = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(Set(help["audio_options"] as? [String] ?? []),
-                       Set((ExportRules.movieAudioActions + ExportRules.soundAudioActions).map(\.rawValue)))
+                       Set((ExportRules.stillMovieAudioActions + ExportRules.soundAudioActions).map(\.rawValue)))
         XCTAssertEqual(help["export_modes"] as? [String], ExportMode.allCases.map(\.rawValue))
         XCTAssertEqual(help["export_tracks"] as? [String], ExportTracks.allCases.map(\.rawValue))
         XCTAssertEqual(help["export_ranges_separate_default_mode"] as? String, ExportRules.defaultMode(for: .movie).rawValue)

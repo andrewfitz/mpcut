@@ -199,7 +199,7 @@ public struct TranscriptIndex: Sendable {
     package final class CacheIdentity: Sendable {}
 
     package let cacheIdentity = CacheIdentity()
-    let indexes: [TranscriptSpace: WordIndex]
+    let indexes: Clocks
     public let document: TranscriptDocument
     public let timelineRevision: Int
     public let attachment: TranscriptAttachment?
@@ -207,6 +207,28 @@ public struct TranscriptIndex: Sendable {
     public let speakers: [TranscriptSpeaker]
     public let authoredReview: [TranscriptAuthoredReview]
     let inputCoverageProvider: @Sendable (TranscriptSpace, TranscriptFilter) throws -> TranscriptInputCoverageRows
+    /// Whether matches across tracks are out of date, as the first Source or Group word
+    /// reports it. An index knows this whichever clocks it has built.
+    public let staleMatches: Bool
+
+    init(clocks: [TranscriptSpace: WordIndex], gaps: [TranscriptCoverageGap], document: TranscriptDocument,
+         timelineRevision: Int, attachment: TranscriptAttachment?, transcriptRevision: UInt64?,
+         speakers: [TranscriptSpeaker], authoredReview: [TranscriptAuthoredReview],
+         inputCoverageProvider: @escaping @Sendable (TranscriptSpace, TranscriptFilter) throws -> TranscriptInputCoverageRows,
+         usesMix: Bool, staleLead: Bool?) {
+        self.indexes = Clocks(clocks, gaps: gaps)
+        self.document = document
+        self.timelineRevision = timelineRevision
+        self.attachment = attachment
+        self.transcriptRevision = transcriptRevision
+        self.speakers = speakers
+        self.authoredReview = authoredReview
+        self.inputCoverageProvider = inputCoverageProvider
+        self.usesMix = usesMix
+        self.staleMatches = staleLead ?? [TranscriptSpace.source, .group].contains {
+            clocks[$0]?.words.first?.staleMatches == true
+        }
+    }
 
     public func inputCoverage(space: TranscriptSpace, filter: TranscriptFilter = .init(),
                               offset: Int = 0, limit: Int = 100,
@@ -215,7 +237,8 @@ public struct TranscriptIndex: Sendable {
                    trackOffset: trackOffset, trackLimit: trackLimit)
     }
 
-    public let gaps: [TranscriptCoverageGap]
+    /// The stretches of Current Cut that no transcript covers.
+    public var gaps: [TranscriptCoverageGap] { indexes.gaps }
     let usesMix: Bool
 
     public func read(space: TranscriptSpace, filter: TranscriptFilter = .init(),
@@ -256,7 +279,13 @@ public struct TranscriptIndex: Sendable {
     }
 
     public func position(at time: RationalTime, space: TranscriptSpace) -> Int? {
-        indexes[space]?.position(at: time)
+        indexes[space]?.positions(at: time).first
+    }
+
+    /// Words sounding at the playhead, newest onset first (the reader's scroll target).
+    package func activeWords(at time: RationalTime, space: TranscriptSpace) -> [TranscriptOccurrence] {
+        guard let index = indexes[space] else { return [] }
+        return index.positions(at: time, forPlayback: true).map { index.words[$0] }
     }
 
     public func position(of occurrenceID: String, space: TranscriptSpace) -> Int? {
@@ -683,19 +712,47 @@ public struct TranscriptIndex: Sendable {
             }
         }
 
-        func position(at time: RationalTime) -> Int? {
+        func positions(at time: RationalTime, forPlayback: Bool = false) -> [Int] {
             var lower = 0
             var upper = words.count
             while lower < upper {
                 let middle = lower + (upper - lower) / 2
                 if words[middle].range.from <= time { lower = middle + 1 } else { upper = middle }
             }
+            var result: [Int] = []
             var index = lower
             while index > 0, latestEnd[index - 1] > time {
                 index -= 1
-                if words[index].range.contains(time) { return index }
+                if words[index].range.contains(time) {
+                    let position = forPlayback ? playbackPosition(index, at: time) : index
+                    if result.last != position { result.append(position) }
+                }
             }
-            return nil
+            return result
+        }
+
+        /// An aligner can give a short word a single 16 kHz sample at the onset of
+        /// the next word. Share the known interval for display only. A cut, seek or
+        /// export still uses the original word bounds.
+        private func playbackPosition(_ index: Int, at time: RationalTime) -> Int {
+            guard index > 0 else { return index }
+            let word = words[index]
+            let first = words[index - 1]
+            let start = word.range.from
+            guard first.range.from == start,
+                  index < 2 || words[index - 2].range.from != start,
+                  index + 1 == words.count || words[index + 1].range.from != start,
+                  word.precision == .word, first.precision == .word, !word.partial, !first.partial,
+                  word.trackID != nil, word.trackID == first.trackID, word.speakerID == first.speakerID,
+                  word.utteranceID == first.utteranceID, word.clipID == first.clipID,
+                  word.assemblyIndex == first.assemblyIndex,
+                  let length = try? first.range.to.subtracting(start),
+                  length == RationalTime(numerator: 1, denominator: 16_000),
+                  word.range.to > first.range.to,
+                  let elapsed = try? time.subtracting(start),
+                  let remaining = try? word.range.to.subtracting(time) else { return index }
+            // Cap the estimate at 80 ms and leave at least half the span for the second word.
+            return elapsed < RationalTime(numerator: 2, denominator: 25) && elapsed < remaining ? index - 1 : index
         }
 
         /// Calls `body` with the words at each place the phrase is spoken, in transcript order.

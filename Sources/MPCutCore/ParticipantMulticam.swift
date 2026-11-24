@@ -133,9 +133,9 @@ public enum ParticipantMulticam {
     public static func picturePlan(for angle: ParticipantVirtualAngle, in project: CutProject, document: URL,
                                    canvas: ParticipantCanvas, audio: ParticipantRenderAudio = .init()) throws
         -> (project: CutProject, plan: ParticipantRenderPlan) {
-        let source = try excerpt(project, document: document, sourceID: angle.sourceID, range: angle.range)
-        _ = try galleryURL(in: source, sourceID: angle.sourceID, document: document)
+        let (source, gallery, identity) = try excerpt(project, document: document, sourceID: angle.sourceID, range: angle.range)
         let plan = try anglePlan(angle, participants: project.participants, canvas: canvas, audio: audio)
+        try CutEngine().verifyIdentity(gallery, identity: identity)
         return (source, plan)
     }
 
@@ -154,7 +154,9 @@ public enum ParticipantMulticam {
                               canvas: ParticipantCanvas, audio: ParticipantMulticamAudioRouting = .init(),
                               cancelled: (@Sendable () -> Bool)? = nil) throws -> ParticipantMulticamReport {
         let first = try validateGroup(angles)
-        let source = try excerpt(project, document: document, sourceID: first.sourceID, range: first.range, cancelled: cancelled)
+        let (source, gallery, identity) = try excerpt(project, document: document, sourceID: first.sourceID,
+                                                      range: first.range, cancelled: cancelled)
+        let isoSnapshots = audio.includeISOs ? snapshots(in: source, document: document) : [:]
         let renderer = ParticipantRenderer(cancelled: cancelled)
         let reports: [ParticipantMulticamReport.Angle] = try angles.map { angle in
             let sound = iso(for: angle, in: source, routing: audio)
@@ -164,6 +166,8 @@ public enum ParticipantMulticam {
         let timeline = try source.resolveStills()
         let mix = audio.meetingMix ? try meetingMix(in: source, galleryID: first.sourceID, document: document,
                                                    timeline: timeline, binding: audio.meetingAudio, cancelled: cancelled) : nil
+        try CutEngine(cancelled: cancelled).verifyIdentity(gallery, identity: identity)
+        try verifyISOs(Set(reports.flatMap { usedSoundFiles($0.render) }), against: isoSnapshots)
         try mix?.verifySources()
         return .init(angles: reports, meetingMix: mix?.actions ?? [])
     }
@@ -188,19 +192,9 @@ public enum ParticipantMulticam {
         let engine = CutEngine(cancelled: cancelled, useSidecar: false)
         let renderer = ParticipantRenderer(cancelled: cancelled)
         try engine.checkCancellation()
-        let source = try excerpt(project, document: document, sourceID: first.sourceID, range: first.range, cancelled: cancelled)
-        let gallery = try galleryURL(in: source, sourceID: first.sourceID, document: document)
-        let snapshot = try SourceIdentity(gallery)
-        var isoSnapshots: [URL: SourceIdentity] = [:]
-        if audio.includeISOs {
-            // An angle may use a physical ISO, a lane or a lane's replacement.
-            for (_, path) in source.mediaPaths {
-                guard let file = try? CutProject.checkedMediaURL(path, relativeTo: document).standardizedFileURL,
-                      isoSnapshots[file] == nil, let identity = try? SourceIdentity(file) else { continue }
-                isoSnapshots[file] = identity
-                isoSnapshots[AnalysisSidecar.canonicalSource(file)] = identity
-            }
-        }
+        let (source, gallery, identity) = try excerpt(project, document: document, sourceID: first.sourceID,
+                                                      range: first.range, cancelled: cancelled)
+        let isoSnapshots = audio.includeISOs ? snapshots(in: source, document: document) : [:]
         var usedISOs = Set<URL>()
         let timeline = try source.resolveStills()
         let mix = audio.meetingMix ? try meetingMix(in: source, galleryID: first.sourceID, document: document,
@@ -210,6 +204,7 @@ public enum ParticipantMulticam {
                                                 attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: staging) }
         var movies: [MulticamSource] = []
+        var snapshotEntries: [ProjectMediaSnapshot.Entry] = []
         for (index, angle) in angles.enumerated() {
             try engine.checkCancellation()
             let sound = iso(for: angle, in: source, routing: audio)
@@ -217,7 +212,7 @@ public enum ParticipantMulticam {
             let name = "angle-\(index + 1).mov"
             let movie = staging.appendingPathComponent(name)
             let report = try renderer.render(source, document: document, plan: plan, to: movie)
-            usedISOs.formUnion(report.audioActions.flatMap { $0.sources.map { $0.file.standardizedFileURL } })
+            usedISOs.formUnion(usedSoundFiles(report))
             let media = try engine.inspect(movie, keyframes: true)
             guard let firstFrame = media.frames.first, firstFrame.time == .zero,
                   let lastFrame = media.frames.last else {
@@ -230,6 +225,7 @@ public enum ParticipantMulticam {
             let stream = sound.mode == .iso ? media.audio.first?.stream.index : nil
             if sound.mode == .iso && stream == nil { throw invalid("Rendered angle ‘\(angle.name)’ is missing its requested ISO.") }
             movies.append(.init(id: angle.id, file: name, name: angle.name, audioStream: stream))
+            snapshotEntries.append(.init(path: name, media: media))
         }
         var audioSources: [MulticamSource] = []
         var policy = MulticamAudioPolicy.none
@@ -247,6 +243,7 @@ public enum ParticipantMulticam {
             var mixID = "meeting-mix"
             while ids.contains(mixID) { mixID += "-" }
             audioSources = [.init(id: mixID, file: filename, name: "Meeting mix", audioStream: stream)]
+            snapshotEntries.append(.init(path: filename, media: media))
             policy = .fixed(.init(source: mixID, stream: stream))
         }
         let lanes = movies.enumerated().compactMap { index, movie -> MulticamAudioLane? in
@@ -258,14 +255,11 @@ public enum ParticipantMulticam {
                                      audioSources: audioSources, audio: policy, switches: [.init(at: .zero, angle: first.id)],
                                      mixLanes: lanes)
         try result.validate()
-        try result.save(to: staging.appendingPathComponent("multicam.cut"))
-        try engine.verifyIdentity(gallery, identity: snapshot)
+        try result.save(to: staging.appendingPathComponent("multicam.cut"),
+                        mediaSnapshot: ProjectMediaSnapshot(entries: snapshotEntries))
+        try engine.verifyIdentity(gallery, identity: identity)
         try mix?.verifySources()
-        for file in usedISOs {
-            guard let identity = isoSnapshots[file], identity.isCurrentSnapshot(at: file) else {
-                throw CutError(code: "source_changed", message: "The ISO source changed while rendering the angle group: \(file.path)")
-            }
-        }
+        try verifyISOs(usedISOs, against: isoSnapshots)
         try engine.checkCancellation()
         guard chmod(staging.path, try publicationPermissions(0o777)) == 0 else {
             throw CutError(code: "write_failed", message: "Could not publish the multicam angle directory.")
@@ -296,27 +290,46 @@ public enum ParticipantMulticam {
         return first
     }
 
-    private static func galleryURL(in project: CutProject, sourceID: String, document: URL) throws -> URL {
-        if case .multicam(let multicam) = project,
-           let recording = multicam.pictureSources.first(where: { $0.id == sourceID }) {
-            return try CutProject.checkedMediaURL(recording.file, relativeTo: document)
+    private static func snapshots(in project: CutProject, document: URL) -> [URL: SourceIdentity] {
+        // An ISO can use a recording, a lane or a lane's replacement.
+        var snapshots: [URL: SourceIdentity] = [:]
+        for (_, path) in project.mediaPaths {
+            guard let file = try? CutProject.checkedMediaURL(path, relativeTo: document).standardizedFileURL,
+                  snapshots[file] == nil, let identity = try? SourceIdentity(file) else { continue }
+            snapshots[file] = identity
+            snapshots[AnalysisSidecar.canonicalSource(file)] = identity
         }
-        return try CutProject.checkedMediaURL(sourceID, relativeTo: document)
+        return snapshots
+    }
+
+    private static func usedSoundFiles(_ report: ParticipantRenderReport) -> [URL] {
+        report.audioActions.flatMap { $0.sources.map { $0.file.standardizedFileURL } }
+    }
+
+    private static func verifyISOs(_ files: Set<URL>, against snapshots: [URL: SourceIdentity]) throws {
+        for file in files {
+            guard let identity = snapshots[file], identity.isCurrentSnapshot(at: file) else {
+                throw CutError(code: "source_changed", message: "The ISO source changed while preparing the angle group: \(file.path)")
+            }
+        }
     }
 
     private static func excerpt(_ project: CutProject, document: URL, sourceID: String, range: MulticamRange,
-                                cancelled: (@Sendable () -> Bool)? = nil) throws -> CutProject {
+                                cancelled: (@Sendable () -> Bool)? = nil) throws
+        -> (project: CutProject, file: URL, identity: SourceIdentity) {
         try project.validate()
         guard range.from >= .zero, range.from < range.to else { throw invalid("Choose a positive source range.") }
         var selected = project
+        let gallery: URL
+        let media: MediaInfo
         switch project {
         case .multicam(var multicam):
             guard let angle = multicam.angles.first(where: { $0.recordings.contains(where: { $0.id == sourceID }) }),
                   let recording = angle.recordings.first(where: { $0.id == sourceID }) else {
                 throw invalid("The virtual angle's source recording is unavailable.")
             }
-            let file = try CutProject.checkedMediaURL(recording.file, relativeTo: document)
-            let media = try CutEngine(cancelled: cancelled, tracks: .video).inspectSummary(file)
+            gallery = try CutProject.checkedMediaURL(recording.file, relativeTo: document)
+            media = try CutEngine(cancelled: cancelled, tracks: .video).inspectSummary(gallery)
             let offset = try recording.offset.adding(media.multicamSourceOffset)
             let group = try MulticamRange(from: range.from.adding(offset), to: range.to.adding(offset))
             guard media.hasVideo, range.to <= media.duration,
@@ -331,8 +344,8 @@ public enum ParticipantMulticam {
             guard project.sequenceClips?.contains(where: { $0.file == sourceID }) == true else {
                 throw invalid("The virtual angle's source recording is unavailable.")
             }
-            let file = try CutProject.checkedMediaURL(sourceID, relativeTo: document)
-            let media = try CutEngine(cancelled: cancelled, tracks: .video).inspectSummary(file)
+            gallery = try CutProject.checkedMediaURL(sourceID, relativeTo: document)
+            media = try CutEngine(cancelled: cancelled, tracks: .video).inspectSummary(gallery)
             guard media.hasVideo, range.to <= media.duration else {
                 throw invalid("The virtual angle's range is outside the recording's picture.")
             }
@@ -342,7 +355,7 @@ public enum ParticipantMulticam {
         participants.render = nil
         selected.participants = participants
         try selected.validate()
-        return selected
+        return (selected, gallery, media.identity)
     }
 
     private static func meetingMix(in source: CutProject, galleryID: String, document: URL,
@@ -365,7 +378,7 @@ public enum ParticipantMulticam {
             return try ParticipantRenderSound.resolve(soundtrack, document: document, timeline: timeline,
                                                       audio: .init(mode: .program), cancelled: cancelled)
         case .sequence, .stillSequence:
-            guard binding == nil || binding?.selection != nil else {
+            guard binding == nil || (binding?.selection != nil && binding?.laneID == nil) else {
                 throw invalid("A sequence mix needs a source and stream binding.")
             }
             let selection: MulticamAudioSelection?

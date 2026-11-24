@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import MPCutCore
 
@@ -6,20 +7,41 @@ import MPCutCore
 final class SourceIndexLoader {
     struct Key: Hashable, Sendable {
         let url: URL
+        struct Storage: Hashable, Sendable {
+            let project: URL?
+            let directory: URL?
+            let revision: SourceIdentity?
+        }
+        let storage: Storage?
+        var project: URL? { storage?.project }
         let sidecars: Bool
-        let preview: Bool
-        let identity: SourceIdentity?
-        let preferCompleted: Bool
+        private(set) var preview: Bool
+        private(set) var identity: SourceIdentity?
+        var preferCompleted: Bool
         // SourceIdentity's ordinary equality intentionally ignores metadata-only changes.
-        private let changeTime: SourceIdentity.ChangeTime?
+        private var changeTime: SourceIdentity.ChangeTime?
 
-        init(url: URL, sidecars: Bool, preview: Bool, identity: SourceIdentity? = nil, preferCompleted: Bool = false) {
+        init(url: URL, sidecars: Bool, preview: Bool, identity: SourceIdentity? = nil, preferCompleted: Bool = false,
+             project: URL? = SidecarLocations.projectURL) {
             self.url = url.standardizedFileURL
+            // A fresh packet scan has no project-specific input. Restored indexes can
+            // differ between projects when their recording evidence has diverged.
+            storage = sidecars ? Storage(project: project, directory: SidecarLocations.storageDirectory,
+                                         revision: SidecarLocations.configurationRevision) : nil
             self.sidecars = sidecars
             self.preview = preview
             self.identity = identity
             self.preferCompleted = preferCompleted
             changeTime = identity?.changeTime
+        }
+
+        func fullIndex(afterProbing identity: SourceIdentity) -> Self {
+            var retry = self
+            retry.preview = false
+            retry.preferCompleted = false
+            retry.identity = identity
+            retry.changeTime = identity.changeTime
+            return retry
         }
     }
 
@@ -45,22 +67,38 @@ final class SourceIndexLoader {
         }
     }
 
+    private struct StoredCopy: Equatable {
+        let url: URL
+        let identity: SourceIdentity
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.url == rhs.url && lhs.identity.matchesSnapshot(rhs.identity)
+        }
+
+        static func snapshot(for source: URL) -> [Self] {
+            SidecarLocations(source: source).candidates.compactMap { url in
+                (try? SourceIdentity(url)).map { Self(url: url, identity: $0) }
+            }
+        }
+    }
+
     /// This cache adds at most a small bounded set of indexes to those held by open windows.
     private final class CompletedIndexes: @unchecked Sendable {
         private struct Entry {
             let url: URL
             let sidecars: Bool
+            let storage: Key.Storage?
             let index: Index
             var cost: Int
             var multicam: MulticamIndex?
         }
 
         // A provisional import can continue with a packet scan after a corrupt sidecar.
-        // Pin the miss to both files so a replacement sidecar can be used immediately.
+        // Pin a miss to every candidate so any new or repaired copy permits a retry.
         private struct FailedRestore {
             let url: URL
             let source: SourceIdentity
-            let sidecar: SourceIdentity
+            let copies: [StoredCopy]
             let fraction: Double
         }
 
@@ -77,7 +115,7 @@ final class SourceIndexLoader {
 
         func hasCandidate(for key: Key) -> Bool {
             lock.withLock {
-                entries.contains { $0.url == key.url && $0.sidecars == key.sidecars }
+                entries.contains { $0.url == key.url && $0.sidecars == key.sidecars && $0.storage == key.storage }
             }
         }
 
@@ -88,7 +126,7 @@ final class SourceIndexLoader {
                     bytes -= entry.cost
                     return true
                 }
-                guard let position = entries.firstIndex(where: { $0.url == key.url && $0.sidecars == key.sidecars }) else {
+                guard let position = entries.firstIndex(where: { $0.url == key.url && $0.sidecars == key.sidecars && $0.storage == key.storage }) else {
                     return nil
                 }
                 let entry = entries.remove(at: position)
@@ -108,20 +146,32 @@ final class SourceIndexLoader {
             }
         }
 
-        func recordFailedRestore(for url: URL, source: SourceIdentity, sidecar: SourceIdentity, fraction: Double) {
+        func discardCleared(_ sources: Set<URL>) {
+            func matches(_ url: URL) -> Bool {
+                sources.contains(url.standardizedFileURL.resolvingSymlinksInPath())
+            }
             lock.withLock {
-                failedRestores.removeAll { $0.url == url }
-                if failedRestores.count >= countLimit { failedRestores.removeFirst() }
-                failedRestores.append(FailedRestore(url: url, source: source, sidecar: sidecar, fraction: fraction))
+                failedRestores.removeAll { matches($0.url) }
+                entries.removeAll { entry in
+                    guard matches(entry.url) else { return false }
+                    bytes -= entry.cost
+                    return true
+                }
             }
         }
 
-        func failedRestoreProgress(for url: URL, source: SourceIdentity, sidecar: SourceIdentity) -> Double? {
+        func recordFailedRestore(for url: URL, source: SourceIdentity, copies: [StoredCopy], fraction: Double) {
             lock.withLock {
-                failedRestores.first {
-                    $0.url == url && $0.source.matchesSnapshot(source) && $0.sidecar.matchesSnapshot(sidecar)
-                }?.fraction
+                failedRestores.removeAll { $0.url == url }
+                if failedRestores.count >= countLimit { failedRestores.removeFirst() }
+                failedRestores.append(FailedRestore(url: url, source: source, copies: copies, fraction: fraction))
             }
+        }
+
+        func failedRestoreProgress(for url: URL, source: SourceIdentity, copies: @autoclosure () -> [StoredCopy]) -> Double? {
+            let previous = lock.withLock { failedRestores.first { $0.url == url && $0.source.matchesSnapshot(source) } }
+            guard let previous, previous.copies == copies() else { return nil }
+            return previous.fraction
         }
 
         func multicam(for index: Index) -> MulticamIndex? {
@@ -148,13 +198,13 @@ final class SourceIndexLoader {
             let cost = index.storageBytes
             guard cost <= byteLimit else { return }
             lock.withLock {
-                if let existing = entries.firstIndex(where: { $0.url == key.url && $0.sidecars == key.sidecars }) {
+                if let existing = entries.firstIndex(where: { $0.url == key.url && $0.sidecars == key.sidecars && $0.storage == key.storage }) {
                     bytes -= entries.remove(at: existing).cost
                 }
                 while entries.count >= countLimit || bytes + cost > byteLimit {
                     bytes -= entries.removeFirst().cost
                 }
-                entries.append(Entry(url: key.url, sidecars: key.sidecars, index: index, cost: cost))
+                entries.append(Entry(url: key.url, sidecars: key.sidecars, storage: key.storage, index: index, cost: cost))
                 bytes += cost
             }
         }
@@ -166,6 +216,7 @@ final class SourceIndexLoader {
         let token = EditCancellation()
         var subscribers: [UUID: Subscriber] = [:]
         var fraction = 0.0
+        var allowRetention = true
     }
 
     private final class Conversion {
@@ -189,6 +240,7 @@ final class SourceIndexLoader {
     private let completed: CompletedIndexes
     private var requests: [Key: Request] = [:]
     private var conversions: [ObjectIdentifier: Conversion] = [:]
+    private var clearObservation: AnyCancellable?
 
     init(completedIndexByteLimit: Int = 64 * 1_024 * 1_024) {
         completed = CompletedIndexes(byteLimit: completedIndexByteLimit)
@@ -198,10 +250,18 @@ final class SourceIndexLoader {
         restores.qualityOfService = .userInitiated
         indexes.maxConcurrentOperationCount = 2
         indexes.qualityOfService = .utility
+        clearObservation = NotificationCenter.default.publisher(for: .sidecarCachesDidClear).sink { [weak self] note in
+            guard let self, let sources = note.object as? Set<URL> else { return }
+            let paths = Set(sources.map { $0.standardizedFileURL.resolvingSymlinksInPath() })
+            self.completed.discardCleared(paths)
+            for (key, request) in self.requests where paths.contains(key.url.resolvingSymlinksInPath()) {
+                request.allowRetention = false
+            }
+        }
     }
 
     /// A manual or watched refresh has already paid to index this recording.
-    func acceptRefreshedIndex(_ media: MediaInfo, sidecars: Bool) {
+    func acceptRefreshedIndex(_ media: MediaInfo, sidecars: Bool, project: URL? = SidecarLocations.projectURL) {
         let url = media.url.standardizedFileURL
         let stale = CutError(code: "source_changed", message: "The recording changed while loading.")
         let obsolete = requests.filter { $0.key.url.standardizedFileURL == url }
@@ -216,7 +276,7 @@ final class SourceIndexLoader {
         }
         completed.discard(url)
         if media.hasFullEditIndex {
-            completed.store(Index(ordinary: media), for: Key(url: url, sidecars: sidecars, preview: false))
+            completed.store(Index(ordinary: media), for: Key(url: url, sidecars: sidecars, preview: false, project: project))
         }
         // Detach all requests before notifying callers. Their handlers may immediately retry.
         for request in obsolete.values {
@@ -254,8 +314,9 @@ final class SourceIndexLoader {
 
     func admit(_ key: Key, progress: @escaping (Double) -> Void = { _ in },
                completion: @escaping (Result<MulticamIndex, Error>) -> Void) -> () -> Void {
-        let key = Key(url: key.url, sidecars: key.sidecars, preview: key.preview,
-                      identity: key.identity, preferCompleted: key.preview)
+        var request = key
+        request.preferCompleted = key.preview
+        let key = request
         var cancel: (() -> Void)?
         let convert: (Result<Index, Error>) -> Void = { result in
             switch result {
@@ -266,7 +327,7 @@ final class SourceIndexLoader {
         cancel = load(key, progress: progress) { result in
             // Some containers do not declare a usable duration in the header.
             if case let .failure(error as PreviewUnavailable) = result {
-                cancel = self.load(.init(url: key.url, sidecars: key.sidecars, preview: false, identity: error.identity),
+                cancel = self.load(key.fullIndex(afterProbing: error.identity),
                                    progress: progress, completion: convert)
             } else {
                 convert(result)
@@ -349,7 +410,7 @@ final class SourceIndexLoader {
                 Task { @MainActor [weak self] in
                     guard let self, let request = self.requests[key], request.token === token else { return }
                     self.requests[key] = nil
-                    if shouldStore, case let .success(index) = result { self.completed.store(index, for: key) }
+                    if shouldStore, request.allowRetention, case let .success(index) = result { self.completed.store(index, for: key) }
                     for subscriber in Array(request.subscribers.values) { subscriber.completion(result) }
                 }
             }
@@ -369,8 +430,8 @@ final class SourceIndexLoader {
                     for subscriber in Array(request.subscribers.values) { subscriber.progress(fraction) }
                 }
             }
-            let sidecarURL = AnalysisSidecar.url(for: key.url)
-            let work: @Sendable () -> Void = {
+            let context = ProjectSidecarWork(project: key.project, storageDirectory: key.storage?.directory)
+            let work = context.queued {
                 guard !token.isCancelled else { return }
                 var shouldStore = false
                 let result = Result {
@@ -385,8 +446,8 @@ final class SourceIndexLoader {
                         do { ordinary = try engine.inspectForPreview(key.url) }
                         catch { throw PreviewUnavailable(identity: identity) }
                     } else {
-                        if key.sidecars, let sidecar = try? SourceIdentity(sidecarURL),
-                           let restored = completed.failedRestoreProgress(for: key.url, source: identity, sidecar: sidecar) {
+                        if key.sidecars, let restored = completed.failedRestoreProgress(for: key.url, source: identity,
+                                                                                      copies: StoredCopy.snapshot(for: key.url)) {
                             report(restored)
                             ordinary = try engine.inspectFresh(key.url, keyframes: true, expectedIdentity: identity,
                                                                progress: { report(restored + (1 - restored) * $0) })
@@ -410,7 +471,7 @@ final class SourceIndexLoader {
             if key.preview, key.preferCompleted, key.sidecars {
                 let probes = self.probes
                 let restores = self.restores
-                probes.addOperation {
+                probes.addOperation(context.queued {
                     guard !token.isCancelled else { return }
                     do {
                         let identity = try freshIdentity()
@@ -418,9 +479,9 @@ final class SourceIndexLoader {
                             finish(.success(cached), false)
                             return
                         }
-                        guard let sidecar = try? SourceIdentity(sidecarURL),
-                              let cache = try? AnalysisSidecar(source: key.url),
-                              completed.failedRestoreProgress(for: key.url, source: identity, sidecar: sidecar) == nil else {
+                        let copies = StoredCopy.snapshot(for: key.url)
+                        guard !copies.isEmpty, let cache = try? AnalysisSidecar(source: key.url),
+                              completed.failedRestoreProgress(for: key.url, source: identity, copies: copies) == nil else {
                             work()
                             return
                         }
@@ -429,7 +490,7 @@ final class SourceIndexLoader {
                             work()
                             return
                         }
-                        restores.addOperation {
+                        restores.addOperation(context.queued {
                             guard !token.isCancelled else { return }
                             do {
                                 if let cached = completed.index(for: key, identity: try freshIdentity()) {
@@ -446,17 +507,17 @@ final class SourceIndexLoader {
                                     finish(.success(Index(ordinary: media)), true)
                                 } else {
                                     guard !token.isCancelled else { return }
-                                    completed.recordFailedRestore(for: key.url, source: identity, sidecar: sidecar, fraction: fraction)
+                                    completed.recordFailedRestore(for: key.url, source: identity, copies: copies, fraction: fraction)
                                     probes.addOperation(work)
                                 }
                             } catch {
                                 finish(.failure(error), false)
                             }
-                        }
+                        })
                     } catch {
                         finish(.failure(error), false)
                     }
-                }
+                })
             } else if key.preview {
                 probes.addOperation(work)
             } else if completed.hasCandidate(for: key) {

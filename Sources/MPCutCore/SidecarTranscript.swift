@@ -58,17 +58,23 @@ extension AnalysisSidecar {
                                        replacing: Bool = false,
                                        cancelled: () -> Bool = { Task.isCancelled }) throws {
         let name = try Self.transcriptActivitySection(key)
-        try saveTranscript(data, name: name, media: media, replacing: replacing, cancelled: cancelled)
+        try saveTranscript(data, name: name, media: media, replacing: replacing, cancelled: cancelled) { db, stamp in
+            guard replacing else { return }
+            try TranscriptRecognitionCache.retainReferencedLevels(at: name, stream: key.stream, replacement: data, in: self,
+                                                                  db: db, stamp: stamp, cancelled: cancelled)
+        }
     }
 
+    /// `beforeUpdate` sees the section as it stands, in the transaction that updates it.
     func saveTranscript(_ data: Data, name: String, media: MediaInfo, replacing: Bool = false,
-                        cancelled: () -> Bool) throws {
+                        cancelled: () -> Bool,
+                        beforeUpdate: (SidecarDatabase, String) throws -> Void = { _, _ in }) throws {
         guard media.identity.matchesSnapshot(identity), let evidence = media.refreshEvidence else {
             throw transcriptError("Fully indexed stream evidence is required to cache transcript results.",
                                   code: "missing_stream_evidence")
         }
-        try save([Self.evidenceKey: evidence.encoded()],
-                 updating: [name: { previous in replacing ? data : previous ?? data }],
-                 cancelled: cancelled)
+        try transact([Self.evidenceKey: evidence.encoded()],
+                     updating: [name: { previous in replacing ? data : previous ?? data }],
+                     cancelled: cancelled, beforeUpdate)
     }
 }

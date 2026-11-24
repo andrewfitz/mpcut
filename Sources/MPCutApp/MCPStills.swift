@@ -50,6 +50,7 @@ extension CutProject {
         let first = min(offset, placements)
         let last = first + min(limit, placements - first)
         var result: [String: Any] = ["items": [[String: Any]](), "offset": offset, "total": placements]
+        if let soundtrack = stillSoundtrack { result["soundtrack"] = try mcpStillJSON(soundtrack) }
         if let policy = programColorPolicy { result["program_color_policy"] = try mcpStillJSON(policy) }
         guard first < last else { return result }
         let visible = Dictionary(grouping: try resolveStills().spans.compactMap { span in
@@ -163,7 +164,7 @@ extension ProjectSession {
         guard card.from < boundary, boundary < card.to else {
             throw MCPCommandError("invalid_target", "Choose an interior presentation boundary on the still.")
         }
-        let rightID = UUID().uuidString
+        let rightID = ProjectIdentifier.make()
         let candidate = try project.splittingStill(id: card.insert.id, at: boundary.subtracting(card.from), newID: rightID)
         let right = try candidate.mcpStillOccurrences().first { $0.insert.id == rightID }
         guard let right else { throw MCPCommandError("invalid_target", "The still could not split at that boundary.") }
@@ -183,7 +184,7 @@ extension ProjectSession {
 extension ProjectSessions {
     func mcpStills(tool: String, arguments: [String: Any], session: ProjectSession,
                    checkAccess: @escaping @MainActor () throws -> Void) async throws -> [String: Any]? {
-        guard ["still_editor_placements_list", "timeline_gap_insert", "still_editor_placement_insert", "still_editor_picture_replace", "still_editor_placement_update", "still_editor_placement_remove", "still_editor_asset_relink", "timeline_clips_space"].contains(tool) else { return nil }
+        guard ["still_editor_placements_list", "timeline_gap_insert", "still_editor_placement_insert", "still_editor_picture_replace", "still_editor_placement_update", "still_editor_placement_remove", "still_editor_soundtrack_attach", "still_editor_soundtrack_fit", "still_editor_soundtrack_detach", "timeline_clips_space"].contains(tool) else { return nil }
         guard let project = session.mcpStillProject else { throw MCPCommandError("invalid_target", "Open a picture timeline.") }
         if tool == "still_editor_placements_list" {
             return try project.mcpStillList(location: session.mcpStillLocation, offset: arguments["offset"] as? Int ?? 0,
@@ -195,7 +196,26 @@ extension ProjectSessions {
         var candidate = project
         var result: [String: Any] = [:]
         let action: String
+        var soundtrackMedia: MediaInfo?
         switch tool {
+        case "still_editor_soundtrack_attach":
+            guard project.stillFormat != nil else { throw input.invalid("Open a still-only project to attach a soundtrack.") }
+            let (clip, media) = try await input.soundtrack()
+            guard media.identity.isCurrentSnapshot(at: media.url) else {
+                throw CutError(code: "source_changed", message: "The soundtrack changed while the recording was being read.")
+            }
+            candidate = try project.attachingStillSoundtrack(clip)
+            if arguments["fit_soundtrack"] as? Bool == true {
+                candidate = try candidate.fittingStillToSoundtrack()
+            }
+            soundtrackMedia = media
+            action = "Attach Soundtrack"
+        case "still_editor_soundtrack_fit":
+            candidate = try project.fittingStillToSoundtrack()
+            action = "Fit Image to Soundtrack"
+        case "still_editor_soundtrack_detach":
+            candidate = try project.attachingStillSoundtrack(nil)
+            action = "Detach Soundtrack"
         case "timeline_clips_space":
             guard project.hasSpacingBoundaries else {
                 throw MCPCommandError("invalid_target", "Space Clips requires at least two clips or still pictures.")
@@ -234,18 +254,18 @@ extension ProjectSessions {
                 guard operation == "insert", arguments["path"] == nil else {
                     throw input.invalid("A color gap requires an insert with no image path.")
                 }
-                asset = candidate.stillAssets.first(where: \.isGap) ?? StillAsset(gapID: UUID().uuidString)
+                asset = candidate.stillAssets.first(where: \.isGap) ?? StillAsset(gapID: ProjectIdentifier.make(avoiding: candidate.stillAssets.map(\.id)))
             } else {
                 let image = try await input.image()
                 let location = session.mcpStillLocation ?? URL(fileURLWithPath: "/Untitled.cut")
                 asset = candidate.stillAssets.first {
                     !$0.isGap && $0.fingerprint == image.fingerprint && CutProject.mediaURL($0.file, relativeTo: location) == image.url
-                } ?? StillAsset(id: UUID().uuidString, file: image.url.path,
+                } ?? StillAsset(id: ProjectIdentifier.make(avoiding: candidate.stillAssets.map(\.id)), file: image.url.path,
                                 displayName: image.url.lastPathComponent, fingerprint: image.fingerprint)
             }
             try checkAccess()
             let assetID = asset.id
-            let placementID = UUID().uuidString
+            let placementID = ProjectIdentifier.make()
             let framing = try input.framing(existing: .fit)
             candidate = try candidate.addingStillAsset(asset)
             if operation == "insert" {
@@ -322,19 +342,15 @@ extension ProjectSessions {
             result["placement"] = id
             action = "Delete Still"
         default:
-            let id = try input.id("asset")
-            guard project.stillAssets.contains(where: { $0.id == id }) else {
-                throw MCPCommandError("invalid_target", "Read the current still placements and choose an asset ID.")
-            }
-            let image = try await input.image()
-            try checkAccess()
-            candidate = try project.relinkingStillAsset(id, file: image.url.path, fingerprint: image.fingerprint)
-            result["asset"] = id
-            action = "Relink Still Image"
+            return nil
         }
         try checkAccess()
         guard session.mcpRevision == revision else { throw MCPCommandError("stale_revision", "The project changed during the still edit.") }
-        if candidate != project { try session.mcpCommitStill(candidate, action: action) }
+        if candidate != project {
+            if let soundtrackMedia { session.editor.cacheStillSoundtrackMedia(soundtrackMedia) }
+            try session.mcpCommitStill(candidate, action: action)
+        }
+        if let soundtrack = candidate.stillSoundtrack { result["soundtrack"] = try mcpStillJSON(soundtrack) }
         result["action"] = action
         result["changed"] = session.mcpRevision != revision
         result["history_retained"] = session.mcpRevision != revision && preferences.historyLimit > 0
@@ -379,6 +395,24 @@ private struct MCPStillInput {
         }
         if let background = fields["background"] as? String { value.background = background }
         return value
+    }
+
+    func soundtrack() async throws -> (CutSequenceClip, MediaInfo) {
+        let path = try string("soundtrack")
+        guard path.hasPrefix("/"), !path.utf8.contains(0) else { throw invalid("Supply an absolute local soundtrack path.") }
+        let file = URL(fileURLWithPath: path)
+        let stream = fields["audio_stream"].flatMap(mcpInteger)
+        let from = try time("from")
+        let to = try time("to")
+        let worker = Task.detached(priority: .userInitiated) {
+            let media = try CutEngine(cancelled: { Task.isCancelled }).inspect(file)
+            let clip = try StillSoundtrack.reference(media: media, stream: stream, from: from, to: to)
+            try Task.checkCancellation()
+            return (clip, media)
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: { worker.cancel() }
     }
 
     func image() async throws -> (url: URL, fingerprint: String) {

@@ -124,6 +124,16 @@ func TestSDKHostStdio(t *testing.T) {
 					t.Errorf("%s missing", name)
 				}
 			}
+			for _, operation := range []string{"list", "locate", "relink", "replace"} {
+				name := "project_editor_media_" + operation
+				if tools[name] == nil || fileTool(name) {
+					t.Errorf("%s is missing or incorrectly routed to the file worker", name)
+				}
+				name = "project_file_media_" + operation
+				if tools[name] == nil || !fileTool(name) {
+					t.Errorf("%s is missing or incorrectly routed to a live editor", name)
+				}
+			}
 
 			resources, err := session.ListResources(ctx, nil)
 			if err != nil {

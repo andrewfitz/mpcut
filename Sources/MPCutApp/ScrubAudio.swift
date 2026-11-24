@@ -240,6 +240,7 @@ final class ScrubAudioPlayer {
             channels[1][i] = grain.stereo[2 * i + 1] * gain
         }
         if !engine.isRunning {
+            MutedLaunch.mute(engine)
             do { try engine.start() } catch { return }
         }
         node.scheduleBuffer(buffer, at: nil, options: .interrupts)

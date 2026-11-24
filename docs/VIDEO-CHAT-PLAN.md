@@ -1,6 +1,6 @@
 # Video chat recordings and two-angle interviews
 
-Proposed design for review, November 23, 2026. No project format or public API is committed by this plan.
+Design reviewed November 23, 2026. See the [editing guide](PARTICIPANTS.md) for the implemented workflow and the [verification report](VIDEO-CHAT-VERIFICATION.md) for measured accuracy, performance and platform coverage.
 
 ## What an editor should be able to do
 

@@ -172,7 +172,8 @@ final class FFPreviewReader: @unchecked Sendable {
                 return preceding
             }
             guard let image else { continue }
-            let frame = PreviewFrame(buffer: image, time: pts, transform: transform)
+            let frame = PreviewFrame(buffer: image, time: pts, transform: transform,
+                                     sourcePicture: .init(url: url, pts: pts))
             if nearbyKeyframe, !mp_preview_met_damage(decoder), frame.time.seconds >= target - 8,
                frame.time.seconds <= target, frame.time.seconds < end { return frame }
             if frame.time.seconds > target + 0.000_000_001, missing() {
@@ -249,9 +250,12 @@ final class FFPreviewReader: @unchecked Sendable {
                     }
                 } else if !videoFinished {
                     let frame = PreviewFrame(buffer: image, time: ffTime(max(sourceTime, target) + timelineOffset.seconds),
-                                             transform: transform)
-                    if needsFirst && sourceTime < target {
-                        preceding = (frame, sourceTime + sample.duration.seconds)
+                                             transform: transform, sourcePicture: .init(url: url, pts: sample.presentationTimeStamp))
+                    let sourceEnd = sourceTime + sample.duration.seconds
+                    // A held picture can cover the seek target while the next
+                    // picture or EOF is still many batches of audio away.
+                    if needsFirst && sourceTime < target && !(sourceEnd > target) {
+                        preceding = (frame, sourceEnd)
                         continue
                     }
                     if needsFirst {
@@ -383,6 +387,7 @@ final class WebSequencePlayback {
         self.onIssue = onIssue
         self.onGap = onGap
         self.onAudioWarning = onAudioWarning
+        MutedLaunch.mute(audioRenderer)
         synchronizer.addRenderer(audioRenderer)
         synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
     }

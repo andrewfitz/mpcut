@@ -3,18 +3,51 @@
 import argparse
 from fractions import Fraction
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import wave
 from xml.etree import ElementTree
 
 from media_regression import ffmpeg, probe, run
+from saved_project import read_project, saved_file, saved_text
 
 CLI = None
 
 
 class StillOnlyTests(unittest.TestCase):
+    def test_saved_soundtrack_identity_only_gates_sound(self):
+        with tempfile.TemporaryDirectory(prefix="mpcut-still-soundtrack-identity-") as directory:
+            root = Path(directory)
+            cover = root / "cover.png"
+            project = root / "cover.cut"
+            recording = root / "recording.wav"
+            ffmpeg("-f", "lavfi", "-i", "color=red:size=64x36", "-frames:v", "1", cover)
+            with wave.open(str(recording), "wb") as wav:
+                wav.setparams((1, 2, 48000, 48001, "NONE", "not compressed"))
+                wav.writeframes(bytes(48001 * 2))
+            run([CLI, "still", "project", "create", "--out-project", project, "--image", cover,
+                 "--width", "64", "--height", "36", "--rate", "30",
+                 "--soundtrack", recording, "--fit-soundtrack", "--json"])
+            command = [CLI, "export", "project", "render", "--project", project,
+                       "--output", root / "cover.mov", "--audio", "pcm", "--dry-run", "--json"]
+            run(command)
+            original = recording.stat()
+            # Keep the audio format, sample count and file size while replacing the media generation.
+            with recording.open("r+b") as changed:
+                changed.seek(-2, os.SEEK_END)
+                changed.write(bytes([1, 0]))
+            os.utime(recording, ns=(original.st_atime_ns, original.st_mtime_ns + 2_000_000_000))
+            self.assertEqual(recording.stat().st_size, original.st_size)
+            rejected = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(json.loads(rejected.stdout)["error"]["code"], "source_changed")
+            video_plan = json.loads(run([*command, "--tracks", "video"]))
+            self.assertEqual(video_plan["generated_video_sample_count"], 1)
+            self.assertEqual(video_plan["sound_actions"], [])
+
     def test_single_gap_black_and_custom_color(self):
         with tempfile.TemporaryDirectory(prefix="mpcut-color-gap-") as directory:
             root = Path(directory)
@@ -27,7 +60,12 @@ class StillOnlyTests(unittest.TestCase):
                     run([CLI, "still", "placement", "update", "--project", cut, "--placement", report["placement_id"],
                          "--background", "#FF0000", "--in-place"])
                 output = root / (name + ".mov")
-                run([CLI, "export", "project", "render", "--project", cut, "--output", output], allow_diagnostics=True)
+                command = [CLI, "export", "project", "render", "--project", cut, "--output", output, "--json"]
+                dry_run = json.loads(run([*command, "--dry-run"], allow_diagnostics=True))
+                self.assertNotIn("output_bytes", dry_run)
+                self.assertFalse(output.exists())
+                result = json.loads(run(command, allow_diagnostics=True))
+                self.assertEqual(result["output_bytes"], output.stat().st_size)
                 pixels = ffmpeg("-i", output, "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-")
                 self.assertEqual(len(pixels), 160 * 96 * 3)
                 for channel, target in enumerate(expected):
@@ -52,16 +90,22 @@ class StillOnlyTests(unittest.TestCase):
             tree.write(xml, encoding="utf-8", xml_declaration=True)
             sibling = root / "Sibling.cut"
             run([CLI, "project", "convert", xml, "--output", sibling])
-            self.assertEqual(json.loads(sibling.read_text())["still_assets"][0]["file"], image.name)
+            sibling_project = read_project(sibling)
+            self.assertEqual(saved_file(sibling_project, sibling_project["still_assets"][0]["file"]), image.name)
             nested = root / "nested"
             nested.mkdir()
             restored = nested / "Restored.cut"
             run([CLI, "project", "convert", xml, "--output", restored])
-            original = json.loads(cut.read_text())
+            original = read_project(cut)
             result = json.loads(restored.read_text())
+            for project in (original, result):
+                for clip in project["clips"]:
+                    still = clip["still"]
+                    for key in ("id", "asset_id"):
+                        still[key] = saved_text(project, still[key])
             self.assertEqual(result["clips"], original["clips"])
             self.assertEqual(result["still_format"], original["still_format"])
-            self.assertEqual(result["still_assets"][0]["file"], "../Card #1.png")
+            self.assertEqual(saved_file(result, result["still_assets"][0]["file"]), "../Card #1.png")
 
     def test_interchange_refuses_a_timeline_with_no_retained_material(self):
         with tempfile.TemporaryDirectory(prefix="mpcut-still-conversion-") as directory:
@@ -138,10 +182,10 @@ class StillOnlyTests(unittest.TestCase):
                         "--width", "320", "--height", "180", "--rate", "30000/1001",
                         "--codec", codec, "--container", extension, "--color", program_color, "--frames", "5",
                     ])
-                    project = json.loads(cut.read_text())
-                    self.assertEqual(project["schema_version"], 4)
+                    project = read_project(cut)
+                    self.assertIn(project["schema_version"], (4, 5))
                     self.assertEqual(project["clips"][0]["kind"], "still")
-                    self.assertEqual(project["still_assets"][0]["file"], image.name)
+                    self.assertEqual(saved_file(project, project["still_assets"][0]["file"]), image.name)
                     self.assertEqual(project["program_color_policy"]["transfer"], transfer)
                     run([
                         CLI, "still", "placement", "insert", "--project", cut, "--image", last_image, "--clock", "sequence", "--at", "1001/6000", "--duration", "1001/30000", "--in-place", "--json",

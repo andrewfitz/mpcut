@@ -6,6 +6,8 @@ struct ExportSheetOptions: Sendable, Equatable {
     var organization = ExportOrganization()
     var placements: ExportPlacementScope = .none
     var requireCameraCopy = false
+    var pictureTiming: StillPictureTiming?
+    var stillVideoCodec: ReencodeCodec?
     var mode: ExportMode = ExportRules.defaultMode(for: .movie)
     var tracks: ExportTracks = .all
     var audioTrackOrdinal: Int?
@@ -66,10 +68,16 @@ struct ExportSheetOptions: Sendable, Equatable {
 
     /// Selects a conversion and a container it can be written to, keeping `preferred` when it fits.
     mutating func convertAudio(to format: ReencodeAudio, preferred: String? = nil) {
-        let choices = AudioExportEngine.containers(for: format)
+        let choices = conversionContainers(for: format)
         audioMode = .encode
         audioFormat = format
         conversionContainer = preferred.flatMap { choices.contains($0) ? $0 : nil } ?? choices.first ?? conversionContainer
+    }
+    func conversionContainers(for format: ReencodeAudio) -> [String] {
+        let ordinary = AudioExportEngine.containers(for: format)
+        guard placements == .insertion else { return ordinary }
+        let still = ExportRules.stillContainers(mode: .encode, tracks: .audio, codec: codec, audio: format)
+        return ordinary + still.filter { !ordinary.contains($0) }
     }
     var quality: ReencodeQuality { codec == .prores ? proResQuality : standardQuality }
     /// The audio action that is requested. A container that cannot carry it is refused by the export rules with
@@ -78,19 +86,27 @@ struct ExportSheetOptions: Sendable, Equatable {
     var settings: ReencodeSettings { .init(codec: codec, quality: quality, audio: effectiveAudio) }
     /// The settings of a batch, which names a conversion format through its audio action.
     var batchSettings: ReencodeSettings { convertsAudio ? ReencodeSettings(audio: audioFormat) : settings }
+    var stillBatchSettings: ReencodeSettings {
+        if tracks == .audio, effectiveMode == .copy { return .init(audio: .copyOriginal) }
+        return batchSettings
+    }
 
     /// The selection that an alternative reported by a batch stands for.
     func applying(_ alternative: ExportAlternative) -> ExportSheetOptions {
         var current = self
         if let video = alternative.stillVideoSettings {
             current.codec = video.codec
+            current.stillVideoCodec = video.codec
             if video.codec == .prores { current.proResQuality = video.quality }
             else { current.standardQuality = video.quality }
         }
         let action = alternative.requestedStillAudio ?? alternative.audio ?? (placements == .none ? .auto : audio)
         var result = current.applying(ExportRequest(clips: [], mode: alternative.mode, tracks: alternative.tracks,
                                                     audio: action), container: alternative.container)
-        if placements != .none { result.requireCameraCopy = alternative.arguments.contains("--require-camera-copy") }
+        if placements != .none {
+            result.requireCameraCopy = alternative.arguments.contains("--require-camera-copy")
+            result.pictureTiming = alternative.argument("--still-timing").flatMap(StillPictureTiming.init(rawValue:)) ?? pictureTiming
+        }
         return result
     }
 }
@@ -176,12 +192,24 @@ extension ExportPlan {
             return "Copy \(Self.seconds(edit.duration.seconds)) of \(contents) to \(edit.container.uppercased())."
         case .conversion(let plan):
             let video = "\(plan.settings.codec.displayName) · \(plan.settings.quality.displayName) · \(plan.width) × \(plan.height)"
+            // Tracks converted alike share an entry. It states what is written: the AAC bit rate or the PCM word length.
+            func format(_ track: ReencodeAudioAction) -> String {
+                if track.action == .aac, let rate = track.bitRate { return " (\(rate / 1000) kbps)" }
+                if track.action == .pcm, let depth = track.bitDepth {
+                    return " (\(depth)-bit\(track.codec?.hasPrefix("pcm_f") == true ? " float" : ""))"
+                }
+                return ""
+            }
             let groups = Dictionary(grouping: plan.audioActions, by: \.action)
-            let audio = ReencodeAudio.allCases.compactMap { action -> String? in
-                guard let tracks = groups[action] else { return nil }
-                let label = tracks.count == 1 ? "Track" : "Tracks"
-                let numbers = tracks.map { String($0.track) }.joined(separator: ", ")
-                return "\(label) \(numbers): \(action.displayName)"
+            let audio = ReencodeAudio.allCases.flatMap { action -> [String] in
+                let tracks = groups[action] ?? []
+                let formats = tracks.map(format).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+                return formats.map { written in
+                    let alike = tracks.filter { format($0) == written }
+                    let label = alike.count == 1 ? "Track" : "Tracks"
+                    let numbers = alike.map { String($0.track) }.joined(separator: ", ")
+                    return "\(label) \(numbers): \(action.displayName)\(written)"
+                }
             }
             let audioSummary = "Audio: " + (audio.isEmpty ? "No audio tracks" : audio.joined(separator: ", "))
             return ([video, audioSummary] + plan.warnings).joined(separator: "\n")
@@ -344,6 +372,8 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         return nil
     }
     private let stillProject: CutProject?
+    private let expectedSoundtrackIdentity: SourceIdentity?
+    private let stillAudioIssue: (ExportTracks, ReencodeAudio) -> CutError?
     private var stillExportOverride: CutProject?
     private(set) var appliedStillReview: CutProject?
 
@@ -352,25 +382,32 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     /// The modes the matrix writes as themselves for the selected tracks.
     private var modes: [ExportMode] { ExportEntryPoint.sheet.selectableModes(source: sourceKind, tracks: options.tracks, placements: options.placements) }
     private func title(of mode: ExportMode) -> String { cell(mode).displayName }
-    private let codecs = ReencodeCodec.allCases
+    private var codecs: [ReencodeCodec] {
+        ReencodeCodec.allCases.filter { $0 != .jpeg || stillProject?.stillFormat != nil }
+    }
     /// The source's own format first, then the named conversions of the matrix.
     private var conversionFormats: [ReencodeAudio] {
         let selected = options.audioTrackOrdinal.flatMap { audioStreams.indices.contains($0) ? audioStreams[$0] : nil }
             ?? audioStreams.first
         let formats = ExportRules.namedConversions(sourceCodec: selected?.codec)
+        if stillProject?.stillSoundtrack != nil || stillProject?.stillAudioReference?.audioTrack != nil {
+            return ExportRules.stillSoundConversions
+        }
         return options.placements == .insertion ? formats.filter(ExportRules.stillSoundConversions.contains) : formats
     }
     /// Every audio action of the cell. One the container cannot carry is refused with its alternatives.
     private var audioChoices: [ReencodeAudio] {
         if options.convertsAudio { return conversionFormats }
-        if options.placements != .none && options.effectiveMode == .smart {
-            return cell(.smart).audioActions
+        if options.placements != .none {
+            let actions = cell(options.effectiveMode).audioActions
+            let hasSoundtrack = stillProject?.stillSoundtrack != nil || stillProject?.stillAudioReference?.audioTrack != nil
+            return !hasSoundtrack || actions.contains(.auto) ? actions : [.auto] + actions
         }
         return cell(.encode).audioActions
     }
     private var qualities: [ReencodeQuality] { ExportRules.qualities(options.codec) }
     private var containers: [String] {
-        if options.convertsAudio { return ExportRules.conversionContainers(options.audioFormat) }
+        if options.convertsAudio { return options.conversionContainers(for: options.audioFormat) }
         if options.placements != .none && options.tracks != .audio {
             return ExportRules.stillContainers(mode: options.effectiveMode, tracks: options.tracks,
                                                codec: options.codec, audio: options.effectiveAudio)
@@ -380,6 +417,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     private let videoCheck = NSButton(checkboxWithTitle: "Video", target: nil, action: nil)
     private let audioCheck = NSButton(checkboxWithTitle: "Audio", target: nil, action: nil)
     private let preserveCamera = NSButton(checkboxWithTitle: "Require Camera Video Copy", target: nil, action: nil)
+    private let heldStills = NSButton(checkboxWithTitle: "One frame per still", target: nil, action: nil)
     private let modePicker = NSPopUpButton()
     private let containerPicker = NSPopUpButton()
     private let codecPicker = NSPopUpButton()
@@ -446,10 +484,15 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
 
     init(panel: NSSavePanel, options: ExportSheetOptions, copyContainers: ExportContainerChoices,
          clips: [ClipRequest], media: [URL: MediaInfo], useSidecar: Bool = true, excludedSources: Set<URL> = [],
-         allowsApplyingReviewToTimeline: Bool = true, stillProject: CutProject? = nil, changed: @escaping (ExportSheetOptions, Bool) -> Void,
+         allowsApplyingReviewToTimeline: Bool = true, stillProject: CutProject? = nil,
+         expectedSoundtrackIdentity: SourceIdentity? = nil,
+         stillAudioIssue: @escaping (ExportTracks, ReencodeAudio) -> CutError? = { _, _ in nil },
+         changed: @escaping (ExportSheetOptions, Bool) -> Void,
          directoryChanged: @escaping (URL) -> Void) {
         self.allowsApplyingReviewToTimeline = allowsApplyingReviewToTimeline
         self.stillProject = stillProject
+        self.expectedSoundtrackIdentity = expectedSoundtrackIdentity
+        self.stillAudioIssue = stillAudioIssue
         self.panel = panel
         self.options = options
         self.copyContainers = copyContainers
@@ -457,12 +500,17 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         self.media = media
         self.excludedSources = excludedSources
         self.useSidecar = useSidecar
-        let reference = stillProject?.stillAudioReference.flatMap {
-            media[URL(fileURLWithPath: $0.file).standardizedFileURL]?.streams.filter { $0.kind == "audio" }
+        let reference = (stillProject?.stillSoundtrack ?? stillProject?.stillAudioReference).flatMap { clip in
+            let streams = media[URL(fileURLWithPath: clip.file).standardizedFileURL]?.streams.filter { $0.kind == "audio" }
+            if let index = clip.audioTrack, let streams, streams.indices.contains(index) {
+                return [streams[index]]
+            }
+            return streams
         }
         audioStreams = reference ?? Self.commonAudioStreams(clips: clips, media: media)
         sourceHasVideo = stillProject != nil || media.values.contains(where: \.hasVideo)
-        sourceHasAudio = media.values.contains { $0.streams.contains { $0.kind == "audio" } }
+        sourceHasAudio = stillProject?.stillSoundtrack != nil || stillProject?.stillAudioReference != nil ||
+            media.values.contains { $0.streams.contains { $0.kind == "audio" } }
         self.changed = changed
         self.directoryChanged = directoryChanged
         super.init()
@@ -477,6 +525,9 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         preserveCamera.target = self
         preserveCamera.action = #selector(selectPreserveCamera)
         preserveCamera.toolTip = "Require stream copy for retained camera video"
+        heldStills.target = self
+        heldStills.action = #selector(selectStillTiming)
+        heldStills.toolTip = "Store one independently decodable video sample per still hold"
         configure(audioTrackPicker, label: "Audio tracks", action: #selector(selectAudioTrack))
         audioTrackPicker.toolTip = "Choose audio tracks"
         trackRow.addArrangedSubview(row("Tracks", audioTrackPicker))
@@ -518,7 +569,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         let picture = paired(row("Video", codecPicker), row("Quality", qualityPicker))
         videoSettings = picture
         settings.addArrangedSubview(picture)
-        if media.values.contains(where: { !$0.audio.isEmpty }) {
+        if sourceHasAudio {
             settings.addArrangedSubview(row("Audio", audioPicker))
         }
         statusIcon.symbolConfiguration = .init(pointSize: 13, weight: .regular)
@@ -556,7 +607,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         audioTrackNote.preferredMaxLayoutWidth = 446
         audioTrackNote.maximumNumberOfLines = 0
         audioTrackNote.setAccessibilityLabel("Audio tracks of the clips")
-        [paired(videoCheck, audioCheck), trackRow, audioTrackNote, paired(row("Mode", modePicker), row("Container", containerPicker)), preserveCamera, settings, result,
+        [paired(videoCheck, audioCheck), trackRow, audioTrackNote, paired(row("Mode", modePicker), row("Container", containerPicker)), preserveCamera, heldStills, settings, result,
          reviewButton, stillReview, offerRow, reviewScroll, applyButton, saveExportResult].forEach(accessory.addArrangedSubview)
         summary.widthAnchor.constraint(equalToConstant: 446).isActive = true
         updatePickers()
@@ -624,6 +675,9 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         modePicker.isEnabled = modes.count > 1
         preserveCamera.state = options.requireCameraCopy ? .on : .off
         preserveCamera.isHidden = options.placements == .none || options.tracks == .audio
+        let defaultTiming = stillProject.map { ExportRules.defaultStillPictureTiming(for: $0) } ?? .cadence
+        heldStills.state = (options.pictureTiming ?? defaultTiming) == .held ? .on : .off
+        heldStills.isHidden = options.placements == .none || options.tracks == .audio
         fill(containerPicker, titles: containers.map(containerDisplayName), selected: containers.firstIndex(of: options.container))
         fill(codecPicker, titles: codecs.map(\.displayName), selected: codecs.firstIndex(of: options.codec))
         fill(qualityPicker, titles: qualities.map(\.displayName), selected: qualities.firstIndex(of: options.quality))
@@ -631,8 +685,9 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
              selected: audioChoices.firstIndex(of: options.convertsAudio ? options.audioFormat : options.effectiveAudio))
         let stillSound = options.placements != .none && options.tracks == .all &&
             options.effectiveMode == .smart && sourceHasAudio
-        settings.isHidden = options.effectiveMode != .encode && !stillSound
-        videoSettings?.isHidden = options.convertsAudio || stillSound
+        let standalonePicture = stillProject?.stillFormat != nil && options.tracks != .audio && options.effectiveMode == .smart
+        settings.isHidden = options.effectiveMode != .encode && !stillSound && !standalonePicture
+        videoSettings?.isHidden = options.convertsAudio || (options.effectiveMode != .encode && !standalonePicture)
     }
 
     private func didChange(from previousContainer: String, explicitCopyContainer: Bool = false) {
@@ -742,7 +797,13 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     @objc private func selectCodec() {
         let previousContainer = options.container
         options.codec = codecs[codecPicker.indexOfSelectedItem]
+        if stillProject != nil { options.stillVideoCodec = options.codec }
         didChange(from: previousContainer)
+    }
+
+    @objc private func selectStillTiming() {
+        options.pictureTiming = heldStills.state == .on ? .held : .cadence
+        didChange(from: options.container)
     }
 
     @objc private func selectQuality() {
@@ -775,15 +836,23 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
         alternatives = []
         failure = nil
         review = nil
+        if let issue = stillAudioIssue(options.tracks, options.stillBatchSettings.audio) {
+            availability = .unavailable(issue.message, nil)
+            failure = issue
+            isChecking = false
+            updateActions()
+            return
+        }
         isChecking = true
         updateActions()
         let clips = clipOverride ?? self.clips
         let stillProject = stillExportOverride ?? self.stillProject
         // One call to the shared rules returns the plan, or the failure with the alternatives that work.
-        let task = Task.detached(priority: .userInitiated) { [options, media, useSidecar, excludedSources, stillProject] in
+        let task = Task.detached(priority: .userInitiated) { [options, media, useSidecar, excludedSources, stillProject, expectedSoundtrackIdentity] in
             AnalysisSidecar.$excludedSources.withValue(excludedSources) {
                 if let stillProject {
-                    return ExportAvailability.resolve(options, project: stillProject, useSidecar: useSidecar)
+                    return ExportAvailability.resolve(options, project: stillProject, useSidecar: useSidecar,
+                                                      expectedSoundtrackIdentity: expectedSoundtrackIdentity)
                 }
                 return ExportAvailability.resolve(options, clips: clips, media: media, useSidecar: useSidecar)
             }
@@ -889,6 +958,7 @@ final class ExportFormatControl: NSObject, NSOpenSavePanelDelegate {
     }
 
     func panel(_ sender: Any, validate url: URL) throws {
+        if let issue = stillAudioIssue(options.tracks, options.stillBatchSettings.audio) { throw issue }
         if case .unavailable(let message, _) = availability {
             throw CutError(code: "export_unavailable", message: message)
         }
@@ -917,6 +987,7 @@ extension ReencodeCodec {
         case .h264: return "H.264"
         case .hevc: return "HEVC"
         case .prores: return "ProRes"
+        case .jpeg: return "JPEG"
         }
     }
 }
@@ -966,9 +1037,12 @@ func validateExportDestination(_ url: URL, container: String) throws {
 
 extension ExportAvailability {
     static func resolve(_ options: ExportSheetOptions, project: CutProject,
-                        useSidecar: Bool) -> (availability: Self, failure: CutError?, offers: [ExportFallback]) {
+                        useSidecar: Bool, expectedSoundtrackIdentity: SourceIdentity? = nil)
+        -> (availability: Self, failure: CutError?, offers: [ExportFallback]) {
         do {
-            let plan = try options.planStills(project, useSidecar: useSidecar, cancelled: { Task.isCancelled })
+            let plan = try options.planStills(project, useSidecar: useSidecar,
+                                             expectedSoundtrackIdentity: expectedSoundtrackIdentity,
+                                             cancelled: { Task.isCancelled })
             return (.stillReady(plan), nil, [])
         } catch {
             let issue = (error as? CutError) ?? CutError(code: "export_failed", message: error.localizedDescription)
@@ -982,11 +1056,20 @@ extension ExportAvailability {
 
 extension ExportSheetOptions {
     func planStills(_ project: CutProject, output: URL? = nil, useSidecar: Bool = true,
+                    audioAction: ReencodeAudio? = nil,
+                    expectedSoundtrackIdentity: SourceIdentity? = nil,
                     cancelled: @escaping @Sendable () -> Bool) throws -> StillExportPlan {
-        return try StillExportPlanner(useSidecar: useSidecar, cancelled: cancelled)
+        let settings = stillBatchSettings
+        let action = settings.audio
+        let explicitAudio = audioAction ?? (effectiveMode != .copy && action != .auto ? action : nil)
+        return try StillExportPlanner(useSidecar: useSidecar, cancelled: cancelled, replacementReferenceAngles: [:],
+                                      expectedSoundtrackIdentity: expectedSoundtrackIdentity)
             .resolve(project, tracks: tracks, audioTrackOrdinal: audioTrackOrdinal, mode: effectiveMode,
                      requireCameraCopy: tracks != .audio && requireCameraCopy, container: container.isEmpty ? nil : container,
-                     output: output, settings: batchSettings)
+                     output: output, settings: settings,
+                     audioAction: explicitAudio,
+                     pictureTiming: pictureTiming,
+                     videoCodec: stillVideoCodec ?? (project.stillFormat == nil && effectiveMode == .encode ? codec : nil))
     }
 }
 
@@ -995,9 +1078,9 @@ extension StillExportPlan {
         let counts = [
             "Copied camera: \(report.copiedCameraDuration) s",
             "Encoded camera: \(report.encodedCameraDuration) s",
-            "Generated stills: \(report.generatedStillDuration) s",
+            "Generated stills: \(report.generatedStillDuration) s · \(report.generatedVideoSampleCount) samples",
             "Output duration: \(duration) s",
-        ]
+        ] + (report.videoCodec.map { ["Video: \($0.uppercased()) · \(report.writtenPictureDuration ?? duration) s"] } ?? [])
         let picture = report.picture.filter { $0.action != .copy }.map { span in
             let range = "\(span.output.from)–\(span.output.to) s"
             if let id = span.placementID { return "Still \(id) · \(span.clock) · output \(range)" }
@@ -1006,7 +1089,14 @@ extension StillExportPlan {
         let sound = report.soundActions.map { action in
             let silence = action.generatedSilence.isEmpty ? "" :
                 " · silence " + action.generatedSilence.map { "\($0.from)–\($0.to) s" }.joined(separator: ", ")
-            return "Audio track \(action.ordinal + 1): \(action.audio.displayName)\(silence)"
+            let sources = Array(Set(action.sources.compactMap(\.codec))).sorted()
+            let source = sources.isEmpty ? "" : " · source " + sources.joined(separator: ", ")
+            let layout = action.channelLayout.map { " · \($0)" } ?? ""
+            let rate = action.sampleRate.map { " · \($0) Hz" } ?? ""
+            let precision = action.bitDepth.map { " · \($0)-bit" } ?? ""
+            let codec = action.codec.map { " · \($0.uppercased())" } ?? ""
+            let treatment = action.treatment ?? action.audio.displayName
+            return "Audio track \(action.ordinal + 1): \(treatment)\(codec)\(layout)\(rate)\(precision)\(source)\(silence)"
         }
         return (counts + picture + sound + report.warnings).joined(separator: "\n")
     }

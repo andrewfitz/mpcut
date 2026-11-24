@@ -63,16 +63,19 @@ enum ParticipantRenderSound {
                                            selection: MulticamAudioSelection,
                                            cancelled: (@Sendable () -> Bool)?) throws -> StillSoundPlan {
         let clips = Dictionary(uniqueKeysWithValues: (project.sequenceClips ?? []).map { ($0.id, $0) })
-        guard clips.values.contains(where: { $0.file == selection.source }) else {
-            throw missing("Place a microphone from a separate recording on a synced multicam audio source.")
-        }
         let file = try CutProject.checkedMediaURL(selection.source, relativeTo: document)
         let media = try CutEngine(cancelled: cancelled).inspect(file)
+        let matchingFiles = Set(clips.values.map(\.file)).filter { path in
+            guard let candidate = try? CutProject.checkedMediaURL(path, relativeTo: document) else { return false }
+            return file == candidate || (try? SourceIdentity(candidate)) == media.identity
+        }
+        guard !matchingFiles.isEmpty else {
+            throw missing("Place a microphone from a separate recording on a synced multicam audio source.")
+        }
         guard let index = media.audio.first(where: { $0.stream.index == selection.stream }) else {
             throw missing("The participant's source has no matching microphone stream.")
         }
         let coverage = try index.audibleBounds(origin: media.origin)
-        var sourceMatches: [String: Bool] = [:]
         var spans: [ConvertedSoundSpan] = []
         func appendSilence(from: RationalTime, to: RationalTime) {
             guard from < to else { return }
@@ -80,19 +83,8 @@ enum ParticipantRenderSound {
             spans.append(.init(media: nil, stream: nil, input: range, output: range))
         }
         for span in timeline.spans {
-            guard case .source(let id, let range) = span.origin, let clip = clips[id] else {
-                appendSilence(from: span.output.from, to: span.output.to)
-                continue
-            }
-            let matches: Bool
-            if let cached = sourceMatches[clip.file] {
-                matches = cached
-            } else {
-                let candidate = try CutProject.checkedMediaURL(clip.file, relativeTo: document)
-                matches = file == candidate || (try? SourceIdentity(candidate)) == media.identity
-                sourceMatches[clip.file] = matches
-            }
-            guard matches else {
+            guard case .source(let id, let range) = span.origin, let clip = clips[id],
+                  matchingFiles.contains(clip.file) else {
                 appendSilence(from: span.output.from, to: span.output.to)
                 continue
             }
@@ -128,8 +120,27 @@ enum ParticipantRenderSound {
         if let lane = binding.laneID {
             try selectLanes([lane], in: &project)
         } else if let selection = binding.selection {
+            guard project.sources.contains(where: { $0.id == selection.source }),
+                  (0...Int(Int32.max)).contains(selection.stream) else {
+                throw missing("The selected microphone source or stream is unavailable.")
+            }
+            let replacements = project.audioReplacements.indices.filter {
+                project.audioReplacements[$0].replacement == selection
+            }
+            guard replacements.count <= 1 else {
+                throw missing("This microphone has more than one sync placement. Select its audio lane.")
+            }
             for index in project.switches.indices { project.switches[index].audio = nil }
-            project.audio = .fixed(selection)
+            if let index = replacements.first {
+                // Keep the replacement's synced placement and fill uncovered time with silence.
+                project.audioReplacements[index].uncovered = .leaveUncovered
+                project.audio = .fixed(project.audioReplacements[index].original)
+            } else {
+                // A physical stream binding selects that microphone even when
+                // program audio substitutes a different recording for it.
+                project.audioReplacements.removeAll { $0.original == selection }
+                project.audio = .fixed(selection)
+            }
         } else {
             throw missing("The selected microphone binding is empty.")
         }

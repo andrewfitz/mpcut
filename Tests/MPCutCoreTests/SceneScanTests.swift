@@ -68,6 +68,23 @@ final class SceneScanTests: XCTestCase {
         XCTAssertEqual(sidecar.sceneReport()?.views.first?.name, "Wide")
     }
 
+    func testWholeSidecarClearInvalidatesCompletedSceneInOpenSession() throws {
+        let source = try copyFixture()
+        let root = source.deletingLastPathComponent().appendingPathComponent("config")
+        try SidecarLocations.$storageDirectory.withValue(root) {
+            let session = SceneScanSession()
+            let media = try CutEngine(useSidecar: false).inspect(source, keyframes: false)
+            let result = try SceneAnalysis.run(media, session: session)
+            XCTAssertEqual(result.progress.durable, media.duration)
+            XCTAssertNotNil(SceneAnalysis.lookup(media, session: session)?.report)
+            let entries = SidecarCacheCleaner.preview(sources: [source])
+            XCTAssertEqual(entries.count, 1)
+            let clear = SidecarCacheCleaner.clear(entries, wholeSidecars: true)
+            XCTAssertEqual(clear.cleared.count, 1, "\(clear.skipped)")
+            XCTAssertNil(SceneAnalysis.lookup(media, session: session)?.report)
+        }
+    }
+
     func testRecoveringSceneCheckpointHonorsClearedViewNames() throws {
         let source = try copyFixture()
         let first = try XCTUnwrap(SceneAnalysis.run(source, session: SceneScanSession()).report)

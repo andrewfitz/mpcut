@@ -35,7 +35,7 @@ extension MulticamEditorModel {
             let usedSlots = Set(project.mixLanes.map(\.colorSlot))
             let slot = (0..<MulticamAudioLane.colorSlotCount).first { !usedSlots.contains($0) }
                 ?? project.mixLanes.count % MulticamAudioLane.colorSlotCount
-            project.mixLanes.append(.init(id: UUID().uuidString, target: target, label: label, colorSlot: slot))
+            project.mixLanes.append(.init(id: ProjectIdentifier.make(avoiding: project.mixLanes.map(\.id)), target: target, label: label, colorSlot: slot))
             project.audio = .mix
         }
     }

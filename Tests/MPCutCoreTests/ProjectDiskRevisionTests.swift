@@ -15,7 +15,7 @@ final class ProjectDiskRevisionTests: XCTestCase {
         try external.save(to: externalURL)
         let data = try Data(contentsOf: externalURL)
 
-        XCTAssertThrowsError(try CutProject.sequence([]).saveRevision(to: url, undo: [], redo: [], expected: revision) {
+        XCTAssertThrowsError(try CutProject.sequence([]).saveRevision(to: url, undo: [], redo: [], mediaSnapshot: .empty, expected: revision) {
             try data.write(to: url, options: .atomic)
         }) {
             XCTAssertEqual(($0 as? CutError)?.code, "project_save_conflict")
@@ -37,7 +37,7 @@ final class ProjectDiskRevisionTests: XCTestCase {
         let started = DispatchSemaphore(value: 0)
         let finished = DispatchSemaphore(value: 0)
 
-        _ = try first.saveRevision(to: url, undo: [], redo: [], expected: revision) {
+        _ = try first.saveRevision(to: url, undo: [], redo: [], mediaSnapshot: .empty, expected: revision) {
             DispatchQueue.global().async {
                 started.signal()
                 do {
@@ -77,7 +77,7 @@ final class ProjectDiskRevisionTests: XCTestCase {
         XCTAssertFalse(revision.matchesDestination(lexical))
 
         let edited = CutProject.sequence([.init(id: "clip", file: "offline.mov", from: .zero, to: .init(numerator: 1))])
-        _ = try edited.saveRevision(to: traversal, undo: [], redo: [], expected: revision)
+        _ = try edited.saveRevision(to: traversal, undo: [], redo: [], mediaSnapshot: .empty, expected: revision)
         XCTAssertEqual(try CutProject.load(from: project), edited)
         XCTAssertFalse(files.fileExists(atPath: lexical.path))
     }
@@ -106,7 +106,7 @@ final class ProjectDiskRevisionTests: XCTestCase {
             ])
             let outcome: String
             do {
-                _ = try edit.saveRevision(to: url, undo: [], redo: [], expected: expected)
+                _ = try edit.saveRevision(to: url, undo: [], redo: [], mediaSnapshot: .empty, expected: expected)
                 outcome = "saved"
             } catch {
                 outcome = (error as? CutError)?.code ?? error.localizedDescription

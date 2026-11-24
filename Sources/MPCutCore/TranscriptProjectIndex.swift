@@ -16,18 +16,62 @@ public struct TranscriptProjectIndex: Sendable {
         self.space = space
         language = indexes.first?.document.provenance?.language
         inputCoverageProviders = indexes.map(\.inputCoverageProvider)
-        gaps = Self.mergeCoverage(indexes.map(\.gaps))
+        // The gaps belong to Current Cut. A view of another clock merges them only if it is
+        // asked, because asking makes an index that builds clocks on demand build that one.
+        let clocks = indexes.map(\.indexes)
+        let coverage = MergedCoverage { Self.mergeCoverage(clocks.map(\.gaps)) }
+        self.coverage = coverage
         if indexes.count == 1, let only = indexes.first?.indexes[space] {
             index = only
         } else {
             // A still card or silence separates phrases however many transcripts are attached.
             index = .init(indexes.flatMap { $0.indexes[space]?.words ?? [] }, space: space,
-                          gaps: space == .currentCut ? gaps : [], usesMix: indexes.first?.usesMix == true)
+                          gaps: space == .currentCut ? coverage.gaps : [], usesMix: indexes.first?.usesMix == true)
         }
     }
 
+    private final class MergedCoverage: @unchecked Sendable {
+        private let lock = NSLock()
+        private var merge: (() -> [TranscriptCoverageGap])?
+        private var merged: [TranscriptCoverageGap] = []
+
+        init(_ merge: @escaping () -> [TranscriptCoverageGap]) {
+            self.merge = merge
+        }
+
+        var gaps: [TranscriptCoverageGap] {
+            lock.withLock {
+                if let merge {
+                    merged = merge()
+                    self.merge = nil
+                }
+                return merged
+            }
+        }
+    }
+
+    private let coverage: MergedCoverage
+
     public func inputCoverage(filter: TranscriptFilter = .init(), offset: Int = 0, limit: Int = 100,
                               trackOffset: Int? = nil, trackLimit: Int? = nil) throws -> TranscriptInputCoverageReport {
+        try Self.inputCoverage(inputCoverageProviders, space: space, filter: filter, offset: offset, limit: limit,
+                               trackOffset: trackOffset, trackLimit: trackLimit)
+    }
+
+    /// Input coverage of a clock for a caller that reads none of its words. Coverage is
+    /// known without the words, and the ordered view of a clock is not.
+    public static func inputCoverage(of indexes: [TranscriptIndex], space: TranscriptSpace, filter: TranscriptFilter = .init(),
+                                     offset: Int = 0, limit: Int = 100, trackOffset: Int? = nil,
+                                     trackLimit: Int? = nil) throws -> TranscriptInputCoverageReport {
+        try inputCoverage(indexes.map(\.inputCoverageProvider), space: space, filter: filter, offset: offset, limit: limit,
+                          trackOffset: trackOffset, trackLimit: trackLimit)
+    }
+
+    private static func inputCoverage(
+        _ inputCoverageProviders: [@Sendable (TranscriptSpace, TranscriptFilter) throws -> TranscriptInputCoverageRows],
+        space: TranscriptSpace, filter: TranscriptFilter, offset: Int, limit: Int,
+        trackOffset: Int?, trackLimit: Int?
+    ) throws -> TranscriptInputCoverageReport {
         if inputCoverageProviders.count == 1, let provider = inputCoverageProviders.first {
             return try .paged(provider(space, filter), offset: offset, limit: limit,
                               trackOffset: trackOffset, trackLimit: trackLimit)
@@ -48,7 +92,7 @@ public struct TranscriptProjectIndex: Sendable {
     }
 
     /// Gaps no attached transcript covers, merged once for reading and for phrase search.
-    public let gaps: [TranscriptCoverageGap]
+    public var gaps: [TranscriptCoverageGap] { coverage.gaps }
 
     static func mergeCoverage(_ coverage: [[TranscriptCoverageGap]]) -> [TranscriptCoverageGap] {
         guard coverage.count > 1 else { return coverage.first ?? [] }

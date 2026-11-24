@@ -35,8 +35,8 @@ struct StillReplacementRequest {
         func boundary(_ time: RationalTime) throws -> RationalTime { try snap(time, clock, fragment) }
         return try project.editingStillReplacement(id: replacement.id, fragmentIndex: fragmentIndex,
                                                    from: from.map(boundary), to: to.map(boundary), at: at.map(boundary),
-                                                   clock: clock, duplicateID: action == .duplicate ? UUID().uuidString : nil,
-                                                   detachID: action == .detach ? UUID().uuidString : nil)
+                                                   clock: clock, duplicateID: action == .duplicate ? ProjectIdentifier.make() : nil,
+                                                   detachID: action == .detach ? ProjectIdentifier.make() : nil)
     }
 }
 

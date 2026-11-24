@@ -82,7 +82,12 @@ final class MCPLocalControl {
         sessions?.mcpOutputJobs.disable()
         sessions?.mcpAnalysisJobs.disable()
         sessions?.mcpTranscriptPlans.removeAll()
-        if let sessions { for session in sessions.sessions.values { session.editor.cancelMCPTrimPreview() } }
+        if let sessions {
+            for session in sessions.sessions.values {
+                session.editor.cancelMCPTrimPreview()
+                session.mcpMediaPreview = nil
+            }
+        }
         sessions?.preferences.localMCPStatus = "Off"
     }
 
@@ -274,10 +279,19 @@ final class MCPLocalControl {
     }
 
     private func wait(for operation: Operation) async throws -> [String: Any] {
-        if let outcome = operation.outcome { return try outcome.get() }
         let id = UUID()
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { operation.waiters[id] = $0 }
+            try await withCheckedThrowingContinuation { continuation in
+                // The operation can finish before this continuation registers.
+                if let outcome = operation.outcome {
+                    continuation.resume(with: outcome)
+                } else if Task.isCancelled {
+                    if operation.waiters.isEmpty { operation.task?.cancel() }
+                    continuation.resume(throwing: Self.cancelled())
+                } else {
+                    operation.waiters[id] = continuation
+                }
+            }
         } onCancel: {
             Task { @MainActor [weak operation] in
                 guard let operation, let waiter = operation.waiters.removeValue(forKey: id) else { return }
@@ -439,12 +453,28 @@ final class MCPLocalControl {
             capability("analysis_editor_sidecars_save", canEdit && model.canSaveAnalysisSidecars, "An indexed source and an idle editor are required.")
         }
         let hasTimeline = !session.isMulticam || session.multicam.project != nil
+        let hasMedia = session.mcpHasProjectMedia
+        capability("project_editor_media_list", hasMedia, "Open a project to list its media.", allowsSheet: true)
+        capability("project_editor_media_locate", hasMedia, "Open a project to locate its media.", allowsSheet: true)
+        for tool in ["project_editor_media_relink", "project_editor_media_replace"] {
+            capability(tool, hasMedia && session.mcpCanEditProjectMedia, "An idle project is required.")
+        }
         capability("timeline_editor_range_map", hasTimeline, "Open a timeline to map a range.", allowsSheet: true)
         capability("history_editor_compare", hasTimeline, "Open a timeline to compare retained states.", allowsSheet: true)
         capability("still_editor_placements_list", session.mcpStillProject != nil, "Open a timeline to list still placements.", allowsSheet: true)
         for tool in ["timeline_gap_insert", "still_editor_placement_insert", "still_editor_picture_replace", "still_editor_placement_update", "still_editor_placement_remove", "still_editor_asset_relink"] {
             capability(tool, session.mcpCanEditStills, "An editable picture timeline is required.")
         }
+        let stillProject = session.mcpStillProject
+        let stillOnly = stillProject?.stillFormat != nil
+        let hasSoundtrack = stillProject?.stillSoundtrack != nil
+        let firstAsset = stillProject?.stillInserts.first?.assetID
+        let onlyImage = stillProject?.stillInserts.count == 1 &&
+            stillProject?.stillAssets.contains(where: { $0.id == firstAsset && !$0.isGap }) == true
+        capability("still_editor_soundtrack_attach", session.mcpCanEditStills && stillOnly, "An editable still-only project is required.")
+        capability("still_editor_soundtrack_fit", session.mcpCanEditStills && hasSoundtrack && onlyImage,
+                   "One image and an attached soundtrack are required.")
+        capability("still_editor_soundtrack_detach", session.mcpCanEditStills && hasSoundtrack, "An attached soundtrack is required.")
         capability("timeline_clips_space", session.mcpCanEditStills && session.mcpStillProject?.hasSpacingBoundaries == true,
                    "An editable picture timeline with at least two clips or still pictures is required.")
         if let project = session.mcpStillProject, project.mcpHasStills || project.programColorPolicy != nil {

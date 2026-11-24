@@ -258,6 +258,48 @@ final class StillProjectTests: XCTestCase {
         XCTAssertThrowsError(try project.settingStillFormat(nil))
     }
 
+    func testFittedSoundtrackUsesExactClockAndSurvivesHistoryRoundTrip() throws {
+        let format = StillTimelineFormat(width: 1920, height: 1080, cadence: title.cadence,
+                                         codec: .h264, container: "mov")
+        let original = try CutProject.makeStillTimeline(format: format, asset: asset,
+                                                        placementID: title.id, duration: title.duration)
+        let end = RationalTime(numerator: 96_001, denominator: 48_000)
+        let duration = RationalTime(numerator: 48_001, denominator: 48_000)
+        let audio = CutSequenceClip(id: "soundtrack", file: "recordings/source.wav",
+                                    from: time(1), to: end, audioTrack: 0)
+        let attached = try original.attachingStillSoundtrack(audio)
+        let fitted = try attached.fittingStillToSoundtrack()
+
+        let longer = try duration.adding(time(2))
+        let resized = try attached.resizingStill(id: title.id, duration: longer)
+        XCTAssertEqual(try resized.resolveStills().duration, longer)
+        XCTAssertEqual(resized.stillSoundtrack, audio)
+        XCTAssertEqual(try CutProject.decode(JSONEncoder().encode(resized)), resized)
+        XCTAssertEqual(try resized.resizingStill(id: title.id, duration: time(2)).stillInserts.first?.usesExactDuration, false)
+
+        XCTAssertEqual(try fitted.resolveStills().duration, duration)
+        XCTAssertEqual(fitted.stillInserts.first?.usesExactDuration, true)
+        let mapping = try XCTUnwrap(fitted.stillSoundtrackMapping(in: range(1, 2)))
+        XCTAssertEqual(mapping.output, .init(from: time(1), to: duration))
+        XCTAssertEqual(mapping.source, .init(from: time(2), to: end))
+        XCTAssertNil(try fitted.stillSoundtrackMapping(in: range(2, 3)))
+        XCTAssertEqual(try fitted.attachingStillSoundtrack(nil).resolveStills().duration, duration)
+        XCTAssertThrowsError(try CutProject.sequence([clip]).attachingStillSoundtrack(audio))
+
+        let plain = try JSONEncoder().encode(fitted)
+        XCTAssertEqual(try CutProject.decode(plain), fitted)
+        let refs = ProjectMedia.references(in: fitted)
+        XCTAssertEqual(refs.first(where: { $0.kind == .stillSoundtrack })?.path, audio.file)
+        XCTAssertEqual(fitted.mapMediaPaths { "/new/" + $0 }.stillSoundtrack?.file, "/new/" + audio.file)
+
+        let redo = [CutHistoryState(action: "Fit Image to Soundtrack", project: fitted)]
+        let (bytes, _) = try original.encodedArchive(undo: [], redo: redo, mediaSnapshot: .empty,
+                                                     byteLimit: MulticamProject.maximumFileSize)
+        let archive = try CutProject.decodeDocument(bytes, limit: 10)
+        XCTAssertEqual(archive.project, original)
+        XCTAssertEqual(archive.redo, redo)
+    }
+
     func testRedoOnlyStillUsesCurrentSchemaAndProtectsAssetAcrossHistory() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
@@ -270,7 +312,7 @@ final class StillProjectTests: XCTestCase {
         let media = folder.appendingPathComponent("photo.avif")
         let history = [CutHistoryState(action: "Insert Still", project: withStill)]
         try current.save(to: url, undo: [], redo: history)
-        let bytes = try Data(contentsOf: url)
+        let bytes = try ProjectFile.documentJSON(Data(contentsOf: url))
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
         XCTAssertEqual(root["schema_version"] as? Int, 4)
         let reopened = try CutProject.decodeDocument(bytes, limit: 10)
@@ -284,7 +326,7 @@ final class StillProjectTests: XCTestCase {
         let savedMedia = try CutProjectMedia.load(from: url)
         XCTAssertThrowsError(try savedMedia.validateDestination(symlink, relativeTo: url))
         try current.save(to: url, undo: [], redo: [])
-        let withoutHistory = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let withoutHistory = try XCTUnwrap(JSONSerialization.jsonObject(with: CutProject.documentJSON(saved: Data(contentsOf: url))) as? [String: Any])
         XCTAssertEqual(withoutHistory["schema_version"] as? Int, 4)
     }
 

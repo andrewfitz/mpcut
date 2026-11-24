@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from saved_project import read_project
 
 
 def seconds(time):
@@ -168,14 +169,14 @@ class Silence(unittest.TestCase):
         project = self.source.parent / "pinned.cut"
         self.project(project, audio={"mode": "fixed", "source_id": "a", "audio_stream_index": 1},
                      switches=[{"group_time": "0", "angle_id": "a"}])
-        doc = json.loads(project.read_text())
+        doc = read_project(project)
         doc["assembly"] = [{"kind": "group", "from": "1", "to": "5", "angle_id": "b"}]
         project.write_text(json.dumps(doc))
         destination = project.with_name("pinned-short.cut")
         result = subprocess.run([CLI, "silence", "shorten", "--json", "--project", project,
                                  "--out-project", destination], capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        retained = json.loads(destination.read_text())["assembly"]
+        retained = read_project(destination)["assembly"]
         self.assertEqual([item["angle_id"] for item in retained], ["b", "b"])
 
     def test_project_follow_and_override_use_offsets_and_absolute_streams(self):
@@ -231,7 +232,7 @@ class Silence(unittest.TestCase):
             project = folder / "edit.cut"
             self.project(project, audio={"mode": "fixed", "source_id": "z", "audio_stream_index": 0},
                          switches=[{"group_time": "0", "angle_id": "a"}])
-            document = json.loads(project.read_text())
+            document = read_project(project)
             document["audio_sources"] = [{"id": "z", "file": audio.name}]
             project.write_text(json.dumps(document))
             output = folder / "shortened.mov"
@@ -397,7 +398,7 @@ class Silence(unittest.TestCase):
         project = self.source.parent / "partial-coverage.cut"
         self.project(project, audio={"mode": "fixed", "source_id": "recorder", "audio_stream_index": 1},
                      switches=[{"group_time": "0", "angle_id": "a"}])
-        document = json.loads(project.read_text())
+        document = read_project(project)
         document["audio_sources"][0]["offset"] = "2"
         project.write_text(json.dumps(document))
         args = ("--project", project, "--threshold-db", "-40", "--no-sidecar")

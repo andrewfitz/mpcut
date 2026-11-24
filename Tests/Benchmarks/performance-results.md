@@ -34,6 +34,21 @@ The desktop preview benchmark used four 320×180 H.264 cameras at 25 fps, two mo
 
 With four 1080p H.264 cameras carrying 48 kHz AAC, median seek and switch lag were both 7.25 ms. The steady 25 fps run again submitted all 75 expected frames. Copying that 40-second edit with all four audio tracks to a 70.4 MB MP4 took 79 ms in the prior packaged release and 81 ms in the optimized release (warm medians of three). All five stream payload hashes matched. On the 60-second PCM project, the optimized packaged app exported separate tracks in 71 ms, mono in 212 ms, and stereo in 250 ms. The corresponding prior release timings were 75 ms, 238 ms, and 284 ms. All three comparisons matched picture and audio stream hashes.
 
+## Held still with lossless audio
+
+The signed macOS package used its bundled CLI and FFmpeg to render the same 1920×1080 SDR cover image with a 48 kHz, 24-bit stereo WAV. Each movie used MOV, H.264 and ALAC in Smart Trim. Cadence used the same settings at 24 fps. Elapsed time covers one export after preflight, including final verification and publication. Other release checks ran in parallel.
+
+| Program and picture timing | Elapsed | Video packets | Video bytes | Audio bytes | Container bytes | Total bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 seconds, held | 1.16 s | 1 | 70,812 | 1,534,701 | 1,922 | 1,607,435 |
+| 5 minutes, held | 1.40 s | 1 | 70,812 | 46,029,567 | 15,682 | 46,116,061 |
+| 1 hour, held | 49.07 s | 1 | 70,812 | 552,357,254 | 172,306 | 552,600,372 |
+| 10 seconds, cadence | 1.83 s | 240 | 638,787 | 1,534,701 | 2,914 | 2,176,402 |
+
+Each dry run reported the planned video packet count and left the destination unwritten. After publication, `output_bytes` equaled the filesystem length in all four cases. Video and audio bytes are sums of packet payload sizes. Container bytes are the remainder. Every held video packet was a sync sample that started at zero and lasted for the full program. All three held files decoded to the same RGB image. The full decoded stereo PCM matched the source at 24-bit precision in each case.
+
+The 10-second held file saved 568,967 bytes (26.1%) compared with cadence, including an 88.9% reduction in video payload. Audio payload was the same. For the hour-long export, the earlier staged path created 1,382,400,000 bytes of raw PCM and reached 1,935,072,137 sampled staging bytes. The packaged direct WAV path showed zero raw PCM staging bytes and peaked at 1,105,272,509 sampled staging bytes. Packet counts, payload sizes and decoded samples matched between paths.
+
 ## Experiments that did not justify a change
 
 - A GPU buffer pool made isolated allocation cheaper, but median forced SDR rendering across 30-frame blocks went from 71 to 138 ms in a noisy end-to-end comparison. The prototype was removed.

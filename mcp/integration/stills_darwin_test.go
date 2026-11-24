@@ -2,6 +2,7 @@ package integration
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -18,11 +19,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-func checkStillAuthoring(t *testing.T, toolCaller func(*testing.T) func(string, object, string) object,
-	rawCall func(*testing.T, string, object) *mcp.CallToolResult,
-	runGUIProbe func(*testing.T, string, string) bool, dir string) {
+func writeStillTestCard(t *testing.T, card string) []byte {
 	t.Helper()
-	card := filepath.Join(dir, "Red card.png")
 	picture := image.NewRGBA(image.Rect(0, 0, 64, 36))
 	for y := 0; y < 36; y++ {
 		for x := 0; x < 64; x++ {
@@ -36,6 +34,100 @@ func checkStillAuthoring(t *testing.T, toolCaller func(*testing.T) func(string, 
 	if err := os.WriteFile(card, pngData.Bytes(), 0600); err != nil {
 		t.Fatal(err)
 	}
+	return pngData.Bytes()
+}
+
+func checkHeldSoundtrack(t *testing.T, call func(string, object, string) object, dir string) {
+	t.Helper()
+	const samples = 48001
+	header := []byte("RIFF")
+	header = binary.LittleEndian.AppendUint32(header, 36+samples*2)
+	header = append(header, "WAVEfmt "...)
+	for _, word := range []uint32{16, 1<<16 | 1, 48000, 96000, 16<<16 | 2} {
+		header = binary.LittleEndian.AppendUint32(header, word)
+	}
+	header = append(header, "data"...)
+	header = binary.LittleEndian.AppendUint32(header, samples*2)
+	recording := filepath.Join(dir, "held soundtrack.wav")
+	if err := os.WriteFile(recording, append(header, make([]byte, samples*2)...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cover := filepath.Join(dir, "held cover.png")
+	writeStillTestCard(t, cover)
+	project := filepath.Join(dir, "held cover.cut")
+	filePlan := func(tool string, args object) object {
+		t.Helper()
+		args["operation_id"] = fileOperationID()
+		job := call(tool, args, "")["job_id"]
+		var result object
+		eventually(t, tool, func() bool {
+			status := call("file_job_status_read", object{"job_id": job}, "")
+			if status["state"] == "running" {
+				return false
+			}
+			if status["state"] != "succeeded" {
+				t.Fatalf("%s failed: %v", tool, status)
+			}
+			result = status["result"].(object)
+			return true
+		})
+		return result
+	}
+	filePlan("still_file_project_create", object{"out_project": project, "image": cover,
+		"width": 64, "height": 36, "rate": "30", "duration": "2"})
+	filePlan("still_file_soundtrack_attach", object{"project_path": project, "soundtrack": recording,
+		"fit_soundtrack": true, "in_place": true})
+	output := filepath.Join(dir, "held cover.m4v")
+	fileResult := filePlan("export_file_project_render", object{"project_path": project,
+		"output": output, "container": "m4v", "mode": "smart", "video": "h264", "audio": "alac", "still_timing": "held", "dry_run": true})
+	const count = "generated_video_sample_count"
+	wantDuration := object{"numerator": float64(samples), "denominator": float64(48000)}
+	if fileResult[count] != float64(1) || !reflect.DeepEqual(fileResult["written_picture_duration"], wantDuration) {
+		t.Fatalf("unexpected file plan: %v", fileResult)
+	}
+
+	handle := call("project_open", object{"project_path": project, "operation_id": "held-soundtrack-open"}, "")["project_handle"]
+	state := func() object { return call("project_editor_state_read", object{"project_handle": handle}, "") }
+	eventually(t, "held project ready", func() bool { return state()["busy"] == false && state()["can_edit"] == true })
+	edit := func(tool, operation string, fields object) object {
+		args := object{"project_handle": handle, "expected_revision": state()["revision"], "operation_id": operation}
+		maps.Copy(args, fields)
+		return call(tool, args, "")
+	}
+	edit("still_editor_soundtrack_detach", "held-soundtrack-detach", nil)
+	attach := edit("still_editor_soundtrack_attach", "held-soundtrack-attach", object{"soundtrack": recording, "fit_soundtrack": true})
+	if attach["changed"] != true || attach["soundtrack"] == nil {
+		t.Fatalf("live attach did not report the soundtrack edit: %v", attach)
+	}
+	job := edit("export_editor_project_plan", "held-soundtrack-plan", object{
+		"output": output, "container": "m4v", "mode": "smart", "codec": "h264", "audio": "alac", "still_timing": "held",
+	})["job_id"]
+	eventually(t, "held live plan", func() bool {
+		status := call("export_editor_job_status_read", object{"project_handle": handle, "job_id": job}, "")
+		if status["state"] == "running" {
+			return false
+		}
+		if status["state"] != "succeeded" {
+			t.Fatalf("held live plan failed: %v", status)
+		}
+		result := status["result"].(object)
+		plan, _ := result["plan"].(object)
+		for _, field := range []string{"container", count, "video_codec", "written_picture_duration"} {
+			if !reflect.DeepEqual(plan[field], fileResult[field]) {
+				t.Fatalf("held plans disagree on %s: %v vs %v", field, plan, fileResult)
+			}
+		}
+		return true
+	})
+	edit("project_close", "held-soundtrack-close", object{"changes": "discard"})
+}
+
+func checkStillAuthoring(t *testing.T, toolCaller func(*testing.T) func(string, object, string) object,
+	rawCall func(*testing.T, string, object) *mcp.CallToolResult,
+	runGUIProbe func(*testing.T, string, string) bool, dir string) {
+	t.Helper()
+	card := filepath.Join(dir, "Red card.png")
+	pngData := writeStillTestCard(t, card)
 	for _, fixture := range []struct {
 		name, program, replacement, contents string
 	}{
@@ -322,7 +414,7 @@ func checkStillAuthoring(t *testing.T, toolCaller func(*testing.T) func(string, 
 				t.Fatalf("undo did not rejoin split still: %v", got)
 			}
 			newPath := filepath.Join(dir, "Relinked "+fixture.name+".png")
-			if err := os.WriteFile(newPath, pngData.Bytes(), 0600); err != nil {
+			if err := os.WriteFile(newPath, pngData, 0600); err != nil {
 				t.Fatal(err)
 			}
 			mutate("still_editor_asset_relink", "relink", object{"asset": insert["asset"], "path": newPath})

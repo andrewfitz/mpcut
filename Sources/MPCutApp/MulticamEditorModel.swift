@@ -5,6 +5,9 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class MulticamEditorModel: ObservableObject {
+    @Published var projectMediaRequest: ProjectMediaRequest?
+    let projectMediaJobs = ProjectMediaJobs()
+    let projectMediaSummaryPaths = ProjectMediaSummaryPaths()
     enum EditSelection: Equatable, Sendable {
         case group
         case assembly
@@ -27,6 +30,7 @@ final class MulticamEditorModel: ObservableObject {
     private(set) var lastEditAction: String?
     @Published private(set) var project: MulticamProject? {
         didSet {
+            projectMediaSummaryPaths.invalidate()
             var previous = oldValue
             var current = project
             previous?.transcripts = .init()
@@ -54,15 +58,27 @@ final class MulticamEditorModel: ObservableObject {
     @Published private(set) var sourceIndexProgress: [String: Double] = [:]
     @Published private(set) var sourceIndexIssues: [String: String] = [:]
     @Published private(set) var projectURL: URL? {
-        didSet { if let projectURL { preferences.recentFiles.record([projectURL]) } }
+        didSet {
+            filmstrip.sidecarPreference.projectURL = projectURL
+            sidecarReferences = []
+            if let projectURL { preferences.recentFiles.record([projectURL]) }
+        }
+    }
+    var sidecarWork: ProjectSidecarWork {
+        ProjectSidecarWork(project: filmstrip.sidecarPreference.projectURL)
     }
     private var projectDiskRevision: ProjectDiskRevision?
+    private(set) var mediaSnapshot = ProjectMediaSnapshot() {
+        didSet { ignoredMediaPaths = mediaSnapshot.ignoredPaths }
+    }
+    private var ignoredMediaPaths: Set<String> = []
     @Published private(set) var savedProject: MulticamProject?
     struct HistoryEntry: Equatable, Sendable {
         let action: String
         var origin = HistoryOrigin.current
         var project: MulticamProject
         var selection: Selection?
+        var bindingChanges: [TranscriptBindingChange] = []
     }
     @Published private(set) var undoStack: [HistoryEntry] = []
     @Published private(set) var redoStack: [HistoryEntry] = []
@@ -93,7 +109,15 @@ final class MulticamEditorModel: ObservableObject {
     @Published var report: String?
     @Published var exportDeliverySummary: String?
     @Published var exportRequested = false
-    @Published var queuedRanges: [MulticamQueuedRange] = []
+    @Published var queuedRanges: [MulticamQueuedRange] = [] {
+        didSet {
+            var targets = QueueMediaTargets()
+            for entry in queuedRanges { entry.addMediaTargets(to: &targets) }
+            queuedMediaTargets = targets
+            if mediaWatcher != nil { updateMediaWatcher() }
+        }
+    }
+    private var queuedMediaTargets = QueueMediaTargets()
     @Published var isBulkQueuePresented = false
     @Published var isReplacementAudioPresented = false
     @Published var trackReplacementTarget: MulticamAudioSelection?
@@ -152,10 +176,15 @@ final class MulticamEditorModel: ObservableObject {
         didSet { if timelineZoom == 0, oldValue > 0 { previousTimelineZoom = oldValue } }
     }
     @Published var timeEntryRequest = 0
-    private(set) var openingProjectURL: URL?
+    private(set) var openingProjectURL: URL? {
+        didSet { filmstrip.sidecarPreference.projectURL = openingProjectURL.flatMap {
+            ProjectDraft.isManaged($0) || draft.managesDestination($0) ? nil : $0
+        } ?? projectURL }
+    }
     var chooseProjectRequest: (() -> Void)?
     var canSaveProjectTo: ((URL) -> Bool)?
     weak var window: NSWindow?
+    private var storageObservers: Set<AnyCancellable> = []
     private var preferenceObservation: AnyCancellable?
     var useAnalysisSidecars: Bool {
         get { preferences.useAnalysisSidecars }
@@ -193,8 +222,9 @@ final class MulticamEditorModel: ObservableObject {
     private var refreshReviewPicture = Set<URL>()
     private var refreshReviewReasons: [String: String] = [:]
     private var refreshBaselines: [URL: MediaInfo] = [:]
-    private var invalidatedQueueIDs = Set<UUID>()
+    @Published private(set) var invalidatedQueueIDs = Set<UUID>()
     private var mediaWatcher: ProjectMediaWatcher?
+    var interchangeCheckingVolumes: Set<String> { mediaWatcher?.checkingVolumes ?? ProjectMediaWatcher.knownCheckingVolumes }
     private var operation: EditCancellation?
     private var worker: Task<Void, Never>?
     struct Selection: Equatable, Sendable {
@@ -222,7 +252,6 @@ final class MulticamEditorModel: ObservableObject {
     private var sourceProgressUpdate: Task<Void, Never>?
     private var importLoads: [() -> Void] = []
     private var importID: UUID?
-    private var cancelRelinkRequest: (() -> Void)?
     var activeNativeOperation: MCPNativeOperation? {
         guard isBusy, let id = operation?.id ?? importID else { return nil }
         let kind = isExporting ? "export" : (importID != nil || openingProjectURL != nil ? "import" : nativeWorkerKind)
@@ -230,6 +259,7 @@ final class MulticamEditorModel: ObservableObject {
                                   cancelling: operation?.isCancelled ?? false)
     }
     private var nativeWorkerKind = "multicam"
+    private var isFlushingDraftSidecars = false
     private var provisionalGroupRange: MulticamRange?
     private var savedMediaPaths: [String: String] = [:]
     private var importingURLs: [URL] = []
@@ -252,6 +282,23 @@ final class MulticamEditorModel: ObservableObject {
             self?.analysisNavigationAvailability.removeAll()
             self?.objectWillChange.send()
         }
+        NotificationCenter.default.publisher(for: .sidecarStorageDidChange).sink { [weak self] _ in
+            guard let self else { return }
+            self.sidecarReferences = []
+            self.refreshSidecarProtection()
+        }.store(in: &storageObservers)
+        NotificationCenter.default.publisher(for: .sidecarCachesDidClear).sink { [weak self] notification in
+            guard let self, let cleared = notification.object as? Set<URL> else { return }
+            let urls = Set(cleared.map { $0.standardizedFileURL.resolvingSymlinksInPath() })
+            let affected = self.media.filter { urls.contains($0.value.url.standardizedFileURL.resolvingSymlinksInPath()) }
+            guard !affected.isEmpty else { return }
+            if self.nativeWorkerKind == "sidecars" { self.operation?.cancel() }
+            self.mediaRefresh.cancel()
+            for source in affected.values {
+                self.filmstrip.invalidate(source.url)
+            }
+            self.analysis.discardClearedAnalysis(for: Set(affected.keys), whole: notification.userInfo?["wholeSidecars"] as? Bool == true)
+        }.store(in: &storageObservers)
         preferenceObservation = preferences.observeChanges { [weak self] change in
             switch change {
             case .automaticallyRefreshMedia:
@@ -274,7 +321,7 @@ final class MulticamEditorModel: ObservableObject {
                 if let self {
                     self.analysis.configureSilence(minimum: self.preferences.minimumPause, threshold: self.analysis.pauseThreshold)
                 }
-            case .largeThumbnails, .defaultExportMode, .jpegPreset, .padding:
+            case .largeThumbnails, .sourceTimeTicks, .defaultExportMode, .jpegPreset, .padding:
                 self?.objectWillChange.send()
             default:
                 break
@@ -372,7 +419,7 @@ final class MulticamEditorModel: ObservableObject {
         var errors: [String] = []
         var remaining = unique.count
         for file in unique {
-            importLoads.append(SourceIndexLoader.shared.admit(.init(url: file, sidecars: usesSidecar(for: file), preview: true)) { [weak self] result in
+            importLoads.append(SourceIndexLoader.shared.admit(.init(url: file, sidecars: usesSidecar(for: file), preview: true, project: sidecarWork.project)) { [weak self] result in
                 guard let self, self.importID == workerID else { return }
                 switch result {
                 case .success(let index):
@@ -380,7 +427,7 @@ final class MulticamEditorModel: ObservableObject {
                     if info.hasFullEditIndex, info.multicamClockOffset != .zero {
                         ordinaryResults[info.url] = index.ordinary
                     }
-                    let source = MulticamSource(id: UUID().uuidString, file: file.path,
+                    let source = MulticamSource(id: ProjectIdentifier.make(), file: file.path,
                                                audioStream: info.audio.first?.stream.index)
                     results[file] = SourceDraft(source: source, media: info)
                 case .failure(let error):
@@ -436,7 +483,7 @@ final class MulticamEditorModel: ObservableObject {
     private func writePendingSetup(_ pending: MulticamProject) {
         guard pending != pendingSetupProject else { return }
         pendingSetupProject = pending
-        do { try draft.write { _ = try Self.writeDocument(pending, undo: [], redo: [], to: $0) } }
+        do { try draft.write { _ = try Self.writeDocument(pending, undo: [], redo: [], mediaSnapshot: .init(), to: $0) } }
         catch { draftFailed(error) }
     }
 
@@ -479,7 +526,6 @@ final class MulticamEditorModel: ObservableObject {
 
     private func finishImport() {
         importID = nil
-        cancelRelinkRequest = nil
         importLoads.removeAll()
         importingURLs = []
         isBusy = false
@@ -581,10 +627,12 @@ final class MulticamEditorModel: ObservableObject {
                 guard case .multicam(let prior) = state.project else {
                     throw CutError(code: "invalid_multicam_project", message: "Expected a multicam history state.")
                 }
-                return HistoryEntry(action: state.action, origin: state.origin, project: absolute(prior))
+                return HistoryEntry(action: state.action, origin: state.origin, project: absolute(prior),
+                                    bindingChanges: state.bindingChanges?.map { change in change.mappingPaths { CutProject.mediaURL($0, relativeTo: url).path } } ?? [])
             }
             return try (absolute(project), states.undo.map(entry), states.redo.map(entry),
-                        savedMedia.absoluteSources(relativeTo: url), savedMedia.diskRevision)
+                        savedMedia.absoluteSources(relativeTo: url), savedMedia.diskRevision,
+                        savedMedia.mediaSnapshot.mappingPaths { CutProject.mediaURL($0, relativeTo: url).path })
         } onSuccess: { result in
             guard allowCommit?() != false else { return }
             let recovered = self.draft.adopt(claim)
@@ -593,6 +641,7 @@ final class MulticamEditorModel: ObservableObject {
             self.savedMediaPaths = result.3
             self.install(project: result.0, media: [:], issues: [:], url: recovered ? nil : url)
             self.projectDiskRevision = recovered ? nil : result.4
+            self.mediaSnapshot = result.5
             self.undoStack = result.1
             self.redoStack = result.2
             self.savedHistoryCursor = self.historyCursor
@@ -643,7 +692,7 @@ final class MulticamEditorModel: ObservableObject {
         let firstURL = Self.availableURL(primary)
         let useSidecar = usesSidecar(for: url)
         let cancellation = EditCancellation()
-        let work = Task.detached(priority: .userInitiated) {
+        let work = sidecarWork.detached(priority: .userInitiated) {
             let engine = CutEngine(cancelled: { cancellation.isCancelled }, useSidecar: useSidecar)
             let primaryMedia = try primary.coverage == nil ? firstURL.map(engine.inspectMulticamSource) : nil
             let ordinary = try engine.inspect(url, keyframes: true)
@@ -660,7 +709,7 @@ final class MulticamEditorModel: ObservableObject {
             throw MCPCommandError("stale_revision", "The multicam project changed while the recording was read.")
         }
         var candidate = project
-        let id = UUID().uuidString
+        let id = ProjectIdentifier.make(avoiding: candidate.sources.map(\.id))
         try candidate.addRecording(id: id, media: info, to: angle, at: start, primaryMedia: first)
         cacheIndexedSource(info, ordinary: ordinary)
         guard edit("Add Camera Recording", { $0 = candidate }) else {
@@ -680,125 +729,22 @@ final class MulticamEditorModel: ObservableObject {
     }
 
     func relink(_ id: String, to url: URL) {
-        startRelink(id, to: url, validateCommit: {}) { [weak self] result in
-            if case .failure(let error) = result, !(error is CancellationError) {
-                self?.fail(error.localizedDescription)
-            }
+        Task { [weak self] in
+            guard let self else { return }
+            do { _ = try await relink(id, to: url, validateCommit: {}) }
+            catch is CancellationError {}
+            catch { fail(error.localizedDescription) }
         }
     }
 
     func relink(_ id: String, to url: URL,
                 validateCommit: @escaping @MainActor () throws -> Void) async throws
         -> (revision: Int, changed: Bool, historyRetained: Bool, warning: String?) {
-        let cancellation = EditCancellation()
-        return try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            return try await withCheckedThrowingContinuation { continuation in
-                var observer: UUID?
-                let request = startRelink(id, to: url, validateCommit: {
-                    if cancellation.isCancelled { throw CancellationError() }
-                    try validateCommit()
-                }) { result in
-                    if let observer { cancellation.removeCancellationHandler(observer) }
-                    continuation.resume(with: result.map { changed in
-                        (self.mcpRevision, changed, changed && self.preferences.historyLimit > 0, self.notice?.message)
-                    })
-                }
-                guard let request else {
-                    continuation.resume(throwing: MCPCommandError("editor_busy", "The multicam source is unavailable for relink."))
-                    return
-                }
-                observer = cancellation.onCancel { [weak self] in
-                    Task { @MainActor in
-                        guard let self, self.importID == request else { return }
-                        self.cancel()
-                    }
-                }
-            }
-        } onCancel: {
-            cancellation.cancel()
+        guard let source = project?.sources.first(where: { $0.id == id }) else {
+            throw CutError(code: "missing_source", message: "The multicam source is no longer available.")
         }
-    }
-
-    @discardableResult
-    private func startRelink(_ id: String, to url: URL, validateCommit: @escaping @MainActor () throws -> Void,
-                             completed: @escaping (Result<Bool, Error>) -> Void) -> UUID? {
-        guard let project, !isBusy, let source = project.sources.first(where: { $0.id == id }) else { return nil }
-        let angle = project.pictureSources.contains { $0.id == id }
-        let url = url.standardizedFileURL
-        importingURLs = [url]
-        reconcileSourceLoads()
-        isBusy = true
-        status = "Reading replacement source…"
-        var selectedStreams = Set(project.switches.compactMap(\.audio)
-            .filter { $0.source == id }.map(\.stream))
-        if let selection = project.fixedAudio, selection.source == id {
-            selectedStreams.insert(selection.stream)
-        }
-        for lane in project.mixLanes {
-            switch lane.target {
-            case .camera(let camera):
-                if project.angles.first(where: { $0.id == camera })?.recordings.contains(where: { $0.id == id }) == true,
-                   let stream = source.audioStream {
-                    selectedStreams.insert(stream)
-                }
-            case .recording(let selection) where selection.source == id:
-                selectedStreams.insert(selection.stream)
-            case .recording:
-                break
-            }
-        }
-        for binding in project.audioReplacements {
-            for selection in [binding.original, binding.replacement] where selection.source == id {
-                selectedStreams.insert(selection.stream)
-            }
-        }
-        for person in project.participants.people {
-            if let selection = person.audio?.selection, selection.source == id {
-                selectedStreams.insert(selection.stream)
-            }
-        }
-        if angle, let stream = source.audioStream {
-            selectedStreams.insert(stream)
-        }
-        let preview = selectedStreams.isEmpty
-        let request = UUID()
-        importID = request
-        cancelRelinkRequest = { completed(.failure(CancellationError())) }
-        importLoads.append(SourceIndexLoader.shared.admit(.init(url: url, sidecars: usesSidecar(for: url), preview: preview)) { [weak self] result in
-            guard let self, self.importID == request else { return }
-            self.finishImport()
-            let outcome = Result {
-                try validateCommit()
-                let index = try result.get()
-                guard angle ? index.multicam.hasVideo : !index.multicam.audio.isEmpty else {
-                    throw CutError(code: "source_type_mismatch", message: "The replacement recording must match the source type.")
-                }
-                let missing = selectedStreams.subtracting(index.multicam.audio.map(\.stream.index)).sorted()
-                guard missing.isEmpty else {
-                    throw CutError(code: "missing_audio_stream",
-                                   message: "The replacement recording is missing selected audio stream\(missing.count == 1 ? "" : "s") \(missing.map(String.init).joined(separator: ", ")).")
-                }
-                self.cacheIndexedSource(index.multicam, ordinary: index.ordinary)
-                let staleGeometry = project.participants.needsReconciliation(sourceID: id, identity: index.multicam.identity)
-                guard source.file != url.path else {
-                    if staleGeometry { self.fail("The recording ‘\(source.displayName)’ needs participant geometry review.") }
-                    return false
-                }
-                guard self.updateSource(id, { $0.file = url.path }) else {
-                    let message = self.notice?.message ?? "The multicam editor could not relink this recording."
-                    self.notice = nil
-                    throw CutError(code: "edit_failed", message: message)
-                }
-                if staleGeometry {
-                    self.fail("The replacement for ‘\(source.displayName)’ needs participant geometry review.")
-                }
-                return true
-            }
-            self.reconcileSourceLoads()
-            completed(outcome)
-        })
-        return request
+        let changed = try await relinkProjectMedia(from: source.file, to: url, validateCommit: validateCommit)
+        return (mcpRevision, changed, false, nil)
     }
 
     func requestSaveProject(asNew: Bool = false) {
@@ -832,10 +778,10 @@ final class MulticamEditorModel: ObservableObject {
     }
 
     @discardableResult
-    func saveProject(to destination: URL) -> Bool {
+    func saveProject(to destination: URL, flushDraftAnalysis: Bool = true) -> Bool {
         guard project != nil, !isBusy else { return false }
         do {
-            try writeProject(to: destination)
+            try writeProject(to: destination, flushDraftAnalysis: flushDraftAnalysis)
             return true
         } catch let error as CutError where error.code == "project_draft_destination" {
             fail(error.localizedDescription)
@@ -862,7 +808,8 @@ final class MulticamEditorModel: ObservableObject {
     func transcriptAssetContext() throws -> URL {
         if let url = projectURL ?? draft.url { return url }
         guard let project else { throw CutError(code: "missing_project", message: "No transcript store is available.") }
-        try draft.write { _ = try Self.writeDocument(project, undo: undoStack, redo: redoStack, to: $0) }
+        let snapshot = projectMediaSnapshotForWriting
+        try draft.write { _ = try Self.writeDocument(project, undo: undoStack, redo: redoStack, mediaSnapshot: snapshot, to: $0, checkingVolumes: interchangeCheckingVolumes) }
         guard let url = draft.url else { throw CutError(code: "missing_project", message: "No transcript store is available.") }
         return url
     }
@@ -887,7 +834,10 @@ final class MulticamEditorModel: ObservableObject {
         updateDraft()
     }
 
-    func writeProject(to destination: URL, replacingExisting: Bool = true) throws {
+    func writeProject(to destination: URL, replacingExisting: Bool = true, flushDraftAnalysis: Bool = true) throws {
+        if interchangeCheckingVolumes.contains(ProjectMediaVolume.key(for: destination)) {
+            throw CutError(code: "media_volume_checking", message: "The destination volume is still checking: \(destination.path)")
+        }
         guard var project, !isBusy else {
             throw CutError(code: "editor_busy", message: "Finish multicam setup and wait for the current operation.")
         }
@@ -900,11 +850,12 @@ final class MulticamEditorModel: ObservableObject {
         }
         try validateHistoryDestination(url)
         let expected = projectDiskRevision.flatMap { $0.matchesDestination(url) ? $0 : nil }
-        let saved = try Self.writeDocument(project, undo: undoStack, redo: redoStack, to: url,
+        let saved = try Self.writeDocument(project, undo: undoStack, redo: redoStack, mediaSnapshot: projectMediaSnapshotForWriting, to: url, checkingVolumes: interchangeCheckingVolumes,
                                            replacingExisting: replacingExisting, coordinate: true, expected: expected,
                                            copyingTranscriptsFrom: projectURL ?? draft.url)
         projectDiskRevision = saved.revision
         project.transcripts.attachments = saved.attachments
+        let flush = flushDraftAnalysis && projectURL == nil && useAnalysisSidecars && SidecarLocations.mode == .project
         projectURL = url
         self.project = project
         savedProject = project
@@ -914,6 +865,7 @@ final class MulticamEditorModel: ObservableObject {
         savedHistoryCursor = historyCursor
         draft.discard()
         status = "Saved \(url.lastPathComponent)"
+        if flush { saveAnalysisSidecars(afterFirstProjectSave: true) }
     }
 
     private var documentMediaPaths: [String: String] {
@@ -921,15 +873,14 @@ final class MulticamEditorModel: ObservableObject {
         func include(_ document: MulticamProject, includeAttachments: Bool = false) {
             for source in document.pictureSources { paths[source.file] = source.id }
             for source in document.audioSources { paths[source.file] = source.id }
-            for asset in CutProject.multicam(document).stillAssets { paths[asset.file] = asset.id }
+            for asset in document.stillAssets where !asset.isGap { paths[asset.file] = asset.id }
             for record in document.transcripts.authoring {
                 for anchor in record.anchors + [record.speakerReference].compactMap({ $0 }) {
                     if let file = anchor.binding.file { paths[file] = record.id }
                 }
             }
-            guard includeAttachments else { return }
             for attachment in document.transcripts.attachments {
-                if let context = projectURL ?? draft.url {
+                if includeAttachments, let context = projectURL ?? draft.url {
                     paths[CutProject.mediaURL(attachment.asset.file, relativeTo: context).path] = attachment.id
                     if let location = TranscriptStore.assetLocation(attachment.asset, relativeTo: context) {
                         paths[location.path] = attachment.id
@@ -962,8 +913,10 @@ final class MulticamEditorModel: ObservableObject {
         let references = Set(paths.keys)
         guard sidecarReferences != references else { return }
         sidecarReferences = references
-        let excluded = CutProject.sidecarExclusions(absoluteSources: paths,
-                                                   candidates: references.map { URL(fileURLWithPath: $0) })
+        let excluded = ProjectMediaVolume.$checking.withValue(interchangeCheckingVolumes) {
+            CutProject.sidecarExclusions(absoluteSources: paths,
+                candidates: references.map { URL(fileURLWithPath: $0, isDirectory: false) }, projectURL: sidecarWork.project)
+        }
         let changed = sidecarExclusions.symmetricDifference(excluded)
         sidecarExclusions = excluded
         filmstrip.sidecarPreference.setExclusions(excluded)
@@ -979,42 +932,51 @@ final class MulticamEditorModel: ObservableObject {
     }
 
     func validateHistoryDestination(_ output: URL, includesContents: Bool = false) throws {
-        try CutProject.validateMediaDestination(output, absoluteSources: protectedMediaPaths, includesContents: includesContents)
+        try ProjectMediaVolume.$checking.withValue(interchangeCheckingVolumes) {
+            try CutProject.validateMediaDestination(output, absoluteSources: protectedMediaPaths, includesContents: includesContents)
+        }
     }
 
     @discardableResult
     nonisolated private static func writeDocument(_ project: MulticamProject, undo: [HistoryEntry],
-                                                  redo: [HistoryEntry], to url: URL, replacingExisting: Bool = true,
+                                                  redo: [HistoryEntry], mediaSnapshot: ProjectMediaSnapshot, to url: URL,
+                                                  checkingVolumes: Set<String> = [], replacingExisting: Bool = true,
                                                   coordinate: Bool = false,
                                                   expected: ProjectDiskRevision? = nil,
                                                   copyingTranscriptsFrom source: URL? = nil) throws
         -> (revision: ProjectDiskRevision?, attachments: [TranscriptAttachment]) {
-        var paths: [String: String] = [:]
-        func document(_ value: MulticamProject) -> CutProject {
-            .multicam(Self.mapSourcePaths(in: value, cache: &paths) { CutProject.relativeMediaPath($0, to: url) })
-        }
-        func state(_ entry: HistoryEntry) -> CutHistoryState {
-            CutHistoryState(action: entry.action, origin: entry.origin, project: document(entry.project))
-        }
-        let current = document(project)
-        let undo = undo.map(state), redo = redo.map(state)
-        if coordinate {
-            if let source {
-                let saved = try current.saveCopyRevision(to: url, copyingTranscriptsFrom: source, undo: undo, redo: redo,
-                                                         replacingExisting: replacingExisting, expected: expected)
-                // The disk archive stores binding paths relative to its location. Keep live bindings absolute.
-                var attachments = project.transcripts.attachments
-                for index in attachments.indices {
-                    attachments[index].asset = saved.project.transcripts.attachments[index].asset
-                }
-                return (saved.revision, attachments)
+        try ProjectMediaVolume.$checking.withValue(checkingVolumes) {
+            var paths: [String: String] = [:]
+            func document(_ value: MulticamProject) -> CutProject {
+                .multicam(Self.mapSourcePaths(in: value, cache: &paths) { CutProject.relativeMediaPath($0, to: url) })
             }
-            let revision = try current.saveRevision(to: url, undo: undo, redo: redo,
-                                                    replacingExisting: replacingExisting, expected: expected)
-            return (revision, project.transcripts.attachments)
+            func state(_ entry: HistoryEntry) -> CutHistoryState {
+                CutHistoryState(action: entry.action, origin: entry.origin, project: document(entry.project),
+                                bindingChanges: entry.bindingChanges.map { change in
+                                    change.mappingPaths { CutProject.relativeMediaPath($0, to: url) }
+                                })
+            }
+            let current = document(project)
+            let undo = undo.map(state), redo = redo.map(state)
+            let snapshot = mediaSnapshot.mappingPaths { CutProject.relativeMediaPath($0, to: url) }
+            if coordinate {
+                if let source {
+                    let saved = try current.saveCopyRevision(to: url, copyingTranscriptsFrom: source, undo: undo, redo: redo, mediaSnapshot: snapshot,
+                                                             replacingExisting: replacingExisting, expected: expected)
+                    // The disk archive stores binding paths relative to its location. Keep live bindings absolute.
+                    var attachments = project.transcripts.attachments
+                    for index in attachments.indices {
+                        attachments[index].asset = saved.project.transcripts.attachments[index].asset
+                    }
+                    return (saved.revision, attachments)
+                }
+                let revision = try current.saveRevision(to: url, undo: undo, redo: redo, mediaSnapshot: snapshot,
+                                                        replacingExisting: replacingExisting, expected: expected)
+                return (revision, project.transcripts.attachments)
+            }
+            try current.saveStaged(to: url, undo: undo, redo: redo, mediaSnapshot: snapshot, replacingExisting: replacingExisting)
+            return (nil, project.transcripts.attachments)
         }
-        try current.saveStaged(to: url, undo: undo, redo: redo, replacingExisting: replacingExisting)
-        return (nil, project.transcripts.attachments)
     }
 
     /// All states use the document's directory. Resolve each distinct media path once per read or write.
@@ -1031,6 +993,7 @@ final class MulticamEditorModel: ObservableObject {
         copy.angles = project.angles.map { $0.mappingFiles(path) }
         copy.audioSources = project.audioSources.map { $0.mappingFiles(path) }
         copy.stillAssets = project.stillAssets.map { asset in
+            guard !asset.isGap else { return asset }
             var copy = asset
             copy.file = path(asset.file)
             return copy
@@ -1042,8 +1005,10 @@ final class MulticamEditorModel: ObservableObject {
         guard projectURL == nil, let project else { return }
         let undo = undoStack
         let redo = redoStack
+        let snapshot = projectMediaSnapshotForWriting
+        let checkingVolumes = interchangeCheckingVolumes
         let save: @Sendable (URL) throws -> Void = { url in
-            _ = try Self.writeDocument(project, undo: undo, redo: redo, to: url)
+            _ = try Self.writeDocument(project, undo: undo, redo: redo, mediaSnapshot: snapshot, to: url, checkingVolumes: checkingVolumes)
         }
         func records(in value: MulticamProject) -> Int {
             value.angles.count + value.audioSources.count + value.switches.count + (value.assemblyItems?.count ?? 0)
@@ -1096,13 +1061,15 @@ final class MulticamEditorModel: ObservableObject {
         guard let project = project ?? pendingSetupProject, isChanged else { return }
         let undo = undoStack, redo = redoStack
         let source = projectURL
+        let snapshot = projectMediaSnapshotForWriting
+        let checkingVolumes = interchangeCheckingVolumes
         let save: @Sendable (URL) throws -> Void = { url in
             var document = project
             if let source {
                 let draftDocument = url.deletingLastPathComponent().appendingPathComponent("Untitled.cut")
                 document.transcripts = try TranscriptStore.copy(in: document.transcripts, from: source, to: draftDocument, draft: true)
             }
-            _ = try Self.writeDocument(document, undo: undo, redo: redo, to: url)
+            _ = try Self.writeDocument(document, undo: undo, redo: redo, mediaSnapshot: snapshot, to: url, checkingVolumes: checkingVolumes)
         }
         do {
             try draft.write(save)
@@ -1110,6 +1077,8 @@ final class MulticamEditorModel: ObservableObject {
     }
 
     func reset() {
+        projectMediaJobs.reset()
+        projectMediaRequest = nil
         mediaRefresh.reset()
         mediaRefreshProgress = nil
         mediaRefreshWarnings = [:]
@@ -1130,7 +1099,8 @@ final class MulticamEditorModel: ObservableObject {
         resetExportQueue()
         isReplacementAudioPresented = false
         trackReplacementTarget = nil
-        cancel()
+        if !isFlushingDraftSidecars { cancel() }
+        isFlushingDraftSidecars = false
         operation = nil
         worker = nil
         isBusy = false
@@ -1144,6 +1114,7 @@ final class MulticamEditorModel: ObservableObject {
         pauseEdits.reset()
         project = nil
         savedMediaPaths = [:]
+        mediaSnapshot = .init()
         importingURLs = []
         sidecarReferences = []
         sidecarExclusions = []
@@ -1188,7 +1159,8 @@ final class MulticamEditorModel: ObservableObject {
         preview.pause()
         provisionalGroupRange = nil
         self.project = project
-        self.media = media
+        mediaSnapshot = .init()
+        self.media = media.mapValues(filmstrip.sidecarPreference.attachingDocument)
         sourceIssues = issues
         indexedByURL = Dictionary(grouping: media.values, by: \.url).compactMapValues(\.first)
         issuesByPath = Dictionary(grouping: project.sources, by: \.file)
@@ -1284,16 +1256,23 @@ final class MulticamEditorModel: ObservableObject {
         var undo = undoStack, redo = redoStack
         var target = project
         var restored: Selection? = selection
+        var bindingChanges: [[TranscriptBindingChange]] = []
         while index != undo.count {
             let entry = backwards ? undo.removeLast() : redo.removeLast()
-            let inverse = HistoryEntry(action: entry.action, origin: entry.origin, project: target, selection: restored)
+            bindingChanges.append(entry.bindingChanges)
+            let inverse = HistoryEntry(action: entry.action, origin: entry.origin, project: target, selection: restored,
+                                       bindingChanges: entry.bindingChanges.map(\.reversed))
             if backwards { redo.append(inverse) } else { undo.append(inverse) }
             target = entry.project
             restored = entry.selection
         }
         var transcripts = project.transcripts
-        if transcripts.authoring != target.transcripts.authoring {
+        let changesBindings = bindingChanges.reduce(false) { changed, transitions in
+            TranscriptBindingChange.apply(transitions, to: &transcripts) || changed
+        }
+        if transcripts.authoring != target.transcripts.authoring || changesBindings {
             transcripts.authoring = target.transcripts.authoring
+            transcripts.revision = project.transcripts.revision
             do { try transcripts.advanceRevision() } catch { fail(error.localizedDescription); return }
         }
         target.transcripts = transcripts
@@ -1345,18 +1324,24 @@ final class MulticamEditorModel: ObservableObject {
         let cameras = Set(project.pictureSources.map(\.id))
         let updated = Dictionary(uniqueKeysWithValues: project.sources.compactMap { source -> (String, MediaInfo)? in
             guard let url = Self.availableURL(source),
+                  mediaWatcher?.status(for: url) != .offline, mediaWatcher?.status(for: url) != .checking,
                   let info = indexedByURL[url],
                   (cameras.contains(source.id) ? info.hasVideo : !info.audio.isEmpty) else { return nil }
-            return (source.id, info)
+            return (source.id, filmstrip.sidecarPreference.attachingDocument(to: info))
         })
         if media.mapValues(\.url) != updated.mapValues(\.url) ||
             media.mapValues(\.identity) != updated.mapValues(\.identity) ||
             media.mapValues(\.hasFullEditIndex) != updated.mapValues(\.hasFullEditIndex) || force { media = updated }
         let issues = Dictionary(uniqueKeysWithValues: project.sources.compactMap { source -> (String, String)? in
-            if updated[source.id] != nil { return nil }
             guard let url = Self.availableURL(source) else {
                 return (source.id, "A parent folder in the recording path is unavailable.")
             }
+            switch mediaWatcher?.status(for: url) {
+            case .offline: return (source.id, "Recording is offline.")
+            case .checking: return (source.id, "Checking volume…")
+            default: break
+            }
+            if updated[source.id] != nil { return nil }
             if indexedByURL[url] != nil {
                 return (source.id, "The recording does not match the source type.")
             }
@@ -1398,10 +1383,11 @@ final class MulticamEditorModel: ObservableObject {
         }
         for url in urls where sourceLoads[url] == nil && indexIssuesByURL[url] == nil && issuesByPath[url.path] == nil {
             let header = indexedByURL[url]
-            guard header?.hasFullEditIndex != true else { continue }
+            guard header?.hasFullEditIndex != true,
+                  mediaWatcher?.status(for: url) != .offline, mediaWatcher?.status(for: url) != .checking else { continue }
             let id = UUID()
             let key = SourceIndexLoader.Key(url: url, sidecars: usesSidecar(for: url), preview: header == nil,
-                                            identity: header?.identity)
+                                            identity: header?.identity, project: sidecarWork.project)
             let cancel = SourceIndexLoader.shared.admit(key, progress: { [weak self] fraction in
                 guard let self, let load = self.sourceLoads[url], load.id == id, fraction > load.progress else { return }
                 self.sourceLoads[url]?.progress = fraction
@@ -1491,7 +1477,7 @@ final class MulticamEditorModel: ObservableObject {
 
     func ordinaryAnalysisMedia(_ id: String) -> MediaInfo? {
         guard let info = media[id], info.hasFullEditIndex else { return nil }
-        return ordinaryByURL[info.url] ?? (info.multicamClockOffset == .zero ? info : nil)
+        return ordinaryByURL[info.url].map(filmstrip.sidecarPreference.attachingDocument) ?? (info.multicamClockOffset == .zero ? info : nil)
     }
 
     @discardableResult
@@ -2232,19 +2218,37 @@ final class MulticamEditorModel: ObservableObject {
         }
     }
 
-    func saveAnalysisSidecars() {
+    func saveAnalysisSidecars() { saveAnalysisSidecars(afterFirstProjectSave: false) }
+
+    private func saveAnalysisSidecars(afterFirstProjectSave: Bool) {
         guard canSaveSidecars else { return }
+        if SidecarLocations.mode == .project, projectURL == nil {
+            if let receipt = mcpSidecarReceipt {
+                receipt.finish("failed", detail: ["error": "Save the project before saving analysis in its folder."])
+                mcpSidecarReceipt = nil
+            } else {
+                let panel = makeSavePanel()
+                ProjectPanels.present(panel, in: window) { [weak self] accepted in
+                    guard let self, accepted, let url = panel.url, self.saveProject(to: url, flushDraftAnalysis: false) else { return }
+                    self.saveAnalysisSidecars()
+                }
+            }
+            return
+        }
         let receipt = mcpSidecarReceipt
         let outputs = receipt.map { _ in MCPLiveOutputProgress() }
         let endWork = receipt?.cleanup.begin()
         var seen: Set<URL> = []
         let sources = media.keys.sorted().compactMap { id -> (MediaInfo, MediaInfo?, [FilmstripTile], MulticamAnalysisSnapshot)? in
             guard let info = media[id] else { return nil }
+            if afterFirstProjectSave, !filmstrip.sidecarPreference.permits(info.url) { return nil }
             guard info.hasFullEditIndex, seen.insert(info.url).inserted else { return nil }
             let ordinary = ordinaryAnalysisMedia(id)
             let snapshot = ordinary.map { analysis.snapshot(for: $0) } ?? MulticamAnalysisSnapshot()
-            return (info, ordinary, filmstrip.snapshot(for: info), snapshot)
+            return (info.pinningSidecarWrites(), ordinary, filmstrip.snapshot(for: info), snapshot)
         }
+        guard !sources.isEmpty else { endWork?(); return }
+        isFlushingDraftSidecars = afterFirstProjectSave
         let protected = protectedMediaPaths
         let checkpointRequests = Dictionary(grouping: analysis.sceneCheckpointRequests, by: { $0.media.identity })
         let sceneCache = analysis.sceneCache
@@ -2263,7 +2267,7 @@ final class MulticamEditorModel: ObservableObject {
                 // Multicam adds the authored MOV offset after reading that index.
                 let indexed = try AnalysisSidecar.$automaticWritesEnabled.withValue(false) {
                     try ordinary ?? engine.inspect(info.url, keyframes: true)
-                }
+                }.inheritingSidecarContext(from: info)
                 guard indexed.identity.matchesSnapshot(info.identity) else {
                     throw CutError(code: "source_changed", message: "Source \(info.url.lastPathComponent) changed. Relink it before saving its analysis.")
                 }
@@ -2278,7 +2282,8 @@ final class MulticamEditorModel: ObservableObject {
                         }
                     }
                 }
-                try AnalysisSidecar(media: info).save(sections, updating: snapshot.metadataUpdates,
+                let store = AnalysisSidecar(media: info)
+                try store.save(sections, updating: snapshot.metadataUpdates,
                     retainingLatest: tiles.isEmpty ? [:] : [FilmstripTileKey.sectionPrefix: FilmstripTileBuffer.countLimit],
                     cancelled: cancelled)
                 for item in checkpointRequests[indexed.identity] ?? [] {
@@ -2287,7 +2292,7 @@ final class MulticamEditorModel: ObservableObject {
                         checkpoints.append((item.id, progress))
                     }
                 }
-                outputs?.published(AnalysisSidecar.url(for: info.url))
+                outputs?.published(store.url)
                 outputs?.update(Double(index + 1) / Double(sources.count))
             }
             return (sources.count, checkpoints)
@@ -2300,7 +2305,7 @@ final class MulticamEditorModel: ObservableObject {
         } onSuccess: { result in
             let (count, checkpoints) = result
             for (id, progress) in checkpoints { self.analysis.didSaveSceneCheckpoint(id, progress: progress) }
-            receipt?.finish("succeeded", detail: ["outputs": sources.map { AnalysisSidecar.url(for: $0.0.url).path }])
+            receipt?.finish("succeeded", detail: outputs?.snapshot ?? [:])
             self.mcpSidecarReceipt = nil
             for (_, ordinary, _, snapshot) in sources {
                 if let ordinary { self.analysis.didSave(snapshot, for: ordinary) }
@@ -2399,6 +2404,7 @@ final class MulticamEditorModel: ObservableObject {
                 settings: ReencodeSettings = .init(), selection: [MulticamRange]? = nil,
                 requireCameraCopy: Bool = false, saveResult: Bool = false,
                 audioOutput: MulticamAudioOutput = .separateTracks, audioAction: ReencodeAudio? = nil,
+                pictureTiming: StillPictureTiming? = nil,
                 reviewed: ((String) -> Void)? = nil, checked: (() -> Void)? = nil) {
         guard let project, !isBusy else { return }
         preview.pause()
@@ -2439,14 +2445,15 @@ final class MulticamEditorModel: ObservableObject {
                     let plan = try planner.resolve(stillDocument, tracks: tracks, mode: mode,
                                                    requireCameraCopy: tracks != .audio && requireCameraCopy,
                                                    output: output, settings: settings,
-                                                   audioOutput: audioOutput, audioAction: audioAction)
+                                                   audioOutput: audioOutput, audioAction: audioAction,
+                                                   pictureTiming: pictureTiming)
                     if dryRun { return (plan.inspectorSummary, plan.audioDeliverySummary) }
                     let result = saveResult ? try ExportResultFile(output: output, plan: plan.report, cutMap: plan.report.cutMap) : nil
                     try planner.write(plan, to: output) {
                         update(token, $0)
                         return !token.isCancelled
                     }
-                    return (result?.completionMessage(for: output) ?? "Exported \(output.lastPathComponent)", "")
+                    return (ExportResultFile.stillCompletionMessage(for: output, result: result), "")
                 }
                 let engine = MulticamEngine(cancelled: { token.isCancelled })
                 // The plan, or the failure with the alternatives of the export rules, as every export reports them.
@@ -2499,12 +2506,10 @@ final class MulticamEditorModel: ObservableObject {
         mediaRefresh.cancel()
         operation?.cancel()
         if !importLoads.isEmpty {
-            let onCancel = cancelRelinkRequest
             for cancel in importLoads { cancel() }
             finishImport()
             reconcileSourceLoads()
             status = "Cancelled."
-            onCancel?()
         }
     }
 
@@ -2512,7 +2517,7 @@ final class MulticamEditorModel: ObservableObject {
         let operationWorker = worker ?? mediaRefresh.worker
         let metadataWrite = analysis.metadataWrite
         guard !importLoads.isEmpty || operationWorker != nil || metadataWrite != nil else { return false }
-        cancel()
+        if !isFlushingDraftSidecars { cancel() }
         Task { @MainActor in
             await operationWorker?.value
             await metadataWrite?.value
@@ -2540,7 +2545,7 @@ final class MulticamEditorModel: ObservableObject {
         isExporting = exporting
         progress = exporting ? 0 : nil
         status = label
-        let task = Task.detached(priority: .userInitiated) {
+        let task = sidecarWork.detached(priority: .userInitiated) {
             try AnalysisSidecar.$excludedSources.withValue(protected) { try work(token, useSidecar) }
         }
         worker = Task { [weak self] in
@@ -2549,6 +2554,7 @@ final class MulticamEditorModel: ObservableObject {
             if !additionalSources.isEmpty { self.importingURLs = [] }
             defer { if !additionalSources.isEmpty { self.reconcileSourceLoads() } }
             self.operation = nil
+            self.isFlushingDraftSidecars = false
             self.openingProjectURL = nil
             self.isBusy = false
             self.isExporting = false
@@ -2611,36 +2617,69 @@ extension MulticamEditorModel {
     }
 
     func refreshProjectMedia(deep: Bool = false, receipt: MCPAnalysisReceipt? = nil) {
+        updateMediaWatcher()
         _ = refreshProjectMedia(deep: deep, verify: [], receipt: receipt)
     }
 
-    private func updateMediaWatcher() {
-        guard preferences.automaticallyRefreshMedia else {
-            mediaWatcher?.stop()
-            mediaWatcher = nil
-            return
-        }
-        if mediaWatcher == nil {
-            mediaWatcher = ProjectMediaWatcher { [weak self] verify in
-                self?.refreshProjectMedia(deep: false, verify: verify, receipt: nil) ?? false
-            }
-        }
-        mediaWatcher?.update(Set((project?.sources ?? []).compactMap(Self.availableURL)))
+    private func currentMediaTargets() -> [URL: Bool] {
+        guard let project else { return queuedMediaTargets.presenceOnlyByURL }
+        let location = projectURL ?? draft.url ?? URL(fileURLWithPath: "/Untitled.cut", isDirectory: false)
+        return CutProject.multicam(project).mediaRefreshTargets(relativeTo: location)
+            .merging(queuedMediaTargets.presenceOnlyByURL) { $0 && $1 }
     }
 
-    private func refreshProjectMedia(deep: Bool, verify: Set<URL>, receipt: MCPAnalysisReceipt?) -> Bool {
-        guard canRefreshProjectMedia, let project else {
+    func mediaStatus(for url: URL) -> ProjectMediaStatus {
+        let url = ProjectMediaVolume.watchURL(url)
+        if let status = mediaWatcher?.status(for: url), status == .checking || status == .offline || status == .changed {
+            return status == .offline && ignoredMediaPaths.contains(url.path)
+                ? .ignored : status
+        }
+        if refreshReviewPicture.contains(url) || !(refreshReviewStreams[url] ?? []).isEmpty { return .needsReview }
+        if !refreshReviewReasons.isEmpty, let project, project.sources.contains(where: {
+            refreshReviewReasons[$0.id] != nil && Self.availableURL($0) == url
+        }) { return .needsReview }
+        if sourceLoads[url] != nil { return .indexing }
+        return mediaWatcher?.status(for: url) ?? .online
+    }
+
+    private func updateMediaWatcher() {
+        if mediaWatcher == nil {
+            mediaWatcher = ProjectMediaWatcher(publish: { [weak self] urls in
+                guard let self, let project = self.project else { return }
+                self.objectWillChange.send()
+                self.invalidateQueuedMedia(at: Set(urls.filter {
+                    let status = self.mediaStatus(for: $0)
+                    return status == .offline || status == .changed || status == .ignored
+                }))
+                guard project.sources.contains(where: { Self.availableURL($0).map(urls.contains) == true }) else { return }
+                self.preview.invalidateMedia(urls)
+                self.updateMedia(for: project, force: true)
+                self.publishSourceProgress()
+            }, refresh: { [weak self] urls, verify in
+                guard let self, let project = self.project else { return true }
+                let recordings = urls.intersection(project.sources.compactMap(Self.availableURL))
+                guard !recordings.isEmpty else { return true }
+                return self.refreshProjectMedia(deep: false, verify: verify, receipt: nil, only: recordings)
+            })
+        }
+        let expected = queuedMediaTargets.indexed.mapValues(\.identity)
+            .merging(ordinaryByURL.mapValues(\.identity)) { _, current in current }
+        mediaWatcher?.update(Set(currentMediaTargets().keys), expected: expected, perFile: preferences.automaticallyRefreshMedia)
+    }
+
+    private func refreshProjectMedia(deep: Bool, verify: Set<URL>, receipt: MCPAnalysisReceipt?, only: Set<URL>? = nil) -> Bool {
+        guard canRefreshProjectMedia, project != nil else {
             receipt?.finish("failed", detail: ["error": "Finish the current project operation before refreshing media."])
             return false
         }
-        let documents = [project] + undoStack.map(\.project) + redoStack.map(\.project) + queuedRanges.map(\.project)
-        let urls = Set(documents.flatMap(\.sources).compactMap(Self.availableURL))
+        let targets = currentMediaTargets().filter { only?.contains($0.key) != false && mediaWatcher?.status(for: $0.key) != .checking }
         var verify = verify
-        let inputs = urls.map { url in
+        let inputs = targets.map { url, presenceOnly in
             if issuesByPath[url.path] != nil { verify.insert(url) }
             let previous = ordinaryByURL[url] ?? refreshBaselines[url] ??
-                indexedByURL[url].flatMap { $0.multicamClockOffset == .zero ? $0 : nil }
-            return ProjectMediaRefreshInput(url: url, previous: previous)
+                indexedByURL[url].flatMap { $0.multicamClockOffset == .zero ? $0 : nil } ??
+                queuedMediaTargets.indexed[url]
+            return ProjectMediaRefreshInput(url: url, previous: previous, presenceOnly: presenceOnly)
         }
         guard !inputs.isEmpty else {
             receipt?.finish("failed", detail: ["error": "No recordings are referenced by this project."])
@@ -2651,14 +2690,17 @@ extension MulticamEditorModel {
         mediaRefreshProgress = 0
         status = "Refreshing project media…"
         mediaRefresh.start(inputs: inputs, deep: deep, verify: verify, persist: useAnalysisSidecars, alignForMulticam: true,
-                           exclusions: sidecarExclusions, receipt: receipt, progress: { [weak self] fraction in
+                           project: projectURL, exclusions: sidecarExclusions, receipt: receipt, progress: { [weak self] fraction in
             self?.progress = fraction
             self?.mediaRefreshProgress = fraction
-        }, publish: { [weak self] result, aliases, aligned in
+        }, publish: { [weak self] result, aliases, aligned, identity in
+            self?.mediaWatcher?.noteVerified(aliases, identity: identity)
             self?.installMediaRefresh(result, aliases: aliases, aligned: aligned)
+            self?.objectWillChange.send()
         }, finished: { [weak self] message in
             guard let self else { return }
             self.mediaRefreshProgress = nil
+            if only == nil { self.mediaWatcher?.checkNow() }
             self.progress = nil
             self.isBusy = false
             self.status = message
@@ -2671,15 +2713,28 @@ extension MulticamEditorModel {
         invalidatedQueueIDs.remove(id)
     }
 
-    func queuedMediaRefreshIssue() -> CutError? {
-        if project?.participants.render != nil { return ParticipantProjectExport.unsupported("A queued range export") }
-        guard queuedRanges.contains(where: { invalidatedQueueIDs.contains($0.id) }) else { return nil }
-        return CutError(code: "source_changed", message: "Remove and re-add affected queued ranges to export the refreshed media.")
+    var readyQueuedRanges: [MulticamQueuedRange] {
+        queuedRanges.filter { !invalidatedQueueIDs.contains($0.id) }
+    }
+
+    func invalidateQueuedMedia(at paths: Set<URL>) {
+        guard !paths.isEmpty, !queuedRanges.isEmpty else { return }
+        let keys = Set(paths.map(ProjectMediaVolume.watchURL))
+        let affected = readyQueuedRanges.filter { entry in
+            entry.mediaDependencies.contains { keys.contains(ProjectMediaVolume.watchURL($0)) }
+        }.map(\.id)
+        if !affected.isEmpty { invalidatedQueueIDs.formUnion(affected) }
     }
 
     func refreshIssue(for span: MulticamSpan, mayStartWithSilence: Bool = false) -> String? {
         guard let source = project?.sources.first(where: { $0.id == span.source }),
               let url = Self.availableURL(source) else { return nil }
+        switch mediaWatcher?.status(for: url) {
+        case .offline: return "\(source.displayName) — recording is offline. Open Project Media to relink it."
+        case .checking: return "\(source.displayName) — checking the recording’s volume."
+        case .changed: return "\(source.displayName) — the recording changed. Open Project Media to review it."
+        default: break
+        }
         if let unavailable = refreshReviewReasons[span.source] { return unavailable }
         guard let info = media[span.source], refreshBaselines[url] != nil else { return nil }
         if let stream = span.stream {
@@ -2738,12 +2793,10 @@ extension MulticamEditorModel {
             for alias in aliases {
                 let item = media.forRefreshAlias(alias)
                 refreshBaselines[alias] = item
-                SourceIndexLoader.shared.acceptRefreshedIndex(item, sidecars: usesSidecar(for: alias))
+                SourceIndexLoader.shared.acceptRefreshedIndex(item, sidecars: usesSidecar(for: alias), project: projectURL)
             }
         }
-        for queued in queuedRanges where queued.project.sources.contains(where: { Self.availableURL($0).map(matches) == true }) {
-            invalidatedQueueIDs.insert(queued.id)
-        }
+        invalidateQueuedMedia(at: aliases.union([url]))
         var refreshedIndexes: [URL: MediaInfo] = [:]
         for source in sources {
             guard let alias = Self.availableURL(source) else { continue }
@@ -2803,14 +2856,195 @@ extension MulticamEditorModel {
     }
 
     func seekParticipantAppearance(sourceID: String, range: MulticamRange) {
+        let clockOffset = media[sourceID]?.multicamClockOffset ?? .zero
+        guard let from = try? range.from.adding(clockOffset), let to = try? range.to.adding(clockOffset) else { return }
         let occurrences = mapping?.picture.compactMap { span -> RationalTime? in
-            let source = max(range.from, span.input.from)
-            guard span.source == sourceID, source < min(range.to, span.input.to) else { return nil }
+            let source = max(from, span.input.from)
+            guard span.source == sourceID, source < min(to, span.input.to) else { return nil }
             return try? span.output.from.adding(source.subtracting(span.input.from))
         } ?? []
         if let time = occurrences.min(by: { abs($0.seconds - preview.time.seconds) < abs($1.seconds - preview.time.seconds) }) {
             preview.pause()
             preview.seek(to: time)
         }
+    }
+}
+
+extension MulticamEditorModel {
+    private var canChangeProjectMedia: Bool {
+        !isBusy && !isBulkQueuePresented && analysis.metadataWrite == nil && notice == nil
+    }
+
+    var projectMediaSnapshotForWriting: ProjectMediaSnapshot {
+        // Refresh removes unavailable sources from the live index but keeps the
+        // last inspected generation available for verification and the next save.
+        let indices = refreshBaselines
+            .merging(indexedByURL) { _, indexed in indexed }
+            .merging(ordinaryByURL) { _, ordinary in ordinary }
+            .values.map { ($0.url.path, $0) }
+        let assets = ([project].compactMap { $0 } + undoStack.map(\.project) + redoStack.map(\.project)).flatMap(\.stillAssets)
+        var seen = Set(indices.map(\.0))
+        let entries = assets.compactMap { ProjectMediaSnapshot.Entry(path: $0.file, asset: $0) }
+            .filter { seen.insert($0.path).inserted }
+        return mediaSnapshot.merging(media: indices, stills: entries)
+    }
+
+    var projectMediaArchive: LiveProjectMediaArchive? {
+        guard let project else { return nil }
+        func state(_ entry: HistoryEntry) -> CutHistoryState {
+            .init(action: entry.action, origin: entry.origin, project: .multicam(entry.project), bindingChanges: entry.bindingChanges)
+        }
+        return .init(project: .multicam(project), undo: undoStack.map(state), redo: redoStack.map(state),
+                     snapshot: projectMediaSnapshotForWriting, documentURL: projectURL ?? draft.url ?? LiveProjectMediaArchive.untitledURL,
+                     checkingVolumes: interchangeCheckingVolumes)
+    }
+
+    func relinkProjectMedia(from: String, to: URL, validateCommit: @escaping @MainActor () throws -> Void = {}) async throws -> Bool {
+        guard canChangeProjectMedia, let archive = projectMediaArchive else { throw unavailableLiveProjectMedia() }
+        let generation = mcpGeneration, revision = mcpRevision
+        let result = try await archive.relink(from, to: to)
+        return try installProjectMedia(result.project, archive: archive, snapshot: result.snapshot,
+                                       relinkHistory: (result.undo, result.redo), affected: [archive.url(from)],
+                                       verified: result.candidate.outcome == .verified ? [archive.url(from): result.candidate] : [:],
+                                       generation: generation, revision: revision) {
+            try validateCommit()
+            if result.candidate.outcome.canRelink {
+                try checkLiveMediaVolume(result.candidate.url, volumes: self.interchangeCheckingVolumes)
+            }
+            try result.candidate.checkGeneration()
+        }
+    }
+
+    func relinkProjectMedia(_ mappings: [ProjectMediaMapping], validateCommit: @escaping @MainActor () throws -> Void = {}) async throws
+        -> LiveProjectMediaRelinkBatch {
+        guard canChangeProjectMedia, let archive = projectMediaArchive else { throw unavailableLiveProjectMedia() }
+        let generation = mcpGeneration, revision = mcpRevision
+        return try await archive.applyRelinks(mappings, checkingVolumes: { self.interchangeCheckingVolumes }) { result, rows, validateRows in
+            let verified = Dictionary(rows.filter { $0.candidate.outcome == .verified }
+                .map { (archive.url($0.from), $0.candidate) }, uniquingKeysWith: { first, _ in first })
+            return try installProjectMedia(result.project, archive: archive, snapshot: result.snapshot,
+                                     relinkHistory: (result.undo, result.redo), affected: Set(rows.map { archive.url($0.from) }),
+                                     verified: verified, generation: generation, revision: revision) {
+                try validateCommit()
+                try validateRows()
+            }
+        }
+    }
+
+    func revertProjectMedia(_ path: String, validateCommit: @escaping @MainActor () throws -> Void = {}) async throws -> Bool {
+        guard canChangeProjectMedia, let archive = projectMediaArchive else { throw unavailableLiveProjectMedia() }
+        let generation = mcpGeneration, revision = mcpRevision
+        let result = try await archive.revert(path)
+        return try installProjectMedia(result.project, archive: archive, snapshot: result.snapshot,
+                                       relinkHistory: (result.undo, result.redo), affected: [archive.url(path)],
+                                       verified: result.candidate.outcome == .verified ? [archive.url(path): result.candidate] : [:],
+                                       generation: generation, revision: revision) {
+            try validateCommit()
+            if result.candidate.outcome.canRelink {
+                try checkLiveMediaVolume(result.candidate.url, volumes: self.interchangeCheckingVolumes)
+            }
+            try result.candidate.checkGeneration()
+        }
+    }
+
+    func ignoreProjectMedia(_ path: String) throws {
+        guard canChangeProjectMedia, var archive = projectMediaArchive else { throw unavailableLiveProjectMedia() }
+        try archive.ignore(path)
+        mediaSnapshot = archive.snapshot
+        historyRevision += 1
+        mcpRevision += 1
+        objectWillChange.send()
+        updateMediaWatcher()
+        updateDraft()
+    }
+
+    func applyProjectMediaReplacement(_ preview: MediaReplacePreview,
+                                      validateCommit: @escaping @MainActor () throws -> Void = {}) async throws -> Bool {
+        guard canChangeProjectMedia, let archive = projectMediaArchive else { throw unavailableLiveProjectMedia() }
+        try checkLiveMediaVolume(preview.candidateURL, volumes: self.interchangeCheckingVolumes)
+        let project = try preview.applying(to: archive.project)
+        return try installProjectMedia(project, archive: archive, snapshot: preview.snapshot,
+                                       relinkHistory: nil, affected: [preview.sourceURL],
+                                       generation: mcpGeneration, revision: mcpRevision,
+                                       replacingAt: preview.replacesAtSameLocation ? preview.sourceURL : nil) {
+            try validateCommit()
+            try checkLiveMediaVolume(preview.candidateURL, volumes: self.interchangeCheckingVolumes)
+            try preview.checkGeneration()
+        }
+    }
+
+    private func installProjectMedia(_ document: CutProject, archive: LiveProjectMediaArchive, snapshot snapshotMedia: ProjectMediaSnapshot,
+                                     relinkHistory states: (undo: [CutHistoryState], redo: [CutHistoryState])?, affected: Set<URL>,
+                                     verified: [URL: ProjectMediaCandidate] = [:], generation: UUID, revision: Int,
+                                     replacingAt: URL? = nil,
+                                     validateCommit: () throws -> Void) throws -> Bool {
+        try Task.checkCancellation()
+        try validateCommit()
+        let nextDocument = document.mapMediaPaths(archive.absolutePath)
+        let snapshot = snapshotMedia.mappingPaths(archive.absolutePath)
+        let relinkHistory = states.map { (undo: archive.absoluteHistory($0.undo), redo: archive.absoluteHistory($0.redo)) }
+        guard canChangeProjectMedia, generation == mcpGeneration, revision == mcpRevision, let project,
+              (projectURL ?? draft.url ?? LiveProjectMediaArchive.untitledURL) == archive.documentURL,
+              CutProject.multicam(project) == archive.project, undoStack.count == archive.undo.count, redoStack.count == archive.redo.count,
+              case .multicam(var next) = nextDocument else { throw staleLiveProjectMedia() }
+        let historyChanged = relinkHistory.map { $0.undo != archive.undo || $0.redo != archive.redo } ?? false
+        guard nextDocument != archive.project || snapshot != archive.snapshot || historyChanged else { return false }
+        if next.transcripts != project.transcripts, next.transcripts.revision == project.transcripts.revision {
+            try next.transcripts.advanceRevision()
+        }
+        if let relinkHistory {
+            func map(_ existing: [HistoryEntry], _ states: [CutHistoryState]) throws -> [HistoryEntry] {
+                try zip(existing, states).map { entry, state in
+                    guard case .multicam(let project) = state.project else { throw staleLiveProjectMedia() }
+                    var entry = entry
+                    entry.project = project
+                    entry.bindingChanges = state.bindingChanges ?? []
+                    return entry
+                }
+            }
+            let undo = try map(undoStack, relinkHistory.undo)
+            let redo = try map(redoStack, relinkHistory.redo)
+            undoStack = undo
+            redoStack = redo
+        } else {
+            if preferences.historyLimit > 0 {
+                undoStack.append(.init(action: "Replace Source File", project: project, selection: selection,
+                                       bindingChanges: TranscriptBindingChange.changes(from: next.transcripts, to: project.transcripts)))
+            }
+            redoStack.removeAll()
+            _ = trimHistory()
+            lastEditAction = "Replace Source File"
+            if let replacingAt {
+                indexedByURL[replacingAt] = nil
+                ordinaryByURL[replacingAt] = nil
+                issuesByPath[replacingAt.path] = nil
+                indexIssuesByURL[replacingAt] = nil
+                refreshReviewPicture.remove(replacingAt)
+                refreshReviewStreams[replacingAt] = nil
+                refreshBaselines[replacingAt] = nil
+                sourceLoads.removeValue(forKey: replacingAt)?.cancel()
+                for source in next.sources where Self.availableURL(source) == replacingAt {
+                    refreshReviewReasons[source.id] = nil
+                    mediaRefreshWarnings[source.id] = nil
+                }
+            }
+        }
+        if !verified.isEmpty {
+            let snapshots = Dictionary(archive.snapshot.entries.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
+            for source in project.sources {
+                let path = archive.url(source.file)
+                guard let candidate = verified[path],
+                      let original = media[source.id] ?? refreshBaselines[path],
+                      snapshots[path.path]?.sourceFingerprint == original.identity.transcriptFingerprint else { continue }
+                analysis.carryVerifiedRelink(source.id, to: candidate, original: original)
+            }
+        }
+        historyRevision += 1
+        mediaSnapshot = snapshot
+        apply(next)
+        if mcpRevision == revision { mcpRevision += 1 }
+        invalidateQueuedMedia(at: affected)
+        updateDraft()
+        return true
     }
 }

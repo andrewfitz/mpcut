@@ -30,11 +30,11 @@ To join recordings, add clips and drag them into playback order. Matching format
 
 ## Edit from a transcript
 
-Open **View → Toggle Transcript** (⌥⌘T) or the multicam inspector’s **Transcript** tab. Choose **Import Transcript…** for Transcriberrr JSON, SRT or WebVTT. To recognize the audio with an installed helper, choose **Transcribe with Transcriberrr…**. Check that each track is bound to the recording and microphone that supplied it.
+Open **View → Toggle Transcript** (⌥⌘T) or the multicam inspector’s **Transcript** tab. Choose **Import Transcript…** for Transcriberrr JSON, SRT or WebVTT. To recognize the audio with an installed helper, choose **Transcribe Audio…**. Check that each track is bound to the recording and microphone that supplied it.
 
-Search **Source** for an off-air take, **Group** to compare synchronized microphones, or **Current Cut** to find what the audience will hear. Enter the words in **Find dialogue** and press Return. Click a result to seek. Use **Play Context** to audition a source passage.
+Search **Source** for an off-air take, **Group** to compare synchronized microphones, or **Current Cut** to find what the audience will hear. Enter the words in **Find dialogue** and press Return. The transcript reads as one continuous passage with each match highlighted in place. Use the **Previous match** and **Next match** arrows to move between matches, and click a word to seek. Use **Play Context** to audition a source passage.
 
-![Transcript search in MPCut with speaker names, timecodes and surrounding dialogue](images/transcript-search.png)
+![Transcript search in MPCut with speaker names, timecodes and highlighted matches](images/transcript-search.png)
 
 Select the words you want to keep or remove. Review the proposed media boundaries before applying an edit, or choose **Queue Excerpt…** to keep the passage as a separate export. For captions timed to the edited movie, export the transcript from **Current Cut**. Keep the project and its sibling `.cut.transcripts` directory together when moving your work.
 
@@ -45,6 +45,8 @@ Select the words you want to keep or remove. Review the proposed media boundarie
 Mark a range and choose **Sequence → Replace Picture…** (⇧⌘R) to show a photo while the soundtrack continues. In multicam, mark the interval on the **Group** timeline. A picture replacement appears in every retained occurrence of that interval.
 
 Choose **Sequence → Insert Still…** (⇧⌘I) at the playhead to add a card with its own duration and silence. In multicam, position the playhead on the **Assembly** timeline to insert at a specific occurrence. To start a project with just images, insert a still or drop an image into an empty project window and set its canvas in **Still Timeline Format**.
+
+Turn on **Settings → General → Timeline → Show source time ticks inside clips** to see each recording’s original timestamps alongside the elapsed time on the main ruler. Multicam assembly ranges show their original group times.
 
 Choose **Sequence → Insert Color Gap…** to add one solid-color pause, or **Sequence → Space Clips…** to add gaps between clips or assembly items in one edit. **Fixed Duration** fits a uniform pause between items. **Source Timing** restores elapsed time between chronological, nonoverlapping ranges on the same source clock, or on the multicam group clock. To close the internal gaps, apply **Fixed Duration** with a duration of zero.
 
@@ -133,7 +135,7 @@ Click the ruler to move the playhead. Drag a clip to move it, or drag either edg
 
 Open **Source Ranges** to save a named range from a recording or build an ordered list from files and saved selects. Include the same range more than once to repeat it. Apply the list at an insertion point or over a marked sequence interval. MPCut validates the whole list before changing the timeline and applies it in one history step. Named selects are saved with the project and remain available when the timeline no longer uses that recording.
 
-Faded frames fall outside the edit. Drag the handle back over them to restore them, or press Esc during a drag to cancel. The ruler shows the duration you’ve kept. The time beside the handle shows where you are in the source. The left handle previews the first frame you’ll keep. The right handle previews the last frame and shows the time just after it.
+Faded frames fall outside the edit. Drag the handle back over them to restore them, or press Esc during a drag to cancel. Click the eye button beside **Snap To** to hide or show those cut sections. The ruler shows the duration you’ve kept. The time beside the handle shows where you are in the source. The left handle previews the first frame you’ll keep. The right handle previews the last frame and shows the time just after it.
 
 Handles move one frame at a time by default. Use **Snap To** beside the zoom slider to line up later edits with **Keyframes** (verified copy points), **Scenes** (detected scene changes), or **Silence** (pause boundaries on the selected track, rounded to a video frame). Start a scene scan with **Playback → Scan for Scenes**, then choose **Selected Clip** or **All Sources**. Choosing **Silence** starts a scan if needed. In **Keyframes** mode, the playhead snaps to the nearest keyframe in the clip under the pointer. For **Scenes** and **Silence**, the playhead snaps within eight screen points of a matching boundary. Choose **Off** to return to frame editing.
 
@@ -255,7 +257,7 @@ Click **Scan for Silence** below the timeline to start scanning and open the pau
 
 ### Queue multicam exports and replace the soundtrack
 
-Use **Sequence → Add Marked Range to Export Queue** (⇧⌘A) to queue a range as a separate file. A dragged **Assembly** selection queues picture, cards and sound in output order. A marked **Group** interval queues the switched footage once in group time. Each queued item preserves the program decisions active when you add it. Open **Export Queue** (⇧⌘E) to review or remove items and set the tracks, export mode and container for the batch. MPCut checks all queued ranges before writing the numbered files.
+Use **Sequence → Add Marked Range to Export Queue** (⇧⌘A) to queue a range as a separate file. A dragged **Assembly** selection queues picture, cards and sound in output order. A marked **Group** interval queues the switched footage once in group time. Each queued item preserves the program decisions active when you add it. Open **Export Queue** (⇧⌘E) to review or remove items and set the tracks, export mode and container for the batch. MPCut checks the ready ranges before writing the numbered files. Entries affected by a media change are marked in the queue and skipped until you replan them.
 
 In Mix snapshots, the MCP `export_queue_list` result identifies queued sound by `lane_id`, `lane_label` and `lane_color_slot`. Items with `kind: "audio_gap"` mark uncovered output ranges for a lane.
 
@@ -365,7 +367,7 @@ For a copy-only edit, choose **Snap To → Keyframes** before shortening and cho
 
 Mark a range with **I** and **O**, then press **⇧⌘A** or click the add-range button beside **Mark Out**. MPCut queues those source ranges and clears the marks so you can set the next pair. A queued range can cross clips and captures the footage as it was arranged when you added it.
 
-Open **File → Export Queue** or press **⇧⌘E** to review or remove entries. Choose tracks, export mode and container for the batch, then select an output folder. For movies with sound, the queue starts with the movie export mode chosen in Settings, which is Smart Trim unless you change it. For silent movies it starts with Lossless Copy and also offers Smart Trim and Re-encode. Sound-only output starts with **Lossless Copy**. Choose **Convert Audio** to render a different sound format or to handle cuts the original format can’t copy. Picture-only movie ranges use **Lossless Copy** unless they include stills or gaps that need rendering. For sound-only output from multitrack sources, choose all audio tracks or one. Expand **Folders and filenames** to choose an optional subfolder and base name and preview the first filename. Each range produces a separate numbered file in queue order. If preflight finds a problem with a range or destination, the batch stops before writing. Use an empty folder to export the same queue again.
+Open **File → Export Queue** or press **⇧⌘E** to review or remove entries. Choose tracks, export mode and container for the batch, then select an output folder. For movies with sound, the queue starts with the movie export mode chosen in Settings, which is Smart Trim unless you change it. For silent movies it starts with Lossless Copy and also offers Smart Trim and Re-encode. Sound-only output starts with **Lossless Copy**. Choose **Convert Audio** to render a different sound format or to handle cuts the original format can’t copy. Picture-only movie ranges use **Lossless Copy** unless they include stills or gaps that need rendering. For sound-only output from multitrack sources, choose all audio tracks or one. Expand **Folders and filenames** to choose an optional subfolder and base name and preview the first filename. Each ready range produces a separate numbered file in queue order. An entry affected by a media change shows a warning and a **Replan** button. Replan captures the current edit at the original bounds. For a transcript excerpt, mark the range you want to recapture first. You can also remove the entry. If preflight finds a problem with a ready range or destination, the batch stops before writing. Use an empty folder to export the same queue again.
 
 Open an entry’s details to inspect its captured files and trims in playback order, including repeated ranges. Later timeline edits leave those captured ranges intact. Use **Rename** to change the entry’s name. Set new marks in the editor, then choose **Replace with Marked Range** to capture the current edit at those marks or **Extend to Marked Range** to capture a larger interval in the same clock.
 
@@ -420,7 +422,7 @@ Press **⌘E** to choose an export mode, file format, and filename. Movies start
 | **Lossless Copy** | Copy compatible video and audio without encoding, including when changing containers. For an unsafe cut, **Review Cuts…** shows proposed boundaries and the change in total duration. **Apply to Timeline** lets you preview or undo those changes before exporting. |
 | **Re-encode** | Convert every retained video frame using the Mac’s hardware encoder. Choose H.264 or HEVC in MP4, MOV or MKV, or ProRes in MOV or MKV. |
 
-Re-encode starts with MP4, H.264, Balanced and Auto audio. H.264 and HEVC offer Smaller File, Balanced and High Quality. ProRes offers 422 LT, 422 and 422 HQ. **Auto** copies audio when the export can preserve it exactly. When conversion is necessary, it uses AAC or, for ProRes, PCM. You can also choose Copy Original, AAC, or PCM (MOV or MKV). To copy just the picture, clear the **Audio** checkbox. For an explicit video conversion that drops audio, the CLI accepts `--mode encode --audio remove`. Check the per-track actions, output dimensions and warnings in the sheet. For example, converting 10-bit SDR to H.264 reduces it to 8-bit.
+Re-encode starts with MP4, H.264, Balanced and Auto audio. H.264 and HEVC offer Smaller File, Balanced and High Quality. ProRes offers 422 LT, 422 and 422 HQ. **Auto** copies audio when the export can preserve it exactly. When conversion is necessary, it writes a lossless track (PCM, FLAC, ALAC, TrueHD or MLP) as PCM in MOV, and in MKV for mono and stereo. MP4 cannot carry PCM here and MKV cannot describe wider PCM, so there the track becomes AAC. It converts any other track to AAC at the bit rate of an AAC source or, for ProRes, PCM under the same container limits. You can also choose Copy Original, AAC, or PCM (MOV or MKV). To copy just the picture, clear the **Audio** checkbox. For an explicit video conversion that drops audio, the CLI accepts `--mode encode --audio remove`. Check the per-track actions, output dimensions and warnings in the sheet. For example, converting 10-bit SDR to H.264 reduces it to 8-bit.
 
 If the export includes stills or color gaps, **Smart Trim** generates those frames and copies eligible camera footage. **Require Camera Video Copy** lets preflight refuse any plan that would encode retained camera frames. Check the audio actions too when an insert adds silence. [Still export](STILL-IMAGES.md#export-the-program)
 
@@ -469,7 +471,7 @@ Start with the installed executable. In a shell, set `mpcut=/Applications/MPCut.
 | Build or inspect a multicam project | `help multicam --json`, `project inspect --project` | Editable schema template, selected streams, and source coverage |
 | Inspect sound | `waveform envelope read`, `silence scan`, `silence scan --project PROJECT` | Signed envelope or detected pauses, removal and retained ranges. Silence can also export the joined result |
 | Review picture | `scenes scan`, `scenes export`, `review frames export` | Scene/view report or grouped exports, or JPEGs and a timestamped manifest |
-| Save or inspect reusable analysis | `analysis sidecar build`, `analysis sidecar inspect` | Adjacent analysis database on save, plus its status and inventory on either invocation |
+| Save or inspect reusable analysis | `analysis sidecar build`, `analysis sidecar inspect` | Analysis database at the selected destination, plus its status and inventory |
 | Convert an editable project | `project convert INPUT --output NEW_PROJECT` | A project in the format selected by its extension. [Supported editors and requirements](../README.md#convert-projects) |
 | Send a timeline to Resolve | `project resolve export --project PROJECT --output FILE.fcpxml` | An editable timeline. Use `project resolve import` to import it into the current Resolve project. [Resolve setup and import](../README.md#export-a-project-to-davinci-resolve) |
 | Produce media | `export clips join`, `export ranges join`, `export ranges separate` | One edited/replaced/remuxed/converted recording, one ordered set of selects, or one numbered file per range |
@@ -618,19 +620,25 @@ Open **MPCut → Settings…** (⌘,).
 | Where | What you can set |
 | --- | --- |
 | **General → Automation** | Enable local MCP control and check its status. [MPCut Agent Guide](MCP-AGENT-GUIDE.md) |
-| **General → Media** | Automatically refresh changed recordings. |
-| **General → Timeline** | Choose the snap target and enlarge thumbnails and waveforms. |
+| **General → Media** | Turn on **Watch recordings for changes while editing** to refresh changed recordings automatically. |
+| **General → Timeline** | Choose the snap target, **Show source time ticks inside clips**, and enlarge thumbnails and waveforms. |
 | **General → History** | Set **Maximum undo and redo steps** per project. |
 | **General → Playback** | Adjust **Preview volume**, **Mute preview audio**, or **Play audio while scrubbing**. |
 | **General → Export defaults** | Choose the **Default movie export mode** and **Default JPEG preset**. Use **Warn when an edit lowers the export tier** to control the prompt for manual edits. |
-| **Analysis → Analysis sidecars** | Use **Save and reuse analysis beside recordings** to keep an analysis sidecar with each source. |
+| **Analysis → Analysis sidecars** | Choose whether to save and reuse analysis, where to store new sidecars, and which caches to clear. |
 | **Analysis → Silence** | Set **Minimum pause**, **Ignore sounds up to**, and **Padding per side** for new scans. |
 
 ## Save and reuse analysis
 
-Completed indexes, scene scans, thumbnails, waveforms and silence results are saved automatically. Choose **File → Save Analysis Sidecars** to save the full edit index and the analysis already completed for each loaded recording. This includes scene cuts and view names, available filmstrip thumbnails, waveforms, calibrated room floors, and silence intervals for the scanned tracks and settings. The sidecar is a versioned SQLite file beside the original, such as `interview.mov.cutdb`. Subsequent saves merge completed sections. MPCut writes SQLite sidecar format 4. It stores regular audio packet runs and 20 ms transcription level measurements compactly and applies lossless LZFSE compression to individual analysis payloads when it saves space. The app can read format 3 and upgrades it on the next analysis write, including archived reports and scene-scan checkpoints. Earlier MPCut releases can only open their supported formats. MPCut preserves unsupported and unreadable sidecars because they may contain authored view names or thresholds. Move an unsupported sidecar to a backup location to let MPCut build a fresh cache beside the recording.
+Completed indexes, scene scans, thumbnails, waveforms and silence results are saved automatically. Choose **File → Save Analysis Sidecars** to save the full edit index and the analysis already completed for each loaded recording. This includes scene cuts and view names, available filmstrip thumbnails, waveforms, calibrated room floors, and silence intervals for the scanned tracks and settings. Each recording has a compressed SQLite sidecar. By default it sits beside the original, such as `interview.mov.cutdb`. Subsequent saves merge completed sections. MPCut writes SQLite sidecar format 5. It stores regular audio packet runs and 20 ms transcription level measurements compactly and applies lossless LZFSE compression to individual analysis payloads when it saves space. The app can read formats 3 and 4 and upgrades them on the next analysis write, including archived reports and scene-scan checkpoints. Earlier MPCut releases can only open their supported formats. A format 1 or 2 sidecar from an early MPCut build is replaced on the next analysis write, keeping its manual silence thresholds, scene boundaries and view names. MPCut preserves sidecars from a newer build and unreadable sidecars because they may contain authored view names or thresholds. Move such a sidecar to a backup location to let MPCut build a fresh cache at the selected destination.
 
-Automatic sidecars are on by default. When you open a recording, MPCut loads the saved editing index if it is complete and matches the file. It builds an index when the saved one is missing, out of date, or unreadable. In **MPCut → Settings… → Analysis**, clear **Save and reuse analysis beside recordings** to bypass automatic sidecars, including during export checks. An explicit **Save Analysis Sidecars** can still save the current analysis.
+Automatic sidecars are on by default. When you open a recording, MPCut loads the saved editing index if it is complete and matches the file. It builds an index when the saved one is missing, out of date, or unreadable. In **MPCut → Settings… → Analysis**, turn off **Save and reuse analysis** to bypass automatic sidecars, including during export checks. An explicit **Save Analysis Sidecars** can still save the current analysis.
+
+In **Settings → Analysis → Save new sidecars**, choose **Next to media**, **In project folder**, or **On cache disk**. Project-folder storage uses an `MPCut Cache` directory beside the saved project. Cache-disk storage uses the folder you choose for all projects. Two recordings named `Interview.mov` have separate entries. Changing this setting directs future saves. When loading a recording, MPCut checks available locations for the freshest compatible analysis. An unsaved project can hold its analysis in memory until you save the project.
+
+Choose **Clear Caches…** to preview the recordings in each location. Filter by location or folder to see how many sidecars you can clear and the estimated space you can reclaim. Recordings with the same filename show their source folders. Use **Scan Folder…** to find older sidecars.
+
+**Clear Analysis** keeps saved edits, recognition results and resumable work. To delete those as well, select **Remove entire sidecars** and confirm the number of files shown. The completion report lists what was cleared, the space actually reclaimed, and any skipped sidecars. A disconnected disk can supply its saved analysis again when you reconnect it.
 
 ```sh
 mpcut analysis sidecar build --json interview.mov
@@ -644,13 +652,23 @@ The first command builds the edit index, scenes, and audio analysis on every aud
 
 MPCut checks the media file’s inode, size and modification timestamp, along with the sidecar version and section checksums. If the recording changes, a later query computes fresh results. Copying the video and sidecar to another drive requires building a sidecar for the copy. When renaming the video on the same volume, rename its companion to match.
 
+## Missing and moved media
+
+When a sequence or multicam project opens with recordings that can’t be found, a banner reports how many files are offline. Click **Relink…**, or choose **File → Relink Offline Media…** (⇧⌘L). **File → Project Media…** opens the same list with every stored path. Filter it by **Offline**, **Needs review** or **All** to see each file’s status and where it is used. An offline clip keeps its position and duration. Its red hatch and preview slate identify the recording to locate. Right-click a clip on the timeline, or a multicam source, for **Locate Media…**, **Replace Source File…**, **Reveal in Finder** and **Show in Project Media**.
+
+Choose **Locate…** for a recording you moved or renamed. If you moved a whole shoot, choose **Locate Folder…** and review the proposed matches together. When several files could match, select the intended take, then relink the matched files in one step. Relinking updates uses of the recording throughout retained undo and redo history. A row’s menu can also **Leave Offline**, **Revert to Previous Location** after a relink, or **Show Uses** to jump to a clip.
+
+Choose **Replace Source File…** for different footage. Choose whether to replace all uses or one. Review the affected cuts, tracks and transcript bindings before choosing **Apply Replacement**. A shorter take can put a whole cut beyond the end of the replacement. Use **Ranges past the end** to trim a range to the new end or keep it offline, and **Uses beyond the end** to remove or keep whole uses. **Clock** keeps cuts at the same source-relative times or the same source timecode. In a multicam project, **Re-sync** keeps the current offset or realigns the replacement by timecode or waveform. For bound transcripts, choose **Keep (unverified)** or **Re-transcribe**, which opens **Transcribe Audio** with the affected streams selected. Undo restores the earlier edit.
+
+Trimming, exporting and queueing a clip that is offline or needs review stops with a prompt to review it in Project Media. Converting a project to another editor also requires its media to be online. Export Queue entries affected by a media change are skipped until you replan them. [CLI commands](CLI.md#find-and-relink-project-media)
+
 ## Refresh project media
 
 Choose **File → Refresh Project Media** after replacing a recording or changing its soundtrack. MPCut checks each recording once, updates its index when needed, and reloads the previews in use. A change confined to one audio track can leave scene markers and analysis of other tracks current. When MPCut cannot verify a match, it marks the affected analysis out of date. Check any clip marked **Needs review** before exporting.
 
 Choose **File → Deep Verify Project Media** if a replacement might have the same size and modification time. This checks source contents.
 
-To watch the recordings while you edit, enable **Automatically refresh changed recordings** in **Settings → General → Media**. Watching is off by default.
+To watch the recordings while you edit, enable **Watch recordings for changes while editing** in **Settings → General → Media**. Watching is off by default.
 
 To check a saved project from the terminal, run `mpcut project media refresh --project edit.cut --json`. Add `--deep` to verify stream contents when a replacement might have the same size and modification time. The command leaves the saved edit intact.
 

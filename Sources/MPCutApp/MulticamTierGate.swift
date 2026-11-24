@@ -178,8 +178,9 @@ final class MulticamTierGate {
         let media = model.transcriptMediaRevision, checked = model.tierGeneration
         let prior = Self.program(made.prior), program = made.program
         let from = made.from.map { (tier: $0.tier, factors: $0.factors) }
+        let context = model.sidecarWork
         Task { [weak self, weak model] in
-            let found = await Task.detached(priority: .utility) {
+            let found = await context.detached(priority: .utility) {
                 Self.comparison(of: program, state, with: prior, from: from, indexed: indexed, cancelled: { token.isCancelled })
             }.value
             guard let self, let model, self.comparing?.id == id else { return }

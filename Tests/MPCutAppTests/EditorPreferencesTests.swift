@@ -151,6 +151,8 @@ final class EditorPreferencesTests: XCTestCase {
         settings.defaultExportMode = .copy
         settings.jpegPreset = .full
         settings.isMuted = true
+        XCTAssertFalse(settings.sourceTimeTicks)
+        settings.sourceTimeTicks = true
         settings.volume = 0.35
 
         let reopened = EditorPreferences(defaults: defaults)
@@ -158,6 +160,7 @@ final class EditorPreferencesTests: XCTestCase {
         XCTAssertEqual(reopened.defaultExportMode, .copy)
         XCTAssertEqual(reopened.jpegPreset, .full)
         XCTAssertTrue(reopened.isMuted)
+        XCTAssertTrue(reopened.sourceTimeTicks)
         XCTAssertEqual(reopened.volume, 0.35)
     }
 

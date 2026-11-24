@@ -110,7 +110,7 @@ extension MulticamEditorModel {
             let asset = assets[0]
             self?.performStillEditByHand("Replace Picture") { document in
                 try document.addingStillAsset(asset).addingStillReplacement(
-                    .init(id: UUID().uuidString, assetID: asset.id, framing: .fit, coverage: .group(bounds))
+                    .init(id: ProjectIdentifier.make(), assetID: asset.id, framing: .fit, coverage: .group(bounds))
                 )
             }
         }
@@ -169,9 +169,9 @@ extension MulticamEditorModel {
         let revision = mcpRevision
         StillPanels.gap(cadence: multicamStillCadence(atAssembly: position), in: window) { [weak self] duration, cadence, framing in
             guard let self, self.mcpRevision == revision, !self.isBusy else { return }
-            let id = UUID().uuidString
+            let id = ProjectIdentifier.make()
             if self.performStillEditByHand("Insert Color Gap", { document in
-                let asset = document.stillAssets.first(where: \.isGap) ?? StillAsset(gapID: UUID().uuidString)
+                let asset = document.stillAssets.first(where: \.isGap) ?? StillAsset(gapID: ProjectIdentifier.make(avoiding: document.stillAssets.map(\.id)))
                 let gap = StillInsert(id: id, assetID: asset.id, duration: duration, cadence: cadence, framing: framing)
                 return try document.addingStillAsset(asset).insertingStill(gap, at: position)
             }), let index = self.assemblyItems.firstIndex(where: { $0.still?.id == id }) {
@@ -224,12 +224,12 @@ extension MulticamEditorModel {
             guard let self, self.mcpRevision == revision else { return }
             self.inspectMulticamImages(urls) { [weak self] assets in
                 guard let self else { return }
-                let firstID = UUID().uuidString
+                let firstID = ProjectIdentifier.make()
                 if self.performStillEditByHand(title, { project in
                     var document = project
                     var at = position
                     for (index, asset) in assets.enumerated() {
-                        let id = index == 0 ? firstID : UUID().uuidString
+                        let id = index == 0 ? firstID : ProjectIdentifier.make()
                         document = try document.addingStillAsset(asset)
                         document = try document.insertingStill(.init(id: id, assetID: asset.id, duration: duration,
                                                                      cadence: cadence), at: at)
@@ -311,8 +311,9 @@ extension MulticamEditorModel {
         let inserts = assemblyItems.enumerated().compactMap { index, item -> StillPlacementRow? in
             guard let insert = item.still, let asset = assets[insert.assetID] else { return nil }
             return StillPlacementRow(id: insert.id, title: asset.displayName, details:
-                "Insert · Assembly \(assemblyStart(at: index))–\(assemblyRangeEnds[index]) · \(insert.duration)s · \(insert.framing.mode.rawValue.capitalized)\(stillOffline(asset))",
-                isInsert: true, isGap: asset.isGap)
+                "Insert · Assembly \(assemblyStart(at: index))–\(assemblyRangeEnds[index]) · \(insert.duration)s · \(insert.framing.mode.rawValue.capitalized)",
+                isInsert: true, isGap: asset.isGap,
+                mediaStatus: asset.isGap ? .online : mediaStatus(for: projectMediaURL(asset.file)))
         }
         let replacements = project.stillReplacements.compactMap { replacement -> StillPlacementRow? in
             guard let asset = assets[replacement.assetID], case .group(let bounds) = replacement.coverage else { return nil }
@@ -331,14 +332,10 @@ extension MulticamEditorModel {
             let resolved = windows.map { "\($0.from)–\($0.to)" }.joined(separator: ", ")
             let visible = windows.isEmpty ? "0s visible" : "Assembly \(resolved) · \(duration)s visible"
             return StillPlacementRow(id: replacement.id, title: asset.displayName, details:
-                "Replace · Group \(bounds.from)–\(bounds.to) · \(visible) · \(replacement.framing.mode.rawValue.capitalized)\(stillOffline(asset))",
-                isInsert: false)
+                "Replace · Group \(bounds.from)–\(bounds.to) · \(visible) · \(replacement.framing.mode.rawValue.capitalized)",
+                isInsert: false, mediaStatus: mediaStatus(for: projectMediaURL(asset.file)))
         }
         return inserts + replacements
-    }
-
-    private func stillOffline(_ asset: StillAsset) -> String {
-        FileManager.default.isReadableFile(atPath: asset.file) ? "" : " · Offline"
     }
 
     func manageMulticamStill(_ row: StillPlacementRow, action: StillPlacementAction) {
@@ -388,22 +385,15 @@ extension MulticamEditorModel {
             }
         case .duplicate:
             guard var insert, let index = assemblyItems.firstIndex(where: { $0.still?.id == row.id }) else { return }
-            insert.id = UUID().uuidString
+            insert.id = ProjectIdentifier.make()
             let end = assemblyRangeEnds[index]
             performStillEditByHand("Duplicate Still") { try $0.insertingStill(insert, at: end) }
         case .detach: return
         case .remove:
             performStillEditByHand("Delete Still") { try $0.removingStill(id: row.id) }
         case .relink:
-            StillPanels.chooseImage(in: window) { [weak self] url in
-                guard let self, self.mcpRevision == revision else { return }
-                self.inspectMulticamImages([url], reuseAssets: false) { [weak self] assets in
-                    let asset = assets[0]
-                    self?.performStillEditByHand("Relink Still Image") {
-                        try $0.relinkingStillAsset(assetID, file: asset.file, fingerprint: asset.fingerprint)
-                    }
-                }
-            }
+            guard let asset = project.stillAssets.first(where: { $0.id == assetID && !$0.isGap }) else { return }
+            presentProjectMedia(.locate, path: projectMediaURL(asset.file).path)
         }
     }
 
@@ -423,9 +413,12 @@ struct MulticamAssetSpan: Identifiable, Equatable {
     let title: String
     let interval: MulticamRange
     var frame: StillReviewFrame? = nil
+    var mediaURL: URL?
+    var mediaStatus: ProjectMediaStatus = .online
 
     static func == (left: Self, right: Self) -> Bool {
-        left.id == right.id && left.title == right.title && left.interval == right.interval
+        left.id == right.id && left.title == right.title && left.interval == right.interval &&
+            left.mediaURL == right.mediaURL && left.mediaStatus == right.mediaStatus
     }
 }
 
@@ -434,12 +427,16 @@ extension MulticamEditorModel {
     var groupStillFrames: [MulticamAssetSpan] {
         guard let project else { return [] }
         let document = CutProject.multicam(project)
-        let names = Dictionary(uniqueKeysWithValues: project.stillAssets.map { ($0.id, $0.displayName) })
+        let assets = Dictionary(uniqueKeysWithValues: project.stillAssets.map { ($0.id, $0) })
         return project.stillReplacements.compactMap { replacement in
             guard case .group(let range) = replacement.coverage else { return nil }
-            return .init(id: replacement.id, title: names[replacement.assetID] ?? replacement.assetID, interval: range,
-                         frame: try? document.stillReviewFrame(placementID: replacement.id, interval: range,
-                                                               document: projectURL, canvas: stillReviewCanvas))
+            guard let asset = assets[replacement.assetID], !asset.isGap else { return nil }
+            let url = projectMediaURL(asset.file)
+            let status = mediaStatus(for: url)
+            return .init(id: replacement.id, title: asset.displayName, interval: range,
+                         frame: status.hidesMedia ? nil : try? document.stillReviewFrame(
+                            placementID: replacement.id, interval: range, document: projectURL, canvas: stillReviewCanvas),
+                         mediaURL: url, mediaStatus: status)
         }
     }
 
@@ -447,12 +444,14 @@ extension MulticamEditorModel {
         guard let project, !project.stillAssets.isEmpty else { return [] }
         let document = CutProject.multicam(project)
         guard let plan = try? document.resolveStills() else { return [] }
-        let names = Dictionary(uniqueKeysWithValues: project.stillAssets.filter { !$0.isGap }.map { ($0.id, $0.displayName) })
+        let assets = Dictionary(uniqueKeysWithValues: project.stillAssets.filter { !$0.isGap }.map { ($0.id, $0) })
         let assetIDs = Dictionary(uniqueKeysWithValues:
             project.stillReplacements.map { ($0.id, $0.assetID) } + document.stillInserts.map { ($0.id, $0.assetID) })
         return plan.spans.enumerated().compactMap { index, span in
-            guard let id = span.placementID, let asset = assetIDs[id], let title = names[asset] else { return nil }
-            return .init(id: "\(id)-\(index)", title: title, interval: span.output)
+            guard let id = span.placementID, let assetID = assetIDs[id], let asset = assets[assetID] else { return nil }
+            let url = projectMediaURL(asset.file)
+            return .init(id: "\(id)-\(index)", title: asset.displayName, interval: span.output,
+                         mediaURL: url, mediaStatus: mediaStatus(for: url))
         }
     }
 }

@@ -13,6 +13,7 @@ import unittest
 import wave
 
 from media_regression import ffmpeg
+from saved_project import read_project
 
 
 def rational(value):
@@ -122,7 +123,7 @@ class MulticamSyncTests(unittest.TestCase):
         restart = self.camera("restart.mov", audio=self.directory / "restart.wav")
         target = self.camera("close.mov", audio=self.directory / "target.wav")
         self.write_project(reference, target)
-        project = json.loads(self.project.read_text())
+        project = read_project(self.project)
         project["group_range"]["to"] = "80"
         project["angles"][0].update({
             "group_coverage": {"from": "1", "to": "71"},

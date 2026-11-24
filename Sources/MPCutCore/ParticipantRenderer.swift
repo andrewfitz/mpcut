@@ -11,6 +11,7 @@ public struct ParticipantRenderer: Sendable {
 
     public func report(_ project: CutProject, document: URL, plan: ParticipantRenderPlan? = nil,
                        output: URL? = nil) throws -> ParticipantRenderReport {
+        if let output { try project.validateDestination(output, relativeTo: document) }
         let resolved = try prepare(project, document: document, plan: plan, cancelled: cancelled)
         let sound = try ParticipantRenderSound.resolve(project, document: document, timeline: resolved.timeline.timeline,
                                                        audio: resolved.plan.audio, cancelled: cancelled)
@@ -31,6 +32,7 @@ public struct ParticipantRenderer: Sendable {
         }
 
         _ = update(0)
+        try project.validateDestination(output, relativeTo: document)
         let resolved = try prepare(project, document: document, plan: plan, cancelled: isCancelled)
         let sound = try ParticipantRenderSound.resolve(project, document: document, timeline: resolved.timeline.timeline,
                                                        audio: resolved.plan.audio, cancelled: isCancelled)
@@ -143,6 +145,8 @@ final class ParticipantRenderSession {
     private let media: [URL: MediaInfo]
     private let geometry: [String: ParticipantGeometryIndex]
     private let stale: Set<String>
+    private let pendingIdentities: [String: Set<String>]
+    private let pendingPrivacySources: Set<String>
     private let treatments: [String: ParticipantRedaction]
     private var readers: [(file: URL, reader: ParticipantPictureReader)] = []
     private var privacyIssues: [ParticipantPrivacyIssue] = []
@@ -168,7 +172,8 @@ final class ParticipantRenderSession {
         _ = try duration.multiplied(by: .init(numerator: Int64(scale)))
         timescale = scale
         extent = .init(x: 0, y: 0, width: plan.canvas.width, height: plan.canvas.height)
-        treatments = Dictionary(uniqueKeysWithValues: plan.redactions.map { ($0.participantID, $0) })
+        let treatments = Dictionary(uniqueKeysWithValues: plan.redactions.map { ($0.participantID, $0) })
+        self.treatments = treatments
 
         let slots = Set(plan.shots.flatMap(\.slots).filter { $0.target == .participant }.map(\.id))
         var media: [URL: MediaInfo] = [:]
@@ -196,6 +201,11 @@ final class ParticipantRenderSession {
         self.media = media
         self.geometry = geometry
         self.stale = stale
+        let pendingIdentities = Dictionary(uniqueKeysWithValues: project.participants.sources.map {
+            ($0.sourceID, Set($0.unresolvedParticipantIDs))
+        })
+        self.pendingIdentities = pendingIdentities
+        self.pendingPrivacySources = Set(pendingIdentities.filter { !$0.value.isDisjoint(with: treatments.keys) }.keys)
         if auditPrivacy && !treatments.isEmpty { privacyIssues = try audit() }
     }
 
@@ -271,6 +281,7 @@ final class ParticipantRenderSession {
         let frames = media[route.file]!.frames
         let time = frames[index].time
         return stale.contains(route.id)
+            || pendingPrivacySources.contains(route.id)
             || geometry[route.id]!.at(time).needsPrivacyCover
             || (index > 0 && frames[index - 1].time == time)
             || (index + 1 < frames.count && frames[index + 1].time == time)
@@ -303,9 +314,12 @@ final class ParticipantRenderSession {
         }
         func image(_ route: ParticipantRenderRoute, _ index: Int) throws -> CIImage {
             if let cached = pictures[route.id] { return cached }
-            let original = try read(route.file, index)
-            let result = ParticipantCompositor.redact(original,
-                appearances: geometry[route.id]!.at(media[route.file]!.frames[index].time).appearances, treatments: treatments)
+            let sourceGeometry = geometry[route.id]!
+            let usesCrop = window.base?.id == route.id && window.shot.slots.contains { $0.target != .camera }
+            let original = try read(route.file, index, usingScannedGeometry: sourceGeometry.usesScannedGeometry &&
+                (!treatments.isEmpty || usesCrop))
+            let result = ParticipantCompositor.redact(original, appearances: sourceGeometry.at(media[route.file]!.frames[index].time)
+                .appearances, treatments: treatments)
             pictures[route.id] = result
             return result
         }
@@ -335,6 +349,7 @@ final class ParticipantRenderSession {
                 }
                 let frameGeometry = geometry.at(frameTime)
                 let confirmedAbsent = !frameGeometry.needsPrivacyCover && !stale.contains(route.id)
+                    && !(slot.target == .participant && pendingIdentities[route.id]?.contains(slot.id) == true)
                     && !frameGeometry.appearances.contains {
                         slot.target == .participant ? $0.participantID == slot.id : $0.id == slot.id
                     }
@@ -361,7 +376,7 @@ final class ParticipantRenderSession {
         return result
     }
 
-    private func read(_ file: URL, _ index: Int) throws -> CIImage {
+    private func read(_ file: URL, _ index: Int, usingScannedGeometry: Bool) throws -> CIImage {
         let reader: ParticipantPictureReader
         if let found = readers.firstIndex(where: { $0.file == file }) {
             reader = readers.remove(at: found).reader
@@ -370,7 +385,7 @@ final class ParticipantRenderSession {
             reader = try .init(media[file]!, control: control)
         }
         readers.append((file, reader))
-        return try reader.picture(at: index)
+        return try reader.picture(at: index, usingScannedGeometry: usingScannedGeometry)
     }
 }
 

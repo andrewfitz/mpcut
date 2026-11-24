@@ -134,4 +134,59 @@ final class StillPreviewTests: XCTestCase {
         XCTAssertGreaterThan(pixel[40], pixel[0])
         XCTAssertEqual(CVBufferCopyAttachment(input, kCVImageBufferTransferFunctionKey, nil) as? String, pq as String)
     }
+
+    @MainActor
+    func testSoundtrackPreviewKeepsOneSelectedAudioRangeAcrossStills() async throws {
+        let movie = try XCTUnwrap(Bundle.module.url(forResource: "Standalone-Multitrack", withExtension: "mov",
+                                                    subdirectory: "Fixtures"))
+        let media = try CutEngine(useSidecar: false).inspect(movie, keyframes: false)
+        let stream = try XCTUnwrap(media.audio.dropFirst().first?.stream)
+        let clip = try StillSoundtrack.reference(media: media, stream: stream.index,
+                                                 from: .init(numerator: 1, denominator: 16),
+                                                 to: .init(numerator: 3, denominator: 16))
+        let cadence = RationalTime(numerator: 1, denominator: 30)
+        let asset = StillAsset(gapID: "black")
+        let first = StillInsert(id: "first", assetID: asset.id, duration: .init(numerator: 1, denominator: 15),
+                                cadence: cadence)
+        let second = StillInsert(id: "second", assetID: asset.id, duration: .init(numerator: 14, denominator: 15),
+                                 cadence: cadence)
+        let format = StillTimelineFormat(width: 96, height: 64, cadence: cadence, codec: .h264, container: "mov")
+        let project = CutProject.stillSequence(.init(items: [.still(first), .still(second)],
+                                                    stillAssets: [asset], stillFormat: format, stillSoundtrack: clip))
+        let suite = "StillPreviewTests.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let editor = EditorModel(defaults: defaults)
+        editor.useAnalysisSidecars = false
+        defer { editor.endSession() }
+        editor.cacheStillSoundtrackMedia(media)
+        try editor.applyStillProject(project, action: "Attach Soundtrack")
+        let waveform = try XCTUnwrap(editor.stillSoundtrackWaveform)
+        XCTAssertEqual(waveform.source, .init(from: clip.from, to: clip.to))
+        XCTAssertEqual(waveform.output, .init(from: .zero, to: .init(numerator: 1, denominator: 8)))
+        let preview = editor.preview
+        preview.scrubSoundEnabled = false
+
+        XCTAssertEqual(preview.ranges.count, 2)
+        XCTAssertEqual(preview.ranges.first?.audioTrack, 1)
+        XCTAssertEqual(preview.ranges.last?.isSilentInsert, true)
+        XCTAssertEqual(preview.ranges.last?.exactEnd, .init(numerator: 7, denominator: 8))
+        let composition = try await SequencePreview.makeAudioComposition(preview.ranges)
+        let tracks = try await composition.loadTracks(withMediaType: .audio)
+        XCTAssertEqual(tracks.count, 1)
+        let track = try XCTUnwrap(tracks.first)
+        let segments = try await track.load(.segments).filter { !$0.isEmpty }
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEqual((segments.first as? AVCompositionTrackSegment)?.sourceTrackID, stream.trackID)
+        XCTAssertEqual(segments.first?.timeMapping.source.start.seconds, 0.0625)
+        XCTAssertEqual(segments.first?.timeMapping.target.end.seconds, 0.125)
+
+        editor.scrub(0.1)
+        XCTAssertEqual(editor.playhead, 0.1)
+        editor.scrub(0.75)
+        XCTAssertEqual(editor.playhead, 0.75)
+        editor.scrub(0.05)
+        XCTAssertEqual(editor.playhead, 0.05)
+        preview.endScrub()
+    }
 }

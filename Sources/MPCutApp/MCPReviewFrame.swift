@@ -147,7 +147,7 @@ extension ProjectSessions {
             position = try sequenceReview(session.editor, time: time, space: space, plans: &plans)
         }
         let picture = position.picture
-        let work = Task.detached(priority: .userInitiated) {
+        let work = session.sidecarWork.detached(priority: .userInitiated) {
             let image = try picture.render(preset: .review)
             return (image, image.data.base64EncodedString())
         }

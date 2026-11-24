@@ -89,6 +89,14 @@ final class OpenIssuesAuditTests: XCTestCase {
         XCTAssertNotNil(analysis.status, "A waveform that could not be read must be reported.")
         XCTAssertNil(analysis.waveform(sourceID: "wide", stream: stream))
 
+        // Another file at the missing path must keep the failure, even with identical bytes.
+        try FileManager.default.copyItem(at: hidden, to: url)
+        analysis.scan(.silence)
+        try await waitUntil { analysis.waveformIssue != nil && !analysis.isScanning(.silence) }
+        XCTAssertNotNil(analysis.waveformIssue)
+        XCTAssertNil(analysis.waveform(sourceID: "wide", stream: stream))
+        try FileManager.default.removeItem(at: url)
+
         try FileManager.default.moveItem(at: hidden, to: url)
         analysis.scan(.silence)
         try await waitUntil { analysis.waveform(sourceID: "wide", stream: stream) != nil && !analysis.isScanning(.silence) }

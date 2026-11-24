@@ -338,6 +338,7 @@ private extension EditorPreferences {
             Key.analysisSidecarReuseEnabled.rawValue: useAnalysisSidecars,
             Key.historyMaxSteps.rawValue: historyLimit,
             Key.timelineSnapTarget.rawValue: snapTarget.rawValue,
+            Key.timelineSourceTimeTicksEnabled.rawValue: sourceTimeTicks,
             Key.timelineLargePreviewsEnabled.rawValue: largeThumbnails,
             Key.playbackPreviewVolumeFraction.rawValue: volume,
             Key.playbackPreviewMuted.rawValue: isMuted,
@@ -362,6 +363,7 @@ private extension EditorPreferences {
         case .mediaAutoRefreshEnabled: automaticallyRefreshMedia = try flag()
         case .exportTierDowngradeWarningEnabled: warnBeforeLoweringExportTier = try flag()
         case .analysisSidecarReuseEnabled: useAnalysisSidecars = try flag()
+        case .timelineSourceTimeTicksEnabled: sourceTimeTicks = try flag()
         case .timelineLargePreviewsEnabled: largeThumbnails = try flag()
         case .playbackScrubAudioEnabled: scrubSoundEnabled = try flag()
         case .playbackPreviewMuted: isMuted = try flag()
