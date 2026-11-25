@@ -295,9 +295,14 @@ final class EditorModelTests: XCTestCase {
         try await waitForEdit(model)
         model.manualThresholdDB = 0
         model.scanForSilence()
+        // A silence report saved in the fixture's cutcache by an earlier run restores the pauses
+        // without waiting for the waveform, which can still be queued behind other analysis.
         let deadline = ContinuousClock.now + .seconds(5)
-        while !model.pauseAnalysisReady, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        while !model.pauseAnalysisReady || model.audioStore.finished.isEmpty, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         XCTAssertTrue(model.pauseAnalysisReady)
+        XCTAssertEqual(model.audioStore.finished.count, 1)
         XCTAssertEqual(model.audioStore.waves.count, 1)
         XCTAssertEqual(model.pausePlan.count, 2)
         let original = model.duration

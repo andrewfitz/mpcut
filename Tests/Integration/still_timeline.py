@@ -227,14 +227,14 @@ class StillTimelineAcceptance(unittest.TestCase):
         target = base.with_stem(base.stem + "-replaced")
         self.cli("still", "picture", "replace", "--project", base, "--image", image or self.sdr_card, "--clock", "sequence" if kind == "sequence" else "group", "--from", start,
                  "--to", end, "--out-project", target)
-        self.assertIn(read_project(target)["schema_version"], (4, 5))
+        self.assertEqual(read_project(target)["schema_version"], 9)
         return target
 
     def insert(self, base, kind, at, *, image=None, count=24, rate=FPS):
         target = base.with_stem(base.stem + "-inserted")
         self.cli("still", "placement", "insert", "--project", base, "--image", image or self.sdr_card, "--clock", "sequence" if kind == "sequence" else "assembly", "--at", at,
                  "--frames", count, "--rate", rate, "--out-project", target)
-        self.assertIn(read_project(target)["schema_version"], (4, 5))
+        self.assertEqual(read_project(target)["schema_version"], 9)
         return target
 
     def export(self, project, output, *args, **options):
@@ -556,6 +556,8 @@ class StillTimelineAcceptance(unittest.TestCase):
         for report in (planned, written):
             self.assert_report(report, copied, generated)
         self.assertNotIn("output_bytes", planned)
+        # Only the dry run of a saved project issues a plan token.
+        self.assertTrue(planned.pop("plan_token").startswith("v1-"))
         self.assertEqual({**planned, "dry_run": False, "output_bytes": output.stat().st_size}, written)
         self.assert_picture(output, row, reference, parts)
         self.assert_card(output, row, at + Fraction(1, 2), hdr=row.hdr and operation != "replace")
@@ -983,6 +985,9 @@ class StillTimelineAcceptance(unittest.TestCase):
         planned = self.export(project, output, *arguments, "--dry-run")
         self.assert_report(planned, copied=4, generated=2)
         from_document = self.export("-", output, *arguments, "--dry-run", stdin=json.dumps(read_project(project)))
+        # The token binds the saved project file, so a project read from standard input has none.
+        self.assertNotIn("plan_token", from_document)
+        from_document["plan_token"] = planned["plan_token"]
         from_request = self.cli("export", "project", "render", "--stdin", "--dry-run",
                                 stdin=json.dumps({"project_path": str(project), "output": str(output),
                                                   "mode": "smart", "tracks": "video"}))

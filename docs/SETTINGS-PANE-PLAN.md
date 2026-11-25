@@ -282,7 +282,7 @@ Names follow feature → subject → qualifier → unit. A key that only seeds n
 | `tiles_scan_default_layout` | `tilesScanLayout` | `TilesScanLayout`: `video_call`, `camera_multiview`, `even_grid` | `video_call` |
 | `tiles_scan_default_grid_columns`, `…_rows` | `tilesScanColumns`, `tilesScanRows` | integer 1–12 | 2, 2 |
 | `tiles_scan_default_detail` | `tilesScanDetail` | `ParticipantSampling`: `adaptive`, `every_frame`, `sparse` | `adaptive` |
-| `tiles_dialogue_default_min_hold_seconds` | `dialogueMinimumHold` | number 0–60 | 1 |
+| `tiles_dialogue_default_min_hold_seconds` | `dialogueMinimumHold` | number 0.04–60 | 1 |
 | `tiles_dialogue_default_overlap_policy` | `dialogueOverlap` | `ParticipantDialogueOptions.Overlap`: `hold`, `visible_speaker` | `hold` |
 | `tiles_dialogue_default_offscreen_policy` | `dialogueOffscreen` | `ParticipantDialogueOptions.Offscreen`: `hold`, `original`, `reaction` | `hold` |
 | `transcript_default_engine` | `transcriptEngine` | engine name, up to 128 characters; empty is Automatic | empty |

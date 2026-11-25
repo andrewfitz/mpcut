@@ -63,7 +63,7 @@ struct CommandHelp: Encodable {
     private static let projectExportExample = "mpcut export project render --project edit.cut --output finished.mov --json"
     private static let spacingUsage = "[--space-clips source|DURATION]"
     private static let projectSilenceExample = "mpcut silence scan --project edit.cut --min-pause-seconds 1.5 --padding-per-side-seconds 0.2 --json"
-    private static let projectExportResult = "A project dry run returns plan_token. Pass it on the render to require the reviewed inputs and options. Visible stills use Smart Trim when mode is omitted. With Smart Trim, --audio aac or --audio pcm requests audio conversion where needed. --require-camera-copy permits generated stills and requires all retained camera picture to copy. A still export reports copied_camera_duration, encoded_camera_duration, generated_still_duration and per-track sound actions. Multicam export and its optional dry run report the playback intervals in plan, resolved source paths in sources, track actions and encoded edges in picture and audio, and the video durations in copied_video_duration and encoded_video_duration."
+    private static let projectExportResult = "A dry run of a saved project file returns plan_token. Pass it on the render to require the reviewed inputs and options. A project read from standard input has no plan token. Visible stills use Smart Trim when mode is omitted. With Smart Trim, --audio aac or --audio pcm requests audio conversion where needed. --require-camera-copy permits generated stills and requires all retained camera picture to copy. A still export reports copied_camera_duration, encoded_camera_duration, generated_still_duration and per-track sound actions. Multicam export and its optional dry run report the playback intervals in plan, resolved source paths in sources, track actions and encoded edges in picture and audio, and the video durations in copied_video_duration and encoded_video_duration."
     private static let multicamTemplate = MulticamProject(
         referenceAngle: "wide", range: MulticamRange(from: .zero, to: RationalTime(numerator: 4)),
         angles: [.init(id: "wide", file: "wide.mov"), .init(id: "close", file: "close.mov")],
@@ -368,13 +368,17 @@ struct CommandHelp: Encodable {
               examples: ["mpcut project media list edit.cut --json",
                          "mpcut project media relink edit.cut --from camera.mov --to relocated/camera.mov --out-project relinked.cut",
                          "mpcut project media locate edit.cut --folder /Volumes/Archive --json",
+                         "mpcut project media leave-offline edit.cut --source camera.mov --in-place --json",
+                         "mpcut project media revert relinked.cut --source relocated/camera.mov --out-project reverted.cut --json",
                          "mpcut project media replace edit.cut --source camera.mov --with alternate.mov --json"]),
         .init(name: "frames", purpose: "Export JPEGs, or lossless PNG or TIFF frames with --format, and exact timestamps for source or multicam review.",
               usage: ["mpcut review frames export [--json] --output NEW_DIRECTORY [--preset review|full] [--format jpeg|png|tiff] [--at TIME ...] [--at-file LIST] [--] FILE",
                       "mpcut review frames export [--json] --output NEW_DIRECTORY [--select scenes|non-silent] [--sample first|midpoint] [--limit N] [--preset review|full] [--format jpeg|png|tiff] [--stream INDEX] [--threshold-db DB] [--min-pause-seconds SEC] [--] FILE",
-                      "mpcut review frames export [--json] --project PROJECT [--clock sequence|assembly|group] --at TIME [--at TIME ...] --output NEW_DIRECTORY [--preset review|full] [--format jpeg|png|tiff]"],
+                      "mpcut review frames export [--json] --project PROJECT [--clock sequence|assembly|group] --at TIME [--at TIME ...] --output NEW_DIRECTORY [--preset review|full] [--format jpeg|png|tiff]",
+                      "mpcut review frames export [--json] --mcp-image --at TIME (--project PROJECT [--clock sequence|assembly|group] | [--] FILE)"],
               instructions: ["Default is a review JPEG at each scene midpoint. Review fits the long edge within 640 pixels at quality 0.62. Full uses display resolution at quality 0.95. --limit is positive and spreads images across the ranges. Supply one --at per explicit source time, without --select, --sample or --limit. Audio options apply only to non-silent ranges. Their defaults match silence detection. Both the JPEGs and manifest.json go into a new directory.",
-                             "For a multicam project with tile processing, the default is the assembly clock. Both assembly and group clocks sample one rendered program frame per time. Other multicam projects default to the group clock, which returns a row for every angle, including coverage gaps. Use --clock assembly for the edited program and still placements. A sequence project uses the sequence clock."],
+                             "For a multicam project with tile processing, the default is the assembly clock. Both assembly and group clocks sample one rendered program frame per time. Other multicam projects default to the group clock, which returns a row for every angle, including coverage gaps. Use --clock assembly for the edited program and still placements. A sequence project uses the sequence clock.",
+                             "--mcp-image serves the MCP review_file_frame_read job. It requires MPCUT_REVIEW_JOB_DIRECTORY set to an absolute job directory and one nonnegative --at time, and takes no --output, --preset, --format or selection options. It returns one review JPEG of at most 640 pixels and 1 MiB inline, without writing a frame folder."],
               result: "The stdout manifest matches manifest.json. frames[].file names a JPEG inside output_directory. Actual picture time and source PTS appear in frame_time and frame_pts where available. Single-source rows give clip_from and clip_to as frame-aligned export bounds, with range_number, scene_number and view_label where applicable. Angle-comparison rows give group_time, angle_id, source_time and availability in request order, then project angle order. Available rows give group_coverage, the half-open interval where that picture is visible on the group clock. See angles[] for the source path, offset, original timestamp origin, time base and source errors. Rendered Tiles rows report frame_time on the selected program clock and any applied privacy_issues.",
               examples: ["mpcut review frames export --json --select scenes --limit 12 --output overview interview.mov",
                          "mpcut review frames export --json --preset full --at 3/2 --output detail interview.mov",
@@ -388,7 +392,10 @@ struct CommandHelp: Encodable {
               instructions: ["Disk mode uses the configured folder or selects the supplied writable folder. Preview recursively searches an explicit folder, with an optional storage-location filter. Supply a saved project to protect its media references, including history, and identify its project cache.",
                              "Review the preview and pass only the desired clear_token values to clear, using the same folder and filters. A missing or changed selection cancels the request before removal starts."],
               result: "Read storage mode and shared folder availability, preview cache paths, storage details and reclaimable bytes, or list the cleared and skipped caches.",
-              examples: ["mpcut analysis cache preview --folder /Volumes/Recordings --json"]),
+              examples: ["mpcut analysis cache settings --json",
+                         "mpcut analysis cache configure --mode disk --folder /Volumes/Cache --json",
+                         "mpcut analysis cache preview --folder /Volumes/Recordings --json",
+                         "mpcut analysis cache clear --folder /Volumes/Recordings --select 50d858e0985ecc7f60418aaf0cc5ab587f42c2570a884095a9e8ccacd0f6545c --confirm --json"]),
         .init(name: "sidecar", purpose: "Save reusable analysis in the configured location or inspect available caches.",
               usage: ["mpcut analysis sidecar build [--json] [--project PROJECT] [--only index,scenes,audio | --only-file LIST] [--stream INDEX] [--min-pause-seconds SEC] [--threshold-db DB] [--] FILE",
                       "mpcut analysis sidecar inspect [--json] [--project PROJECT] [--] FILE"],
@@ -497,6 +504,8 @@ struct CommandHelp: Encodable {
         "transcript attachment inspect": "--project interview.cut --attachment-id session",
         "transcript excerpt queue": "--project interview.cut --first-word-id word-0 --name opening --out-project opening.cut",
         "transcript job cancel": "--job-id 8764D90A-1612-4129-B353-AD54BF7AA763",
+        "transcript job list": "--project interview.cut --job-directory ./jobs --json",
+        "transcript job reconcile": "--project interview.cut --attachment-id session --json",
         "transcript job retry": "--project interview.cut --job-id 8764D90A-1612-4129-B353-AD54BF7AA763",
         "transcript job run": "--job-id 8764D90A-1612-4129-B353-AD54BF7AA763 --job-directory ./jobs --json",
         "transcript job status": "--job-id 8764D90A-1612-4129-B353-AD54BF7AA763",

@@ -201,12 +201,12 @@ static int read_to(MPJPEGReader *r, int64_t pts)
                 if (r->first_dts == AV_NOPTS_VALUE && !r->sought)
                     r->first_dts = r->packet->dts != AV_NOPTS_VALUE ? r->packet->dts : r->packet->pts;
                 ret = avcodec_send_packet(r->codec, r->packet);
-                if (ret == 0 && r->clean_pts == INT64_MAX && r->resume_pts == INT64_MAX &&
-                    (r->packet->flags & AV_PKT_FLAG_KEY) && r->packet->pts != AV_NOPTS_VALUE) {
+                // The decoder keeps a packet even when sending it reports damage in
+                // pictures sent earlier, so a keyframe sent here can still resume.
+                if (skip_damage(r, ret)) ret = 0;
+                if (r->clean_pts == INT64_MAX && r->resume_pts == INT64_MAX &&
+                    (r->packet->flags & AV_PKT_FLAG_KEY) && r->packet->pts != AV_NOPTS_VALUE)
                     r->resume_pts = r->packet->pts;
-                } else if (skip_damage(r, ret)) {
-                    ret = 0;
-                }
             }
             av_packet_unref(r->packet);
         }

@@ -558,8 +558,10 @@ class MulticamCLITests(unittest.TestCase):
             self.assertEqual(piped.pop("project_path"), "-")
             self.assertEqual(piped, {key: saved[key] for key in piped})
         export = ["--output", "program.mov", "--json", "--dry-run"]
-        self.assertEqual(self.success("export", "project", "render", "--project", "-", *export, request=document),
-                         self.success("export", "project", "render", "--project", self.project, *export))
+        saved_plan = self.success("export", "project", "render", "--project", self.project, *export)
+        # A plan token binds the saved project file it reviewed, so only a saved project's dry run issues one.
+        self.assertTrue(saved_plan.pop("plan_token").startswith("v1-"))
+        self.assertEqual(self.success("export", "project", "render", "--project", "-", *export, request=document), saved_plan)
         silence = self.success("silence", "scan", "--project", "-", "--json", request=document)
         self.assertEqual(silence["project_path"], "-")
         frames = self.success("review", "frames", "export", "--project", "-", "--at", "1", "--output", "review", "--json", request=document)

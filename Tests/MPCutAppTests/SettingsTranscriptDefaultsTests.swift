@@ -123,8 +123,10 @@ final class SettingsTranscriptDefaultsTests: XCTestCase {
         XCTAssertEqual(dialogue.offscreen, .reaction)
         XCTAssertEqual(TilesDialogueDefaults.switchLaneHold(preferences), RationalTime(numerator: 5, denominator: 2))
         preferences.dialogueMinimumHold = 0
-        XCTAssertEqual(TilesDialogueDefaults.switchLaneHold(preferences), RationalTime(numerator: 1),
-                       "The lane needs a positive hold, so zero keeps core's second")
+        XCTAssertEqual(preferences.dialogueMinimumHold, EditorPreferences.dialogueHoldRange.lowerBound,
+                       "Settings clamps the hold to its 0.04 s minimum and never stores zero")
+        XCTAssertEqual(TilesDialogueDefaults.switchLaneHold(preferences), RationalTime(numerator: 1, denominator: 25),
+                       "The lane keeps the shortest positive hold Settings allows")
     }
 
     func testOpeningSheetsReadsSettingsAndWritesNothing() throws {
