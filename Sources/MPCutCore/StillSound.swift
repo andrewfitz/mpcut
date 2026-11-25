@@ -204,7 +204,7 @@ struct StillSoundPlanner {
                     let stream = format(of: spans)?.audio.stream ?? lane.format?.audio.stream
                     append(copy, audio: .copyOriginal, codec: stream?.codec, rate: stream?.sampleRate,
                            layout: stream?.canonicalChannelLayout, bitDepth: stream.flatMap(AudioExportEngine.integerDepth),
-                           description: "copied packets")
+                           warnings: copy.edit.audioJoinNotes, description: "copied packets")
                     continue
                 } catch let issue as CutError where issue.code != "cancelled" && issue.code != "source_changed" {
                     copyFailure = trackIssue(issue, ordinal: ordinal, lane: lane, spans: copySpans)
@@ -824,6 +824,7 @@ struct StillSoundPlanner {
         var silentAAC: [Int: Int] = [:]
         var audibleAAC = Set<Int>()
         var segments: [ResolvedSegment] = []
+        var joinRanges: [AudioJoinNotes.Range] = []
         var wholeFile = false
         for (index, span) in lane.enumerated() {
             try engine.checkCancellation()
@@ -885,14 +886,16 @@ struct StillSoundPlanner {
             }
             segments.append(ResolvedSegment(file: selected.url, from: from, to: to, outputStart: span.output.from,
                                             tracks: windows, sourceOrigin: selected.origin, reachesEnd: wholeFile))
+            joinRanges.append(AudioJoinNotes.Range(segment: segments[segments.count - 1], media: selected))
             identities[selected.url] = selected.identity
         }
         if audibleAAC.isEmpty, let first = silentAAC.values.min() {
             throw CutError(code: "unsafe_boundary", message: "The selected AAC program contains only empty presentation edits.",
                            segment: first, track: lane[first - 1].stream)
         }
-        let edit = ResolvedEdit(segments: segments, duration: duration, container: container, identities: identities,
+        var edit = ResolvedEdit(segments: segments, duration: duration, container: container, identities: identities,
                                 tracks: .audio, usesPerSourceAudioStream: true)
+        edit.noteAudioJoins(joinRanges)
         return .copy(edit, program: !wholeFile)
     }
 }

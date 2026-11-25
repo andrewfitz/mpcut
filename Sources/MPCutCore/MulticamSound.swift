@@ -8,6 +8,7 @@ extension MulticamEngine {
         var reference: MediaInfo?
         var prepared: [String: [Int: MediaInfo]] = [:]
         var segments: [ResolvedSegment] = []
+        var joinRanges: [AudioJoinNotes.Range] = []
         var silentAAC: [Int: Int] = [:]
         var audibleAAC = Set<Int>()
         let spans = supplied ?? mapping.audioLanes.first { $0.id == MulticamPlan.programAudioLaneID }?.spans ?? []
@@ -93,6 +94,7 @@ extension MulticamEngine {
                 }
                 segments.append(ResolvedSegment(file: selected.url, from: from, to: to, outputStart: span.output.from,
                                                 tracks: windows, sourceOrigin: selected.origin, reachesEnd: container == "flac" && whole))
+                joinRanges.append(AudioJoinNotes.Range(segment: segments[segments.count - 1], media: media))
                 identities[selected.url] = selected.identity
             } catch let issue as CutError {
                 throw try contextual(issue, span: span, mapping: mapping, index: segment, nearest: [], laneID: laneID)
@@ -105,9 +107,11 @@ extension MulticamEngine {
             throw try contextual(issue, span: spans[first - 1], mapping: mapping, index: first, laneID: laneID)
         }
         for (file, identity) in identities { try engine.verifyIdentity(file, identity: identity) }
-        return ResolvedEdit(segments: segments, duration: mapping.duration, container: container,
-                            identities: identities, tracks: .audio,
-                            audioStream: container == "flac" ? spans.first?.stream : nil)
+        var edit = ResolvedEdit(segments: segments, duration: mapping.duration, container: container,
+                                identities: identities, tracks: .audio,
+                                audioStream: container == "flac" ? spans.first?.stream : nil)
+        edit.noteAudioJoins(joinRanges)
+        return edit
     }
 
     /// A program soundtrack is written within its planned ranges. Unlike a linked

@@ -130,7 +130,8 @@ extension MulticamEngine {
                     let report = MulticamExportAudioLane(id: lane.id, label: lane.label, colorSlot: lane.colorSlot,
                         sourceLaneIDs: [lane.id], segments: copy.segments, action: .copyOriginal, codec: stream.codec,
                         sampleRate: stream.sampleRate, channelLayout: stream.canonicalChannelLayout,
-                        generatedSilence: [], retainedPCM: false, warnings: [])
+                        generatedSilence: [], retainedPCM: false,
+                        warnings: copy.audioJoinNotes.map { "Audio lane \(lane.label): \($0)" })
                     return .init(report: report, treatment: .copy(copy))
                 } catch let issue as CutError where issue.code != "cancelled" && issue.code != "source_changed" {
                     copyFailure = issue

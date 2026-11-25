@@ -311,9 +311,11 @@ extension CutEngine {
                            segment: segment, track: track).because(.cutAACCoverage)
         }
         for media in uniqueMedia { try verifyIdentity(media.url, identity: media.identity) }
-        return ResolvedEdit(segments: segments, duration: duration, container: container,
-                            identities: Dictionary(uniqueKeysWithValues: uniqueMedia.map { ($0.url, $0.identity) }),
-                            tracks: .audio, audioStream: audioStream, usesPerSourceAudioStream: audioTrackOrdinal != nil)
+        var edit = ResolvedEdit(segments: segments, duration: duration, container: container,
+                                identities: Dictionary(uniqueKeysWithValues: uniqueMedia.map { ($0.url, $0.identity) }),
+                                tracks: .audio, audioStream: audioStream, usesPerSourceAudioStream: audioTrackOrdinal != nil)
+        edit.noteAudioJoins(zip(segments, groups).map { AudioJoinNotes.Range(segment: $0, media: $1.media) })
+        return edit
     }
 
     func preservesAudioEnd(_ media: MediaInfo) -> Bool {

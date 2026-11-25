@@ -746,6 +746,7 @@ public struct CutEngine: Sendable {
         var edit = ResolvedEdit(segments: segments, duration: duration, container: container,
                                 identities: Dictionary(uniqueKeysWithValues: uniqueMedia.map { ($0.url, $0.identity) }), tracks: tracks)
         edit.smartTrimNotes = smartTrimNotes
+        edit.noteAudioJoins(zip(segments, effective).map { AudioJoinNotes.Range(segment: $0, media: $1.info) })
         return edit
     }
 
@@ -833,7 +834,7 @@ public struct CutEngine: Sendable {
     /// staged picture (a multicam program's lane) reports only the 'hev1' description. A source that cannot be opened
     /// reports nothing here; the export itself reports it.
     public func copyOmissions(_ edit: ResolvedEdit) -> [String] {
-        var omissions = edit.smartTrimNotes
+        var omissions = edit.smartTrimNotes + edit.audioJoinNotes
         if let issue = edit.timecodeIssue {
             omissions.append("The timecode track is not copied. \(issue)")
         }

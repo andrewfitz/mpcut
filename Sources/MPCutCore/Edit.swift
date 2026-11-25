@@ -149,6 +149,9 @@ public struct ResolvedEdit: Encodable, Sendable {
     var timecodeIssue: String? = nil
     /// What Smart Trim edges lose without being refused, one sentence each, such as film grain synthesis.
     var smartTrimNotes: [String] = []
+    /// Where a copied lossy audio track meets the next range inside the output and some players or decoders cannot
+    /// keep the join exact, one sentence per track (`AudioJoinNotes`). A dry run and the export report them alike.
+    var audioJoinNotes: [String] = []
 
     enum CodingKeys: String, CodingKey { case segments, duration, container }
 
